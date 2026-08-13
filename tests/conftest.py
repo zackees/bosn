@@ -6,6 +6,15 @@ import pytest
 
 from bosn.engine import Engine, engine_reachable
 
+
+@pytest.fixture(autouse=True)
+def isolated_state_dir(tmp_path_factory, monkeypatch) -> None:
+    """Never let a test touch the developer's real registry or spawn a real daemon there."""
+    state_dir = tmp_path_factory.mktemp("bosn-state")
+    monkeypatch.setenv("BOSN_STATE_DIR", str(state_dir))
+    monkeypatch.delenv("BOSN_PORT", raising=False)
+
+
 _ENGINE_REACHABLE: bool | None = None
 
 

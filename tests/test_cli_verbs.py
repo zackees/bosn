@@ -6,8 +6,10 @@ import pytest
 
 from bosn import cli
 
+UNIMPLEMENTED = sorted(v for v, (_, phase) in cli.VERBS.items() if phase != "implemented")
 
-@pytest.mark.parametrize("verb", sorted(set(cli.VERBS) - {"doctor"}))
+
+@pytest.mark.parametrize("verb", UNIMPLEMENTED)
 def test_unimplemented_verbs_fail_with_a_specific_error(verb: str, capsys) -> None:
     code = cli.main([verb])
     assert code == cli.NOT_IMPLEMENTED_EXIT, f"{verb} must not silently succeed"

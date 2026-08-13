@@ -1,5 +1,9 @@
 # bosn
 
+[![CI (Linux)](https://github.com/zackees/bosn/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/zackees/bosn/actions/workflows/ci.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 **A machine-wide lifecycle supervisor for container development resources.**
 
 `bosn` (bo's'n — the ship's officer who keeps the deck in order) is a standalone CLI
@@ -190,6 +194,34 @@ clud ships a thin `clud bosn …` forwarder that passes argv verbatim to the exe
 as it shells out to soldr, pinned to a bosn release. The second seam is the worktree-teardown
 hook that calls `bosn done`. Both degrade safely when bosn is absent: teardown proceeds, and
 the derived signals catch up later.
+
+## Development
+
+Three bash trampolines are the whole interface. `./lint` and `./test` hold no logic of
+their own — they exec into `ci/lint.py` and `ci/test.py`, which do the real work under `uv`:
+
+```bash
+./install     # install uv if absent, then `uv sync --all-groups`
+./lint        # ruff format --check, ruff check, pyright, KeyboardInterrupt checker
+./test        # pytest; passthrough args work, e.g. ./test -k registry
+```
+
+Linting includes a dedicated **KeyboardInterrupt checker** (`ci/lint_kbi.py`). Ctrl-C and
+Python do not mix well: a broad `except Exception` silently swallows the user's interrupt.
+Ruff's BLE001 can flag the blind except, but the actual defect is the *missing*
+`except KeyboardInterrupt` beside it, so an AST checker enforces that instead:
+
+| Code | Rule |
+| --- | --- |
+| `KBI001` | `except Exception` / `BaseException` with no sibling `except KeyboardInterrupt` |
+| `KBI002` | a `KeyboardInterrupt` handler that neither re-raises nor calls `_thread.interrupt_main()` |
+| `KBI003` | a bare `except:` that never re-raises |
+
+Suppress a line with `# noqa: KBI001` when a case is genuinely intentional.
+
+CI runs on Linux only. Docker-backed tests carry a `docker` pytest marker: they skip when no
+engine is reachable, and `ci/test.py` excludes them outright on non-Linux CI runners, so the
+unit suite stands alone without an engine.
 
 ## License
 

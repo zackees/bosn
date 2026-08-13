@@ -1,0 +1,218 @@
+"""Phase 3: daemon singleton lifecycle.
+
+The deterministic loopback port is the singleton concurrency primitive: a second daemon
+fails its bind with EADDRINUSE, so the operating system is the arbiter. These tests pin
+that property along with spawn, heartbeat, idle retirement, and fail-closed behavior.
+
+No Docker involved -- these run on every platform.
+"""
+
+from __future__ import annotations
+
+import os
+import socket
+import threading
+import time
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+
+from bosn import daemon as daemon_mod
+from bosn import ipc
+from bosn.daemon import Daemon, DaemonError, DaemonState
+
+
+def _wait_until(predicate, timeout: float = 15.0, interval: float = 0.05) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
+@pytest.fixture
+def served(tmp_path: Path) -> Iterator[Daemon]:
+    daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=3600)
+    thread = threading.Thread(target=daemon.serve_forever, daemon=True)
+    thread.start()
+    assert _wait_until(lambda: daemon_mod.is_serving(tmp_path)), "daemon never came up"
+    try:
+        yield daemon
+    finally:
+        daemon.request_stop()
+        thread.join(timeout=15)
+        daemon.shutdown()
+
+
+# -- the port as singleton primitive ---------------------------------------
+
+
+def test_port_is_deterministic_not_random(tmp_path: Path) -> None:
+    assert daemon_mod.port_for(tmp_path) == daemon_mod.port_for(tmp_path)
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    assert daemon_mod.port_for(other) != daemon_mod.port_for(tmp_path)
+
+
+def test_default_state_dir_uses_the_fixed_default_port(monkeypatch) -> None:
+    monkeypatch.delenv("BOSN_PORT", raising=False)
+    from bosn.registry import default_state_dir
+
+    assert daemon_mod.port_for(default_state_dir()) == daemon_mod.DEFAULT_PORT
+
+
+def test_port_can_be_overridden_by_env(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("BOSN_PORT", "50123")
+    assert daemon_mod.port_for(tmp_path) == 50123
+
+
+def test_second_daemon_loses_the_bind_and_refuses_to_start(served: Daemon, tmp_path: Path) -> None:
+    """The singleton check IS the failed bind -- not a pid comparison, not a lock file."""
+    with pytest.raises(DaemonError, match="already owns port"):
+        Daemon(state_dir=tmp_path).serve_forever()
+
+
+def test_a_foreign_listener_on_the_port_also_blocks_startup(tmp_path: Path) -> None:
+    """Anything holding the port wins; the daemon never assumes the port is free."""
+    port = daemon_mod.port_for(tmp_path)
+    squatter = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        squatter.bind((ipc.LOOPBACK, port))
+        squatter.listen(1)
+        with pytest.raises(DaemonError, match="already owns port"):
+            Daemon(state_dir=tmp_path).serve_forever()
+    finally:
+        squatter.close()
+
+
+def test_a_stale_state_file_cannot_fake_a_live_daemon(tmp_path: Path) -> None:
+    DaemonState(
+        pid=os.getpid(), port=daemon_mod.port_for(tmp_path), started_at=0.0, version="0"
+    ).write(daemon_mod.state_file(tmp_path))
+    # nothing is listening, so liveness is false regardless of what the file claims
+    assert daemon_mod.running_state(tmp_path) is None
+    assert not daemon_mod.state_file(tmp_path).exists()
+
+
+# -- serving ---------------------------------------------------------------
+
+
+def test_daemon_publishes_state_and_answers_ping(served: Daemon, tmp_path: Path) -> None:
+    state = daemon_mod.running_state(tmp_path)
+    assert state is not None
+    assert state.port == served.port == daemon_mod.port_for(tmp_path)
+    assert state.pid == os.getpid()
+    reply = ipc.send_request(state.port, {"verb": "ping"})
+    assert reply["ok"] and reply["pong"]
+
+
+def test_status_reports_registry_id_and_uptime(served: Daemon) -> None:
+    reply = ipc.send_request(served.port, {"verb": "status"})
+    assert reply["ok"]
+    assert reply["registry_id"] == served.registry.registry_id
+    assert reply["uptime_seconds"] >= 0
+
+
+def test_unknown_verb_is_rejected_not_ignored(served: Daemon) -> None:
+    reply = ipc.send_request(served.port, {"verb": "definitely-not-a-verb"})
+    assert reply["ok"] is False
+    assert "unknown daemon verb" in reply["error"]
+
+
+def test_requests_refresh_the_heartbeat(served: Daemon) -> None:
+    before = served.heartbeat_at
+    time.sleep(0.05)
+    ipc.send_request(served.port, {"verb": "ping"})
+    assert served.heartbeat_at > before
+
+
+def test_registry_is_usable_from_the_server_threads(served: Daemon) -> None:
+    """The daemon serves on threads; a thread-affine sqlite handle would fail here."""
+    for _ in range(5):
+        assert ipc.send_request(served.port, {"verb": "status"})["ok"]
+
+
+# -- shutdown and retirement -----------------------------------------------
+
+
+def test_shutdown_verb_stops_the_daemon_and_clears_state(tmp_path: Path) -> None:
+    daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=3600)
+    thread = threading.Thread(target=daemon.serve_forever, daemon=True)
+    thread.start()
+    assert _wait_until(lambda: daemon_mod.is_serving(tmp_path))
+
+    assert daemon_mod.stop(tmp_path) is True
+    thread.join(timeout=15)
+    assert not daemon_mod.is_serving(tmp_path)
+    assert not daemon_mod.state_file(tmp_path).exists()
+
+
+def test_the_port_is_released_for_the_next_daemon(tmp_path: Path) -> None:
+    """A retired daemon must not leave its port wedged, or the singleton becomes a lockout."""
+    for _ in range(2):
+        daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=3600)
+        thread = threading.Thread(target=daemon.serve_forever, daemon=True)
+        thread.start()
+        assert _wait_until(lambda: daemon_mod.is_serving(tmp_path))
+        assert daemon_mod.stop(tmp_path)
+        thread.join(timeout=15)
+
+
+def test_idle_retirement_stops_an_unused_daemon(tmp_path: Path) -> None:
+    daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=0.5)
+    thread = threading.Thread(target=daemon.serve_forever, daemon=True)
+    thread.start()
+    assert _wait_until(lambda: daemon_mod.is_serving(tmp_path))
+    thread.join(timeout=20)
+    assert not thread.is_alive(), "idle daemon should have retired itself"
+    assert not daemon_mod.is_serving(tmp_path)
+
+
+# -- client behavior -------------------------------------------------------
+
+
+def test_mutating_request_fails_closed_without_a_daemon(tmp_path: Path) -> None:
+    with pytest.raises(DaemonError, match="no bosn daemon is running"):
+        daemon_mod.request("status", tmp_path, autostart=False)
+
+
+def test_transport_error_on_a_dead_port() -> None:
+    with pytest.raises(ipc.TransportError, match="unreachable"):
+        ipc.send_request(daemon_mod.free_port(), {"verb": "ping"}, timeout=1.0)
+
+
+def test_stop_returns_false_when_nothing_is_running(tmp_path: Path) -> None:
+    assert daemon_mod.stop(tmp_path) is False
+
+
+def test_spawn_reports_a_clear_error_when_detachment_is_unavailable(tmp_path: Path) -> None:
+    """The missing-trampoline case must name the cause, not raise FileNotFoundError."""
+    if daemon_mod.spawn_daemon_available():
+        pytest.skip("running-process can detach here; the failure path is not reachable")
+    with pytest.raises(DaemonError, match="cannot detach on this platform"):
+        daemon_mod.spawn(tmp_path, timeout=5)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    not daemon_mod.spawn_daemon_available(),
+    reason=(
+        "running-process 4.10.1 publishes no assets/daemon-trampoline in its wheels, so "
+        "spawn_daemon cannot detach yet. Re-enable once a build ships the trampoline."
+    ),
+)
+def test_real_detached_spawn_and_autostart(tmp_path: Path) -> None:
+    """End-to-end: the CLI lazily spawns a real detached daemon and talks to it."""
+    state = daemon_mod.spawn(tmp_path, timeout=60)
+    try:
+        assert state.port == daemon_mod.port_for(tmp_path)
+        assert state.pid != os.getpid(), "daemon must be a separate process"
+        assert ipc.send_request(state.port, {"verb": "ping"})["ok"]
+
+        # spawn is idempotent and autostart reaches the same daemon
+        assert daemon_mod.spawn(tmp_path).pid == state.pid
+        assert daemon_mod.request("status", tmp_path)["pid"] == state.pid
+    finally:
+        assert daemon_mod.stop(tmp_path, timeout=30)
