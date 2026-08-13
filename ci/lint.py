@@ -12,6 +12,9 @@ CHECKS: list[list[str]] = [
     ["ruff", "format", "--check", "."],
     ["ruff", "check", "."],
     ["pyright"],
+    # Ctrl-C correctness: ruff's BLE001 flags blind excepts but cannot see the *missing*
+    # KeyboardInterrupt sibling handler, which is the actual defect.
+    [sys.executable, str(ROOT / "ci" / "lint_kbi.py")],
 ]
 
 
@@ -26,7 +29,7 @@ def main(argv: list[str] | None = None) -> int:
     for check in CHECKS:
         cmd = check + argv if argv else check
         if run(cmd) != 0:
-            failed.append(cmd[0] + " " + (cmd[1] if len(cmd) > 1 else ""))
+            failed.append(" ".join(Path(part).name for part in cmd[:2]))
     if failed:
         print(f"\nLINT FAILED: {', '.join(failed)}", file=sys.stderr)
         return 1

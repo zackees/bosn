@@ -53,4 +53,5 @@ reportMissingImports = false
 testpaths = ["tests"]
 markers = [
     "docker: test requires a reachable Docker engine (Linux CI only)",
+    "slow: test spawns real processes or builds images",
 ]

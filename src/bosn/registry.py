@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -131,14 +132,18 @@ class Registry:
         self.read_only = read_only
         if not read_only:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.path), isolation_level=None)
+        # The daemon serves requests on a thread pool while owning one connection, so the
+        # connection must outlive its creating thread; a lock keeps it single-writer.
+        self._lock = threading.RLock()
+        self.conn = sqlite3.connect(str(self.path), isolation_level=None, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.execute("PRAGMA busy_timeout=5000")
-        if not read_only:
-            self.conn.executescript(SCHEMA)
-            self._ensure_meta()
+        with self._lock:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA foreign_keys=ON")
+            self.conn.execute("PRAGMA busy_timeout=5000")
+            if not read_only:
+                self.conn.executescript(SCHEMA)
+                self._ensure_meta()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -149,20 +154,26 @@ class Registry:
         self.close()
 
     def close(self) -> None:
-        self.conn.close()
+        with self._lock:
+            self.conn.close()
+
+    def _exec(self, sql: str, params: tuple[object, ...] = ()) -> sqlite3.Cursor:
+        """Every statement goes through here so the daemon stays single-writer."""
+        with self._lock:
+            return self.conn.execute(sql, params)
 
     def _ensure_meta(self) -> None:
-        self.conn.execute(
+        self._exec(
             "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
             (str(SCHEMA_VERSION),),
         )
-        self.conn.execute(
+        self._exec(
             "INSERT OR IGNORE INTO meta(key, value) VALUES ('registry_id', ?)",
             (str(uuid.uuid4()),),
         )
 
     def meta(self, key: str) -> str | None:
-        row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        row = self._exec("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else None
 
     @property
@@ -174,7 +185,7 @@ class Registry:
 
     @property
     def journal_mode(self) -> str:
-        return str(self.conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        return str(self._exec("PRAGMA journal_mode").fetchone()[0]).lower()
 
     # -- resources ---------------------------------------------------------
 
@@ -193,7 +204,7 @@ class Registry:
         now = self.clock.now()
         rid = resource_id or str(uuid.uuid4())
         created = now if created_at is None else created_at
-        self.conn.execute(
+        self._exec(
             "INSERT OR REPLACE INTO resources"
             "(id, kind, name, stack, generation, scope, workspace, created_at, last_used, state)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')",
@@ -205,28 +216,28 @@ class Registry:
         return resource
 
     def get_resource(self, resource_id: str) -> Resource | None:
-        row = self.conn.execute("SELECT * FROM resources WHERE id = ?", (resource_id,)).fetchone()
+        row = self._exec("SELECT * FROM resources WHERE id = ?", (resource_id,)).fetchone()
         return _resource_from_row(row) if row else None
 
     def list_resources(self, *, state: str | None = None) -> list[Resource]:
         if state is None:
-            rows = self.conn.execute("SELECT * FROM resources ORDER BY created_at").fetchall()
+            rows = self._exec("SELECT * FROM resources ORDER BY created_at").fetchall()
         else:
-            rows = self.conn.execute(
+            rows = self._exec(
                 "SELECT * FROM resources WHERE state = ? ORDER BY created_at", (state,)
             ).fetchall()
         return [_resource_from_row(row) for row in rows]
 
     def touch_resource(self, resource_id: str) -> None:
-        self.conn.execute(
+        self._exec(
             "UPDATE resources SET last_used = ? WHERE id = ?", (self.clock.now(), resource_id)
         )
 
     def set_resource_state(self, resource_id: str, state: str) -> None:
-        self.conn.execute("UPDATE resources SET state = ? WHERE id = ?", (state, resource_id))
+        self._exec("UPDATE resources SET state = ? WHERE id = ?", (state, resource_id))
 
     def remove_resource(self, resource_id: str) -> None:
-        self.conn.execute("DELETE FROM resources WHERE id = ?", (resource_id,))
+        self._exec("DELETE FROM resources WHERE id = ?", (resource_id,))
         self.log_event("resource.removed", resource_id)
 
     # -- leases ------------------------------------------------------------
@@ -241,7 +252,7 @@ class Registry:
     ) -> Lease:
         now = self.clock.now()
         lease_id = str(uuid.uuid4())
-        self.conn.execute(
+        self._exec(
             "INSERT INTO leases"
             "(id, resource_id, pid, proc_start, acquired_at, heartbeat_at, ttl_seconds)"
             " VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -253,34 +264,30 @@ class Registry:
         return lease
 
     def get_lease(self, lease_id: str) -> Lease | None:
-        row = self.conn.execute("SELECT * FROM leases WHERE id = ?", (lease_id,)).fetchone()
+        row = self._exec("SELECT * FROM leases WHERE id = ?", (lease_id,)).fetchone()
         return _lease_from_row(row) if row else None
 
     def leases_for(self, resource_id: str) -> list[Lease]:
-        rows = self.conn.execute(
-            "SELECT * FROM leases WHERE resource_id = ?", (resource_id,)
-        ).fetchall()
+        rows = self._exec("SELECT * FROM leases WHERE resource_id = ?", (resource_id,)).fetchall()
         return [_lease_from_row(row) for row in rows]
 
     def heartbeat(self, lease_id: str) -> None:
-        self.conn.execute(
-            "UPDATE leases SET heartbeat_at = ? WHERE id = ?", (self.clock.now(), lease_id)
-        )
+        self._exec("UPDATE leases SET heartbeat_at = ? WHERE id = ?", (self.clock.now(), lease_id))
 
     def release_lease(self, lease_id: str) -> None:
-        self.conn.execute("DELETE FROM leases WHERE id = ?", (lease_id,))
+        self._exec("DELETE FROM leases WHERE id = ?", (lease_id,))
         self.log_event("lease.released", lease_id)
 
     # -- generations -------------------------------------------------------
 
     def record_generation(self, digest: str, stack: str) -> None:
-        self.conn.execute(
+        self._exec(
             "INSERT OR IGNORE INTO generations(digest, stack, created_at) VALUES (?, ?, ?)",
             (digest, stack, self.clock.now()),
         )
 
     def supersede_generations(self, stack: str, keep_digest: str) -> int:
-        cur = self.conn.execute(
+        cur = self._exec(
             "UPDATE generations SET superseded_at = ?"
             " WHERE stack = ? AND digest != ? AND superseded_at IS NULL",
             (self.clock.now(), stack, keep_digest),
@@ -288,7 +295,7 @@ class Registry:
         return cur.rowcount
 
     def generation_superseded_at(self, digest: str) -> float | None:
-        row = self.conn.execute(
+        row = self._exec(
             "SELECT superseded_at FROM generations WHERE digest = ?", (digest,)
         ).fetchone()
         return row["superseded_at"] if row else None
@@ -296,15 +303,13 @@ class Registry:
     # -- events ------------------------------------------------------------
 
     def log_event(self, kind: str, detail: str = "") -> None:
-        self.conn.execute(
+        self._exec(
             "INSERT INTO events(at, kind, detail) VALUES (?, ?, ?)",
             (self.clock.now(), kind, detail),
         )
 
     def events(self, limit: int = 100) -> list[sqlite3.Row]:
-        return self.conn.execute(
-            "SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall()
+        return self._exec("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
 
 def _resource_from_row(row: sqlite3.Row) -> Resource:

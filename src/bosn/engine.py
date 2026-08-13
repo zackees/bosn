@@ -82,6 +82,8 @@ class Engine:
         try:
             client = self.run(["version", "--format", "{{.Client.Version}}"])
             server = self.run(["version", "--format", "{{.Server.Version}}"])
+        except KeyboardInterrupt:
+            raise
         except Exception as exc:  # noqa: BLE001 - doctor must never crash
             return EngineInfo(binary=self.binary, reachable=False, detail=str(exc))
         if not server.ok:
