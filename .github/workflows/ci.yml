@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux (lint + unit + docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Docker engine version
+        run: docker version
+
+      - name: Install
+        run: ./install
+
+      - name: Lint
+        run: ./lint
+
+      - name: Test (unit + docker)
+        run: ./test
+
+      - name: Build wheel
+        run: uv build --wheel
+
+      - name: Assert py3-none-any wheel
+        run: |
+          set -e
+          ls dist/
+          test -n "$(ls dist/*-py3-none-any.whl)"
