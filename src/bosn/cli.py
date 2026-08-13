@@ -22,11 +22,11 @@ NOT_IMPLEMENTED_EXIT = 3
 
 # verb -> (help text, phase that lands it)
 VERBS: dict[str, tuple[str, str]] = {
-    "run": ("run an ad-hoc command in a stack", "phase 5"),
-    "shell": ("interactive session in the persistent container", "phase 5"),
-    "tasks": ("list manifest tasks, stacks, digests, registration state", "phase 5"),
+    "run": ("run an ad-hoc command in a stack", "implemented"),
+    "shell": ("interactive session in the persistent container", "phase 6"),
+    "tasks": ("list manifest tasks, stacks, digests, registration state", "implemented"),
     "jobs": ("list daemon-owned jobs", "implemented"),
-    "attach": ("attach to a daemon-owned job", "phase 5"),
+    "attach": ("attach to a daemon-owned job", "phase 6"),
     "status": ("tiers, leases, managed bytes vs ceiling, foreign registries", "phase 6"),
     "gc": ("report or reclaim collectable resources", "phase 6"),
     "done": ("mark this workspace finished; its caches become collectable", "phase 6"),
@@ -56,10 +56,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="override the bosn state directory (registry + daemon state)",
     )
+    parser.add_argument(
+        "--manifest", default=None, help="path to bosn.toml (default: nearest one upward)"
+    )
     subparsers = parser.add_subparsers(dest="verb", metavar="VERB")
     for verb, (help_text, _) in VERBS.items():
         sub = subparsers.add_parser(verb, help=help_text)
         sub.add_argument("args", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
+        if verb in {"run", "tasks", "shell"}:
+            sub.add_argument("--stack", default=None, help="stack to use (default: the default)")
+            sub.add_argument("--task", default=None, help="run a manifest task by name")
+            sub.add_argument("--manifest", default=None, dest="sub_manifest")
 
     daemon_parser = subparsers.add_parser(DAEMON_VERB, help=argparse.SUPPRESS)
     daemon_parser.add_argument("--port", type=int, default=None)
@@ -122,6 +129,92 @@ def cmd_jobs(ns: argparse.Namespace) -> int:
     return 0
 
 
+def _open_manifest_and_registry(ns: argparse.Namespace):
+    from bosn.manifest import ManifestError, find_manifest, load
+    from bosn.registry import Registry, default_db_path
+
+    raw_manifest = getattr(ns, "sub_manifest", None) or getattr(ns, "manifest", None)
+    manifest_path = Path(raw_manifest) if raw_manifest else find_manifest()
+    if manifest_path is None:
+        raise ManifestError(
+            "no bosn.toml found in this directory or any parent; create one or pass --manifest"
+        )
+    manifest = load(manifest_path)
+    state_dir = resolve_state_dir(ns)
+    db_path = (state_dir / "registry.sqlite3") if state_dir else default_db_path()
+    return manifest, Registry(db_path)
+
+
+def cmd_tasks(ns: argparse.Namespace) -> int:
+    from bosn.manifest import ManifestError, generation_digest
+
+    try:
+        manifest, registry = _open_manifest_and_registry(ns)
+    except ManifestError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    try:
+        payload = {
+            "manifest": str(manifest.path),
+            "stacks": {
+                name: {
+                    "dockerfile": stack.dockerfile,
+                    "image": stack.image,
+                    "family": stack.family,
+                    "default": stack.default,
+                    "digest": generation_digest(manifest, stack),
+                    "volumes": {v.name: v.scope for v in stack.volumes},
+                }
+                for name, stack in manifest.stacks.items()
+            },
+            "tasks": {name: {"stack": t.stack, "cmd": t.cmd} for name, t in manifest.tasks.items()},
+        }
+    except ManifestError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    finally:
+        registry.close()
+
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def cmd_run(ns: argparse.Namespace) -> int:
+    from bosn.converge import Converger
+    from bosn.engine import EngineError
+    from bosn.manifest import ManifestError
+
+    command = [a for a in (ns.args or []) if a != "--"]
+    if not command and not ns.task:
+        print("nothing to run: pass a command after `--`, or name a task", file=sys.stderr)
+        return 2
+
+    try:
+        manifest, registry = _open_manifest_and_registry(ns)
+    except ManifestError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    try:
+        if ns.task:
+            from bosn.converge import run_task
+
+            _result, code, output = run_task(manifest, registry, ns.task, engine=Engine(ns.engine))
+        else:
+            converger = Converger(manifest, registry, Engine(ns.engine))
+            _result, code, output = converger.run(command, stack_name=ns.stack)
+    except (ManifestError, EngineError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    finally:
+        registry.close()
+
+    if output:
+        print(output)
+    return code
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     ns = parser.parse_args(argv if argv is not None else sys.argv[1:])
@@ -138,6 +231,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if ns.verb == "jobs":
         return cmd_jobs(ns)
+
+    if ns.verb == "tasks":
+        return cmd_tasks(ns)
+
+    if ns.verb == "run":
+        return cmd_run(ns)
 
     error = VerbNotImplementedError(ns.verb, VERBS[ns.verb][1])
     print(str(error), file=sys.stderr)
