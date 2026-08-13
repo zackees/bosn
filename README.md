@@ -12,9 +12,16 @@ records your development workflow creates. It knows what each resource belongs t
 which ones are in active use, and when the rest may be deleted — so build caches
 stay warm while total storage stays bounded, without anyone remembering to clean up.
 
-> **Status: design complete, implementation not started.** The full v3 design lives in
-> [issue #1](https://github.com/zackees/bosn/issues/1). That text predates the rename and
-> refers to the project as *dockhand*; the design is unchanged, the name is not.
+> **Status: base functionality implemented and validated.** The manifest, generation
+> digests, converge-then-run, the sqlite registry, the daemon singleton, leases, adoption,
+> and tiered GC are all in place and covered end to end against a real Docker engine on
+> Linux CI. The full v3 design lives in
+> [issue #1](https://github.com/zackees/bosn/issues/1) and the bringup plan in
+> [issue #3](https://github.com/zackees/bosn/issues/3). Issue #1's text predates the rename
+> and refers to the project as *dockhand*; the design is unchanged, the name is not.
+>
+> Not yet built: the `bosn-docker` compatibility subset, `bosn init` from `compose.yaml`,
+> daemon-owned background jobs (`bosn attach`), macOS/Windows CI, and podman.
 
 ## Why this exists
 

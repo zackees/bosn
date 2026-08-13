@@ -10,11 +10,11 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections.abc import Sequence
-from pathlib import Path
+from collections.abc import Callable, Sequence
 
 from bosn import __version__, ipc
 from bosn.engine import Engine
+from bosn.options import Options, from_namespace
 
 DAEMON_VERB = "__daemon"
 
@@ -23,13 +23,13 @@ NOT_IMPLEMENTED_EXIT = 3
 # verb -> (help text, phase that lands it)
 VERBS: dict[str, tuple[str, str]] = {
     "run": ("run an ad-hoc command in a stack", "implemented"),
-    "shell": ("interactive session in the persistent container", "phase 6"),
+    "shell": ("interactive session in the persistent container", "implemented"),
     "tasks": ("list manifest tasks, stacks, digests, registration state", "implemented"),
     "jobs": ("list daemon-owned jobs", "implemented"),
     "attach": ("attach to a daemon-owned job", "phase 6"),
-    "status": ("tiers, leases, managed bytes vs ceiling, foreign registries", "phase 6"),
-    "gc": ("report or reclaim collectable resources", "phase 6"),
-    "done": ("mark this workspace finished; its caches become collectable", "phase 6"),
+    "status": ("tiers, leases, managed bytes vs ceiling, foreign registries", "implemented"),
+    "gc": ("report or reclaim collectable resources", "implemented"),
+    "done": ("mark this workspace finished; its caches become collectable", "implemented"),
     "doctor": ("engine health and reachability", "implemented"),
 }
 
@@ -63,10 +63,26 @@ def build_parser() -> argparse.ArgumentParser:
     for verb, (help_text, _) in VERBS.items():
         sub = subparsers.add_parser(verb, help=help_text)
         sub.add_argument("args", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
-        if verb in {"run", "tasks", "shell"}:
+        if verb in {"run", "tasks", "shell", "done"}:
             sub.add_argument("--stack", default=None, help="stack to use (default: the default)")
             sub.add_argument("--task", default=None, help="run a manifest task by name")
             sub.add_argument("--manifest", default=None, dest="sub_manifest")
+        if verb == "gc":
+            group = sub.add_mutually_exclusive_group()
+            group.add_argument(
+                "--dry-run",
+                dest="dry_run",
+                action="store_true",
+                default=True,
+                help="report what would be reclaimed (default)",
+            )
+            group.add_argument(
+                "--apply",
+                dest="dry_run",
+                action="store_false",
+                help="actually reclaim. There is deliberately no --force: automatic "
+                "deletion always requires complete ownership proof",
+            )
 
     daemon_parser = subparsers.add_parser(DAEMON_VERB, help=argparse.SUPPRESS)
     daemon_parser.add_argument("--port", type=int, default=None)
@@ -75,11 +91,6 @@ def build_parser() -> argparse.ArgumentParser:
     # Accepted after the verb as well, so a spawned argv need not order its flags.
     daemon_parser.add_argument("--state-dir", default=None, dest="daemon_state_dir")
     return parser
-
-
-def resolve_state_dir(ns: argparse.Namespace) -> Path | None:
-    raw = getattr(ns, "daemon_state_dir", None) or ns.state_dir
-    return Path(raw) if raw else None
 
 
 def cmd_doctor(engine_binary: str) -> int:
@@ -94,34 +105,34 @@ def cmd_doctor(engine_binary: str) -> int:
     return 0
 
 
-def cmd_daemon(ns: argparse.Namespace) -> int:
+def cmd_daemon(opts: Options) -> int:
     from bosn import daemon as daemon_mod
 
-    state_dir = resolve_state_dir(ns)
+    state_dir = opts.state_dir
 
-    if ns.stop:
+    if opts.stop:
         stopped = daemon_mod.stop(state_dir)
         print("daemon stopped" if stopped else "no daemon was running")
         return 0
 
     idle = (
-        ns.idle_retire_seconds
-        if ns.idle_retire_seconds is not None
+        opts.idle_retire_seconds
+        if opts.idle_retire_seconds is not None
         else daemon_mod.DEFAULT_IDLE_RETIRE_SECONDS
     )
     try:
-        daemon = daemon_mod.Daemon(state_dir=state_dir, port=ns.port, idle_retire_seconds=idle)
+        daemon = daemon_mod.Daemon(state_dir=state_dir, port=opts.port, idle_retire_seconds=idle)
         return daemon.serve_forever()
     except daemon_mod.DaemonError as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
 
-def cmd_jobs(ns: argparse.Namespace) -> int:
+def cmd_jobs(opts: Options) -> int:
     from bosn import daemon as daemon_mod
 
     try:
-        reply = daemon_mod.request("jobs", resolve_state_dir(ns))
+        reply = daemon_mod.request("jobs", opts.state_dir)
     except (daemon_mod.DaemonError, ipc.TransportError) as exc:  # fail closed, stay visible
         print(f"cannot reach the bosn daemon: {exc}", file=sys.stderr)
         return 1
@@ -129,27 +140,26 @@ def cmd_jobs(ns: argparse.Namespace) -> int:
     return 0
 
 
-def _open_manifest_and_registry(ns: argparse.Namespace):
+def _open_manifest_and_registry(opts: Options):
     from bosn.manifest import ManifestError, find_manifest, load
     from bosn.registry import Registry, default_db_path
 
-    raw_manifest = getattr(ns, "sub_manifest", None) or getattr(ns, "manifest", None)
-    manifest_path = Path(raw_manifest) if raw_manifest else find_manifest()
+    manifest_path = opts.manifest or find_manifest()
     if manifest_path is None:
         raise ManifestError(
             "no bosn.toml found in this directory or any parent; create one or pass --manifest"
         )
     manifest = load(manifest_path)
-    state_dir = resolve_state_dir(ns)
+    state_dir = opts.state_dir
     db_path = (state_dir / "registry.sqlite3") if state_dir else default_db_path()
     return manifest, Registry(db_path)
 
 
-def cmd_tasks(ns: argparse.Namespace) -> int:
+def cmd_tasks(opts: Options) -> int:
     from bosn.manifest import ManifestError, generation_digest
 
     try:
-        manifest, registry = _open_manifest_and_registry(ns)
+        manifest, registry = _open_manifest_and_registry(opts)
     except ManifestError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -180,30 +190,32 @@ def cmd_tasks(ns: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_run(ns: argparse.Namespace) -> int:
+def cmd_run(opts: Options) -> int:
     from bosn.converge import Converger
     from bosn.engine import EngineError
     from bosn.manifest import ManifestError
 
-    command = [a for a in (ns.args or []) if a != "--"]
-    if not command and not ns.task:
+    command = opts.command
+    if not command and not opts.task:
         print("nothing to run: pass a command after `--`, or name a task", file=sys.stderr)
         return 2
 
     try:
-        manifest, registry = _open_manifest_and_registry(ns)
+        manifest, registry = _open_manifest_and_registry(opts)
     except ManifestError as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
     try:
-        if ns.task:
+        if opts.task:
             from bosn.converge import run_task
 
-            _result, code, output = run_task(manifest, registry, ns.task, engine=Engine(ns.engine))
+            _result, code, output = run_task(
+                manifest, registry, opts.task, engine=Engine(opts.engine)
+            )
         else:
-            converger = Converger(manifest, registry, Engine(ns.engine))
-            _result, code, output = converger.run(command, stack_name=ns.stack)
+            converger = Converger(manifest, registry, Engine(opts.engine))
+            _result, code, output = converger.run(command, stack_name=opts.stack)
     except (ManifestError, EngineError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -215,29 +227,82 @@ def cmd_run(ns: argparse.Namespace) -> int:
     return code
 
 
+def cmd_status(opts: Options) -> int:
+    from bosn.gc import status
+    from bosn.registry import Registry, default_db_path
+
+    state_dir = opts.state_dir
+    db_path = (state_dir / "registry.sqlite3") if state_dir else default_db_path()
+    with Registry(db_path) as registry:
+        print(json.dumps(status(registry, Engine(opts.engine)), indent=2))
+    return 0
+
+
+def cmd_gc(opts: Options) -> int:
+    from bosn.gc import Collector, done_workspaces
+    from bosn.registry import Registry, default_db_path
+
+    state_dir = opts.state_dir
+    db_path = (state_dir / "registry.sqlite3") if state_dir else default_db_path()
+    with Registry(db_path) as registry:
+        collector = Collector(registry, Engine(opts.engine))
+        result = collector.collect(dry_run=opts.dry_run, done_workspaces=done_workspaces(registry))
+
+    print(json.dumps({**result.summary(), "dry_run": result.dry_run}, indent=2))
+    for name in result.removed:
+        print(("would remove " if result.dry_run else "removed ") + name)
+    for message in result.errors:
+        print(f"error: {message}", file=sys.stderr)
+    return 1 if result.errors else 0
+
+
+def cmd_done(opts: Options) -> int:
+    from bosn.gc import mark_done
+    from bosn.manifest import ManifestError
+
+    try:
+        manifest, registry = _open_manifest_and_registry(opts)
+    except ManifestError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    try:
+        marked = mark_done(registry, str(manifest.root))
+    finally:
+        registry.close()
+    print(f"marked {marked} resource(s) in {manifest.root} as done")
+    return 0
+
+
+def cmd_shell(opts: Options) -> int:
+    from dataclasses import replace
+
+    return cmd_run(replace(opts, args=("sh",), task=None))
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     ns = parser.parse_args(argv if argv is not None else sys.argv[1:])
+    opts = from_namespace(ns)
 
-    if ns.verb is None:
+    if opts.verb is None:
         parser.print_help()
         return 0
 
-    if ns.verb == DAEMON_VERB:
-        return cmd_daemon(ns)
+    handlers: dict[str, Callable[[Options], int]] = {
+        DAEMON_VERB: cmd_daemon,
+        "doctor": lambda o: cmd_doctor(o.engine),
+        "jobs": cmd_jobs,
+        "tasks": cmd_tasks,
+        "run": cmd_run,
+        "shell": cmd_shell,
+        "status": cmd_status,
+        "gc": cmd_gc,
+        "done": cmd_done,
+    }
+    handler = handlers.get(opts.verb)
+    if handler is not None:
+        return handler(opts)
 
-    if ns.verb == "doctor":
-        return cmd_doctor(ns.engine)
-
-    if ns.verb == "jobs":
-        return cmd_jobs(ns)
-
-    if ns.verb == "tasks":
-        return cmd_tasks(ns)
-
-    if ns.verb == "run":
-        return cmd_run(ns)
-
-    error = VerbNotImplementedError(ns.verb, VERBS[ns.verb][1])
+    error = VerbNotImplementedError(opts.verb, VERBS[opts.verb][1])
     print(str(error), file=sys.stderr)
     return NOT_IMPLEMENTED_EXIT
