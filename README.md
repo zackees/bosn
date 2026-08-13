@@ -111,6 +111,26 @@ bosn gc --dry-run            # what would be reclaimed right now
 bosn doctor                  # engine health, backing-volume free space, VHDX slack
 ```
 
+## Existing Docker and Compose workloads
+
+Most real projects already have a `compose.yaml` and scripts that shell out to `docker`.
+Those keep working: bosn ships a second binary, **`bosn-docker`**, that is a drop-in
+replacement for the `docker` and `docker compose` CLIs, with optional `docker` /
+`docker-compose` shims so unmodified scripts need no edits at all. Everything it creates
+is labeled, registered, leased, and collected like any other managed resource — the
+Docker interface is a front door, not a bypass.
+
+It implements a subset and grows as real workloads demand. Anything outside that subset
+**fails with a specific error naming the flag or key it cannot honor**, never by silently
+ignoring the option and never by quietly falling back to raw Docker — either of those
+would reintroduce exactly the unlabeled resources bosn exists to eliminate.
+
+The two surfaces are not peers. `bosn` is the better-managed environment and the
+recommended way to use the product: manifest-declared stacks, digest-keyed generations,
+converge-on-run, one-word tasks, and machine-shared caches. `bosn-docker` is the on-ramp
+for what you already have, and `bosn init` can read an existing `compose.yaml` to generate
+a starting `bosn.toml` when you want the stronger guarantees.
+
 ## Design commitments
 
 - **Never `docker system prune`.** Never prune the default builder. Never delete a foreign
