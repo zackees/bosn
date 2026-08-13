@@ -1,0 +1,56 @@
+[project]
+name = "bosn"
+version = "0.1.0"
+description = "A machine-wide lifecycle supervisor for container development resources"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "Zach Vorhies" }]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "running-process>=1.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/zackees/bosn"
+
+[project.scripts]
+bosn = "bosn.cli:main"
+bosn-docker = "bosn.docker_cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "pyright>=1.1.380",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bosn"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests", "ci"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pyright]
+include = ["src", "tests", "ci"]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+reportMissingImports = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "docker: test requires a reachable Docker engine (Linux CI only)",
+]
