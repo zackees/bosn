@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import os
 import socket
-import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -188,12 +187,20 @@ def test_stop_returns_false_when_nothing_is_running(tmp_path: Path) -> None:
     assert daemon_mod.stop(tmp_path) is False
 
 
+def test_spawn_reports_a_clear_error_when_detachment_is_unavailable(tmp_path: Path) -> None:
+    """The missing-trampoline case must name the cause, not raise FileNotFoundError."""
+    if daemon_mod.spawn_daemon_available():
+        pytest.skip("running-process can detach here; the failure path is not reachable")
+    with pytest.raises(DaemonError, match="cannot detach on this platform"):
+        daemon_mod.spawn(tmp_path, timeout=5)
+
+
 @pytest.mark.slow
 @pytest.mark.skipif(
-    sys.platform.startswith("win"),
+    not daemon_mod.spawn_daemon_available(),
     reason=(
-        "running-process 4.10.1's win_amd64 wheel ships no assets/daemon-trampoline.exe, "
-        "so spawn_daemon cannot detach on Windows. Linux CI covers this path."
+        "running-process 4.10.1 publishes no assets/daemon-trampoline in its wheels, so "
+        "spawn_daemon cannot detach yet. Re-enable once a build ships the trampoline."
     ),
 )
 def test_real_detached_spawn_and_autostart(tmp_path: Path) -> None:

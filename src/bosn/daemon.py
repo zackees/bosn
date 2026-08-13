@@ -140,8 +140,20 @@ class _Handler(socketserver.StreamRequestHandler):
 
 
 class _Server(socketserver.ThreadingTCPServer):
-    # Address reuse OFF on purpose: the failed bind IS the singleton check.
-    allow_reuse_address = False
+    # SO_REUSEADDR is platform-conditional, and the difference matters for correctness.
+    #
+    # On POSIX it only permits binding a port stuck in TIME_WAIT; a port with a *live*
+    # listener still refuses the bind, so the singleton guarantee is intact and a restarted
+    # daemon does not have to wait out TIME_WAIT before it can serve again.
+    #
+    # On Windows SO_REUSEADDR is different: it lets a second socket steal a port that is
+    # actively being listened on, which would silently break the singleton. So it stays off
+    # there and a restart eats the TIME_WAIT delay instead.
+    #
+    # SO_REUSEPORT is never set on any platform -- that one really does allow two live
+    # listeners on one port, which is precisely the thing this design relies on being
+    # impossible.
+    allow_reuse_address = not sys.platform.startswith("win")
     daemon_threads = True
 
     def __init__(self, addr: tuple[str, int], daemon_ref: Daemon) -> None:
@@ -279,6 +291,24 @@ class Daemon:
 # -- client side -----------------------------------------------------------
 
 
+def spawn_daemon_available() -> bool:
+    """True when running-process can actually detach on this platform.
+
+    `spawn_daemon` needs a trampoline binary shipped in the wheel's assets directory.
+    running-process 4.10.1 publishes wheels without it on every platform, so the blessed
+    spawner is present in the API but not yet usable. Probing keeps the failure legible
+    instead of surfacing as a FileNotFoundError deep inside a spawn.
+    """
+    try:
+        # The *bundled* path inside the installed wheel -- not assets_dir(), which is the
+        # runtime hard-link cache and can hold a trampoline the spawner will not look at.
+        return rp_daemon.trampoline_source_path().exists()
+    except KeyboardInterrupt:
+        raise
+    except Exception:  # noqa: BLE001 - probe must never crash a caller
+        return False
+
+
 def _detach(state_dir: Path) -> int:
     """Start a detached `bosn __daemon` via running-process's daemon spawner.
 
@@ -287,6 +317,12 @@ def _detach(state_dir: Path) -> int:
     pid. Hand-rolling this with subprocess flags pops a console on Windows, which is exactly
     what a background supervisor must never do.
     """
+    if not spawn_daemon_available():
+        raise DaemonError(
+            "running-process cannot detach on this platform: its installed wheel ships no "
+            "bundled daemon-trampoline binary. Install a running-process build that "
+            "includes it, or start the daemon manually with `bosn __daemon`."
+        )
     env = rp_daemon.build_daemon_env(dict(os.environ))
     env["BOSN_STATE_DIR"] = str(state_dir)
     argv = [sys.executable, "-m", "bosn", "__daemon", "--state-dir", str(state_dir)]
