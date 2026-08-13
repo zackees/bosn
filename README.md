@@ -152,11 +152,21 @@ loopback, so the v1 CLI detects WSL and fails closed with that explanation rathe
 half-working.
 
 Docker is the v1 engine. Nothing in the model is Docker-specific, and podman is the intended
-second target — the name is a deliberate step away from `dock*`.
+second target — the name is a deliberate step away from `dock*`. Engine access goes through
+the `docker` / `podman` CLI rather than a Docker-specific API binding, which is most of what
+makes that second target cheap.
+
+**bosn is a pure-Python application** — it follows soldr's and zccache's *shape* (own repo,
+own daemon, own release cadence), not their implementation language. It ships as a single
+`py3-none-any` wheel with no compiled artifact and no per-platform build matrix, which is the
+whole reason for the choice: clud invokes bosn on every platform clud itself supports, and a
+compiled bosn would owe each of those a cross-compiled binary. Install it into its own
+isolated environment (`uv tool install bosn`) so a broken project venv can never take the
+disk-space supervisor offline with it.
 
 ## Integration
 
-clud ships a thin `clud bosn …` forwarder that passes argv verbatim to the binary, exactly
+clud ships a thin `clud bosn …` forwarder that passes argv verbatim to the executable, exactly
 as it shells out to soldr, pinned to a bosn release. The second seam is the worktree-teardown
 hook that calls `bosn done`. Both degrade safely when bosn is absent: teardown proceeds, and
 the derived signals catch up later.
