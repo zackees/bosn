@@ -114,6 +114,8 @@ def cmd_doctor(engine_binary: str) -> int:
 
 def cmd_daemon(opts: Options) -> int:
     from bosn import daemon as daemon_mod
+    from bosn.config import ConfigError
+    from bosn.config import load as load_config
 
     state_dir = opts.state_dir
 
@@ -137,21 +139,26 @@ def cmd_daemon(opts: Options) -> int:
             print("no daemon was running")
         return 0
 
-    idle = (
-        opts.idle_retire_seconds
-        if opts.idle_retire_seconds is not None
-        else daemon_mod.DEFAULT_IDLE_RETIRE_SECONDS
-    )
     try:
+        config = load_config(
+            flags={
+                "idle_retire_seconds": opts.idle_retire_seconds,
+                "max_builds": opts.max_builds,
+                "build_ttl_seconds": opts.build_ttl_seconds,
+            }
+        )
         daemon = daemon_mod.Daemon(
             state_dir=state_dir,
             port=opts.port,
-            idle_retire_seconds=idle,
-            max_builds=opts.max_builds,
-            build_ttl_seconds=opts.build_ttl_seconds,
+            idle_retire_seconds=config.get("idle_retire_seconds"),
+            max_builds=int(config.get("max_builds")),
+            build_ttl_seconds=config.get("build_ttl_seconds"),
             engine_binary=opts.engine,
         )
         return daemon.serve_forever()
+    except ConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     except daemon_mod.DaemonError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -400,14 +407,19 @@ def cmd_cancel(opts: Options) -> int:
 
 
 def cmd_status(opts: Options) -> int:
+    from bosn.config import ConfigError
     from bosn.gc import status
     from bosn.registry import Registry, default_db_path
 
     state_dir = opts.state_dir
     db_path = (state_dir / "registry.sqlite3") if state_dir else default_db_path()
-    with Registry(db_path) as registry:
-        print(json.dumps(status(registry, Engine(opts.engine)), indent=2))
-    return 0
+    try:
+        with Registry(db_path) as registry:
+            print(json.dumps(status(registry, Engine(opts.engine)), indent=2))
+        return 0
+    except ConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
 
 def cmd_gc(opts: Options) -> int:

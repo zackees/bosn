@@ -43,7 +43,6 @@ terminates with a reason its clients can read.
 from __future__ import annotations
 
 import itertools
-import os
 import queue
 import threading
 import time
@@ -84,23 +83,15 @@ def default_max_builds() -> int:
     own distinct key are all individually legal and can still saturate the machine. #1 caps
     bytes; this is the CPU-side analogue of the same commitment.
     """
-    override = os.environ.get("BOSN_MAX_BUILDS")
-    if override:
-        try:
-            return max(1, int(override))
-        except ValueError:
-            pass
-    return max(2, (os.cpu_count() or 2) // 2)
+    from bosn.config import load
+
+    return int(load().get("max_builds"))
 
 
 def default_ttl_seconds() -> float:
-    override = os.environ.get("BOSN_BUILD_TTL_SECONDS")
-    if override:
-        try:
-            return max(1.0, float(override))
-        except ValueError:
-            pass
-    return DEFAULT_TTL_SECONDS
+    from bosn.config import load
+
+    return load().get("build_ttl_seconds")
 
 
 class JobError(RuntimeError):

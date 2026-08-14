@@ -235,6 +235,16 @@ writer. The daemon is the registry's only writer and the only executor of reap a
 lazily spawned, autostarted at login, and idle-retired with a scheduled catch-up tick so
 maintenance still runs unattended.
 
+## Configuration
+
+Machine policy lives in `~/.config/bosn/config.toml` (or `$XDG_CONFIG_HOME/bosn/config.toml`;
+set `BOSN_CONFIG` to select another file). Values use `default < file < environment < CLI flag`
+precedence and invalid values stop the command while naming the bad key. The `[policy]` table
+accepts `container_idle_stop`, `container_remove`, `warm_volume_ttl`, `superseded_cap`,
+`shared_cache_ceiling`, `run_max_duration`, `idle_retire_seconds`, `build_ttl_seconds`, and
+`max_builds`; environment overrides are their uppercase `BOSN_` equivalents. `bosn status`
+reports each effective value and its origin.
+
 Losing the database is survivable: **ownership lives in the labels, and the registry is
 authoritative only for time and leases.** A lost registry rebuilds by rescanning Docker
 labels, with adoption time as last-use and a 24 h quiet period so recovery is never followed

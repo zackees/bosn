@@ -63,13 +63,19 @@ class Pressure:
 
 
 def container_should_stop(resource: Resource, now: float) -> bool:
-    return resource.kind == "container" and (now - resource.last_used) >= CONTAINER_IDLE_STOP
+    from bosn.config import load
+
+    return resource.kind == "container" and (now - resource.last_used) >= load().get(
+        "container_idle_stop"
+    )
 
 
 def _ttl_for(resource: Resource) -> float:
+    from bosn.config import load
+
     if resource.kind == "container":
-        return CONTAINER_REMOVE
-    return VOLUME_WARM_TTL
+        return load().get("container_remove")
+    return load().get("warm_volume_ttl")
 
 
 def evaluate(
@@ -98,7 +104,9 @@ def evaluate(
         return Verdict(resource, False, KEPT_QUIET_PERIOD)
 
     if superseded:
-        if age >= SUPERSEDED_CAP:
+        from bosn.config import load
+
+        if age >= load().get("superseded_cap"):
             return Verdict(resource, True, COLLECT_SUPERSEDED)
         return Verdict(resource, False, KEPT_WARM)
 
