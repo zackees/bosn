@@ -326,7 +326,7 @@ class Daemon:
     def _reconcile_startup_resources(self) -> None:
         """Repair create-before-registry crashes without making engine absence fatal."""
         from bosn.engine import Engine, EngineError
-        from bosn.resources import ResourceScanner, reconcile_owned
+        from bosn.resources import ResourceScanner, recompute_manifest_generations, reconcile_owned
 
         try:
             engine = Engine(self.engine_binary)
@@ -339,6 +339,7 @@ class Daemon:
             if self._stop.is_set():
                 return
             repaired = reconcile_owned(self.registry, scan, prior_resources=prior_resources)
+            recompute_manifest_generations(self.registry, scan)
         except EngineError as exc:
             self.registry.log_event("recovery.scan.unavailable", str(exc))
             return
@@ -424,13 +425,13 @@ class Daemon:
             self._write_heartbeat()
             for job in self.jobs.reap_expired():
                 self.registry.log_event("job.expired", f"{job.id} {job.stack}")
-            self.run_maintenance_if_due()
             if self.should_retire():
                 if self.request_stop():
                     self.registry.log_event(
                         "daemon.idle_retired", f"idle={self.idle_seconds():.0f}s"
                     )
                     return
+            self.run_maintenance_if_due()
 
     def _write_heartbeat(self) -> None:
         heartbeat_file(self.state_dir).touch()
@@ -639,6 +640,7 @@ class Daemon:
             ResourceScanner,
             TransferError,
             adopt,
+            recompute_manifest_generations,
             reconcile_owned,
             transfer_volume,
         )
@@ -704,7 +706,9 @@ class Daemon:
                 ),
             }
         self.registry.set_meta("registry_id", registry_id)
-        names = adopt(self.registry, ResourceScanner(engine).scan(registry_id))
+        recovered = ResourceScanner(engine).scan(registry_id)
+        names = adopt(self.registry, recovered)
+        recompute_manifest_generations(self.registry, recovered)
         return {"ok": True, "adopted": names, "registry_id": registry_id}
 
     def _verb_compose_adopt(self, _request: dict[str, Any]) -> dict[str, Any]:

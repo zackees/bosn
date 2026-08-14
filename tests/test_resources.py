@@ -540,6 +540,31 @@ def test_startup_reconciliation_repairs_remove_before_registry_crash(
     assert registry.get_resource(stale.id) is None
 
 
+def test_recovery_recomputes_current_local_manifest_generation(
+    registry: Registry, tmp_path: Path
+) -> None:
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    (tmp_path / "bosn.toml").write_text(
+        "[stack.dev]\ndockerfile = 'Dockerfile'\ndefault = true\n", encoding="utf-8"
+    )
+    stale = label_dict(
+        **{
+            labels.WORKSPACE: str(tmp_path),
+            labels.STACK: "dev",
+            labels.GENERATION: "sha256:old",
+        }
+    )
+    scan = ScanResult(owned=[DiscoveredResource("volume", "cache", stale)])
+
+    assert resources.recompute_manifest_generations(registry, scan) == 1
+    from bosn.manifest import generation_digest, load
+
+    manifest = load(tmp_path)
+    assert registry.generation_recorded(
+        generation_digest(manifest, manifest.stack("dev")), "dev", str(tmp_path)
+    )
+
+
 def test_adopted_resources_are_protected_by_the_quiet_period(clock: FakeClock) -> None:
     """Recovery is never followed by a mass age-out."""
     adopted_at = clock.now()

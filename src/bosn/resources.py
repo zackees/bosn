@@ -522,6 +522,45 @@ def reconcile_owned(
     return reconciled
 
 
+def recompute_manifest_generations(registry: Registry, scan: ScanResult) -> int:
+    """Record the current local-content generation for recoverable workspaces.
+
+    Label values describe the generation at creation time.  When the workspace still
+    exists, recovery must also restore the current manifest generation so old labeled
+    resources become superseded after an edit made while SQLite was unavailable.
+    External-image stacks record their content closure but defer supersession to normal
+    daemon convergence: pulling or building during recovery would evade job cancellation.
+    """
+    from bosn.manifest import ManifestError, dockerfile_external_images, generation_digest, load
+
+    refreshed = 0
+    seen: set[tuple[str, str]] = set()
+    for resource in scan.owned:
+        parsed = resource.parsed()
+        key = (parsed.workspace, parsed.stack)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            manifest = load(Path(parsed.workspace))
+            stack = manifest.stack(parsed.stack)
+        except (ManifestError, OSError):
+            continue
+        has_external_identity = bool(
+            stack.image or dockerfile_external_images(manifest.root, stack)
+        )
+        digest = generation_digest(manifest, stack)
+        registry.record_generation(digest, parsed.stack, parsed.workspace)
+        # A base-image identity is resolved only inside a managed build job.  Recording
+        # the local content closure is still useful after recovery, but treating it as
+        # the final identity would incorrectly retire a resource built from the same
+        # Dockerfile with a resolved external image digest.
+        if not has_external_identity:
+            registry.supersede_generations(parsed.stack, digest, parsed.workspace)
+        refreshed += 1
+    return refreshed
+
+
 def within_quiet_period(adopted_at: float, now: float) -> bool:
     """Adopted resources are protected from age-out for the quiet period."""
     return (now - adopted_at) < QUIET_PERIOD_SECONDS
