@@ -22,6 +22,7 @@ from bosn import daemon as daemon_mod
 from bosn import ipc, labels
 from bosn.daemon import Daemon
 from bosn.engine import Engine
+from bosn.registry import Registry
 
 pytestmark = pytest.mark.docker
 
@@ -76,14 +77,25 @@ def served(tmp_path: Path) -> Iterator[Daemon]:
     try:
         yield daemon
     finally:
+        registry_id = daemon.registry.registry_id
         daemon.request_stop()
         thread.join(timeout=30)
         daemon.shutdown()
-        _remove_built_images(Engine())
+        _remove_built_images(Engine(), registry_id)
 
 
-def _remove_built_images(engine: Engine) -> None:
-    listed = engine.run(["image", "ls", "--filter", f"label={labels.REGISTRY}", "--quiet"])
+def _remove_built_images(engine: Engine, registry_id: str) -> None:
+    """Remove only images this daemon's own registry built.
+
+    Filtering on the label's *value*, not merely its presence, matters: an unscoped
+    `label=com.zackees.bosn.registry` filter would match every bosn-built image on the
+    engine, including a live registry's (e.g. this developer's real one), and force-remove
+    them too. Scoping to the exact id this test's own daemon minted is the same ownership
+    proof the rest of the suite's teardown uses.
+    """
+    listed = engine.run(
+        ["image", "ls", "--filter", f"label={labels.REGISTRY}={registry_id}", "--quiet"]
+    )
     for image_id in {line.strip() for line in listed.stdout.splitlines() if line.strip()}:
         engine.run(["image", "rm", "--force", image_id])
 
@@ -234,5 +246,16 @@ def test_bosn_run_converges_through_the_daemon_then_runs_locally(
         assert listed, "the converge really did go through the daemon"
         assert all(row["state"] == "succeeded" for row in listed), listed
     finally:
+        # The daemon here is a genuinely separate OS process (`daemon_mod.spawn`), so the
+        # in-process `Registry.__init__` tracking in conftest never sees it construct its
+        # registry. Reading its id back from its own database -- known-safe because
+        # `state_dir` is this test's own `tmp_path`, never the developer's real state dir
+        # -- is the only way this test's cleanup can scope image removal to what it built.
+        db_path = state_dir / "registry.sqlite3"
+        registry_id = None
+        if db_path.exists():
+            with Registry(db_path, read_only=True) as registry:
+                registry_id = registry.registry_id
         daemon_mod.stop(state_dir, timeout=60)
-        _remove_built_images(Engine())
+        if registry_id is not None:
+            _remove_built_images(Engine(), registry_id)
