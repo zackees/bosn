@@ -439,3 +439,27 @@ def test_the_digest_splits_copied_files_from_bind_source_contents(tmp_path: Path
 
     (root / "copied.py").write_text("print('edited')\n", encoding="utf-8")
     assert digest() != baseline, "a COPYed file must roll the generation"
+
+
+def test_a_git_bash_spelled_bind_source_resolves(tmp_path: Path) -> None:
+    r"""A manifest written in one shell must work when read in another.
+
+    Argv from Git Bash is usually MSYS-converted to a native path before bosn sees it, but
+    a string inside bosn.toml never passes through that conversion. `/c/work/repo` would
+    otherwise be joined into `C:\c\work\repo` and rejected as missing.
+    """
+    import os
+
+    root = _write(tmp_path, BIND_SAMPLE)
+    (root / "src").mkdir()
+    native = str((root / "src").resolve())
+    if os.name != "nt":
+        pytest.skip("drive-letter spellings only differ on Windows")
+
+    drive = native[0].lower()
+    tail = native[2:].replace("\\", "/").lstrip("/")
+    body = BIND_SAMPLE.replace('source = "."', f'source = "/{drive}/{tail}"')
+
+    stack = load(_write(tmp_path, body)).stacks["test"]
+
+    assert stack.mounts[0].resolve_source(root) == (root / "src").resolve()
