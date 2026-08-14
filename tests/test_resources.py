@@ -506,8 +506,140 @@ def test_adoption_is_idempotent(registry: Registry, clock: FakeClock) -> None:
     assert len(registry.list_resources()) == 1
 
 
+def test_startup_reconciliation_repairs_create_before_registry_crash(
+    registry: Registry, clock: FakeClock
+) -> None:
+    """A complete owned engine object is sufficient to repair a missing SQLite row."""
+    scan = ScanResult(owned=[DiscoveredResource("volume", "created-first", label_dict())])
+
+    assert resources.reconcile_owned(registry, scan) == ["created-first"]
+    recovered = registry.get_resource_by_engine_identity("volume", "created-first")
+    assert recovered is not None
+    assert recovered.state == "adopted"
+    assert registry.generation_recorded(recovered.generation, recovered.stack, recovered.workspace)
+
+    assert resources.reconcile_owned(registry, scan) == []
+    assert len(registry.list_resources()) == 1
+
+
+def test_startup_reconciliation_leaves_lifecycle_state_alone(
+    registry: Registry, clock: FakeClock
+) -> None:
+    """Observing an already-registered resource must not count as using it.
+
+    The daemon idle-retires and restarts constantly. If reconciliation refreshed rows it
+    merely observed, every restart would revert `bosn done` to active and push `last_used`
+    forward, so done-collection never fires and idle/superseded age never accumulates --
+    age-based GC would go inert and the disk would grow without bound.
+    """
+    from bosn.gc import done_workspaces, mark_done
+
+    resource = registry.register_resource(
+        kind="volume",
+        name="warm-cache",
+        stack="dev",
+        generation="digest",
+        scope="spec",
+        workspace="workspace",
+    )
+    mark_done(registry, "workspace")
+    before = registry.get_resource(resource.id)
+    assert before is not None and before.state == "done"
+
+    clock.advance(10_000)
+    scan = ScanResult(
+        owned=[DiscoveredResource("volume", "warm-cache", label_dict())], scanned_kinds={"volume"}
+    )
+    assert resources.reconcile_owned(registry, scan) == []
+
+    after = registry.get_resource(resource.id)
+    assert after is not None
+    assert after.state == "done", "reconciliation reverted `bosn done`"
+    assert after.last_used == before.last_used, "reconciliation reset the idle-age clock"
+    assert done_workspaces(registry) == {"workspace"}
+
+
+def test_startup_reconciliation_repairs_remove_before_registry_crash(
+    registry: Registry,
+) -> None:
+    stale = registry.register_resource(
+        kind="volume",
+        name="removed-first",
+        stack="dev",
+        generation="digest",
+        scope="spec",
+        workspace="workspace",
+    )
+    prior = registry.list_resources()
+    scan = ScanResult(scanned_kinds={"volume"})
+
+    assert resources.reconcile_owned(registry, scan, prior_resources=prior) == []
+    assert registry.get_resource(stale.id) is None
+
+
+def test_recovery_recomputes_current_local_manifest_generation(
+    registry: Registry, tmp_path: Path
+) -> None:
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    (tmp_path / "bosn.toml").write_text(
+        "[stack.dev]\ndockerfile = 'Dockerfile'\ndefault = true\n", encoding="utf-8"
+    )
+    stale = label_dict(
+        **{
+            labels.WORKSPACE: str(tmp_path),
+            labels.STACK: "dev",
+            labels.GENERATION: "sha256:old",
+        }
+    )
+    scan = ScanResult(owned=[DiscoveredResource("volume", "cache", stale)])
+
+    assert resources.recompute_manifest_generations(registry, scan) == 1
+    from bosn.manifest import generation_digest, load
+
+    manifest = load(tmp_path)
+    assert registry.generation_recorded(
+        generation_digest(manifest, manifest.stack("dev")), "dev", str(tmp_path)
+    )
+
+
 def test_adopted_resources_are_protected_by_the_quiet_period(clock: FakeClock) -> None:
     """Recovery is never followed by a mass age-out."""
     adopted_at = clock.now()
     assert resources.within_quiet_period(adopted_at, clock.advance(23 * 3600))
     assert not resources.within_quiet_period(adopted_at, clock.advance(2 * 3600))
+
+
+def test_explicit_volume_transfer_stages_data_before_recreating_labels(
+    registry: Registry,
+) -> None:
+    class TransferEngine:
+        def __init__(self) -> None:
+            self.commands: list[list[str]] = []
+
+        def run(self, args: list[str], *, check: bool = False) -> EngineResult:
+            self.commands.append(args)
+            return EngineResult(0, "", "")
+
+    engine = TransferEngine()
+    resource = DiscoveredResource("volume", "foreign-cache", label_dict(registry=THEIRS))
+
+    assert resources.transfer_volume(registry, engine, resource) == "foreign-cache"  # type: ignore[arg-type]
+    assert engine.commands[0] == ["ps", "--all", "--filter", "volume=foreign-cache", "--quiet"]
+    assert engine.commands[1][:2] == ["volume", "create"]
+    assert engine.commands[1][2].startswith("bosn-transfer-")
+    recreated = next(
+        command
+        for command in engine.commands
+        if command[:2] == ["volume", "create"] and command[-1] == "foreign-cache"
+    )
+    assert any(f"{labels.REGISTRY}={registry.registry_id}" in arg for arg in recreated)
+
+
+def test_explicit_volume_transfer_refuses_an_attached_volume(registry: Registry) -> None:
+    class AttachedEngine:
+        def run(self, args: list[str], *, check: bool = False) -> EngineResult:
+            return EngineResult(0, "container-id", "")
+
+    resource = DiscoveredResource("volume", "foreign-cache", label_dict(registry=THEIRS))
+    with pytest.raises(resources.TransferError, match="attached"):
+        resources.transfer_volume(registry, AttachedEngine(), resource)  # type: ignore[arg-type]

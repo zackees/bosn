@@ -323,6 +323,35 @@ class Daemon:
             on_settled=self.note_activity,
         )
 
+    def _reconcile_startup_resources(self) -> None:
+        """Repair create-before-registry crashes without making engine absence fatal."""
+        from bosn.engine import Engine, EngineError
+        from bosn.resources import ResourceScanner, recompute_manifest_generations, reconcile_owned
+
+        try:
+            engine = Engine(self.engine_binary)
+            # Maintenance tests provide a minimal reachability probe.  Those test
+            # doubles intentionally are not a resource-listing engine.
+            if not callable(getattr(engine, "run", None)):
+                return
+            prior_resources = self.registry.list_resources()
+            scan = ResourceScanner(engine).scan(self.registry.registry_id)
+            if self._stop.is_set():
+                return
+            repaired = reconcile_owned(self.registry, scan, prior_resources=prior_resources)
+            recompute_manifest_generations(self.registry, scan)
+        except EngineError as exc:
+            self.registry.log_event("recovery.scan.unavailable", str(exc))
+            return
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # background recovery must never take down IPC
+            if not self._stop.is_set():
+                self.registry.log_event("recovery.scan.failed", str(exc))
+            return
+        if repaired:
+            self.registry.log_event("recovery.startup", ",".join(repaired))
+
     # -- lifecycle ---------------------------------------------------------
 
     @property
@@ -379,6 +408,10 @@ class Daemon:
             pass
         self.registry.log_event("daemon.started", f"pid={os.getpid()} port={self.port}")
 
+        # Docker can be unavailable or taking a long time to wake.  Recovery must not
+        # postpone serving IPC; this daemon-owned worker is cancelled by normal shutdown.
+        threading.Thread(target=self._reconcile_startup_resources, daemon=True).start()
+
         self._watchdog_thread = threading.Thread(target=self._idle_watchdog, daemon=True)
         self._watchdog_thread.start()
         try:
@@ -392,13 +425,13 @@ class Daemon:
             self._write_heartbeat()
             for job in self.jobs.reap_expired():
                 self.registry.log_event("job.expired", f"{job.id} {job.stack}")
-            self.run_maintenance_if_due()
             if self.should_retire():
                 if self.request_stop():
                     self.registry.log_event(
                         "daemon.idle_retired", f"idle={self.idle_seconds():.0f}s"
                     )
                     return
+            self.run_maintenance_if_due()
 
     def _write_heartbeat(self) -> None:
         heartbeat_file(self.state_dir).touch()
@@ -603,18 +636,79 @@ class Daemon:
 
     def _verb_adopt(self, request: dict[str, Any]) -> dict[str, Any]:
         from bosn.engine import Engine
-        from bosn.resources import ResourceScanner, adopt
+        from bosn.resources import (
+            ResourceScanner,
+            TransferError,
+            adopt,
+            recompute_manifest_generations,
+            reconcile_owned,
+            transfer_volume,
+        )
 
         engine = Engine(str(request.get("engine") or self.engine_binary))
+        selectors = [str(item) for item in request.get("transfer", [])]
+        if selectors:
+            transferred: list[str] = []
+            for selector in selectors:
+                kind, separator, name = selector.partition(":")
+                if separator != ":" or not kind or not name:
+                    return {"ok": False, "error": f"invalid transfer selector: {selector}"}
+                if kind != "volume":
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"{kind} labels are immutable and cannot be safely recreated; "
+                            "only detached volumes support transfer"
+                        ),
+                    }
+                candidates = ResourceScanner(engine).discover(kind)
+                resource = next((item for item in candidates if item.name == name), None)
+                if resource is None or not resource.complete:
+                    return {"ok": False, "error": f"no complete labeled volume named {name}"}
+                if resource.owned_by(self.registry.registry_id):
+                    return {
+                        "ok": False,
+                        "error": f"volume already belongs to this registry: {name}",
+                    }
+                try:
+                    transferred.append(transfer_volume(self.registry, engine, resource))
+                except TransferError as exc:
+                    return {"ok": False, "error": str(exc), "transferred": transferred}
+            scan = ResourceScanner(engine).scan(self.registry.registry_id, kinds=["volume"])
+            reconcile_owned(self.registry, scan)
+            return {
+                "ok": True,
+                "transferred": transferred,
+                "registry_id": self.registry.registry_id,
+            }
         scan = ResourceScanner(engine).scan("", kinds=["container", "volume", "image"])
         registries = scan.foreign_registries
         if not registries:
             return {"ok": True, "adopted": [], "registry_id": None}
-        if len(registries) != 1:
-            return {"ok": False, "error": "adopt refused: multiple foreign registry ids found"}
-        registry_id = next(iter(registries))
+        selected = str(request.get("source_registry") or "")
+        if selected:
+            if selected not in registries:
+                return {"ok": False, "error": f"adopt source registry not found: {selected}"}
+            registry_id = selected
+        elif len(registries) == 1:
+            registry_id = next(iter(registries))
+        else:
+            commands = "; ".join(
+                f"bosn adopt --from-registry {candidate}" for candidate in sorted(registries)
+            )
+            return {"ok": False, "error": f"choose a source registry: {commands}"}
+        if self.registry.list_resources() and registry_id != self.registry.registry_id:
+            return {
+                "ok": False,
+                "error": (
+                    "adopt recovery requires an empty registry; current identity is preserved. "
+                    "Use an explicit ownership-transfer workflow instead."
+                ),
+            }
         self.registry.set_meta("registry_id", registry_id)
-        names = adopt(self.registry, ResourceScanner(engine).scan(registry_id))
+        recovered = ResourceScanner(engine).scan(registry_id)
+        names = adopt(self.registry, recovered)
+        recompute_manifest_generations(self.registry, recovered)
         return {"ok": True, "adopted": names, "registry_id": registry_id}
 
     def _verb_compose_adopt(self, _request: dict[str, Any]) -> dict[str, Any]:

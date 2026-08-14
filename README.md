@@ -248,10 +248,33 @@ reports each effective value and its origin.
 ## Registry recovery
 
 Run `bosn doctor` after an unclean shutdown. If it finds complete labels from a prior
-registry it prints `bosn adopt`, the only ownership-transfer command. SQLite diagnosis is
+registry it prints a source-specific `bosn adopt --from-registry <uuid>` command. This is
+lost-database recovery only: it restores that identity into an empty registry and never
+replaces the identity of a registry that already has rows. SQLite diagnosis is
 non-destructive: run `sqlite3 registry.sqlite3 "PRAGMA integrity_check"`; if recovery is
-needed, copy the database first and use SQLite's `.recover` output to build a replacement.
-Adopted resources receive a 24-hour quiet period before normal age-based retention resumes.
+needed, first copy `registry.sqlite3` (including its `-wal` and `-shm` siblings), then use
+the copy as input to `sqlite3 copy.sqlite3 ".recover"`. Adopted resources receive a
+24-hour quiet period before normal age-based retention resumes.
+
+To transfer a resource between live registries, select it explicitly with
+`bosn adopt --transfer volume:<name>`. Docker labels are immutable, so bosn requires that
+the volume have no attached containers, copies its contents to a temporary staging volume,
+recreates the selected name with the current labels, copies the data back, and preserves the
+staging volume if a copy/recreate step fails. Images and containers are refused rather than
+silently recreating an unknown runtime contract.
+
+To adopt resources from a documented pre-bosn producer, run
+`bosn adopt --legacy <family> --yes`, where `<family>` is `clud`, `soldr`, or `zccache` — the
+only families bosn recognizes; any other name is refused with the list of known families.
+Selection is by each family's own `.managed=true` label under its documented namespace
+(`com.clud.docker-build`, `io.soldr.perf-local`, `io.zccache.perf-local`) — never by matching
+a resource's name. Only volumes are adopted this way (relabeled in place by the same staged
+copy/recreate used by `--transfer`); a legacy container or image with the managed label is
+reported as skipped rather than rebuilt. A resource whose producer schema is unrecognized
+(soldr's `.schema`) or whose required workspace label is absent is refused rather than
+migrated on a guess. Without `--yes`, the command only reports what it would adopt and
+changes nothing; adopted resources get the same adoption-time aging and 24-hour quiet period
+as any other recovered resource.
 
 Enable the per-user login launcher once with `bosn __daemon --autostart`; it writes a
 Startup launcher on Windows, a LaunchAgent on macOS, or a user systemd unit on Linux.

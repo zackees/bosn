@@ -38,6 +38,23 @@ def test_registry_id_is_a_stable_uuid(tmp_path: Path) -> None:
     assert len(original) == 36
 
 
+def test_integrity_check_is_read_only(tmp_path: Path) -> None:
+    path = tmp_path / "registry.sqlite3"
+    with Registry(path) as registry:
+        registry.register_resource(
+            kind="volume",
+            name="cache",
+            stack="dev",
+            generation="digest",
+            scope="spec",
+            workspace="workspace",
+        )
+    before = path.read_bytes()
+    with Registry(path, read_only=True) as registry:
+        assert registry.integrity_check() == "ok"
+    assert path.read_bytes() == before
+
+
 def test_registry_ids_differ_across_databases(tmp_path: Path) -> None:
     with Registry(tmp_path / "a.sqlite3") as a, Registry(tmp_path / "b.sqlite3") as b:
         assert a.registry_id != b.registry_id

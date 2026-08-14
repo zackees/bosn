@@ -18,13 +18,14 @@ import json
 import os
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from bosn import labels
 from bosn.clock import Clock, SystemClock
 from bosn.engine import Engine
-from bosn.registry import Registry
+from bosn.registry import Registry, Resource
 
 # Docker CLI list commands per resource kind, formatted as one JSON object per line.
 _LIST_COMMANDS: dict[str, list[str]] = {
@@ -68,6 +69,7 @@ class ScanResult:
     owned: list[DiscoveredResource] = field(default_factory=list)
     foreign: list[DiscoveredResource] = field(default_factory=list)
     unlabeled: list[DiscoveredResource] = field(default_factory=list)
+    scanned_kinds: set[str] = field(default_factory=set)
 
     @property
     def foreign_registries(self) -> set[str]:
@@ -116,13 +118,13 @@ class ResourceScanner:
     def __init__(self, engine: Engine | None = None) -> None:
         self.engine = engine or Engine()
 
-    def discover(self, kind: str) -> list[DiscoveredResource]:
+    def _discover(self, kind: str) -> tuple[list[DiscoveredResource], bool]:
         args = _LIST_COMMANDS.get(kind)
         if args is None:
             raise ValueError(f"cannot enumerate unknown kind {kind!r}")
         result = self.engine.run(args)
         if not result.ok:
-            return []
+            return [], False
 
         discovered: list[DiscoveredResource] = []
         for line in result.stdout.splitlines():
@@ -144,6 +146,11 @@ class ResourceScanner:
                 # before concluding a resource is unlabeled.
                 raw = self.inspect_labels(kind, name) or raw
             discovered.append(DiscoveredResource(kind=kind, name=name, raw_labels=raw))
+        return discovered, True
+
+    def discover(self, kind: str) -> list[DiscoveredResource]:
+        """List one kind; callers needing safety metadata should use :meth:`scan`."""
+        discovered, _success = self._discover(kind)
         return discovered
 
     def inspect_labels(self, kind: str, name: str) -> dict[str, str]:
@@ -158,7 +165,10 @@ class ResourceScanner:
     def scan(self, registry_id: str, kinds: list[str] | None = None) -> ScanResult:
         scan = ScanResult()
         for kind in kinds or list(_LIST_COMMANDS):
-            for resource in self.discover(kind):
+            discovered, success = self._discover(kind)
+            if success:
+                scan.scanned_kinds.add(kind)
+            for resource in discovered:
                 if not resource.complete:
                     scan.unlabeled.append(resource)
                 elif resource.owned_by(registry_id):
@@ -356,6 +366,113 @@ def prune_dead_leases(registry: Registry, *, alive_probe=process_alive) -> list[
 # -- adoption --------------------------------------------------------------
 
 QUIET_PERIOD_SECONDS = 24 * 3600
+TRANSFER_IMAGE = "alpine:3.20"
+
+
+class TransferError(RuntimeError):
+    """An explicit ownership transfer cannot be performed safely."""
+
+
+def transfer_volume(registry: Registry, engine: Engine, resource: DiscoveredResource) -> str:
+    """Recreate one detached foreign volume with the current ownership labels.
+
+    Thin wrapper over :func:`recreate_volume_with_labels`: this call site is explicit
+    ownership transfer, so the new label set is the old one with only ``registry``
+    swapped for ours -- everything else about the resource (stack, generation, scope,
+    workspace, created) is preserved exactly.
+    """
+    if resource.kind != "volume" or not resource.complete:
+        raise TransferError("only a complete labeled volume can be transferred")
+    parsed = resource.parsed()
+    new_labels = labels.ResourceLabels(
+        registry=registry.registry_id,
+        kind=parsed.kind,
+        stack=parsed.stack,
+        generation=parsed.generation,
+        scope=parsed.scope,
+        workspace=parsed.workspace,
+        created=parsed.created,
+    )
+    return recreate_volume_with_labels(engine, resource, new_labels)
+
+
+def volume_is_attached(engine: Engine, name: str) -> bool:
+    """True when a container references this volume (list is not empty on success).
+
+    Shared by explicit ownership transfer and legacy-family adoption: both recreate a
+    volume in place, which is only safe once nothing has it mounted.
+    """
+    attached = engine.run(["ps", "--all", "--filter", f"volume={name}", "--quiet"])
+    if not attached.ok:
+        raise TransferError(f"could not check volume attachments for {name}")
+    return bool(attached.stdout.strip())
+
+
+def recreate_volume_with_labels(
+    engine: Engine, resource: DiscoveredResource, new_labels: labels.ResourceLabels
+) -> str:
+    """Recreate one detached volume carrying ``new_labels``, staging its data first.
+
+    Docker labels are immutable, so "relabeling" a volume means: copy its data into a
+    scratch volume, remove the original, recreate it under the same name with the new
+    label set, and copy the data back. The staging volume retains a recoverable copy
+    until the replacement is verified, so a failed relabel never silently destroys data.
+
+    This is the mechanical core shared by explicit ``--transfer`` (adopt.py's foreign-id
+    recovery) and legacy-family adoption (``legacy.py``): both need "same object, new
+    ownership labels" and neither can get there by writing a database row, because the
+    labels the engine reports come from the object itself, not from bosn's registry.
+    """
+    if resource.kind != "volume":
+        raise TransferError("only a volume can be relabeled by staged recreation")
+    if volume_is_attached(engine, resource.name):
+        raise TransferError(f"volume {resource.name} is attached; stop its containers first")
+    staging = f"bosn-transfer-{uuid.uuid4().hex}"
+    created_staging = engine.run(["volume", "create", staging])
+    if not created_staging.ok:
+        raise TransferError(f"could not create transfer staging volume for {resource.name}")
+    copy_to_staging = engine.run(
+        [
+            "run",
+            "--rm",
+            "-v",
+            f"{resource.name}:/from:ro",
+            "-v",
+            f"{staging}:/to",
+            TRANSFER_IMAGE,
+            "sh",
+            "-c",
+            "cp -a /from/. /to/",
+        ]
+    )
+    if not copy_to_staging.ok:
+        raise TransferError(f"copy to staging failed; preserved staging volume {staging}")
+    removed = engine.run(["volume", "rm", resource.name])
+    if not removed.ok:
+        raise TransferError(f"could not remove old volume; preserved staging volume {staging}")
+    create = engine.run(["volume", "create", *new_labels.to_docker_args(), resource.name])
+    if not create.ok:
+        raise TransferError(f"could not recreate volume; preserved staging volume {staging}")
+    copy_back = engine.run(
+        [
+            "run",
+            "--rm",
+            "-v",
+            f"{staging}:/from:ro",
+            "-v",
+            f"{resource.name}:/to",
+            TRANSFER_IMAGE,
+            "sh",
+            "-c",
+            "cp -a /from/. /to/",
+        ]
+    )
+    if not copy_back.ok:
+        raise TransferError(
+            f"copy into recreated volume failed; preserved staging volume {staging}"
+        )
+    engine.run(["volume", "rm", staging])
+    return resource.name
 
 
 def adopt(
@@ -396,6 +513,94 @@ def adopt(
         registry.log_event("resource.adopted", f"{resource.kind}:{resource.name}")
         adopted.append(resource.name)
     return adopted
+
+
+def reconcile_owned(
+    registry: Registry, scan: ScanResult, *, prior_resources: list[Resource] | None = None
+) -> list[str]:
+    """Make registry state agree with complete resources carrying our identity.
+
+    This is deliberately additive: a failed or unavailable engine listing must never
+    turn an empty scan into permission to forget registry rows.  Engine deletion is
+    already idempotently handled by collection; startup reconciliation repairs the
+    other crash boundary, where Docker accepted a create but the process died before
+    SQLite recorded it.
+    """
+    reconciled: list[str] = []
+    for resource in scan.owned:
+        parsed = resource.parsed()
+        existing = registry.get_resource_by_engine_identity(resource.kind, resource.name)
+        if existing is not None:
+            # Observing a resource is not using it. `reconcile_resource` is an
+            # "I am using this now" mutation (last_used = now, state = 'active'), and the
+            # daemon idle-retires and restarts constantly, so calling it for rows that
+            # already exist would: revert `bosn done` back to active (done workspaces
+            # never collect again), reset last_used so idle/superseded age never
+            # accumulates across a restart (age-based GC becomes inert and the disk grows
+            # without bound -- the exact failure this project exists to prevent), and flip
+            # 'adopted' to 'active', stripping the 24h quiet period so pressure can evict
+            # data that recovery just restored. Reconciliation repairs the missing-row
+            # crash boundary only; it must leave lifecycle state alone.
+            continue
+        registered = registry.reconcile_resource(
+            kind=resource.kind,
+            name=resource.name,
+            stack=parsed.stack,
+            generation=parsed.generation,
+            scope=parsed.scope,
+            workspace=parsed.workspace,
+        )
+        registry.record_generation(parsed.generation, parsed.stack, parsed.workspace)
+        registry.set_resource_state(registered.id, "adopted")
+        registry.log_event("resource.recovered", f"{resource.kind}:{resource.name}")
+        reconciled.append(resource.name)
+    discovered = {(resource.kind, resource.name) for resource in scan.owned}
+    # Only rows observed before the scan are candidates.  A concurrent converge may
+    # create a new engine object after listing completes; deleting that fresh row from a
+    # stale scan would reintroduce the crash boundary this function repairs.
+    for resource in prior_resources or []:
+        if resource.kind in scan.scanned_kinds and (resource.kind, resource.name) not in discovered:
+            registry.remove_resource(resource.id)
+    return reconciled
+
+
+def recompute_manifest_generations(registry: Registry, scan: ScanResult) -> int:
+    """Record the current local-content generation for recoverable workspaces.
+
+    Label values describe the generation at creation time.  When the workspace still
+    exists, recovery must also restore the current manifest generation so old labeled
+    resources become superseded after an edit made while SQLite was unavailable.
+    External-image stacks record their content closure but defer supersession to normal
+    daemon convergence: pulling or building during recovery would evade job cancellation.
+    """
+    from bosn.manifest import ManifestError, dockerfile_external_images, generation_digest, load
+
+    refreshed = 0
+    seen: set[tuple[str, str]] = set()
+    for resource in scan.owned:
+        parsed = resource.parsed()
+        key = (parsed.workspace, parsed.stack)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            manifest = load(Path(parsed.workspace))
+            stack = manifest.stack(parsed.stack)
+        except (ManifestError, OSError):
+            continue
+        has_external_identity = bool(
+            stack.image or dockerfile_external_images(manifest.root, stack)
+        )
+        digest = generation_digest(manifest, stack)
+        registry.record_generation(digest, parsed.stack, parsed.workspace)
+        # A base-image identity is resolved only inside a managed build job.  Recording
+        # the local content closure is still useful after recovery, but treating it as
+        # the final identity would incorrectly retire a resource built from the same
+        # Dockerfile with a resolved external image digest.
+        if not has_external_identity:
+            registry.supersede_generations(parsed.stack, digest, parsed.workspace)
+        refreshed += 1
+    return refreshed
 
 
 def within_quiet_period(adopted_at: float, now: float) -> bool:

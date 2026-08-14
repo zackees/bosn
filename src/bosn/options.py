@@ -31,6 +31,10 @@ class Options:
     # stack-facing verbs
     stack: str | None = None
     task: str | None = None
+    source_registry: str | None = None
+    transfer: tuple[str, ...] = ()
+    legacy: str | None = None
+    yes: bool = False
     args: tuple[str, ...] = ()
     json: bool = False
 
@@ -125,6 +129,10 @@ def from_namespace(ns: argparse.Namespace) -> Options:
         manifest=_as_path(manifest),
         stack=_as_str(get("stack")),
         task=_as_str(get("task")),
+        source_registry=_as_str(get("source_registry")),
+        transfer=get_list("transfer"),
+        legacy=_as_str(get("legacy")),
+        yes=bool(get("yes", False)),
         args=get_list("args"),
         json=bool(get("json", False)),
         dry_run=bool(get("dry_run", True)),
