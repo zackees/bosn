@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import re
+import subprocess
 import sys
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
-from bosn import __version__
+from bosn import __version__, labels
+from bosn.registry import Registry, default_db_path
+from bosn.resources import ResourceScanner, adopt
 
 
 class DockerFrontDoorError(ValueError):
@@ -55,7 +60,53 @@ def build_parser() -> argparse.ArgumentParser:
     init = sub.add_parser("init", help="generate bosn.toml from compose.yaml")
     init.add_argument("--compose", default="compose.yaml")
     init.add_argument("--output", default="bosn.toml")
+    compose = sub.add_parser("compose", help="managed Compose subset: up, down, logs, ps")
+    compose.add_argument("command", choices=["up", "down", "logs", "ps"])
+    compose.add_argument("args", nargs=argparse.REMAINDER)
+    compose.add_argument("-f", "--file", default="compose.yaml")
     return parser
+
+
+def _compose_overlay(registry: Registry, compose: Path) -> Path:
+    """Generate an ephemeral Compose overlay that labels every service container."""
+    names = re.findall(r"^  ([A-Za-z0-9_-]+):\s*$", compose.read_text(encoding="utf-8"), re.M)
+    if not names:
+        raise DockerFrontDoorError("compose file has no services")
+    created = dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z")
+    workspace = str(compose.parent.resolve())
+    lines = ["services:"]
+    for name in names:
+        contract = labels.ResourceLabels(
+            registry=registry.registry_id, kind="container", stack=name, generation="compose",
+            scope="stack", workspace=workspace, created=created,
+        )
+        lines += [f"  {name}:", "    labels:"]
+        lines += [f'      {key}: "{value}"' for key, value in contract.to_dict().items()]
+    handle = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".bosn-compose.yaml", delete=False, encoding="utf-8"
+    )
+    try:
+        handle.write("\n".join(lines) + "\n")
+        return Path(handle.name)
+    finally:
+        handle.close()
+
+
+def _run_compose(command: str, compose: Path, args: list[str]) -> int:
+    if args:
+        raise DockerFrontDoorError(f"unsupported compose flag or argument {args[0]!r}")
+    with Registry(default_db_path()) as registry:
+        overlay = _compose_overlay(registry, compose)
+        try:
+            completed = subprocess.run(
+                ["docker", "compose", "-f", str(compose), "-f", str(overlay), command], check=False
+            )
+            if command == "up" and completed.returncode == 0:
+                scan = ResourceScanner().scan(registry.registry_id)
+                adopt(registry, scan)
+            return completed.returncode
+        finally:
+            overlay.unlink(missing_ok=True)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -76,4 +127,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         print(f"wrote {output}")
         return 0
+    if ns.verb == "compose":
+        try:
+            return _run_compose(ns.command, Path(ns.file), list(ns.args))
+        except (OSError, DockerFrontDoorError) as exc:
+            print(f"bosn-docker compose: {exc}", file=sys.stderr)
+            return 1
     return 2
