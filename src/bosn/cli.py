@@ -99,6 +99,21 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_parser.add_argument("--max-builds", type=int, default=None)
     daemon_parser.add_argument("--build-ttl-seconds", type=float, default=None)
     daemon_parser.add_argument("--stop", action="store_true", help="stop a running daemon")
+    autostart = daemon_parser.add_mutually_exclusive_group()
+    autostart.add_argument(
+        "--autostart",
+        action="store_const",
+        const=True,
+        dest="autostart",
+        help="start the maintenance daemon automatically at login",
+    )
+    autostart.add_argument(
+        "--no-autostart",
+        action="store_const",
+        const=False,
+        dest="autostart",
+        help="remove bosn's per-user login launcher",
+    )
     # Accepted after the verb as well, so a spawned argv need not order its flags.
     daemon_parser.add_argument("--state-dir", default=None, dest="daemon_state_dir")
     return parser
@@ -133,6 +148,13 @@ def cmd_daemon(opts: Options) -> int:
     from bosn import daemon as daemon_mod
     from bosn.config import ConfigError
     from bosn.config import load as load_config
+
+    if opts.autostart is not None:
+        from bosn import autostart
+
+        target = autostart.enable() if opts.autostart else autostart.disable()
+        print(f"autostart {'enabled' if opts.autostart else 'disabled'}: {target}")
+        return 0
 
     state_dir = opts.state_dir
 

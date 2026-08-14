@@ -21,7 +21,9 @@ import pytest
 
 from bosn import daemon as daemon_mod
 from bosn import ipc
+from bosn.clock import FakeClock
 from bosn.daemon import Daemon, DaemonError, DaemonState
+from bosn.engine import EngineInfo
 
 
 def _detach_code() -> str:
@@ -191,6 +193,88 @@ def test_idle_retirement_stops_an_unused_daemon(tmp_path: Path) -> None:
     thread.join(timeout=20)
     assert not thread.is_alive(), "idle daemon should have retired itself"
     assert not daemon_mod.is_serving(tmp_path)
+
+
+# -- unattended maintenance ------------------------------------------------
+
+
+def test_maintenance_catches_up_then_runs_on_the_injected_clock(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The first pass is due at startup; subsequent passes require no human command."""
+    clock = FakeClock()
+    calls: list[str] = []
+
+    class ReachableEngine:
+        def __init__(self, _binary: str) -> None:
+            pass
+
+        def info(self) -> EngineInfo:
+            return EngineInfo(binary="docker", reachable=True)
+
+    class RecordingCollector:
+        def __init__(self, _registry, _engine) -> None:
+            pass
+
+        def collect(self, **_kwargs):
+            calls.append("gc")
+
+            class Result:
+                def summary(self):
+                    return {"removed": 0}
+
+            return Result()
+
+    import bosn.engine
+    import bosn.gc
+
+    monkeypatch.setattr(bosn.engine, "Engine", ReachableEngine)
+    monkeypatch.setattr(bosn.gc, "Collector", RecordingCollector)
+    daemon = Daemon(
+        state_dir=tmp_path, clock=clock, maintenance_interval_seconds=60, idle_retire_seconds=3600
+    )
+    try:
+        assert daemon.run_maintenance_if_due() is True
+        assert calls == ["gc"]
+        assert daemon.run_maintenance_if_due() is False
+        clock.advance(60)
+        assert daemon.run_maintenance_if_due() is True
+        assert calls == ["gc", "gc"]
+        events = [row["kind"] for row in daemon.registry.events()]
+        assert "maintenance.reap.started" in events
+        assert "maintenance.gc.started" in events
+        assert "maintenance.gc.finished" in events
+    finally:
+        daemon.registry.close()
+
+
+def test_maintenance_engine_down_is_visible_and_uses_exponential_backoff(
+    monkeypatch, tmp_path: Path
+) -> None:
+    clock = FakeClock()
+
+    class DownEngine:
+        def __init__(self, _binary: str) -> None:
+            pass
+
+        def info(self) -> EngineInfo:
+            return EngineInfo(binary="docker", reachable=False, detail="daemon asleep")
+
+    import bosn.engine
+
+    monkeypatch.setattr(bosn.engine, "Engine", DownEngine)
+    daemon = Daemon(state_dir=tmp_path, clock=clock, maintenance_interval_seconds=60)
+    try:
+        assert daemon.run_maintenance_if_due()
+        assert daemon._next_maintenance_at == clock.now() + 30
+        clock.advance(30)
+        assert daemon.run_maintenance_if_due()
+        assert daemon._next_maintenance_at == clock.now() + 60
+        events = daemon.registry.events()
+        assert events[0]["kind"] == "maintenance.engine_down"
+        assert "retry_in=60s" in events[0]["detail"]
+    finally:
+        daemon.registry.close()
 
 
 # -- client behavior -------------------------------------------------------
