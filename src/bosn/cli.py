@@ -455,6 +455,15 @@ def cmd_shell(opts: Options) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    from bosn.paths import in_wsl
+
+    if in_wsl():
+        print(
+            "bosn v1 does not support WSL: its Windows loopback daemon is unreachable "
+            "from WSL; use a native Windows shell or wait for the v2 transport.",
+            file=sys.stderr,
+        )
+        return 1
     parser = build_parser()
     ns = parser.parse_args(argv if argv is not None else sys.argv[1:])
     opts = from_namespace(ns)
