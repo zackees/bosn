@@ -193,3 +193,8 @@ def test_status_reports_counts_and_foreign_registries(registry: Registry) -> Non
     assert report["registered"] == 1
     assert "by_reason" in report
     assert isinstance(report["foreign_registries"], list)
+    assert report["managed_bytes"] == 0
+    assert report["attribution"] == [
+        {"workspace": "/w", "stack": "s", "role": "volume", "count": 1, "bytes": 0, "unmeasured": 1}
+    ]
+    assert report["decisions"][0]["reason"] == "warm"

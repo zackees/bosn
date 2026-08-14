@@ -12,6 +12,7 @@ from bosn.registry import Registry
 from bosn.retention import (
     COLLECT_DONE,
     COLLECT_IDLE,
+    COLLECT_PRESSURE,
     COLLECT_SUPERSEDED,
     KEPT_LEASED,
     KEPT_MACHINE_SCOPE,
@@ -146,6 +147,39 @@ def test_machine_scoped_caches_age_only_under_pressure(
     assert evaluate(registry, resource, alive_probe=DEAD).reason == KEPT_MACHINE_SCOPE
     under = evaluate(registry, resource, pressure=Pressure(under_pressure=True), alive_probe=DEAD)
     assert under.collect
+
+
+def test_pressure_evicts_workspace_caches_before_machine_caches(
+    registry: Registry, clock: FakeClock
+) -> None:
+    workspace = make(registry, scope="spec")
+    machine = registry.register_resource(
+        kind="volume", name="machine", stack="s", generation="g", scope="machine", workspace="/w"
+    )
+    clock.advance(100 * DAY)
+    verdict = evaluate(
+        registry, workspace, pressure=Pressure(under_pressure=True), alive_probe=DEAD
+    )
+    assert verdict.collect and verdict.reason == COLLECT_PRESSURE
+    planned = retention.collectable(
+        retention.plan(registry, pressure=Pressure(under_pressure=True), alive_probe=DEAD)
+    )
+    assert [item.name for item in planned] == [workspace.name, machine.name]
+
+
+def test_pressure_assessment_keeps_count_bytes_and_free_space_distinct() -> None:
+    pressure = Pressure.assess(
+        resource_count=5,
+        managed_bytes=100,
+        free_bytes=9,
+        resource_ceiling=4,
+        managed_bytes_ceiling=101,
+        min_free_bytes=10,
+    )
+    assert pressure.under_pressure
+    assert pressure.count_exceeded
+    assert not pressure.bytes_exceeded
+    assert pressure.free_space_exceeded
 
 
 def test_done_never_collects_machine_scoped_caches(registry: Registry, clock: FakeClock) -> None:

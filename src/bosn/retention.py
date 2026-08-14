@@ -26,6 +26,10 @@ from bosn.resources import (
 
 HOUR = 3600.0
 DAY = 24 * HOUR
+GIB = 1024**3
+DEFAULT_RESOURCE_CEILING = 1_000
+DEFAULT_MANAGED_BYTES_CEILING = 100 * GIB
+DEFAULT_MIN_FREE_BYTES = 10 * GIB
 
 CONTAINER_IDLE_STOP = 1 * HOUR
 CONTAINER_REMOVE = 1 * DAY
@@ -42,6 +46,7 @@ KEPT_MACHINE_SCOPE = "machine-scope"
 COLLECT_SUPERSEDED = "superseded"
 COLLECT_IDLE = "idle"
 COLLECT_DONE = "workspace-done"
+COLLECT_PRESSURE = "pressure"
 
 
 @dataclass(frozen=True)
@@ -60,6 +65,31 @@ class Pressure:
     """Free-space pressure on the engine's backing store."""
 
     under_pressure: bool = False
+    count_exceeded: bool = False
+    bytes_exceeded: bool = False
+    free_space_exceeded: bool = False
+
+    @classmethod
+    def assess(
+        cls,
+        *,
+        resource_count: int,
+        managed_bytes: int,
+        free_bytes: int,
+        resource_ceiling: int = DEFAULT_RESOURCE_CEILING,
+        managed_bytes_ceiling: int = DEFAULT_MANAGED_BYTES_CEILING,
+        min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
+    ) -> Pressure:
+        """Evaluate all three pressure signals without conflating bytes and free space."""
+        count_exceeded = resource_count > resource_ceiling
+        bytes_exceeded = managed_bytes > managed_bytes_ceiling
+        free_space_exceeded = free_bytes < min_free_bytes
+        return cls(
+            under_pressure=count_exceeded or bytes_exceeded or free_space_exceeded,
+            count_exceeded=count_exceeded,
+            bytes_exceeded=bytes_exceeded,
+            free_space_exceeded=free_space_exceeded,
+        )
 
 
 def container_should_stop(resource: Resource, now: float) -> bool:
@@ -113,6 +143,11 @@ def evaluate(
     if workspace_done and resource.scope != "machine":
         return Verdict(resource, True, COLLECT_DONE)
 
+    # Pressure can evict warm resources, but never leases/adoption quiet-period resources.
+    # Machine-wide caches are deliberately considered after all workspace-scoped caches.
+    if pressure.under_pressure and resource.scope != "machine":
+        return Verdict(resource, True, COLLECT_PRESSURE)
+
     if resource.scope == "machine" and not pressure.under_pressure:
         # Machine-shared caches age only under pressure.
         return Verdict(resource, False, KEPT_MACHINE_SCOPE)
@@ -152,7 +187,17 @@ def plan(
 
 
 def collectable(verdicts: list[Verdict]) -> list[Verdict]:
-    return [v for v in verdicts if v.collect]
+    # A single order is essential under pressure: clearly obsolete first, then completed
+    # worktrees, then ordinary pressure candidates, with shared machine caches last.
+    order = {COLLECT_SUPERSEDED: 0, COLLECT_DONE: 1, COLLECT_IDLE: 2, COLLECT_PRESSURE: 3}
+    return sorted(
+        (v for v in verdicts if v.collect),
+        key=lambda v: (
+            v.resource.scope == "machine",
+            order.get(v.reason, 99),
+            v.resource.last_used,
+        ),
+    )
 
 
 def kept(verdicts: list[Verdict]) -> list[Verdict]:
