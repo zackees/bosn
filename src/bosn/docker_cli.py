@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import re
 import subprocess
 import sys
 import tempfile
@@ -12,6 +11,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from bosn import __version__, daemon, labels
+from bosn.compose import ComposeError, load_compose
 from bosn.registry import Registry
 
 
@@ -20,29 +20,17 @@ class DockerFrontDoorError(ValueError):
 
 
 def compose_to_manifest(source: Path) -> str:
-    """Translate the portable image/build subset without silently accepting YAML we ignore."""
-    lines = source.read_text(encoding="utf-8").splitlines()
-    services: list[tuple[str, str]] = []
-    current: str | None = None
-    in_services = False
-    for raw in lines:
-        if not raw.strip() or raw.lstrip().startswith("#"):
-            continue
-        if raw == "services:":
-            in_services = True
-            continue
-        if not in_services:
-            continue
-        service = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", raw)
-        if service:
-            current = service.group(1)
-            continue
-        image = re.match(r"^    image:\s*['\"]?([^'\"\s]+)", raw)
-        if image and current:
-            services.append((current, image.group(1)))
-            continue
-        if raw.startswith("    ") and current and not raw.strip().startswith(("image:", "build:")):
-            raise DockerFrontDoorError(f"unsupported compose key {raw.strip().split(':', 1)[0]!r}")
+    """Translate the portable image/build subset without silently accepting YAML we ignore.
+
+    Reads through the parsed model rather than indentation regexes. The regexes could not
+    see YAML: they resolved no anchors, so a service whose `image` arrived through a `<<:`
+    merge looked like it had none, and `profiles:` -- the key the acceptance workload in
+    #47 opens with -- was reported as an unsupported key rather than parsed.
+    """
+    try:
+        services = load_compose(source).image_pairs()
+    except ComposeError as exc:
+        raise DockerFrontDoorError(str(exc)) from exc
     if not services:
         raise DockerFrontDoorError("compose file has no supported service image")
     stacks = []
@@ -80,83 +68,6 @@ def _yaml_scalar(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _parse_top_level_entries(text: str, section: str) -> list[str]:
-    """Collect entry names declared directly under a top-level `<section>:` block.
-
-    Deliberately narrow, matching the existing service-name parser's shape: only
-    lines that look exactly like `  name:` (two-space indent) immediately inside
-    the top-level block named `section` count. A line starting at column 0 ends
-    the block -- including one that opens a *different* top-level section -- so a
-    service's own nested `volumes:`/`networks:` keys (which live at four-or-more
-    space indent inside `services:`) are never mistaken for top-level
-    declarations. #47 tracks replacing this with a real YAML model.
-    """
-    names: list[str] = []
-    in_section = False
-    for raw in text.splitlines():
-        if not raw.strip() or raw.lstrip().startswith("#"):
-            continue
-        if re.match(r"^\S", raw):
-            in_section = raw.rstrip() == f"{section}:"
-            continue
-        if not in_section:
-            continue
-        entry = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", raw)
-        if entry:
-            names.append(entry.group(1))
-    return names
-
-
-def _find_anonymous_service_volumes(text: str) -> list[str]:
-    """Find service-level `volumes:` list entries with no top-level name to label.
-
-    A service's short-syntax volume entry with no `:` (e.g. `- /data`) creates an
-    anonymous volume Compose names at runtime -- there is no stable top-level key
-    an overlay can attach `labels:` to. Entries of the form `name:/path` or
-    `./host:/path` are excluded: those reference a top-level named volume (already
-    labeled) or a bind mount (outside bosn's scope). Detection is line-based and
-    only looks inside a service's nested `    volumes:` list, matching the same
-    narrow parsing style as `_parse_top_level_entries`; #47 tracks a real parser.
-    """
-    found: list[str] = []
-    in_services = False
-    current_service: str | None = None
-    in_volumes_list = False
-    for raw in text.splitlines():
-        if not raw.strip() or raw.lstrip().startswith("#"):
-            continue
-        if re.match(r"^\S", raw):
-            in_services = raw.rstrip() == "services:"
-            current_service = None
-            in_volumes_list = False
-            continue
-        if not in_services:
-            continue
-        service = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", raw)
-        if service:
-            current_service = service.group(1)
-            in_volumes_list = False
-            continue
-        if raw == "    volumes:":
-            in_volumes_list = True
-            continue
-        if in_volumes_list:
-            item = re.match(r"^      - ([^\s:]+)\s*$", raw)
-            if item and current_service:
-                found.append(f"{current_service}:{item.group(1)}")
-                continue
-            # Long (mapping) syntax, e.g. `- type: volume` / `- target: /data`, can
-            # declare an anonymous volume too (no `source:` key) but this line-based
-            # parser cannot see across the mapping to tell. Refuse rather than let it
-            # slip through unlabeled -- matches the fail-closed style of the rest of
-            # this parser.
-            if current_service and re.match(r"^      - [A-Za-z0-9_-]+: ", raw):
-                found.append(f"{current_service}:<long-syntax volume entry unsupported>")
-                continue
-            in_volumes_list = False
-    return found
-
-
 def _compose_overlay(registry_id: str | Registry, compose: Path) -> Path:
     """Generate an ephemeral Compose overlay that labels every resource Compose creates.
 
@@ -169,18 +80,25 @@ def _compose_overlay(registry_id: str | Registry, compose: Path) -> Path:
     """
     if isinstance(registry_id, Registry):
         registry_id = registry_id.registry_id
-    text = compose.read_text(encoding="utf-8")
-    names = _parse_top_level_entries(text, "services")
+    try:
+        parsed = load_compose(compose)
+    except ComposeError as exc:
+        raise DockerFrontDoorError(str(exc)) from exc
+    names = list(parsed.services)
     if not names:
         raise DockerFrontDoorError("compose file has no services")
-    volume_names = _parse_top_level_entries(text, "volumes")
-    network_names = _parse_top_level_entries(text, "networks")
-    anonymous = _find_anonymous_service_volumes(text)
+    volume_names = list(parsed.volumes)
+    network_names = list(parsed.networks)
+    anonymous = [
+        f"{service.name}:{mount}"
+        for service in parsed.services.values()
+        for mount in service.anonymous_volumes
+    ]
     if anonymous:
         raise DockerFrontDoorError(
-            "compose file declares service volume entries that cannot be governed "
-            "through this overlay (anonymous, or long-syntax this narrow parser "
-            f"cannot verify): {', '.join(anonymous)}; declare them under a "
+            "compose file declares anonymous service volumes, which Compose names at "
+            "runtime -- there is no stable key an overlay can attach labels to, so they "
+            f"would come up ungoverned: {', '.join(anonymous)}; declare them under a "
             "top-level `volumes:` entry using short `name:/path` syntax instead"
         )
     created = dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z")
