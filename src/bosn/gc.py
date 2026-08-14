@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from bosn import labels
-from bosn.accounting import probe, resource_bytes
+from bosn.accounting import StorageInventory, probe, resource_bytes
 from bosn.config import Config
 from bosn.engine import Engine
 from bosn.registry import Registry
@@ -199,13 +199,14 @@ def status(
 
     config = config or load_config()
     scan = ResourceScanner(engine).scan(registry.registry_id)
+    inventory = StorageInventory.collect(engine)
 
     attributed: dict[tuple[str, str, str], dict[str, int]] = defaultdict(
         lambda: {"count": 0, "bytes": 0, "unmeasured": 0}
     )
     measured: dict[str, int | None] = {}
     for resource in registry.list_resources():
-        size = resource_bytes(engine, resource)
+        size = resource_bytes(engine, resource, inventory)
         measured[resource.id] = size
         bucket = attributed[(resource.workspace, resource.stack, resource.kind)]
         bucket["count"] += 1
@@ -214,7 +215,7 @@ def status(
         else:
             bucket["bytes"] += size
     managed_bytes = sum(size for size in measured.values() if size is not None)
-    storage = probe(registry.path.parent)
+    storage = probe(engine, registry.path.parent)
     pressure = Pressure.assess(
         resource_count=len(measured), managed_bytes=managed_bytes, free_bytes=storage.free_bytes
     )
@@ -238,7 +239,15 @@ def status(
         "by_reason": by_reason,
         "engine": scan.counts(),
         "foreign_registries": sorted(scan.foreign_registries),
-        "foreign_registry_totals": {"count": len(scan.foreign), "bytes": None},
+        "foreign_registry_totals": {
+            "count": len(scan.foreign),
+            "bytes": sum(
+                inventory.sizes.get((resource.kind, resource.name), 0) for resource in scan.foreign
+            ),
+            "unmeasured": sum(
+                (resource.kind, resource.name) not in inventory.sizes for resource in scan.foreign
+            ),
+        },
         "managed_bytes": managed_bytes,
         "managed_reclaimable_bytes": reclaimable,
         "pressure": {
