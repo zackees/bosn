@@ -253,6 +253,11 @@ non-destructive: run `sqlite3 registry.sqlite3 "PRAGMA integrity_check"`; if rec
 needed, copy the database first and use SQLite's `.recover` output to build a replacement.
 Adopted resources receive a 24-hour quiet period before normal age-based retention resumes.
 
+Enable the per-user login launcher once with `bosn __daemon --autostart`; it writes a
+Startup launcher on Windows, a LaunchAgent on macOS, or a user systemd unit on Linux.
+Disable and remove it with `bosn __daemon --no-autostart`. Each scheduled pass reaps
+expired jobs before running GC, logs both stages, and backs off visibly when Docker is down.
+
 Losing the database is survivable: **ownership lives in the labels, and the registry is
 authoritative only for time and leases.** A lost registry rebuilds by rescanning Docker
 labels, with adoption time as last-use and a 24 h quiet period so recovery is never followed

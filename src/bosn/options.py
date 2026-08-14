@@ -42,6 +42,7 @@ class Options:
     max_builds: int | None = None
     build_ttl_seconds: float | None = None
     stop: bool = False
+    autostart: bool | None = None
 
     extras: tuple[str, ...] = field(default=())
 
@@ -92,6 +93,8 @@ def from_namespace(ns: argparse.Namespace) -> Options:
     port = get("port")
     max_builds = get("max_builds")
     build_ttl = get("build_ttl_seconds")
+    raw_autostart = get("autostart")
+    autostart = raw_autostart if isinstance(raw_autostart, bool) else None
 
     return Options(
         verb=_as_str(get("verb")),
@@ -107,4 +110,5 @@ def from_namespace(ns: argparse.Namespace) -> Options:
         max_builds=None if max_builds is None else int(str(max_builds)),
         build_ttl_seconds=None if build_ttl is None else float(str(build_ttl)),
         stop=bool(get("stop", False)),
+        autostart=autostart,
     )

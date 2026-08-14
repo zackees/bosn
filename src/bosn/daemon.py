@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from bosn import __version__, ipc
+from bosn.clock import Clock, SystemClock
 from bosn.jobs import BuildOutcome, Job, JobError, JobManager
 from bosn.registry import Registry, default_state_dir
 
@@ -41,6 +42,9 @@ PORT_RANGE_START = 47765
 PORT_RANGE_SIZE = 1024
 
 DEFAULT_IDLE_RETIRE_SECONDS = 900.0
+DEFAULT_MAINTENANCE_INTERVAL_SECONDS = 300.0
+MAINTENANCE_BACKOFF_INITIAL_SECONDS = 30.0
+MAINTENANCE_BACKOFF_MAX_SECONDS = 3600.0
 SPAWN_TIMEOUT_SECONDS = 30.0
 
 # Verbs that hold the connection open and write many messages instead of one.
@@ -263,18 +267,24 @@ class Daemon:
         max_builds: int | None = None,
         build_ttl_seconds: float | None = None,
         engine_binary: str = "docker",
+        maintenance_interval_seconds: float = DEFAULT_MAINTENANCE_INTERVAL_SECONDS,
+        clock: Clock | None = None,
     ) -> None:
         self.engine_binary = engine_binary
+        self.clock = clock or SystemClock()
         self.state_dir = state_dir or default_state_dir()
         self.bind_port = port_for(self.state_dir) if port is None else port
         self.idle_retire_seconds = idle_retire_seconds
-        self.started_at = time.time()
+        self.started_at = self.clock.now()
         self.last_activity = self.started_at
         self.heartbeat_at = self.started_at
+        self.maintenance_interval_seconds = maintenance_interval_seconds
+        self._next_maintenance_at = self.started_at  # catch up immediately after downtime
+        self._maintenance_backoff_seconds = MAINTENANCE_BACKOFF_INITIAL_SECONDS
         self._server: _Server | None = None
         self._stop = threading.Event()
         self.secret = secrets.token_urlsafe(32)
-        self.registry = Registry(self.state_dir / "registry.sqlite3")
+        self.registry = Registry(self.state_dir / "registry.sqlite3", clock=self.clock)
         self.jobs = JobManager(
             self._build,
             max_builds=max_builds,
@@ -293,11 +303,11 @@ class Daemon:
         return int(self._server.server_address[1])
 
     def note_activity(self) -> None:
-        self.last_activity = time.time()
+        self.last_activity = self.clock.now()
         self.heartbeat_at = self.last_activity
 
     def idle_seconds(self) -> float:
-        return time.time() - self.last_activity
+        return self.clock.now() - self.last_activity
 
     def should_retire(self) -> bool:
         """Idle *and* holding no work. Retiring mid-build would destroy it.
@@ -350,6 +360,7 @@ class Daemon:
             self._write_heartbeat()
             for job in self.jobs.reap_expired():
                 self.registry.log_event("job.expired", f"{job.id} {job.stack}")
+            self.run_maintenance_if_due()
             if self.should_retire():
                 self.registry.log_event("daemon.idle_retired", f"idle={self.idle_seconds():.0f}s")
                 self.request_stop()
@@ -357,6 +368,64 @@ class Daemon:
 
     def _write_heartbeat(self) -> None:
         heartbeat_file(self.state_dir).touch()
+
+    def run_maintenance_if_due(self) -> bool:
+        """Run one unattended reap/GC pass when its deadline has arrived.
+
+        Kept separate from the wall-clock watchdog so tests and embedders can advance an
+        injected clock without sleeping.  Reap always precedes GC: an expired build lease
+        must not shield a resource from the same pass that would otherwise collect it.
+        """
+        if self.clock.now() < self._next_maintenance_at:
+            return False
+        self._run_maintenance()
+        return True
+
+    def _run_maintenance(self) -> None:
+        """Execute a maintenance pass, recording every outcome and scheduling its retry."""
+        from bosn.engine import Engine
+        from bosn.gc import Collector, done_workspaces
+
+        self.registry.log_event("maintenance.reap.started")
+        try:
+            expired = self.jobs.reap_expired()
+            for job in expired:
+                self.registry.log_event("job.expired", f"{job.id} {job.stack}")
+            self.registry.log_event("maintenance.reap.finished", f"expired={len(expired)}")
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a scheduler failure must be visible
+            self.registry.log_event("maintenance.reap.error", f"{type(exc).__name__}: {exc}")
+            self._next_maintenance_at = self.clock.now() + self.maintenance_interval_seconds
+            return
+
+        engine = Engine(self.engine_binary)
+        info = engine.info()
+        if not info.reachable:
+            detail = info.detail or "engine daemon unreachable"
+            self.registry.log_event(
+                "maintenance.engine_down",
+                f"retry_in={self._maintenance_backoff_seconds:g}s {detail}",
+            )
+            self._next_maintenance_at = self.clock.now() + self._maintenance_backoff_seconds
+            self._maintenance_backoff_seconds = min(
+                self._maintenance_backoff_seconds * 2, MAINTENANCE_BACKOFF_MAX_SECONDS
+            )
+            return
+
+        self.registry.log_event("maintenance.gc.started")
+        try:
+            result = Collector(self.registry, engine).collect(
+                dry_run=False, done_workspaces=done_workspaces(self.registry)
+            )
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001 - never claim a failed GC succeeded
+            self.registry.log_event("maintenance.gc.error", f"{type(exc).__name__}: {exc}")
+        else:
+            self.registry.log_event("maintenance.gc.finished", json.dumps(result.summary()))
+        self._maintenance_backoff_seconds = MAINTENANCE_BACKOFF_INITIAL_SECONDS
+        self._next_maintenance_at = self.clock.now() + self.maintenance_interval_seconds
 
     def request_stop(self) -> None:
         self._stop.set()
