@@ -1,7 +1,7 @@
 [project]
 name = "bosn"
-version = "0.1.0"
-description = "A machine-wide lifecycle supervisor for container development resources"
+version = "0.1.0a1"
+description = "Let your agents use Docker all day without filling the disk"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
