@@ -317,6 +317,10 @@ def test_a_running_job_blocks_idle_retirement(
     """Retiring mid-build would destroy the build; the old idle-only rule would have."""
     state_dir = tmp_path / "state2"
     daemon = Daemon(state_dir=state_dir, idle_retire_seconds=0.2)
+    # See test_daemon.py::test_idle_retirement_stops_an_unused_daemon: a due maintenance
+    # pass probes the engine twice at 60s each inside the same watchdog tick that checks
+    # retirement, which on an engine-less runner outlasts the join deadline below.
+    daemon._set_next_maintenance(daemon.clock.now() + 3600)
     daemon.jobs.builder = builder
     thread = threading.Thread(target=daemon.serve_forever, daemon=True)
     thread.start()
