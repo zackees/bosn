@@ -19,7 +19,14 @@ from dataclasses import dataclass
 
 from bosn import labels
 from bosn.engine import Engine, EngineError
-from bosn.manifest import Manifest, StackSpec, dockerfile_external_images, generation_digest
+from bosn.manifest import (
+    RESERVED_HEARTBEAT,
+    RESERVED_PREFIX,
+    Manifest,
+    StackSpec,
+    dockerfile_external_images,
+    generation_digest,
+)
 from bosn.registry import Lease, Registry, Resource
 from bosn.resources import ResourceScanner, process_start_time
 
@@ -700,12 +707,19 @@ class Converger:
     ) -> dict[str, dict[str, str | bool]]:
         mounts: dict[str, dict[str, str | bool]] = {}
         for volume, volume_name in zip(stack.volumes, volume_names, strict=True):
-            destination = f"/bosn/{volume.name}"
+            destination = volume.mount_at()
             mounts[destination] = {
                 "type": "volume",
                 "source": volume_name,
                 "destination": destination,
                 "rw": True,
+            }
+        for mount in stack.mounts:
+            mounts[mount.destination] = {
+                "type": "bind",
+                "source": str(mount.resolve_source(self.manifest.root)),
+                "destination": mount.destination,
+                "rw": not mount.readonly,
             }
         heartbeat = (self.registry.path.parent / "daemon.heartbeat").resolve()
         heartbeat.touch(exist_ok=True)
@@ -834,10 +848,21 @@ class Converger:
             for mount in raw_mounts
             if isinstance(mount, dict) and mount.get("Destination")
         }
+        # "Managed" is whatever this generation declares, plus anything still sitting in
+        # bosn's reserved namespace even if the current declaration no longer names it --
+        # that catches a volume whose default destination moved. A dropped bind mount is
+        # *not* caught here: its declaration lived outside the reserved namespace, so a
+        # leftover copy is indistinguishable from a foreign mount. That's fine -- removing
+        # a mount from the manifest changes the digest, and the generation check above
+        # forces replacement before this comparison ever runs. A destination outside both
+        # is a mount the user added out-of-band; bosn doesn't own it and must not treat its
+        # mere presence as staleness.
         managed_destinations = {
             destination
             for destination in actual
-            if destination.startswith("/bosn/") or destination == "/bosn-daemon/heartbeat"
+            if destination in expected
+            or destination.startswith(RESERVED_PREFIX)
+            or destination == RESERVED_HEARTBEAT
         }
         if managed_destinations != set(expected):
             return False

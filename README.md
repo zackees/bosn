@@ -125,26 +125,42 @@ Startup `.cmd` loop, so it leaves a console window open.)
 
 This is the part most likely to surprise you, and it decides how you write the Dockerfile.
 
-**Declared volumes exist only when a command runs. `docker build` never sees them.**
+**Mounts exist only when a command runs. `docker build` never sees them.**
 
-| Path | What it is | When |
+| Declared as | Lands at | bosn's relationship to it |
 | --- | --- | --- |
-| `/bosn/<volume-name>` | each declared volume, read-write | command execution only |
-| `/bosn-daemon/heartbeat` | the daemon's liveness file, read-only | command execution only |
+| `[stack.X.volumes]` | `/bosn/<name>`, or an explicit `destination` | owns it — labels, tracks, and may delete it |
+| `[stack.X.mounts]` | the `destination` you give | only references it — never labeled, never deleted |
+| *(automatic)* | `/bosn-daemon/heartbeat`, read-only | the daemon's liveness file |
 
-That is the entire mount set, and it has three consequences:
+That distinction is the whole reason binds are a separate table: bosn deletes Docker objects
+it owns, and a host path is not one.
 
-**Your source tree is not bind-mounted.** Your Dockerfile `COPY`s it in, which is what makes
-the content digest meaningful — and it means editing a copied source file rolls a new
-generation and rebuilds. That is the model, not a bug.
+**Bind-mount your source tree if you want an edit-in-place loop:**
 
-**Anything you want cached during the build needs a BuildKit cache mount**
-(`RUN --mount=type=cache,...`), not a bosn volume. bosn does not manage the builder cache
-(see Status), so that cache is outside its accounting — it is also the one thing bosn will
-never delete out from under you.
+```toml
+[stack.test.mounts]
+repo = { source = ".", destination = "/repo" }
+conf = { source = "./config", destination = "/etc/app", readonly = true }
+```
+
+`source` is relative to the manifest root and must exist — a missing source is an error, not
+an empty directory the engine creates for you. A destination inside `/bosn/*`, a relative
+destination, or two mounts sharing one destination are all refused at parse time.
+
+**The declaration is digested; a bind source's contents are not.** Moving a mount rolls the
+generation. Editing a file that is only visible through a bind does not — that is exactly
+what a bind is for, and hashing a live working tree would rebuild on every keystroke. Files
+your Dockerfile `COPY`s are still content-digested as usual, so you choose per path whether
+something participates in identity.
+
+**Anything you want cached during the *build* needs a BuildKit cache mount**
+(`RUN --mount=type=cache,...`), not a bosn volume — mounts are run-time only. bosn does not
+manage the builder cache (see Status), so it is outside bosn's accounting, and also the one
+thing bosn will never delete out from under you.
 
 **Declaring a volume wires it to nothing.** The manifest has no `env` or `workdir` key, so
-the Dockerfile has to point the toolchain at the mount:
+either point the toolchain at the mount from the Dockerfile:
 
 ```dockerfile
 ENV CARGO_HOME=/bosn/cargo-reg \
@@ -152,7 +168,13 @@ ENV CARGO_HOME=/bosn/cargo-reg \
     CARGO_TARGET_DIR=/bosn/target
 ```
 
-Without those lines the example above creates three volumes and warms none of them.
+or give the volume the destination the image already expects, which is the easier path when
+adopting an existing image:
+
+```toml
+[stack.test.volumes]
+cargo-reg = { scope = "machine", destination = "/root/.cargo" }
+```
 
 The image also needs a POSIX shell with `date`, `stat`, and `sleep`: the persistent
 container's PID 1 is a shell loop, and `bosn shell` execs `sh`. Distroless and scratch
