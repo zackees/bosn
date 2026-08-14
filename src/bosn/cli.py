@@ -36,6 +36,7 @@ VERBS: dict[str, tuple[str, str]] = {
     "gc": ("report or reclaim collectable resources", "implemented"),
     "done": ("mark this workspace finished; its caches become collectable", "implemented"),
     "ensure": ("pre-warm a stack without running a command", "implemented"),
+    "adopt": ("recover labeled resources into this registry", "implemented"),
     "doctor": ("engine health and reachability", "implemented"),
 }
 
@@ -69,7 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
     for verb, (help_text, _) in VERBS.items():
         sub = subparsers.add_parser(verb, help=help_text)
         sub.add_argument("args", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
-        if verb in {"run", "tasks", "shell", "done", "ensure"}:
+        if verb in {"run", "tasks", "shell", "done", "ensure", "adopt"}:
             sub.add_argument("--stack", default=None, help="stack to use (default: the default)")
             sub.add_argument("--task", default=None, help="run a manifest task by name")
             sub.add_argument("--manifest", default=None, dest="sub_manifest")
@@ -103,8 +104,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def cmd_doctor(engine_binary: str) -> int:
-    info = Engine(engine_binary).info()
+def cmd_doctor(opts: Options) -> int:
+    info = Engine(opts.engine).info()
     print(f"engine binary:  {info.binary}")
     print(f"client version: {info.client_version or '-'}")
     print(f"server version: {info.server_version or '-'}")
@@ -112,6 +113,19 @@ def cmd_doctor(engine_binary: str) -> int:
     if not info.reachable:
         print(f"diagnosis:      {info.detail}", file=sys.stderr)
         return 1
+    from bosn.registry import Registry, default_db_path
+    from bosn.resources import ResourceScanner
+
+    db_path = (opts.state_dir / "registry.sqlite3") if opts.state_dir else default_db_path()
+    with Registry(db_path) as registry:
+        scan = ResourceScanner(Engine(opts.engine)).scan(registry.registry_id)
+        if scan.foreign_registries:
+            state = f" --state-dir {opts.state_dir}" if opts.state_dir else ""
+            print(
+                "complete resources from foreign registry ids found; recover with: "
+                f"bosn{state} adopt",
+                file=sys.stderr,
+            )
     return 0
 
 
@@ -463,6 +477,31 @@ def cmd_done(opts: Options) -> int:
     return 0
 
 
+def cmd_adopt(opts: Options) -> int:
+    """The sole ownership-transfer/recovery entry point for complete label contracts."""
+    from bosn.registry import Registry, default_db_path
+    from bosn.resources import ResourceScanner, adopt
+
+    state_dir = opts.state_dir
+    db_path = (state_dir / "registry.sqlite3") if state_dir else default_db_path()
+    with Registry(db_path) as registry:
+        # Scan with an impossible id so every complete contract is classified as foreign.
+        scan = ResourceScanner(Engine(opts.engine)).scan("", kinds=["container", "volume", "image"])
+        registries = scan.foreign_registries
+        if not registries:
+            print("no complete labeled resources found")
+            return 0
+        if len(registries) != 1:
+            print("adopt refused: multiple foreign registry ids found", file=sys.stderr)
+            return 1
+        old_id = next(iter(registries))
+        registry.set_meta("registry_id", old_id)
+        owned = ResourceScanner(Engine(opts.engine)).scan(old_id)
+        names = adopt(registry, owned)
+    print(json.dumps({"adopted": names, "registry_id": old_id}, indent=2))
+    return 0
+
+
 def cmd_shell(opts: Options) -> int:
     from dataclasses import replace
 
@@ -516,7 +555,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     handlers: dict[str, Callable[[Options], int]] = {
         DAEMON_VERB: cmd_daemon,
-        "doctor": lambda o: cmd_doctor(o.engine),
+        "doctor": cmd_doctor,
         "jobs": cmd_jobs,
         "attach": cmd_attach,
         "cancel": cmd_cancel,
@@ -527,6 +566,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "status": cmd_status,
         "gc": cmd_gc,
         "done": cmd_done,
+        "adopt": cmd_adopt,
     }
     handler = handlers.get(opts.verb)
     if handler is not None:

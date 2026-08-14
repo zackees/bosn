@@ -240,6 +240,12 @@ def adopt(
             workspace=parsed.workspace,
             created_at=now,
         )
+        registered = next(
+            r
+            for r in registry.list_resources()
+            if r.kind == resource.kind and r.name == resource.name
+        )
+        registry.set_resource_state(registered.id, "adopted")
         registry.log_event("resource.adopted", f"{resource.kind}:{resource.name}")
         adopted.append(resource.name)
     return adopted

@@ -176,6 +176,10 @@ class Registry:
         row = self._exec("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else None
 
+    def set_meta(self, key: str, value: str) -> None:
+        """Set metadata during explicit recovery; normal resource writes never need this."""
+        self._exec("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (key, value))
+
     @property
     def registry_id(self) -> str:
         value = self.meta("registry_id")
