@@ -318,6 +318,8 @@ def _drive_job(events, *, quiet: bool = False) -> dict:
                 print(note, file=sys.stderr)
         elif kind == "attached" and not quiet:
             print(f"attached to {event.get('job')} ({event.get('state')})", file=sys.stderr)
+        elif kind == "cancelling":
+            print(f"build cancelling: {event.get('reason')}", file=sys.stderr)
         if event.get("final"):
             final = event
     if not final:
