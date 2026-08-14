@@ -35,6 +35,7 @@ VERBS: dict[str, tuple[str, str]] = {
     "status": ("tiers, leases, managed bytes vs ceiling, foreign registries", "implemented"),
     "gc": ("report or reclaim collectable resources", "implemented"),
     "done": ("mark this workspace finished; its caches become collectable", "implemented"),
+    "ensure": ("pre-warm a stack without running a command", "implemented"),
     "doctor": ("engine health and reachability", "implemented"),
 }
 
@@ -68,10 +69,12 @@ def build_parser() -> argparse.ArgumentParser:
     for verb, (help_text, _) in VERBS.items():
         sub = subparsers.add_parser(verb, help=help_text)
         sub.add_argument("args", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
-        if verb in {"run", "tasks", "shell", "done"}:
+        if verb in {"run", "tasks", "shell", "done", "ensure"}:
             sub.add_argument("--stack", default=None, help="stack to use (default: the default)")
             sub.add_argument("--task", default=None, help="run a manifest task by name")
             sub.add_argument("--manifest", default=None, dest="sub_manifest")
+        if verb in {"tasks", "status"}:
+            sub.add_argument("--json", action="store_true", help="emit machine-readable JSON")
         if verb == "gc":
             group = sub.add_mutually_exclusive_group()
             group.add_argument(
@@ -454,6 +457,33 @@ def cmd_shell(opts: Options) -> int:
     return cmd_run(replace(opts, args=("sh",), task=None))
 
 
+def cmd_ensure(opts: Options) -> int:
+    """Build/register the requested generation without starting a command."""
+    from bosn import daemon as daemon_mod
+    from bosn.manifest import ManifestError
+
+    try:
+        manifest, registry = _open_manifest_and_registry(opts)
+    except ManifestError as exc:
+        print(
+            json.dumps({"ok": False, "error": str(exc), "next": "create-or-pass-manifest"}),
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        result = _converge_via_daemon(opts, manifest, opts.stack)
+    except JobFailed as exc:
+        print(json.dumps({"ok": False, "error": str(exc), "next": "inspect-jobs"}), file=sys.stderr)
+        return exc.exit_code
+    except (daemon_mod.DaemonError, ipc.TransportError) as exc:
+        print(json.dumps({"ok": False, "error": str(exc), "next": "start-daemon"}), file=sys.stderr)
+        return 1
+    finally:
+        registry.close()
+    print(json.dumps({"ok": True, "stack": result.stack, "digest": result.digest}))
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     ns = parser.parse_args(argv if argv is not None else sys.argv[1:])
@@ -472,6 +502,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "tasks": cmd_tasks,
         "run": cmd_run,
         "shell": cmd_shell,
+        "ensure": cmd_ensure,
         "status": cmd_status,
         "gc": cmd_gc,
         "done": cmd_done,
