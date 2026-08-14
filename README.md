@@ -245,6 +245,14 @@ accepts `container_idle_stop`, `container_remove`, `warm_volume_ttl`, `supersede
 `max_builds`; environment overrides are their uppercase `BOSN_` equivalents. `bosn status`
 reports each effective value and its origin.
 
+## Registry recovery
+
+Run `bosn doctor` after an unclean shutdown. If it finds complete labels from a prior
+registry it prints `bosn adopt`, the only ownership-transfer command. SQLite diagnosis is
+non-destructive: run `sqlite3 registry.sqlite3 "PRAGMA integrity_check"`; if recovery is
+needed, copy the database first and use SQLite's `.recover` output to build a replacement.
+Adopted resources receive a 24-hour quiet period before normal age-based retention resumes.
+
 Losing the database is survivable: **ownership lives in the labels, and the registry is
 authoritative only for time and leases.** A lost registry rebuilds by rescanning Docker
 labels, with adoption time as last-use and a 24 h quiet period so recovery is never followed
