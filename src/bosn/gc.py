@@ -52,6 +52,7 @@ class GCResult:
     kept: list[str] = field(default_factory=list)
     skipped_unproven: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    advisories: list[str] = field(default_factory=list)
 
     def summary(self) -> dict[str, int]:
         return {
@@ -61,6 +62,7 @@ class GCResult:
             "kept": len(self.kept),
             "skipped_unproven": len(self.skipped_unproven),
             "errors": len(self.errors),
+            "advisories": len(self.advisories),
         }
 
 
@@ -88,14 +90,80 @@ class Collector:
         dry_run: bool = True,
         pressure: Pressure | None = None,
     ) -> GCResult:
-        verdicts: list[Verdict] = plan(self.registry, pressure=pressure, config=self.config)
+        from bosn.config import load as load_config
+
+        config = self.config or load_config()
+        inventory = StorageInventory.collect(self.engine)
+        resources = self.registry.list_resources()
+        measured = {
+            resource.id: resource_bytes(self.engine, resource, inventory) for resource in resources
+        }
+        storage = probe(self.engine, self.registry.path.parent)
+        # Pressure is intentionally derived here for every pass. The argument remains only
+        # as a compatibility shim for callers from older releases and cannot override policy.
+        _ = pressure
+        pressure = Pressure.assess(
+            resource_count=len(resources),
+            managed_bytes=sum(size for size in measured.values() if size is not None),
+            free_bytes=storage.free_bytes,
+            managed_bytes_ceiling=int(config.get("shared_cache_ceiling")),
+        )
+        byte_pressure_started = pressure.bytes_exceeded
+
+        def reassess_pressure() -> Pressure:
+            """Use one conservative state transition for dry-run and real removal."""
+            updated = Pressure.assess(
+                resource_count=len(measured),
+                managed_bytes=sum(size for size in measured.values() if size is not None),
+                free_bytes=storage.free_bytes,
+                managed_bytes_ceiling=int(config.get("shared_cache_ceiling")),
+            )
+            if storage.vhdx_slack_bytes is not None and storage.vhdx_slack_bytes > reclaimable:
+                updated = Pressure(
+                    under_pressure=updated.count_exceeded or updated.bytes_exceeded,
+                    count_exceeded=updated.count_exceeded,
+                    bytes_exceeded=updated.bytes_exceeded,
+                )
+            if any(size is None for size in measured.values()):
+                # Unknown resources cannot prove that a byte target is now satisfied.
+                updated = Pressure(
+                    under_pressure=updated.count_exceeded
+                    or updated.bytes_exceeded
+                    or byte_pressure_started,
+                    count_exceeded=updated.count_exceeded,
+                    bytes_exceeded=updated.bytes_exceeded or byte_pressure_started,
+                )
+            return updated
+
+        verdicts: list[Verdict] = plan(self.registry, pressure=pressure, config=config)
         result = GCResult(dry_run=dry_run)
+        reclaimable = sum(
+            measured.get(verdict.resource.id, 0) or 0 for verdict in collectable(verdicts)
+        )
+        if (
+            storage.vhdx_slack_bytes is not None
+            and storage.vhdx_slack_bytes > reclaimable
+            and pressure.under_pressure
+        ):
+            advisory = (
+                "backing-store slack dominates managed reclaimable bytes; compact Docker VHDX"
+            )
+            result.advisories.append(advisory)
+            self.registry.log_event("gc.compaction_advisory", advisory)
+            # Deleting caches cannot reduce slack trapped inside the virtual disk, but it
+            # can still satisfy configured count/byte ceilings.
+            pressure = Pressure(
+                under_pressure=pressure.count_exceeded or pressure.bytes_exceeded,
+                count_exceeded=pressure.count_exceeded,
+                bytes_exceeded=pressure.bytes_exceeded,
+            )
+            verdicts = plan(self.registry, pressure=pressure, config=config)
 
         for verdict in verdicts:
             if not verdict.collect:
                 result.kept.append(verdict.name)
                 if not container_should_stop(
-                    verdict.resource, self.registry.clock.now(), config=self.config
+                    verdict.resource, self.registry.clock.now(), config=config
                 ):
                     continue
                 # The planning snapshot is not a mutation boundary: another client may
@@ -115,14 +183,14 @@ class Collector:
                         superseded=superseded,
                         workspace_done=workspace_done,
                         pressure=pressure,
-                        config=self.config,
+                        config=config,
                     )
                     protected = current.reason in {KEPT_LEASED, KEPT_QUIET_PERIOD}
                     if (
                         current.collect
                         or protected
                         or not container_should_stop(
-                            resource, self.registry.clock.now(), config=self.config
+                            resource, self.registry.clock.now(), config=config
                         )
                     ):
                         continue
@@ -158,7 +226,7 @@ class Collector:
                     superseded=superseded,
                     workspace_done=workspace_done,
                     pressure=pressure,
-                    config=self.config,
+                    config=config,
                 )
                 if not current.collect:
                     result.kept.append(resource.name)
@@ -170,6 +238,8 @@ class Collector:
 
                 if dry_run:
                     result.removed.append(resource.name)
+                    measured.pop(resource.id, None)
+                    pressure = reassess_pressure()
                     continue
 
                 args = _REMOVE_COMMANDS.get(resource.kind)
@@ -182,6 +252,8 @@ class Collector:
                     self.registry.remove_resource(resource.id)
                     self.registry.log_event("gc.removed", f"{resource.kind}:{resource.name}")
                     result.removed.append(resource.name)
+                    measured.pop(resource.id, None)
+                    pressure = reassess_pressure()
                 else:
                     message = f"{resource.name}: {removal.stderr or removal.stdout}"
                     result.errors.append(message)
@@ -217,7 +289,10 @@ def status(
     managed_bytes = sum(size for size in measured.values() if size is not None)
     storage = probe(engine, registry.path.parent)
     pressure = Pressure.assess(
-        resource_count=len(measured), managed_bytes=managed_bytes, free_bytes=storage.free_bytes
+        resource_count=len(measured),
+        managed_bytes=managed_bytes,
+        free_bytes=storage.free_bytes,
+        managed_bytes_ceiling=int(config.get("shared_cache_ceiling")),
     )
     verdicts = plan(registry, pressure=pressure, config=config)
     reclaimable = sum(measured[v.resource.id] or 0 for v in collectable(verdicts))

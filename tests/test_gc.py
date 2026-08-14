@@ -10,8 +10,11 @@ from pathlib import Path
 
 import pytest
 
+from bosn import gc as gc_mod
 from bosn import labels
+from bosn.accounting import StorageInventory, StorageProbe
 from bosn.clock import FakeClock
+from bosn.config import load as load_config
 from bosn.engine import EngineResult
 from bosn.gc import Collector, done_workspaces, mark_done, status
 from bosn.registry import Registry
@@ -132,7 +135,111 @@ def test_gc_never_issues_a_system_prune(registry: Registry, clock: FakeClock) ->
 
     flat = [" ".join(cmd) for cmd in engine.commands]
     assert not any("prune" in cmd for cmd in flat)
-    assert not any("system" in cmd for cmd in flat)
+    assert not any("system prune" in cmd for cmd in flat)
+
+
+def test_gc_computes_configured_storage_pressure_and_stops_at_target(
+    monkeypatch, registry: Registry
+) -> None:
+    first = add(registry, "first")
+    second = add(registry, "second")
+    engine = FakeEngine(
+        {
+            "first": label_dict(registry=registry.registry_id),
+            "second": label_dict(registry=registry.registry_id),
+        }
+    )
+    monkeypatch.setattr(
+        gc_mod.StorageInventory,
+        "collect",
+        classmethod(
+            lambda _cls, _engine: StorageInventory(
+                {("volume", "first"): 10, ("volume", "second"): 10}
+            )
+        ),
+    )
+    config = load_config(flags={"shared_cache_ceiling": 10})
+
+    result = Collector(registry, engine, config=config).collect(dry_run=False)  # type: ignore[arg-type]
+
+    assert result.removed == [first.name]
+    assert registry.get_resource(second.id) is not None
+
+
+def test_pressure_dry_run_matches_bounded_apply_plan(monkeypatch, registry: Registry) -> None:
+    first = add(registry, "first")
+    add(registry, "second")
+    engine = FakeEngine(
+        {
+            "first": label_dict(registry=registry.registry_id),
+            "second": label_dict(registry=registry.registry_id),
+        }
+    )
+    monkeypatch.setattr(
+        gc_mod.StorageInventory,
+        "collect",
+        classmethod(
+            lambda _cls, _engine: StorageInventory(
+                {("volume", "first"): 10, ("volume", "second"): 10}
+            )
+        ),
+    )
+    config = load_config(flags={"shared_cache_ceiling": 10})
+
+    preview = Collector(registry, engine, config=config).collect(dry_run=True)  # type: ignore[arg-type]
+    applied = Collector(registry, engine, config=config).collect(dry_run=False)  # type: ignore[arg-type]
+
+    assert preview.removed == applied.removed == [first.name]
+
+
+@pytest.mark.parametrize("source", ["file", "environment", "flag"])
+def test_storage_ceiling_overrides_change_gc_pressure_decision(
+    monkeypatch, tmp_path: Path, registry: Registry, source: str
+) -> None:
+    resource = add(registry, "cache")
+    engine = FakeEngine({"cache": label_dict(registry=registry.registry_id)})
+    monkeypatch.setattr(
+        gc_mod.StorageInventory,
+        "collect",
+        classmethod(lambda _cls, _engine: StorageInventory({("volume", "cache"): 10})),
+    )
+    if source == "file":
+        path = tmp_path / "config.toml"
+        path.write_text("[policy]\nshared_cache_ceiling = 1\n", encoding="utf-8")
+        config = load_config(path=path)
+    elif source == "environment":
+        monkeypatch.setenv("BOSN_SHARED_CACHE_CEILING", "1")
+        config = load_config(path=tmp_path / "missing.toml")
+    else:
+        config = load_config(path=tmp_path / "missing.toml", flags={"shared_cache_ceiling": 1})
+
+    result = Collector(registry, engine, config=config).collect(dry_run=True)  # type: ignore[arg-type]
+
+    assert result.removed == [resource.name]
+
+
+def test_gc_advises_compaction_instead_of_eviction_when_vhdx_slack_dominates(
+    monkeypatch, registry: Registry
+) -> None:
+    resource = add(registry, "warm")
+    engine = FakeEngine({"warm": label_dict(registry=registry.registry_id)})
+    monkeypatch.setattr(
+        gc_mod.StorageInventory,
+        "collect",
+        classmethod(lambda _cls, _engine: StorageInventory({("volume", "warm"): 10})),
+    )
+    monkeypatch.setattr(
+        gc_mod,
+        "probe",
+        lambda _engine, _path: StorageProbe(free_bytes=100, total_bytes=100, vhdx_slack_bytes=20),
+    )
+    config = load_config(flags={"shared_cache_ceiling": 1000})
+
+    result = Collector(registry, engine, config=config).collect(dry_run=False)  # type: ignore[arg-type]
+
+    assert result.removed == []
+    assert result.advisories
+    assert registry.get_resource(resource.id) is not None
 
 
 def test_there_is_no_force_flag_on_gc() -> None:
