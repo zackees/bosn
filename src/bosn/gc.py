@@ -14,9 +14,11 @@ Design commitments enforced here:
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, field
 
 from bosn import labels
+from bosn.accounting import probe, resource_bytes
 from bosn.engine import Engine
 from bosn.registry import Registry
 from bosn.resources import ResourceScanner
@@ -112,8 +114,33 @@ def status(registry: Registry, engine: Engine | None = None) -> dict:
     from bosn.config import load as load_config
 
     config = load_config()
-    verdicts = plan(registry)
     scan = ResourceScanner(engine).scan(registry.registry_id)
+
+    attributed: dict[tuple[str, str, str], dict[str, int]] = defaultdict(
+        lambda: {"count": 0, "bytes": 0, "unmeasured": 0}
+    )
+    measured: dict[str, int | None] = {}
+    for resource in registry.list_resources():
+        size = resource_bytes(engine, resource)
+        measured[resource.id] = size
+        bucket = attributed[(resource.workspace, resource.stack, resource.kind)]
+        bucket["count"] += 1
+        if size is None:
+            bucket["unmeasured"] += 1
+        else:
+            bucket["bytes"] += size
+    managed_bytes = sum(size for size in measured.values() if size is not None)
+    storage = probe(registry.path.parent)
+    pressure = Pressure.assess(
+        resource_count=len(measured), managed_bytes=managed_bytes, free_bytes=storage.free_bytes
+    )
+    verdicts = plan(registry, pressure=pressure)
+    reclaimable = sum(measured[v.resource.id] or 0 for v in collectable(verdicts))
+    advisory = (
+        "Backing-store slack exceeds managed reclaimable bytes; compact the Docker VHDX manually."
+        if storage.vhdx_slack_bytes is not None and storage.vhdx_slack_bytes > reclaimable
+        else None
+    )
 
     by_reason: dict[str, int] = {}
     for verdict in verdicts:
@@ -127,6 +154,35 @@ def status(registry: Registry, engine: Engine | None = None) -> dict:
         "by_reason": by_reason,
         "engine": scan.counts(),
         "foreign_registries": sorted(scan.foreign_registries),
+        "foreign_registry_totals": {"count": len(scan.foreign), "bytes": None},
+        "managed_bytes": managed_bytes,
+        "managed_reclaimable_bytes": reclaimable,
+        "pressure": {
+            "under_pressure": pressure.under_pressure,
+            "count_exceeded": pressure.count_exceeded,
+            "bytes_exceeded": pressure.bytes_exceeded,
+            "free_space_exceeded": pressure.free_space_exceeded,
+        },
+        "storage": {
+            "free_bytes": storage.free_bytes,
+            "total_bytes": storage.total_bytes,
+            "vhdx_slack_bytes": storage.vhdx_slack_bytes,
+            "compaction_advisory": advisory,
+        },
+        "attribution": [
+            {"workspace": workspace, "stack": stack, "role": role, **values}
+            for (workspace, stack, role), values in sorted(attributed.items())
+        ],
+        "decisions": [
+            {
+                "name": verdict.name,
+                "kind": verdict.resource.kind,
+                "eligible": verdict.collect,
+                "reason": verdict.reason,
+                "bytes": measured[verdict.resource.id],
+            }
+            for verdict in verdicts
+        ],
     }
 
 
