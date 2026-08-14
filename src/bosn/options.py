@@ -32,6 +32,7 @@ class Options:
     stack: str | None = None
     task: str | None = None
     args: tuple[str, ...] = ()
+    json: bool = False
 
     # gc
     dry_run: bool = True
@@ -125,6 +126,7 @@ def from_namespace(ns: argparse.Namespace) -> Options:
         stack=_as_str(get("stack")),
         task=_as_str(get("task")),
         args=get_list("args"),
+        json=bool(get("json", False)),
         dry_run=bool(get("dry_run", True)),
         port=None if port is None else int(str(port)),
         idle_retire_seconds=None if idle is None else float(str(idle)),

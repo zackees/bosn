@@ -8,9 +8,13 @@ silent no-op and never a fallback to raw Docker.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
+import sqlite3
 import sys
 from collections.abc import Callable, Sequence
+from typing import NoReturn
 
 from bosn import __version__, ipc
 from bosn.engine import Engine
@@ -44,10 +48,43 @@ _POLICY_FLAG_KEYS = (
     "build_ttl_seconds",
 )
 
+_GLOBAL_VALUE_FLAGS = {
+    "--engine",
+    "--state-dir",
+    "--manifest",
+    *(f"--{key.replace('_', '-')}" for key in _POLICY_FLAG_KEYS),
+}
+
 
 def _add_policy_flags(parser: argparse.ArgumentParser, *, default: object) -> None:
     for key in _POLICY_FLAG_KEYS:
         parser.add_argument(f"--{key.replace('_', '-')}", type=float, default=default)
+
+
+def _error(*, code: str, message: str, next_step: str, as_json: bool = False) -> int:
+    """Emit the stable machine error envelope while preserving readable stderr."""
+    if as_json:
+        print(json.dumps({"ok": False, "code": code, "message": message, "next": next_step}))
+    else:
+        print(message, file=sys.stderr)
+    return 1
+
+
+class _JSONArgumentParser(argparse.ArgumentParser):
+    """Suppress argparse prose when the caller explicitly requests JSON."""
+
+    def error(self, message: str) -> NoReturn:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "code": "parse.invalid",
+                    "message": message,
+                    "next": "correct the command arguments and retry",
+                }
+            )
+        )
+        raise SystemExit(2)
 
 
 # verb -> (help text, phase that lands it)
@@ -74,10 +111,9 @@ class VerbNotImplementedError(RuntimeError):
         self.phase = phase
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="bosn", description="bosn - container lifecycle supervisor"
-    )
+def build_parser(*, json_errors: bool = False) -> argparse.ArgumentParser:
+    parser_type = _JSONArgumentParser if json_errors else argparse.ArgumentParser
+    parser = parser_type(prog="bosn", description="bosn - container lifecycle supervisor")
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument(
         "--engine",
@@ -92,6 +128,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--manifest", default=None, help="path to bosn.toml (default: nearest one upward)"
     )
+    parser.add_argument(
+        "--json", action="store_true", help="emit structured machine-readable output"
+    )
     # Policy is global because every command must resolve exactly the same snapshot.
     # The daemon repeats its three operational flags after the verb for spawned argv
     # compatibility; the remaining flags belong before the verb like --engine.
@@ -105,8 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("--stack", default=None, help="stack to use (default: the default)")
             sub.add_argument("--task", default=None, help="run a manifest task by name")
             sub.add_argument("--manifest", default=None, dest="sub_manifest")
-        if verb in {"tasks", "status"}:
-            sub.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+        sub.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
         if verb == "gc":
             group = sub.add_mutually_exclusive_group()
             group.add_argument(
@@ -266,6 +304,7 @@ def _open_manifest_and_registry(opts: Options, *, read_only: bool = False):
 
 def cmd_tasks(opts: Options) -> int:
     from bosn.manifest import ManifestError, find_manifest, generation_digest, load
+    from bosn.registry import Registry, default_db_path
 
     try:
         manifest_path = opts.manifest or find_manifest()
@@ -275,8 +314,41 @@ def cmd_tasks(opts: Options) -> int:
             )
         manifest = load(manifest_path)
     except ManifestError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
+        return _error(
+            code="manifest.invalid",
+            message=str(exc),
+            next_step="create or select a valid bosn.toml with --manifest",
+            as_json=opts.json,
+        )
+
+    db_path = (opts.state_dir / "registry.sqlite3") if opts.state_dir else default_db_path()
+    registered = []
+    registry_reason = "registry not initialized"
+    if db_path.exists():
+        try:
+            with Registry(db_path, read_only=True) as registry:
+                registered = registry.list_resources()
+        except (OSError, sqlite3.DatabaseError) as exc:
+            return _error(
+                code="registry.unreadable",
+                message=f"cannot read registry: {exc}",
+                next_step="run `bosn doctor` and follow its SQLite recovery guidance",
+                as_json=opts.json,
+            )
+        registry_reason = "daemon job state unavailable; run `bosn jobs`"
+
+    def readiness(stack_name: str) -> dict[str, object]:
+        resources = [
+            resource
+            for resource in registered
+            if resource.stack == stack_name and resource.workspace == str(manifest.root)
+        ]
+        return {
+            "state": "ready" if resources else "unregistered",
+            "resources": len(resources),
+            "generations": sorted({resource.generation for resource in resources}),
+            "jobs": {"state": "unavailable", "reason": registry_reason},
+        }
 
     try:
         payload = {
@@ -292,14 +364,26 @@ def cmd_tasks(opts: Options) -> int:
                     # generation digest before job coalescing and registration.
                     "content_digest": generation_digest(manifest, stack),
                     "volumes": {v.name: v.scope for v in stack.volumes},
+                    "readiness": readiness(name),
                 }
                 for name, stack in manifest.stacks.items()
             },
-            "tasks": {name: {"stack": t.stack, "cmd": t.cmd} for name, t in manifest.tasks.items()},
+            "tasks": {
+                name: {
+                    "stack": t.stack,
+                    "cmd": t.cmd,
+                    "readiness": readiness(t.stack or manifest.default_stack().name),
+                }
+                for name, t in manifest.tasks.items()
+            },
         }
     except ManifestError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
+        return _error(
+            code="manifest.digest_failed",
+            message=str(exc),
+            next_step="fix the manifest or Dockerfile inputs, then retry",
+            as_json=opts.json,
+        )
     print(json.dumps(payload, indent=2))
     return 0
 
@@ -543,14 +627,43 @@ def cmd_gc(opts: Options) -> int:
             "gc", opts.state_dir, engine=opts.engine, dry_run=opts.dry_run, policy_flags=flags
         )
     except ConfigError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
+        return _error(
+            code="policy.invalid",
+            message=str(exc),
+            next_step="correct the named policy value and retry",
+            as_json=opts.json,
+        )
     except (daemon_mod.DaemonError, ipc.TransportError) as exc:
-        print(f"cannot reach the bosn daemon: {exc}", file=sys.stderr)
-        return 1
+        return _error(
+            code="daemon.unreachable",
+            message=f"cannot reach the bosn daemon: {exc}",
+            next_step="start or restart the daemon, then retry",
+            as_json=opts.json,
+        )
     if not reply.get("ok"):
-        print(str(reply.get("error") or "gc failed"), file=sys.stderr)
-        return 1
+        return _error(
+            code="gc.failed",
+            message=str(reply.get("error") or "gc failed"),
+            next_step="inspect `bosn status` and retry after resolving the reported error",
+            as_json=opts.json,
+        )
+    if opts.json:
+        print(
+            json.dumps(
+                {
+                    "ok": not bool(reply.get("errors")),
+                    "result": reply["result"],
+                    "dry_run": opts.dry_run,
+                    "would_stop": reply.get("would_stop", []),
+                    "stopped": reply.get("stopped", []),
+                    "removed": reply.get("removed", []),
+                    "errors": reply.get("errors", []),
+                    "advisories": reply.get("advisories", []),
+                },
+                indent=2,
+            )
+        )
+        return 1 if reply.get("errors") else 0
     print(json.dumps({**reply["result"], "dry_run": opts.dry_run}, indent=2))
     for name in reply.get("would_stop", []):
         print(f"would stop {name}")
@@ -687,8 +800,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    parser = build_parser()
-    ns = parser.parse_args(argv if argv is not None else sys.argv[1:])
+    raw_argv = list(argv if argv is not None else sys.argv[1:])
+    # A manifest task is the friendly front door: `bosn unit` is equivalent to
+    # `bosn run --task unit`.  Fixed verbs remain reserved, so adding a task called
+    # `status` never changes the meaning of `bosn status`.
+    command_index: int | None = None
+    skip_value = False
+    for index, token in enumerate(raw_argv):
+        if skip_value:
+            skip_value = False
+            continue
+        if token in _GLOBAL_VALUE_FLAGS:
+            skip_value = True
+            continue
+        if token.startswith("--"):
+            continue
+        command_index = index
+        break
+    if command_index is not None and raw_argv[command_index] not in {*VERBS, DAEMON_VERB}:
+        task = raw_argv[command_index]
+        raw_argv[command_index : command_index + 1] = ["run", "--task", task]
+    parser = build_parser(json_errors="--json" in raw_argv)
+    ns = parser.parse_args(raw_argv)
     opts = from_namespace(ns)
 
     if opts.verb is None:
@@ -712,6 +845,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     handler = handlers.get(opts.verb)
     if handler is not None:
+        if opts.json and opts.verb not in {"tasks", "gc"}:
+            # Older human-oriented verbs already return useful exit codes and write
+            # diagnostics to stderr.  Adapt that boundary once so JSON callers never
+            # need to parse prose while those commands are migrated individually.
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = handler(opts)
+            if code:
+                message = (stderr.getvalue() + stdout.getvalue()).strip() or f"{opts.verb} failed"
+                return _error(
+                    code="command.failed",
+                    message=message,
+                    next_step="resolve the reported condition and retry the command",
+                    as_json=True,
+                )
+            print(stdout.getvalue(), end="")
+            print(stderr.getvalue(), end="", file=sys.stderr)
+            return code
         return handler(opts)
 
     error = VerbNotImplementedError(opts.verb, VERBS[opts.verb][1])
