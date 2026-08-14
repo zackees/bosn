@@ -339,6 +339,46 @@ def test_a_hung_build_is_reaped_by_its_ttl(builder: SlowBuilder) -> None:
         manager.shutdown(timeout=5)
 
 
+def test_builder_progress_keeps_a_long_build_alive(builder: SlowBuilder) -> None:
+    manager = JobManager(builder, max_builds=2, ttl_seconds=1)
+    try:
+        job = manager.submit(workspace=WORKSPACE, stack=STACK, digest="sha256:progress").job
+        assert wait_until(lambda: job.state == RUNNING)
+        assert job.started_at is not None
+        # It has run longer than the inactivity window, but the builder just emitted output.
+        job.started_at = time.time() - 2
+        job.log("still building")
+        assert manager.reap_expired(now=time.time()) == []
+        assert job.state == RUNNING
+    finally:
+        builder.release.set()
+        manager.shutdown(timeout=5)
+
+
+def test_watcher_activity_does_not_refresh_builder_progress(builder: SlowBuilder) -> None:
+    manager = JobManager(builder, max_builds=2, ttl_seconds=1)
+    try:
+        job = manager.submit(workspace=WORKSPACE, stack=STACK, digest="sha256:silent").job
+        assert wait_until(lambda: job.state == RUNNING)
+        assert job.started_at is not None
+        watcher = job.watch()
+        assert manager.reap_expired(now=job.started_at + 2) == [job]
+        assert job.error is not None and "no builder progress" in job.error
+        events = [watcher.get(timeout=1) for _ in range(2)]  # initial log + cancellation
+        assert any(
+            event["event"] == "cancelling" and "no builder progress" in event["reason"]
+            for event in events
+        )
+        late = job.watch()
+        replay = []
+        while not late.empty():
+            replay.append(late.get_nowait())
+        assert any(event["event"] == "cancelling" for event in replay)
+    finally:
+        builder.release.set()
+        manager.shutdown(timeout=5)
+
+
 def test_a_healthy_build_is_not_reaped(manager: JobManager, builder: SlowBuilder) -> None:
     job = submit(manager, "sha256:fine").job
     assert wait_until(lambda: job.state == RUNNING)
