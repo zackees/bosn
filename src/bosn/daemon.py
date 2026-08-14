@@ -384,7 +384,7 @@ class Daemon:
     def _run_maintenance(self) -> None:
         """Execute a maintenance pass, recording every outcome and scheduling its retry."""
         from bosn.engine import Engine
-        from bosn.gc import Collector, done_workspaces
+        from bosn.gc import Collector
 
         self.registry.log_event("maintenance.reap.started")
         try:
@@ -415,9 +415,7 @@ class Daemon:
 
         self.registry.log_event("maintenance.gc.started")
         try:
-            result = Collector(self.registry, engine).collect(
-                dry_run=False, done_workspaces=done_workspaces(self.registry)
-            )
+            result = Collector(self.registry, engine).collect(dry_run=False)
         except KeyboardInterrupt:
             raise
         except Exception as exc:  # noqa: BLE001 - never claim a failed GC succeeded

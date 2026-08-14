@@ -14,8 +14,10 @@ Design commitments enforced here:
 
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from bosn import labels
 from bosn.accounting import probe, resource_bytes
@@ -80,13 +82,9 @@ class Collector:
         self,
         *,
         dry_run: bool = True,
-        done_workspaces: set[str] | None = None,
         pressure: Pressure | None = None,
     ) -> GCResult:
-        done_workspaces = done_workspaces or set()
-        verdicts: list[Verdict] = plan(
-            self.registry, done_workspaces=done_workspaces, pressure=pressure
-        )
+        verdicts: list[Verdict] = plan(self.registry, pressure=pressure)
         result = GCResult(dry_run=dry_run)
 
         for verdict in verdicts:
@@ -102,12 +100,14 @@ class Collector:
                     resource = self.registry.get_resource(verdict.resource.id)
                     if resource is None:
                         continue
+                    superseded, workspace_done = self.registry.resource_retention_signals(
+                        resource.id
+                    )
                     current = evaluate(
                         self.registry,
                         resource,
-                        superseded=self.registry.generation_superseded_at(resource.generation)
-                        is not None,
-                        workspace_done=resource.workspace in done_workspaces,
+                        superseded=superseded,
+                        workspace_done=workspace_done,
                         pressure=pressure,
                     )
                     protected = current.reason in {KEPT_LEASED, KEPT_QUIET_PERIOD}
@@ -138,30 +138,44 @@ class Collector:
         for verdict in sorted(
             collectable(verdicts), key=lambda verdict: verdict.resource.kind != "container"
         ):
-            resource = verdict.resource
-            if not self._ownership_proven(resource.kind, resource.name):
-                result.skipped_unproven.append(resource.name)
-                self.registry.log_event("gc.skipped_unproven", resource.name)
-                continue
+            with self.registry.lifecycle_guard():
+                resource = self.registry.get_resource(verdict.resource.id)
+                if resource is None:
+                    continue
+                superseded, workspace_done = self.registry.resource_retention_signals(resource.id)
+                current = evaluate(
+                    self.registry,
+                    resource,
+                    superseded=superseded,
+                    workspace_done=workspace_done,
+                    pressure=pressure,
+                )
+                if not current.collect:
+                    result.kept.append(resource.name)
+                    continue
+                if not self._ownership_proven(resource.kind, resource.name):
+                    result.skipped_unproven.append(resource.name)
+                    self.registry.log_event("gc.skipped_unproven", resource.name)
+                    continue
 
-            if dry_run:
-                result.removed.append(resource.name)
-                continue
+                if dry_run:
+                    result.removed.append(resource.name)
+                    continue
 
-            args = _REMOVE_COMMANDS.get(resource.kind)
-            if args is None:
-                result.errors.append(f"{resource.name}: unknown kind {resource.kind}")
-                continue
+                args = _REMOVE_COMMANDS.get(resource.kind)
+                if args is None:
+                    result.errors.append(f"{resource.name}: unknown kind {resource.kind}")
+                    continue
 
-            removal = self.engine.run([*args, resource.name])
-            if removal.ok:
-                self.registry.remove_resource(resource.id)
-                self.registry.log_event("gc.removed", f"{resource.kind}:{resource.name}")
-                result.removed.append(resource.name)
-            else:
-                message = f"{resource.name}: {removal.stderr or removal.stdout}"
-                result.errors.append(message)
-                self.registry.log_event("gc.error", message)
+                removal = self.engine.run([*args, resource.name])
+                if removal.ok:
+                    self.registry.remove_resource(resource.id)
+                    self.registry.log_event("gc.removed", f"{resource.kind}:{resource.name}")
+                    result.removed.append(resource.name)
+                else:
+                    message = f"{resource.name}: {removal.stderr or removal.stdout}"
+                    result.errors.append(message)
+                    self.registry.log_event("gc.error", message)
 
         return result
 
@@ -250,14 +264,16 @@ def mark_done(registry: Registry, workspace: str) -> int:
     Dirty work is never destroyed on inference: this is the first-party signal, the
     strongest one there is. Derived signals are the caller's responsibility.
     """
-    marked = 0
-    for resource in registry.list_resources():
-        if resource.workspace == workspace and resource.scope != "machine":
-            registry.set_resource_state(resource.id, "done")
-            marked += 1
+    marked = registry.mark_workspace_done(workspace)
+    path = Path(workspace)
+    if marked == 0 and path.exists():
+        canonical = os.path.normcase(str(path.resolve()))
+        if canonical != workspace:
+            marked = registry.mark_workspace_done(canonical)
+            workspace = canonical
     registry.log_event("workspace.done", f"{workspace} ({marked} resources)")
     return marked
 
 
 def done_workspaces(registry: Registry) -> set[str]:
-    return {r.workspace for r in registry.list_resources() if r.state == "done"}
+    return registry.done_workspace_ids()

@@ -5,6 +5,7 @@ No Docker needed; these are pure unit tests and run on every platform.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -75,6 +76,97 @@ def test_touch_resource_advances_last_used(registry: Registry, clock: FakeClock)
     assert updated.last_used == resource.created_at + 3600
 
 
+def test_engine_identity_is_unique_and_registration_reconciles_in_place(
+    registry: Registry, clock: FakeClock
+) -> None:
+    first = registry.register_resource(
+        kind="volume",
+        name="shared-cache",
+        stack="one",
+        generation="sha256:old",
+        scope="stack",
+        workspace="/w1",
+    )
+    clock.advance(60)
+
+    second = registry.register_resource(
+        kind="volume",
+        name="shared-cache",
+        stack="two",
+        generation="sha256:new",
+        scope="machine",
+        workspace="/w2",
+    )
+
+    assert second.id == first.id
+    assert second.last_used == clock.now()
+    assert (second.stack, second.generation, second.scope, second.workspace) == (
+        "two",
+        "sha256:new",
+        "machine",
+        "/w2",
+    )
+    assert [(resource.kind, resource.name) for resource in registry.list_resources()] == [
+        ("volume", "shared-cache")
+    ]
+
+
+def test_legacy_image_tag_is_merged_into_its_immutable_identity(registry: Registry) -> None:
+    legacy = registry.register_resource(
+        kind="image",
+        name="bosn/test:tag",
+        stack="test",
+        generation="sha256:g",
+        scope="spec",
+        workspace="/w1",
+    )
+    canonical = registry.register_resource(
+        kind="image",
+        name="sha256:image-id",
+        stack="test",
+        generation="sha256:g",
+        scope="spec",
+        workspace="/w2",
+    )
+    legacy_lease = registry.acquire_lease(legacy.id, pid=1, proc_start=1.0)
+
+    merged = registry.canonicalize_image_identity("bosn/test:tag", "sha256:image-id")
+
+    assert merged is not None
+    assert merged.id == canonical.id
+    assert registry.get_resource(legacy.id) is None
+    moved_lease = registry.get_lease(legacy_lease.id)
+    assert moved_lease is not None
+    assert moved_lease.resource_id == canonical.id
+    assert [(resource.kind, resource.name) for resource in registry.list_resources()] == [
+        ("image", "sha256:image-id")
+    ]
+    uses = registry.conn.execute(
+        "SELECT workspace FROM resource_uses WHERE resource_id = ? ORDER BY workspace",
+        (canonical.id,),
+    ).fetchall()
+    assert [row["workspace"] for row in uses] == ["/w1", "/w2"]
+
+
+def test_legacy_short_image_id_is_merged_into_the_full_identity(registry: Registry) -> None:
+    full_id = "sha256:0123456789ababcdef0123456789abcdef0123456789abcdef0123456789ab"
+    legacy = registry.register_resource(
+        kind="image",
+        name="0123456789ab",
+        stack="test",
+        generation="sha256:g",
+        scope="spec",
+        workspace="/w",
+    )
+
+    merged = registry.canonicalize_image_identity("bosn/test:tag", full_id)
+
+    assert merged is not None
+    assert merged.id == legacy.id
+    assert merged.name == full_id
+    assert registry.get_resource_by_engine_identity("image", "0123456789ab") is None
+
+
 def test_lease_expiry_is_driven_by_the_injected_clock(registry: Registry, clock: FakeClock) -> None:
     resource = registry.register_resource(
         kind="volume", name="v", stack="s", generation="g", scope="spec", workspace="/w"
@@ -115,12 +207,102 @@ def test_removing_a_resource_cascades_to_its_leases(registry: Registry) -> None:
 def test_generations_supersede_all_but_the_current_digest(
     registry: Registry, clock: FakeClock
 ) -> None:
-    registry.record_generation("sha256:old", "test")
+    registry.record_generation("sha256:old", "test", "/w")
     clock.advance(60)
-    registry.record_generation("sha256:new", "test")
-    assert registry.supersede_generations("test", keep_digest="sha256:new") == 1
-    assert registry.generation_superseded_at("sha256:old") == clock.now()
-    assert registry.generation_superseded_at("sha256:new") is None
+    registry.record_generation("sha256:new", "test", "/w")
+    assert registry.supersede_generations("test", keep_digest="sha256:new", workspace="/w") == 1
+    assert (
+        registry.generation_superseded_at("sha256:old", stack="test", workspace="/w") == clock.now()
+    )
+    assert registry.generation_superseded_at("sha256:new", stack="test", workspace="/w") is None
+
+
+def test_generation_supersession_is_scoped_to_one_workspace(
+    registry: Registry, clock: FakeClock
+) -> None:
+    for workspace in ("/w1", "/w2"):
+        registry.record_generation("sha256:shared", "test", workspace)
+    registry.record_generation("sha256:w1-new", "test", "/w1")
+
+    assert registry.supersede_generations("test", keep_digest="sha256:w1-new", workspace="/w1") == 1
+    assert (
+        registry.generation_superseded_at("sha256:shared", stack="test", workspace="/w1")
+        == clock.now()
+    )
+    assert registry.generation_superseded_at("sha256:shared", stack="test", workspace="/w2") is None
+
+
+def test_mixed_done_and_superseded_consumers_make_a_shared_resource_retirable(
+    registry: Registry,
+) -> None:
+    for workspace in ("/w1", "/w2"):
+        registry.record_generation("sha256:old", "test", workspace)
+        registry.register_resource(
+            kind="image",
+            name="sha256:image",
+            stack="test",
+            generation="sha256:old",
+            scope="spec",
+            workspace=workspace,
+        )
+    registry.mark_workspace_done("/w1")
+    registry.record_generation("sha256:new", "test", "/w2")
+    registry.supersede_generations("test", keep_digest="sha256:new", workspace="/w2")
+    image = registry.get_resource_by_engine_identity("image", "sha256:image")
+    assert image is not None
+
+    assert registry.resource_retention_signals(image.id) == (True, False)
+
+
+def test_v1_migration_deduplicates_engine_objects_and_preserves_leases(tmp_path: Path) -> None:
+    path = tmp_path / "v1.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta VALUES ('schema_version', '1');
+        INSERT INTO meta VALUES ('registry_id', 'registry-v1');
+        CREATE TABLE resources (
+            id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+            stack TEXT NOT NULL, generation TEXT NOT NULL, scope TEXT NOT NULL,
+            workspace TEXT NOT NULL, created_at REAL NOT NULL, last_used REAL NOT NULL,
+            state TEXT NOT NULL DEFAULT 'active'
+        );
+        CREATE TABLE leases (
+            id TEXT PRIMARY KEY, resource_id TEXT NOT NULL REFERENCES resources(id)
+                ON DELETE CASCADE,
+            pid INTEGER NOT NULL, proc_start REAL NOT NULL, acquired_at REAL NOT NULL,
+            heartbeat_at REAL NOT NULL, ttl_seconds REAL NOT NULL
+        );
+        CREATE TABLE generations (
+            digest TEXT PRIMARY KEY, stack TEXT NOT NULL, created_at REAL NOT NULL,
+            superseded_at REAL
+        );
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL NOT NULL,
+            kind TEXT NOT NULL, detail TEXT NOT NULL DEFAULT ''
+        );
+        INSERT INTO resources VALUES
+            ('old', 'volume', 'cache', 'test', 'sha256:g', 'stack', '/w', 1, 2, 'active'),
+            ('new', 'volume', 'cache', 'test', 'sha256:g', 'stack', '/w', 3, 4, 'active');
+        INSERT INTO leases VALUES ('lease-old', 'old', 1, 1, 1, 1, 900);
+        INSERT INTO generations VALUES ('sha256:g', 'test', 1, NULL);
+        """
+    )
+    connection.close()
+
+    with Registry(path) as migrated:
+        resources = migrated.list_resources()
+        assert len(resources) == 1
+        assert resources[0].id == "new"
+        assert resources[0].created_at == 1
+        assert migrated.leases_for("new")[0].id == "lease-old"
+        assert migrated.meta("schema_version") == "2"
+        assert migrated.generation_superseded_at("sha256:g", stack="test", workspace="/w") is None
+        index_columns = migrated.conn.execute(
+            "PRAGMA index_info(idx_resources_engine_identity)"
+        ).fetchall()
+        assert [row["name"] for row in index_columns] == ["kind", "name"]
 
 
 def test_events_are_recorded_for_lifecycle_actions(registry: Registry) -> None:

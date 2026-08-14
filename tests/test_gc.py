@@ -243,6 +243,59 @@ def test_lease_acquired_after_planning_is_seen_before_idle_stop(
     assert [cmd for cmd in engine.commands if cmd[:2] == ["container", "stop"]] == []
 
 
+def test_dependency_lease_acquired_after_planning_is_seen_before_removal(
+    registry: Registry, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import bosn.gc as gc_mod
+
+    resource = add(registry, "active-volume")
+    engine = FakeEngine({"active-volume": label_dict(registry=registry.registry_id, kind="volume")})
+    clock.advance(10 * DAY)
+    original_plan = gc_mod.plan
+
+    def plan_then_lease(*args, **kwargs):
+        verdicts = original_plan(*args, **kwargs)
+        registry.acquire_lease(resource.id, pid=os.getpid(), proc_start=clock.now())
+        return verdicts
+
+    monkeypatch.setattr(gc_mod, "plan", plan_then_lease)
+    result = Collector(registry, engine).collect(dry_run=False)  # type: ignore[arg-type]
+
+    assert result.removed == []
+    assert result.kept == ["active-volume"]
+    assert engine.removals() == []
+
+
+def test_dependency_reused_after_done_planning_is_seen_before_removal(
+    registry: Registry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import bosn.gc as gc_mod
+
+    resource = add(registry, "reused-volume")
+    assert mark_done(registry, "/w") == 1
+    engine = FakeEngine({"reused-volume": label_dict(registry=registry.registry_id, kind="volume")})
+    original_plan = gc_mod.plan
+
+    def plan_then_reconcile(*args, **kwargs):
+        verdicts = original_plan(*args, **kwargs)
+        registry.reconcile_resource(
+            kind=resource.kind,
+            name=resource.name,
+            stack=resource.stack,
+            generation=resource.generation,
+            scope=resource.scope,
+            workspace=resource.workspace,
+        )
+        return verdicts
+
+    monkeypatch.setattr(gc_mod, "plan", plan_then_reconcile)
+    result = Collector(registry, engine).collect(dry_run=False)  # type: ignore[arg-type]
+
+    assert result.removed == []
+    assert result.kept == ["reused-volume"]
+    assert engine.removals() == []
+
+
 def test_idle_stop_serializes_concurrent_lease_acquisition(
     registry: Registry, clock: FakeClock
 ) -> None:

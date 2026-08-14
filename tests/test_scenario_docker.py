@@ -19,7 +19,7 @@ from bosn import labels
 from bosn.clock import FakeClock
 from bosn.converge import Converger
 from bosn.engine import Engine
-from bosn.gc import Collector, done_workspaces, mark_done, status
+from bosn.gc import Collector, mark_done, status
 from bosn.manifest import load
 from bosn.registry import Registry
 from bosn.resources import ResourceScanner
@@ -87,7 +87,11 @@ def registry(tmp_path: Path, clock: FakeClock) -> Iterator[Registry]:
 
 
 def _cleanup(registry: Registry, engine: Engine) -> None:
-    for resource in registry.list_resources():
+    resources = registry.list_resources()
+    for resource in resources:
+        if resource.kind == "container":
+            engine.run(["container", "rm", "--force", resource.name])
+    for resource in resources:
         if resource.kind == "volume":
             engine.run(["volume", "rm", "--force", resource.name])
         elif resource.kind == "image":
@@ -119,21 +123,21 @@ def test_full_lifecycle_run_lease_done_ttl_gc(
         clock.advance(10 * DAY)
 
         collector = Collector(registry, engine)
-        held = collector.collect(dry_run=True, done_workspaces=done_workspaces(registry))
+        held = collector.collect(dry_run=True)
         assert target.name not in held.removed, "a live lease must protect its resource"
 
         # -- release the lease, then mark the workspace done ------------------
         registry.release_lease(lease.id)
         assert mark_done(registry, str(load(project).root)) >= 1
 
-        planned = collector.collect(dry_run=True, done_workspaces=done_workspaces(registry))
+        planned = collector.collect(dry_run=True)
         assert target.name in planned.removed
         assert all(m.name not in planned.removed for m in machine_volumes), (
             "done must never collect machine-scoped caches"
         )
 
         # -- apply: exactly the owned resources go ----------------------------
-        applied = collector.collect(dry_run=False, done_workspaces=done_workspaces(registry))
+        applied = collector.collect(dry_run=False)
         assert target.name in applied.removed
         assert applied.errors == []
 
@@ -174,7 +178,11 @@ def test_a_lost_registry_rebuilds_from_labels(
     converger = Converger(load(project), registry, engine)
     try:
         converger.run(["true"])
-        original = {r.name for r in registry.list_resources() if r.kind == "volume"}
+        original = {
+            (resource.kind, resource.name)
+            for resource in registry.list_resources()
+            if resource.kind in {"container", "volume", "image"}
+        }
         registry_id = registry.registry_id
 
         # wipe every row, keeping the registry id -- the database is "lost"
@@ -182,9 +190,16 @@ def test_a_lost_registry_rebuilds_from_labels(
             registry.remove_resource(resource.id)
         assert registry.list_resources() == []
 
-        scan = ResourceScanner(engine).scan(registry_id, kinds=["volume"])
+        scan = ResourceScanner(engine).scan(registry_id, kinds=["container", "volume", "image"])
         adopted = adopt(registry, scan, clock=clock)
 
-        assert original <= set(adopted), "every owned volume must be rediscovered from labels"
+        assert {name for _kind, name in original} <= set(adopted)
+        assert {resource.kind for resource in registry.list_resources()} == {
+            "container",
+            "image",
+            "volume",
+        }
+        _result, code, output = converger.run(["echo", "adopted-ok"])
+        assert code == 0, output
     finally:
         _cleanup(registry, engine)

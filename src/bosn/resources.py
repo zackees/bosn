@@ -25,7 +25,9 @@ from bosn.registry import Registry
 _LIST_COMMANDS: dict[str, list[str]] = {
     "container": ["ps", "--all", "--format", "{{json .}}"],
     "volume": ["volume", "ls", "--format", "{{json .}}"],
-    "image": ["images", "--format", "{{json .}}"],
+    # `docker images` shortens `.ID` to 12 characters unless told otherwise.  Adoption,
+    # convergence, execution leases, and GC must all use the same immutable full ID.
+    "image": ["images", "--no-trunc", "--format", "{{json .}}"],
 }
 
 _INSPECT_COMMANDS: dict[str, list[str]] = {
