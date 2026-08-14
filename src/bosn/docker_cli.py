@@ -77,8 +77,13 @@ def _compose_overlay(registry: Registry, compose: Path) -> Path:
     lines = ["services:"]
     for name in names:
         contract = labels.ResourceLabels(
-            registry=registry.registry_id, kind="container", stack=name, generation="compose",
-            scope="stack", workspace=workspace, created=created,
+            registry=registry.registry_id,
+            kind="container",
+            stack=name,
+            generation="compose",
+            scope="stack",
+            workspace=workspace,
+            created=created,
         )
         lines += [f"  {name}:", "    labels:"]
         lines += [f'      {key}: "{value}"' for key, value in contract.to_dict().items()]
