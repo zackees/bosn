@@ -91,7 +91,7 @@ def _remove_built_images(engine: Engine) -> None:
 def converge(daemon: Daemon, project: Path, timeout: float = 300.0):
     return ipc.stream_request(
         daemon.port,
-        {"verb": "converge", "manifest": str(project / "bosn.toml")},
+        {"verb": "converge", "manifest": str(project / "bosn.toml"), "auth": daemon.secret},
         timeout=timeout,
     )
 
@@ -120,7 +120,9 @@ def test_a_real_build_outlives_the_client_that_asked_for_it(served: Daemon, proj
     assert served.jobs.get(job_id).state == "running", "the daemon kept building"
 
     # ...and a re-run reattaches to it rather than starting a second build
-    reattached = ipc.stream_request(served.port, {"verb": "attach", "job": job_id}, timeout=300)
+    reattached = ipc.stream_request(
+        served.port, {"verb": "attach", "job": job_id, "auth": served.secret}, timeout=300
+    )
     assert next(reattached)["event"] == "attached"
     final = [e for e in reattached if e.get("final")][-1]
     assert final["state"] == "succeeded", final.get("error")
@@ -165,7 +167,9 @@ def test_cancelling_a_real_build_leaves_no_generation_row(served: Daemon, projec
     job_id = next(stream)["job"]
     assert wait_until(lambda: served.jobs.get(job_id).state == "running", timeout=30)
 
-    assert ipc.send_request(served.port, {"verb": "cancel", "job": job_id})["ok"]
+    assert ipc.send_request(served.port, {"verb": "cancel", "job": job_id, "auth": served.secret})[
+        "ok"
+    ]
     final = [e for e in stream if e.get("final")][-1]
     assert final["state"] == "cancelled"
 
