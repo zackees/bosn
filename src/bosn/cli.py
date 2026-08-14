@@ -14,6 +14,7 @@ import json
 import sqlite3
 import sys
 from collections.abc import Callable, Sequence
+from typing import NoReturn
 
 from bosn import __version__, ipc
 from bosn.engine import Engine
@@ -69,6 +70,23 @@ def _error(*, code: str, message: str, next_step: str, as_json: bool = False) ->
     return 1
 
 
+class _JSONArgumentParser(argparse.ArgumentParser):
+    """Suppress argparse prose when the caller explicitly requests JSON."""
+
+    def error(self, message: str) -> NoReturn:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "code": "parse.invalid",
+                    "message": message,
+                    "next": "correct the command arguments and retry",
+                }
+            )
+        )
+        raise SystemExit(2)
+
+
 # verb -> (help text, phase that lands it)
 VERBS: dict[str, tuple[str, str]] = {
     "run": ("run an ad-hoc command in a stack", "implemented"),
@@ -93,10 +111,9 @@ class VerbNotImplementedError(RuntimeError):
         self.phase = phase
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="bosn", description="bosn - container lifecycle supervisor"
-    )
+def build_parser(*, json_errors: bool = False) -> argparse.ArgumentParser:
+    parser_type = _JSONArgumentParser if json_errors else argparse.ArgumentParser
+    parser = parser_type(prog="bosn", description="bosn - container lifecycle supervisor")
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument(
         "--engine",
@@ -803,7 +820,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command_index is not None and raw_argv[command_index] not in {*VERBS, DAEMON_VERB}:
         task = raw_argv[command_index]
         raw_argv[command_index : command_index + 1] = ["run", "--task", task]
-    parser = build_parser()
+    parser = build_parser(json_errors="--json" in raw_argv)
     ns = parser.parse_args(raw_argv)
     opts = from_namespace(ns)
 
@@ -832,17 +849,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             # Older human-oriented verbs already return useful exit codes and write
             # diagnostics to stderr.  Adapt that boundary once so JSON callers never
             # need to parse prose while those commands are migrated individually.
+            stdout = io.StringIO()
             stderr = io.StringIO()
-            with contextlib.redirect_stderr(stderr):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 code = handler(opts)
             if code:
-                message = stderr.getvalue().strip() or f"{opts.verb} failed"
+                message = (stderr.getvalue() + stdout.getvalue()).strip() or f"{opts.verb} failed"
                 return _error(
                     code="command.failed",
                     message=message,
                     next_step="resolve the reported condition and retry the command",
                     as_json=True,
                 )
+            print(stdout.getvalue(), end="")
+            print(stderr.getvalue(), end="", file=sys.stderr)
             return code
         return handler(opts)
 

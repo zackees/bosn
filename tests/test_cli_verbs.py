@@ -132,6 +132,19 @@ def test_done_json_error_uses_the_common_envelope(tmp_path, capsys) -> None:
     payload = json.loads(capsys.readouterr().out)
     assert payload["code"] == "command.failed"
     assert payload["next"] == "resolve the reported condition and retry the command"
+
+
+def test_doctor_json_failure_emits_one_parseable_envelope(tmp_path, capsys) -> None:
+    assert cli.main(["--json", "--engine", "definitely-not-an-engine", "doctor"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["code"] == "command.failed"
+
+
+def test_json_parse_error_has_the_stable_envelope(capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--json", "gc", "--apply", "--dry-run"])
+    assert exc.value.code == 2
+    assert json.loads(capsys.readouterr().out)["code"] == "parse.invalid"
     assert cli.VERBS["cancel"][1] == "implemented"
 
 
