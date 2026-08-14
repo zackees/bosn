@@ -121,6 +121,30 @@ def test_warm_volumes_survive_far_longer_than_containers(
     assert evaluate(registry, volume, alive_probe=DEAD).reason == COLLECT_IDLE
 
 
+def test_networks_share_the_container_removal_clock_not_the_volume_warm_ttl(
+    registry: Registry, clock: FakeClock
+) -> None:
+    """A network is cheap to recreate, like a container -- not a warm cache asset."""
+    network = make(registry, kind="network")
+
+    # Past the volume's 72h warm TTL would still be warm, but well past the container's
+    # 24h removal clock: a network should already be collectable here.
+    clock.advance(1 * DAY + 1)
+    verdict = evaluate(registry, network, alive_probe=DEAD)
+    assert verdict.collect
+    assert verdict.reason == COLLECT_IDLE
+
+
+def test_a_fresh_network_is_kept_warm_before_its_removal_clock_elapses(
+    registry: Registry, clock: FakeClock
+) -> None:
+    network = make(registry, kind="network")
+    clock.advance(1 * HOUR)
+    verdict = evaluate(registry, network, alive_probe=DEAD)
+    assert not verdict.collect
+    assert verdict.reason == KEPT_WARM
+
+
 # -- superseded generations ------------------------------------------------
 
 

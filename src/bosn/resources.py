@@ -34,12 +34,14 @@ _LIST_COMMANDS: dict[str, list[str]] = {
     # `docker images` shortens `.ID` to 12 characters unless told otherwise.  Adoption,
     # convergence, execution leases, and GC must all use the same immutable full ID.
     "image": ["images", "--no-trunc", "--format", "{{json .}}"],
+    "network": ["network", "ls", "--format", "{{json .}}"],
 }
 
 _INSPECT_COMMANDS: dict[str, list[str]] = {
     "container": ["inspect", "--format", "{{json .Config.Labels}}"],
     "volume": ["volume", "inspect", "--format", "{{json .Labels}}"],
     "image": ["image", "inspect", "--format", "{{json .Config.Labels}}"],
+    "network": ["network", "inspect", "--format", "{{json .Labels}}"],
 }
 
 
@@ -109,6 +111,8 @@ def _name_of(kind: str, row: dict[str, object]) -> str:
         return str(row.get("Name", ""))
     if kind == "image":
         return str(row.get("ID", ""))
+    # `container` rows carry `Names`; `network` rows carry `Name` (no plural) -- both fall
+    # through to this shared branch rather than getting a dedicated one.
     return str(row.get("Names") or row.get("Name") or row.get("ID", ""))
 
 

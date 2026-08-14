@@ -63,6 +63,8 @@ class FakeEngine:
             if args[0] == "images"
             else "container"
             if args[0] == "ps"
+            else "network"
+            if args[0] == "network"
             else None
         )
         rows = self.listings.get(kind or "", [])
@@ -129,6 +131,29 @@ def test_image_discovery_requests_and_keeps_the_full_immutable_id() -> None:
 
     assert [resource.name for resource in scan.owned] == [image_id]
     assert ["images", "--no-trunc", "--format", "{{json .}}"] in engine.commands
+
+
+def test_network_discovery_classifies_owned_foreign_and_unlabeled() -> None:
+    """A Compose project's network must be scannable exactly like a container or volume."""
+    engine = FakeEngine(
+        {
+            "network": [
+                {"Name": "proj_default", "Labels": json.dumps(label_dict(kind="network"))},
+                {
+                    "Name": "someone-elses",
+                    "Labels": json.dumps(label_dict(kind="network", registry=THEIRS)),
+                },
+                {"Name": "bridge", "Labels": ""},
+            ]
+        }
+    )
+
+    scan = ResourceScanner(engine).scan(OURS, kinds=["network"])  # type: ignore[arg-type]
+
+    assert [r.name for r in scan.owned] == ["proj_default"]
+    assert [r.name for r in scan.foreign] == ["someone-elses"]
+    assert [r.name for r in scan.unlabeled] == ["bridge"]
+    assert ["network", "ls", "--format", "{{json .}}"] in engine.commands
 
 
 @pytest.mark.parametrize(
