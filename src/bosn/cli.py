@@ -101,6 +101,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--manifest", default=None, help="path to bosn.toml (default: nearest one upward)"
     )
+    parser.add_argument(
+        "--json", action="store_true", help="emit structured machine-readable output"
+    )
     # Policy is global because every command must resolve exactly the same snapshot.
     # The daemon repeats its three operational flags after the verb for spawned argv
     # compatibility; the remaining flags belong before the verb like --engine.
@@ -114,8 +117,7 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("--stack", default=None, help="stack to use (default: the default)")
             sub.add_argument("--task", default=None, help="run a manifest task by name")
             sub.add_argument("--manifest", default=None, dest="sub_manifest")
-        if verb in {"tasks", "status"}:
-            sub.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+        sub.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
         if verb == "gc":
             group = sub.add_mutually_exclusive_group()
             group.add_argument(
@@ -590,14 +592,26 @@ def cmd_gc(opts: Options) -> int:
             "gc", opts.state_dir, engine=opts.engine, dry_run=opts.dry_run, policy_flags=flags
         )
     except ConfigError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
+        return _error(
+            code="policy.invalid",
+            message=str(exc),
+            next_step="correct the named policy value and retry",
+            as_json=opts.json,
+        )
     except (daemon_mod.DaemonError, ipc.TransportError) as exc:
-        print(f"cannot reach the bosn daemon: {exc}", file=sys.stderr)
-        return 1
+        return _error(
+            code="daemon.unreachable",
+            message=f"cannot reach the bosn daemon: {exc}",
+            next_step="start or restart the daemon, then retry",
+            as_json=opts.json,
+        )
     if not reply.get("ok"):
-        print(str(reply.get("error") or "gc failed"), file=sys.stderr)
-        return 1
+        return _error(
+            code="gc.failed",
+            message=str(reply.get("error") or "gc failed"),
+            next_step="inspect `bosn status` and retry after resolving the reported error",
+            as_json=opts.json,
+        )
     print(json.dumps({**reply["result"], "dry_run": opts.dry_run}, indent=2))
     for name in reply.get("would_stop", []):
         print(f"would stop {name}")

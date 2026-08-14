@@ -98,6 +98,13 @@ def test_tasks_json_manifest_error_has_stable_remedy(tmp_path, capsys) -> None:
         "message": payload["message"],
         "next": "create or select a valid bosn.toml with --manifest",
     }
+
+
+def test_gc_json_daemon_error_has_stable_remedy(tmp_path, capsys) -> None:
+    assert cli.main(["--state-dir", str(tmp_path), "gc", "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["code"] == "daemon.unreachable"
+    assert payload["next"] == "start or restart the daemon, then retry"
     assert cli.VERBS["cancel"][1] == "implemented"
 
 
