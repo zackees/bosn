@@ -480,6 +480,24 @@ class Daemon:
                 "maintenance.prune_leases.error", f"{type(exc).__name__}: {exc}"
             )
 
+        # Derived done-signals run before GC (so a workspace reclaimed in this very pass is
+        # eligible for the same pass's collection) and before the engine reachability check
+        # below (so a Docker-down machine still gets the benefit -- this step only shells
+        # out to git, never Docker).
+        self.registry.log_event("maintenance.derived_done.started")
+        try:
+            candidates, reclaimed = self._derived_done_pass()
+            self.registry.log_event(
+                "maintenance.derived_done.finished",
+                f"candidates={candidates} reclaimed={reclaimed}",
+            )
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a scheduler failure must be visible, not silent
+            self.registry.log_event(
+                "maintenance.derived_done.error", f"{type(exc).__name__}: {exc}"
+            )
+
         engine = Engine(self.engine_binary)
         info = engine.info()
         if not info.reachable:
@@ -505,6 +523,63 @@ class Daemon:
             self.registry.log_event("maintenance.gc.finished", json.dumps(result.summary()))
         self._maintenance_backoff_seconds = MAINTENANCE_BACKOFF_INITIAL_SECONDS
         self._set_next_maintenance(self.clock.now() + self.maintenance_interval_seconds)
+
+    def _derived_done_pass(self) -> tuple[int, int]:
+        """Mark done every not-yet-done workspace whose Git state proves it is finished.
+
+        Explicit `bosn done` remains the strongest, first-party signal -- this only ever
+        *adds* done-ness through the same `gc.mark_done` write path, never removes it and
+        never overrides one. A workspace is enumerated from `resources.workspace` (via
+        `list_resources`), the same identity `mark_workspace_done` matches on, so it is
+        passed through to `classify_workspace`/`mark_done` unmodified rather than
+        renormalized. This misses a workspace that only survives in an older
+        `resource_uses` row whose owning resource has since moved on to a different
+        workspace -- an acceptable gap, since the failure direction is a missed
+        reclamation, never a false "done".
+
+        Every decision is logged, protected or reclaimed alike: a protected workspace with
+        no recorded reason is what makes a derived-done pass untrustworthy. A classifier
+        that raises protects the workspace it was evaluating and is logged, but must never
+        aim to take down the rest of this pass -- so it is caught per workspace, not once
+        for the whole loop.
+
+        Returns (candidates considered, workspaces reclaimed).
+        """
+        from bosn.gc import mark_done
+        from bosn.gitstate import classify_workspace
+
+        known = {
+            resource.workspace
+            for resource in self.registry.list_resources()
+            if resource.scope != "machine" and resource.workspace
+        }
+        candidates = sorted(known - self.registry.done_workspace_ids())
+        reclaimed = 0
+        for workspace in candidates:
+            try:
+                verdict = classify_workspace(workspace)
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:  # noqa: BLE001 - ambiguity protects; a failed classifier
+                # decides nothing, so treat it the same as any other non-safe verdict:
+                # log why, leave the workspace exactly as it was, keep evaluating the rest.
+                self.registry.log_event(
+                    "maintenance.derived_done.error", f"{workspace}: {type(exc).__name__}: {exc}"
+                )
+                continue
+            if verdict.safe_to_mark_done:
+                mark_done(self.registry, workspace)
+                reclaimed += 1
+                self.registry.log_event(
+                    "maintenance.derived_done.reclaimed",
+                    f"{workspace} state={verdict.state.value} evidence={verdict.evidence}",
+                )
+            else:
+                self.registry.log_event(
+                    "maintenance.derived_done.protected",
+                    f"{workspace} state={verdict.state.value} evidence={verdict.evidence}",
+                )
+        return len(candidates), reclaimed
 
     def _set_next_maintenance(self, deadline: float) -> None:
         self._next_maintenance_at = deadline
