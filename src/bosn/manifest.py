@@ -105,11 +105,20 @@ class MountSpec:
     def resolve_source(self, root: Path) -> Path:
         """The absolute host path, relative to the manifest root.
 
+        The spelling is whatever shell wrote the manifest. A path typed in Git Bash reads
+        `/c/work/repo`, which `Path` on Windows would join into `C:\\c\\work\\repo` -- a
+        directory that does not exist, so the check below would reject a source that is
+        perfectly valid. Unlike argv, a string inside bosn.toml never passes through MSYS
+        path conversion, so nothing upstream has already fixed it.
+
         A missing source is an error rather than a silently engine-created empty
         directory: mounting a directory that was supposed to hold your source tree, and
         getting an empty one, fails much later and much more confusingly.
         """
-        resolved = (root / self.source).resolve()
+        from bosn.paths import to_host_path
+
+        spelled = to_host_path(self.source)
+        resolved = (spelled if spelled.is_absolute() else root / spelled).resolve()
         if not resolved.exists():
             raise ManifestError(
                 f"mount {self.name!r} sources {self.source!r}, which resolves to "
@@ -198,7 +207,12 @@ def find_manifest(start: Path | None = None) -> Path | None:
 
 
 def load(path: Path | str) -> Manifest:
-    path = Path(path)
+    # Accepts whatever spelling the caller's shell produced. Argv from Git Bash is usually
+    # converted to a native path before it reaches us, but "usually" is not a contract:
+    # MSYS_NO_PATHCONV, a path built inside a script, or an IPC client all bypass it.
+    from bosn.paths import to_host_path
+
+    path = to_host_path(path)
     if path.is_dir():
         path = path / MANIFEST_NAME
     if not path.is_file():
