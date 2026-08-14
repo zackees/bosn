@@ -186,11 +186,21 @@ def test_the_port_is_released_for_the_next_daemon(tmp_path: Path) -> None:
 
 
 def test_idle_retirement_stops_an_unused_daemon(tmp_path: Path) -> None:
+    """An unused daemon retires itself.
+
+    The maintenance deadline is pushed out of the way first because `_idle_watchdog`
+    runs `run_maintenance_if_due()` in the same 0.5s tick that checks retirement, and a
+    due maintenance pass probes the engine twice at `engine.DEFAULT_TIMEOUT` (60s) each.
+    On a host where the docker binary is present but its daemon is unreachable -- every
+    hosted Windows/macOS runner -- that blocks the tick for up to two minutes and this
+    assertion times out having measured engine probing rather than idle retirement.
+    """
     daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=0.5)
+    daemon._set_next_maintenance(daemon.clock.now() + 3600)
     thread = threading.Thread(target=daemon.serve_forever, daemon=True)
     thread.start()
     assert _wait_until(lambda: daemon_mod.is_serving(tmp_path))
-    thread.join(timeout=20)
+    thread.join(timeout=30)
     assert not thread.is_alive(), "idle daemon should have retired itself"
     assert not daemon_mod.is_serving(tmp_path)
 
