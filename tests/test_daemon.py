@@ -753,6 +753,220 @@ def test_malformed_persisted_maintenance_deadline_recovers(tmp_path: Path) -> No
         daemon.registry.close()
 
 
+# -- derived done-signals (#49) ---------------------------------------------
+#
+# `classify_workspace` is faked throughout: the classifier module (bosn.gitstate) proves
+# its own git-state logic against real repositories in its own test module. These tests
+# only prove the daemon's wiring -- enumeration, the mark-done call, event evidence, and
+# fault isolation -- so nothing here builds a real git repo.
+
+
+def _seed_workspace(registry, workspace: str, name: str, *, scope: str = "spec") -> None:
+    registry.register_resource(
+        kind="volume", name=name, stack="s", generation="g", scope=scope, workspace=workspace
+    )
+
+
+def _fake_verdict(state, evidence: str):
+    from bosn.gitstate import WorkspaceState, WorkspaceVerdict
+
+    resolved = state if isinstance(state, WorkspaceState) else WorkspaceState(state)
+    safe = resolved in (WorkspaceState.ABSENT, WorkspaceState.CLEAN)
+    return WorkspaceVerdict(state=resolved, safe_to_mark_done=safe, evidence=evidence)
+
+
+def test_derived_done_marks_absent_and_clean_workspaces(monkeypatch, tmp_path: Path) -> None:
+    import bosn.gitstate
+
+    clock = FakeClock()
+    daemon = Daemon(state_dir=tmp_path, clock=clock)
+    try:
+        _seed_workspace(daemon.registry, "/absent", "vol-absent")
+        _seed_workspace(daemon.registry, "/clean", "vol-clean")
+
+        def fake_classify(path):
+            from bosn.gitstate import WorkspaceState
+
+            mapping = {
+                "/absent": (WorkspaceState.ABSENT, "does not exist"),
+                "/clean": (WorkspaceState.CLEAN, "'main' is clean and matches upstream"),
+            }
+            state, evidence = mapping[str(path)]
+            return _fake_verdict(state, evidence)
+
+        monkeypatch.setattr(bosn.gitstate, "classify_workspace", fake_classify)
+
+        candidates, reclaimed = daemon._derived_done_pass()
+
+        assert candidates == 2
+        assert reclaimed == 2
+        assert daemon.registry.done_workspace_ids() == {"/absent", "/clean"}
+    finally:
+        daemon.registry.close()
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "dirty",
+        "unpushed",
+        "detached",
+        "no_upstream",
+        "not_a_repo",
+        "unavailable",
+    ],
+)
+def test_derived_done_leaves_unsafe_states_untouched(
+    monkeypatch, tmp_path: Path, state: str
+) -> None:
+    import bosn.gitstate
+
+    clock = FakeClock()
+    daemon = Daemon(state_dir=tmp_path, clock=clock)
+    try:
+        _seed_workspace(daemon.registry, "/w", "vol")
+
+        monkeypatch.setattr(
+            bosn.gitstate, "classify_workspace", lambda _path: _fake_verdict(state, "evidence")
+        )
+
+        candidates, reclaimed = daemon._derived_done_pass()
+
+        assert candidates == 1
+        assert reclaimed == 0
+        assert daemon.registry.done_workspace_ids() == set()
+    finally:
+        daemon.registry.close()
+
+
+def test_derived_done_does_not_reclassify_an_already_done_workspace(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import bosn.gitstate
+    from bosn.gc import mark_done
+
+    clock = FakeClock()
+    daemon = Daemon(state_dir=tmp_path, clock=clock)
+    try:
+        _seed_workspace(daemon.registry, "/already-done", "vol-done")
+        _seed_workspace(daemon.registry, "/pending", "vol-pending")
+        assert mark_done(daemon.registry, "/already-done") == 1
+
+        classified: list[str] = []
+
+        def fake_classify(path):
+            classified.append(str(path))
+            return _fake_verdict("clean", "clean and pushed")
+
+        monkeypatch.setattr(bosn.gitstate, "classify_workspace", fake_classify)
+
+        candidates, reclaimed = daemon._derived_done_pass()
+
+        assert candidates == 1
+        assert reclaimed == 1
+        assert classified == ["/pending"], "an already-done workspace must never be reclassified"
+    finally:
+        daemon.registry.close()
+
+
+def test_derived_done_logs_evidence_for_both_directions(monkeypatch, tmp_path: Path) -> None:
+    import bosn.gitstate
+
+    clock = FakeClock()
+    daemon = Daemon(state_dir=tmp_path, clock=clock)
+    try:
+        _seed_workspace(daemon.registry, "/safe", "vol-safe")
+        _seed_workspace(daemon.registry, "/unsafe", "vol-unsafe")
+
+        def fake_classify(path):
+            from bosn.gitstate import WorkspaceState
+
+            if str(path) == "/safe":
+                return _fake_verdict(WorkspaceState.CLEAN, "'main' is clean and matches upstream")
+            return _fake_verdict(WorkspaceState.DIRTY, "3 uncommitted changes")
+
+        monkeypatch.setattr(bosn.gitstate, "classify_workspace", fake_classify)
+
+        daemon._derived_done_pass()
+
+        events = [(row["kind"], row["detail"]) for row in daemon.registry.events()]
+        reclaimed = [
+            detail for kind, detail in events if kind == "maintenance.derived_done.reclaimed"
+        ]
+        protected = [
+            detail for kind, detail in events if kind == "maintenance.derived_done.protected"
+        ]
+        assert len(reclaimed) == 1
+        assert "/safe" in reclaimed[0]
+        assert "clean and matches upstream" in reclaimed[0]
+        assert len(protected) == 1
+        assert "/unsafe" in protected[0]
+        assert "3 uncommitted changes" in protected[0]
+    finally:
+        daemon.registry.close()
+
+
+def test_derived_done_raising_classifier_protects_and_does_not_block_gc(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A classifier crash must be logged, must protect the workspace it was evaluating, and
+    must not prevent the GC step that follows it in the same pass from running."""
+    import bosn.gitstate
+
+    clock = FakeClock()
+
+    class ReachableEngine:
+        def __init__(self, _binary: str) -> None:
+            pass
+
+        def info(self) -> EngineInfo:
+            return EngineInfo(binary="docker", reachable=True)
+
+    gc_calls: list[str] = []
+
+    class RecordingCollector:
+        def __init__(self, _registry, _engine, *, config=None) -> None:
+            pass
+
+        def collect(self, **_kwargs):
+            gc_calls.append("gc")
+
+            class Result:
+                def summary(self):
+                    return {"removed": 0}
+
+            return Result()
+
+    import bosn.engine
+    import bosn.gc
+
+    monkeypatch.setattr(bosn.engine, "Engine", ReachableEngine)
+    monkeypatch.setattr(bosn.gc, "Collector", RecordingCollector)
+
+    def boom(_path):
+        raise RuntimeError("git executable vanished mid-classification")
+
+    monkeypatch.setattr(bosn.gitstate, "classify_workspace", boom)
+
+    daemon = Daemon(state_dir=tmp_path, clock=clock, maintenance_interval_seconds=60)
+    try:
+        _seed_workspace(daemon.registry, "/flaky", "vol-flaky")
+
+        assert daemon.run_maintenance_if_due() is True
+
+        events = [(row["kind"], row["detail"]) for row in reversed(daemon.registry.events())]
+        kinds = [kind for kind, _detail in events]
+        assert any(
+            kind == "maintenance.derived_done.error" and "/flaky" in detail
+            for kind, detail in events
+        )
+        assert daemon.registry.done_workspace_ids() == set()
+        assert "maintenance.gc.started" in kinds
+        assert gc_calls == ["gc"], "a classifier failure must not prevent GC from running"
+    finally:
+        daemon.registry.close()
+
+
 def test_adopt_with_multiple_foreign_registries_prints_selectable_commands(
     monkeypatch, tmp_path: Path
 ) -> None:
