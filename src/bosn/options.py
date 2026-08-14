@@ -39,6 +39,8 @@ class Options:
     # daemon
     port: int | None = None
     idle_retire_seconds: float | None = None
+    max_builds: int | None = None
+    build_ttl_seconds: float | None = None
     stop: bool = False
 
     extras: tuple[str, ...] = field(default=())
@@ -88,6 +90,8 @@ def from_namespace(ns: argparse.Namespace) -> Options:
 
     idle = get("idle_retire_seconds")
     port = get("port")
+    max_builds = get("max_builds")
+    build_ttl = get("build_ttl_seconds")
 
     return Options(
         verb=_as_str(get("verb")),
@@ -100,5 +104,7 @@ def from_namespace(ns: argparse.Namespace) -> Options:
         dry_run=bool(get("dry_run", True)),
         port=None if port is None else int(str(port)),
         idle_retire_seconds=None if idle is None else float(str(idle)),
+        max_builds=None if max_builds is None else int(str(max_builds)),
+        build_ttl_seconds=None if build_ttl is None else float(str(build_ttl)),
         stop=bool(get("stop", False)),
     )

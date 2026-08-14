@@ -294,6 +294,12 @@ class Registry:
         )
         return cur.rowcount
 
+    def generation_recorded(self, digest: str) -> bool:
+        return (
+            self._exec("SELECT 1 FROM generations WHERE digest = ?", (digest,)).fetchone()
+            is not None
+        )
+
     def generation_superseded_at(self, digest: str) -> float | None:
         row = self._exec(
             "SELECT superseded_at FROM generations WHERE digest = ?", (digest,)

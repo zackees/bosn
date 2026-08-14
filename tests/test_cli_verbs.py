@@ -9,7 +9,8 @@ from bosn import cli
 UNIMPLEMENTED = sorted(v for v, (_, phase) in cli.VERBS.items() if phase != "implemented")
 
 
-@pytest.mark.parametrize("verb", UNIMPLEMENTED)
+@pytest.mark.skipif(not UNIMPLEMENTED, reason="every designed verb is implemented")
+@pytest.mark.parametrize("verb", UNIMPLEMENTED or [""])
 def test_unimplemented_verbs_fail_with_a_specific_error(verb: str, capsys) -> None:
     code = cli.main([verb])
     assert code == cli.NOT_IMPLEMENTED_EXIT, f"{verb} must not silently succeed"
@@ -18,9 +19,50 @@ def test_unimplemented_verbs_fail_with_a_specific_error(verb: str, capsys) -> No
     assert "not implemented" in err
 
 
+def test_the_unimplemented_path_still_fails_loudly() -> None:
+    """Kept live even with nothing left to skip: a placeholder must never be a no-op."""
+    error = cli.VerbNotImplementedError("someday", "a later phase")
+    assert "someday" in str(error)
+    assert "not implemented" in str(error)
+
+
 def test_every_designed_verb_is_registered() -> None:
-    designed = {"run", "shell", "tasks", "jobs", "attach", "status", "gc", "done", "doctor"}
+    designed = {
+        "run",
+        "shell",
+        "tasks",
+        "jobs",
+        "attach",
+        "cancel",
+        "status",
+        "gc",
+        "done",
+        "doctor",
+    }
     assert designed <= set(cli.VERBS)
+
+
+def test_attach_and_cancel_are_no_longer_placeholders() -> None:
+    """Both landed with daemon-owned jobs; `attach`'s stale 'phase 6' label went with them."""
+    assert cli.VERBS["attach"][1] == "implemented"
+    assert cli.VERBS["cancel"][1] == "implemented"
+
+
+def test_attach_without_a_job_id_explains_itself(capsys) -> None:
+    assert cli.main(["attach"]) == 2
+    assert "job id" in capsys.readouterr().err
+
+
+def test_cancel_without_a_job_id_explains_itself(capsys) -> None:
+    assert cli.main(["cancel"]) == 2
+    assert "job id" in capsys.readouterr().err
+
+
+def test_cancel_fails_closed_when_no_daemon_is_running(tmp_path, capsys) -> None:
+    """No daemon means no jobs to cancel -- and never a fallback to raw Docker."""
+    code = cli.main(["--state-dir", str(tmp_path), "cancel", "j1-abc"])
+    assert code == 1
+    assert "cannot reach the bosn daemon" in capsys.readouterr().err
 
 
 def test_unknown_verb_is_rejected() -> None:
@@ -35,3 +77,25 @@ def test_doctor_reports_unreachable_engine_without_crashing(capsys) -> None:
     captured = capsys.readouterr()
     assert "reachable:      no" in captured.out
     assert "not on PATH" in captured.err
+
+
+def test_stopping_a_daemon_that_was_not_running_says_so(tmp_path, capsys) -> None:
+    assert cli.main(["--state-dir", str(tmp_path), "__daemon", "--stop"]) == 0
+    assert "no daemon was running" in capsys.readouterr().out
+
+
+def test_a_daemon_still_draining_is_not_reported_as_absent(tmp_path, monkeypatch, capsys) -> None:
+    """Stopping now waits for in-flight builds, so the wait can expire on a live daemon.
+
+    Saying "no daemon was running" there would be a plainly wrong answer to the question
+    the user asked, and it would send them looking in the wrong place.
+    """
+    from bosn import daemon as daemon_mod
+
+    monkeypatch.setattr(daemon_mod, "is_serving", lambda *a, **k: True)
+    monkeypatch.setattr(daemon_mod, "stop", lambda *a, **k: False)
+
+    assert cli.main(["--state-dir", str(tmp_path), "__daemon", "--stop"]) == 1
+    err = capsys.readouterr().err
+    assert "still shutting down" in err
+    assert "bosn jobs" in err

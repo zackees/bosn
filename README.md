@@ -117,10 +117,73 @@ Everything else is lifecycle and introspection:
 bosn tasks --json            # discovery: tasks, stacks, digests, registration state
 bosn status                  # tiers, leases, managed bytes vs ceiling, foreign registries
 bosn jobs / bosn attach <j>  # daemon-owned builds that survive a killed CLI
+bosn cancel <j>              # stop a build you no longer want
 bosn done                    # this workspace is finished; its caches become collectable
 bosn gc --dry-run            # what would be reclaimed right now
 bosn doctor                  # engine health, backing-volume free space, VHDX slack
 ```
+
+## Build jobs and the concurrency policy
+
+Cold builds belong to the daemon, not to the CLI that asked for one. `bosn run` submits a
+converge, attaches, streams the build to stderr, and exits with the job's status — but if
+that CLI is killed, the build keeps going. Re-run the same command and you reattach to it;
+`bosn jobs` lists what is in flight and `bosn attach <id>` reconnects explicitly. This is
+the whole point: a 20-minute build must not die because an agent's timeout fired.
+
+Which creates the problem the policy exists to solve. The daemon now owns work that
+outlives its requester, and bosn's primary consumer is an agent in an edit-and-rerun loop.
+Each edit is a new digest against the same stack, so those requests neither join (not
+identical) nor parallelize (same key). Left to serialize, they queue without bound — every
+entry but the last obsolete on arrival, each pinning volumes against GC, and running jobs
+block idle retirement, so the loop keeps the daemon resident and its resources
+uncollectable at the same time.
+
+**The rule: per `(workspace-id, stack)`, at most one running build and one pending
+request.**
+
+| Request arrives while... | What happens |
+| --- | --- |
+| nothing is in flight | it builds |
+| the same digest is building | it **joins** — one build, many watchers |
+| a different digest is building | it takes the **pending slot** |
+| the pending slot holds the same digest | it joins that |
+| the pending slot holds a different digest | it replaces the occupant, which ends as **superseded** |
+
+The bound is structural rather than tuned, and the worst case is waiting out one obsolete
+build — which warms BuildKit's layer cache for the one that follows. The alternative of
+cancelling in-flight builds so the newest always wins is more responsive but can livelock:
+under a fast edit loop every build is killed before finishing and the agent never gets
+output. Rejecting the second request instead ("a build is already running") turns a queue
+problem into a retry loop, which this project treats as a bug, not an error message.
+
+The consequence worth knowing: superseding only ever drops a build that has **not
+started**, so cancellation never happens behind your back. Stopping a running build is
+always deliberate — `bosn cancel`, daemon shutdown, or the per-job TTL.
+
+Other guarantees:
+
+- **Distinct keys build in parallel.** Two worktrees never block each other. `workspace-id`
+  is the resolved manifest root, never the cwd, so two agents in different subdirectories
+  of one worktree correctly share a key.
+- **Total concurrency is capped** at `max(2, cpus/2)` builds machine-wide (`BOSN_MAX_BUILDS`).
+  Per-key serialization alone does not bound host load; N worktrees still can.
+- **A cancelled build leaves nothing behind.** Registration happens only after `docker
+  build` exits 0, so a killed build cannot leave a generation row implying a usable image —
+  and cannot mark the previous, working generation superseded.
+- **Nothing fails silently.** A superseded, dropped, or cancelled request exits non-zero
+  with a message naming what happened: `4` for superseded, `5` for cancelled, `1` for a
+  build that failed.
+- **A hung build cannot pin the daemon.** Running jobs block idle retirement, so a per-job
+  TTL (default 1 h, `BOSN_BUILD_TTL_SECONDS`) reaps anything that stops reporting.
+- **Job history is bounded too.** The 50 most recent finished jobs stay listable and
+  attachable; older ids are forgotten and report `no such job`. Remembering every job of
+  an all-day agent loop, each with its build output, is the same kind of unbounded growth
+  the queue policy exists to prevent.
+
+There is deliberately no `--detach`. Blocking-with-attach is the only mode, because
+backgrounding is the easiest way to recreate the pile-up above and fan-out is already
+available by running from multiple worktrees.
 
 ## Existing Docker and Compose workloads
 

@@ -4,6 +4,12 @@ A newline-delimited JSON protocol over loopback TCP. Loopback (not a unix socket
 v1 targets cmd.exe, PowerShell, and MSYS Git Bash on Windows alongside macOS and Linux with
 one mechanism. The listening port is published in the daemon's state file.
 
+Most verbs are one request, one reply. Build jobs are the exception: the connection stays
+open and the daemon writes a stream of events -- output lines, status changes, heartbeats
+-- terminated by one message carrying `"final": true`. That is why reads go through
+`MessageStream` rather than a single recv: a stream puts many messages on one socket, and
+whatever arrives past the first newline is the next message, not garbage to discard.
+
 Mutating verbs fail closed when the daemon is unreachable -- falling back to raw Docker
 would recreate exactly the unregistered resources bosn exists to eliminate.
 """
@@ -12,14 +18,58 @@ from __future__ import annotations
 
 import json
 import socket
+from collections.abc import Generator
 from typing import Any
 
 LOOPBACK = "127.0.0.1"
 DEFAULT_TIMEOUT = 10.0
+# Generous, because a cold build is silent for long stretches -- but not infinite, because
+# a client must eventually notice a daemon that died. The daemon heartbeats well inside it.
+STREAM_TIMEOUT = 120.0
+# A connected client that has not sent its request by now is not going to.
+REQUEST_READ_TIMEOUT = 30.0
 
 
 class TransportError(RuntimeError):
     """The daemon could not be reached or spoke nonsense."""
+
+
+class MessageStream:
+    """Reads newline-delimited JSON objects off a socket, buffering across messages."""
+
+    def __init__(self, sock: socket.socket, *, timeout: float | None = DEFAULT_TIMEOUT) -> None:
+        self.sock = sock
+        self._buffer = b""
+        if timeout is not None:
+            self.sock.settimeout(timeout)
+
+    def read(self) -> dict[str, Any] | None:
+        """The next message, or None at clean end of stream."""
+        while b"\n" not in self._buffer:
+            try:
+                chunk = self.sock.recv(65536)
+            except TimeoutError as exc:
+                raise TransportError("timed out waiting for the daemon") from exc
+            except OSError as exc:
+                raise TransportError(f"connection to the daemon failed: {exc}") from exc
+            if not chunk:
+                if self._buffer.strip():
+                    raise TransportError("daemon closed the connection mid-message")
+                return None
+            self._buffer += chunk
+        raw, self._buffer = self._buffer.split(b"\n", 1)
+        if not raw.strip():
+            return None
+        try:
+            message = json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise TransportError(f"malformed reply from daemon: {exc}") from exc
+        if not isinstance(message, dict):
+            raise TransportError("daemon reply was not a JSON object")
+        return message
+
+    def write(self, message: dict[str, Any]) -> None:
+        self.sock.sendall((json.dumps(message) + "\n").encode("utf-8"))
 
 
 def send_request(
@@ -29,43 +79,68 @@ def send_request(
     host: str = LOOPBACK,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> dict[str, Any]:
-    payload = (json.dumps(request) + "\n").encode("utf-8")
+    """One request, one reply."""
     try:
         with socket.create_connection((host, port), timeout=timeout) as sock:
-            sock.settimeout(timeout)
-            sock.sendall(payload)
-            return _read_message(sock)
+            stream = MessageStream(sock, timeout=timeout)
+            stream.write(request)
+            reply = stream.read()
+    except TransportError:
+        raise
     except OSError as exc:
         raise TransportError(f"daemon unreachable on {host}:{port}: {exc}") from exc
-
-
-def _read_message(sock: socket.socket) -> dict[str, Any]:
-    chunks: list[bytes] = []
-    while True:
-        chunk = sock.recv(4096)
-        if not chunk:
-            break
-        chunks.append(chunk)
-        if b"\n" in chunk:
-            break
-    raw = b"".join(chunks).split(b"\n", 1)[0]
-    if not raw:
+    if reply is None:
         raise TransportError("daemon closed the connection without replying")
+    return reply
+
+
+def stream_request(
+    port: int,
+    request: dict[str, Any],
+    *,
+    host: str = LOOPBACK,
+    timeout: float = STREAM_TIMEOUT,
+) -> Generator[dict[str, Any], None, None]:
+    """One request, many replies -- yields events until the daemon sends `final`.
+
+    Disconnecting mid-stream is safe and expected: the job belongs to the daemon, so
+    hanging up abandons the *view*, never the work.
+    """
     try:
-        message = json.loads(raw.decode("utf-8"))
-    except json.JSONDecodeError as exc:
-        raise TransportError(f"malformed reply from daemon: {exc}") from exc
-    if not isinstance(message, dict):
-        raise TransportError("daemon reply was not a JSON object")
-    return message
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except OSError as exc:
+        raise TransportError(f"daemon unreachable on {host}:{port}: {exc}") from exc
+    with sock:
+        stream = MessageStream(sock, timeout=timeout)
+        stream.write(request)
+        while True:
+            message = stream.read()
+            if message is None:
+                raise TransportError("daemon closed the stream before the job ended")
+            yield message
+            if message.get("final"):
+                return
 
 
 def read_request(conn: socket.socket) -> dict[str, Any] | None:
-    """Server side: read one newline-delimited JSON request, or None on clean EOF."""
+    """Server side: read one newline-delimited JSON request, or None on clean EOF.
+
+    The read is deadlined even though the daemon is patient elsewhere. A client always
+    writes its request immediately, so a connection that opens and then says nothing is a
+    port scanner, a half-open socket, or a CLI killed mid-handshake -- and with no timeout
+    each one parks a handler thread in `recv` forever. Daemon threads keep that from
+    blocking process exit, but they accumulate without bound in a process meant to stay
+    resident for hours.
+
+    The deadline is then cleared: it governs reading the request, not the minutes or hours
+    of build output that a streaming verb may go on to write.
+    """
     try:
-        return _read_message(conn)
+        request = MessageStream(conn, timeout=REQUEST_READ_TIMEOUT).read()
     except TransportError:
         return None
+    conn.settimeout(None)
+    return request
 
 
 def send_response(conn: socket.socket, response: dict[str, Any]) -> None:
