@@ -742,10 +742,21 @@ def cmd_adopt(opts: Options) -> int:
     if not reply.get("ok"):
         print(str(reply.get("error") or "adopt failed"), file=sys.stderr)
         return 1
-    if not reply.get("adopted"):
+    adopted = list(reply.get("adopted") or [])
+    transferred = list(reply.get("transferred") or [])
+    if not adopted and not transferred:
         print("no complete labeled resources found")
         return 0
-    print(json.dumps({"adopted": reply["adopted"], "registry_id": reply["registry_id"]}, indent=2))
+    print(
+        json.dumps(
+            {
+                "adopted": adopted,
+                "transferred": transferred,
+                "registry_id": reply.get("registry_id"),
+            },
+            indent=2,
+        )
+    )
     return 0
 
 
