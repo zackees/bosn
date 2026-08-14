@@ -127,6 +127,7 @@ def test_daemon_publishes_state_and_answers_ping(served: Daemon, tmp_path: Path)
     assert state.pid == os.getpid()
     reply = ipc.send_request(state.port, {"verb": "ping"})
     assert reply["ok"] and reply["pong"]
+    assert daemon_mod.heartbeat_file(tmp_path).exists()
 
 
 def test_status_reports_registry_id_and_uptime(served: Daemon) -> None:
@@ -168,6 +169,7 @@ def test_shutdown_verb_stops_the_daemon_and_clears_state(tmp_path: Path) -> None
     thread.join(timeout=15)
     assert not daemon_mod.is_serving(tmp_path)
     assert not daemon_mod.state_file(tmp_path).exists()
+    assert not daemon_mod.heartbeat_file(tmp_path).exists()
 
 
 def test_the_port_is_released_for_the_next_daemon(tmp_path: Path) -> None:

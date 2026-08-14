@@ -59,6 +59,11 @@ def state_file(state_dir: Path | None = None) -> Path:
     return (state_dir or default_state_dir()) / "daemon.json"
 
 
+def heartbeat_file(state_dir: Path | None = None) -> Path:
+    """A host-visible heartbeat consumed by persistent container PID 1 watchdogs."""
+    return (state_dir or default_state_dir()) / "daemon.heartbeat"
+
+
 def port_for(state_dir: Path | None = None) -> int:
     """The deterministic loopback port that owns this state directory.
 
@@ -281,6 +286,7 @@ class Daemon:
             started_at=self.started_at,
             version=__version__,
         ).write(state_file(self.state_dir))
+        self._write_heartbeat()
         self.registry.log_event("daemon.started", f"pid={os.getpid()} port={self.port}")
 
         threading.Thread(target=self._idle_watchdog, daemon=True).start()
@@ -292,12 +298,16 @@ class Daemon:
 
     def _idle_watchdog(self) -> None:
         while not self._stop.wait(0.5):
+            self._write_heartbeat()
             for job in self.jobs.reap_expired():
                 self.registry.log_event("job.expired", f"{job.id} {job.stack}")
             if self.should_retire():
                 self.registry.log_event("daemon.idle_retired", f"idle={self.idle_seconds():.0f}s")
                 self.request_stop()
                 return
+
+    def _write_heartbeat(self) -> None:
+        heartbeat_file(self.state_dir).touch()
 
     def request_stop(self) -> None:
         self._stop.set()
@@ -320,6 +330,7 @@ class Daemon:
             self._server.server_close()
             self._server = None
         state_file(self.state_dir).unlink(missing_ok=True)
+        heartbeat_file(self.state_dir).unlink(missing_ok=True)
         try:
             self.registry.log_event("daemon.stopped", "")
             self.registry.close()

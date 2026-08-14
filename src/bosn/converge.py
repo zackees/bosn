@@ -9,6 +9,8 @@ whose remedy is always the same mechanical command is just a forced retry loop.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import os
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -22,6 +24,8 @@ from bosn.registry import Registry
 REUSED = "reused"
 REGISTERED = "registered"
 ROLLED = "rolled"
+CONTAINER_HEARTBEAT_TIMEOUT_SECONDS = 600
+RUN_MAX_DURATION_SECONDS = 8 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -264,6 +268,55 @@ class Converger:
 
     # -- running -----------------------------------------------------------
 
+    @staticmethod
+    def container_name(workspace: str, stack: str) -> str:
+        """Stable, Docker-safe container identity for one workspace and stack."""
+        digest = hashlib.sha256(f"{workspace}\0{stack}".encode()).hexdigest()[:16]
+        return f"bosn-{stack}-{digest}"
+
+    def ensure_container(
+        self, converged: ConvergeResult, *, stack_name: str | None, workspace: str
+    ) -> str:
+        """Create/start the persistent execution container, or reuse its existing one."""
+        stack = self.manifest.stack(stack_name)
+        name = self.container_name(workspace, stack.name)
+        inspected = self.engine.run(["container", "inspect", name])
+        if not inspected.ok:
+            labels = self._resource_labels(stack, "container", converged.digest, "stack", workspace)
+            # Docker removes an orphan automatically once PID 1's watchdog exits.
+            args = ["create", "--rm", "--name", name, *labels.to_docker_args()]
+            for volume in stack.volumes:
+                volume_name = volume_name_for(
+                    stack,
+                    volume.scope,
+                    volume.name,
+                    digest=converged.digest,
+                    workspace=workspace,
+                    family=stack.family,
+                )
+                args += ["--volume", f"{volume_name}:/bosn/{volume.name}"]
+            heartbeat = self.registry.path.parent / "daemon.heartbeat"
+            heartbeat.touch(exist_ok=True)
+            args += ["--volume", f"{heartbeat.resolve()}:/bosn-daemon/heartbeat:ro"]
+            # PID 1 exits when the daemon heartbeat goes stale or a run is orphaned for
+            # too long.  `--rm` above then removes the stopped container automatically.
+            watchdog = (
+                "started=$(date +%s); while :; do now=$(date +%s); "
+                "beat=$(stat -c %Y /bosn-daemon/heartbeat 2>/dev/null || echo 0); "
+                f"[ $((now-beat)) -gt {CONTAINER_HEARTBEAT_TIMEOUT_SECONDS} ] && exit 0; "
+                f"[ $((now-started)) -gt {RUN_MAX_DURATION_SECONDS} ] && exit 0; "
+                "sleep 30; done"
+            )
+            args += [converged.image_tag, "sh", "-c", watchdog]
+            created = self.engine.run(args)
+            if not created.ok:
+                raise EngineError(f"creating persistent container {name} failed: {created.stderr}")
+            self._register(stack, "container", name, converged.digest, "stack", workspace)
+        started = self.engine.run(["start", name])
+        if not started.ok and "already started" not in (started.stderr or started.stdout).lower():
+            raise EngineError(f"starting persistent container {name} failed: {started.stderr}")
+        return name
+
     def run(
         self,
         command: list[str],
@@ -292,24 +345,36 @@ class Converger:
         caller's terminal and exit status.
         """
         workspace = workspace or workspace_of(self.manifest)
-        stack = self.manifest.stack(stack_name)
-
-        args = ["run", "--rm"]
-        for volume in stack.volumes:
-            name = volume_name_for(
-                stack,
-                volume.scope,
-                volume.name,
-                digest=converged.digest,
-                workspace=workspace,
-                family=stack.family,
-            )
-            args += ["--volume", f"{name}:/bosn/{volume.name}"]
-        args += [converged.image_tag, *command]
-
-        result = self.engine.run(args)
+        name = self.ensure_container(converged, stack_name=stack_name, workspace=workspace)
+        args = ["exec", name, *command]
+        resource = next(
+            r for r in self.registry.list_resources() if r.kind == "container" and r.name == name
+        )
+        lease = self.registry.acquire_lease(
+            resource.id, pid=os.getpid(), proc_start=self.registry.clock.now()
+        )
+        try:
+            result = self.engine.run(args)
+        finally:
+            self.registry.release_lease(lease.id)
         self.registry.log_event("run", f"{converged.stack} rc={result.returncode}")
         return converged, result.returncode, result.stdout or result.stderr
+
+    def shell_converged(
+        self, converged: ConvergeResult, *, stack_name: str | None, workspace: str
+    ) -> int:
+        """Attach a real interactive shell to the persistent container."""
+        name = self.ensure_container(converged, stack_name=stack_name, workspace=workspace)
+        resource = next(
+            r for r in self.registry.list_resources() if r.kind == "container" and r.name == name
+        )
+        lease = self.registry.acquire_lease(
+            resource.id, pid=os.getpid(), proc_start=self.registry.clock.now()
+        )
+        try:
+            return self.engine.interactive(["exec", "-it", name, "sh"])
+        finally:
+            self.registry.release_lease(lease.id)
 
 
 def run_task(
