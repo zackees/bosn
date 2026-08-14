@@ -42,3 +42,34 @@ jobs:
           set -e
           ls dist/
           test -n "$(ls dist/*-py3-none-any.whl)"
+
+  native:
+    name: ${{ matrix.name }} (lint + unit)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows
+          - os: macos-latest
+            name: macOS
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: ./install
+
+      - name: Lint
+        run: ./lint
+
+      - name: Test (unit)
+        run: ./test

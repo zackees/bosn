@@ -1,6 +1,6 @@
 # bosn
 
-[![CI (Linux)](https://github.com/zackees/bosn/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/zackees/bosn/actions/workflows/ci.yml)
+[![CI](https://github.com/zackees/bosn/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/zackees/bosn/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -21,7 +21,8 @@ stay warm while total storage stays bounded, without anyone remembering to clean
 > and refers to the project as *dockhand*; the design is unchanged, the name is not.
 >
 > Not yet built: the `bosn-docker` compatibility subset, `bosn init` from `compose.yaml`,
-> daemon-owned background jobs (`bosn attach`), macOS/Windows CI, and podman.
+> daemon-owned background jobs (`bosn attach`), and podman. macOS and Windows now have
+> native, non-Docker CI lanes; see [Platform CI coverage](#platform-ci-coverage).
 
 ## Why this exists
 
@@ -335,9 +336,31 @@ Ruff's BLE001 can flag the blind except, but the actual defect is the *missing*
 
 Suppress a line with `# noqa: KBI001` when a case is genuinely intentional.
 
-CI runs on Linux only. Docker-backed tests carry a `docker` pytest marker: they skip when no
-engine is reachable, and `ci/test.py` excludes them outright on non-Linux CI runners, so the
-unit suite stands alone without an engine.
+Docker-backed tests carry a `docker` pytest marker: they skip when no engine is reachable,
+and `ci/test.py` excludes them outright on non-Linux CI runners, so the unit suite stands
+alone without an engine.
+
+### Platform CI coverage
+
+CI gates merges on three lanes, run in parallel:
+
+| Lane | Runner | Steps | Docker-backed tests |
+| --- | --- | --- | --- |
+| Linux | `ubuntu-latest` | install, lint, unit + docker tests, wheel build | yes |
+| Windows | `windows-latest` | install, lint, unit tests | no |
+| macOS | `macos-latest` | install, lint, unit tests | no |
+
+The Windows and macOS lanes run `./install`, `./lint`, and `./test` under bash (the runners
+ship Git Bash / a POSIX shell), exercising native process, path, and filesystem behavior on
+real Windows and macOS runners instead of Linux-only string fixtures. Dedicated cmd.exe,
+PowerShell, and MSYS path/argv coverage lives in the test suite itself, not in the CI step
+shell.
+
+**Docker-backed scenarios remain Linux-only.** Hosted macOS runners provide no Docker daemon,
+and hosted Windows runners cannot run Linux containers, so `ci/test.py` excludes the `docker`
+marker on those platforms automatically (see above). Getting real Docker Desktop coverage on
+macOS or Windows requires a self-hosted runner with Docker Desktop installed and licensed —
+none is configured today; this remains a manual follow-up for the maintainer.
 
 ## License
 
