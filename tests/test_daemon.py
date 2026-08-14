@@ -195,6 +195,18 @@ def test_idle_retirement_stops_an_unused_daemon(tmp_path: Path) -> None:
     assert not daemon_mod.is_serving(tmp_path)
 
 
+def test_active_execution_session_pins_daemon_and_refuses_shutdown(tmp_path: Path) -> None:
+    daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=0)
+    try:
+        daemon._execution_sessions["session"] = ("lease",)
+        assert not daemon.should_retire()
+        reply = daemon._verb_shutdown({})
+        assert reply["ok"] is False
+        assert "active execution" in reply["error"]
+    finally:
+        daemon.registry.close()
+
+
 # -- unattended maintenance ------------------------------------------------
 
 

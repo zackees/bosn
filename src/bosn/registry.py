@@ -151,10 +151,21 @@ class Registry:
         # The daemon serves requests on a thread pool while owning one connection, so the
         # connection must outlive its creating thread; a lock keeps it single-writer.
         self._lock = threading.RLock()
-        self.conn = sqlite3.connect(str(self.path), isolation_level=None, check_same_thread=False)
+        if read_only:
+            # URI mode=ro refuses a missing database and prevents SQLite from creating WAL,
+            # schema, or migration state behind a supposedly read-only CLI command.
+            uri = f"file:{self.path.as_posix()}?mode=ro"
+            self.conn = sqlite3.connect(
+                uri, uri=True, isolation_level=None, check_same_thread=False
+            )
+        else:
+            self.conn = sqlite3.connect(
+                str(self.path), isolation_level=None, check_same_thread=False
+            )
         self.conn.row_factory = sqlite3.Row
         with self._lock:
-            self.conn.execute("PRAGMA journal_mode=WAL")
+            if not read_only:
+                self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.execute("PRAGMA foreign_keys=ON")
             self.conn.execute("PRAGMA busy_timeout=5000")
             if not read_only:

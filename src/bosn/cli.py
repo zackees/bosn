@@ -159,23 +159,27 @@ def cmd_doctor(opts: Options) -> int:
     from bosn.registry import Registry, default_db_path
 
     db_path = (opts.state_dir / "registry.sqlite3") if opts.state_dir else default_db_path()
-    with Registry(db_path) as registry:
-        deadline = registry.meta("maintenance.next_deadline")
-        print(f"scheduler manifest installed: {autostart.manifest_installed()}")
-        print(f"scheduler next deadline: {deadline or '-'}")
-        if not info.reachable:
-            print(f"diagnosis:      {info.detail}", file=sys.stderr)
-            return 1
-        from bosn.resources import ResourceScanner
+    if not db_path.exists():
+        deadline = None
+        registry_id = None
+    else:
+        with Registry(db_path, read_only=True) as registry:
+            deadline = registry.meta("maintenance.next_deadline")
+            registry_id = registry.registry_id
+    print(f"scheduler manifest installed: {autostart.manifest_installed()}")
+    print(f"scheduler next deadline: {deadline or '-'}")
+    if not info.reachable:
+        print(f"diagnosis:      {info.detail}", file=sys.stderr)
+        return 1
+    from bosn.resources import ResourceScanner
 
-        scan = ResourceScanner(Engine(opts.engine)).scan(registry.registry_id)
-        if scan.foreign_registries:
-            state = f" --state-dir {opts.state_dir}" if opts.state_dir else ""
-            print(
-                "complete resources from foreign registry ids found; recover with: "
-                f"bosn{state} adopt",
-                file=sys.stderr,
-            )
+    scan = ResourceScanner(Engine(opts.engine)).scan(registry_id or "")
+    if scan.foreign_registries:
+        state = f" --state-dir {opts.state_dir}" if opts.state_dir else ""
+        print(
+            f"complete resources from foreign registry ids found; recover with: bosn{state} adopt",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -245,7 +249,7 @@ def cmd_jobs(opts: Options) -> int:
     return 0
 
 
-def _open_manifest_and_registry(opts: Options):
+def _open_manifest_and_registry(opts: Options, *, read_only: bool = False):
     from bosn.manifest import ManifestError, find_manifest, load
     from bosn.registry import Registry, default_db_path
 
@@ -257,14 +261,19 @@ def _open_manifest_and_registry(opts: Options):
     manifest = load(manifest_path)
     state_dir = opts.state_dir
     db_path = (state_dir / "registry.sqlite3") if state_dir else default_db_path()
-    return manifest, Registry(db_path)
+    return manifest, Registry(db_path, read_only=read_only)
 
 
 def cmd_tasks(opts: Options) -> int:
-    from bosn.manifest import ManifestError, generation_digest
+    from bosn.manifest import ManifestError, find_manifest, generation_digest, load
 
     try:
-        manifest, registry = _open_manifest_and_registry(opts)
+        manifest_path = opts.manifest or find_manifest()
+        if manifest_path is None:
+            raise ManifestError(
+                "no bosn.toml found in this directory or any parent; create one or pass --manifest"
+            )
+        manifest = load(manifest_path)
     except ManifestError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -291,9 +300,6 @@ def cmd_tasks(opts: Options) -> int:
     except ManifestError as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    finally:
-        registry.close()
-
     print(json.dumps(payload, indent=2))
     return 0
 
@@ -393,9 +399,9 @@ def cmd_run(opts: Options) -> int:
     from bosn import daemon as daemon_mod
     from bosn.config import ConfigError
     from bosn.config import load as load_config
-    from bosn.converge import Converger, workspace_of
+    from bosn.converge import workspace_of
     from bosn.engine import EngineError
-    from bosn.manifest import ManifestError
+    from bosn.manifest import ManifestError, find_manifest, load
 
     command = opts.command
     if not command and not opts.task:
@@ -403,7 +409,10 @@ def cmd_run(opts: Options) -> int:
         return 2
 
     try:
-        manifest, registry = _open_manifest_and_registry(opts)
+        manifest_path = opts.manifest or find_manifest()
+        if manifest_path is None:
+            raise ManifestError("no bosn.toml found; create one or pass --manifest")
+        manifest = load(manifest_path)
     except ManifestError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -418,15 +427,25 @@ def cmd_run(opts: Options) -> int:
             stack_name = opts.stack
 
         converged = _converge_via_daemon(opts, manifest, stack_name)
-        converger = Converger(
-            manifest,
-            registry,
-            Engine(opts.engine),
-            run_max_duration=config.get("run_max_duration"),
+        acquired = daemon_mod.request(
+            "execution-acquire",
+            opts.state_dir,
+            manifest=str(manifest.path),
+            result=converged.to_dict(),
+            stack=stack_name,
+            workspace=workspace_of(manifest),
+            engine=opts.engine,
         )
-        _result, code, output = converger.run_converged(
-            converged, command, stack_name=stack_name, workspace=workspace_of(manifest)
-        )
+        if not acquired.get("ok"):
+            raise EngineError(str(acquired.get("error") or "execution acquire failed"))
+        try:
+            result = Engine(opts.engine).run(
+                ["exec", str(acquired["container"]), *command],
+                timeout=config.get("run_max_duration"),
+            )
+        finally:
+            daemon_mod.request("execution-release", opts.state_dir, session=acquired["session"])
+        code, output = result.returncode, result.stdout or result.stderr
     except JobFailed as exc:
         print(str(exc), file=sys.stderr)
         return exc.exit_code
@@ -436,9 +455,6 @@ def cmd_run(opts: Options) -> int:
     except (ManifestError, EngineError, ConfigError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    finally:
-        registry.close()
-
     if output:
         print(output)
     return code
@@ -496,8 +512,11 @@ def cmd_status(opts: Options) -> int:
 
     state_dir = opts.state_dir
     db_path = (state_dir / "registry.sqlite3") if state_dir else default_db_path()
+    if not db_path.exists():
+        print(json.dumps({"registered": 0, "storage": "not initialized"}, indent=2))
+        return 0
     try:
-        with Registry(db_path) as registry:
+        with Registry(db_path, read_only=True) as registry:
             print(
                 json.dumps(
                     status(
@@ -513,115 +532,133 @@ def cmd_status(opts: Options) -> int:
 
 
 def cmd_gc(opts: Options) -> int:
+    from bosn import daemon as daemon_mod
     from bosn.config import ConfigError
     from bosn.config import load as load_config
-    from bosn.gc import Collector
-    from bosn.registry import Registry, default_db_path
 
-    state_dir = opts.state_dir
-    db_path = (state_dir / "registry.sqlite3") if state_dir else default_db_path()
     try:
-        with Registry(db_path) as registry:
-            collector = Collector(
-                registry, Engine(opts.engine), config=load_config(flags=_policy_flags(opts))
-            )
-            result = collector.collect(dry_run=opts.dry_run)
+        flags = _policy_flags(opts)
+        load_config(flags=flags)
+        reply = daemon_mod.request(
+            "gc", opts.state_dir, engine=opts.engine, dry_run=opts.dry_run, policy_flags=flags
+        )
     except ConfigError as exc:
         print(str(exc), file=sys.stderr)
         return 1
-
-    print(json.dumps({**result.summary(), "dry_run": result.dry_run}, indent=2))
-    for name in result.would_stop:
+    except (daemon_mod.DaemonError, ipc.TransportError) as exc:
+        print(f"cannot reach the bosn daemon: {exc}", file=sys.stderr)
+        return 1
+    if not reply.get("ok"):
+        print(str(reply.get("error") or "gc failed"), file=sys.stderr)
+        return 1
+    print(json.dumps({**reply["result"], "dry_run": opts.dry_run}, indent=2))
+    for name in reply.get("would_stop", []):
         print(f"would stop {name}")
-    for name in result.stopped:
+    for name in reply.get("stopped", []):
         print(f"stopped {name}")
-    for name in result.removed:
-        print(("would remove " if result.dry_run else "removed ") + name)
-    for message in result.errors:
+    for name in reply.get("removed", []):
+        print(("would remove " if opts.dry_run else "removed ") + name)
+    for message in reply.get("errors", []):
         print(f"error: {message}", file=sys.stderr)
-    for advisory in result.advisories:
+    for advisory in reply.get("advisories", []):
         print(f"advisory: {advisory}", file=sys.stderr)
-    return 1 if result.errors else 0
+    return 1 if reply.get("errors") else 0
 
 
 def cmd_done(opts: Options) -> int:
+    from bosn import daemon as daemon_mod
     from bosn.converge import workspace_of
-    from bosn.gc import mark_done
-    from bosn.manifest import ManifestError
+    from bosn.manifest import ManifestError, find_manifest, load
 
     try:
-        manifest, registry = _open_manifest_and_registry(opts)
+        manifest_path = opts.manifest or find_manifest()
+        if manifest_path is None:
+            raise ManifestError("no bosn.toml found; create one or pass --manifest")
+        manifest = load(manifest_path)
+        reply = daemon_mod.request("done", opts.state_dir, workspace=workspace_of(manifest))
     except ManifestError as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    try:
-        # The canonical workspace id, matching what converge registered resources under.
-        # A raw manifest.root would miss them whenever the two spellings differ.
-        marked = mark_done(registry, workspace_of(manifest))
-    finally:
-        registry.close()
-    print(f"marked {marked} resource(s) in {manifest.root} as done")
+    except (daemon_mod.DaemonError, ipc.TransportError) as exc:
+        print(f"cannot reach the bosn daemon: {exc}", file=sys.stderr)
+        return 1
+    if not reply.get("ok"):
+        print(str(reply.get("error") or "done failed"), file=sys.stderr)
+        return 1
+    print(f"marked {reply['marked']} resource(s) in {manifest.root} as done")
     return 0
 
 
 def cmd_adopt(opts: Options) -> int:
     """The sole ownership-transfer/recovery entry point for complete label contracts."""
-    from bosn.registry import Registry, default_db_path
-    from bosn.resources import ResourceScanner, adopt
+    from bosn import daemon as daemon_mod
 
-    state_dir = opts.state_dir
-    db_path = (state_dir / "registry.sqlite3") if state_dir else default_db_path()
-    with Registry(db_path) as registry:
-        # Scan with an impossible id so every complete contract is classified as foreign.
-        scan = ResourceScanner(Engine(opts.engine)).scan("", kinds=["container", "volume", "image"])
-        registries = scan.foreign_registries
-        if not registries:
-            print("no complete labeled resources found")
-            return 0
-        if len(registries) != 1:
-            print("adopt refused: multiple foreign registry ids found", file=sys.stderr)
-            return 1
-        old_id = next(iter(registries))
-        registry.set_meta("registry_id", old_id)
-        owned = ResourceScanner(Engine(opts.engine)).scan(old_id)
-        names = adopt(registry, owned)
-    print(json.dumps({"adopted": names, "registry_id": old_id}, indent=2))
+    try:
+        reply = daemon_mod.request("adopt", opts.state_dir, engine=opts.engine)
+    except (daemon_mod.DaemonError, ipc.TransportError) as exc:
+        print(f"cannot reach the bosn daemon: {exc}", file=sys.stderr)
+        return 1
+    if not reply.get("ok"):
+        print(str(reply.get("error") or "adopt failed"), file=sys.stderr)
+        return 1
+    if not reply.get("adopted"):
+        print("no complete labeled resources found")
+        return 0
+    print(json.dumps({"adopted": reply["adopted"], "registry_id": reply["registry_id"]}, indent=2))
     return 0
 
 
 def cmd_shell(opts: Options) -> int:
     from bosn import daemon as daemon_mod
-    from bosn.converge import Converger, workspace_of
+    from bosn.converge import workspace_of
     from bosn.engine import EngineError
-    from bosn.manifest import ManifestError
+    from bosn.manifest import ManifestError, find_manifest, load
 
     try:
-        manifest, registry = _open_manifest_and_registry(opts)
+        manifest_path = opts.manifest or find_manifest()
+        if manifest_path is None:
+            raise ManifestError("no bosn.toml found; create one or pass --manifest")
+        manifest = load(manifest_path)
     except ManifestError as exc:
         print(str(exc), file=sys.stderr)
         return 1
     try:
         converged = _converge_via_daemon(opts, manifest, opts.stack)
-        return Converger(manifest, registry, Engine(opts.engine)).shell_converged(
-            converged, stack_name=opts.stack, workspace=workspace_of(manifest)
+        acquired = daemon_mod.request(
+            "execution-acquire",
+            opts.state_dir,
+            manifest=str(manifest.path),
+            result=converged.to_dict(),
+            stack=opts.stack,
+            workspace=workspace_of(manifest),
+            engine=opts.engine,
         )
+        if not acquired.get("ok"):
+            raise EngineError(str(acquired.get("error") or "execution acquire failed"))
+        try:
+            return Engine(opts.engine).interactive(
+                ["exec", "-it", str(acquired["container"]), "sh"]
+            )
+        finally:
+            daemon_mod.request("execution-release", opts.state_dir, session=acquired["session"])
     except JobFailed as exc:
         print(str(exc), file=sys.stderr)
         return exc.exit_code
     except (daemon_mod.DaemonError, ipc.TransportError, EngineError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    finally:
-        registry.close()
 
 
 def cmd_ensure(opts: Options) -> int:
     """Build/register the requested generation without starting a command."""
     from bosn import daemon as daemon_mod
-    from bosn.manifest import ManifestError
+    from bosn.manifest import ManifestError, find_manifest, load
 
     try:
-        manifest, registry = _open_manifest_and_registry(opts)
+        manifest_path = opts.manifest or find_manifest()
+        if manifest_path is None:
+            raise ManifestError("no bosn.toml found; create one or pass --manifest")
+        manifest = load(manifest_path)
     except ManifestError as exc:
         print(
             json.dumps({"ok": False, "error": str(exc), "next": "create-or-pass-manifest"}),
@@ -636,8 +673,6 @@ def cmd_ensure(opts: Options) -> int:
     except (daemon_mod.DaemonError, ipc.TransportError) as exc:
         print(json.dumps({"ok": False, "error": str(exc), "next": "start-daemon"}), file=sys.stderr)
         return 1
-    finally:
-        registry.close()
     print(json.dumps({"ok": True, "stack": result.stack, "digest": result.digest}))
     return 0
 

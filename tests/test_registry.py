@@ -329,3 +329,10 @@ def test_a_second_reader_sees_writes_and_is_not_blocked(tmp_path: Path) -> None:
                 kind="volume", name="v2", stack="s", generation="g", scope="spec", workspace="/w"
             )
             assert len(reader.list_resources()) == 2
+
+
+def test_read_only_registry_refuses_missing_database_without_creating_it(tmp_path: Path) -> None:
+    path = tmp_path / "missing.sqlite3"
+    with pytest.raises(sqlite3.OperationalError):
+        Registry(path, read_only=True)
+    assert not path.exists()

@@ -26,6 +26,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Generator, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -179,10 +180,22 @@ class _Handler(socketserver.StreamRequestHandler):
                 self.connection, {"ok": False, "error": "unauthenticated IPC request"}
             )
             return
-        if str(request.get("version") or __version__) != __version__ and verb in {
+        mutating_verbs = {
+            "converge",
             "cancel",
-            "shutdown",
-        }:
+            "gc",
+            "done",
+            "adopt",
+            "compose-adopt",
+            "execution-acquire",
+            "execution-release",
+        }
+        if (
+            verb != "shutdown"
+            and verb in mutating_verbs
+            and "version" in request
+            and str(request.get("version") or "") != __version__
+        ):
             ipc.send_response(
                 self.connection,
                 {
@@ -287,6 +300,9 @@ class Daemon:
         self._server: _Server | None = None
         self._stop = threading.Event()
         self._watchdog_thread: threading.Thread | None = None
+        self._execution_sessions: dict[str, tuple[str, ...]] = {}
+        self._execution_lock = threading.RLock()
+        self._stopping = False
         self.secret = secrets.token_urlsafe(32)
         self.registry = Registry(self.state_dir / "registry.sqlite3", clock=self.clock)
         stored_deadline = self.registry.meta("maintenance.next_deadline")
@@ -331,7 +347,9 @@ class Daemon:
         what keeps this from becoming a way to pin the daemon forever -- a build that never
         reports is eventually cancelled, and then this goes back to being about idleness.
         """
-        if self.jobs.active_count() > 0:
+        with self._execution_lock:
+            sessions_active = bool(self._execution_sessions)
+        if self.jobs.active_count() > 0 or sessions_active:
             return False
         return self.idle_seconds() >= self.idle_retire_seconds
 
@@ -376,9 +394,11 @@ class Daemon:
                 self.registry.log_event("job.expired", f"{job.id} {job.stack}")
             self.run_maintenance_if_due()
             if self.should_retire():
-                self.registry.log_event("daemon.idle_retired", f"idle={self.idle_seconds():.0f}s")
-                self.request_stop()
-                return
+                if self.request_stop():
+                    self.registry.log_event(
+                        "daemon.idle_retired", f"idle={self.idle_seconds():.0f}s"
+                    )
+                    return
 
     def _write_heartbeat(self) -> None:
         heartbeat_file(self.state_dir).touch()
@@ -443,16 +463,21 @@ class Daemon:
         self._next_maintenance_at = deadline
         self.registry.set_meta("maintenance.next_deadline", f"{deadline:.6f}")
 
-    def request_stop(self) -> None:
+    def request_stop(self) -> bool:
+        with self._execution_lock:
+            if self._execution_sessions:
+                return False
+            self._stopping = True
         self._stop.set()
         if self._server is not None:
             threading.Thread(target=self._server.shutdown, daemon=True).start()
+        return True
 
     def shutdown(self) -> None:
         self._stop.set()
         watchdog = self._watchdog_thread
         if watchdog is not None and watchdog is not threading.current_thread():
-            watchdog.join(timeout=2)
+            watchdog.join()
         # Cancel in-flight builds and wait for them *before* closing the registry they
         # write to. Each one tells its attached clients why it stopped rather than dying
         # silently.
@@ -485,6 +510,12 @@ class Daemon:
             "status": self._verb_status,
             "jobs": self._verb_jobs,
             "cancel": self._verb_cancel,
+            "gc": self._verb_gc,
+            "done": self._verb_done,
+            "adopt": self._verb_adopt,
+            "compose-adopt": self._verb_compose_adopt,
+            "execution-acquire": self._verb_execution_acquire,
+            "execution-release": self._verb_execution_release,
             "shutdown": self._verb_shutdown,
         }.get(verb)
         if handler is None:
@@ -529,6 +560,100 @@ class Daemon:
             return {"ok": False, "error": str(exc)}
         self.registry.log_event("job.cancelled", job.id)
         return {"ok": True, "job": job.id, "state": job.state}
+
+    def _verb_gc(self, request: dict[str, Any]) -> dict[str, Any]:
+        from bosn.config import load as load_config
+        from bosn.engine import Engine
+        from bosn.gc import Collector
+
+        flags = request.get("policy_flags")
+        config = load_config(flags=flags if isinstance(flags, dict) else None)
+        result = Collector(
+            self.registry, Engine(str(request.get("engine") or self.engine_binary)), config=config
+        ).collect(dry_run=bool(request.get("dry_run", True)))
+        return {
+            "ok": True,
+            "result": result.summary(),
+            "removed": result.removed,
+            "stopped": result.stopped,
+            "would_stop": result.would_stop,
+            "errors": result.errors,
+            "advisories": result.advisories,
+        }
+
+    def _verb_done(self, request: dict[str, Any]) -> dict[str, Any]:
+        from bosn.gc import mark_done
+
+        workspace = str(request.get("workspace") or "")
+        if not workspace:
+            return {"ok": False, "error": "done requires a workspace"}
+        return {"ok": True, "marked": mark_done(self.registry, workspace)}
+
+    def _verb_adopt(self, request: dict[str, Any]) -> dict[str, Any]:
+        from bosn.engine import Engine
+        from bosn.resources import ResourceScanner, adopt
+
+        engine = Engine(str(request.get("engine") or self.engine_binary))
+        scan = ResourceScanner(engine).scan("", kinds=["container", "volume", "image"])
+        registries = scan.foreign_registries
+        if not registries:
+            return {"ok": True, "adopted": [], "registry_id": None}
+        if len(registries) != 1:
+            return {"ok": False, "error": "adopt refused: multiple foreign registry ids found"}
+        registry_id = next(iter(registries))
+        self.registry.set_meta("registry_id", registry_id)
+        names = adopt(self.registry, ResourceScanner(engine).scan(registry_id))
+        return {"ok": True, "adopted": names, "registry_id": registry_id}
+
+    def _verb_compose_adopt(self, _request: dict[str, Any]) -> dict[str, Any]:
+        from bosn.resources import ResourceScanner, adopt
+
+        scan = ResourceScanner().scan(self.registry.registry_id)
+        return {"ok": True, "adopted": adopt(self.registry, scan)}
+
+    def _verb_execution_acquire(self, request: dict[str, Any]) -> dict[str, Any]:
+        from bosn.converge import Converger, ConvergeResult
+        from bosn.engine import Engine
+        from bosn.manifest import load
+
+        manifest = load(Path(str(request.get("manifest") or "")))
+        converged = ConvergeResult.from_dict(dict(request.get("result") or {}))
+        workspace = str(request.get("workspace") or "")
+        if not workspace:
+            return {"ok": False, "error": "execution-acquire requires workspace"}
+        session = str(uuid.uuid4())
+        with self._execution_lock:
+            if self._stopping:
+                return {"ok": False, "error": "daemon is stopping; retry after it restarts"}
+            # Reserve before engine/registry work so shutdown sees this as active immediately.
+            self._execution_sessions[session] = ()
+        try:
+            name, leases = Converger(
+                manifest, self.registry, Engine(str(request.get("engine") or self.engine_binary))
+            )._acquire_execution_container(
+                converged, stack_name=request.get("stack") or None, workspace=workspace
+            )
+        except KeyboardInterrupt:
+            with self._execution_lock:
+                self._execution_sessions.pop(session, None)
+            raise
+        except Exception:
+            with self._execution_lock:
+                self._execution_sessions.pop(session, None)
+            raise
+        with self._execution_lock:
+            self._execution_sessions[session] = tuple(lease.id for lease in leases)
+        return {"ok": True, "container": name, "session": session}
+
+    def _verb_execution_release(self, request: dict[str, Any]) -> dict[str, Any]:
+        session = str(request.get("session") or "")
+        with self._execution_lock:
+            leases = self._execution_sessions.pop(session, None)
+        if leases is None:
+            return {"ok": False, "error": "unknown execution session"}
+        for lease_id in leases:
+            self.registry.release_lease(lease_id)
+        return {"ok": True}
 
     def _verb_converge(self, request: dict[str, Any]) -> Iterator[dict[str, Any]]:
         """Submit a converge under the coalescing policy, then stream the job it landed on.
@@ -623,7 +748,11 @@ class Daemon:
         return BuildOutcome(returncode=0, result=result.to_dict())
 
     def _verb_shutdown(self, _request: dict[str, Any]) -> dict[str, Any]:
-        self.request_stop()
+        if not self.request_stop():
+            return {
+                "ok": False,
+                "error": "daemon has active execution session(s); wait for run or shell to exit",
+            }
         return {"ok": True, "stopping": True}
 
 
