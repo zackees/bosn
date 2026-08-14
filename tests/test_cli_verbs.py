@@ -184,6 +184,120 @@ def test_doctor_reports_unreachable_engine_and_scheduler_state_without_crashing(
     assert "not on PATH" in captured.err
 
 
+def _stub_reachable_engine(monkeypatch) -> None:
+    """Doctor only reaches the foreign-registry report once the engine is reachable."""
+    from bosn.engine import EngineInfo
+
+    class FakeEngine:
+        def __init__(self, binary: str = "docker") -> None:
+            self.binary = binary
+
+        def info(self):
+            return EngineInfo(binary=self.binary, reachable=True, client_version="1.0")
+
+    monkeypatch.setattr(cli, "Engine", FakeEngine)
+
+
+def _stub_scan(monkeypatch, foreign_by_registry: dict[str, int]) -> None:
+    """Fake a scan whose foreign bucket holds ``count`` resources per registry id."""
+    import bosn.resources
+    from bosn import labels
+    from bosn.resources import DiscoveredResource, ScanResult
+
+    def _raw(registry: str) -> dict[str, str]:
+        return labels.ResourceLabels(
+            registry=registry,
+            kind="volume",
+            stack="dev",
+            generation="digest",
+            scope="spec",
+            workspace="workspace",
+            created="2026-01-01T00:00:00Z",
+        ).to_dict()
+
+    foreign = [
+        DiscoveredResource("volume", f"{registry_id}-{i}", _raw(registry_id))
+        for registry_id, count in foreign_by_registry.items()
+        for i in range(count)
+    ]
+
+    class Scanner:
+        def __init__(self, _engine) -> None:
+            pass
+
+        def scan(self, _registry_id, **_kwargs):
+            return ScanResult(foreign=foreign)
+
+    monkeypatch.setattr(bosn.resources, "ResourceScanner", Scanner)
+
+
+def test_doctor_reports_few_foreign_registries_as_exact_adopt_commands(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """The case doctor's foreign-registry report was built for: one lost identity."""
+    _stub_reachable_engine(monkeypatch)
+    _stub_scan(monkeypatch, {"lost-registry-1": 2, "lost-registry-2": 1})
+
+    code = cli.main(["--state-dir", str(tmp_path), "doctor"])
+    assert code == 0
+    err = capsys.readouterr().err
+    assert f"bosn --state-dir {tmp_path} adopt --from-registry lost-registry-1" in err
+    assert f"bosn --state-dir {tmp_path} adopt --from-registry lost-registry-2" in err
+
+
+def test_doctor_aggregates_many_foreign_registries_instead_of_listing_each(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """150 foreign ids must not become 150 semicolon-joined commands on one line."""
+    _stub_reachable_engine(monkeypatch)
+    foreign_by_registry = {f"leaked-registry-{i}": 1 for i in range(150)}
+    _stub_scan(monkeypatch, foreign_by_registry)
+
+    code = cli.main(["--state-dir", str(tmp_path), "doctor"])
+    assert code == 0
+    err = capsys.readouterr().err
+
+    # The aggregate counts are reported...
+    assert "150" in err
+    assert "150 registry ids" in err or "registry ids" in err
+    # ...but no per-id adopt command is emitted for the bulk of them.
+    assert err.count("adopt --from-registry leaked-registry-") == 0
+    assert "adopt --from-registry <id>" in err
+
+
+def test_doctor_reports_total_resource_count_not_just_id_count(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """150 ids holding 151 resources and a few ids holding thousands read very differently."""
+    _stub_reachable_engine(monkeypatch)
+    heavy = {"heavy-registry-a": 3000, "heavy-registry-b": 2000}
+    padding = {f"leaked-registry-{i}": 1 for i in range(10)}
+    _stub_scan(monkeypatch, {**heavy, **padding})
+
+    code = cli.main(["--state-dir", str(tmp_path), "doctor"])
+    assert code == 0
+    err = capsys.readouterr().err
+    assert "5010" in err  # total resource count, not just the 12 distinct ids
+    assert "heavy-registry-a" in err
+    assert "heavy-registry-b" in err
+
+
+def test_doctor_foreign_registry_wording_never_claims_dead_or_safe_to_delete(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """bosn cannot distinguish a stale registry from one owned by a live user elsewhere."""
+    _stub_reachable_engine(monkeypatch)
+    foreign_by_registry = {f"leaked-registry-{i}": 1 for i in range(150)}
+    _stub_scan(monkeypatch, foreign_by_registry)
+
+    code = cli.main(["--state-dir", str(tmp_path), "doctor"])
+    assert code == 0
+    err = capsys.readouterr().err.lower()
+
+    for forbidden in ("orphan", "dead", "stale", "safe to delete", "safe to remove"):
+        assert forbidden not in err, f"doctor must not claim foreign resources are {forbidden!r}"
+
+
 def test_gc_reports_invalid_policy_without_a_traceback(monkeypatch, tmp_path, capsys) -> None:
     monkeypatch.setenv("BOSN_WARM_VOLUME_TTL", "not-a-number")
     assert cli.main(["--state-dir", str(tmp_path), "gc"]) == 1

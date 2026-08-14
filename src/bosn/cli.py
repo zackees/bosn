@@ -271,17 +271,60 @@ def cmd_doctor(opts: Options) -> int:
 
     scan = ResourceScanner(Engine(opts.engine)).scan(registry_id or "")
     if scan.foreign_registries:
-        state = f" --state-dir {opts.state_dir}" if opts.state_dir else ""
+        _report_foreign_registries(scan, opts)
+    return 0
+
+
+# A foreign label only proves "not this registry" -- it is not, and cannot be, proof of
+# death. The same machine can host another live bosn instance (a different user, a
+# different --state-dir, a CI runner) whose registry id will show up here forever, by
+# design: `resources.py` refuses to ever delete or downgrade a foreign resource on its
+# own say-so. So this report counts and points at the biggest holders; it never claims
+# orphaned/dead/safe-to-remove, because bosn has no signal that would make that claim true.
+#
+# Threshold: above this many distinct foreign ids, one command per id stops being
+# actionable (nobody reads, let alone runs, a 150-command line) and starts being noise
+# that buries the one thing doctor still owes the reader: how big the situation is. Below
+# it -- the case this feature was built for, recovering a single lost prior identity --
+# the exact `adopt --from-registry <id>` command is still printed because it is the whole
+# point of running doctor in the first place.
+_FOREIGN_REGISTRY_COMMAND_THRESHOLD = 5
+_FOREIGN_REGISTRY_TOP_N = 5
+
+
+def _report_foreign_registries(scan, opts: Options) -> None:
+    from collections import Counter
+
+    per_registry = Counter(resource.registry for resource in scan.foreign if resource.registry)
+    registry_ids = sorted(per_registry)
+    total_resources = sum(per_registry.values())
+    state = f" --state-dir {opts.state_dir}" if opts.state_dir else ""
+
+    if len(registry_ids) <= _FOREIGN_REGISTRY_COMMAND_THRESHOLD:
         commands = "; ".join(
-            f"bosn{state} adopt --from-registry {candidate}"
-            for candidate in sorted(scan.foreign_registries)
+            f"bosn{state} adopt --from-registry {candidate}" for candidate in registry_ids
         )
         print(
-            "complete resources from foreign registry ids found; "
-            f"choose recovery source: {commands}",
+            "resources labeled with a registry id other than this one were found "
+            "(bosn cannot tell whether that registry is gone or still in use elsewhere -- "
+            f"complete foreign resources are never touched automatically); recovery options "
+            f"if one of these was this machine's own prior identity: {commands}",
             file=sys.stderr,
         )
-    return 0
+        return
+
+    top = ", ".join(
+        f"{registry_id} ({count} resource{'' if count == 1 else 's'})"
+        for registry_id, count in per_registry.most_common(_FOREIGN_REGISTRY_TOP_N)
+    )
+    print(
+        f"{total_resources} resources belong to {len(registry_ids)} registry ids other than "
+        "this one (bosn cannot tell a prior identity of this machine from a registry still "
+        "in use elsewhere -- these are never touched automatically); "
+        f"largest by resource count: {top}; recover an id you recognize with "
+        f"bosn{state} adopt --from-registry <id>",
+        file=sys.stderr,
+    )
 
 
 def cmd_daemon(opts: Options) -> int:
