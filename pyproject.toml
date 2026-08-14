@@ -12,6 +12,7 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
+    "pyyaml>=6.0.3",
     "running-process>=1.0.0",
 ]
 
