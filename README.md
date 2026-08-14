@@ -176,6 +176,10 @@ Other guarantees:
   build that failed.
 - **A hung build cannot pin the daemon.** Running jobs block idle retirement, so a per-job
   TTL (default 1 h, `BOSN_BUILD_TTL_SECONDS`) reaps anything that stops reporting.
+- **Job history is bounded too.** The 50 most recent finished jobs stay listable and
+  attachable; older ids are forgotten and report `no such job`. Remembering every job of
+  an all-day agent loop, each with its build output, is the same kind of unbounded growth
+  the queue policy exists to prevent.
 
 There is deliberately no `--detach`. Blocking-with-attach is the only mode, because
 backgrounding is the easiest way to recreate the pile-up above and fan-out is already
