@@ -6,6 +6,7 @@ Unit tests drive a fake engine, so they run everywhere without Docker.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -193,6 +194,17 @@ def test_a_dead_holder_releases_after_one_ttl(registry: Registry, clock: FakeClo
     clock.advance(2)
     assert resources.lease_is_expired(lease, clock.now(), alive_probe=dead)
     assert not resources.resource_is_leased(registry, resource.id, alive_probe=dead)
+
+
+def test_pid_reuse_with_a_different_process_start_releases_expired_lease(
+    registry: Registry, clock: FakeClock, monkeypatch
+) -> None:
+    resource = _resource(registry)
+    lease = registry.acquire_lease(resource.id, pid=os.getpid(), proc_start=1.0, ttl_seconds=60)
+    monkeypatch.setattr(resources, "process_start_time", lambda _pid: 99.0)
+
+    clock.advance(61)
+    assert resources.lease_is_expired(lease, clock.now())
 
 
 def test_process_alive_probe_is_true_for_this_process() -> None:
