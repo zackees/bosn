@@ -263,6 +263,19 @@ recreates the selected name with the current labels, copies the data back, and p
 staging volume if a copy/recreate step fails. Images and containers are refused rather than
 silently recreating an unknown runtime contract.
 
+To adopt resources from a documented pre-bosn producer, run
+`bosn adopt --legacy <family> --yes`, where `<family>` is `clud`, `soldr`, or `zccache` — the
+only families bosn recognizes; any other name is refused with the list of known families.
+Selection is by each family's own `.managed=true` label under its documented namespace
+(`com.clud.docker-build`, `io.soldr.perf-local`, `io.zccache.perf-local`) — never by matching
+a resource's name. Only volumes are adopted this way (relabeled in place by the same staged
+copy/recreate used by `--transfer`); a legacy container or image with the managed label is
+reported as skipped rather than rebuilt. A resource whose producer schema is unrecognized
+(soldr's `.schema`) or whose required workspace label is absent is refused rather than
+migrated on a guess. Without `--yes`, the command only reports what it would adopt and
+changes nothing; adopted resources get the same adoption-time aging and 24-hour quiet period
+as any other recovered resource.
+
 Enable the per-user login launcher once with `bosn __daemon --autostart`; it writes a
 Startup launcher on Windows, a LaunchAgent on macOS, or a user systemd unit on Linux.
 Disable and remove it with `bosn __daemon --no-autostart`. Each scheduled pass reaps

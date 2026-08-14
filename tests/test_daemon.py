@@ -456,6 +456,55 @@ def test_malformed_persisted_maintenance_deadline_recovers(tmp_path: Path) -> No
         daemon.registry.close()
 
 
+def test_adopt_with_multiple_foreign_registries_prints_selectable_commands(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Ambiguity must produce exact `--from-registry <id>` commands, not a blanket refusal."""
+    from bosn import labels
+    from bosn.resources import DiscoveredResource, ScanResult
+
+    first, second = "lost-registry-1", "lost-registry-2"
+
+    def _raw(registry: str) -> dict[str, str]:
+        return labels.ResourceLabels(
+            registry=registry,
+            kind="volume",
+            stack="dev",
+            generation="digest",
+            scope="spec",
+            workspace="workspace",
+            created="2026-01-01T00:00:00Z",
+        ).to_dict()
+
+    class Scanner:
+        def __init__(self, _engine) -> None:
+            pass
+
+        def scan(self, registry_id: str, **_kwargs):
+            foreign = [
+                DiscoveredResource("volume", "cache-1", _raw(first)),
+                DiscoveredResource("volume", "cache-2", _raw(second)),
+            ]
+            return ScanResult(foreign=foreign)
+
+    import bosn.resources
+
+    monkeypatch.setattr(bosn.resources, "ResourceScanner", Scanner)
+    daemon = Daemon(state_dir=tmp_path)
+    try:
+        original = daemon.registry.registry_id
+        reply = daemon._verb_adopt({"engine": "docker"})
+        assert not reply["ok"]
+        error = str(reply["error"])
+        # Exact, selectable commands for each candidate -- never a blanket refusal.
+        assert f"bosn adopt --from-registry {first}" in error
+        assert f"bosn adopt --from-registry {second}" in error
+        assert "refused" not in error
+        assert daemon.registry.registry_id == original
+    finally:
+        daemon.registry.close()
+
+
 def test_adopt_preserves_a_nonempty_registry_identity(monkeypatch, tmp_path: Path) -> None:
     """Recovery of a lost database must never strand rows in an existing one."""
     from bosn import labels
@@ -534,6 +583,159 @@ def test_adopt_recovers_the_selected_lost_identity(monkeypatch, tmp_path: Path) 
         assert reply["ok"]
         assert daemon.registry.registry_id == lost
         assert daemon.registry.get_resource_by_engine_identity("volume", "cache") is not None
+    finally:
+        daemon.registry.close()
+
+
+# -- startup reconciliation -------------------------------------------------
+#
+# gc.Collector.collect() has exactly one persistent removal boundary: it calls the
+# engine to remove a resource, and only on success does it call registry.remove_resource
+# (src/bosn/gc.py, the final loop). A crash between those two calls leaves a stale
+# registry row for an engine object that no longer exists -- the "remove-before-registry"
+# case below. The container-stop step earlier in collect() only issues `container stop`
+# and a log_event; it never deletes a registry row, so it is not a removal boundary.
+#
+# The complementary creation boundary lives in converge.py: engine.run(["...", "create",
+# ...]) followed by self._register(...) -> registry.register_resource(...). A crash
+# between those two calls leaves a complete labeled engine object with no registry row --
+# the "create-before-registry" case below.
+#
+# Both boundaries are repaired by Daemon._reconcile_startup_resources via
+# resources.reconcile_owned. These tests exercise that daemon method directly (not just
+# the underlying resources.reconcile_owned unit), to prove the daemon wires scanning,
+# prior-resource capture, and event logging together correctly.
+
+
+class _StubEngine:
+    """Only needs to look like an Engine to the reachability check in the daemon."""
+
+    def run(self, args, *, check: bool = False):  # pragma: no cover - not exercised
+        raise AssertionError("the stubbed ResourceScanner should intercept all calls")
+
+
+def test_startup_reconciliation_repairs_create_before_registry_crash(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Daemon startup must recover a labeled engine object with no registry row."""
+    from bosn import labels
+    from bosn.resources import DiscoveredResource, ScanResult
+
+    raw = labels.ResourceLabels(
+        registry="placeholder",
+        kind="volume",
+        stack="dev",
+        generation="digest",
+        scope="spec",
+        workspace="workspace",
+        created="2026-01-01T00:00:00Z",
+    ).to_dict()
+
+    class Scanner:
+        def __init__(self, _engine) -> None:
+            pass
+
+        def scan(self, registry_id: str, **_kwargs):
+            raw["bosn.registry"] = registry_id
+            resource = DiscoveredResource("volume", "created-first", raw)
+            return ScanResult(owned=[resource], scanned_kinds={"volume"})
+
+    import bosn.engine
+    import bosn.resources
+
+    monkeypatch.setattr(bosn.resources, "ResourceScanner", Scanner)
+    monkeypatch.setattr(bosn.engine, "Engine", lambda *a, **k: _StubEngine())
+    daemon = Daemon(state_dir=tmp_path)
+    try:
+        daemon._reconcile_startup_resources()
+        recovered = daemon.registry.get_resource_by_engine_identity("volume", "created-first")
+        assert recovered is not None
+        assert recovered.state == "adopted"
+        assert any(event["kind"] == "recovery.startup" for event in daemon.registry.events())
+    finally:
+        daemon.registry.close()
+
+
+def test_startup_reconciliation_repairs_remove_before_registry_crash(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Daemon startup must drop a registry row whose engine object is already gone."""
+    from bosn.resources import ScanResult
+
+    class Scanner:
+        def __init__(self, _engine) -> None:
+            pass
+
+        def scan(self, registry_id: str, **_kwargs):
+            return ScanResult(scanned_kinds={"volume"})
+
+    import bosn.engine
+    import bosn.resources
+
+    monkeypatch.setattr(bosn.resources, "ResourceScanner", Scanner)
+    monkeypatch.setattr(bosn.engine, "Engine", lambda *a, **k: _StubEngine())
+    daemon = Daemon(state_dir=tmp_path)
+    try:
+        stale = daemon.registry.register_resource(
+            kind="volume",
+            name="removed-first",
+            stack="dev",
+            generation="digest",
+            scope="spec",
+            workspace="workspace",
+        )
+        daemon._reconcile_startup_resources()
+        assert daemon.registry.get_resource(stale.id) is None
+    finally:
+        daemon.registry.close()
+
+
+def test_startup_reconciliation_is_idempotent(monkeypatch, tmp_path: Path) -> None:
+    """Mirrors the prune_dead_leases idempotency test: a second pass repairs nothing."""
+    from bosn import labels
+    from bosn.resources import DiscoveredResource, ScanResult
+
+    raw = labels.ResourceLabels(
+        registry="placeholder",
+        kind="volume",
+        stack="dev",
+        generation="digest",
+        scope="spec",
+        workspace="workspace",
+        created="2026-01-01T00:00:00Z",
+    ).to_dict()
+
+    class Scanner:
+        def __init__(self, _engine) -> None:
+            pass
+
+        def scan(self, registry_id: str, **_kwargs):
+            raw["bosn.registry"] = registry_id
+            resource = DiscoveredResource("volume", "created-first", raw)
+            return ScanResult(owned=[resource], scanned_kinds={"volume"})
+
+    import bosn.engine
+    import bosn.resources
+
+    monkeypatch.setattr(bosn.resources, "ResourceScanner", Scanner)
+    monkeypatch.setattr(bosn.engine, "Engine", lambda *a, **k: _StubEngine())
+    daemon = Daemon(state_dir=tmp_path)
+    try:
+        daemon._reconcile_startup_resources()
+        after_first = daemon.registry.list_resources()
+        repairs_after_first = sum(
+            1 for event in daemon.registry.events() if event["kind"] == "recovery.startup"
+        )
+        assert repairs_after_first == 1
+
+        daemon._reconcile_startup_resources()
+        after_second = daemon.registry.list_resources()
+        repairs_after_second = sum(
+            1 for event in daemon.registry.events() if event["kind"] == "recovery.startup"
+        )
+
+        assert [r.id for r in after_second] == [r.id for r in after_first]
+        assert repairs_after_second == repairs_after_first, "second pass must log no repair"
     finally:
         daemon.registry.close()
 

@@ -376,16 +376,13 @@ class TransferError(RuntimeError):
 def transfer_volume(registry: Registry, engine: Engine, resource: DiscoveredResource) -> str:
     """Recreate one detached foreign volume with the current ownership labels.
 
-    Docker labels are immutable.  The staging volume retains a recoverable copy until the
-    replacement is verified, so a failed selected transfer never silently destroys data.
+    Thin wrapper over :func:`recreate_volume_with_labels`: this call site is explicit
+    ownership transfer, so the new label set is the old one with only ``registry``
+    swapped for ours -- everything else about the resource (stack, generation, scope,
+    workspace, created) is preserved exactly.
     """
     if resource.kind != "volume" or not resource.complete:
         raise TransferError("only a complete labeled volume can be transferred")
-    attached = engine.run(["ps", "--all", "--filter", f"volume={resource.name}", "--quiet"])
-    if not attached.ok:
-        raise TransferError(f"could not check volume attachments for {resource.name}")
-    if attached.stdout.strip():
-        raise TransferError(f"volume {resource.name} is attached; stop its containers first")
     parsed = resource.parsed()
     new_labels = labels.ResourceLabels(
         registry=registry.registry_id,
@@ -396,6 +393,40 @@ def transfer_volume(registry: Registry, engine: Engine, resource: DiscoveredReso
         workspace=parsed.workspace,
         created=parsed.created,
     )
+    return recreate_volume_with_labels(engine, resource, new_labels)
+
+
+def volume_is_attached(engine: Engine, name: str) -> bool:
+    """True when a container references this volume (list is not empty on success).
+
+    Shared by explicit ownership transfer and legacy-family adoption: both recreate a
+    volume in place, which is only safe once nothing has it mounted.
+    """
+    attached = engine.run(["ps", "--all", "--filter", f"volume={name}", "--quiet"])
+    if not attached.ok:
+        raise TransferError(f"could not check volume attachments for {name}")
+    return bool(attached.stdout.strip())
+
+
+def recreate_volume_with_labels(
+    engine: Engine, resource: DiscoveredResource, new_labels: labels.ResourceLabels
+) -> str:
+    """Recreate one detached volume carrying ``new_labels``, staging its data first.
+
+    Docker labels are immutable, so "relabeling" a volume means: copy its data into a
+    scratch volume, remove the original, recreate it under the same name with the new
+    label set, and copy the data back. The staging volume retains a recoverable copy
+    until the replacement is verified, so a failed relabel never silently destroys data.
+
+    This is the mechanical core shared by explicit ``--transfer`` (adopt.py's foreign-id
+    recovery) and legacy-family adoption (``legacy.py``): both need "same object, new
+    ownership labels" and neither can get there by writing a database row, because the
+    labels the engine reports come from the object itself, not from bosn's registry.
+    """
+    if resource.kind != "volume":
+        raise TransferError("only a volume can be relabeled by staged recreation")
+    if volume_is_attached(engine, resource.name):
+        raise TransferError(f"volume {resource.name} is attached; stop its containers first")
     staging = f"bosn-transfer-{uuid.uuid4().hex}"
     created_staging = engine.run(["volume", "create", staging])
     if not created_staging.ok:

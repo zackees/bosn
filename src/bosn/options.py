@@ -33,6 +33,8 @@ class Options:
     task: str | None = None
     source_registry: str | None = None
     transfer: tuple[str, ...] = ()
+    legacy: str | None = None
+    yes: bool = False
     args: tuple[str, ...] = ()
     json: bool = False
 
@@ -129,6 +131,8 @@ def from_namespace(ns: argparse.Namespace) -> Options:
         task=_as_str(get("task")),
         source_registry=_as_str(get("source_registry")),
         transfer=get_list("transfer"),
+        legacy=_as_str(get("legacy")),
+        yes=bool(get("yes", False)),
         args=get_list("args"),
         json=bool(get("json", False)),
         dry_run=bool(get("dry_run", True)),

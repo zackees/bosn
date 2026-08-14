@@ -159,6 +159,23 @@ def build_parser(*, json_errors: bool = False) -> argparse.ArgumentParser:
                 metavar="KIND:NAME",
                 help="explicitly transfer one detached volume by staged copy and recreation",
             )
+            sub.add_argument(
+                "--legacy",
+                dest="legacy",
+                default=None,
+                metavar="FAMILY",
+                help=(
+                    "adopt resources from a documented pre-bosn producer contract "
+                    "(clud, soldr, zccache); unknown names remain manual"
+                ),
+            )
+            sub.add_argument(
+                "--yes",
+                dest="yes",
+                action="store_true",
+                default=False,
+                help="apply the adoption; without it, only report what would be adopted",
+            )
         if verb == "gc":
             group = sub.add_mutually_exclusive_group()
             group.add_argument(
@@ -223,6 +240,21 @@ def cmd_doctor(opts: Options) -> int:
     print(f"scheduler manifest installed: {autostart.manifest_installed()}")
     print(f"scheduler next deadline: {deadline or '-'}")
     print(f"registry integrity: {integrity}")
+    if db_path.exists() and integrity != "ok":
+        backup = db_path.with_suffix(".backup.sqlite3")
+        recovered = db_path.with_suffix(".recovered.sql")
+        print(
+            "registry integrity check failed; back up before attempting recovery, "
+            "then recover into a new file -- never overwrite the original:",
+            file=sys.stderr,
+        )
+        print(f"  sqlite3 {db_path} \"VACUUM INTO '{backup}'\"", file=sys.stderr)
+        print(f"  sqlite3 {db_path} .recover > {recovered}", file=sys.stderr)
+        print(
+            "inspect the recovered SQL before replacing anything; the original "
+            f"{db_path} is left untouched by these commands",
+            file=sys.stderr,
+        )
     if not info.reachable:
         print(f"diagnosis:      {info.detail}", file=sys.stderr)
         return 1
@@ -724,9 +756,138 @@ def cmd_done(opts: Options) -> int:
     return 0
 
 
+def cmd_adopt_legacy(opts: Options) -> int:
+    """``adopt --legacy <family>``: documented pre-bosn producer contracts, no name guessing.
+
+    Unlike lost-registry recovery and explicit ``--transfer``, this path never mutates the
+    registry directly from the CLI (writes to it always go through the daemon -- see
+    ``bosn/daemon.py``'s ``compose-adopt`` verb). It only recreates qualifying volumes with
+    bosn's label contract via the engine, then asks the daemon to register whatever now
+    carries our identity -- the same idempotent step ``bosn/docker_cli.py`` already runs
+    after ``docker compose up``.
+    """
+    from bosn import daemon as daemon_mod
+    from bosn import legacy
+    from bosn.engine import Engine
+    from bosn.resources import ResourceScanner
+
+    try:
+        family = legacy.resolve_family(str(opts.legacy))
+    except legacy.UnknownLegacyFamilyError as exc:
+        return _error(
+            code="adopt.unknown_legacy_family",
+            message=str(exc),
+            next_step=f"choose one of: {', '.join(legacy.known_families())}",
+            as_json=opts.json,
+        )
+
+    try:
+        status = daemon_mod.request("status", opts.state_dir)
+    except (daemon_mod.DaemonError, ipc.TransportError) as exc:
+        return _error(
+            code="daemon.unreachable",
+            message=f"cannot reach the bosn daemon: {exc}",
+            next_step="start or restart the daemon, then retry",
+            as_json=opts.json,
+        )
+    if not status.get("ok"):
+        return _error(
+            code="adopt.failed",
+            message=str(status.get("error") or "could not read current registry identity"),
+            next_step="run `bosn doctor` and retry",
+            as_json=opts.json,
+        )
+    registry_id = str(status["registry_id"])
+
+    import time
+
+    engine = Engine(opts.engine)
+    plan = legacy.plan_adoption(
+        ResourceScanner(engine), family, registry_id=registry_id, now=time.time()
+    )
+    eligible_names = [entry.resource.name for entry in plan.eligible]
+    skipped_names = [resource.name for resource in plan.skipped_immutable]
+    refused_report = [
+        {"name": resource.name, "reason": reason} for resource, reason in plan.refused
+    ]
+
+    if not opts.yes:
+        report = {
+            "ok": False,
+            "code": "adopt.confirmation_required",
+            "message": (
+                f"--legacy {family.name} would adopt {len(eligible_names)} volume(s); "
+                "no changes applied without --yes"
+            ),
+            "next": "re-run the same command with --yes to apply",
+            "family": family.name,
+            "would_adopt": eligible_names,
+            "skipped_immutable": skipped_names,
+            "refused": refused_report,
+            "applied": False,
+        }
+        if opts.json:
+            print(json.dumps(report))
+        else:
+            print(report["message"], file=sys.stderr)
+            for name in eligible_names:
+                print(f"  would adopt: {name}", file=sys.stderr)
+            for name in skipped_names:
+                print(f"  skipped (not a volume, cannot relabel): {name}", file=sys.stderr)
+            for item in refused_report:
+                print(f"  refused: {item['name']}: {item['reason']}", file=sys.stderr)
+        return 1
+
+    from bosn.resources import TransferError
+
+    try:
+        legacy.apply_plan(engine, plan)
+    except TransferError as exc:
+        return _error(
+            code="adopt.legacy_relabel_failed",
+            message=str(exc),
+            next_step="resolve the reported engine error and retry",
+            as_json=opts.json,
+        )
+
+    try:
+        registered = daemon_mod.request("compose-adopt", opts.state_dir)
+    except (daemon_mod.DaemonError, ipc.TransportError) as exc:
+        return _error(
+            code="daemon.unreachable",
+            message=(
+                f"relabeled {len(eligible_names)} volume(s) but could not reach the daemon "
+                f"to register them: {exc}"
+            ),
+            next_step="run `bosn adopt --from-registry` or restart the daemon and retry",
+            as_json=opts.json,
+        )
+    if not registered.get("ok"):
+        return _error(
+            code="adopt.failed",
+            message=str(registered.get("error") or "registration after relabel failed"),
+            next_step="run `bosn doctor` and retry",
+            as_json=opts.json,
+        )
+
+    result = {
+        "adopted": eligible_names,
+        "skipped_immutable": skipped_names,
+        "refused": refused_report,
+        "family": family.name,
+        "registry_id": registry_id,
+        "applied": True,
+    }
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def cmd_adopt(opts: Options) -> int:
     """The sole ownership-transfer/recovery entry point for complete label contracts."""
     from bosn import daemon as daemon_mod
+
+    if opts.legacy:
+        return cmd_adopt_legacy(opts)
 
     try:
         reply = daemon_mod.request(
@@ -737,11 +898,19 @@ def cmd_adopt(opts: Options) -> int:
             transfer=list(opts.transfer),
         )
     except (daemon_mod.DaemonError, ipc.TransportError) as exc:
-        print(f"cannot reach the bosn daemon: {exc}", file=sys.stderr)
-        return 1
+        return _error(
+            code="daemon.unreachable",
+            message=f"cannot reach the bosn daemon: {exc}",
+            next_step="start or restart the daemon, then retry",
+            as_json=opts.json,
+        )
     if not reply.get("ok"):
-        print(str(reply.get("error") or "adopt failed"), file=sys.stderr)
-        return 1
+        return _error(
+            code="adopt.failed",
+            message=str(reply.get("error") or "adopt failed"),
+            next_step="run `bosn doctor` and retry",
+            as_json=opts.json,
+        )
     adopted = list(reply.get("adopted") or [])
     transferred = list(reply.get("transferred") or [])
     if not adopted and not transferred:
@@ -884,7 +1053,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     handler = handlers.get(opts.verb)
     if handler is not None:
-        if opts.json and opts.verb not in {"tasks", "gc"}:
+        if opts.json and opts.verb not in {"tasks", "gc", "adopt"}:
             # Older human-oriented verbs already return useful exit codes and write
             # diagnostics to stderr.  Adapt that boundary once so JSON callers never
             # need to parse prose while those commands are migrated individually.
