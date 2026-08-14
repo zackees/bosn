@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -365,6 +366,82 @@ def prune_dead_leases(registry: Registry, *, alive_probe=process_alive) -> list[
 # -- adoption --------------------------------------------------------------
 
 QUIET_PERIOD_SECONDS = 24 * 3600
+TRANSFER_IMAGE = "alpine:3.20"
+
+
+class TransferError(RuntimeError):
+    """An explicit ownership transfer cannot be performed safely."""
+
+
+def transfer_volume(registry: Registry, engine: Engine, resource: DiscoveredResource) -> str:
+    """Recreate one detached foreign volume with the current ownership labels.
+
+    Docker labels are immutable.  The staging volume retains a recoverable copy until the
+    replacement is verified, so a failed selected transfer never silently destroys data.
+    """
+    if resource.kind != "volume" or not resource.complete:
+        raise TransferError("only a complete labeled volume can be transferred")
+    attached = engine.run(["ps", "--all", "--filter", f"volume={resource.name}", "--quiet"])
+    if not attached.ok:
+        raise TransferError(f"could not check volume attachments for {resource.name}")
+    if attached.stdout.strip():
+        raise TransferError(f"volume {resource.name} is attached; stop its containers first")
+    parsed = resource.parsed()
+    new_labels = labels.ResourceLabels(
+        registry=registry.registry_id,
+        kind=parsed.kind,
+        stack=parsed.stack,
+        generation=parsed.generation,
+        scope=parsed.scope,
+        workspace=parsed.workspace,
+        created=parsed.created,
+    )
+    staging = f"bosn-transfer-{uuid.uuid4().hex}"
+    created_staging = engine.run(["volume", "create", staging])
+    if not created_staging.ok:
+        raise TransferError(f"could not create transfer staging volume for {resource.name}")
+    copy_to_staging = engine.run(
+        [
+            "run",
+            "--rm",
+            "-v",
+            f"{resource.name}:/from:ro",
+            "-v",
+            f"{staging}:/to",
+            TRANSFER_IMAGE,
+            "sh",
+            "-c",
+            "cp -a /from/. /to/",
+        ]
+    )
+    if not copy_to_staging.ok:
+        raise TransferError(f"copy to staging failed; preserved staging volume {staging}")
+    removed = engine.run(["volume", "rm", resource.name])
+    if not removed.ok:
+        raise TransferError(f"could not remove old volume; preserved staging volume {staging}")
+    create = engine.run(["volume", "create", *new_labels.to_docker_args(), resource.name])
+    if not create.ok:
+        raise TransferError(f"could not recreate volume; preserved staging volume {staging}")
+    copy_back = engine.run(
+        [
+            "run",
+            "--rm",
+            "-v",
+            f"{staging}:/from:ro",
+            "-v",
+            f"{resource.name}:/to",
+            TRANSFER_IMAGE,
+            "sh",
+            "-c",
+            "cp -a /from/. /to/",
+        ]
+    )
+    if not copy_back.ok:
+        raise TransferError(
+            f"copy into recreated volume failed; preserved staging volume {staging}"
+        )
+    engine.run(["volume", "rm", staging])
+    return resource.name
 
 
 def adopt(

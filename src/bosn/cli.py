@@ -152,6 +152,13 @@ def build_parser(*, json_errors: bool = False) -> argparse.ArgumentParser:
                 default=None,
                 help="recover this lost registry identity (required when several are found)",
             )
+            sub.add_argument(
+                "--transfer",
+                action="append",
+                default=[],
+                metavar="KIND:NAME",
+                help="explicitly transfer one detached volume by staged copy and recreation",
+            )
         if verb == "gc":
             group = sub.add_mutually_exclusive_group()
             group.add_argument(
@@ -723,7 +730,11 @@ def cmd_adopt(opts: Options) -> int:
 
     try:
         reply = daemon_mod.request(
-            "adopt", opts.state_dir, engine=opts.engine, source_registry=opts.source_registry
+            "adopt",
+            opts.state_dir,
+            engine=opts.engine,
+            source_registry=opts.source_registry,
+            transfer=list(opts.transfer),
         )
     except (daemon_mod.DaemonError, ipc.TransportError) as exc:
         print(f"cannot reach the bosn daemon: {exc}", file=sys.stderr)

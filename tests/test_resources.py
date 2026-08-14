@@ -545,3 +545,39 @@ def test_adopted_resources_are_protected_by_the_quiet_period(clock: FakeClock) -
     adopted_at = clock.now()
     assert resources.within_quiet_period(adopted_at, clock.advance(23 * 3600))
     assert not resources.within_quiet_period(adopted_at, clock.advance(2 * 3600))
+
+
+def test_explicit_volume_transfer_stages_data_before_recreating_labels(
+    registry: Registry,
+) -> None:
+    class TransferEngine:
+        def __init__(self) -> None:
+            self.commands: list[list[str]] = []
+
+        def run(self, args: list[str], *, check: bool = False) -> EngineResult:
+            self.commands.append(args)
+            return EngineResult(0, "", "")
+
+    engine = TransferEngine()
+    resource = DiscoveredResource("volume", "foreign-cache", label_dict(registry=THEIRS))
+
+    assert resources.transfer_volume(registry, engine, resource) == "foreign-cache"  # type: ignore[arg-type]
+    assert engine.commands[0] == ["ps", "--all", "--filter", "volume=foreign-cache", "--quiet"]
+    assert engine.commands[1][:2] == ["volume", "create"]
+    assert engine.commands[1][2].startswith("bosn-transfer-")
+    recreated = next(
+        command
+        for command in engine.commands
+        if command[:2] == ["volume", "create"] and command[-1] == "foreign-cache"
+    )
+    assert any(f"{labels.REGISTRY}={registry.registry_id}" in arg for arg in recreated)
+
+
+def test_explicit_volume_transfer_refuses_an_attached_volume(registry: Registry) -> None:
+    class AttachedEngine:
+        def run(self, args: list[str], *, check: bool = False) -> EngineResult:
+            return EngineResult(0, "container-id", "")
+
+    resource = DiscoveredResource("volume", "foreign-cache", label_dict(registry=THEIRS))
+    with pytest.raises(resources.TransferError, match="attached"):
+        resources.transfer_volume(registry, AttachedEngine(), resource)  # type: ignore[arg-type]

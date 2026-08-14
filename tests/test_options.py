@@ -132,3 +132,7 @@ def test_gc_apply_flips_dry_run() -> None:
 
 def test_adopt_can_select_a_lost_registry_identity() -> None:
     assert opts(["adopt", "--from-registry", "lost-registry"]).source_registry == "lost-registry"
+
+
+def test_adopt_can_select_exact_resources_for_transfer() -> None:
+    assert opts(["adopt", "--transfer", "volume:cache"]).transfer == ("volume:cache",)

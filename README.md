@@ -256,6 +256,13 @@ needed, first copy `registry.sqlite3` (including its `-wal` and `-shm` siblings)
 the copy as input to `sqlite3 copy.sqlite3 ".recover"`. Adopted resources receive a
 24-hour quiet period before normal age-based retention resumes.
 
+To transfer a resource between live registries, select it explicitly with
+`bosn adopt --transfer volume:<name>`. Docker labels are immutable, so bosn requires that
+the volume have no attached containers, copies its contents to a temporary staging volume,
+recreates the selected name with the current labels, copies the data back, and preserves the
+staging volume if a copy/recreate step fails. Images and containers are refused rather than
+silently recreating an unknown runtime contract.
+
 Enable the per-user login launcher once with `bosn __daemon --autostart`; it writes a
 Startup launcher on Windows, a LaunchAgent on macOS, or a user systemd unit on Linux.
 Disable and remove it with `bosn __daemon --no-autostart`. Each scheduled pass reaps

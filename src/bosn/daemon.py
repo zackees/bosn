@@ -342,6 +342,8 @@ class Daemon:
         except EngineError as exc:
             self.registry.log_event("recovery.scan.unavailable", str(exc))
             return
+        except KeyboardInterrupt:
+            raise
         except Exception as exc:  # background recovery must never take down IPC
             if not self._stop.is_set():
                 self.registry.log_event("recovery.scan.failed", str(exc))
@@ -633,9 +635,50 @@ class Daemon:
 
     def _verb_adopt(self, request: dict[str, Any]) -> dict[str, Any]:
         from bosn.engine import Engine
-        from bosn.resources import ResourceScanner, adopt
+        from bosn.resources import (
+            ResourceScanner,
+            TransferError,
+            adopt,
+            reconcile_owned,
+            transfer_volume,
+        )
 
         engine = Engine(str(request.get("engine") or self.engine_binary))
+        selectors = [str(item) for item in request.get("transfer", [])]
+        if selectors:
+            transferred: list[str] = []
+            for selector in selectors:
+                kind, separator, name = selector.partition(":")
+                if separator != ":" or not kind or not name:
+                    return {"ok": False, "error": f"invalid transfer selector: {selector}"}
+                if kind != "volume":
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"{kind} labels are immutable and cannot be safely recreated; "
+                            "only detached volumes support transfer"
+                        ),
+                    }
+                candidates = ResourceScanner(engine).discover(kind)
+                resource = next((item for item in candidates if item.name == name), None)
+                if resource is None or not resource.complete:
+                    return {"ok": False, "error": f"no complete labeled volume named {name}"}
+                if resource.owned_by(self.registry.registry_id):
+                    return {
+                        "ok": False,
+                        "error": f"volume already belongs to this registry: {name}",
+                    }
+                try:
+                    transferred.append(transfer_volume(self.registry, engine, resource))
+                except TransferError as exc:
+                    return {"ok": False, "error": str(exc), "transferred": transferred}
+            scan = ResourceScanner(engine).scan(self.registry.registry_id, kinds=["volume"])
+            reconcile_owned(self.registry, scan)
+            return {
+                "ok": True,
+                "transferred": transferred,
+                "registry_id": self.registry.registry_id,
+            }
         scan = ResourceScanner(engine).scan("", kinds=["container", "volume", "image"])
         registries = scan.foreign_registries
         if not registries:
