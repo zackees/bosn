@@ -557,8 +557,8 @@ otherwise swallows Ctrl-C.
 CI runs Linux, Windows, and macOS lanes on every pull request. Docker-backed tests carry a
 `docker` pytest marker and run on Linux only — hosted macOS runners have no Docker daemon and
 hosted Windows runners cannot run Linux containers, so real Docker Desktop coverage there
-would need a self-hosted runner. The native lanes are advisory until they are added to branch
-protection's required status checks.
+would need a self-hosted runner. All three lanes are required status checks on `main`, so a
+red lane blocks the merge.
 
 ## License
 
