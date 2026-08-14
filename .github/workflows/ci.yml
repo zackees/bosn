@@ -72,14 +72,6 @@ jobs:
       - name: Install
         run: ./install
 
-      # Temporary: issue #68. process_alive(4) disagrees between a dev box and this runner,
-      # and the wrong answer means a live holder's lease can be reaped. Print the evidence
-      # rather than guess. Remove this step once the behavior is recorded on the issue.
-      - name: Diagnose PID-4 liveness (issue #68)
-        if: runner.os == 'Windows'
-        continue-on-error: true
-        run: uv run python ci/diagnose_pid4.py
-
       - name: Lint
         run: ./lint
 

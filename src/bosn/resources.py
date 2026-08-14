@@ -317,7 +317,20 @@ def process_alive(pid: int, proc_start: float | None = None) -> bool:
         # same fail-open posture as PermissionError above.
         return True
     except OSError:
-        return False
+        # Only ProcessLookupError above proves the process is gone. Every other OSError
+        # means this probe could not answer, so ask the OS-owned identity source instead
+        # of guessing -- in either direction.
+        #
+        # Observed on an elevated Windows CI runner (issue #68): os.kill(4, 0) against the
+        # live System process raises OSError [WinError 87] "The parameter is incorrect",
+        # while tasklist lists the process and process_start_time() returns a valid
+        # creation time for it. Answering "dead" there called a demonstrably live process
+        # dead, expiring its lease. Answering "alive" unconditionally is no better: a
+        # long-gone pid also lands here on Windows, and its lease would never expire.
+        #
+        # A creation time is positive evidence the process exists; its absence, after
+        # os.kill already failed, means two independent probes could not find it.
+        return process_start_time(pid) is not None
     if proc_start is None:
         return True
     actual = process_start_time(pid)

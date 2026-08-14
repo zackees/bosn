@@ -157,6 +157,25 @@ def test_native_process_start_pairs_matching_and_mismatched_identity_with_livene
 # it reliably exercises this branch without any monkeypatching.
 
 
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="the access-denied liveness branch is Windows-only"
+)
+def test_native_windows_access_denied_pid_reads_as_alive() -> None:
+    """A live, other-user process must never read as dead, however os.kill reports it.
+
+    PID 4 is the Windows System process: always present, always owned by another user, and
+    never openable. What os.kill(4, 0) raises depends on the host -- SystemError on an
+    ordinary developer box, OSError [WinError 87] on an elevated CI runner (issue #68).
+    Both mean "cannot tell", and both must fail open, because judging a live holder dead
+    expires its lease and lets GC reap resources that are still in use.
+
+    Deliberately asserts only the outward behavior, not the exception type: that is exactly
+    the detail that legitimately differs between hosts, and pinning it is what made the
+    first version of this test fail on CI while passing locally.
+    """
+    assert process_alive(4) is True
+
+
 # -- 3. autostart adapters without mutating system-wide state ----------------
 #
 # autostart.enable()'s Windows and darwin branches are pure file writes under the injected

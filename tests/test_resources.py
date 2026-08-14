@@ -339,6 +339,51 @@ def test_process_alive_treats_windows_access_denied_system_error_as_alive(monkey
     assert resources.process_alive(4) is True
 
 
+def test_process_alive_treats_an_ambiguous_oserror_as_alive(monkeypatch) -> None:
+    """Only ProcessLookupError proves absence; any other OSError means "cannot tell".
+
+    Observed on an elevated Windows CI runner (issue #68): os.kill(4, 0) against the live
+    System process raises OSError [WinError 87] "The parameter is incorrect", while
+    tasklist lists the process and process_start_time() returns a creation time for it.
+    The old `except OSError: return False` therefore called a demonstrably live process
+    dead, which expires its lease and lets GC reap resources still in use.
+    """
+
+    def _raises_winerror_87(pid: int, sig: int) -> None:
+        raise OSError(22, "The parameter is incorrect")
+
+    monkeypatch.setattr(os, "kill", _raises_winerror_87)
+    monkeypatch.setattr(resources, "process_start_time", lambda _pid: 1234.5)
+    assert resources.process_alive(4) is True
+
+
+def test_an_ambiguous_oserror_without_a_creation_time_is_dead(monkeypatch) -> None:
+    """The fail-open rule must not resurrect a long-gone pid.
+
+    A stale pid also raises a non-ProcessLookupError OSError on Windows, so answering
+    "alive" unconditionally would mean its lease never expires and its resources are
+    pinned forever. When os.kill cannot answer *and* the OS has no creation time for the
+    pid, two independent probes failed to find it -- that is the dead case.
+    """
+
+    def _raises_winerror_87(pid: int, sig: int) -> None:
+        raise OSError(22, "The parameter is incorrect")
+
+    monkeypatch.setattr(os, "kill", _raises_winerror_87)
+    monkeypatch.setattr(resources, "process_start_time", lambda _pid: None)
+    assert resources.process_alive(4) is False
+
+
+def test_process_alive_still_reports_a_missing_process_as_dead(monkeypatch) -> None:
+    """The fail-open rule above must not swallow the one case that is real proof."""
+
+    def _raises_lookup(pid: int, sig: int) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setattr(os, "kill", _raises_lookup)
+    assert resources.process_alive(4) is False
+
+
 def test_windows_process_start_probe_uses_cim_not_get_process(monkeypatch) -> None:
     """Get-Process's .StartTime throws access-denied on another user's process, silently
     yielding an empty stdout (stderr is discarded). Get-CimInstance does not have this
