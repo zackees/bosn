@@ -145,6 +145,39 @@ def test_unknown_verb_is_rejected_not_ignored(served: Daemon) -> None:
     assert "unknown daemon verb" in reply["error"]
 
 
+def test_done_normalizes_the_request_workspace_before_matching(tmp_path: Path) -> None:
+    """The IPC contract must accept any supported spelling, not only the CLI's own.
+
+    `_verb_done` used to pass `request["workspace"]` straight into an exact-match SQL
+    query. The bundled CLI always sends an already-normalized identity, so this never
+    showed up there -- but any other IPC client sending an equivalent-but-differently-
+    spelled path (MSYS, WSL, a trailing slash, drive-letter case) would match zero rows
+    and get back `{"ok": True, "marked": 0}`: a silent no-op reported as success. This
+    proves a request spelled differently from the stored identity still marks it.
+    """
+    from bosn.paths import normalize_workspace_path
+
+    daemon = Daemon(state_dir=tmp_path)
+    try:
+        canonical = normalize_workspace_path(r"C:\Users\Me\work")
+        daemon.registry.register_resource(
+            kind="volume",
+            name="cache",
+            stack="s",
+            generation="g",
+            scope="spec",
+            workspace=canonical,
+        )
+        differently_spelled = "/c/Users/Me/work"
+        assert differently_spelled != canonical
+
+        reply = daemon.dispatch("done", {"workspace": differently_spelled})
+
+        assert reply == {"ok": True, "marked": 1}
+    finally:
+        daemon.registry.close()
+
+
 def test_requests_refresh_the_heartbeat(served: Daemon) -> None:
     before = served.heartbeat_at
     time.sleep(0.05)

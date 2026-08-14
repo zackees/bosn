@@ -1,4 +1,15 @@
-"""Canonical path identities across native Windows, MSYS, WSL and UNC spellings."""
+"""Canonical path identities across the supported shells' path spellings.
+
+Issue #1 names cmd.exe, PowerShell, MSYS Git Bash, macOS, and Linux as the supported
+shells, so a native Windows path, a `/c/...` MSYS spelling, a `//?/` UNC-prefixed path,
+and a plain POSIX path must all resolve to one identity. WSL itself is rejected outright
+(see `in_wsl`) rather than supported, but its `/mnt/c/...` spelling is recognized anyway,
+defensively, the same way Cygwin's `/cygdrive/c/...` spelling is: neither shell is
+supported, but the cost of recognizing either prefix is one alternation, and the
+alternative -- silently rooting the identity at a nonexistent path like
+`c:\\cygdrive\\c\\...` -- is a workspace identity that never matches, which is exactly the
+silent split this module exists to prevent.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +22,7 @@ from pathlib import Path
 def normalize_workspace_path(path: str | Path) -> str:
     raw = str(path).replace("\\", "/")
     raw = re.sub(r"^//\?/", "", raw)
-    match = re.match(r"^/(?:mnt/)?([a-zA-Z])/(.*)$", raw)
+    match = re.match(r"^/(?:mnt/|cygdrive/)?([a-zA-Z])/(.*)$", raw)
     if match:
         raw = f"{match.group(1).upper()}:/{match.group(2)}"
     if re.match(r"^[a-zA-Z]:/", raw) or raw.startswith("//"):
