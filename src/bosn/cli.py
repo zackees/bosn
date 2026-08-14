@@ -50,6 +50,15 @@ def _add_policy_flags(parser: argparse.ArgumentParser, *, default: object) -> No
         parser.add_argument(f"--{key.replace('_', '-')}", type=float, default=default)
 
 
+def _error(*, code: str, message: str, next_step: str, as_json: bool = False) -> int:
+    """Emit the stable machine error envelope while preserving readable stderr."""
+    if as_json:
+        print(json.dumps({"ok": False, "code": code, "message": message, "next": next_step}))
+    else:
+        print(message, file=sys.stderr)
+    return 1
+
+
 # verb -> (help text, phase that lands it)
 VERBS: dict[str, tuple[str, str]] = {
     "run": ("run an ad-hoc command in a stack", "implemented"),
@@ -276,8 +285,12 @@ def cmd_tasks(opts: Options) -> int:
             )
         manifest = load(manifest_path)
     except ManifestError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
+        return _error(
+            code="manifest.invalid",
+            message=str(exc),
+            next_step="create or select a valid bosn.toml with --manifest",
+            as_json=opts.json,
+        )
 
     db_path = (opts.state_dir / "registry.sqlite3") if opts.state_dir else default_db_path()
     registered = []
@@ -328,8 +341,12 @@ def cmd_tasks(opts: Options) -> int:
             },
         }
     except ManifestError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
+        return _error(
+            code="manifest.digest_failed",
+            message=str(exc),
+            next_step="fix the manifest or Dockerfile inputs, then retry",
+            as_json=opts.json,
+        )
     print(json.dumps(payload, indent=2))
     return 0
 

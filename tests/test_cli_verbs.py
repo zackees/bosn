@@ -87,6 +87,17 @@ def test_tasks_json_reports_unregistered_readiness(tmp_path, capsys) -> None:
     payload = json.loads(capsys.readouterr().out)
     assert payload["stacks"]["dev"]["readiness"]["state"] == "unregistered"
     assert payload["tasks"]["unit"]["readiness"]["jobs"]["state"] == "unavailable"
+
+
+def test_tasks_json_manifest_error_has_stable_remedy(tmp_path, capsys) -> None:
+    assert cli.main(["--state-dir", str(tmp_path), "tasks", "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "ok": False,
+        "code": "manifest.invalid",
+        "message": payload["message"],
+        "next": "create or select a valid bosn.toml with --manifest",
+    }
     assert cli.VERBS["cancel"][1] == "implemented"
 
 
