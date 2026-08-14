@@ -319,3 +319,123 @@ def test_a_missing_referenced_file_is_an_error_not_a_zero(project: Path) -> None
     manifest = load(project)
     with pytest.raises(ManifestError, match="does not exist"):
         generation_digest(manifest, manifest.stacks["test"])
+
+
+# -- bind mounts and explicit volume destinations (#76) ----------------------
+
+
+BIND_SAMPLE = """
+[stack.test]
+dockerfile = "docker/test.Dockerfile"
+default = true
+
+[stack.test.volumes]
+target = { scope = "stack", destination = "/target" }
+cache  = { scope = "machine" }
+
+[stack.test.mounts]
+repo = { source = ".", destination = "/repo" }
+conf = { source = "docker", destination = "/etc/app", readonly = true }
+"""
+
+
+def _write(root: Path, body: str) -> Path:
+    (root / "docker").mkdir(exist_ok=True)
+    (root / "docker" / "test.Dockerfile").write_text("FROM alpine\n", encoding="utf-8")
+    (root / "bosn.toml").write_text(body, encoding="utf-8")
+    return root
+
+
+def test_mounts_and_explicit_volume_destinations_parse(tmp_path: Path) -> None:
+    stack = load(_write(tmp_path, BIND_SAMPLE)).stacks["test"]
+
+    assert {v.name: v.mount_at() for v in stack.volumes} == {
+        "target": "/target",  # explicit destination honored
+        "cache": "/bosn/cache",  # default when omitted
+    }
+    assert [(m.name, m.destination, m.readonly) for m in stack.mounts] == [
+        ("repo", "/repo", False),
+        ("conf", "/etc/app", True),
+    ]
+    assert stack.mounts[0].resolve_source(tmp_path) == tmp_path.resolve()
+
+
+def test_a_missing_bind_source_is_an_error_not_an_empty_directory(tmp_path: Path) -> None:
+    """Docker would create the source silently; an empty /repo fails much later."""
+    body = BIND_SAMPLE.replace('source = "."', 'source = "does-not-exist"')
+    stack = load(_write(tmp_path, body)).stacks["test"]
+
+    with pytest.raises(ManifestError, match="does not exist"):
+        stack.mounts[0].resolve_source(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "destination",
+    ["/bosn/target", "/bosn-daemon/heartbeat"],
+)
+def test_a_mount_inside_bosns_own_namespace_is_refused(tmp_path: Path, destination: str) -> None:
+    """Shadowing a managed volume or the heartbeat the container's PID 1 watches."""
+    body = BIND_SAMPLE.replace('destination = "/repo"', f'destination = "{destination}"')
+
+    with pytest.raises(ManifestError, match="reserved"):
+        load(_write(tmp_path, body))
+
+
+def test_a_relative_destination_is_refused(tmp_path: Path) -> None:
+    body = BIND_SAMPLE.replace('destination = "/repo"', 'destination = "repo"')
+
+    with pytest.raises(ManifestError, match="absolute"):
+        load(_write(tmp_path, body))
+
+
+def test_two_mounts_at_one_destination_are_refused(tmp_path: Path) -> None:
+    """Docker takes the last one silently, leaving the other mysteriously absent."""
+    body = BIND_SAMPLE.replace('destination = "/etc/app"', 'destination = "/repo"')
+
+    with pytest.raises(ManifestError, match="twice"):
+        load(_write(tmp_path, body))
+
+
+def test_a_bind_colliding_with_a_volume_destination_is_refused(tmp_path: Path) -> None:
+    body = BIND_SAMPLE.replace('destination = "/repo"', 'destination = "/target"')
+
+    with pytest.raises(ManifestError, match="twice"):
+        load(_write(tmp_path, body))
+
+
+def test_moving_a_mount_rolls_the_generation(tmp_path: Path) -> None:
+    """Where something is mounted is part of the stack's identity."""
+    before = load(_write(tmp_path, BIND_SAMPLE))
+    after = load(_write(tmp_path, BIND_SAMPLE.replace('"/repo"', '"/src"')))
+
+    assert generation_digest(before, before.stacks["test"]) != generation_digest(
+        after, after.stacks["test"]
+    )
+
+
+def test_the_digest_splits_copied_files_from_bind_source_contents(tmp_path: Path) -> None:
+    """The deliberate narrowing: a bind exists to keep its contents OUT of identity.
+
+    Proven both ways against one Dockerfile that COPYs a single file. Editing the copied
+    file rolls the generation; editing a sibling visible only through the bind does not.
+    Without that second half a live working tree would rebuild on every keystroke, which
+    is the reason for bind-mounting it in the first place.
+    """
+    root = _write(tmp_path, BIND_SAMPLE)
+    (root / "docker" / "test.Dockerfile").write_text(
+        "FROM alpine\nCOPY copied.py /copied.py\n", encoding="utf-8"
+    )
+    (root / "copied.py").write_text("print('one')\n", encoding="utf-8")
+    (root / "only_bind_mounted.py").write_text("print('one')\n", encoding="utf-8")
+
+    def digest() -> str:
+        loaded = load(root)
+        return generation_digest(loaded, loaded.stacks["test"])
+
+    baseline = digest()
+
+    (root / "only_bind_mounted.py").write_text("print('edited')\n", encoding="utf-8")
+    assert digest() == baseline, "a bind source's contents must not roll the generation"
+
+    (root / "copied.py").write_text("print('edited')\n", encoding="utf-8")
+    assert digest() != baseline, "a COPYed file must roll the generation"

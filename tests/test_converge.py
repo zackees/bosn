@@ -124,7 +124,12 @@ class FakeEngine:
                 read_only = rendered.endswith(":ro")
                 core = rendered[:-3] if read_only else rendered
                 source, destination = core.rsplit(":", 1)
-                mount_type = "bind" if destination == "/bosn-daemon/heartbeat" else "volume"
+                # A named volume's "source" is a bare token; a bind source is always a
+                # path. That's the only signal available here to tell them apart.
+                is_path = "/" in source or "\\" in source
+                mount_type = (
+                    "bind" if destination == "/bosn-daemon/heartbeat" or is_path else "volume"
+                )
                 mounts.append(
                     {
                         "Type": mount_type,
@@ -184,6 +189,27 @@ class FakeEngine:
 def project(tmp_path: Path) -> Path:
     (tmp_path / "Dockerfile").write_text("FROM alpine\n", encoding="utf-8")
     (tmp_path / "bosn.toml").write_text(SAMPLE, encoding="utf-8")
+    return tmp_path
+
+
+BIND_SAMPLE = """
+[stack.test]
+dockerfile = "Dockerfile"
+family = "rust"
+default = true
+
+[stack.test.mounts]
+repo = { source = "repo", destination = "/repo" }
+"""
+
+
+@pytest.fixture
+def bind_project(tmp_path: Path) -> Path:
+    """A stack with one declared bind mount and no volumes, so mount matching is isolated."""
+    (tmp_path / "Dockerfile").write_text("FROM alpine\n", encoding="utf-8")
+    (tmp_path / "repo").mkdir()
+    (tmp_path / "repo" / "marker").write_text("hi", encoding="utf-8")
+    (tmp_path / "bosn.toml").write_text(BIND_SAMPLE, encoding="utf-8")
     return tmp_path
 
 
@@ -995,6 +1021,151 @@ def test_changed_required_mount_recreates_an_owned_container(converger: Converge
 
     assert len(engine.ran("container", "rm", "--force")) == 1
     assert len(engine.ran("create")) == 2
+
+
+# -- bind mounts -------------------------------------------------------------
+
+
+def test_volume_with_explicit_destination_mounts_there_not_under_bosn(
+    tmp_path: Path, registry: Registry
+) -> None:
+    (tmp_path / "Dockerfile").write_text("FROM alpine\n", encoding="utf-8")
+    (tmp_path / "bosn.toml").write_text(
+        """
+[stack.test]
+dockerfile = "Dockerfile"
+default = true
+
+[stack.test.volumes]
+target = { scope = "spec", destination = "/target" }
+""",
+        encoding="utf-8",
+    )
+    engine = FakeEngine()
+    converger = Converger(load(tmp_path), registry, engine)  # type: ignore[arg-type]
+
+    converger.run(["true"])
+
+    create = engine.ran("create")[0]
+    volume_args = [a for a in create if ":/target" in a]
+    assert len(volume_args) == 1
+    assert not any(":/bosn/target" in a for a in create)
+
+
+def test_bind_mount_reaches_the_container_with_source_destination_and_readonly(
+    tmp_path: Path, registry: Registry
+) -> None:
+    (tmp_path / "Dockerfile").write_text("FROM alpine\n", encoding="utf-8")
+    (tmp_path / "secrets").mkdir()
+    (tmp_path / "bosn.toml").write_text(
+        """
+[stack.test]
+dockerfile = "Dockerfile"
+default = true
+
+[stack.test.mounts]
+secrets = { source = "secrets", destination = "/etc/app", readonly = true }
+""",
+        encoding="utf-8",
+    )
+    engine = FakeEngine()
+    converger = Converger(load(tmp_path), registry, engine)  # type: ignore[arg-type]
+
+    converger.run(["true"])
+
+    create = engine.ran("create")[0]
+    source = str((tmp_path / "secrets").resolve())
+    assert "--volume" in create
+    assert f"{source}:/etc/app:ro" in create
+
+
+def test_bind_mount_source_is_never_registered_labeled_or_collected(
+    bind_project: Path, registry: Registry
+) -> None:
+    """bosn owns volumes and may delete them; it only references a bind source."""
+    engine = FakeEngine()
+    converger = Converger(load(bind_project), registry, engine)  # type: ignore[arg-type]
+
+    converger.run(["true"])
+
+    resource_kinds = {r.kind for r in registry.list_resources()}
+    assert resource_kinds <= {"image", "container"}
+    repo_source = str((bind_project / "repo").resolve())
+    assert all(r.name != repo_source for r in registry.list_resources())
+    assert engine.ran("volume", "create") == []
+
+
+def test_container_matching_its_full_declared_mount_set_is_reused(
+    bind_project: Path, registry: Registry
+) -> None:
+    """The opposite failure: a bind-mounted container must not be needlessly replaced.
+
+    RED before the Task 2 fix: the old filter only ever counted `/bosn/*` and the
+    heartbeat as "managed", so a declared bind destination like `/repo` never appeared in
+    that set. The equality check against the full expected set then failed unconditionally,
+    and a container whose bind mount was correct in every respect still got torn down and
+    recreated on every single run.
+    """
+    engine = FakeEngine()
+    converger = Converger(load(bind_project), registry, engine)  # type: ignore[arg-type]
+    converger.run(["true"])
+    assert len(engine.ran("create")) == 1
+
+    converger.run(["true"])
+
+    assert len(engine.ran("create")) == 1, "an unchanged bind mount must not force a rebuild"
+    assert engine.ran("container", "rm", "--force") == []
+
+
+def test_bind_mount_source_drift_is_not_silently_reused() -> None:
+    """RED before the Task 2 fix: `/repo` is outside `/bosn/*`, so the old filter dropped it
+    from the "managed" set entirely and the per-entry source comparison below was never
+    reached -- a drifted bind source was invisible to the match, not merely tolerated."""
+    expected = {
+        "/bosn-daemon/heartbeat": {
+            "type": "bind",
+            "source": "/state/heartbeat",
+            "destination": "/bosn-daemon/heartbeat",
+            "rw": False,
+        },
+        "/repo": {
+            "type": "bind",
+            "source": "/host/repo",
+            "destination": "/repo",
+            "rw": True,
+        },
+    }
+    matching = [
+        {
+            "Type": "bind",
+            "Source": "/state/heartbeat",
+            "Destination": "/bosn-daemon/heartbeat",
+            "RW": False,
+        },
+        {"Type": "bind", "Source": "/host/repo", "Destination": "/repo", "RW": True},
+    ]
+    drifted_source = [
+        {
+            "Type": "bind",
+            "Source": "/state/heartbeat",
+            "Destination": "/bosn-daemon/heartbeat",
+            "RW": False,
+        },
+        {"Type": "bind", "Source": "/host/OLD-repo", "Destination": "/repo", "RW": True},
+    ]
+    drifted_destination = [
+        {
+            "Type": "bind",
+            "Source": "/state/heartbeat",
+            "Destination": "/bosn-daemon/heartbeat",
+            "RW": False,
+        },
+        {"Type": "bind", "Source": "/host/repo", "Destination": "/moved", "RW": True},
+    ]
+
+    assert Converger._container_mounts_match(matching, expected) is True
+    assert Converger._container_mounts_match(drifted_source, expected) is False
+    assert Converger._container_mounts_match(drifted_destination, expected) is False
 
 
 def test_changed_image_id_recreates_an_owned_container(converger: Converger) -> None:

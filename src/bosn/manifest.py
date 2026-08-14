@@ -23,15 +23,37 @@ from typing import Any
 MANIFEST_NAME = "bosn.toml"
 VALID_SCOPES = {"spec", "stack", "machine"}
 
+# bosn mounts its own objects under this prefix and keeps the daemon heartbeat beside
+# it. User mounts may not land here: a collision would shadow a managed volume or the
+# liveness file the container's PID 1 watches.
+RESERVED_PREFIX = "/bosn/"
+RESERVED_HEARTBEAT = "/bosn-daemon/heartbeat"
+
 
 class ManifestError(ValueError):
     """The manifest is malformed, or names something that does not exist."""
+
+
+def _validate_destination(destination: str, *, what: str, name: str) -> str:
+    """A mount destination must be absolute, unique, and outside bosn's own namespace."""
+    if not destination.startswith("/"):
+        raise ManifestError(
+            f"{what} {name!r} has destination {destination!r}; it must be an absolute path"
+        )
+    normalized = destination.rstrip("/") or "/"
+    if normalized == RESERVED_HEARTBEAT.rstrip("/") or normalized.startswith(RESERVED_PREFIX):
+        raise ManifestError(
+            f"{what} {name!r} would mount at {destination!r}, inside bosn's reserved "
+            f"namespace ({RESERVED_PREFIX}*, {RESERVED_HEARTBEAT}); choose another destination"
+        )
+    return normalized
 
 
 @dataclass(frozen=True)
 class VolumeSpec:
     name: str
     scope: str
+    destination: str | None = None
 
     def __post_init__(self) -> None:
         if self.scope not in VALID_SCOPES:
@@ -39,6 +61,61 @@ class VolumeSpec:
                 f"volume {self.name!r} has unknown scope {self.scope!r}; "
                 f"expected one of {sorted(VALID_SCOPES)}"
             )
+        if self.destination is not None:
+            object.__setattr__(
+                self,
+                "destination",
+                _validate_destination(self.destination, what="volume", name=self.name),
+            )
+
+    def mount_at(self) -> str:
+        """Where this volume lands in the container.
+
+        Defaults to bosn's own namespace; an explicit destination lets an existing image
+        keep the paths its ENV already points at instead of rewriting its Dockerfile.
+        """
+        return self.destination or f"{RESERVED_PREFIX}{self.name}"
+
+
+@dataclass(frozen=True)
+class MountSpec:
+    """A host path bind-mounted into the container.
+
+    bosn *owns* volumes and may delete them; it only *references* a bind source and must
+    never touch it. That distinction is why binds are a separate table rather than another
+    volume scope: nothing here is ever labeled, registered, or collected.
+    """
+
+    name: str
+    source: str
+    destination: str
+    readonly: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.source:
+            raise ManifestError(f"mount {self.name!r} must set `source`")
+        if not self.destination:
+            raise ManifestError(f"mount {self.name!r} must set `destination`")
+        object.__setattr__(
+            self,
+            "destination",
+            _validate_destination(self.destination, what="mount", name=self.name),
+        )
+
+    def resolve_source(self, root: Path) -> Path:
+        """The absolute host path, relative to the manifest root.
+
+        A missing source is an error rather than a silently engine-created empty
+        directory: mounting a directory that was supposed to hold your source tree, and
+        getting an empty one, fails much later and much more confusingly.
+        """
+        resolved = (root / self.source).resolve()
+        if not resolved.exists():
+            raise ManifestError(
+                f"mount {self.name!r} sources {self.source!r}, which resolves to "
+                f"{resolved} and does not exist"
+            )
+        return resolved
 
 
 @dataclass(frozen=True)
@@ -49,6 +126,7 @@ class StackSpec:
     family: str | None = None
     default: bool = False
     volumes: tuple[VolumeSpec, ...] = ()
+    mounts: tuple[MountSpec, ...] = ()
 
     def referenced_files(self, root: Path) -> list[Path]:
         """Files whose byte content folds into this stack's digest."""
@@ -132,6 +210,31 @@ def load(path: Path | str) -> Manifest:
     return parse(raw, root=path.parent)
 
 
+def _refuse_duplicate_destinations(
+    stack: str, volumes: tuple[VolumeSpec, ...], mounts: tuple[MountSpec, ...]
+) -> None:
+    """Two mounts at one destination is last-writer-wins in Docker; refuse it here.
+
+    The engine accepts the container and one of the two simply does not appear, which
+    surfaces as a mysteriously empty directory rather than an error.
+    """
+    seen: dict[str, str] = {}
+    for volume in volumes:
+        seen[volume.mount_at()] = f"volume {volume.name!r}"
+    for mount in mounts:
+        previous = seen.get(mount.destination)
+        if previous is not None:
+            raise ManifestError(
+                f"[stack.{stack}] mounts {mount.destination!r} twice: "
+                f"{previous} and mount {mount.name!r}"
+            )
+        seen[mount.destination] = f"mount {mount.name!r}"
+    destinations = [v.mount_at() for v in volumes]
+    if len(set(destinations)) != len(destinations):
+        duplicated = sorted({d for d in destinations if destinations.count(d) > 1})
+        raise ManifestError(f"[stack.{stack}] mounts {duplicated} more than once")
+
+
 def parse(raw: dict, root: Path) -> Manifest:
     manifest = Manifest(root=root)
 
@@ -139,9 +242,27 @@ def parse(raw: dict, root: Path) -> Manifest:
         if not isinstance(body, dict):
             raise ManifestError(f"[stack.{name}] must be a table")
         volumes = tuple(
-            VolumeSpec(name=vol_name, scope=str((vol_body or {}).get("scope", "spec")))
+            VolumeSpec(
+                name=vol_name,
+                scope=str((vol_body or {}).get("scope", "spec")),
+                destination=(
+                    str((vol_body or {}).get("destination"))
+                    if (vol_body or {}).get("destination")
+                    else None
+                ),
+            )
             for vol_name, vol_body in (body.get("volumes") or {}).items()
         )
+        mounts = tuple(
+            MountSpec(
+                name=mount_name,
+                source=str((mount_body or {}).get("source", "")),
+                destination=str((mount_body or {}).get("destination", "")),
+                readonly=bool((mount_body or {}).get("readonly", False)),
+            )
+            for mount_name, mount_body in (body.get("mounts") or {}).items()
+        )
+        _refuse_duplicate_destinations(name, volumes, mounts)
         stack = StackSpec(
             name=name,
             dockerfile=body.get("dockerfile"),
@@ -149,6 +270,7 @@ def parse(raw: dict, root: Path) -> Manifest:
             family=body.get("family"),
             default=bool(body.get("default", False)),
             volumes=volumes,
+            mounts=mounts,
         )
         if stack.dockerfile is None and stack.image is None:
             raise ManifestError(f"[stack.{name}] must set either `dockerfile` or `image`")
@@ -189,7 +311,12 @@ def generation_digest(manifest: Manifest, stack: StackSpec) -> str:
         "dockerfile": stack.dockerfile,
         "image": stack.image,
         "family": stack.family,
-        "volumes": sorted((v.name, v.scope) for v in stack.volumes),
+        # Declarations are digested; a bind source's *contents* deliberately are not.
+        # Where something is mounted is part of this stack's identity, but the live
+        # working tree behind a bind is exactly the thing a bind exists to keep outside
+        # content identity -- and hashing it would be both enormous and never stable.
+        "volumes": sorted((v.name, v.scope, v.mount_at()) for v in stack.volumes),
+        "mounts": sorted((m.name, m.source, m.destination, m.readonly) for m in stack.mounts),
     }
     _hash_field(
         hasher,
