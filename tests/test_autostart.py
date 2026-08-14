@@ -17,5 +17,15 @@ def test_per_user_login_launcher_can_be_enabled_and_removed(
     assert installed.exists()
     text = installed.read_text(encoding="utf-8")
     assert "bosn" in text
+    if platform == "win32":
+        assert "timeout /t" in text and "goto loop" in text
+    elif platform == "darwin":
+        assert "StartInterval" in text
+    else:
+        timer = installed.with_name("bosn-daemon.timer")
+        assert timer.exists() and "Persistent=true" in timer.read_text(encoding="utf-8")
+        assert "Type=simple" in text
     assert autostart.disable(platform=platform, home=tmp_path) == installed
     assert not installed.exists()
+    if platform == "linux":
+        assert not installed.with_name("bosn-daemon.timer").exists()

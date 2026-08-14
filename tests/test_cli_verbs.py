@@ -71,11 +71,17 @@ def test_unknown_verb_is_rejected() -> None:
     assert exc.value.code != 0
 
 
-def test_doctor_reports_unreachable_engine_without_crashing(capsys) -> None:
-    code = cli.main(["--engine", "definitely-not-an-engine-binary", "doctor"])
+def test_doctor_reports_unreachable_engine_and_scheduler_state_without_crashing(
+    tmp_path, capsys
+) -> None:
+    code = cli.main(
+        ["--state-dir", str(tmp_path), "--engine", "definitely-not-an-engine-binary", "doctor"]
+    )
     assert code == 1
     captured = capsys.readouterr()
     assert "reachable:      no" in captured.out
+    assert "scheduler manifest installed:" in captured.out
+    assert "scheduler next deadline: -" in captured.out
     assert "not on PATH" in captured.err
 
 

@@ -277,6 +277,69 @@ def test_maintenance_engine_down_is_visible_and_uses_exponential_backoff(
         daemon.registry.close()
 
 
+def test_maintenance_deadline_persists_across_scheduler_wake(monkeypatch, tmp_path: Path) -> None:
+    clock = FakeClock()
+    calls: list[str] = []
+
+    class Engine:
+        def __init__(self, *_args):
+            pass
+
+        def info(self):
+            return EngineInfo(binary="docker", reachable=True)
+
+    class Collector:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def collect(self, **_kwargs):
+            calls.append("gc")
+            return type("Result", (), {"summary": lambda self: {}})()
+
+    import bosn.engine
+    import bosn.gc
+
+    monkeypatch.setattr(bosn.engine, "Engine", Engine)
+    monkeypatch.setattr(bosn.gc, "Collector", Collector)
+    first = Daemon(
+        state_dir=tmp_path, clock=clock, maintenance_interval_seconds=60, idle_retire_seconds=1
+    )
+    assert first.run_maintenance_if_due()
+    assert first.registry.meta("maintenance.next_deadline") == f"{clock.now() + 60:.6f}"
+    thread = threading.Thread(target=first.serve_forever, daemon=True)
+    thread.start()
+    assert _wait_until(lambda: daemon_mod.is_serving(tmp_path))
+    clock.advance(1)
+    thread.join(timeout=15)
+    assert not thread.is_alive(), "the first daemon must retire before the scheduler wakes it"
+    assert not daemon_mod.is_serving(tmp_path)
+    clock.advance(120)
+    wake = Daemon(state_dir=tmp_path, clock=clock, maintenance_interval_seconds=60)
+    try:
+        assert wake._next_maintenance_at == clock.now() - 61
+        assert wake.run_maintenance_if_due(), "a missed deadline catches up on scheduler wake"
+        assert calls == ["gc", "gc"]
+    finally:
+        wake.registry.close()
+
+
+def test_malformed_persisted_maintenance_deadline_recovers(tmp_path: Path) -> None:
+    clock = FakeClock()
+    registry_path = tmp_path / "registry.sqlite3"
+    from bosn.registry import Registry
+
+    with Registry(registry_path, clock=clock) as registry:
+        registry.set_meta("maintenance.next_deadline", "not-a-timestamp")
+    daemon = Daemon(state_dir=tmp_path, clock=clock)
+    try:
+        assert daemon._next_maintenance_at == clock.now()
+        assert any(
+            event["kind"] == "maintenance.deadline.recovered" for event in daemon.registry.events()
+        )
+    finally:
+        daemon.registry.close()
+
+
 # -- client behavior -------------------------------------------------------
 
 
