@@ -8,11 +8,16 @@ never shell strings.
 from __future__ import annotations
 
 import shutil
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import running_process as rp
 
 DEFAULT_TIMEOUT = 60
+# How often a streaming command checks whether it has been cancelled.
+STREAM_POLL_SECONDS = 0.05
 
 
 class EngineError(RuntimeError):
@@ -70,6 +75,66 @@ class Engine:
                 f"{result.stderr or result.stdout}"
             )
         return result
+
+    def stream(
+        self,
+        args: list[str],
+        *,
+        on_line: Callable[[str], None] | None = None,
+        cancelled: threading.Event | None = None,
+    ) -> EngineResult:
+        """Run a command, publishing output line by line, killing it on cancellation.
+
+        Builds go through here rather than `run`. Two reasons, both about the 20-minute
+        cold build: its output has to reach a watching client while it happens rather than
+        in one lump at the end, and it has to be killable, since `bosn cancel`, daemon
+        shutdown, and the job TTL all need a way to stop a build that is already going.
+
+        Deliberately no timeout: the owning job's TTL is the one deadline. `run`'s 60s
+        default is right for `docker inspect` and catastrophic for `docker build`, and two
+        competing deadlines would just mean the tighter one silently wins.
+        """
+        if not self.available():
+            raise EngineError(f"{self.binary!r} is not on PATH")
+        lines: list[str] = []
+
+        def publish(text: str) -> None:
+            lines.append(text)
+            if on_line is not None:
+                on_line(text)
+
+        process = rp.RunningProcess([self.binary, *args], check=False, timeout=None)
+        killed = False
+        try:
+            while True:
+                if cancelled is not None and cancelled.is_set() and not killed:
+                    process.kill()
+                    killed = True
+                line = process.get_next_line_non_blocking()
+                if isinstance(line, rp.EndOfStream):
+                    break
+                if line is None:
+                    if process.finished and not process.has_pending_output:
+                        break
+                    time.sleep(STREAM_POLL_SECONDS)
+                    continue
+                publish(str(line))
+        finally:
+            try:
+                # wait() is typed as int | IdleWaitResult because it doubles as an idle
+                # detector; with no idle_detector passed it always returns the exit code.
+                waited = process.wait(timeout=30)
+                returncode = waited if isinstance(waited, int) else -1
+            except KeyboardInterrupt:
+                raise
+            except Exception:  # noqa: BLE001 - a wait that fails must not mask the real outcome
+                process.kill()
+                returncode = -1
+
+        output = "\n".join(lines)
+        if killed:
+            return EngineResult(returncode=returncode or -1, stdout=output, stderr="cancelled")
+        return EngineResult(returncode=returncode, stdout=output, stderr="")
 
     def info(self) -> EngineInfo:
         """Probe the engine. Never raises — the result carries the diagnosis."""

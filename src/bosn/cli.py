@@ -26,7 +26,8 @@ VERBS: dict[str, tuple[str, str]] = {
     "shell": ("interactive session in the persistent container", "implemented"),
     "tasks": ("list manifest tasks, stacks, digests, registration state", "implemented"),
     "jobs": ("list daemon-owned jobs", "implemented"),
-    "attach": ("attach to a daemon-owned job", "phase 6"),
+    "attach": ("attach to a daemon-owned job", "implemented"),
+    "cancel": ("cancel a daemon-owned job", "implemented"),
     "status": ("tiers, leases, managed bytes vs ceiling, foreign registries", "implemented"),
     "gc": ("report or reclaim collectable resources", "implemented"),
     "done": ("mark this workspace finished; its caches become collectable", "implemented"),
@@ -87,6 +88,8 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_parser = subparsers.add_parser(DAEMON_VERB, help=argparse.SUPPRESS)
     daemon_parser.add_argument("--port", type=int, default=None)
     daemon_parser.add_argument("--idle-retire-seconds", type=float, default=None)
+    daemon_parser.add_argument("--max-builds", type=int, default=None)
+    daemon_parser.add_argument("--build-ttl-seconds", type=float, default=None)
     daemon_parser.add_argument("--stop", action="store_true", help="stop a running daemon")
     # Accepted after the verb as well, so a spawned argv need not order its flags.
     daemon_parser.add_argument("--state-dir", default=None, dest="daemon_state_dir")
@@ -121,7 +124,14 @@ def cmd_daemon(opts: Options) -> int:
         else daemon_mod.DEFAULT_IDLE_RETIRE_SECONDS
     )
     try:
-        daemon = daemon_mod.Daemon(state_dir=state_dir, port=opts.port, idle_retire_seconds=idle)
+        daemon = daemon_mod.Daemon(
+            state_dir=state_dir,
+            port=opts.port,
+            idle_retire_seconds=idle,
+            max_builds=opts.max_builds,
+            build_ttl_seconds=opts.build_ttl_seconds,
+            engine_binary=opts.engine,
+        )
         return daemon.serve_forever()
     except daemon_mod.DaemonError as exc:
         print(str(exc), file=sys.stderr)
@@ -190,8 +200,98 @@ def cmd_tasks(opts: Options) -> int:
     return 0
 
 
+class JobFailed(RuntimeError):
+    """A daemon-owned job ended without producing a usable generation."""
+
+    def __init__(self, message: str, exit_code: int) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+def _drive_job(events, *, quiet: bool = False) -> dict:
+    """Render a job's event stream to stderr and return its terminal event.
+
+    Build output goes to stderr, never stdout: `bosn run`'s stdout belongs to the command
+    the user asked to run, and an agent parsing that output must not find build noise in it.
+    """
+    final: dict = {}
+    for event in events:
+        kind = event.get("event")
+        if kind == "log":
+            if not quiet:
+                print(event.get("line", ""), file=sys.stderr)
+        elif kind == "submitted" and not quiet:
+            note = _submission_note(event)
+            if note:
+                print(note, file=sys.stderr)
+        elif kind == "attached" and not quiet:
+            print(f"attached to {event.get('job')} ({event.get('state')})", file=sys.stderr)
+        if event.get("final"):
+            final = event
+    if not final:
+        raise JobFailed("the daemon ended the stream without a result", 1)
+    return final
+
+
+def _submission_note(event: dict) -> str | None:
+    disposition = event.get("disposition")
+    job = event.get("job")
+    if event.get("joined"):
+        return f"joined in-flight build {job} for the same generation"
+    if disposition == "pending":
+        return (
+            f"queued as {job}: a build for an older generation of this stack is still "
+            "running; it will start as soon as that one finishes"
+        )
+    if disposition == "queued":
+        return None
+    return None
+
+
+# Distinct codes so a caller can tell "your build broke" from "your request was dropped".
+BUILD_FAILED_EXIT = 1
+SUPERSEDED_EXIT = 4
+CANCELLED_EXIT = 5
+
+
+def _result_or_raise(final: dict):
+    """Turn a terminal job event into a ConvergeResult, or a specific, non-silent failure."""
+    from bosn.converge import ConvergeResult
+
+    state = final.get("state")
+    if state == "succeeded":
+        return ConvergeResult.from_dict(final.get("result") or {})
+    reason = final.get("error") or state or "unknown failure"
+    if state == "superseded":
+        raise JobFailed(f"converge did not run: {reason}", SUPERSEDED_EXIT)
+    if state == "cancelled":
+        raise JobFailed(f"build cancelled: {reason}", CANCELLED_EXIT)
+    raise JobFailed(f"build failed: {reason}", BUILD_FAILED_EXIT)
+
+
+def _converge_via_daemon(opts: Options, manifest, stack_name: str | None):
+    """Ask the daemon to converge, watching its build. The job outlives this process.
+
+    Converge runs in the daemon rather than here so that killing this CLI cannot destroy a
+    20-minute build, and so the registry keeps exactly one writer.
+    """
+    from bosn import daemon as daemon_mod
+    from bosn.converge import workspace_of
+
+    events = daemon_mod.stream(
+        "converge",
+        opts.state_dir,
+        manifest=str(manifest.path),
+        stack=stack_name,
+        workspace=workspace_of(manifest),
+        engine=opts.engine,
+    )
+    return _result_or_raise(_drive_job(events))
+
+
 def cmd_run(opts: Options) -> int:
-    from bosn.converge import Converger
+    from bosn import daemon as daemon_mod
+    from bosn.converge import Converger, workspace_of
     from bosn.engine import EngineError
     from bosn.manifest import ManifestError
 
@@ -208,14 +308,23 @@ def cmd_run(opts: Options) -> int:
 
     try:
         if opts.task:
-            from bosn.converge import run_task
-
-            _result, code, output = run_task(
-                manifest, registry, opts.task, engine=Engine(opts.engine)
-            )
+            task = manifest.task(opts.task)
+            command = ["sh", "-c", task.cmd]
+            stack_name = task.stack or None
         else:
-            converger = Converger(manifest, registry, Engine(opts.engine))
-            _result, code, output = converger.run(command, stack_name=opts.stack)
+            stack_name = opts.stack
+
+        converged = _converge_via_daemon(opts, manifest, stack_name)
+        converger = Converger(manifest, registry, Engine(opts.engine))
+        _result, code, output = converger.run_converged(
+            converged, command, stack_name=stack_name, workspace=workspace_of(manifest)
+        )
+    except JobFailed as exc:
+        print(str(exc), file=sys.stderr)
+        return exc.exit_code
+    except (daemon_mod.DaemonError, ipc.TransportError) as exc:  # fail closed, stay visible
+        print(f"cannot reach the bosn daemon: {exc}", file=sys.stderr)
+        return 1
     except (ManifestError, EngineError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -225,6 +334,50 @@ def cmd_run(opts: Options) -> int:
     if output:
         print(output)
     return code
+
+
+def cmd_attach(opts: Options) -> int:
+    from bosn import daemon as daemon_mod
+
+    job_id = next(iter(opts.command), "")
+    if not job_id:
+        print("attach needs a job id; see `bosn jobs`", file=sys.stderr)
+        return 2
+    try:
+        final = _drive_job(daemon_mod.stream("attach", opts.state_dir, job=job_id))
+    except JobFailed as exc:
+        print(str(exc), file=sys.stderr)
+        return exc.exit_code
+    except (daemon_mod.DaemonError, ipc.TransportError) as exc:
+        print(f"cannot reach the bosn daemon: {exc}", file=sys.stderr)
+        return 1
+    state = final.get("state")
+    if state != "succeeded":
+        print(
+            f"job {job_id} ended as {state}: {final.get('error') or ''}".rstrip(), file=sys.stderr
+        )
+        return CANCELLED_EXIT if state == "cancelled" else BUILD_FAILED_EXIT
+    print(f"job {job_id} succeeded", file=sys.stderr)
+    return 0
+
+
+def cmd_cancel(opts: Options) -> int:
+    from bosn import daemon as daemon_mod
+
+    job_id = next(iter(opts.command), "")
+    if not job_id:
+        print("cancel needs a job id; see `bosn jobs`", file=sys.stderr)
+        return 2
+    try:
+        reply = daemon_mod.request("cancel", opts.state_dir, autostart=False, job=job_id)
+    except (daemon_mod.DaemonError, ipc.TransportError) as exc:
+        print(f"cannot reach the bosn daemon: {exc}", file=sys.stderr)
+        return 1
+    if not reply.get("ok"):
+        print(str(reply.get("error") or "cancel failed"), file=sys.stderr)
+        return 1
+    print(f"cancelled {job_id}")
+    return 0
 
 
 def cmd_status(opts: Options) -> int:
@@ -257,6 +410,7 @@ def cmd_gc(opts: Options) -> int:
 
 
 def cmd_done(opts: Options) -> int:
+    from bosn.converge import workspace_of
     from bosn.gc import mark_done
     from bosn.manifest import ManifestError
 
@@ -266,7 +420,9 @@ def cmd_done(opts: Options) -> int:
         print(str(exc), file=sys.stderr)
         return 1
     try:
-        marked = mark_done(registry, str(manifest.root))
+        # The canonical workspace id, matching what converge registered resources under.
+        # A raw manifest.root would miss them whenever the two spellings differ.
+        marked = mark_done(registry, workspace_of(manifest))
     finally:
         registry.close()
     print(f"marked {marked} resource(s) in {manifest.root} as done")
@@ -292,6 +448,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         DAEMON_VERB: cmd_daemon,
         "doctor": lambda o: cmd_doctor(o.engine),
         "jobs": cmd_jobs,
+        "attach": cmd_attach,
+        "cancel": cmd_cancel,
         "tasks": cmd_tasks,
         "run": cmd_run,
         "shell": cmd_shell,

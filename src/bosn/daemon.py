@@ -24,11 +24,13 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Generator, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from bosn import __version__, ipc
+from bosn.jobs import BuildOutcome, Job, JobError, JobManager
 from bosn.registry import Registry, default_state_dir
 
 DAEMON_NAME = "bosn-daemon"
@@ -39,6 +41,9 @@ PORT_RANGE_SIZE = 1024
 
 DEFAULT_IDLE_RETIRE_SECONDS = 900.0
 SPAWN_TIMEOUT_SECONDS = 30.0
+
+# Verbs that hold the connection open and write many messages instead of one.
+STREAMING_VERBS = frozenset({"converge", "attach"})
 
 
 class DaemonError(RuntimeError):
@@ -128,6 +133,9 @@ class _Handler(socketserver.StreamRequestHandler):
         daemon_ref.note_activity()
         verb = str(request.get("verb", ""))
         try:
+            if verb in STREAMING_VERBS:
+                self._stream(daemon_ref, verb, request)
+                return
             response = daemon_ref.dispatch(verb, request)
         except KeyboardInterrupt:
             # Ctrl-C on the daemon means shut down, not "this one request failed".
@@ -136,6 +144,36 @@ class _Handler(socketserver.StreamRequestHandler):
         except Exception as exc:  # noqa: BLE001 - every failure is observable, none fatal
             response = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         ipc.send_response(self.connection, response)
+
+    def _stream(self, daemon_ref: Daemon, verb: str, request: dict[str, Any]) -> None:
+        """Hold the connection open and write events until the job reaches a terminal one.
+
+        A client that hangs up here is abandoning its *view* of the job, never the job --
+        which is the entire point of moving builds into the daemon. So a write failure ends
+        this loop and nothing else.
+        """
+
+        def emit(event: dict[str, Any]) -> bool:
+            try:
+                ipc.send_response(self.connection, event)
+            except OSError:
+                return False  # the client went away; the job carries on without it
+            return True
+
+        # The whole iteration is guarded, not just the call that builds it: a streaming
+        # verb is a generator, so nothing in its body runs until the first `next`. Catching
+        # only around the call would let a bad manifest or an unknown job id hang the
+        # connection up with no message at all -- a silent failure, which is the one thing
+        # this protocol may never do.
+        try:
+            for event in daemon_ref.dispatch_stream(verb, request):
+                if not emit(event):
+                    return
+        except KeyboardInterrupt:
+            daemon_ref.request_stop()
+            raise
+        except Exception as exc:  # noqa: BLE001 - a failed stream still owes the client a reason
+            emit({"ok": False, "final": True, "error": f"{type(exc).__name__}: {exc}"})
 
 
 class _Server(socketserver.ThreadingTCPServer):
@@ -169,7 +207,11 @@ class Daemon:
         state_dir: Path | None = None,
         port: int | None = None,
         idle_retire_seconds: float = DEFAULT_IDLE_RETIRE_SECONDS,
+        max_builds: int | None = None,
+        build_ttl_seconds: float | None = None,
+        engine_binary: str = "docker",
     ) -> None:
+        self.engine_binary = engine_binary
         self.state_dir = state_dir or default_state_dir()
         self.bind_port = port_for(self.state_dir) if port is None else port
         self.idle_retire_seconds = idle_retire_seconds
@@ -179,6 +221,14 @@ class Daemon:
         self._server: _Server | None = None
         self._stop = threading.Event()
         self.registry = Registry(self.state_dir / "registry.sqlite3")
+        self.jobs = JobManager(
+            self._build,
+            max_builds=max_builds,
+            ttl_seconds=build_ttl_seconds,
+            # A finished job is activity: without this the daemon could retire the instant
+            # a 20-minute build lands, before the client that was waiting for it comes back.
+            on_settled=self.note_activity,
+        )
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -196,6 +246,16 @@ class Daemon:
         return time.time() - self.last_activity
 
     def should_retire(self) -> bool:
+        """Idle *and* holding no work. Retiring mid-build would destroy it.
+
+        Request idleness alone is not enough now that the daemon owns builds: a client that
+        submits a 20-minute build and hangs up leaves no request traffic at all, and the
+        old rule would have retired the daemon out from under its own job. The job TTL is
+        what keeps this from becoming a way to pin the daemon forever -- a build that never
+        reports is eventually cancelled, and then this goes back to being about idleness.
+        """
+        if self.jobs.active_count() > 0:
+            return False
         return self.idle_seconds() >= self.idle_retire_seconds
 
     def serve_forever(self) -> int:
@@ -227,6 +287,8 @@ class Daemon:
 
     def _idle_watchdog(self) -> None:
         while not self._stop.wait(0.5):
+            for job in self.jobs.reap_expired():
+                self.registry.log_event("job.expired", f"{job.id} {job.stack}")
             if self.should_retire():
                 self.registry.log_event("daemon.idle_retired", f"idle={self.idle_seconds():.0f}s")
                 self.request_stop()
@@ -239,6 +301,9 @@ class Daemon:
 
     def shutdown(self) -> None:
         self._stop.set()
+        # Cancel in-flight builds before closing the registry they write to. Each one tells
+        # its attached clients why it stopped rather than dying silently.
+        self.jobs.shutdown()
         if self._server is not None:
             self._server.server_close()
             self._server = None
@@ -258,11 +323,19 @@ class Daemon:
             "ping": self._verb_ping,
             "status": self._verb_status,
             "jobs": self._verb_jobs,
+            "cancel": self._verb_cancel,
             "shutdown": self._verb_shutdown,
         }.get(verb)
         if handler is None:
             return {"ok": False, "error": f"unknown daemon verb {verb!r}"}
         return handler(request)
+
+    def dispatch_stream(self, verb: str, request: dict[str, Any]) -> Iterator[dict[str, Any]]:
+        if verb == "converge":
+            return self._verb_converge(request)
+        if verb == "attach":
+            return self._verb_attach(request)
+        raise DaemonError(f"unknown streaming verb {verb!r}")
 
     def _verb_ping(self, _request: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "pong": True, "pid": os.getpid(), "version": __version__}
@@ -279,8 +352,101 @@ class Daemon:
             "resources": len(self.registry.list_resources()),
         }
 
-    def _verb_jobs(self, _request: dict[str, Any]) -> dict[str, Any]:
-        return {"ok": True, "jobs": []}
+    def _verb_jobs(self, request: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "jobs": self.jobs.list_jobs(include_finished=bool(request.get("all", True))),
+            "max_builds": self.jobs.max_builds,
+        }
+
+    def _verb_cancel(self, request: dict[str, Any]) -> dict[str, Any]:
+        job_id = str(request.get("job") or "")
+        try:
+            job = self.jobs.cancel(job_id)
+        except JobError as exc:
+            return {"ok": False, "error": str(exc)}
+        self.registry.log_event("job.cancelled", job.id)
+        return {"ok": True, "job": job.id, "state": job.state}
+
+    def _verb_converge(self, request: dict[str, Any]) -> Iterator[dict[str, Any]]:
+        """Submit a converge under the coalescing policy, then stream the job it landed on.
+
+        The submission decision itself is reported before any build output, so a client can
+        always tell whether it started work, joined someone else's, or is queued behind an
+        obsolete build it is about to wait out.
+        """
+        manifest_path = str(request.get("manifest") or "")
+        if not manifest_path:
+            raise DaemonError("converge requires a manifest path")
+
+        from bosn.converge import workspace_of
+        from bosn.manifest import generation_digest, load
+
+        manifest = load(Path(manifest_path))
+        stack = manifest.stack(request.get("stack") or None)
+        digest = generation_digest(manifest, stack)
+        workspace = str(request.get("workspace") or workspace_of(manifest))
+
+        submission = self.jobs.submit(
+            workspace=workspace,
+            stack=stack.name,
+            digest=digest,
+            payload={
+                "manifest": str(manifest.path),
+                "stack": stack.name,
+                "engine": str(request.get("engine") or self.engine_binary),
+            },
+        )
+        job = submission.job
+        self.registry.log_event("job.submitted", f"{job.id} {submission.disposition}")
+        yield {
+            "event": "submitted",
+            "job": job.id,
+            "state": job.state,
+            "joined": submission.joined,
+            "disposition": submission.disposition,
+            "digest": digest,
+            "workspace": workspace,
+            "stack": stack.name,
+            "superseded": submission.superseded.id if submission.superseded else None,
+        }
+        yield from self.jobs.follow(job, stop=self._stop)
+
+    def _verb_attach(self, request: dict[str, Any]) -> Iterator[dict[str, Any]]:
+        job = self.jobs.get(str(request.get("job") or ""))
+        yield {"event": "attached", "job": job.id, "state": job.state}
+        yield from self.jobs.follow(job, stop=self._stop)
+
+    # -- the builder -------------------------------------------------------
+
+    def _build(self, job: Job) -> BuildOutcome:
+        """Run one converge to completion inside the daemon.
+
+        This is where the registry actually becomes single-writer for converge: the build
+        and the generation/resource rows it produces both happen here, in the process that
+        outlives the CLI.
+        """
+        from bosn.converge import Converger
+        from bosn.engine import Engine, EngineError
+        from bosn.manifest import load
+
+        manifest = load(Path(str(job.payload["manifest"])))
+        engine = Engine(str(job.payload.get("engine") or self.engine_binary))
+        converger = Converger(
+            manifest,
+            self.registry,
+            engine,
+            progress=lambda line: job.log(line),
+            cancelled=job.cancelled,
+        )
+        try:
+            result = converger.converge(
+                str(job.payload.get("stack") or "") or None, workspace=job.workspace
+            )
+        except EngineError as exc:
+            job.log(str(exc), stream="stderr")
+            return BuildOutcome(returncode=1)
+        return BuildOutcome(returncode=0, result=result.to_dict())
 
     def _verb_shutdown(self, _request: dict[str, Any]) -> dict[str, Any]:
         self.request_stop()
@@ -388,6 +554,22 @@ def request(
             raise DaemonError("no bosn daemon is running")
         spawn(state_dir)
     return ipc.send_request(port_for(state_dir), {"verb": verb, **payload})
+
+
+def stream(
+    verb: str,
+    state_dir: Path | None = None,
+    *,
+    autostart: bool = True,
+    **payload: Any,
+) -> Generator[dict[str, Any], None, None]:
+    """Send a streaming verb and yield its events until the daemon sends `final`."""
+    state_dir = state_dir or default_state_dir()
+    if not is_serving(state_dir):
+        if not autostart:
+            raise DaemonError("no bosn daemon is running")
+        spawn(state_dir)
+    return ipc.stream_request(port_for(state_dir), {"verb": verb, **payload})
 
 
 def stop(state_dir: Path | None = None, *, timeout: float = 10.0) -> bool:
