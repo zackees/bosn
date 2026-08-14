@@ -9,11 +9,9 @@ whose remedy is always the same mechanical command is just a forced retry loop.
 from __future__ import annotations
 
 import datetime as dt
-import os
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
 
 from bosn import labels
 from bosn.engine import Engine, EngineError
@@ -341,4 +339,6 @@ def workspace_of(manifest: Manifest) -> str:
     drive-letter and case differences that would otherwise split it in two. Keying on the
     cwd instead is the per-worktree path-hashing that produced the volume explosion in #1.
     """
-    return os.path.normcase(str(Path(manifest.root).resolve()))
+    from bosn.paths import normalize_workspace_path
+
+    return normalize_workspace_path(manifest.root)
