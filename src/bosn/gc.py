@@ -22,7 +22,16 @@ from bosn.accounting import probe, resource_bytes
 from bosn.engine import Engine
 from bosn.registry import Registry
 from bosn.resources import ResourceScanner
-from bosn.retention import Pressure, Verdict, collectable, container_should_stop, plan
+from bosn.retention import (
+    KEPT_LEASED,
+    KEPT_QUIET_PERIOD,
+    Pressure,
+    Verdict,
+    collectable,
+    container_should_stop,
+    evaluate,
+    plan,
+)
 
 _REMOVE_COMMANDS: dict[str, list[str]] = {
     "container": ["rm", "--force"],
@@ -34,6 +43,8 @@ _REMOVE_COMMANDS: dict[str, list[str]] = {
 @dataclass
 class GCResult:
     dry_run: bool
+    stopped: list[str] = field(default_factory=list)
+    would_stop: list[str] = field(default_factory=list)
     removed: list[str] = field(default_factory=list)
     kept: list[str] = field(default_factory=list)
     skipped_unproven: list[str] = field(default_factory=list)
@@ -41,6 +52,8 @@ class GCResult:
 
     def summary(self) -> dict[str, int]:
         return {
+            "stopped": len(self.stopped),
+            "would_stop": len(self.would_stop),
             "removed": len(self.removed),
             "kept": len(self.kept),
             "skipped_unproven": len(self.skipped_unproven),
@@ -70,6 +83,7 @@ class Collector:
         done_workspaces: set[str] | None = None,
         pressure: Pressure | None = None,
     ) -> GCResult:
+        done_workspaces = done_workspaces or set()
         verdicts: list[Verdict] = plan(
             self.registry, done_workspaces=done_workspaces, pressure=pressure
         )
@@ -78,15 +92,46 @@ class Collector:
         for verdict in verdicts:
             if not verdict.collect:
                 result.kept.append(verdict.name)
-                if container_should_stop(verdict.resource, self.registry.clock.now()):
-                    stopped = self.engine.run(["container", "stop", verdict.name])
+                if not container_should_stop(verdict.resource, self.registry.clock.now()):
+                    continue
+                # The planning snapshot is not a mutation boundary: another client may
+                # acquire a lease while the rest of the plan is evaluated. Serialize all
+                # registry writers, re-read the resource and its leases, re-confirm engine
+                # ownership, and only then stop it while the guard remains held.
+                with self.registry.lifecycle_guard():
+                    resource = self.registry.get_resource(verdict.resource.id)
+                    if resource is None:
+                        continue
+                    current = evaluate(
+                        self.registry,
+                        resource,
+                        superseded=self.registry.generation_superseded_at(resource.generation)
+                        is not None,
+                        workspace_done=resource.workspace in done_workspaces,
+                        pressure=pressure,
+                    )
+                    protected = current.reason in {KEPT_LEASED, KEPT_QUIET_PERIOD}
+                    if (
+                        current.collect
+                        or protected
+                        or not container_should_stop(resource, self.registry.clock.now())
+                    ):
+                        continue
+                    if not self._ownership_proven(resource.kind, resource.name):
+                        result.skipped_unproven.append(resource.name)
+                        self.registry.log_event("gc.skipped_unproven", resource.name)
+                        continue
+                    if dry_run:
+                        result.would_stop.append(resource.name)
+                        continue
+                    stopped = self.engine.run(["container", "stop", resource.name])
                     if stopped.ok:
-                        self.registry.log_event("container.stopped_idle", verdict.name)
+                        result.stopped.append(resource.name)
+                        self.registry.log_event("container.stopped_idle", resource.name)
                     else:
-                        self.registry.log_event(
-                            "container.stop_error",
-                            f"{verdict.name}: {stopped.stderr or stopped.stdout}",
-                        )
+                        message = f"{resource.name}: {stopped.stderr or stopped.stdout}"
+                        result.errors.append(message)
+                        self.registry.log_event("container.stop_error", message)
 
         # Containers retain their volumes even after they have stopped. Remove them
         # first so a done workspace can be collected in one pass.

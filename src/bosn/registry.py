@@ -14,6 +14,8 @@ import os
 import sqlite3
 import threading
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -161,6 +163,29 @@ class Registry:
         """Every statement goes through here so the daemon stays single-writer."""
         with self._lock:
             return self.conn.execute(sql, params)
+
+    @contextmanager
+    def lifecycle_guard(self) -> Iterator[None]:
+        """Serialize a lifecycle decision and its engine mutation across registry writers.
+
+        GC must not validate that a container is unleased, release the database lock, and
+        then stop it after another connection has acquired a lease. ``BEGIN IMMEDIATE``
+        excludes writes from other sqlite connections while the in-process lock covers the
+        daemon's worker threads. The guarded sections are deliberately narrow and reserved
+        for lifecycle mutations that must be atomic with their final registry recheck.
+        """
+        with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            except KeyboardInterrupt:
+                self.conn.execute("ROLLBACK")
+                raise
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+            else:
+                self.conn.execute("COMMIT")
 
     def _ensure_meta(self) -> None:
         self._exec(

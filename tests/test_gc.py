@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -24,11 +27,22 @@ class FakeEngine:
         self.label_map = label_map
         self.commands: list[list[str]] = []
         self.fail_on: set[str] = set()
+        self.on_inspect: Callable[[], None] | None = None
+        self.lease_acquired = threading.Event()
+        self.lease_was_active_when_stopped = False
 
     def run(self, args: list[str], *, check: bool = False) -> EngineResult:
         self.commands.append(list(args))
         if "inspect" in args:
+            if self.on_inspect is not None:
+                self.on_inspect()
             return EngineResult(0, json.dumps(self.label_map.get(args[-1], {})), "")
+        if args[:2] == ["container", "stop"]:
+            self.lease_was_active_when_stopped = self.lease_acquired.is_set()
+            name = args[-1]
+            if name in self.fail_on:
+                return EngineResult(1, "", "stop failed")
+            return EngineResult(0, name, "")
         if args[0] in {"rm", "volume", "image"} and "rm" in args:
             name = args[-1]
             if name in self.fail_on:
@@ -40,10 +54,10 @@ class FakeEngine:
         return [c[-1] for c in self.commands if "rm" in c]
 
 
-def label_dict(registry: str = OURS, **overrides: str) -> dict[str, str]:
+def label_dict(registry: str = OURS, kind: str = "volume", **overrides: str) -> dict[str, str]:
     base = labels.ResourceLabels(
         registry=registry,
-        kind="volume",
+        kind=kind,
         stack="s",
         generation="g",
         scope="spec",
@@ -65,9 +79,9 @@ def registry(tmp_path: Path, clock: FakeClock):
         yield reg
 
 
-def add(registry: Registry, name: str, scope="spec", workspace="/w"):
+def add(registry: Registry, name: str, scope="spec", workspace="/w", kind="volume"):
     return registry.register_resource(
-        kind="volume", name=name, stack="s", generation="g", scope=scope, workspace=workspace
+        kind=kind, name=name, stack="s", generation="g", scope=scope, workspace=workspace
     )
 
 
@@ -144,6 +158,121 @@ def test_dry_run_removes_nothing(registry: Registry, clock: FakeClock) -> None:
     assert result.removed == ["ours"], "dry run still reports what would go"
     assert engine.removals() == []
     assert len(registry.list_resources()) == 1
+
+
+def test_dry_run_plans_idle_stop_without_mutating_engine(
+    registry: Registry, clock: FakeClock
+) -> None:
+    add(registry, "idle", kind="container")
+    engine = FakeEngine({"idle": label_dict(registry=registry.registry_id, kind="container")})
+    clock.advance(2 * 3600)
+
+    result = Collector(registry, engine).collect(dry_run=True)  # type: ignore[arg-type]
+
+    assert result.would_stop == ["idle"]
+    assert result.stopped == []
+    assert [cmd for cmd in engine.commands if cmd[:2] == ["container", "stop"]] == []
+
+
+def test_live_lease_prevents_idle_stop_even_in_apply_mode(
+    registry: Registry, clock: FakeClock
+) -> None:
+    resource = add(registry, "active", kind="container")
+    registry.acquire_lease(resource.id, pid=os.getpid(), proc_start=clock.now())
+    engine = FakeEngine({"active": label_dict(registry=registry.registry_id, kind="container")})
+    clock.advance(2 * 3600)
+
+    result = Collector(registry, engine).collect(dry_run=False)  # type: ignore[arg-type]
+
+    assert result.kept == ["active"]
+    assert result.stopped == []
+    assert [cmd for cmd in engine.commands if cmd[:2] == ["container", "stop"]] == []
+
+
+def test_apply_stops_an_unleased_idle_container_and_reports_failure(
+    registry: Registry, clock: FakeClock
+) -> None:
+    add(registry, "idle", kind="container")
+    engine = FakeEngine({"idle": label_dict(registry=registry.registry_id, kind="container")})
+    clock.advance(2 * 3600)
+
+    stopped = Collector(registry, engine).collect(dry_run=False)  # type: ignore[arg-type]
+    assert stopped.stopped == ["idle"]
+    assert any(row["kind"] == "container.stopped_idle" for row in registry.events())
+
+    engine.fail_on.add("idle")
+    failed = Collector(registry, engine).collect(dry_run=False)  # type: ignore[arg-type]
+    assert failed.stopped == []
+    assert failed.errors == ["idle: stop failed"]
+    assert any(row["kind"] == "container.stop_error" for row in registry.events())
+
+
+@pytest.mark.parametrize("engine_labels", [{}, label_dict(registry="foreign", kind="container")])
+def test_idle_stop_requires_complete_current_ownership(
+    registry: Registry, clock: FakeClock, engine_labels: dict[str, str]
+) -> None:
+    add(registry, "not-ours", kind="container")
+    engine = FakeEngine({"not-ours": engine_labels})
+    clock.advance(2 * 3600)
+
+    result = Collector(registry, engine).collect(dry_run=False)  # type: ignore[arg-type]
+
+    assert result.skipped_unproven == ["not-ours"]
+    assert [cmd for cmd in engine.commands if cmd[:2] == ["container", "stop"]] == []
+
+
+def test_lease_acquired_after_planning_is_seen_before_idle_stop(
+    registry: Registry, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import bosn.gc as gc_mod
+
+    resource = add(registry, "active", kind="container")
+    engine = FakeEngine({"active": label_dict(registry=registry.registry_id, kind="container")})
+    clock.advance(2 * 3600)
+    original_plan = gc_mod.plan
+
+    def plan_then_lease(*args, **kwargs):
+        verdicts = original_plan(*args, **kwargs)
+        registry.acquire_lease(resource.id, pid=os.getpid(), proc_start=clock.now())
+        return verdicts
+
+    monkeypatch.setattr(gc_mod, "plan", plan_then_lease)
+    result = Collector(registry, engine).collect(dry_run=False)  # type: ignore[arg-type]
+
+    assert result.stopped == []
+    assert [cmd for cmd in engine.commands if cmd[:2] == ["container", "stop"]] == []
+
+
+def test_idle_stop_serializes_concurrent_lease_acquisition(
+    registry: Registry, clock: FakeClock
+) -> None:
+    resource = add(registry, "idle", kind="container")
+    engine = FakeEngine({"idle": label_dict(registry=registry.registry_id, kind="container")})
+    clock.advance(2 * 3600)
+    other = Registry(registry.path, clock=clock)
+    attempting = threading.Event()
+
+    def acquire() -> None:
+        attempting.set()
+        other.acquire_lease(resource.id, pid=os.getpid(), proc_start=clock.now())
+        engine.lease_acquired.set()
+
+    thread = threading.Thread(target=acquire)
+
+    def race_at_ownership_check() -> None:
+        thread.start()
+        assert attempting.wait(1)
+
+    engine.on_inspect = race_at_ownership_check
+    try:
+        result = Collector(registry, engine).collect(dry_run=False)  # type: ignore[arg-type]
+        thread.join(timeout=2)
+    finally:
+        other.close()
+
+    assert result.stopped == ["idle"]
+    assert not engine.lease_was_active_when_stopped
+    assert engine.lease_acquired.is_set()
 
 
 # -- errors are observable -------------------------------------------------
