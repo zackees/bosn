@@ -8,6 +8,14 @@ def test_windows_native_msys_wsl_and_extended_spellings_share_an_identity() -> N
     assert normalize_workspace_path(r"\\?\C:\Users\Me\work") == expected
 
 
+def test_cygdrive_spelling_shares_the_same_identity() -> None:
+    # Cygwin is not one of the supported shells (see the module docstring), but it is
+    # accepted defensively so a stray /cygdrive/ spelling roots at the real drive instead of
+    # a bogus c:\cygdrive\c\... identity that would silently split the workspace in two.
+    expected = normalize_workspace_path(r"C:\Users\Me\work")
+    assert normalize_workspace_path("/cygdrive/c/Users/Me/work") == expected
+
+
 def test_unc_case_and_separator_spellings_share_an_identity() -> None:
     assert normalize_workspace_path(r"\\Server\Share\Work") == normalize_workspace_path(
         "//server/share/work"

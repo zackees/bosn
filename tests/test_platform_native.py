@@ -144,6 +144,43 @@ def test_native_process_start_pairs_matching_and_mismatched_identity_with_livene
     assert process_alive(pid, proc_start=start - 10_000) is False
 
 
+# -- 2b. Windows access-denied liveness path (issue #68) ---------------------
+#
+# process_alive()'s SystemError handler exists because os.kill(pid, 0) on another
+# user's/SYSTEM's process raises SystemError on Windows -- not an OSError, so it escapes
+# every ordinary handler. The existing unit tests only prove the handler catches what a
+# monkeypatch hands it; they never prove real CPython on a real Windows host still throws
+# that (as opposed to, say, PermissionError, which CPython's Windows os.kill also produces
+# depending on the OS/runtime privilege level and would take a different -- but still
+# fail-open -- branch in process_alive). PID 4 is the Windows "System" process: always
+# present, always owned by SYSTEM, and never killable/inspectable by an ordinary user, so
+# it reliably exercises this branch without any monkeypatching.
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="only Windows raises SystemError here")
+def test_native_windows_access_denied_pid_reads_as_alive() -> None:
+    """process_alive(4) must fail open (report alive) through the REAL os.kill call.
+
+    This intentionally does not assert *which* exception type os.kill(4, 0) raises --
+    that is exactly the detail the issue says may differ between a developer box and a
+    possibly more/less privileged hosted `windows-latest` runner. What must never differ,
+    on any Windows host, is the outward behavior: an access-denied probe against a real,
+    live, other-user process is never mistaken for a dead one.
+    """
+    assert process_alive(4) is True
+
+    # Separately, record what os.kill(4, 0) actually raises on this host so a change in
+    # CPython/Windows behavior is legible rather than silent. Observed on a Windows 10 dev
+    # box (see issue #68): SystemError, not OSError. A hosted windows-latest runner may
+    # instead see PermissionError (an OSError subclass) if it runs at a different privilege
+    # level -- process_alive() has a dedicated branch for each, and both fail open, so this
+    # assertion accepts either known type. It intentionally does NOT accept "no exception
+    # at all": that would mean the OS started permitting the probe outright, at which point
+    # this test -- and the handler it is documenting -- would have nothing left to guard.
+    with pytest.raises((SystemError, PermissionError)):
+        os.kill(4, 0)
+
+
 # -- 3. autostart adapters without mutating system-wide state ----------------
 #
 # autostart.enable()'s Windows and darwin branches are pure file writes under the injected

@@ -628,10 +628,17 @@ class Daemon:
 
     def _verb_done(self, request: dict[str, Any]) -> dict[str, Any]:
         from bosn.gc import mark_done
+        from bosn.paths import normalize_workspace_path
 
         workspace = str(request.get("workspace") or "")
         if not workspace:
             return {"ok": False, "error": "done requires a workspace"}
+        # The bundled CLI already sends a normalized identity (workspace_of() resolves the
+        # manifest root before it ever reaches IPC), but the wire contract itself accepts a
+        # raw string. Any other spelling -- /cygdrive/, MSYS, a trailing slash, drive-letter
+        # case -- must still match the identity mark_workspace_done matches against by exact
+        # SQL equality, or this silently marks nothing while reporting ok=True.
+        workspace = normalize_workspace_path(workspace)
         return {"ok": True, "marked": mark_done(self.registry, workspace)}
 
     def _verb_adopt(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -721,12 +728,18 @@ class Daemon:
         from bosn.converge import Converger, ConvergeResult
         from bosn.engine import Engine
         from bosn.manifest import load
+        from bosn.paths import normalize_workspace_path
 
         manifest = load(Path(str(request.get("manifest") or "")))
         converged = ConvergeResult.from_dict(dict(request.get("result") or {}))
         workspace = str(request.get("workspace") or "")
         if not workspace:
             return {"ok": False, "error": "execution-acquire requires workspace"}
+        # Same boundary gap as `done`, on the write side: an un-normalized spelling here
+        # would record the container's registry row under an identity that `done` (which
+        # does normalize) can never match, permanently pinning the resource. Normalizing is
+        # a no-op for the CLI's already-canonical value.
+        workspace = normalize_workspace_path(workspace)
         session = str(uuid.uuid4())
         with self._execution_lock:
             if self._stopping:
@@ -775,12 +788,21 @@ class Daemon:
         from bosn.converge import generation_coalescing_key, workspace_of
         from bosn.engine import Engine
         from bosn.manifest import load
+        from bosn.paths import normalize_workspace_path
 
         manifest = load(Path(manifest_path))
         stack = manifest.stack(request.get("stack") or None)
         engine_binary = str(request.get("engine") or self.engine_binary)
         coalescing_key = generation_coalescing_key(manifest, stack, Engine(engine_binary))
-        workspace = str(request.get("workspace") or workspace_of(manifest))
+        # Same boundary gap as `done`: an un-normalized spelling here would both write
+        # registry rows under an identity `done` can never match, and fragment the job
+        # slot's (workspace, stack) coalescing key so two spellings of one workspace could
+        # run unserialized -- the same per-worktree splitting issue #1 fixed for the CLI
+        # path. `workspace_of` already normalizes; normalizing an explicit request value too
+        # keeps both branches of this `or` producing the same canonical form.
+        workspace = normalize_workspace_path(
+            str(request.get("workspace") or workspace_of(manifest))
+        )
 
         submission = self.jobs.submit(
             workspace=workspace,
