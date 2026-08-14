@@ -86,7 +86,11 @@ class Collector:
                             f"{verdict.name}: {stopped.stderr or stopped.stdout}",
                         )
 
-        for verdict in collectable(verdicts):
+        # Containers retain their volumes even after they have stopped. Remove them
+        # first so a done workspace can be collected in one pass.
+        for verdict in sorted(
+            collectable(verdicts), key=lambda verdict: verdict.resource.kind != "container"
+        ):
             resource = verdict.resource
             if not self._ownership_proven(resource.kind, resource.name):
                 result.skipped_unproven.append(resource.name)
