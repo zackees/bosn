@@ -189,6 +189,8 @@ class _Handler(socketserver.StreamRequestHandler):
             "compose-adopt",
             "execution-acquire",
             "execution-release",
+            "compose-acquire",
+            "compose-release",
         }
         if (
             verb != "shutdown"
@@ -561,6 +563,8 @@ class Daemon:
             "compose-adopt": self._verb_compose_adopt,
             "execution-acquire": self._verb_execution_acquire,
             "execution-release": self._verb_execution_release,
+            "compose-acquire": self._verb_compose_acquire,
+            "compose-release": self._verb_compose_release,
             "shutdown": self._verb_shutdown,
         }.get(verb)
         if handler is None:
@@ -773,6 +777,87 @@ class Daemon:
         for lease_id in leases:
             self.registry.release_lease(lease_id)
         return {"ok": True}
+
+    def _verb_compose_acquire(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Lease every resource currently registered for a Compose project's workspace.
+
+        Diverges from `execution-acquire` on purpose: that path leases with
+        `pid=os.getpid()` -- the *daemon's* pid -- because the daemon is the one that holds
+        the lease open until an explicit release. Compose has no such holder inside the
+        daemon; `bosn-docker` runs the (possibly long, foreground) compose command itself,
+        so the lease is acquired here on behalf of *its* pid/proc_start, supplied by the
+        caller. If that client is SIGKILLed mid-run, no `finally` there ever fires and no
+        release ever arrives -- held under the daemon's identity that would pin the lease
+        until the daemon itself restarts, exactly the leak leases exist to prevent. Held
+        under the client's identity instead, `lease_is_expired` reclaims it after one TTL
+        once the pid (and start time, when available) stop matching a live process.
+        """
+        from bosn.paths import normalize_workspace_path
+
+        workspace = str(request.get("workspace") or "")
+        if not workspace:
+            return {"ok": False, "error": "compose-acquire requires workspace"}
+        # Same boundary gap as `done`/`execution-acquire`: an un-normalized spelling here
+        # would match zero resources and silently lease nothing.
+        workspace = normalize_workspace_path(workspace)
+        pid = request.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            return {"ok": False, "error": "compose-acquire requires a client pid"}
+        proc_start_raw = request.get("proc_start")
+        proc_start = float(proc_start_raw) if proc_start_raw is not None else None
+        session = str(uuid.uuid4())
+        with self._execution_lock:
+            if self._stopping:
+                return {"ok": False, "error": "daemon is stopping; retry after it restarts"}
+            # Reserve before the lease loop below, same as execution-acquire: shutdown must
+            # see this session as active the instant it exists, not only once every
+            # dependency's lease has landed.
+            self._execution_sessions[session] = ()
+        try:
+            # Compare normalized against normalized rather than trusting a registered
+            # resource's stored `workspace` to already be canonical: the Compose overlay
+            # writes the raw `str(compose.parent.resolve())` into its labels (see
+            # `_compose_overlay`), not a normalized identity, so an un-normalized comparison
+            # here would silently match nothing on any platform where normalization is not
+            # a no-op (Windows case-folding, MSYS/cygdrive spellings, a trailing slash).
+            resources = [
+                resource
+                for resource in self.registry.list_resources()
+                if normalize_workspace_path(resource.workspace) == workspace
+            ]
+            leases = tuple(
+                self.registry.acquire_lease(resource.id, pid=pid, proc_start=proc_start)
+                for resource in resources
+            )
+        except KeyboardInterrupt:
+            # Same as execution-acquire: the reservation above must not outlive a failed
+            # acquire, or a session the client never received a session id for pins the
+            # daemon (`should_retire`/`request_stop` both key off `_execution_sessions`)
+            # forever -- nobody left holding it can ever call compose-release.
+            with self._execution_lock:
+                self._execution_sessions.pop(session, None)
+            raise
+        except Exception:
+            with self._execution_lock:
+                self._execution_sessions.pop(session, None)
+            raise
+        with self._execution_lock:
+            self._execution_sessions[session] = tuple(lease.id for lease in leases)
+        return {"ok": True, "session": session, "leased": len(leases)}
+
+    def _verb_compose_release(self, request: dict[str, Any]) -> dict[str, Any]:
+        session = str(request.get("session") or "")
+        with self._execution_lock:
+            leases = self._execution_sessions.pop(session, None)
+        if leases is None:
+            # A failed compose-acquire returns no session at all, so the client's own
+            # `finally` calls this with `None`/unknown; a double-release after a retried
+            # request lands here too. Neither is a caller error worth surfacing -- there is
+            # simply nothing left to release.
+            return {"ok": True, "released": 0}
+        for lease_id in leases:
+            self.registry.release_lease(lease_id)
+        return {"ok": True, "released": len(leases)}
 
     def _verb_converge(self, request: dict[str, Any]) -> Iterator[dict[str, Any]]:
         """Submit a converge under the coalescing policy, then stream the job it landed on.

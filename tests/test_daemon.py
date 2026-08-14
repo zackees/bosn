@@ -250,6 +250,260 @@ def test_active_execution_session_pins_daemon_and_refuses_shutdown(tmp_path: Pat
         daemon.registry.close()
 
 
+# -- Compose project leases (#48) -------------------------------------------
+
+
+def test_compose_acquire_leases_every_resource_registered_for_the_workspace(
+    tmp_path: Path,
+) -> None:
+    daemon = Daemon(state_dir=tmp_path)
+    try:
+        workspace = str(tmp_path / "proj")
+        container = daemon.registry.register_resource(
+            kind="container",
+            name="app",
+            stack="app",
+            generation="g",
+            scope="stack",
+            workspace=workspace,
+        )
+        volume = daemon.registry.register_resource(
+            kind="volume",
+            name="data",
+            stack="data",
+            generation="g",
+            scope="stack",
+            workspace=workspace,
+        )
+        # A resource from an unrelated workspace must not be swept up in the lease.
+        other = daemon.registry.register_resource(
+            kind="container",
+            name="other",
+            stack="other",
+            generation="g",
+            scope="stack",
+            workspace=str(tmp_path / "unrelated"),
+        )
+
+        reply = daemon.dispatch(
+            "compose-acquire", {"workspace": workspace, "pid": 4242, "proc_start": 100.0}
+        )
+
+        assert reply["ok"] is True
+        assert reply["leased"] == 2
+        leased_ids = {lease.resource_id for lease in daemon.registry.all_leases()}
+        assert leased_ids == {container.id, volume.id}
+        assert not daemon.registry.leases_for(other.id)
+    finally:
+        daemon.registry.close()
+
+
+def test_compose_acquire_holds_the_lease_under_the_callers_identity_not_the_daemons(
+    tmp_path: Path,
+) -> None:
+    """Diverges from `execution-acquire` on purpose: see the docstring on
+    `_verb_compose_acquire`. A daemon-held lease (`pid=os.getpid()` inside the daemon)
+    survives a SIGKILLed client forever; a client-held one expires within one TTL.
+    """
+    daemon = Daemon(state_dir=tmp_path)
+    try:
+        workspace = str(tmp_path / "proj")
+        resource = daemon.registry.register_resource(
+            kind="container",
+            name="app",
+            stack="app",
+            generation="g",
+            scope="stack",
+            workspace=workspace,
+        )
+        client_pid = 999999
+        assert client_pid != os.getpid()
+
+        reply = daemon.dispatch(
+            "compose-acquire",
+            {"workspace": workspace, "pid": client_pid, "proc_start": 55.5},
+        )
+
+        assert reply["ok"] is True
+        (lease,) = daemon.registry.leases_for(resource.id)
+        assert lease.pid == client_pid
+        assert lease.proc_start == 55.5
+    finally:
+        daemon.registry.close()
+
+
+def test_compose_acquire_normalizes_the_request_workspace_before_matching(
+    tmp_path: Path,
+) -> None:
+    from bosn.paths import normalize_workspace_path
+
+    daemon = Daemon(state_dir=tmp_path)
+    try:
+        canonical = normalize_workspace_path(r"C:\Users\Me\proj")
+        resource = daemon.registry.register_resource(
+            kind="container",
+            name="app",
+            stack="app",
+            generation="g",
+            scope="stack",
+            workspace=canonical,
+        )
+        differently_spelled = "/c/Users/Me/proj"
+        assert differently_spelled != canonical
+
+        reply = daemon.dispatch(
+            "compose-acquire",
+            {"workspace": differently_spelled, "pid": 111, "proc_start": None},
+        )
+
+        assert reply["ok"] is True
+        assert reply["leased"] == 1
+        assert daemon.registry.leases_for(resource.id)
+    finally:
+        daemon.registry.close()
+
+
+def test_compose_acquire_accepts_a_null_proc_start(tmp_path: Path) -> None:
+    """`process_start_time()` can return None; the schema must accept it rather than force
+    a wall-clock substitute (see the comment on `_own_process_start_time` in converge.py
+    about why that guess is dangerous).
+    """
+    daemon = Daemon(state_dir=tmp_path)
+    try:
+        workspace = str(tmp_path / "proj")
+        resource = daemon.registry.register_resource(
+            kind="container",
+            name="app",
+            stack="app",
+            generation="g",
+            scope="stack",
+            workspace=workspace,
+        )
+
+        reply = daemon.dispatch(
+            "compose-acquire", {"workspace": workspace, "pid": 111, "proc_start": None}
+        )
+
+        assert reply["ok"] is True
+        (lease,) = daemon.registry.leases_for(resource.id)
+        assert lease.proc_start is None
+    finally:
+        daemon.registry.close()
+
+
+def test_compose_release_frees_the_leases_and_the_session_no_longer_pins_the_daemon(
+    tmp_path: Path,
+) -> None:
+    daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=0)
+    try:
+        workspace = str(tmp_path / "proj")
+        resource = daemon.registry.register_resource(
+            kind="container",
+            name="app",
+            stack="app",
+            generation="g",
+            scope="stack",
+            workspace=workspace,
+        )
+        acquired = daemon.dispatch(
+            "compose-acquire", {"workspace": workspace, "pid": 111, "proc_start": None}
+        )
+        assert not daemon.should_retire()
+
+        released = daemon.dispatch("compose-release", {"session": acquired["session"]})
+
+        assert released == {"ok": True, "released": 1}
+        assert not daemon.registry.leases_for(resource.id)
+        assert daemon.should_retire()
+    finally:
+        daemon.registry.close()
+
+
+def test_compose_release_of_an_unknown_session_is_ok_not_an_error(tmp_path: Path) -> None:
+    """A failed `compose-acquire` never hands the client a session, so its own `finally`
+    calls release with nothing to release. That must not surface as a failure.
+    """
+    daemon = Daemon(state_dir=tmp_path)
+    try:
+        reply = daemon.dispatch("compose-release", {"session": "no-such-session"})
+        assert reply == {"ok": True, "released": 0}
+    finally:
+        daemon.registry.close()
+
+
+def test_a_leased_compose_resource_survives_pressure_eviction(tmp_path: Path) -> None:
+    """The whole reason this lease exists: pressure eviction ignores age for non-machine
+    resources, so a volume `compose up` just created is otherwise eligible immediately.
+    """
+    from bosn.retention import Pressure, evaluate
+
+    daemon = Daemon(state_dir=tmp_path)
+    try:
+        workspace = str(tmp_path / "proj")
+        volume = daemon.registry.register_resource(
+            kind="volume",
+            name="data",
+            stack="data",
+            generation="g",
+            scope="stack",
+            workspace=workspace,
+        )
+        # Freshly created: far younger than any age-based tier, so only pressure -- not
+        # age -- could possibly explain a collect verdict here.
+        under_pressure = Pressure(under_pressure=True, bytes_exceeded=True)
+        unleased_verdict = evaluate(daemon.registry, volume, pressure=under_pressure)
+        assert unleased_verdict.collect is True, "sanity: pressure alone collects this"
+
+        acquired = daemon.dispatch(
+            "compose-acquire", {"workspace": workspace, "pid": 111, "proc_start": None}
+        )
+        assert acquired["ok"] is True
+
+        leased_verdict = evaluate(daemon.registry, volume, pressure=under_pressure)
+
+        assert leased_verdict.collect is False
+        assert leased_verdict.reason == "leased"
+    finally:
+        daemon.registry.close()
+
+
+def test_a_failed_acquire_does_not_leave_a_session_pinning_the_daemon_forever(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The session is reserved before the lease loop runs (so shutdown sees it immediately),
+    but if `acquire_lease` then raises -- e.g. a locked registry under concurrent writers --
+    the caller never receives a session id back and can never call compose-release. Leaving
+    the reservation behind would pin the daemon (`should_retire`/`request_stop` both key off
+    `_execution_sessions`) exactly as permanently as the leak leases exist to prevent.
+    """
+    daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=0)
+    try:
+        workspace = str(tmp_path / "proj")
+        daemon.registry.register_resource(
+            kind="container",
+            name="app",
+            stack="app",
+            generation="g",
+            scope="stack",
+            workspace=workspace,
+        )
+
+        def _boom(*_a: object, **_k: object) -> None:
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(daemon.registry, "acquire_lease", _boom)
+
+        with pytest.raises(RuntimeError, match="database is locked"):
+            daemon.dispatch(
+                "compose-acquire", {"workspace": workspace, "pid": 111, "proc_start": None}
+            )
+
+        assert daemon._execution_sessions == {}
+        assert daemon.should_retire()
+    finally:
+        daemon.registry.close()
+
+
 # -- unattended maintenance ------------------------------------------------
 
 

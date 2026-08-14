@@ -1,3 +1,4 @@
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -172,16 +173,29 @@ class _FakeCompleted:
 class _FakeDaemon:
     """Records every verb sent to the daemon and answers with canned replies."""
 
-    def __init__(self, adopt_reply: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        adopt_reply: dict[str, Any] | None = None,
+        acquire_reply: dict[str, Any] | None = None,
+    ) -> None:
         self.calls: list[str] = []
+        self.requests: list[dict[str, Any]] = []
         self.adopt_reply = adopt_reply if adopt_reply is not None else {"ok": True, "adopted": []}
+        self.acquire_reply = (
+            acquire_reply if acquire_reply is not None else {"ok": True, "session": "sess-1"}
+        )
 
-    def request(self, verb: str, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+    def request(self, verb: str, *_args: Any, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(verb)
+        self.requests.append(kwargs)
         if verb == "status":
             return {"ok": True, "registry_id": "reg-1"}
         if verb == "compose-adopt":
             return self.adopt_reply
+        if verb == "compose-acquire":
+            return self.acquire_reply
+        if verb == "compose-release":
+            return {"ok": True, "released": 0}
         raise AssertionError(f"unexpected verb {verb!r}")
 
 
@@ -189,6 +203,17 @@ def _compose_file(tmp_path: Path) -> Path:
     compose = tmp_path / "compose.yaml"
     compose.write_text("services:\n  app:\n    image: alpine\n", encoding="utf-8")
     return compose
+
+
+@pytest.fixture(autouse=True)
+def _fixed_process_start_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test below fakes `subprocess.run` for the compose command itself, and that
+    monkeypatch replaces the one process-wide `subprocess` module object -- there is no
+    separate copy to leave alone. `process_start_time()` also shells out (`tasklist`/`ps`)
+    to probe the client's own liveness, so without this fixture it would silently receive
+    the compose-command fake instead and blow up on a missing `.stdout` attribute.
+    """
+    monkeypatch.setattr("bosn.docker_cli.process_start_time", lambda pid: 123.0)
 
 
 def test_a_failed_up_still_reconciles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -266,6 +291,108 @@ def test_a_reconcile_failure_is_reported_but_does_not_mask_composes_exit_code(
     assert "may be unregistered" in err
 
 
+# -- Compose project leases (#48) --------------------------------------------
+
+
+def test_compose_acquire_is_sent_before_compose_runs_and_released_after(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_daemon = _FakeDaemon()
+    monkeypatch.setattr(daemon, "request", fake_daemon.request)
+    calls_at_compose_run: list[str] = []
+
+    def _record_and_run(*_a: Any, **_k: Any) -> _FakeCompleted:
+        calls_at_compose_run.extend(fake_daemon.calls)
+        return _FakeCompleted(returncode=0)
+
+    monkeypatch.setattr("bosn.docker_cli.subprocess.run", _record_and_run)
+
+    returncode = _run_compose("up", _compose_file(tmp_path), [])
+
+    assert returncode == 0
+    assert calls_at_compose_run == ["status", "compose-adopt", "compose-acquire"]
+    assert fake_daemon.calls[-2:] == ["compose-release", "compose-adopt"]
+
+
+def test_the_acquire_request_carries_the_clients_own_pid_and_proc_start_not_the_daemons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`bosn-docker` must send its own identity: the daemon has no long-lived holder for a
+    Compose lease the way it does for `execution-acquire`, so a daemon-side pid would pin
+    the lease forever if this client were killed before it could release explicitly.
+    """
+    fake_daemon = _FakeDaemon()
+    monkeypatch.setattr(daemon, "request", fake_daemon.request)
+    monkeypatch.setattr(
+        "bosn.docker_cli.subprocess.run", lambda *a, **k: _FakeCompleted(returncode=0)
+    )
+
+    _run_compose("up", _compose_file(tmp_path), [])
+
+    acquire_request = next(
+        req
+        for call, req in zip(fake_daemon.calls, fake_daemon.requests, strict=True)
+        if call == "compose-acquire"
+    )
+    assert acquire_request["pid"] == os.getpid()
+    assert acquire_request["proc_start"] == 123.0  # from the _fixed_process_start_time fixture
+
+
+def test_release_happens_even_when_compose_exits_non_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_daemon = _FakeDaemon()
+    monkeypatch.setattr(daemon, "request", fake_daemon.request)
+    monkeypatch.setattr(
+        "bosn.docker_cli.subprocess.run", lambda *a, **k: _FakeCompleted(returncode=1)
+    )
+
+    returncode = _run_compose("up", _compose_file(tmp_path), [])
+
+    assert returncode == 1
+    assert "compose-release" in fake_daemon.calls
+
+
+def test_release_happens_on_keyboard_interrupt_and_the_interrupt_still_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_daemon = _FakeDaemon()
+    monkeypatch.setattr(daemon, "request", fake_daemon.request)
+
+    def _interrupted(*_a: Any, **_k: Any) -> _FakeCompleted:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("bosn.docker_cli.subprocess.run", _interrupted)
+
+    with pytest.raises(KeyboardInterrupt):
+        _run_compose("up", _compose_file(tmp_path), [])
+
+    assert "compose-release" in fake_daemon.calls
+
+
+def test_a_failed_acquire_still_lets_compose_run_and_releases_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Leasing is a protection, not a precondition: a project with nothing registered yet
+    (or an unreachable daemon) must not block the compose command itself, and the release
+    that follows a session-less acquire must not raise or be reported as a run failure.
+    """
+    fake_daemon = _FakeDaemon(acquire_reply={"ok": False, "error": "no such workspace"})
+    monkeypatch.setattr(daemon, "request", fake_daemon.request)
+    monkeypatch.setattr(
+        "bosn.docker_cli.subprocess.run", lambda *a, **k: _FakeCompleted(returncode=0)
+    )
+
+    returncode = _run_compose("up", _compose_file(tmp_path), [])
+
+    assert returncode == 0
+    assert "compose-acquire" in fake_daemon.calls
+    assert "compose-release" not in fake_daemon.calls, "nothing to release without a session"
+    err = capsys.readouterr().err
+    assert "no such workspace" in err
+    assert "unprotected against pressure eviction" in err
+
+
 def test_a_clean_up_reconciles_exactly_as_before(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -278,4 +405,13 @@ def test_a_clean_up_reconciles_exactly_as_before(
     returncode = _run_compose("up", _compose_file(tmp_path), [])
 
     assert returncode == 0
-    assert fake_daemon.calls == ["status", "compose-adopt"]
+    # An initial reconcile registers whatever the project already has, then the lease is
+    # acquired and released around the compose command itself, then a closing reconcile
+    # adopts anything newly labeled during this run.
+    assert fake_daemon.calls == [
+        "status",
+        "compose-adopt",
+        "compose-acquire",
+        "compose-release",
+        "compose-adopt",
+    ]

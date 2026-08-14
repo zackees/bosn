@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import os
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,7 @@ from pathlib import Path
 from bosn import __version__, daemon, labels
 from bosn.compose import ComposeError, content_digest, load_compose
 from bosn.registry import Registry
+from bosn.resources import process_start_time
 
 
 class DockerFrontDoorError(ValueError):
@@ -187,6 +189,66 @@ def _reconcile_after_compose(command: str) -> None:
         )
 
 
+def _acquire_compose_lease(workspace: str) -> str | None:
+    """Lease every resource already registered for this Compose project before it runs.
+
+    Held under bosn-docker's own pid/start-time, sent explicitly in the request, rather
+    than the daemon acquiring with its own `os.getpid()` the way `execution-acquire` does.
+    `bosn-docker` runs the (possibly long, foreground) compose command itself; if it is
+    SIGKILLed mid-run, no `finally` here ever executes and no release request is ever sent.
+    A daemon-held lease would then sit pinned until the daemon itself restarts -- a
+    permanent leak, exactly what leases exist to prevent. Held under the client's identity
+    instead, the ordinary TTL-plus-liveness rule (`lease_is_expired`) reclaims it within one
+    TTL once this pid (and start time, when available) no longer match a live process.
+
+    Never fatal: a project with no resources registered yet (its first `up`, before this
+    invocation's own reconcile above has anything to find) leases nothing and that is fine
+    -- the orphan-recovery half of #48 is what protects a run's *own* newly created
+    resources; this lease only protects what a concurrent GC pass could otherwise already
+    see and evict out from under an in-progress run.
+    """
+    try:
+        acquired = daemon.request(
+            "compose-acquire",
+            workspace=workspace,
+            pid=os.getpid(),
+            proc_start=process_start_time(os.getpid()),
+        )
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:  # noqa: BLE001 - fail open, same posture as reconcile below
+        print(
+            f"bosn-docker compose: could not lease project resources: {exc}; "
+            "they are unprotected against pressure eviction for this run",
+            file=sys.stderr,
+        )
+        return None
+    if not acquired.get("ok"):
+        print(
+            f"bosn-docker compose: could not lease project resources: "
+            f"{acquired.get('error') or 'lease acquire failed'}; "
+            "they are unprotected against pressure eviction for this run",
+            file=sys.stderr,
+        )
+        return None
+    return str(acquired["session"])
+
+
+def _release_compose_lease(session: str | None) -> None:
+    """Release a lease acquired above. A `None` session (acquire failed or leased nothing
+    worth tracking) is a normal, silent no-op -- there is nothing on the daemon side to
+    release, and it must never be reported as a failure of the run itself.
+    """
+    if session is None:
+        return
+    try:
+        daemon.request("compose-release", session=session)
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:  # noqa: BLE001 - never mask compose's own exit status
+        print(f"bosn-docker compose: could not release project lease: {exc}", file=sys.stderr)
+
+
 def _run_compose(command: str, compose: Path, args: list[str]) -> int:
     if args:
         raise DockerFrontDoorError(f"unsupported compose flag or argument {args[0]!r}")
@@ -194,17 +256,31 @@ def _run_compose(command: str, compose: Path, args: list[str]) -> int:
     if not reply.get("ok"):
         raise DockerFrontDoorError(str(reply.get("error") or "cannot reach bosn daemon"))
     overlay = _compose_overlay(str(reply["registry_id"]), compose)
+    workspace = str(compose.parent.resolve())
     try:
-        # The inner try/finally is the load-bearing part: it reconciles whether the
-        # subprocess returns normally, raises, or is unwound by a KeyboardInterrupt from
-        # Ctrl-C -- the single most likely way a foreground `up` never reaches a clean
-        # exit. The outer finally still removes the overlay file in every case.
+        # Reconcile before acquiring: a lease can only protect a resource the registry
+        # already knows about, and a project that is already up -- this is a second
+        # `compose up`, or a `logs`/`ps` against a live stack -- has resources sitting on
+        # the engine from a prior invocation that this process never registered itself.
+        _reconcile_after_compose(command)
+        session = _acquire_compose_lease(workspace)
         try:
             completed = subprocess.run(
                 ["docker", "compose", "-f", str(compose), "-f", str(overlay), command], check=False
             )
         finally:
-            _reconcile_after_compose(command)
+            # Release and reconcile both have to happen -- whether the subprocess returned
+            # normally, raised, or is unwinding from a Ctrl-C KeyboardInterrupt -- and
+            # neither may swallow a failure in the other. Nesting the two `finally` blocks
+            # guarantees the inner one (reconcile) still runs even if releasing the lease
+            # raises, and the exception from whichever ran second is what actually
+            # propagates -- same ordering guarantee `try/finally` always gives, just applied
+            # twice. Release goes first only because it can't discover anything reconcile's
+            # scan doesn't need: releasing does not add or remove resource rows.
+            try:
+                _release_compose_lease(session)
+            finally:
+                _reconcile_after_compose(command)
         return completed.returncode
     finally:
         overlay.unlink(missing_ok=True)
