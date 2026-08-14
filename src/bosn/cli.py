@@ -20,6 +20,10 @@ DAEMON_VERB = "__daemon"
 
 NOT_IMPLEMENTED_EXIT = 3
 
+# Long enough to cover a daemon draining a cancelled build (see SHUTDOWN_DRAIN_SECONDS),
+# short enough not to look hung.
+DAEMON_STOP_TIMEOUT = 45.0
+
 # verb -> (help text, phase that lands it)
 VERBS: dict[str, tuple[str, str]] = {
     "run": ("run an ad-hoc command in a stack", "implemented"),
@@ -114,8 +118,23 @@ def cmd_daemon(opts: Options) -> int:
     state_dir = opts.state_dir
 
     if opts.stop:
-        stopped = daemon_mod.stop(state_dir)
-        print("daemon stopped" if stopped else "no daemon was running")
+        # Three outcomes, not two. Stopping now drains in-flight builds before it closes
+        # the registry, so a daemon with a build to cancel can outlast the wait -- and
+        # reporting that as "no daemon was running" would be a plainly wrong answer to the
+        # question the user asked.
+        was_running = daemon_mod.is_serving(state_dir)
+        stopped = daemon_mod.stop(state_dir, timeout=DAEMON_STOP_TIMEOUT)
+        if stopped:
+            print("daemon stopped")
+        elif was_running:
+            print(
+                "daemon is still shutting down; it is waiting for an in-flight build to "
+                "stop cleanly. Run `bosn jobs` to see what it is finishing.",
+                file=sys.stderr,
+            )
+            return 1
+        else:
+            print("no daemon was running")
         return 0
 
     idle = (

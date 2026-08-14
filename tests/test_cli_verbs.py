@@ -77,3 +77,25 @@ def test_doctor_reports_unreachable_engine_without_crashing(capsys) -> None:
     captured = capsys.readouterr()
     assert "reachable:      no" in captured.out
     assert "not on PATH" in captured.err
+
+
+def test_stopping_a_daemon_that_was_not_running_says_so(tmp_path, capsys) -> None:
+    assert cli.main(["--state-dir", str(tmp_path), "__daemon", "--stop"]) == 0
+    assert "no daemon was running" in capsys.readouterr().out
+
+
+def test_a_daemon_still_draining_is_not_reported_as_absent(tmp_path, monkeypatch, capsys) -> None:
+    """Stopping now waits for in-flight builds, so the wait can expire on a live daemon.
+
+    Saying "no daemon was running" there would be a plainly wrong answer to the question
+    the user asked, and it would send them looking in the wrong place.
+    """
+    from bosn import daemon as daemon_mod
+
+    monkeypatch.setattr(daemon_mod, "is_serving", lambda *a, **k: True)
+    monkeypatch.setattr(daemon_mod, "stop", lambda *a, **k: False)
+
+    assert cli.main(["--state-dir", str(tmp_path), "__daemon", "--stop"]) == 1
+    err = capsys.readouterr().err
+    assert "still shutting down" in err
+    assert "bosn jobs" in err
