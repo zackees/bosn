@@ -408,6 +408,11 @@ class Registry:
     def journal_mode(self) -> str:
         return str(self._exec("PRAGMA journal_mode").fetchone()[0]).lower()
 
+    def integrity_check(self) -> str:
+        """Return SQLite's read-only integrity diagnosis without altering the database."""
+        row = self._exec("PRAGMA integrity_check").fetchone()
+        return str(row[0]) if row is not None else "no result"
+
     # -- resources ---------------------------------------------------------
 
     def register_resource(

@@ -207,12 +207,15 @@ def cmd_doctor(opts: Options) -> int:
     if not db_path.exists():
         deadline = None
         registry_id = None
+        integrity = "not initialized"
     else:
         with Registry(db_path, read_only=True) as registry:
             deadline = registry.meta("maintenance.next_deadline")
             registry_id = registry.registry_id
+            integrity = registry.integrity_check()
     print(f"scheduler manifest installed: {autostart.manifest_installed()}")
     print(f"scheduler next deadline: {deadline or '-'}")
+    print(f"registry integrity: {integrity}")
     if not info.reachable:
         print(f"diagnosis:      {info.detail}", file=sys.stderr)
         return 1
