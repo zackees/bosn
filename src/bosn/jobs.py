@@ -133,6 +133,7 @@ class Job:
         self.state = state
         self.created_at = now
         self.started_at: float | None = None
+        self.last_progress_at: float | None = None
         self.ended_at: float | None = None
         self.returncode: int | None = None
         self.error: str | None = None
@@ -187,6 +188,10 @@ class Job:
             if self.state in TERMINAL_STATES:
                 watcher.put(self.summary(final=True))
             else:
+                if self.cancelled.is_set():
+                    watcher.put(
+                        {"event": "cancelling", "job": self.id, "reason": self.error or "cancelled"}
+                    )
                 self._watchers.append(watcher)
         return watcher
 
@@ -237,6 +242,10 @@ class Job:
         return True
 
     def log(self, line: str, stream: str = "stdout") -> None:
+        # Builder output is the liveness signal. Watcher heartbeats deliberately never
+        # call this: a disconnected or chatty client must not keep a wedged build alive.
+        with self._lock:
+            self.last_progress_at = time.time()
         self.emit({"event": "log", "stream": stream, "line": line})
 
     def summary(self, *, final: bool = False) -> dict[str, Any]:
@@ -402,6 +411,7 @@ class JobManager:
                 continue
             job.state = RUNNING
             job.started_at = time.time()
+            job.last_progress_at = job.started_at
             self._running += 1
             job.emit(job.summary())
             thread = threading.Thread(target=self._run, args=(job,), daemon=True)
@@ -516,33 +526,35 @@ class JobManager:
         return job
 
     def reap_expired(self, now: float | None = None) -> list[Job]:
-        """Cancel builds that have outlived their TTL.
+        """Cancel builds whose builder has stopped making progress for the TTL.
 
         Without this a builder that hangs forever pins the daemon forever: running jobs
         block idle retirement, so a job that never reports is also a daemon that never
         retires and resources that never get collected.
         """
         now = now if now is not None else time.time()
-        candidates: list[Job] = []
+        reaped: list[Job] = []
+        notifications: list[tuple[Job, dict[str, Any]]] = []
         with self._lock:
             for job in list(self._jobs.values()):
-                if job.state != RUNNING or job.started_at is None:
-                    continue
-                # Already reaped: a cancelled build stays RUNNING until its builder tears
-                # down, which can take tens of seconds. Without this the watchdog reaps it
-                # again on every 0.5s tick and writes an event row each time.
-                if job.cancelled.is_set():
-                    continue
-                if now - job.started_at > self.ttl_seconds:
-                    candidates.append(job)
-
-        reaped: list[Job] = []
-        for job in candidates:
-            try:
-                self.cancel(job.id, reason=f"exceeded the {self.ttl_seconds:.0f}s build TTL")
-            except JobError:
-                continue  # it finished on its own between the scan and the cancel
-            reaped.append(job)
+                # `log()` holds this same job lock while it refreshes progress, so the
+                # decision cannot race a new builder line between stale inspection and
+                # cancellation.
+                with job._lock:
+                    if job.state != RUNNING or job.started_at is None or job.cancelled.is_set():
+                        continue
+                    progress_at = job.last_progress_at or job.started_at
+                    if now - progress_at <= self.ttl_seconds:
+                        continue
+                    reason = f"no builder progress for {self.ttl_seconds:.0f}s (build TTL)"
+                    job.error = reason
+                    job.cancelled.set()
+                    notifications.append(
+                        (job, {"event": "cancelling", "job": job.id, "reason": reason})
+                    )
+                    reaped.append(job)
+        for job, event in notifications:
+            job.emit(event)
         return reaped
 
     # -- observation -------------------------------------------------------
