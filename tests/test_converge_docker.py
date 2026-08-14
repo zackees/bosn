@@ -57,7 +57,9 @@ def converger(project: Path, registry: Registry, engine: Engine) -> Iterator[Con
         yield conv
     finally:
         for resource in registry.list_resources():
-            if resource.kind == "volume":
+            if resource.kind == "container":
+                engine.run(["rm", "--force", resource.name])
+            elif resource.kind == "volume":
                 engine.run(["volume", "rm", "--force", resource.name])
             elif resource.kind == "image":
                 engine.run(["image", "rm", "--force", resource.name])
@@ -110,7 +112,9 @@ def test_a_manifest_task_runs(project: Path, registry: Registry, engine: Engine)
         assert "task-ran" in output
     finally:
         for resource in registry.list_resources():
-            if resource.kind == "volume":
+            if resource.kind == "container":
+                engine.run(["rm", "--force", resource.name])
+            elif resource.kind == "volume":
                 engine.run(["volume", "rm", "--force", resource.name])
             elif resource.kind == "image":
                 engine.run(["image", "rm", "--force", resource.name])

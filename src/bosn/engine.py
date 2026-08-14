@@ -8,6 +8,7 @@ never shell strings.
 from __future__ import annotations
 
 import shutil
+import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -138,6 +139,16 @@ class Engine:
         if killed:
             return EngineResult(returncode=returncode or -1, stdout=output, stderr="cancelled")
         return EngineResult(returncode=returncode, stdout=output, stderr="")
+
+    def interactive(self, args: list[str]) -> int:
+        """Run an engine command attached to this process's terminal.
+
+        Unlike :meth:`run`, stdio is inherited, so Docker receives the caller's stdin,
+        terminal resize/signals, and can allocate a real TTY for ``exec -it``.
+        """
+        if not self.available():
+            raise EngineError(f"{self.binary!r} is not on PATH")
+        return subprocess.run([self.binary, *args], check=False).returncode
 
     def info(self) -> EngineInfo:
         """Probe the engine. Never raises — the result carries the diagnosis."""

@@ -20,7 +20,7 @@ from bosn import labels
 from bosn.engine import Engine
 from bosn.registry import Registry
 from bosn.resources import ResourceScanner
-from bosn.retention import Pressure, Verdict, collectable, plan
+from bosn.retention import Pressure, Verdict, collectable, container_should_stop, plan
 
 _REMOVE_COMMANDS: dict[str, list[str]] = {
     "container": ["rm", "--force"],
@@ -76,6 +76,15 @@ class Collector:
         for verdict in verdicts:
             if not verdict.collect:
                 result.kept.append(verdict.name)
+                if container_should_stop(verdict.resource, self.registry.clock.now()):
+                    stopped = self.engine.run(["container", "stop", verdict.name])
+                    if stopped.ok:
+                        self.registry.log_event("container.stopped_idle", verdict.name)
+                    else:
+                        self.registry.log_event(
+                            "container.stop_error",
+                            f"{verdict.name}: {stopped.stderr or stopped.stdout}",
+                        )
 
         for verdict in collectable(verdicts):
             resource = verdict.resource

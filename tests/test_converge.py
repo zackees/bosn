@@ -44,6 +44,8 @@ class FakeEngine:
             return EngineResult(0 if args[-1] in self.existing else 1, "", "")
         if args[:2] == ["volume", "create"]:
             self.existing.add(args[-1])
+        if args[0] == "create":
+            self.existing.add(args[args.index("--name") + 1])
         if args[0] == "build":
             self.existing.add(args[args.index("--tag") + 1])
         return EngineResult(0, "ok", "")
@@ -59,6 +61,10 @@ class FakeEngine:
         if on_line is not None:
             on_line(f"fake build: {' '.join(args[:2])}")
         return self.run(args)
+
+    def interactive(self, args: list[str]) -> int:
+        self.commands.append(list(args))
+        return 7
 
     def ran(self, *prefix: str) -> list[list[str]]:
         return [c for c in self.commands if c[: len(prefix)] == list(prefix)]
@@ -356,13 +362,39 @@ def test_run_converges_first_then_runs(converger: Converger) -> None:
     engine: FakeEngine = converger.engine  # type: ignore[assignment]
     assert code == 0
     assert engine.ran("build"), "converge must have happened before the run"
-    run_cmd = engine.ran("run")[0]
-    assert run_cmd[-2:] == ["echo", "hi"]
-    assert "--rm" in run_cmd
+    exec_cmd = engine.ran("exec")[0]
+    assert exec_cmd[-2:] == ["echo", "hi"]
+    assert engine.ran("create"), "the first run creates the persistent container"
 
 
 def test_run_mounts_every_declared_volume(converger: Converger) -> None:
     converger.run(["true"])
     engine: FakeEngine = converger.engine  # type: ignore[assignment]
-    mounts = [a for a in engine.ran("run")[0] if a.startswith("bosn-")]
+    mounts = [a for a in engine.ran("create")[0] if a.startswith("bosn-") and ":/bosn/" in a]
     assert len(mounts) == 3
+
+
+def test_second_run_reuses_the_same_persistent_container(converger: Converger) -> None:
+    converger.run(["true"])
+    converger.run(["true"])
+    engine: FakeEngine = converger.engine  # type: ignore[assignment]
+    assert len(engine.ran("create")) == 1
+    assert len(engine.ran("exec")) == 2
+
+
+def test_shell_uses_an_interactive_tty_exec(converger: Converger) -> None:
+    converged = converger.converge()
+    assert converger.shell_converged(converged, stack_name=None, workspace="/workspace") == 7
+    engine: FakeEngine = converger.engine  # type: ignore[assignment]
+    assert engine.ran("exec")[-1][1] == "-it"
+
+
+def test_persistent_container_has_daemon_loss_and_run_duration_watchdogs(
+    converger: Converger,
+) -> None:
+    converger.run(["true"])
+    engine: FakeEngine = converger.engine  # type: ignore[assignment]
+    create = engine.ran("create")[0]
+    assert "--rm" in create
+    assert any("daemon.heartbeat:/bosn-daemon/heartbeat:ro" in arg for arg in create)
+    assert any("stat -c %Y" in arg and "started" in arg for arg in create)

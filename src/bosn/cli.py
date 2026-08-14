@@ -464,9 +464,29 @@ def cmd_done(opts: Options) -> int:
 
 
 def cmd_shell(opts: Options) -> int:
-    from dataclasses import replace
+    from bosn import daemon as daemon_mod
+    from bosn.converge import Converger, workspace_of
+    from bosn.engine import EngineError
+    from bosn.manifest import ManifestError
 
-    return cmd_run(replace(opts, args=("sh",), task=None))
+    try:
+        manifest, registry = _open_manifest_and_registry(opts)
+    except ManifestError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    try:
+        converged = _converge_via_daemon(opts, manifest, opts.stack)
+        return Converger(manifest, registry, Engine(opts.engine)).shell_converged(
+            converged, stack_name=opts.stack, workspace=workspace_of(manifest)
+        )
+    except JobFailed as exc:
+        print(str(exc), file=sys.stderr)
+        return exc.exit_code
+    except (daemon_mod.DaemonError, ipc.TransportError, EngineError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    finally:
+        registry.close()
 
 
 def cmd_ensure(opts: Options) -> int:
