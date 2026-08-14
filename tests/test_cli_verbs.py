@@ -125,6 +125,13 @@ def test_gc_json_daemon_error_has_stable_remedy(tmp_path, capsys, monkeypatch) -
     payload = json.loads(capsys.readouterr().out)
     assert payload["code"] == "daemon.unreachable"
     assert payload["next"] == "start or restart the daemon, then retry"
+
+
+def test_done_json_error_uses_the_common_envelope(tmp_path, capsys) -> None:
+    assert cli.main(["--state-dir", str(tmp_path), "done", "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["code"] == "command.failed"
+    assert payload["next"] == "resolve the reported condition and retry the command"
     assert cli.VERBS["cancel"][1] == "implemented"
 
 

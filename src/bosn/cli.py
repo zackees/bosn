@@ -8,6 +8,8 @@ silent no-op and never a fallback to raw Docker.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import sqlite3
 import sys
@@ -826,6 +828,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     handler = handlers.get(opts.verb)
     if handler is not None:
+        if opts.json and opts.verb not in {"tasks", "gc"}:
+            # Older human-oriented verbs already return useful exit codes and write
+            # diagnostics to stderr.  Adapt that boundary once so JSON callers never
+            # need to parse prose while those commands are migrated individually.
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = handler(opts)
+            if code:
+                message = stderr.getvalue().strip() or f"{opts.verb} failed"
+                return _error(
+                    code="command.failed",
+                    message=message,
+                    next_step="resolve the reported condition and retry the command",
+                    as_json=True,
+                )
+            return code
         return handler(opts)
 
     error = VerbNotImplementedError(opts.verb, VERBS[opts.verb][1])
