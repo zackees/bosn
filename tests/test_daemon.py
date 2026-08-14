@@ -125,20 +125,20 @@ def test_daemon_publishes_state_and_answers_ping(served: Daemon, tmp_path: Path)
     assert state is not None
     assert state.port == served.port == daemon_mod.port_for(tmp_path)
     assert state.pid == os.getpid()
-    reply = ipc.send_request(state.port, {"verb": "ping"})
+    reply = ipc.send_request(state.port, {"verb": "ping", "auth": served.secret})
     assert reply["ok"] and reply["pong"]
     assert daemon_mod.heartbeat_file(tmp_path).exists()
 
 
 def test_status_reports_registry_id_and_uptime(served: Daemon) -> None:
-    reply = ipc.send_request(served.port, {"verb": "status"})
+    reply = ipc.send_request(served.port, {"verb": "status", "auth": served.secret})
     assert reply["ok"]
     assert reply["registry_id"] == served.registry.registry_id
     assert reply["uptime_seconds"] >= 0
 
 
 def test_unknown_verb_is_rejected_not_ignored(served: Daemon) -> None:
-    reply = ipc.send_request(served.port, {"verb": "definitely-not-a-verb"})
+    reply = ipc.send_request(served.port, {"verb": "definitely-not-a-verb", "auth": served.secret})
     assert reply["ok"] is False
     assert "unknown daemon verb" in reply["error"]
 
@@ -153,7 +153,7 @@ def test_requests_refresh_the_heartbeat(served: Daemon) -> None:
 def test_registry_is_usable_from_the_server_threads(served: Daemon) -> None:
     """The daemon serves on threads; a thread-affine sqlite handle would fail here."""
     for _ in range(5):
-        assert ipc.send_request(served.port, {"verb": "status"})["ok"]
+        assert ipc.send_request(served.port, {"verb": "status", "auth": served.secret})["ok"]
 
 
 # -- shutdown and retirement -----------------------------------------------
@@ -239,7 +239,9 @@ def test_real_detached_spawn_and_autostart(tmp_path: Path) -> None:
     try:
         assert state.port == daemon_mod.port_for(tmp_path)
         assert state.pid != os.getpid(), "daemon must be a separate process"
-        assert ipc.send_request(state.port, {"verb": "ping"})["ok"]
+        assert ipc.send_request(state.port, {"verb": "ping", "auth": daemon_mod._secret(tmp_path)})[
+            "ok"
+        ]
 
         # spawn is idempotent and autostart reaches the same daemon
         assert daemon_mod.spawn(tmp_path).pid == state.pid
