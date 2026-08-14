@@ -109,6 +109,9 @@ class Collector:
 def status(registry: Registry, engine: Engine | None = None) -> dict:
     """Tiers, leases, and foreign registries. Read-only: works with the daemon dead."""
     engine = engine or Engine()
+    from bosn.config import load as load_config
+
+    config = load_config()
     verdicts = plan(registry)
     scan = ResourceScanner(engine).scan(registry.registry_id)
 
@@ -118,6 +121,7 @@ def status(registry: Registry, engine: Engine | None = None) -> dict:
 
     return {
         "registry_id": registry.registry_id,
+        "config": config.report(),
         "registered": len(verdicts),
         "collectable": len(collectable(verdicts)),
         "by_reason": by_reason,
