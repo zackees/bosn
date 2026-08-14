@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import socket
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -21,6 +22,26 @@ import pytest
 from bosn import daemon as daemon_mod
 from bosn import ipc
 from bosn.daemon import Daemon, DaemonError, DaemonState
+
+
+def _detach_code() -> str:
+    """`_detach`'s body with its docstring stripped, so prose cannot satisfy an assertion."""
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(daemon_mod._detach)))
+    func = tree.body[0]
+    assert isinstance(func, ast.FunctionDef)
+    body = func.body
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    return "\n".join(ast.unparse(node) for node in body)
 
 
 def _wait_until(predicate, timeout: float = 15.0, interval: float = 0.05) -> bool:
@@ -187,22 +208,29 @@ def test_stop_returns_false_when_nothing_is_running(tmp_path: Path) -> None:
     assert daemon_mod.stop(tmp_path) is False
 
 
-def test_spawn_reports_a_clear_error_when_detachment_is_unavailable(tmp_path: Path) -> None:
-    """The missing-trampoline case must name the cause, not raise FileNotFoundError."""
-    if daemon_mod.spawn_daemon_available():
-        pytest.skip("running-process can detach here; the failure path is not reachable")
-    with pytest.raises(DaemonError, match="cannot detach on this platform"):
-        daemon_mod.spawn(tmp_path, timeout=5)
+def test_detach_does_not_depend_on_the_running_process_broker() -> None:
+    """Detachment must not require a broker daemon or a bundled trampoline binary.
+
+    Both running-process detach entry points are broker clients: spawn_daemon needs a
+    trampoline binary in its wheel assets, and launch_detached dials a named-pipe broker.
+    bosn must be able to start its own daemon with neither present.
+    """
+    code = _detach_code()
+    assert "spawn_daemon" not in code
+    assert "launch_detached" not in code
+    assert "rp_daemon" not in code
+    assert "subprocess.Popen" in code
+
+
+@pytest.mark.skipif(not sys.platform.startswith("win"), reason="Windows console flags")
+def test_windows_detach_uses_create_no_window_not_detached_process() -> None:
+    """DETACHED_PROCESS gives the child its own console -- a window pops up on screen."""
+    code = _detach_code()
+    assert "CREATE_NO_WINDOW" in code
+    assert "DETACHED_PROCESS" not in code
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(
-    not daemon_mod.spawn_daemon_available(),
-    reason=(
-        "running-process 4.10.1 publishes no assets/daemon-trampoline in its wheels, so "
-        "spawn_daemon cannot detach yet. Re-enable once a build ships the trampoline."
-    ),
-)
 def test_real_detached_spawn_and_autostart(tmp_path: Path) -> None:
     """End-to-end: the CLI lazily spawns a real detached daemon and talks to it."""
     state = daemon_mod.spawn(tmp_path, timeout=60)
