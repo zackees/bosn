@@ -205,6 +205,14 @@ SOLDR = LegacyFamily(
     # label outright would reject every soldr volume that exists, i.e. refuse the very
     # contract this family is here to handle. A *present* but unrecognized value still
     # refuses -- that is the signal of a real producer schema change.
+    #
+    # A schema-1 volume cannot slip through that relaxation, because no such labeled
+    # volume exists: soldr commit 1f7066d5 ("give each checkout root its own perf_local
+    # runner and volumes", #1835) is the same commit that bumped RUNNER_SCHEMA to "2",
+    # and `git show 1f7066d5^:ci/perf_local.py` creates volumes as a bare
+    # `docker volume create <name>` with no --label arguments at all. Volume labels and
+    # schema 2 arrived together, so anything carrying .managed=true is post-bump by
+    # construction; the two populations are disjoint by label presence, not by version.
     recognized_schema_versions=frozenset({"2"}),
 )
 

@@ -522,6 +522,43 @@ def test_startup_reconciliation_repairs_create_before_registry_crash(
     assert len(registry.list_resources()) == 1
 
 
+def test_startup_reconciliation_leaves_lifecycle_state_alone(
+    registry: Registry, clock: FakeClock
+) -> None:
+    """Observing an already-registered resource must not count as using it.
+
+    The daemon idle-retires and restarts constantly. If reconciliation refreshed rows it
+    merely observed, every restart would revert `bosn done` to active and push `last_used`
+    forward, so done-collection never fires and idle/superseded age never accumulates --
+    age-based GC would go inert and the disk would grow without bound.
+    """
+    from bosn.gc import done_workspaces, mark_done
+
+    resource = registry.register_resource(
+        kind="volume",
+        name="warm-cache",
+        stack="dev",
+        generation="digest",
+        scope="spec",
+        workspace="workspace",
+    )
+    mark_done(registry, "workspace")
+    before = registry.get_resource(resource.id)
+    assert before is not None and before.state == "done"
+
+    clock.advance(10_000)
+    scan = ScanResult(
+        owned=[DiscoveredResource("volume", "warm-cache", label_dict())], scanned_kinds={"volume"}
+    )
+    assert resources.reconcile_owned(registry, scan) == []
+
+    after = registry.get_resource(resource.id)
+    assert after is not None
+    assert after.state == "done", "reconciliation reverted `bosn done`"
+    assert after.last_used == before.last_used, "reconciliation reset the idle-age clock"
+    assert done_workspaces(registry) == {"workspace"}
+
+
 def test_startup_reconciliation_repairs_remove_before_registry_crash(
     registry: Registry,
 ) -> None:

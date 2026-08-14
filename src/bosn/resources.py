@@ -530,6 +530,18 @@ def reconcile_owned(
     for resource in scan.owned:
         parsed = resource.parsed()
         existing = registry.get_resource_by_engine_identity(resource.kind, resource.name)
+        if existing is not None:
+            # Observing a resource is not using it. `reconcile_resource` is an
+            # "I am using this now" mutation (last_used = now, state = 'active'), and the
+            # daemon idle-retires and restarts constantly, so calling it for rows that
+            # already exist would: revert `bosn done` back to active (done workspaces
+            # never collect again), reset last_used so idle/superseded age never
+            # accumulates across a restart (age-based GC becomes inert and the disk grows
+            # without bound -- the exact failure this project exists to prevent), and flip
+            # 'adopted' to 'active', stripping the 24h quiet period so pressure can evict
+            # data that recovery just restored. Reconciliation repairs the missing-row
+            # crash boundary only; it must leave lifecycle state alone.
+            continue
         registered = registry.reconcile_resource(
             kind=resource.kind,
             name=resource.name,
@@ -539,10 +551,9 @@ def reconcile_owned(
             workspace=parsed.workspace,
         )
         registry.record_generation(parsed.generation, parsed.stack, parsed.workspace)
-        if existing is None:
-            registry.set_resource_state(registered.id, "adopted")
-            registry.log_event("resource.recovered", f"{resource.kind}:{resource.name}")
-            reconciled.append(resource.name)
+        registry.set_resource_state(registered.id, "adopted")
+        registry.log_event("resource.recovered", f"{resource.kind}:{resource.name}")
+        reconciled.append(resource.name)
     discovered = {(resource.kind, resource.name) for resource in scan.owned}
     # Only rows observed before the scan are candidates.  A concurrent converge may
     # create a new engine object after listing completes; deleting that fresh row from a
