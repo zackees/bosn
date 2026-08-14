@@ -244,6 +244,47 @@ class Registry:
         assert resource is not None
         return resource
 
+    def reconcile_resource(
+        self,
+        *,
+        kind: str,
+        name: str,
+        stack: str,
+        generation: str,
+        scope: str,
+        workspace: str,
+    ) -> Resource:
+        """Make existing rows for one engine name describe its current owned object.
+
+        Container names are stable across generation replacement. Updating their row in
+        place preserves identity for leases while correcting stale generation metadata;
+        issue #35 separately owns enforcing uniqueness for every resource kind.
+        """
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT id FROM resources WHERE kind = ? AND name = ? ORDER BY created_at",
+                (kind, name),
+            ).fetchall()
+            if not rows:
+                return self.register_resource(
+                    kind=kind,
+                    name=name,
+                    stack=stack,
+                    generation=generation,
+                    scope=scope,
+                    workspace=workspace,
+                )
+            now = self.clock.now()
+            self.conn.execute(
+                "UPDATE resources SET stack = ?, generation = ?, scope = ?, workspace = ?, "
+                "last_used = ?, state = 'active' WHERE kind = ? AND name = ?",
+                (stack, generation, scope, workspace, now, kind, name),
+            )
+            self.log_event("resource.reconciled", f"{kind}:{name}")
+            resource = self.get_resource(str(rows[0]["id"]))
+            assert resource is not None
+            return resource
+
     def get_resource(self, resource_id: str) -> Resource | None:
         row = self._exec("SELECT * FROM resources WHERE id = ?", (resource_id,)).fetchone()
         return _resource_from_row(row) if row else None

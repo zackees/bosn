@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from bosn import labels
 from bosn.converge import (
     REGISTERED,
     REUSED,
@@ -16,8 +20,9 @@ from bosn.converge import (
     generation_coalescing_key,
     resolved_generation,
     volume_name_for,
+    workspace_of,
 )
-from bosn.engine import EngineResult
+from bosn.engine import EngineError, EngineResult
 from bosn.manifest import load
 from bosn.registry import Registry
 
@@ -42,16 +47,23 @@ class FakeEngine:
         self.existing: set[str] = set()
         self.image_ids: dict[str, str] = {"alpine": "sha256:alpine-v1"}
         self.image_platforms: dict[str, str] = {"alpine": "linux/amd64"}
+        self.container_specs: dict[str, dict[str, object]] = {}
+        self.container_serial = 0
 
     def run(self, args: list[str], *, check: bool = False) -> EngineResult:
         self.commands.append(list(args))
         if args[:2] == ["version", "--format"]:
             return EngineResult(0, "linux/amd64", "")
+        if args[:2] == ["container", "inspect"] and "{{json .}}" in args:
+            spec = self.container_specs.get(args[-1])
+            return EngineResult(0 if spec else 1, json.dumps(spec) if spec else "", "")
         if args[:2] == ["image", "inspect"] and "{{.Id}}" in args:
             requested_platform = (
                 args[args.index("--platform") + 1] if "--platform" in args else None
             )
             identity = self.image_ids.get(args[-1])
+            if identity is None and args[-1] in self.image_ids.values():
+                identity = args[-1]
             platform_matches = requested_platform is None or (
                 self.image_platforms.get(args[-1]) == requested_platform
             )
@@ -68,10 +80,60 @@ class FakeEngine:
                 self.image_platforms.setdefault(args[-1], "linux/amd64")
         if args[:2] == ["volume", "create"]:
             self.existing.add(args[-1])
+        if args[:3] == ["container", "rm", "--force"]:
+            target = args[-1]
+            name = next(
+                (
+                    candidate
+                    for candidate, spec in self.container_specs.items()
+                    if candidate == target or spec.get("Id") == target
+                ),
+                target,
+            )
+            self.existing.discard(name)
+            self.container_specs.pop(name, None)
         if args[0] == "create":
-            self.existing.add(args[args.index("--name") + 1])
+            name = args[args.index("--name") + 1]
+            self.existing.add(name)
+            self.container_serial += 1
+            identity = f"{name}\0{self.container_serial}"
+            container_id = f"sha256:{hashlib.sha256(identity.encode()).hexdigest()}"
+            raw_labels = {
+                args[index + 1].split("=", 1)[0]: args[index + 1].split("=", 1)[1]
+                for index, value in enumerate(args[:-1])
+                if value == "--label"
+            }
+            mounts: list[dict[str, object]] = []
+            for index, value in enumerate(args[:-1]):
+                if value != "--volume":
+                    continue
+                rendered = args[index + 1]
+                read_only = rendered.endswith(":ro")
+                core = rendered[:-3] if read_only else rendered
+                source, destination = core.rsplit(":", 1)
+                mount_type = "bind" if destination == "/bosn-daemon/heartbeat" else "volume"
+                mounts.append(
+                    {
+                        "Type": mount_type,
+                        "Name": source if mount_type == "volume" else "",
+                        "Source": source,
+                        "Destination": destination,
+                        "RW": not read_only,
+                    }
+                )
+            image = args[-4]
+            self.container_specs[name] = {
+                "Id": container_id,
+                "Config": {"Labels": raw_labels, "Image": image},
+                "Image": self.image_ids.get(image, image),
+                "Mounts": mounts,
+            }
+            return EngineResult(0, container_id, "")
         if args[0] == "build":
-            self.existing.add(args[args.index("--tag") + 1])
+            tag = args[args.index("--tag") + 1]
+            self.existing.add(tag)
+            self.image_ids[tag] = f"sha256:{hashlib.sha256(tag.encode()).hexdigest()}"
+            self.image_platforms[tag] = "linux/amd64"
         return EngineResult(0, "ok", "")
 
     def stream(
@@ -505,18 +567,293 @@ def test_run_mounts_every_declared_volume(converger: Converger) -> None:
 
 
 def test_second_run_reuses_the_same_persistent_container(converger: Converger) -> None:
-    converger.run(["true"])
-    converger.run(["true"])
+    converged, _code, _output = converger.run(["true"])
     engine: FakeEngine = converger.engine  # type: ignore[assignment]
+    name = converger.container_name(workspace_of(converger.manifest), converged.stack)
+    container_id = str(engine.container_specs[name]["Id"])
+
+    converger.run(["true"])
+
     assert len(engine.ran("create")) == 1
     assert len(engine.ran("exec")) == 2
+    assert {command[-1] for command in engine.ran("start")} == {container_id}
+    assert {command[1] for command in engine.ran("exec")} == {container_id}
+
+
+def test_generation_roll_replaces_the_container_and_reconciles_its_row(
+    project: Path, registry: Registry
+) -> None:
+    engine = FakeEngine()
+    first_converger = Converger(load(project), registry, engine)  # type: ignore[arg-type]
+    first, code, _output = first_converger.run(["true"])
+    assert code == 0
+    name = first_converger.container_name(workspace_of(first_converger.manifest), first.stack)
+    first_container_id = str(engine.container_specs[name]["Id"])
+
+    (project / "Dockerfile").write_text("FROM alpine\nRUN echo changed\n", encoding="utf-8")
+    second_converger = Converger(load(project), registry, engine)  # type: ignore[arg-type]
+    second, code, _output = second_converger.run(["true"])
+
+    assert code == 0
+    assert second.digest != first.digest
+    assert len(engine.ran("container", "rm", "--force")) == 1
+    assert engine.ran("container", "rm", "--force")[0][-1] == first_container_id
+    assert len(engine.ran("create")) == 2
+    assert engine.ran("create")[-1][-4] == second.image_tag
+    second_container_id = str(engine.container_specs[name]["Id"])
+    assert second_container_id != first_container_id
+    assert engine.ran("start")[-1][-1] == second_container_id
+    assert engine.ran("exec")[-1][1] == second_container_id
+    container_rows = [row for row in registry.list_resources() if row.kind == "container"]
+    assert container_rows
+    assert {row.generation for row in container_rows} == {second.digest}
+
+
+@pytest.mark.parametrize("collision", ["foreign", "incomplete"])
+def test_foreign_and_incomplete_container_collisions_are_refused_untouched(
+    converger: Converger, registry: Registry, collision: str
+) -> None:
+    engine: FakeEngine = converger.engine  # type: ignore[assignment]
+    converged = converger.converge()
+    workspace = workspace_of(converger.manifest)
+    name = converger.container_name(workspace, converged.stack)
+    if collision == "foreign":
+        raw_labels = labels.ResourceLabels(
+            registry="another-registry",
+            kind="container",
+            stack=converged.stack,
+            generation=converged.digest,
+            scope="stack",
+            workspace=workspace,
+            created="2026-01-01T00:00:00Z",
+        ).to_dict()
+    else:
+        raw_labels = {labels.REGISTRY: registry.registry_id}
+    engine.existing.add(name)
+    engine.container_specs[name] = {
+        "Id": "sha256:colliding-container",
+        "Config": {"Labels": raw_labels},
+        "Image": "sha256:collision",
+        "Mounts": [],
+    }
+
+    with pytest.raises(EngineError, match="name collision"):
+        converger.run_converged(converged, ["true"], stack_name=None, workspace=workspace)
+
+    assert engine.ran("container", "rm", "--force") == []
+    assert engine.ran("start") == []
+    assert name in engine.container_specs
+
+
+def test_changed_required_mount_recreates_an_owned_container(converger: Converger) -> None:
+    converged, code, _output = converger.run(["true"])
+    assert code == 0
+    engine: FakeEngine = converger.engine  # type: ignore[assignment]
+    name = converger.container_name(workspace_of(converger.manifest), converged.stack)
+    mounts = engine.container_specs[name]["Mounts"]
+    assert isinstance(mounts, list)
+    mounts.pop()
+
+    converger.run(["true"])
+
+    assert len(engine.ran("container", "rm", "--force")) == 1
+    assert len(engine.ran("create")) == 2
+
+
+def test_changed_image_id_recreates_an_owned_container(converger: Converger) -> None:
+    converged, code, _output = converger.run(["true"])
+    assert code == 0
+    engine: FakeEngine = converger.engine  # type: ignore[assignment]
+    name = converger.container_name(workspace_of(converger.manifest), converged.stack)
+    engine.container_specs[name]["Image"] = "sha256:not-the-converged-image"
+
+    converger.run(["true"])
+
+    assert len(engine.ran("container", "rm", "--force")) == 1
+    assert len(engine.ran("create")) == 2
+
+
+@pytest.mark.parametrize("failure", ["validation", "start"])
+def test_failed_new_container_is_removed_by_immutable_id(
+    project: Path, registry: Registry, failure: str
+) -> None:
+    class PostCreateFailingEngine(FakeEngine):
+        def __init__(self) -> None:
+            super().__init__()
+            self.created_id = ""
+
+        def run(self, args: list[str], *, check: bool = False) -> EngineResult:
+            result = super().run(args, check=check)
+            if args[0] == "create":
+                self.created_id = result.stdout
+                if failure == "validation":
+                    name = args[args.index("--name") + 1]
+                    self.container_specs[name]["Mounts"] = []
+            if args[0] == "start" and failure == "start":
+                return EngineResult(1, "", "start failed")
+            return result
+
+    engine = PostCreateFailingEngine()
+    converger = Converger(load(project), registry, engine)  # type: ignore[arg-type]
+
+    with pytest.raises(EngineError, match="does not match|starting .* failed"):
+        converger.run(["true"])
+
+    assert engine.created_id
+    assert engine.ran("container", "rm", "--force") == [
+        ["container", "rm", "--force", engine.created_id]
+    ]
+    assert engine.container_specs == {}
+    assert all(resource.kind != "container" for resource in registry.list_resources())
+
+
+def test_new_container_is_removed_if_lease_acquisition_fails(
+    project: Path, registry: Registry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class TrackingEngine(FakeEngine):
+        def __init__(self) -> None:
+            super().__init__()
+            self.created_id = ""
+
+        def run(self, args: list[str], *, check: bool = False) -> EngineResult:
+            result = super().run(args, check=check)
+            if args[0] == "create":
+                self.created_id = result.stdout
+            return result
+
+    engine = TrackingEngine()
+    converger = Converger(load(project), registry, engine)  # type: ignore[arg-type]
+    converged = converger.converge()
+
+    def fail_acquire(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("injected lease failure")
+
+    monkeypatch.setattr(registry, "acquire_lease", fail_acquire)
+    with pytest.raises(RuntimeError, match="injected lease failure"):
+        converger.run_converged(
+            converged,
+            ["true"],
+            workspace=workspace_of(converger.manifest),
+        )
+
+    assert engine.ran("container", "rm", "--force") == [
+        ["container", "rm", "--force", engine.created_id]
+    ]
+    assert engine.container_specs == {}
+    assert all(resource.kind != "container" for resource in registry.list_resources())
+
+
+def test_reused_container_is_not_removed_if_lease_acquisition_fails(
+    converger: Converger, registry: Registry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    converged, code, _output = converger.run(["true"])
+    assert code == 0
+    engine: FakeEngine = converger.engine  # type: ignore[assignment]
+    name = converger.container_name(workspace_of(converger.manifest), converged.stack)
+    container_id = engine.container_specs[name]["Id"]
+
+    def fail_acquire(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("injected lease failure")
+
+    monkeypatch.setattr(registry, "acquire_lease", fail_acquire)
+    with pytest.raises(RuntimeError, match="injected lease failure"):
+        converger.run_converged(
+            converged,
+            ["true"],
+            workspace=workspace_of(converger.manifest),
+        )
+
+    assert engine.ran("container", "rm", "--force") == []
+    assert engine.container_specs[name]["Id"] == container_id
+
+
+def test_client_manifest_volume_drift_is_refused_before_container_mutation(
+    converger: Converger,
+) -> None:
+    converged = converger.converge()
+    stale_snapshot = replace(converged, volumes=("wrong-volume", *converged.volumes[1:]))
+    engine: FakeEngine = converger.engine  # type: ignore[assignment]
+
+    with pytest.raises(EngineError, match="volume contract changed"):
+        converger.run_converged(
+            stale_snapshot,
+            ["true"],
+            stack_name=None,
+            workspace=workspace_of(converger.manifest),
+        )
+
+    assert engine.ran("container", "inspect") == []
+    assert engine.ran("create") == []
+
+
+def test_active_execution_lease_prevents_generation_replacement(
+    project: Path, registry: Registry
+) -> None:
+    engine = FakeEngine()
+    converger = Converger(load(project), registry, engine)  # type: ignore[arg-type]
+    first, code, _output = converger.run(["true"])
+    assert code == 0
+    resource = next(row for row in registry.list_resources() if row.kind == "container")
+    lease = registry.acquire_lease(resource.id, pid=os.getpid(), proc_start=registry.clock.now())
+    try:
+        (project / "Dockerfile").write_text("FROM alpine\nRUN echo changed\n", encoding="utf-8")
+        rolled_converger = Converger(load(project), registry, engine)  # type: ignore[arg-type]
+        rolled = rolled_converger.converge()
+        assert rolled.digest != first.digest
+
+        with pytest.raises(EngineError, match="active execution lease"):
+            rolled_converger.run_converged(
+                rolled,
+                ["true"],
+                stack_name=None,
+                workspace=workspace_of(rolled_converger.manifest),
+            )
+    finally:
+        registry.release_lease(lease.id)
+
+    assert engine.ran("container", "rm", "--force") == []
 
 
 def test_shell_uses_an_interactive_tty_exec(converger: Converger) -> None:
     converged = converger.converge()
-    assert converger.shell_converged(converged, stack_name=None, workspace="/workspace") == 7
+    assert (
+        converger.shell_converged(
+            converged,
+            stack_name=None,
+            workspace=workspace_of(converger.manifest),
+        )
+        == 7
+    )
     engine: FakeEngine = converger.engine  # type: ignore[assignment]
     assert engine.ran("exec")[-1][1] == "-it"
+    name = converger.container_name(workspace_of(converger.manifest), converged.stack)
+    assert engine.ran("exec")[-1][2] == engine.container_specs[name]["Id"]
+
+
+@pytest.mark.parametrize(
+    ("actual", "expected", "matches"),
+    [
+        (r"C:\Users\Alice\state\heartbeat", r"C:\Users\Alice\state\heartbeat", True),
+        (
+            "/run/desktop/mnt/host/c/Users/Alice/state/heartbeat",
+            r"C:\Users\Alice\state\heartbeat",
+            True,
+        ),
+        (
+            "/host_mnt/c/Users/Alice/state/heartbeat",
+            r"C:\Users\Alice\state\heartbeat",
+            True,
+        ),
+        (
+            "/run/desktop/mnt/host/d/Users/Alice/state/heartbeat",
+            r"C:\Users\Alice\state\heartbeat",
+            False,
+        ),
+        ("/different/path", r"C:\Users\Alice\state\heartbeat", False),
+    ],
+)
+def test_docker_desktop_bind_source_equivalence(actual: str, expected: str, matches: bool) -> None:
+    assert Converger._bind_sources_match(actual, expected) is matches
 
 
 def test_persistent_container_has_daemon_loss_and_run_duration_watchdogs(

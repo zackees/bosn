@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from bosn import labels
 from bosn.engine import Engine, EngineError
 from bosn.manifest import Manifest, StackSpec, dockerfile_external_images, generation_digest
-from bosn.registry import Registry
+from bosn.registry import Lease, Registry, Resource
 
 # What converge did, in the order of increasing work.
 REUSED = "reused"
@@ -443,27 +443,58 @@ class Converger:
     def ensure_container(
         self, converged: ConvergeResult, *, stack_name: str | None, workspace: str
     ) -> str:
-        """Create/start the persistent execution container, or reuse its existing one."""
+        """Validate and create, replace, or reuse the persistent execution container."""
+        with self.registry.lifecycle_guard():
+            name, _container_id, _resource, _created = self._ensure_container_locked(
+                converged, stack_name=stack_name, workspace=workspace
+            )
+        return name
+
+    def _ensure_container_locked(
+        self, converged: ConvergeResult, *, stack_name: str | None, workspace: str
+    ) -> tuple[str, str, Resource, bool]:
         stack = self.manifest.stack(stack_name)
+        self._validate_converged_contract(stack, converged, workspace)
         name = self.container_name(workspace, stack.name)
-        inspected = self.engine.run(["container", "inspect", name])
-        if not inspected.ok:
-            labels = self._resource_labels(stack, "container", converged.digest, "stack", workspace)
+        expected_mounts = self._expected_container_mounts(stack, converged.volumes)
+        expected_image = self._expected_image_id(converged.image_tag)
+        existing = self._inspect_container(name)
+        container_id = self._container_id(name, existing) if existing is not None else ""
+        created_container_id: str | None = None
+        if existing is not None:
+            stale = self._container_stale_reasons(
+                name,
+                existing,
+                stack=stack,
+                workspace=workspace,
+                digest=converged.digest,
+                image_id=expected_image,
+                mounts=expected_mounts,
+            )
+            if stale:
+                self._refuse_if_container_leased(name)
+                # Mutate the exact object whose ownership was proved. A name could be
+                # externally reused between inspect and remove; deleting by name would
+                # then destroy a foreign replacement we never validated.
+                removed = self.engine.run(["container", "rm", "--force", container_id])
+                if not removed.ok and self._inspect_container(name) is not None:
+                    raise EngineError(
+                        f"replacing persistent container {name} failed: "
+                        f"{removed.stderr or removed.stdout}"
+                    )
+                self.registry.log_event("container.replaced", f"{name}: {', '.join(stale)}")
+                existing = None
+                container_id = ""
+
+        if existing is None:
+            resource_labels = self._resource_labels(
+                stack, "container", converged.digest, "stack", workspace
+            )
             # Docker removes an orphan automatically once PID 1's watchdog exits.
-            args = ["create", "--rm", "--name", name, *labels.to_docker_args()]
-            for volume in stack.volumes:
-                volume_name = volume_name_for(
-                    stack,
-                    volume.scope,
-                    volume.name,
-                    digest=converged.digest,
-                    workspace=workspace,
-                    family=stack.family,
-                )
-                args += ["--volume", f"{volume_name}:/bosn/{volume.name}"]
-            heartbeat = self.registry.path.parent / "daemon.heartbeat"
-            heartbeat.touch(exist_ok=True)
-            args += ["--volume", f"{heartbeat.resolve()}:/bosn-daemon/heartbeat:ro"]
+            args = ["create", "--rm", "--name", name, *resource_labels.to_docker_args()]
+            for mount in expected_mounts.values():
+                suffix = ":ro" if not mount["rw"] else ""
+                args += ["--volume", f"{mount['source']}:{mount['destination']}{suffix}"]
             # PID 1 exits when the daemon heartbeat goes stale or a run is orphaned for
             # too long.  `--rm` above then removes the stopped container automatically.
             watchdog = (
@@ -477,11 +508,311 @@ class Converger:
             created = self.engine.run(args)
             if not created.ok:
                 raise EngineError(f"creating persistent container {name} failed: {created.stderr}")
-            self._register(stack, "container", name, converged.digest, "stack", workspace)
-        started = self.engine.run(["start", name])
-        if not started.ok and "already started" not in (started.stderr or started.stdout).lower():
-            raise EngineError(f"starting persistent container {name} failed: {started.stderr}")
-        return name
+            created_container_id = created.stdout.strip()
+            if not created_container_id:
+                raise EngineError(
+                    f"creating persistent container {name} succeeded without returning its "
+                    "immutable object id; refusing to continue"
+                )
+            try:
+                existing = self._inspect_container(name)
+                if existing is None:
+                    raise EngineError(
+                        f"created persistent container {name} disappeared before validation"
+                    )
+                container_id = self._container_id(name, existing)
+                if container_id != created_container_id:
+                    raise EngineError(
+                        f"persistent container name collision: {name} was replaced between "
+                        "creation and validation; refusing to touch the replacement"
+                    )
+                stale = self._container_stale_reasons(
+                    name,
+                    existing,
+                    stack=stack,
+                    workspace=workspace,
+                    digest=converged.digest,
+                    image_id=expected_image,
+                    mounts=expected_mounts,
+                )
+                if stale:
+                    raise EngineError(
+                        f"created persistent container {name} does not match its specification: "
+                        f"{', '.join(stale)}"
+                    )
+            except KeyboardInterrupt:
+                self._cleanup_created_container(name, created_container_id)
+                raise
+            except Exception as exc:
+                cleanup_error = self._cleanup_created_container(name, created_container_id)
+                if cleanup_error:
+                    raise EngineError(f"{exc}; {cleanup_error}") from exc
+                raise
+        try:
+            started = self.engine.run(["start", container_id])
+            if (
+                not started.ok
+                and "already started" not in (started.stderr or started.stdout).lower()
+            ):
+                raise EngineError(f"starting persistent container {name} failed: {started.stderr}")
+            resource = self.registry.reconcile_resource(
+                kind="container",
+                name=name,
+                stack=stack.name,
+                generation=converged.digest,
+                scope="stack",
+                workspace=workspace,
+            )
+        except KeyboardInterrupt:
+            if created_container_id is not None:
+                self._cleanup_created_container(name, created_container_id)
+            raise
+        except Exception as exc:
+            if created_container_id is not None:
+                cleanup_error = self._cleanup_created_container(name, created_container_id)
+                if cleanup_error:
+                    raise EngineError(f"{exc}; {cleanup_error}") from exc
+            raise
+        return name, container_id, resource, created_container_id is not None
+
+    def _cleanup_created_container(self, name: str, container_id: str) -> str | None:
+        """Remove only the object this call created after validation/start fails."""
+        try:
+            removed = self.engine.run(["container", "rm", "--force", container_id])
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001 - report cleanup without masking root failure
+            return f"cleanup of newly created container {name} failed: {exc}"
+        if removed.ok:
+            return None
+        return (
+            f"cleanup of newly created container {name} failed: {removed.stderr or removed.stdout}"
+        )
+
+    def _expected_image_id(self, image: str) -> str:
+        inspected = self.engine.run(["image", "inspect", "--format", "{{.Id}}", image])
+        identity = inspected.stdout.strip()
+        if not inspected.ok or not identity:
+            raise EngineError(
+                f"cannot validate execution image {image!r}: {inspected.stderr or inspected.stdout}"
+            )
+        return identity
+
+    def _expected_container_mounts(
+        self, stack: StackSpec, volume_names: tuple[str, ...]
+    ) -> dict[str, dict[str, str | bool]]:
+        mounts: dict[str, dict[str, str | bool]] = {}
+        for volume, volume_name in zip(stack.volumes, volume_names, strict=True):
+            destination = f"/bosn/{volume.name}"
+            mounts[destination] = {
+                "type": "volume",
+                "source": volume_name,
+                "destination": destination,
+                "rw": True,
+            }
+        heartbeat = (self.registry.path.parent / "daemon.heartbeat").resolve()
+        heartbeat.touch(exist_ok=True)
+        mounts["/bosn-daemon/heartbeat"] = {
+            "type": "bind",
+            "source": str(heartbeat),
+            "destination": "/bosn-daemon/heartbeat",
+            "rw": False,
+        }
+        return mounts
+
+    @staticmethod
+    def _validate_converged_contract(
+        stack: StackSpec, converged: ConvergeResult, workspace: str
+    ) -> None:
+        if converged.stack != stack.name:
+            raise EngineError(
+                f"daemon converged stack {converged.stack!r}, but the client selected "
+                f"{stack.name!r}; reload the manifest and retry"
+            )
+        expected_volumes = tuple(
+            volume_name_for(
+                stack,
+                volume.scope,
+                volume.name,
+                digest=converged.digest,
+                workspace=workspace,
+                family=stack.family,
+            )
+            for volume in stack.volumes
+        )
+        if expected_volumes != converged.volumes:
+            raise EngineError(
+                "the manifest's volume contract changed while the daemon converged it; "
+                "reload the manifest and retry"
+            )
+
+    def _inspect_container(self, name: str) -> dict[str, object] | None:
+        inspected = self.engine.run(["container", "inspect", "--format", "{{json .}}", name])
+        if not inspected.ok:
+            detail = (inspected.stderr or inspected.stdout).lower()
+            if not detail or "no such" in detail or "not found" in detail:
+                return None
+            raise EngineError(f"inspecting persistent container {name} failed: {detail}")
+        try:
+            parsed = json.loads(inspected.stdout)
+        except json.JSONDecodeError as exc:
+            raise EngineError(
+                f"persistent container {name} returned invalid inspect data; refusing to touch it"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise EngineError(
+                f"persistent container {name} returned unexpected inspect data; "
+                "refusing to touch it"
+            )
+        return parsed
+
+    @staticmethod
+    def _container_id(name: str, inspected: dict[str, object]) -> str:
+        container_id = str(inspected.get("Id") or "")
+        if not container_id:
+            raise EngineError(
+                f"persistent container {name} inspect data has no object id; refusing to touch it"
+            )
+        return container_id
+
+    def _container_stale_reasons(
+        self,
+        name: str,
+        inspected: dict[str, object],
+        *,
+        stack: StackSpec,
+        workspace: str,
+        digest: str,
+        image_id: str,
+        mounts: dict[str, dict[str, str | bool]],
+    ) -> list[str]:
+        config = inspected.get("Config")
+        raw_labels = config.get("Labels") if isinstance(config, dict) else None
+        engine_labels = (
+            {str(key): str(value) for key, value in raw_labels.items() if value is not None}
+            if isinstance(raw_labels, dict)
+            else {}
+        )
+        if not labels.is_owned_by(engine_labels, self.registry.registry_id):
+            kind = "foreign" if labels.is_complete(engine_labels) else "incompletely labeled"
+            raise EngineError(
+                f"persistent container name collision: {name} is {kind}; "
+                "refusing to start, remove, or replace it"
+            )
+        try:
+            parsed = labels.ResourceLabels.from_dict(engine_labels)
+        except labels.LabelError as exc:
+            raise EngineError(
+                f"persistent container name collision: {name} has invalid labels; "
+                "refusing to touch it"
+            ) from exc
+        if (
+            parsed.kind != "container"
+            or parsed.scope != "stack"
+            or parsed.stack != stack.name
+            or parsed.workspace != workspace
+        ):
+            raise EngineError(
+                f"persistent container name collision: {name} belongs to another bosn resource; "
+                "refusing to start, remove, or replace it"
+            )
+
+        stale: list[str] = []
+        if parsed.generation != digest:
+            stale.append("generation changed")
+        if str(inspected.get("Image") or "") != image_id:
+            stale.append("image changed")
+        if not self._container_mounts_match(inspected.get("Mounts"), mounts):
+            stale.append("mounts changed")
+        return stale
+
+    @staticmethod
+    def _container_mounts_match(
+        raw_mounts: object, expected: dict[str, dict[str, str | bool]]
+    ) -> bool:
+        if not isinstance(raw_mounts, list):
+            return False
+        actual = {
+            str(mount.get("Destination") or ""): mount
+            for mount in raw_mounts
+            if isinstance(mount, dict) and mount.get("Destination")
+        }
+        managed_destinations = {
+            destination
+            for destination in actual
+            if destination.startswith("/bosn/") or destination == "/bosn-daemon/heartbeat"
+        }
+        if managed_destinations != set(expected):
+            return False
+        for destination, wanted in expected.items():
+            found = actual.get(destination)
+            if found is None or str(found.get("Type") or "") != wanted["type"]:
+                return False
+            if bool(found.get("RW")) != wanted["rw"]:
+                return False
+            if wanted["type"] == "volume":
+                if str(found.get("Name") or "") != wanted["source"]:
+                    return False
+            elif not Converger._bind_sources_match(
+                str(found.get("Source") or ""), str(wanted["source"])
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def _bind_sources_match(actual: str, expected: str) -> bool:
+        if os.path.normcase(os.path.normpath(actual)) == os.path.normcase(
+            os.path.normpath(expected)
+        ):
+            return True
+        normalized = expected.replace("\\", "/")
+        drive = re.match(r"^([A-Za-z]):/(.*)$", normalized)
+        if drive is None:
+            return False
+        letter, tail = drive.groups()
+        translated = actual.replace("\\", "/").rstrip("/").casefold()
+        candidates = {
+            f"/run/desktop/mnt/host/{letter}/{tail}",
+            f"/host_mnt/{letter}/{tail}",
+        }
+        return translated in {candidate.rstrip("/").casefold() for candidate in candidates}
+
+    def _refuse_if_container_leased(self, name: str) -> None:
+        from bosn.resources import resource_is_leased
+
+        rows = [
+            resource
+            for resource in self.registry.list_resources()
+            if resource.kind == "container" and resource.name == name
+        ]
+        if any(resource_is_leased(self.registry, resource.id) for resource in rows):
+            raise EngineError(
+                f"persistent container {name} is from an old generation but has an active "
+                "execution lease; retry after that command exits"
+            )
+
+    def _acquire_execution_container(
+        self, converged: ConvergeResult, *, stack_name: str | None, workspace: str
+    ) -> tuple[str, Lease]:
+        with self.registry.lifecycle_guard():
+            name, container_id, resource, created = self._ensure_container_locked(
+                converged, stack_name=stack_name, workspace=workspace
+            )
+            try:
+                lease = self.registry.acquire_lease(
+                    resource.id, pid=os.getpid(), proc_start=self.registry.clock.now()
+                )
+            except KeyboardInterrupt:
+                if created:
+                    self._cleanup_created_container(name, container_id)
+                raise
+            except Exception as exc:
+                if created:
+                    cleanup_error = self._cleanup_created_container(name, container_id)
+                    if cleanup_error:
+                        raise EngineError(f"{exc}; {cleanup_error}") from exc
+                raise
+        return container_id, lease
 
     def run(
         self,
@@ -511,14 +842,10 @@ class Converger:
         caller's terminal and exit status.
         """
         workspace = workspace or workspace_of(self.manifest)
-        name = self.ensure_container(converged, stack_name=stack_name, workspace=workspace)
+        name, lease = self._acquire_execution_container(
+            converged, stack_name=stack_name, workspace=workspace
+        )
         args = ["exec", name, *command]
-        resource = next(
-            r for r in self.registry.list_resources() if r.kind == "container" and r.name == name
-        )
-        lease = self.registry.acquire_lease(
-            resource.id, pid=os.getpid(), proc_start=self.registry.clock.now()
-        )
         try:
             result = self.engine.run(args)
         finally:
@@ -530,12 +857,8 @@ class Converger:
         self, converged: ConvergeResult, *, stack_name: str | None, workspace: str
     ) -> int:
         """Attach a real interactive shell to the persistent container."""
-        name = self.ensure_container(converged, stack_name=stack_name, workspace=workspace)
-        resource = next(
-            r for r in self.registry.list_resources() if r.kind == "container" and r.name == name
-        )
-        lease = self.registry.acquire_lease(
-            resource.id, pid=os.getpid(), proc_start=self.registry.clock.now()
+        name, lease = self._acquire_execution_container(
+            converged, stack_name=stack_name, workspace=workspace
         )
         try:
             return self.engine.interactive(["exec", "-it", name, "sh"])
