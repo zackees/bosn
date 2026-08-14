@@ -25,6 +25,7 @@ from bosn.converge import (
 from bosn.engine import EngineError, EngineResult
 from bosn.manifest import load
 from bosn.registry import Registry
+from conftest import live_proc_start
 
 SAMPLE = """
 [stack.test]
@@ -1134,7 +1135,7 @@ def test_active_execution_lease_prevents_generation_replacement(
     first, code, _output = converger.run(["true"])
     assert code == 0
     resource = next(row for row in registry.list_resources() if row.kind == "container")
-    lease = registry.acquire_lease(resource.id, pid=os.getpid(), proc_start=registry.clock.now())
+    lease = registry.acquire_lease(resource.id, pid=os.getpid(), proc_start=live_proc_start())
     try:
         (project / "Dockerfile").write_text("FROM alpine\nRUN echo changed\n", encoding="utf-8")
         rolled_converger = Converger(load(project), registry, engine)  # type: ignore[arg-type]

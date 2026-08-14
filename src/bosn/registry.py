@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS leases (
     id            TEXT PRIMARY KEY,
     resource_id   TEXT NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
     pid           INTEGER NOT NULL,
-    proc_start    REAL NOT NULL,
+    proc_start    REAL,
     acquired_at   REAL NOT NULL,
     heartbeat_at  REAL NOT NULL,
     ttl_seconds   REAL NOT NULL
@@ -124,7 +124,7 @@ class Lease:
     id: str
     resource_id: str
     pid: int
-    proc_start: float
+    proc_start: float | None
     acquired_at: float
     heartbeat_at: float
     ttl_seconds: float
@@ -289,6 +289,51 @@ class Registry:
             "(resource_id, workspace, stack, generation, last_used, state) "
             "SELECT id, workspace, stack, generation, last_used, state FROM resources"
         )
+        self._relax_lease_proc_start_nullability()
+
+    def _relax_lease_proc_start_nullability(self) -> None:
+        """Allow ``proc_start`` to be NULL for PID-only leases.
+
+        Databases created before this change have ``leases.proc_start REAL NOT NULL``.
+        A wall-clock fallback there is dangerous: if the identity probe fails at acquire
+        time but succeeds later during a liveness check, the stored value would not match
+        the process's real start time and a live holder's lease could look expired. SQLite
+        has no ``ALTER COLUMN``, so relaxing the constraint means rebuilding the table.
+        """
+        columns = self.conn.execute("PRAGMA table_info(leases)").fetchall()
+        proc_start_column = next((c for c in columns if c["name"] == "proc_start"), None)
+        if proc_start_column is None or not proc_start_column["notnull"]:
+            return
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute(
+                "CREATE TABLE leases_nullable ("
+                "id TEXT PRIMARY KEY, "
+                "resource_id TEXT NOT NULL REFERENCES resources(id) ON DELETE CASCADE, "
+                "pid INTEGER NOT NULL, "
+                "proc_start REAL, "
+                "acquired_at REAL NOT NULL, "
+                "heartbeat_at REAL NOT NULL, "
+                "ttl_seconds REAL NOT NULL)"
+            )
+            self.conn.execute(
+                "INSERT INTO leases_nullable"
+                "(id, resource_id, pid, proc_start, acquired_at, heartbeat_at, ttl_seconds) "
+                "SELECT id, resource_id, pid, proc_start, acquired_at, heartbeat_at, "
+                "ttl_seconds FROM leases"
+            )
+            self.conn.execute("DROP TABLE leases")
+            self.conn.execute("ALTER TABLE leases_nullable RENAME TO leases")
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_leases_resource ON leases(resource_id)"
+            )
+            self.conn.execute("COMMIT")
+        except KeyboardInterrupt:
+            self.conn.execute("ROLLBACK")
+            raise
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
 
     def _deduplicate_resources(self) -> None:
         duplicates = self.conn.execute(
@@ -644,7 +689,7 @@ class Registry:
         resource_id: str,
         *,
         pid: int,
-        proc_start: float,
+        proc_start: float | None,
         ttl_seconds: float = 900.0,
     ) -> Lease:
         now = self.clock.now()
@@ -673,12 +718,26 @@ class Registry:
         rows = self._exec("SELECT * FROM leases WHERE resource_id = ?", (resource_id,)).fetchall()
         return [_lease_from_row(row) for row in rows]
 
+    def all_leases(self) -> list[Lease]:
+        rows = self._exec("SELECT * FROM leases").fetchall()
+        return [_lease_from_row(row) for row in rows]
+
     def heartbeat(self, lease_id: str) -> None:
         self._exec("UPDATE leases SET heartbeat_at = ? WHERE id = ?", (self.clock.now(), lease_id))
 
     def release_lease(self, lease_id: str) -> None:
         self._exec("DELETE FROM leases WHERE id = ?", (lease_id,))
         self.log_event("lease.released", lease_id)
+
+    def prune_lease(self, lease_id: str) -> None:
+        """Delete a confirmed-dead lease found during maintenance.
+
+        A distinct event from ``lease.released`` -- that one is a holder's own graceful
+        release, this one is the daemon reclaiming a lease whose holder is gone. Deleting a
+        row that is already gone is a silent no-op, which is what keeps pruning idempotent.
+        """
+        self._exec("DELETE FROM leases WHERE id = ?", (lease_id,))
+        self.log_event("lease.pruned", lease_id)
 
     # -- generations -------------------------------------------------------
 

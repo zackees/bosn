@@ -19,6 +19,7 @@ from bosn.engine import EngineResult
 from bosn.gc import Collector, done_workspaces, mark_done, status
 from bosn.registry import Registry
 from bosn.retention import DAY
+from conftest import live_proc_start
 
 OURS = "our-registry"
 
@@ -285,7 +286,7 @@ def test_live_lease_prevents_idle_stop_even_in_apply_mode(
     registry: Registry, clock: FakeClock
 ) -> None:
     resource = add(registry, "active", kind="container")
-    registry.acquire_lease(resource.id, pid=os.getpid(), proc_start=clock.now())
+    registry.acquire_lease(resource.id, pid=os.getpid(), proc_start=live_proc_start())
     engine = FakeEngine({"active": label_dict(registry=registry.registry_id, kind="container")})
     clock.advance(2 * 3600)
 
@@ -340,7 +341,7 @@ def test_lease_acquired_after_planning_is_seen_before_idle_stop(
 
     def plan_then_lease(*args, **kwargs):
         verdicts = original_plan(*args, **kwargs)
-        registry.acquire_lease(resource.id, pid=os.getpid(), proc_start=clock.now())
+        registry.acquire_lease(resource.id, pid=os.getpid(), proc_start=live_proc_start())
         return verdicts
 
     monkeypatch.setattr(gc_mod, "plan", plan_then_lease)
@@ -362,7 +363,7 @@ def test_dependency_lease_acquired_after_planning_is_seen_before_removal(
 
     def plan_then_lease(*args, **kwargs):
         verdicts = original_plan(*args, **kwargs)
-        registry.acquire_lease(resource.id, pid=os.getpid(), proc_start=clock.now())
+        registry.acquire_lease(resource.id, pid=os.getpid(), proc_start=live_proc_start())
         return verdicts
 
     monkeypatch.setattr(gc_mod, "plan", plan_then_lease)
@@ -414,7 +415,7 @@ def test_idle_stop_serializes_concurrent_lease_acquisition(
 
     def acquire() -> None:
         attempting.set()
-        other.acquire_lease(resource.id, pid=os.getpid(), proc_start=clock.now())
+        other.acquire_lease(resource.id, pid=os.getpid(), proc_start=live_proc_start())
         engine.lease_acquired.set()
 
     thread = threading.Thread(target=acquire)

@@ -419,6 +419,7 @@ class Daemon:
         """Execute a maintenance pass, recording every outcome and scheduling its retry."""
         from bosn.engine import Engine
         from bosn.gc import Collector
+        from bosn.resources import prune_dead_leases
 
         self.registry.log_event("maintenance.reap.started")
         try:
@@ -432,6 +433,17 @@ class Daemon:
             self.registry.log_event("maintenance.reap.error", f"{type(exc).__name__}: {exc}")
             self._set_next_maintenance(self.clock.now() + self.maintenance_interval_seconds)
             return
+
+        self.registry.log_event("maintenance.prune_leases.started")
+        try:
+            pruned = prune_dead_leases(self.registry)
+            self.registry.log_event("maintenance.prune_leases.finished", f"pruned={len(pruned)}")
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a pruning failure must be visible, not silent
+            self.registry.log_event(
+                "maintenance.prune_leases.error", f"{type(exc).__name__}: {exc}"
+            )
 
         engine = Engine(self.engine_binary)
         info = engine.info()

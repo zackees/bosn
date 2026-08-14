@@ -13,6 +13,7 @@ Automatic deletion requires complete ownership proof, which is why there is no `
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import subprocess
@@ -173,13 +174,63 @@ class ResourceScanner:
 PROCESS_START_TOLERANCE_SECONDS = 2.0
 
 
+def _parse_windows_process_start(ticks_text: str) -> float | None:
+    """Parse .NET ``DateTime.Ticks`` (100ns units since 0001-01-01) into an epoch float."""
+    try:
+        return (int(ticks_text.strip()) / 10_000_000) - 62_135_596_800
+    except ValueError:
+        return None
+
+
+def _parse_linux_process_start(
+    stat_text: str, proc_stat_text: str, clock_ticks_per_sec: float
+) -> float | None:
+    """Parse ``/proc/<pid>/stat`` field 22 (starttime, in clock ticks since boot).
+
+    ``stat_text`` is the raw content of ``/proc/<pid>/stat``; the comm field can itself
+    contain spaces or parens, so the split happens after the last ``)``. ``proc_stat_text``
+    is the raw content of ``/proc/stat``, which supplies the boot time (``btime``, seconds
+    since epoch) that the tick count is relative to.
+    """
+    try:
+        fields = stat_text.rsplit(")", 1)[1].split()
+        ticks = int(fields[19])
+        boot = next(
+            int(line.split()[1])
+            for line in proc_stat_text.splitlines()
+            if line.startswith("btime ")
+        )
+        return boot + (ticks / clock_ticks_per_sec)
+    except (IndexError, ValueError, StopIteration):
+        return None
+
+
+def _parse_darwin_process_start(lstart_text: str) -> float | None:
+    """Parse ``ps -o lstart=`` output, e.g. ``Thu Aug 13 09:41:02 2026``."""
+    try:
+        return dt.datetime.strptime(lstart_text.strip(), "%a %b %d %H:%M:%S %Y").timestamp()
+    except ValueError:
+        return None
+
+
 def process_start_time(pid: int) -> float | None:
-    """Return an epoch creation time from an OS-owned process identity source."""
+    """Return an epoch creation time from an OS-owned process identity source.
+
+    This is a thin per-OS dispatch: it gathers the raw platform data (a subprocess call on
+    Windows/macOS, `/proc` reads on Linux) and hands it to a pure parsing helper so the
+    parsing logic itself can be unit-tested on any OS with captured sample input.
+    """
     if pid <= 0:
         return None
     if os.name == "nt":
         # WMIC is removed on current Windows; PowerShell's CIM provider is available on
         # every supported v1 host and returns the creation time without name guessing.
+        # Note: this spawns a PowerShell process (~1s) per call. process_alive() only
+        # invokes it once a lease's TTL has already elapsed, so it is not on the hot path
+        # of a normal heartbeat -- but a maintenance sweep iterating many expired leases
+        # pays this cost per lease. A cache is deliberately not added here: keying on pid
+        # alone is unsafe across PID reuse in a long-lived daemon, and there is no cheap
+        # cache key (pid, start) available before the very probe the cache would replace.
         result = subprocess.run(
             [
                 "powershell",
@@ -191,32 +242,20 @@ def process_start_time(pid: int) -> float | None:
             text=True,
             check=False,
         )
-        try:
-            return (int(result.stdout.strip()) / 10_000_000) - 62_135_596_800
-        except ValueError:
-            return None
+        return _parse_windows_process_start(result.stdout)
     if sys.platform == "linux":
         try:
-            fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
-            ticks = int(fields[19])
-            boot = next(
-                int(line.split()[1])
-                for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines()
-                if line.startswith("btime ")
-            )
-            return boot + (ticks / os.sysconf("SC_CLK_TCK"))
-        except (OSError, ValueError, StopIteration):
+            stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            proc_stat_text = Path("/proc/stat").read_text(encoding="utf-8")
+            clock_ticks_per_sec = os.sysconf("SC_CLK_TCK")
+        except OSError:
             return None
+        return _parse_linux_process_start(stat_text, proc_stat_text, clock_ticks_per_sec)
     if sys.platform == "darwin":
         result = subprocess.run(
             ["ps", "-p", str(pid), "-o", "lstart="], capture_output=True, text=True, check=False
         )
-        try:
-            import datetime as dt
-
-            return dt.datetime.strptime(result.stdout.strip(), "%a %b %d %H:%M:%S %Y").timestamp()
-        except ValueError:
-            return None
+        return _parse_darwin_process_start(result.stdout)
     return None
 
 
@@ -263,6 +302,23 @@ def resource_is_leased(registry: Registry, resource_id: str, *, alive_probe=proc
         not lease_is_expired(lease, now, alive_probe=alive_probe)
         for lease in registry.leases_for(resource_id)
     )
+
+
+def prune_dead_leases(registry: Registry, *, alive_probe=process_alive) -> list[str]:
+    """Delete every lease that is both expired by time and confirmed dead.
+
+    Reuses ``lease_is_expired`` so pruning applies exactly the same liveness proof as the
+    rest of the lease lifecycle -- a lease is never deleted on TTL alone. Idempotent: a
+    pruned lease's row is gone, so a second pass finds nothing left to prune and returns an
+    empty list without error.
+    """
+    now = registry.clock.now()
+    pruned: list[str] = []
+    for lease in registry.all_leases():
+        if lease_is_expired(lease, now, alive_probe=alive_probe):
+            registry.prune_lease(lease.id)
+            pruned.append(lease.id)
+    return pruned
 
 
 # -- adoption --------------------------------------------------------------

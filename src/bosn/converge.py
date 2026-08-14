@@ -886,7 +886,10 @@ class Converger:
                     self.registry.acquire_lease(
                         dependency.id,
                         pid=os.getpid(),
-                        proc_start=process_start_time(os.getpid()) or self.registry.clock.now(),
+                        # None falls through to the PID-only liveness check rather than a
+                        # wall-clock guess that could later mismatch the real process start
+                        # and make a live holder's lease look expired (see process_alive).
+                        proc_start=process_start_time(os.getpid()),
                     )
                     for dependency in dependencies
                 )
