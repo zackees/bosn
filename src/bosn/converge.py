@@ -21,6 +21,7 @@ from bosn import labels
 from bosn.engine import Engine, EngineError
 from bosn.manifest import Manifest, StackSpec, dockerfile_external_images, generation_digest
 from bosn.registry import Lease, Registry, Resource
+from bosn.resources import ResourceScanner
 
 # What converge did, in the order of increasing work.
 REUSED = "reused"
@@ -85,7 +86,8 @@ def volume_name_for(
 ) -> str:
     """Volume identity follows its scope.
 
-    - `spec`    keyed by the generation digest, so a spec edit gets a fresh volume
+    - `spec`    keyed by workspace + generation digest, so a spec edit gets a fresh
+                  volume without another worktree sharing it accidentally
     - `stack`   keyed by workspace + stack, surviving spec edits in this workspace
     - `machine` keyed by family only -- one per machine, shared across every repo and
                 worktree. This is what kills the incident's dominant multiplier.
@@ -96,7 +98,7 @@ def volume_name_for(
         return f"bosn-m-{family or stack.name}-{volume_name}"
     if volume_scope == "stack":
         return f"bosn-s-{stack.name}-{workspace_key}-{volume_name}"
-    return f"bosn-g-{stack.name}-{short_digest}-{volume_name}"
+    return f"bosn-g-{stack.name}-{workspace_key}-{short_digest}-{volume_name}"
 
 
 def _stable_key(value: str) -> str:
@@ -287,8 +289,12 @@ class Converger:
         digest, resolved_image = self._resolved_generation(stack)
         workspace = workspace or workspace_of(self.manifest)
 
-        known = self.registry.generation_superseded_at(digest)
-        is_new_generation = known is None and not self._generation_recorded(digest)
+        known = self.registry.generation_superseded_at(
+            digest, stack=stack.name, workspace=workspace
+        )
+        is_new_generation = known is None and not self._generation_recorded(
+            digest, stack=stack.name, workspace=workspace
+        )
 
         # Build first, register second. The ordering is load-bearing, not stylistic: a
         # build can now be cancelled (by `bosn cancel`, daemon shutdown, or the job TTL),
@@ -312,9 +318,11 @@ class Converger:
         # on retention's 24-hour clock is worse than either outcome on its own.
         self._abort_if_cancelled()
 
-        self.registry.record_generation(digest, stack.name)
+        self.registry.record_generation(digest, stack.name, workspace)
         volumes = self._ensure_volumes(stack, digest, workspace)
-        superseded = self.registry.supersede_generations(stack.name, keep_digest=digest)
+        superseded = self.registry.supersede_generations(
+            stack.name, keep_digest=digest, workspace=workspace
+        )
 
         if superseded:
             action = ROLLED
@@ -346,11 +354,11 @@ class Converger:
         if self.cancelled is not None and self.cancelled.is_set():
             raise EngineError("converge was cancelled")
 
-    def _generation_recorded(self, digest: str) -> bool:
+    def _generation_recorded(self, digest: str, *, stack: str, workspace: str) -> bool:
         # Through the registry's own accessor, not `registry.conn` directly: that accessor
         # holds the lock keeping this one sqlite connection single-writer, and converge now
         # runs on up to `max_builds` daemon threads at once rather than alone in the CLI.
-        return self.registry.generation_recorded(digest)
+        return self.registry.generation_recorded(digest, stack, workspace)
 
     def _resource_labels(
         self, stack: StackSpec, kind: str, digest: str, scope: str, workspace: str
@@ -369,6 +377,16 @@ class Converger:
         if stack.image:
             return  # a pulled image is not ours to label or collect
         if self.engine.run(["image", "inspect", tag]).ok:
+            image_id = self._expected_image_id(tag)
+            self._reconcile_reused_resource(
+                stack,
+                kind="image",
+                engine_name=image_id,
+                inspect_name=tag,
+                digest=digest,
+                scope="spec",
+                workspace=workspace,
+            )
             return
 
         dockerfile = self.manifest.root / str(stack.dockerfile)
@@ -395,7 +413,14 @@ class Converger:
         # Registration happens only after the build exits 0, which is what makes a
         # cancelled or failed build safe: it can never leave a generation row implying a
         # usable image exists. Do not hoist this above the build.
-        self._register(stack, "image", tag, digest, "spec", workspace)
+        self._register(
+            stack,
+            "image",
+            self._expected_image_id(tag),
+            digest,
+            "spec",
+            workspace,
+        )
 
     def _ensure_volumes(self, stack: StackSpec, digest: str, workspace: str) -> list[str]:
         created: list[str] = []
@@ -410,6 +435,15 @@ class Converger:
             )
             created.append(name)
             if self.engine.run(["volume", "inspect", name]).ok:
+                self._reconcile_reused_resource(
+                    stack,
+                    kind="volume",
+                    engine_name=name,
+                    inspect_name=name,
+                    digest=digest,
+                    scope=volume.scope,
+                    workspace=workspace,
+                )
                 continue
             label_args = self._resource_labels(
                 stack, "volume", digest, volume.scope, workspace
@@ -419,6 +453,43 @@ class Converger:
                 raise EngineError(f"creating volume {name} failed: {result.stderr}")
             self._register(stack, "volume", name, digest, volume.scope, workspace)
         return created
+
+    def _reconcile_reused_resource(
+        self,
+        stack: StackSpec,
+        *,
+        kind: str,
+        engine_name: str,
+        inspect_name: str,
+        digest: str,
+        scope: str,
+        workspace: str,
+    ) -> None:
+        """Prove ownership before reviving a reused engine object in the registry."""
+        raw = ResourceScanner(self.engine).inspect_labels(kind, inspect_name)
+        if not labels.is_owned_by(raw, self.registry.registry_id):
+            ownership = "foreign" if labels.is_complete(raw) else "unlabeled or incomplete"
+            raise EngineError(
+                f"existing {kind} {inspect_name!r} is {ownership}; refusing to reuse it"
+            )
+        try:
+            parsed = labels.ResourceLabels.from_dict(raw)
+        except labels.LabelError as exc:
+            raise EngineError(
+                f"existing {kind} {inspect_name!r} has invalid ownership labels"
+            ) from exc
+        if parsed.kind != kind:
+            raise EngineError(f"existing {kind} {inspect_name!r} has a conflicting bosn kind label")
+        if kind == "image":
+            self.registry.canonicalize_image_identity(inspect_name, engine_name)
+        self.registry.reconcile_resource(
+            kind=kind,
+            name=engine_name,
+            stack=stack.name,
+            generation=digest,
+            scope=scope,
+            workspace=workspace,
+        )
 
     def _register(
         self, stack: StackSpec, kind: str, name: str, digest: str, scope: str, workspace: str
@@ -793,14 +864,30 @@ class Converger:
 
     def _acquire_execution_container(
         self, converged: ConvergeResult, *, stack_name: str | None, workspace: str
-    ) -> tuple[str, Lease]:
+    ) -> tuple[str, tuple[Lease, ...]]:
         with self.registry.lifecycle_guard():
             name, container_id, resource, created = self._ensure_container_locked(
                 converged, stack_name=stack_name, workspace=workspace
             )
             try:
-                lease = self.registry.acquire_lease(
-                    resource.id, pid=os.getpid(), proc_start=self.registry.clock.now()
+                dependencies = [resource]
+                image_id = self._expected_image_id(converged.image_tag)
+                for kind, dependency_name in [
+                    ("image", image_id),
+                    *(("volume", volume_name) for volume_name in converged.volumes),
+                ]:
+                    dependency = self.registry.get_resource_by_engine_identity(
+                        kind, dependency_name
+                    )
+                    if dependency is not None:
+                        dependencies.append(dependency)
+                leases = tuple(
+                    self.registry.acquire_lease(
+                        dependency.id,
+                        pid=os.getpid(),
+                        proc_start=self.registry.clock.now(),
+                    )
+                    for dependency in dependencies
                 )
             except KeyboardInterrupt:
                 if created:
@@ -812,7 +899,7 @@ class Converger:
                     if cleanup_error:
                         raise EngineError(f"{exc}; {cleanup_error}") from exc
                 raise
-        return container_id, lease
+        return container_id, leases
 
     def run(
         self,
@@ -842,14 +929,15 @@ class Converger:
         caller's terminal and exit status.
         """
         workspace = workspace or workspace_of(self.manifest)
-        name, lease = self._acquire_execution_container(
+        name, leases = self._acquire_execution_container(
             converged, stack_name=stack_name, workspace=workspace
         )
         args = ["exec", name, *command]
         try:
             result = self.engine.run(args)
         finally:
-            self.registry.release_lease(lease.id)
+            for lease in leases:
+                self.registry.release_lease(lease.id)
         self.registry.log_event("run", f"{converged.stack} rc={result.returncode}")
         return converged, result.returncode, result.stdout or result.stderr
 
@@ -857,13 +945,14 @@ class Converger:
         self, converged: ConvergeResult, *, stack_name: str | None, workspace: str
     ) -> int:
         """Attach a real interactive shell to the persistent container."""
-        name, lease = self._acquire_execution_container(
+        name, leases = self._acquire_execution_container(
             converged, stack_name=stack_name, workspace=workspace
         )
         try:
             return self.engine.interactive(["exec", "-it", name, "sh"])
         finally:
-            self.registry.release_lease(lease.id)
+            for lease in leases:
+                self.registry.release_lease(lease.id)
 
 
 def run_task(

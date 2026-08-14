@@ -48,6 +48,7 @@ class FakeEngine:
         self.image_ids: dict[str, str] = {"alpine": "sha256:alpine-v1"}
         self.image_platforms: dict[str, str] = {"alpine": "linux/amd64"}
         self.container_specs: dict[str, dict[str, object]] = {}
+        self.resource_labels: dict[tuple[str, str], dict[str, str]] = {}
         self.container_serial = 0
 
     def run(self, args: list[str], *, check: bool = False) -> EngineResult:
@@ -57,6 +58,12 @@ class FakeEngine:
         if args[:2] == ["container", "inspect"] and "{{json .}}" in args:
             spec = self.container_specs.get(args[-1])
             return EngineResult(0 if spec else 1, json.dumps(spec) if spec else "", "")
+        if args[:2] == ["volume", "inspect"] and "{{json .Labels}}" in args:
+            raw = self.resource_labels.get(("volume", args[-1]))
+            return EngineResult(0 if raw is not None else 1, json.dumps(raw or {}), "")
+        if args[:2] == ["image", "inspect"] and "{{json .Config.Labels}}" in args:
+            raw = self.resource_labels.get(("image", args[-1]))
+            return EngineResult(0 if raw is not None else 1, json.dumps(raw or {}), "")
         if args[:2] == ["image", "inspect"] and "{{.Id}}" in args:
             requested_platform = (
                 args[args.index("--platform") + 1] if "--platform" in args else None
@@ -80,6 +87,7 @@ class FakeEngine:
                 self.image_platforms.setdefault(args[-1], "linux/amd64")
         if args[:2] == ["volume", "create"]:
             self.existing.add(args[-1])
+            self.resource_labels[("volume", args[-1])] = self._labels_from_args(args)
         if args[:3] == ["container", "rm", "--force"]:
             target = args[-1]
             name = next(
@@ -134,7 +142,18 @@ class FakeEngine:
             self.existing.add(tag)
             self.image_ids[tag] = f"sha256:{hashlib.sha256(tag.encode()).hexdigest()}"
             self.image_platforms[tag] = "linux/amd64"
+            raw = self._labels_from_args(args)
+            self.resource_labels[("image", tag)] = raw
+            self.resource_labels[("image", self.image_ids[tag])] = raw
         return EngineResult(0, "ok", "")
+
+    @staticmethod
+    def _labels_from_args(args: list[str]) -> dict[str, str]:
+        return {
+            args[index + 1].split("=", 1)[0]: args[index + 1].split("=", 1)[1]
+            for index, value in enumerate(args[:-1])
+            if value == "--label"
+        }
 
     def stream(
         self,
@@ -326,12 +345,191 @@ def test_image_backed_stack_runs_the_resolved_declared_image(
 
 def test_the_old_generation_is_marked_superseded(project: Path, registry: Registry) -> None:
     engine = FakeEngine()
-    first = Converger(load(project), registry, engine).converge()  # type: ignore[arg-type]
+    manifest = load(project)
+    workspace = workspace_of(manifest)
+    first = Converger(manifest, registry, engine).converge()  # type: ignore[arg-type]
     (project / "Dockerfile").write_text("FROM debian\n", encoding="utf-8")
     second = Converger(load(project), registry, engine).converge()  # type: ignore[arg-type]
 
-    assert registry.generation_superseded_at(first.digest) is not None
-    assert registry.generation_superseded_at(second.digest) is None
+    assert (
+        registry.generation_superseded_at(first.digest, stack="test", workspace=workspace)
+        is not None
+    )
+    assert (
+        registry.generation_superseded_at(second.digest, stack="test", workspace=workspace) is None
+    )
+
+
+def test_shared_volumes_rebind_to_the_current_generation_and_refresh_liveness(
+    project: Path, tmp_path: Path
+) -> None:
+    from bosn.clock import FakeClock
+
+    clock = FakeClock()
+    engine = FakeEngine()
+    with Registry(tmp_path / "liveness.sqlite3", clock=clock) as registry:
+        first_converger = Converger(load(project), registry, engine)  # type: ignore[arg-type]
+        first = first_converger.converge()
+        shared = {
+            resource.scope: resource
+            for resource in registry.list_resources()
+            if resource.kind == "volume" and resource.scope in {"stack", "machine"}
+        }
+        clock.advance(3600)
+
+        (project / "Dockerfile").write_text("FROM alpine\nRUN echo changed\n", encoding="utf-8")
+        second = Converger(load(project), registry, engine).converge()  # type: ignore[arg-type]
+
+        assert second.digest != first.digest
+        for scope, previous in shared.items():
+            current = registry.get_resource_by_engine_identity("volume", previous.name)
+            assert current is not None
+            assert current.id == previous.id
+            assert current.scope == scope
+            assert current.generation == second.digest
+            assert current.last_used == clock.now()
+            assert (
+                registry.generation_superseded_at(
+                    current.generation,
+                    stack=current.stack,
+                    workspace=current.workspace,
+                )
+                is None
+            )
+
+
+def test_warm_converge_refreshes_each_reused_owned_dependency(
+    project: Path, tmp_path: Path
+) -> None:
+    from bosn.clock import FakeClock
+
+    clock = FakeClock()
+    engine = FakeEngine()
+    with Registry(tmp_path / "warm.sqlite3", clock=clock) as registry:
+        converger = Converger(load(project), registry, engine)  # type: ignore[arg-type]
+        first = converger.converge()
+        image_id = engine.image_ids[first.image_tag]
+        identities = [("image", image_id), *(("volume", name) for name in first.volumes)]
+        before = {
+            identity: registry.get_resource_by_engine_identity(*identity) for identity in identities
+        }
+        assert all(resource is not None for resource in before.values())
+        clock.advance(3600)
+
+        second = converger.converge()
+
+        assert second.action == REUSED
+        for identity, previous in before.items():
+            current = registry.get_resource_by_engine_identity(*identity)
+            assert previous is not None and current is not None
+            assert current.id == previous.id
+            assert current.last_used == clock.now()
+
+
+def test_adopted_image_id_is_refreshed_and_leased_by_a_warm_run(
+    project: Path, tmp_path: Path
+) -> None:
+    from bosn.clock import FakeClock
+    from bosn.retention import KEPT_LEASED, Pressure, evaluate
+
+    clock = FakeClock()
+    engine = FakeEngine()
+    with Registry(tmp_path / "adopted-image.sqlite3", clock=clock) as registry:
+        converger = Converger(load(project), registry, engine)  # type: ignore[arg-type]
+        first = converger.converge()
+        image_id = engine.image_ids[first.image_tag]
+        original = registry.get_resource_by_engine_identity("image", image_id)
+        assert original is not None
+        registry.remove_resource(original.id)
+        adopted = registry.register_resource(
+            kind="image",
+            name=image_id,
+            stack=first.stack,
+            generation=first.digest,
+            scope="spec",
+            workspace=workspace_of(converger.manifest),
+        )
+        registry.set_resource_state(adopted.id, "adopted")
+        clock.advance(3600)
+
+        warm = converger.converge()
+        refreshed = registry.get_resource(adopted.id)
+        assert refreshed is not None
+        assert refreshed.last_used == clock.now()
+        assert refreshed.state == "active"
+        assert registry.get_resource_by_engine_identity("image", first.image_tag) is None
+        _container_id, leases = converger._acquire_execution_container(
+            warm,
+            stack_name=None,
+            workspace=workspace_of(converger.manifest),
+        )
+        try:
+            assert adopted.id in {lease.resource_id for lease in leases}
+            clock.advance(4 * 24 * 3600)
+            verdict = evaluate(
+                registry,
+                refreshed,
+                superseded=True,
+                workspace_done=True,
+                pressure=Pressure(under_pressure=True),
+                alive_probe=lambda _pid, _start: True,
+            )
+            assert not verdict.collect
+            assert verdict.reason == KEPT_LEASED
+        finally:
+            for lease in leases:
+                registry.release_lease(lease.id)
+
+
+@pytest.mark.parametrize("kind", ["image", "volume"])
+def test_owned_reused_resource_without_a_registry_row_is_restored(
+    project: Path, tmp_path: Path, kind: str
+) -> None:
+    engine = FakeEngine()
+    with Registry(tmp_path / "restore-owned.sqlite3") as registry:
+        converger = Converger(load(project), registry, engine)  # type: ignore[arg-type]
+        first = converger.converge()
+        name = engine.image_ids[first.image_tag] if kind == "image" else first.volumes[0]
+        original = registry.get_resource_by_engine_identity(kind, name)
+        assert original is not None
+        registry.remove_resource(original.id)
+
+        converger.converge()
+
+        restored = registry.get_resource_by_engine_identity(kind, name)
+        assert restored is not None
+        assert restored.id != original.id
+
+
+@pytest.mark.parametrize("collision", ["foreign", "incomplete"])
+def test_reused_volume_collision_is_refused_before_registry_reconciliation(
+    project: Path, tmp_path: Path, collision: str
+) -> None:
+    engine = FakeEngine()
+    with Registry(tmp_path / "foreign-volume.sqlite3") as registry:
+        converger = Converger(load(project), registry, engine)  # type: ignore[arg-type]
+        first = converger.converge()
+        name = first.volumes[0]
+        original = registry.get_resource_by_engine_identity("volume", name)
+        assert original is not None
+        registry.remove_resource(original.id)
+        if collision == "foreign":
+            engine.resource_labels[("volume", name)] = labels.ResourceLabels(
+                registry="other-registry",
+                kind="volume",
+                stack="test",
+                generation=first.digest,
+                scope="spec",
+                workspace="/other",
+                created="2026-01-01T00:00:00Z",
+            ).to_dict()
+        else:
+            engine.resource_labels[("volume", name)] = {labels.REGISTRY: registry.registry_id}
+
+        with pytest.raises(EngineError, match="refusing to reuse"):
+            converger.converge()
+
+        assert registry.get_resource_by_engine_identity("volume", name) is None
 
 
 def test_every_created_resource_is_registered(converger: Converger, registry: Registry) -> None:
@@ -365,6 +563,12 @@ def _name(scope: str, *, digest: str, workspace: str, family: str | None = "rust
 def test_spec_scoped_volumes_change_with_the_digest() -> None:
     a = _name("spec", digest="sha256:aaa", workspace="/w1")
     b = _name("spec", digest="sha256:bbb", workspace="/w1")
+    assert a != b
+
+
+def test_spec_scoped_volumes_differ_across_workspaces() -> None:
+    a = _name("spec", digest="sha256:aaa", workspace="/w1")
+    b = _name("spec", digest="sha256:aaa", workspace="/w2")
     assert a != b
 
 
@@ -448,6 +652,80 @@ def test_distinct_worktrees_get_distinct_workspace_ids(tmp_path: Path) -> None:
     assert ids[0] != ids[1]
 
 
+def test_one_workspaces_roll_does_not_supersede_another_workspaces_generation(
+    tmp_path: Path,
+) -> None:
+    roots = [tmp_path / "wt-a", tmp_path / "wt-b"]
+    for root in roots:
+        root.mkdir()
+        (root / "Dockerfile").write_text("FROM alpine\n", encoding="utf-8")
+        (root / "bosn.toml").write_text(SAMPLE, encoding="utf-8")
+    engine = FakeEngine()
+    with Registry(tmp_path / "workspace-generations.sqlite3") as registry:
+        manifests = [load(root) for root in roots]
+        shared = [
+            Converger(manifest, registry, engine).converge()  # type: ignore[arg-type]
+            for manifest in manifests
+        ]
+        assert shared[0].digest == shared[1].digest
+
+        (roots[0] / "Dockerfile").write_text("FROM alpine\nRUN echo changed\n", encoding="utf-8")
+        Converger(load(roots[0]), registry, engine).converge()  # type: ignore[arg-type]
+
+        assert (
+            registry.generation_superseded_at(
+                shared[0].digest,
+                stack=shared[0].stack,
+                workspace=workspace_of(manifests[0]),
+            )
+            is not None
+        )
+        assert (
+            registry.generation_superseded_at(
+                shared[1].digest,
+                stack=shared[1].stack,
+                workspace=workspace_of(manifests[1]),
+            )
+            is None
+        )
+
+
+def test_shared_old_resources_stay_current_until_every_workspace_rolls(tmp_path: Path) -> None:
+    from bosn.clock import FakeClock
+    from bosn.retention import plan
+
+    roots = [tmp_path / "consumer-a", tmp_path / "consumer-b"]
+    for root in roots:
+        root.mkdir()
+        (root / "Dockerfile").write_text("FROM alpine\n", encoding="utf-8")
+        (root / "bosn.toml").write_text(SAMPLE, encoding="utf-8")
+    clock = FakeClock()
+    engine = FakeEngine()
+    with Registry(tmp_path / "shared-consumers.sqlite3", clock=clock) as registry:
+        manifests = [load(root) for root in roots]
+        original = [
+            Converger(manifest, registry, engine).converge()  # type: ignore[arg-type]
+            for manifest in manifests
+        ]
+        old_names = {
+            engine.image_ids[original[0].image_tag],
+            original[0].volumes[0],
+        }
+
+        (roots[1] / "Dockerfile").write_text("FROM alpine\nRUN echo b-rolled\n", encoding="utf-8")
+        Converger(load(roots[1]), registry, engine).converge()  # type: ignore[arg-type]
+        clock.advance(2 * 24 * 3600)
+
+        verdicts = {verdict.name: verdict for verdict in plan(registry)}
+        assert all(not verdicts[name].collect for name in old_names)
+
+        (roots[0] / "Dockerfile").write_text("FROM alpine\nRUN echo a-rolled\n", encoding="utf-8")
+        Converger(load(roots[0]), registry, engine).converge()  # type: ignore[arg-type]
+
+        verdicts = {verdict.name: verdict for verdict in plan(registry)}
+        assert all(verdicts[name].collect for name in old_names)
+
+
 def test_a_non_canonical_path_to_the_same_root_is_the_same_workspace(project: Path) -> None:
     """`..` and `.` must not be able to split one worktree into two."""
     from bosn.converge import workspace_of
@@ -518,7 +796,14 @@ def test_a_failed_build_does_not_supersede_the_working_generation(
     with pytest.raises(EngineError):
         Converger(load(project), registry, FailingEngine()).converge()  # type: ignore[arg-type]
 
-    assert registry.generation_superseded_at(good.digest) is None
+    assert (
+        registry.generation_superseded_at(
+            good.digest,
+            stack=good.stack,
+            workspace=workspace_of(load(project)),
+        )
+        is None
+    )
 
 
 def test_a_cancelled_build_reports_cancellation_not_a_generic_failure(
@@ -578,6 +863,53 @@ def test_second_run_reuses_the_same_persistent_container(converger: Converger) -
     assert len(engine.ran("exec")) == 2
     assert {command[-1] for command in engine.ran("start")} == {container_id}
     assert {command[1] for command in engine.ran("exec")} == {container_id}
+
+
+def test_active_execution_leases_image_container_and_all_mounted_volumes(
+    project: Path, tmp_path: Path
+) -> None:
+    from bosn.clock import FakeClock
+    from bosn.retention import KEPT_LEASED, Pressure, evaluate
+
+    clock = FakeClock()
+    engine = FakeEngine()
+    with Registry(tmp_path / "dependencies.sqlite3", clock=clock) as registry:
+        converger = Converger(load(project), registry, engine)  # type: ignore[arg-type]
+        converged = converger.converge()
+        clock.advance(3600)
+        _container_id, leases = converger._acquire_execution_container(
+            converged,
+            stack_name=None,
+            workspace=workspace_of(converger.manifest),
+        )
+        try:
+            resources = registry.list_resources()
+            assert {lease.resource_id for lease in leases} == {
+                resource.id for resource in resources
+            }
+            assert {resource.kind for resource in resources} == {
+                "container",
+                "image",
+                "volume",
+            }
+            assert len(resources) == 5
+            assert {resource.last_used for resource in resources} == {clock.now()}
+
+            clock.advance(4 * 24 * 3600)
+            for resource in resources:
+                verdict = evaluate(
+                    registry,
+                    resource,
+                    superseded=True,
+                    workspace_done=True,
+                    pressure=Pressure(under_pressure=True),
+                    alive_probe=lambda _pid, _start: True,
+                )
+                assert not verdict.collect
+                assert verdict.reason == KEPT_LEASED
+        finally:
+            for lease in leases:
+                registry.release_lease(lease.id)
 
 
 def test_generation_roll_replaces_the_container_and_reconciles_its_row(

@@ -465,14 +465,14 @@ def cmd_status(opts: Options) -> int:
 
 
 def cmd_gc(opts: Options) -> int:
-    from bosn.gc import Collector, done_workspaces
+    from bosn.gc import Collector
     from bosn.registry import Registry, default_db_path
 
     state_dir = opts.state_dir
     db_path = (state_dir / "registry.sqlite3") if state_dir else default_db_path()
     with Registry(db_path) as registry:
         collector = Collector(registry, Engine(opts.engine))
-        result = collector.collect(dry_run=opts.dry_run, done_workspaces=done_workspaces(registry))
+        result = collector.collect(dry_run=opts.dry_run)
 
     print(json.dumps({**result.summary(), "dry_run": result.dry_run}, indent=2))
     for name in result.would_stop:

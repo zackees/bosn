@@ -110,6 +110,18 @@ def test_labels_are_confirmed_by_inspect_when_the_listing_truncates_them() -> No
     assert any("inspect" in cmd for cmd in engine.commands)
 
 
+def test_image_discovery_requests_and_keeps_the_full_immutable_id() -> None:
+    image_id = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    engine = FakeEngine(
+        {"image": [{"ID": image_id, "Labels": json.dumps(label_dict(kind="image"))}]}
+    )
+
+    scan = ResourceScanner(engine).scan(OURS, kinds=["image"])  # type: ignore[arg-type]
+
+    assert [resource.name for resource in scan.owned] == [image_id]
+    assert ["images", "--no-trunc", "--format", "{{json .}}"] in engine.commands
+
+
 @pytest.mark.parametrize(
     "blob",
     ["", "null", "<no value>", "map[]", "not json at all {", "[1,2,3]"],

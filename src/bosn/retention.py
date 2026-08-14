@@ -172,13 +172,16 @@ def plan(
 
     verdicts: list[Verdict] = []
     for resource in registry.list_resources():
+        superseded, workspace_done = registry.resource_retention_signals(
+            resource.id, done_workspaces=done_workspaces
+        )
         verdicts.append(
             evaluate(
                 registry,
                 resource,
                 now=now,
-                superseded=registry.generation_superseded_at(resource.generation) is not None,
-                workspace_done=resource.workspace in done_workspaces,
+                superseded=superseded,
+                workspace_done=workspace_done,
                 pressure=pressure,
                 alive_probe=alive_probe,
             )

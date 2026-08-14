@@ -285,7 +285,14 @@ def test_a_cancelled_build_leaves_no_generation_row(
     ipc.send_request(served.port, {"verb": "cancel", "job": job_id, "auth": served.secret})
     drain(stream)
 
-    assert served.registry.generation_superseded_at(digest) is None
+    assert (
+        served.registry.generation_superseded_at(
+            digest,
+            stack=manifest.stack(None).name,
+            workspace=str(manifest.root),
+        )
+        is None
+    )
     rows = served.registry.conn.execute(
         "SELECT 1 FROM generations WHERE digest = ?", (digest,)
     ).fetchall()
