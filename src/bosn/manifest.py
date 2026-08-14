@@ -12,9 +12,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
+import re
+import shlex
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 MANIFEST_NAME = "bosn.toml"
 VALID_SCOPES = {"spec", "stack", "machine"}
@@ -48,7 +52,9 @@ class StackSpec:
 
     def referenced_files(self, root: Path) -> list[Path]:
         """Files whose byte content folds into this stack's digest."""
-        return [root / self.dockerfile] if self.dockerfile else []
+        if not self.dockerfile:
+            return []
+        return docker_context_references(root, root / self.dockerfile)
 
 
 @dataclass(frozen=True)
@@ -185,16 +191,497 @@ def generation_digest(manifest: Manifest, stack: StackSpec) -> str:
         "family": stack.family,
         "volumes": sorted((v.name, v.scope) for v in stack.volumes),
     }
-    hasher.update(json.dumps(section, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    _hash_field(
+        hasher,
+        json.dumps(section, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+    )
 
     for file_path in stack.referenced_files(manifest.root):
-        if not file_path.is_file():
+        try:
+            relative = file_path.relative_to(manifest.root).as_posix()
+        except ValueError as exc:
             raise ManifestError(
-                f"stack {stack.name!r} references {file_path}, which does not exist"
-            )
-        hasher.update(b"\0file\0")
-        hasher.update(file_path.name.encode("utf-8"))
-        hasher.update(b"\0")
-        hasher.update(file_path.read_bytes())
+                f"stack {stack.name!r} references {file_path} outside its build context"
+            ) from exc
+        try:
+            if file_path.is_symlink():
+                kind = b"link"
+                content = file_path.readlink().as_posix().encode("utf-8")
+            elif file_path.is_dir():
+                kind = b"dir"
+                content = b""
+            else:
+                kind = b"file"
+                content = file_path.read_bytes()
+        except OSError as exc:
+            raise ManifestError(f"cannot digest referenced path {file_path}: {exc}") from exc
+        hasher.update(b"\0path-record\0")
+        _hash_field(hasher, kind)
+        _hash_field(hasher, relative.encode("utf-8"))
+        _hash_field(hasher, content)
 
     return f"sha256:{hasher.hexdigest()}"
+
+
+def _hash_field(hasher: Any, value: bytes) -> None:
+    """Append one unambiguous binary field to a digest input."""
+    hasher.update(len(value).to_bytes(8, "big"))
+    hasher.update(value)
+
+
+@dataclass(frozen=True)
+class _IgnoreRule:
+    pattern: str
+    negated: bool
+
+
+def _dockerignore_path(root: Path, dockerfile: Path) -> Path | None:
+    specific = dockerfile.with_name(f"{dockerfile.name}.dockerignore")
+    if specific.is_file():
+        return specific
+    default = root / ".dockerignore"
+    return default if default.is_file() else None
+
+
+def _dockerignore_rules(path: Path | None) -> list[_IgnoreRule]:
+    if path is None:
+        return []
+    rules: list[_IgnoreRule] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        if not raw or raw.startswith("#"):
+            continue
+        text = raw.strip()
+        if not text or text == ".":
+            continue
+        negated = text.startswith("!")
+        if negated:
+            text = text[1:]
+        # Docker deliberately disregards leading and trailing slashes. Always use POSIX
+        # separators here so the same checked-out context hashes identically on every host.
+        text = posixpath.normpath(text.replace("\\", "/").strip("/"))
+        if text:
+            rules.append(_IgnoreRule(text, negated))
+    return rules
+
+
+def _docker_pattern_regex(pattern: str) -> re.Pattern[str]:
+    """Compile Docker's slash-aware glob syntax, including its special `**` wildcard."""
+    expression = "^"
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "*":
+            if index + 1 < len(pattern) and pattern[index + 1] == "*":
+                index += 2
+                if index < len(pattern) and pattern[index] == "/":
+                    index += 1
+                    expression += "(?:.*/)?"
+                else:
+                    expression += ".*"
+                continue
+            expression += "[^/]*"
+        elif char == "?":
+            expression += "[^/]"
+        elif char == "[":
+            end = pattern.find("]", index + 1)
+            if end == -1:
+                expression += r"\["
+            else:
+                character_class = pattern[index + 1 : end]
+                if character_class.startswith("!"):
+                    character_class = "^" + character_class[1:]
+                expression += "[" + character_class.replace("\\", r"\\") + "]"
+                index = end
+        elif char == "\\" and index + 1 < len(pattern):
+            index += 1
+            expression += re.escape(pattern[index])
+        else:
+            expression += re.escape(char)
+        index += 1
+    return re.compile(expression + "$")
+
+
+def _glob_matches(pattern: str, candidate: str) -> bool:
+    return _docker_pattern_regex(pattern).fullmatch(candidate) is not None
+
+
+def _ignore_rule_matches(rule: _IgnoreRule, relative: str) -> bool:
+    parts = relative.split("/")
+    prefixes = ["/".join(parts[:index]) for index in range(1, len(parts))]
+    if _glob_matches(rule.pattern, relative):
+        return True
+    # A directory match applies to everything below it. Evaluating each prefix also lets a
+    # later negation re-include a more specific descendant, matching Docker's last-rule-wins
+    # behavior without pruning ignored directories during traversal.
+    return any(_glob_matches(rule.pattern, prefix) for prefix in prefixes)
+
+
+def _is_ignored(path: Path, root: Path, rules: list[_IgnoreRule]) -> bool:
+    relative = path.relative_to(root).as_posix()
+    ignored = False
+    for rule in rules:
+        if _ignore_rule_matches(rule, relative):
+            ignored = not rule.negated
+    return ignored
+
+
+def _logical_dockerfile_lines(text: str) -> list[str]:
+    escape = "\\"
+    for raw in text.splitlines():
+        directive = re.match(r"^\s*#\s*escape\s*=\s*([\\`])\s*$", raw, re.IGNORECASE)
+        if directive:
+            escape = directive.group(1)
+            break
+        if raw.strip() and not raw.lstrip().startswith("#"):
+            break
+    lines: list[str] = []
+    heredocs: list[tuple[str, bool]] = []
+    pending = ""
+    for raw in text.splitlines():
+        if heredocs:
+            delimiter, strip_tabs = heredocs[0]
+            candidate = raw.lstrip("\t") if strip_tabs else raw
+            if candidate == delimiter:
+                heredocs.pop(0)
+            continue
+        stripped = raw.strip()
+        if not stripped or (not pending and stripped.startswith("#")):
+            continue
+        pending += stripped
+        if pending.endswith(escape):
+            pending = pending[:-1] + " "
+            continue
+        lines.append(pending)
+        heredocs.extend(_heredoc_delimiters(pending))
+        pending = ""
+    if pending:
+        lines.append(pending)
+    return lines
+
+
+def _heredoc_delimiters(instruction: str) -> list[tuple[str, bool]]:
+    delimiters: list[tuple[str, bool]] = []
+    pattern = re.compile(
+        r"<<(?P<tabs>-?)(?:\\)?(?P<quote>['\"]?)(?P<name>[A-Za-z0-9_.-]+)(?P=quote)"
+    )
+    index = 0
+    quote: str | None = None
+    while index < len(instruction):
+        char = instruction[index]
+        if quote is not None:
+            if char == "\\" and quote == '"':
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {'"', "'"}:
+            quote = char
+            index += 1
+            continue
+        if char == "\\":
+            index += 2
+            continue
+        match = (
+            pattern.match(instruction, index)
+            if index == 0 or instruction[index - 1] != "<"
+            else None
+        )
+        if match is not None:
+            delimiters.append((match.group("name"), bool(match.group("tabs"))))
+            index = match.end()
+            continue
+        index += 1
+    return delimiters
+
+
+def _copy_instruction(
+    operation: str, payload: str, dockerfile: Path
+) -> tuple[list[str], dict[str, str | None]]:
+    """Parse COPY/ADD while preserving JSON form after its leading option tokens."""
+    flags: dict[str, str | None] = {}
+    body = payload.lstrip()
+    while body.startswith("--"):
+        flag, separator, body = body.partition(" ")
+        if not separator:
+            raise ManifestError(f"{operation} in {dockerfile} has no source or destination")
+        name, equals, value = flag[2:].partition("=")
+        flags[name.lower()] = value if equals else None
+        body = body.lstrip()
+
+    if body.startswith("["):
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise ManifestError(f"cannot parse JSON {operation} in {dockerfile}") from exc
+        if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+            raise ManifestError(f"invalid JSON {operation} in {dockerfile}")
+        tokens = list(parsed)
+    else:
+        try:
+            tokens = shlex.split(body, posix=True)
+        except ValueError as exc:
+            raise ManifestError(f"cannot parse {operation} in {dockerfile}: {exc}") from exc
+    if len(tokens) < 2:
+        raise ManifestError(f"{operation} in {dockerfile} needs a source and destination")
+    return tokens, flags
+
+
+def _run_mounts(line: str, dockerfile: Path) -> list[dict[str, str]]:
+    match = re.match(r"^RUN\s+(.*)$", line, re.IGNORECASE)
+    if not match:
+        return []
+    body = match.group(1).lstrip()
+    mounts: list[dict[str, str]] = []
+    token_pattern = re.compile(r"""^(?P<token>(?:[^\s'"\\]|\\.|"[^"]*"|'[^']*')+)""")
+    while body.startswith("--"):
+        token_match = token_pattern.match(body)
+        if token_match is None:
+            break
+        raw_token = token_match.group("token")
+        try:
+            token = shlex.split(raw_token, posix=True)[0]
+        except (IndexError, ValueError) as exc:
+            raise ManifestError(f"cannot parse RUN option in {dockerfile}: {exc}") from exc
+        body = body[token_match.end() :].lstrip()
+        if not token.startswith("--mount="):
+            continue
+        options: dict[str, str] = {}
+        for item in token.removeprefix("--mount=").split(","):
+            name, equals, value = item.partition("=")
+            if name:
+                options[name.lower()] = value if equals else "true"
+        mounts.append(options)
+    return mounts
+
+
+def _remote_add_kind(source: str) -> str | None:
+    lowered = source.lower()
+    if lowered.startswith(("git://", "ssh://", "git@")):
+        return "git"
+    if lowered.startswith(("http://", "https://")):
+        path = lowered.split("#", 1)[0].split("?", 1)[0]
+        return "git" if path.endswith(".git") else "http"
+    return None
+
+
+def _git_add_is_immutable(source: str) -> bool:
+    fragment = source.rsplit("#", 1)[1] if "#" in source else ""
+    revision = fragment.split(":", 1)[0]
+    return re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", revision) is not None
+
+
+def _copy_sources(dockerfile: Path) -> tuple[list[str], bool]:
+    """Return local COPY/ADD sources and whether a conservative full-context hash is needed."""
+    sources: list[str] = []
+    full_context = False
+    for line in _logical_dockerfile_lines(dockerfile.read_text(encoding="utf-8")):
+        match = re.match(r"^(COPY|ADD)\s+(.*)$", line, re.IGNORECASE)
+        if not match:
+            for mount in _run_mounts(line, dockerfile):
+                if mount.get("type", "bind").lower() != "bind" or mount.get("from"):
+                    continue
+                source = mount.get("source", mount.get("src", "."))
+                if "$" in source:
+                    full_context = True
+                else:
+                    sources.append(source)
+            continue
+        operation, payload = match.groups()
+        operation = operation.upper()
+        tokens, flags = _copy_instruction(operation, payload, dockerfile)
+        if "from" in flags:
+            if not flags["from"]:
+                raise ManifestError(f"{operation} --from in {dockerfile} needs an image or stage")
+            continue
+        for source in tokens[:-1]:
+            if source.startswith("<<"):
+                # Heredoc bodies live in the Dockerfile itself, which is already hashed.
+                continue
+            if "$" in source:
+                full_context = True
+                continue
+            if operation == "ADD" and (remote_kind := _remote_add_kind(source)):
+                if remote_kind == "git" and not _git_add_is_immutable(source):
+                    raise ManifestError(
+                        f"Git ADD source {source!r} in {dockerfile} needs a full commit "
+                        "reference for deterministic generation identity"
+                    )
+                if remote_kind == "http" and not flags.get("checksum"):
+                    raise ManifestError(
+                        f"remote ADD source {source!r} in {dockerfile} needs --checksum for "
+                        "deterministic generation identity"
+                    )
+                continue
+            sources.append(source)
+    return sources, full_context
+
+
+def _walk_source(root: Path, source: str) -> set[Path]:
+    normalized = posixpath.normpath(source.replace("\\", "/").lstrip("/")) or "."
+    while normalized == ".." or normalized.startswith("../"):
+        normalized = normalized.removeprefix("..").lstrip("/") or "."
+    if any(marker in normalized for marker in "*?["):
+        matches = [
+            path
+            for path in root.rglob("*")
+            if _glob_matches(normalized, path.relative_to(root).as_posix())
+        ]
+    else:
+        candidate = root / normalized
+        matches = [candidate] if candidate.exists() or candidate.is_symlink() else []
+    if not matches:
+        raise ManifestError(f"Docker build source {source!r} does not exist under {root}")
+    paths: set[Path] = set()
+    for match in matches:
+        paths.add(match)
+        if match.is_dir():
+            paths.update(match.rglob("*"))
+    return paths
+
+
+def docker_context_references(root: Path, dockerfile: Path) -> list[Path]:
+    """Resolve the local Docker build content closure used for generation identity."""
+    if not dockerfile.is_file():
+        raise ManifestError(f"stack references {dockerfile}, which does not exist")
+    ignore_path = _dockerignore_path(root, dockerfile)
+    rules = _dockerignore_rules(ignore_path)
+    sources, full_context = _copy_sources(dockerfile)
+    paths: set[Path] = {dockerfile}
+    if ignore_path is not None:
+        paths.add(ignore_path)
+    if full_context:
+        paths.update(root.rglob("*"))
+    else:
+        for source in sources:
+            paths.update(_walk_source(root, source))
+    protected = {dockerfile, ignore_path}
+    return sorted(
+        (path for path in paths if path in protected or not _is_ignored(path, root, rules)),
+        key=lambda path: path.relative_to(root).as_posix(),
+    )
+
+
+_AUTOMATIC_PLATFORM_ARGS = frozenset(
+    {
+        "BUILDPLATFORM",
+        "BUILDOS",
+        "BUILDARCH",
+        "BUILDVARIANT",
+        "TARGETPLATFORM",
+        "TARGETOS",
+        "TARGETARCH",
+        "TARGETVARIANT",
+    }
+)
+
+
+def _substitute_build_args(
+    value: str,
+    args: dict[str, str],
+    dockerfile: Path,
+    *,
+    allow_automatic_platform_args: bool = False,
+) -> str:
+    variable = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([^}]+)\})")
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1) or match.group(2) or ""
+        if allow_automatic_platform_args and name in _AUTOMATIC_PLATFORM_ARGS:
+            return match.group(0)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or name not in args:
+            raise ManifestError(
+                f"image reference {value!r} in {dockerfile} uses unresolved build argument {name!r}"
+            )
+        return args[name]
+
+    return variable.sub(replace, value)
+
+
+def dockerfile_external_images(root: Path, stack: StackSpec) -> list[tuple[str, str | None]]:
+    """Return external image references and their requested platforms in build order."""
+    if not stack.dockerfile:
+        return []
+    dockerfile = root / stack.dockerfile
+    if not dockerfile.is_file():
+        raise ManifestError(f"stack {stack.name!r} references {dockerfile}, which does not exist")
+    aliases: set[str] = set()
+    global_args: dict[str, str] = {}
+    images: list[tuple[str, str | None]] = []
+    first_stage_seen = False
+    for line in _logical_dockerfile_lines(dockerfile.read_text(encoding="utf-8")):
+        arg_match = re.match(r"^ARG\s+([A-Za-z_][A-Za-z0-9_]*)(?:=(.*))?$", line, re.IGNORECASE)
+        if arg_match and not first_stage_seen:
+            name, default = arg_match.groups()
+            if default is not None:
+                global_args[name] = _substitute_build_args(
+                    default,
+                    global_args,
+                    dockerfile,
+                    allow_automatic_platform_args=True,
+                )
+            continue
+        from_match = re.match(r"^FROM\s+(.*)$", line, re.IGNORECASE)
+        if from_match:
+            try:
+                tokens = shlex.split(from_match.group(1), posix=True)
+            except ValueError as exc:
+                raise ManifestError(f"cannot parse FROM in {dockerfile}: {exc}") from exc
+            platform: str | None = None
+            while tokens and tokens[0].startswith("--"):
+                option = tokens.pop(0)
+                if option.startswith("--platform="):
+                    platform = _substitute_build_args(
+                        option.partition("=")[2],
+                        global_args,
+                        dockerfile,
+                        allow_automatic_platform_args=True,
+                    )
+            if not tokens:
+                raise ManifestError(f"FROM in {dockerfile} needs an image reference")
+            reference = _substitute_build_args(
+                tokens.pop(0),
+                global_args,
+                dockerfile,
+                allow_automatic_platform_args=True,
+            )
+            alias = tokens[1] if len(tokens) == 2 and tokens[0].lower() == "as" else None
+            if tokens and alias is None:
+                raise ManifestError(f"cannot parse FROM in {dockerfile}")
+            if reference.lower() != "scratch" and reference.lower() not in aliases:
+                images.append((reference, platform))
+            if alias:
+                aliases.add(alias.lower())
+            first_stage_seen = True
+            continue
+        copy_match = re.match(r"^(?:COPY|ADD)\s+(.*)$", line, re.IGNORECASE)
+        if copy_match:
+            _tokens, flags = _copy_instruction("COPY", copy_match.group(1), dockerfile)
+            from_reference = flags.get("from")
+            if from_reference:
+                from_reference = _substitute_build_args(from_reference, global_args, dockerfile)
+                if (
+                    not from_reference.isdigit()
+                    and from_reference.lower() not in aliases
+                    and from_reference.lower() != "scratch"
+                ):
+                    images.append((from_reference, None))
+            continue
+        for mount in _run_mounts(line, dockerfile):
+            from_reference = mount.get("from")
+            if not from_reference:
+                continue
+            from_reference = _substitute_build_args(
+                from_reference,
+                global_args,
+                dockerfile,
+                allow_automatic_platform_args=True,
+            )
+            if (
+                not from_reference.isdigit()
+                and from_reference.lower() not in aliases
+                and from_reference.lower() != "scratch"
+            ):
+                images.append((from_reference, None))
+    return images

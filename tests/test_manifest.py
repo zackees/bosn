@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from bosn import manifest as manifest_mod
-from bosn.manifest import ManifestError, generation_digest, load
+from bosn.manifest import ManifestError, dockerfile_external_images, generation_digest, load
 
 SAMPLE = """
 [stack.test]
@@ -129,6 +129,183 @@ def test_touching_an_unrelated_file_does_not_roll_the_digest(project: Path) -> N
     before = load(project).digest("test")
     (project / "README.md").write_text("hello", encoding="utf-8")
     assert load(project).digest("test") == before
+
+
+def test_editing_a_copy_input_rolls_the_digest(project: Path) -> None:
+    dockerfile = project / "docker" / "test.Dockerfile"
+    dockerfile.write_text("FROM alpine\nCOPY payload /payload\n", encoding="utf-8")
+    (project / "payload").write_text("one", encoding="utf-8")
+    before = load(project).digest("test")
+
+    (project / "payload").write_text("two", encoding="utf-8")
+
+    assert load(project).digest("test") != before
+
+
+def test_file_records_are_length_delimited(tmp_path: Path) -> None:
+    roots = [tmp_path / "one", tmp_path / "two"]
+    for root in roots:
+        (root / "docker").mkdir(parents=True)
+        (root / "docker" / "test.Dockerfile").write_text(
+            "FROM alpine\nCOPY payload-* /payload/\n", encoding="utf-8"
+        )
+        (root / "bosn.toml").write_text(SAMPLE, encoding="utf-8")
+    (roots[0] / "payload-a").write_bytes(b"X\0file\0payload-b\0Y")
+    (roots[1] / "payload-a").write_bytes(b"X")
+    (roots[1] / "payload-b").write_bytes(b"Y")
+
+    assert load(roots[0]).digest("test") != load(roots[1]).digest("test")
+
+
+def test_json_copy_with_flags_tracks_its_input(project: Path) -> None:
+    dockerfile = project / "docker" / "test.Dockerfile"
+    dockerfile.write_text(
+        'FROM alpine\nCOPY --chown=1000:1000 ["payload file", "/payload"]\n',
+        encoding="utf-8",
+    )
+    payload = project / "payload file"
+    payload.write_text("one", encoding="utf-8")
+    before = load(project).digest("test")
+
+    payload.write_text("two", encoding="utf-8")
+
+    assert load(project).digest("test") != before
+
+
+@pytest.mark.parametrize(
+    "mount",
+    [
+        "--mount=source=payload,target=/src",
+        "--mount=source=payload,target=/src,type=bind",
+    ],
+)
+def test_run_bind_mount_tracks_its_local_source(project: Path, mount: str) -> None:
+    dockerfile = project / "docker" / "test.Dockerfile"
+    dockerfile.write_text(f"FROM alpine\nRUN {mount} cat /src\n", encoding="utf-8")
+    payload = project / "payload"
+    payload.write_text("one", encoding="utf-8")
+    before = load(project).digest("test")
+
+    payload.write_text("two", encoding="utf-8")
+
+    assert load(project).digest("test") != before
+
+
+def test_heredoc_body_is_not_parsed_as_dockerfile_instructions(project: Path) -> None:
+    (project / "docker" / "test.Dockerfile").write_text(
+        "FROM alpine\nRUN <<'EOF'\nCOPY missing /x\nEOF\n", encoding="utf-8"
+    )
+
+    assert load(project).digest("test").startswith("sha256:")
+
+
+def test_quoted_heredoc_text_does_not_hide_a_later_copy(project: Path) -> None:
+    dockerfile = project / "docker" / "test.Dockerfile"
+    dockerfile.write_text(
+        'FROM alpine\nRUN echo "<<EOF"\nCOPY payload /payload\n', encoding="utf-8"
+    )
+    payload = project / "payload"
+    payload.write_text("one", encoding="utf-8")
+    before = load(project).digest("test")
+
+    payload.write_text("two", encoding="utf-8")
+
+    assert load(project).digest("test") != before
+
+
+def test_bash_here_string_does_not_hide_a_later_copy(project: Path) -> None:
+    dockerfile = project / "docker" / "test.Dockerfile"
+    dockerfile.write_text(
+        'FROM alpine\nSHELL ["/bin/bash", "-c"]\nRUN cat <<<EOF\nCOPY payload /payload\n',
+        encoding="utf-8",
+    )
+    payload = project / "payload"
+    payload.write_text("one", encoding="utf-8")
+    before = load(project).digest("test")
+
+    payload.write_text("two", encoding="utf-8")
+
+    assert load(project).digest("test") != before
+
+
+def test_dockerignore_excluded_copy_input_does_not_roll(project: Path) -> None:
+    dockerfile = project / "docker" / "test.Dockerfile"
+    dockerfile.write_text("FROM alpine\nCOPY . /work\n", encoding="utf-8")
+    (project / ".dockerignore").write_text("ignored.txt\n", encoding="utf-8")
+    (project / "included.txt").write_text("one", encoding="utf-8")
+    (project / "ignored.txt").write_text("one", encoding="utf-8")
+    before = load(project).digest("test")
+
+    (project / "ignored.txt").write_text("two", encoding="utf-8")
+    assert load(project).digest("test") == before
+
+    (project / "included.txt").write_text("two", encoding="utf-8")
+    assert load(project).digest("test") != before
+
+
+def test_dockerignore_globs_are_root_relative_and_support_negation(project: Path) -> None:
+    dockerfile = project / "docker" / "test.Dockerfile"
+    dockerfile.write_text("FROM alpine\nCOPY . /work\n", encoding="utf-8")
+    (project / ".dockerignore").write_text("*.md\n!keep.md\n", encoding="utf-8")
+    (project / "ignored.md").write_text("one", encoding="utf-8")
+    (project / "keep.md").write_text("one", encoding="utf-8")
+    nested = project / "nested" / "included.md"
+    nested.parent.mkdir()
+    nested.write_text("one", encoding="utf-8")
+    before = load(project).digest("test")
+
+    (project / "ignored.md").write_text("two", encoding="utf-8")
+    assert load(project).digest("test") == before
+
+    nested.write_text("two", encoding="utf-8")
+    assert load(project).digest("test") != before
+
+
+def test_dockerfile_external_images_resolve_args_stages_and_copy_from(project: Path) -> None:
+    dockerfile = project / "docker" / "test.Dockerfile"
+    dockerfile.write_text(
+        "\n".join(
+            [
+                "ARG BASE=alpine:3.20",
+                "FROM --platform=linux/amd64 ${BASE} AS build",
+                "FROM scratch",
+                "COPY --from=build /local /local",
+                "COPY --from=busybox:1.36 /bin/busybox /busybox",
+                "RUN --mount=target=/tool,from=debian:bookworm cat /tool",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    manifest = load(project)
+
+    assert dockerfile_external_images(project, manifest.stack("test")) == [
+        ("alpine:3.20", "linux/amd64"),
+        ("busybox:1.36", None),
+        ("debian:bookworm", None),
+    ]
+
+
+def test_unpinned_remote_add_is_rejected(project: Path) -> None:
+    (project / "docker" / "test.Dockerfile").write_text(
+        "FROM alpine\nADD https://example.invalid/tool /tool\n", encoding="utf-8"
+    )
+    with pytest.raises(ManifestError, match="needs --checksum"):
+        load(project).digest("test")
+
+
+def test_git_add_accepts_only_a_full_commit_reference(project: Path) -> None:
+    dockerfile = project / "docker" / "test.Dockerfile"
+    dockerfile.write_text(
+        "FROM alpine\nADD git@github.com:example/repo.git#main /repo\n", encoding="utf-8"
+    )
+    with pytest.raises(ManifestError, match="full commit"):
+        load(project).digest("test")
+
+    dockerfile.write_text(
+        f"FROM alpine\nADD https://github.com/example/repo.git#{'a' * 40} /repo\n",
+        encoding="utf-8",
+    )
+    assert load(project).digest("test").startswith("sha256:")
 
 
 def test_different_stacks_have_different_digests(project: Path) -> None:

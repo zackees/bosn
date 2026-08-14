@@ -521,22 +521,24 @@ class Daemon:
         if not manifest_path:
             raise DaemonError("converge requires a manifest path")
 
-        from bosn.converge import workspace_of
-        from bosn.manifest import generation_digest, load
+        from bosn.converge import generation_coalescing_key, workspace_of
+        from bosn.engine import Engine
+        from bosn.manifest import load
 
         manifest = load(Path(manifest_path))
         stack = manifest.stack(request.get("stack") or None)
-        digest = generation_digest(manifest, stack)
+        engine_binary = str(request.get("engine") or self.engine_binary)
+        coalescing_key = generation_coalescing_key(manifest, stack, Engine(engine_binary))
         workspace = str(request.get("workspace") or workspace_of(manifest))
 
         submission = self.jobs.submit(
             workspace=workspace,
             stack=stack.name,
-            digest=digest,
+            digest=coalescing_key,
             payload={
                 "manifest": str(manifest.path),
                 "stack": stack.name,
-                "engine": str(request.get("engine") or self.engine_binary),
+                "engine": engine_binary,
             },
         )
         job = submission.job
@@ -547,7 +549,7 @@ class Daemon:
             "state": job.state,
             "joined": submission.joined,
             "disposition": submission.disposition,
-            "digest": digest,
+            "coalescing_key": coalescing_key,
             "workspace": workspace,
             "stack": stack.name,
             "superseded": submission.superseded.id if submission.superseded else None,

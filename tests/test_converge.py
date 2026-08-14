@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from pathlib import Path
 
@@ -12,6 +13,8 @@ from bosn.converge import (
     REUSED,
     ROLLED,
     Converger,
+    generation_coalescing_key,
+    resolved_generation,
     volume_name_for,
 )
 from bosn.engine import EngineResult
@@ -37,11 +40,32 @@ class FakeEngine:
     def __init__(self) -> None:
         self.commands: list[list[str]] = []
         self.existing: set[str] = set()
+        self.image_ids: dict[str, str] = {"alpine": "sha256:alpine-v1"}
+        self.image_platforms: dict[str, str] = {"alpine": "linux/amd64"}
 
     def run(self, args: list[str], *, check: bool = False) -> EngineResult:
         self.commands.append(list(args))
+        if args[:2] == ["version", "--format"]:
+            return EngineResult(0, "linux/amd64", "")
+        if args[:2] == ["image", "inspect"] and "{{.Id}}" in args:
+            requested_platform = (
+                args[args.index("--platform") + 1] if "--platform" in args else None
+            )
+            identity = self.image_ids.get(args[-1])
+            platform_matches = requested_platform is None or (
+                self.image_platforms.get(args[-1]) == requested_platform
+            )
+            return EngineResult(0 if identity and platform_matches else 1, identity or "", "")
         if "inspect" in args:
             return EngineResult(0 if args[-1] in self.existing else 1, "", "")
+        if args[0] == "pull":
+            self.image_ids.setdefault(
+                args[-1], f"sha256:{hashlib.sha256(args[-1].encode()).hexdigest()}"
+            )
+            if "--platform" in args:
+                self.image_platforms[args[-1]] = args[args.index("--platform") + 1]
+            else:
+                self.image_platforms.setdefault(args[-1], "linux/amd64")
         if args[:2] == ["volume", "create"]:
             self.existing.add(args[-1])
         if args[0] == "create":
@@ -130,6 +154,112 @@ def test_editing_the_spec_rolls_the_generation(project: Path, registry: Registry
 
     assert rolled.action == ROLLED
     assert rolled.superseded == 1
+
+
+def test_editing_a_copy_input_rolls_and_rebuilds(project: Path, registry: Registry) -> None:
+    (project / "Dockerfile").write_text("FROM alpine\nCOPY payload /payload\n", encoding="utf-8")
+    payload = project / "payload"
+    payload.write_text("one", encoding="utf-8")
+    engine = FakeEngine()
+    first = Converger(load(project), registry, engine).converge()  # type: ignore[arg-type]
+
+    payload.write_text("two", encoding="utf-8")
+    second = Converger(load(project), registry, engine).converge()  # type: ignore[arg-type]
+
+    assert second.digest != first.digest
+    assert second.action == ROLLED
+    assert len(engine.ran("build")) == 2
+
+
+def test_changing_the_resolved_base_image_rolls_the_generation(
+    project: Path, registry: Registry
+) -> None:
+    engine = FakeEngine()
+    first = Converger(load(project), registry, engine).converge()  # type: ignore[arg-type]
+    engine.image_ids["alpine"] = "sha256:alpine-v2"
+
+    second = Converger(load(project), registry, engine).converge()  # type: ignore[arg-type]
+
+    assert second.digest != first.digest
+    assert second.action == ROLLED
+
+
+def test_explicit_from_platform_is_used_to_resolve_the_image(
+    project: Path, registry: Registry
+) -> None:
+    (project / "Dockerfile").write_text("FROM --platform=linux/arm64 alpine\n", encoding="utf-8")
+    engine = FakeEngine()
+
+    Converger(load(project), registry, engine).converge()  # type: ignore[arg-type]
+
+    assert engine.ran(
+        "image", "inspect", "--platform", "linux/arm64", "--format", "{{.Id}}", "alpine"
+    )
+    assert engine.ran("pull", "--platform", "linux/arm64", "alpine")
+
+
+def test_matching_explicit_platform_does_not_pull_before_or_during_a_warm_converge(
+    project: Path, registry: Registry
+) -> None:
+    (project / "Dockerfile").write_text("FROM --platform=linux/amd64 alpine\n", encoding="utf-8")
+    engine = FakeEngine()
+    manifest = load(project)
+
+    generation_coalescing_key(manifest, manifest.stack(None), engine)  # type: ignore[arg-type]
+    Converger(manifest, registry, engine).converge()  # type: ignore[arg-type]
+
+    assert engine.ran("pull") == []
+
+
+def test_coalescing_probe_never_pulls_a_missing_image(project: Path) -> None:
+    engine = FakeEngine()
+    engine.image_ids.clear()
+    engine.image_platforms.clear()
+    manifest = load(project)
+
+    key = generation_coalescing_key(manifest, manifest.stack(None), engine)  # type: ignore[arg-type]
+
+    assert key.startswith("sha256:")
+    assert engine.ran("pull") == []
+
+
+def test_automatic_from_platform_is_resolved_from_the_engine(project: Path) -> None:
+    (project / "Dockerfile").write_text("FROM --platform=$BUILDPLATFORM alpine\n", encoding="utf-8")
+    manifest = load(project)
+    engine = FakeEngine()
+
+    resolved_generation(manifest, manifest.stack(None), engine)  # type: ignore[arg-type]
+
+    assert engine.ran("version", "--format")
+    assert engine.ran("pull") == []
+
+
+def test_stack_without_external_images_keeps_its_content_digest(
+    project: Path, registry: Registry
+) -> None:
+    (project / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    manifest = load(project)
+
+    result = Converger(manifest, registry, FakeEngine()).converge()  # type: ignore[arg-type]
+
+    assert result.digest == manifest.digest()
+
+
+def test_image_backed_stack_runs_the_resolved_declared_image(
+    tmp_path: Path, registry: Registry
+) -> None:
+    (tmp_path / "bosn.toml").write_text(
+        '[stack.app]\nimage = "alpine:3.20"\ndefault = true\n', encoding="utf-8"
+    )
+    engine = FakeEngine()
+    engine.image_ids["alpine:3.20"] = "sha256:declared-image"
+    converger = Converger(load(tmp_path), registry, engine)  # type: ignore[arg-type]
+
+    result, code, _output = converger.run(["true"])
+
+    assert code == 0
+    assert result.image_tag == "sha256:declared-image"
+    assert engine.ran("create")[0][-4] == "sha256:declared-image"
 
 
 def test_the_old_generation_is_marked_superseded(project: Path, registry: Registry) -> None:
