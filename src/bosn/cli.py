@@ -233,10 +233,19 @@ def cmd_doctor(opts: Options) -> int:
         registry_id = None
         integrity = "not initialized"
     else:
-        with Registry(db_path, read_only=True) as registry:
-            deadline = registry.meta("maintenance.next_deadline")
-            registry_id = registry.registry_id
-            integrity = registry.integrity_check()
+        # A corrupt registry must still produce a diagnosis, never a traceback: doctor is
+        # the tool the user reaches for precisely when the database is damaged, and the
+        # recovery guidance below is printed from `integrity`. Opening, reading meta, and
+        # reading the registry id can each fail on damage severe enough to stop the pager.
+        try:
+            with Registry(db_path, read_only=True) as registry:
+                deadline = registry.meta("maintenance.next_deadline")
+                registry_id = registry.registry_id
+                integrity = registry.integrity_check()
+        except sqlite3.DatabaseError as exc:
+            deadline = None
+            registry_id = None
+            integrity = f"unreadable: {exc}"
     print(f"scheduler manifest installed: {autostart.manifest_installed()}")
     print(f"scheduler next deadline: {deadline or '-'}")
     print(f"registry integrity: {integrity}")

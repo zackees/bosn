@@ -409,8 +409,19 @@ class Registry:
         return str(self._exec("PRAGMA journal_mode").fetchone()[0]).lower()
 
     def integrity_check(self) -> str:
-        """Return SQLite's read-only integrity diagnosis without altering the database."""
-        row = self._exec("PRAGMA integrity_check").fetchone()
+        """Return SQLite's read-only integrity diagnosis without altering the database.
+
+        Damage bad enough to stop the pager makes the PRAGMA itself raise rather than
+        report -- reproducibly so on Linux, where a page-header hit that Windows happened
+        to survive raises "database disk image is malformed". Reporting that as a string
+        is the whole point: `doctor` prints recovery guidance from this value, so raising
+        here would crash the diagnostic in exactly the corrupt-database case it exists to
+        diagnose. Never returns "ok" for a database it could not read.
+        """
+        try:
+            row = self._exec("PRAGMA integrity_check").fetchone()
+        except sqlite3.DatabaseError as exc:
+            return f"unreadable: {exc}"
         return str(row[0]) if row is not None else "no result"
 
     # -- resources ---------------------------------------------------------
