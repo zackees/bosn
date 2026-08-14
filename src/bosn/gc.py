@@ -21,6 +21,7 @@ from pathlib import Path
 
 from bosn import labels
 from bosn.accounting import probe, resource_bytes
+from bosn.config import Config
 from bosn.engine import Engine
 from bosn.registry import Registry
 from bosn.resources import ResourceScanner
@@ -64,10 +65,13 @@ class GCResult:
 
 
 class Collector:
-    def __init__(self, registry: Registry, engine: Engine | None = None) -> None:
+    def __init__(
+        self, registry: Registry, engine: Engine | None = None, *, config: Config | None = None
+    ) -> None:
         self.registry = registry
         self.engine = engine or Engine()
         self.scanner = ResourceScanner(self.engine)
+        self.config = config
 
     def _ownership_proven(self, kind: str, name: str) -> bool:
         """Re-confirm from the engine's labels before deleting anything.
@@ -84,13 +88,15 @@ class Collector:
         dry_run: bool = True,
         pressure: Pressure | None = None,
     ) -> GCResult:
-        verdicts: list[Verdict] = plan(self.registry, pressure=pressure)
+        verdicts: list[Verdict] = plan(self.registry, pressure=pressure, config=self.config)
         result = GCResult(dry_run=dry_run)
 
         for verdict in verdicts:
             if not verdict.collect:
                 result.kept.append(verdict.name)
-                if not container_should_stop(verdict.resource, self.registry.clock.now()):
+                if not container_should_stop(
+                    verdict.resource, self.registry.clock.now(), config=self.config
+                ):
                     continue
                 # The planning snapshot is not a mutation boundary: another client may
                 # acquire a lease while the rest of the plan is evaluated. Serialize all
@@ -109,12 +115,15 @@ class Collector:
                         superseded=superseded,
                         workspace_done=workspace_done,
                         pressure=pressure,
+                        config=self.config,
                     )
                     protected = current.reason in {KEPT_LEASED, KEPT_QUIET_PERIOD}
                     if (
                         current.collect
                         or protected
-                        or not container_should_stop(resource, self.registry.clock.now())
+                        or not container_should_stop(
+                            resource, self.registry.clock.now(), config=self.config
+                        )
                     ):
                         continue
                     if not self._ownership_proven(resource.kind, resource.name):
@@ -149,6 +158,7 @@ class Collector:
                     superseded=superseded,
                     workspace_done=workspace_done,
                     pressure=pressure,
+                    config=self.config,
                 )
                 if not current.collect:
                     result.kept.append(resource.name)
@@ -180,12 +190,14 @@ class Collector:
         return result
 
 
-def status(registry: Registry, engine: Engine | None = None) -> dict:
+def status(
+    registry: Registry, engine: Engine | None = None, *, config: Config | None = None
+) -> dict:
     """Tiers, leases, and foreign registries. Read-only: works with the daemon dead."""
     engine = engine or Engine()
     from bosn.config import load as load_config
 
-    config = load_config()
+    config = config or load_config()
     scan = ResourceScanner(engine).scan(registry.registry_id)
 
     attributed: dict[tuple[str, str, str], dict[str, int]] = defaultdict(
@@ -206,7 +218,7 @@ def status(registry: Registry, engine: Engine | None = None) -> dict:
     pressure = Pressure.assess(
         resource_count=len(measured), managed_bytes=managed_bytes, free_bytes=storage.free_bytes
     )
-    verdicts = plan(registry, pressure=pressure)
+    verdicts = plan(registry, pressure=pressure, config=config)
     reclaimable = sum(measured[v.resource.id] or 0 for v in collectable(verdicts))
     advisory = (
         "Backing-store slack exceeds managed reclaimable bytes; compact the Docker VHDX manually."

@@ -33,6 +33,11 @@ _DEFAULTS = {
 _ENV = {key: f"BOSN_{key.upper()}" for key in _DEFAULTS}
 
 
+def policy_keys() -> tuple[str, ...]:
+    """Documented policy keys, in stable CLI/report order."""
+    return tuple(_DEFAULTS)
+
+
 def default_path() -> Path:
     explicit = os.environ.get("BOSN_CONFIG")
     if explicit:

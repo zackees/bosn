@@ -28,7 +28,6 @@ REUSED = "reused"
 REGISTERED = "registered"
 ROLLED = "rolled"
 CONTAINER_HEARTBEAT_TIMEOUT_SECONDS = 600
-RUN_MAX_DURATION_SECONDS = 8 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -273,6 +272,7 @@ class Converger:
         *,
         progress: Callable[[str], None] | None = None,
         cancelled: threading.Event | None = None,
+        run_max_duration: float | None = None,
     ) -> None:
         self.manifest = manifest
         self.registry = registry
@@ -281,6 +281,7 @@ class Converger:
         # the build stops when the job is cancelled.
         self.progress = progress
         self.cancelled = cancelled
+        self.run_max_duration = run_max_duration
 
     def converge(
         self, stack_name: str | None = None, *, workspace: str | None = None
@@ -566,13 +567,13 @@ class Converger:
             for mount in expected_mounts.values():
                 suffix = ":ro" if not mount["rw"] else ""
                 args += ["--volume", f"{mount['source']}:{mount['destination']}{suffix}"]
-            # PID 1 exits when the daemon heartbeat goes stale or a run is orphaned for
-            # too long.  `--rm` above then removes the stopped container automatically.
+            # PID 1 exits only when the daemon heartbeat goes stale. Execution deadlines
+            # belong to the individual `docker exec`, not the container's creation time:
+            # a warm container may correctly serve many later sessions.
             watchdog = (
-                "started=$(date +%s); while :; do now=$(date +%s); "
+                "while :; do now=$(date +%s); "
                 "beat=$(stat -c %Y /bosn-daemon/heartbeat 2>/dev/null || echo 0); "
                 f"[ $((now-beat)) -gt {CONTAINER_HEARTBEAT_TIMEOUT_SECONDS} ] && exit 0; "
-                f"[ $((now-started)) -gt {RUN_MAX_DURATION_SECONDS} ] && exit 0; "
                 "sleep 30; done"
             )
             args += [converged.image_tag, "sh", "-c", watchdog]
@@ -934,7 +935,7 @@ class Converger:
         )
         args = ["exec", name, *command]
         try:
-            result = self.engine.run(args)
+            result = self.engine.run(args, timeout=self.run_max_duration)
         finally:
             for lease in leases:
                 self.registry.release_lease(lease.id)

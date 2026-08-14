@@ -82,6 +82,49 @@ def test_daemon_numeric_flags_are_typed() -> None:
     assert isinstance(parsed.idle_retire_seconds, float)
 
 
+def test_all_documented_policy_flags_are_typed() -> None:
+    parsed = opts(
+        [
+            "--container-idle-stop",
+            "1",
+            "--container-remove",
+            "2",
+            "--warm-volume-ttl",
+            "3",
+            "--superseded-cap",
+            "4",
+            "--shared-cache-ceiling",
+            "5",
+            "--run-max-duration",
+            "6",
+            "--idle-retire-seconds",
+            "7",
+            "--max-builds",
+            "8",
+            "--build-ttl-seconds",
+            "9",
+            "status",
+        ]
+    )
+    assert [
+        parsed.container_idle_stop,
+        parsed.container_remove,
+        parsed.warm_volume_ttl,
+        parsed.superseded_cap,
+        parsed.shared_cache_ceiling,
+        parsed.run_max_duration,
+        parsed.idle_retire_seconds,
+        parsed.max_builds,
+        parsed.build_ttl_seconds,
+    ] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8, 9.0]
+
+
+def test_policy_flags_work_before_or_after_the_verb() -> None:
+    assert opts(["--run-max-duration", "12", "run"]).run_max_duration == 12
+    assert opts(["run", "--run-max-duration", "12", "--", "true"]).run_max_duration == 12
+    assert opts(["--idle-retire-seconds", "12", "__daemon"]).idle_retire_seconds == 12
+
+
 def test_gc_apply_flips_dry_run() -> None:
     assert opts(["gc"]).dry_run is True
     assert opts(["gc", "--apply"]).dry_run is False

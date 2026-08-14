@@ -8,6 +8,7 @@ import pytest
 
 from bosn import retention
 from bosn.clock import FakeClock
+from bosn.config import load as load_config
 from bosn.registry import Registry
 from bosn.retention import (
     COLLECT_DONE,
@@ -90,6 +91,14 @@ def test_containers_idle_stop_at_one_hour(registry: Registry, clock: FakeClock) 
     assert not retention.container_should_stop(resource, clock.now())
     clock.advance(HOUR + 1)
     assert retention.container_should_stop(resource, clock.now())
+
+
+def test_explicit_policy_snapshot_controls_retention(registry: Registry, clock: FakeClock) -> None:
+    resource = make(registry, kind="container")
+    clock.advance(2)
+    config = load_config(flags={"container_idle_stop": 1, "container_remove": 1})
+    assert retention.container_should_stop(resource, clock.now(), config=config)
+    assert evaluate(registry, resource, config=config, alive_probe=DEAD).collect
 
 
 def test_containers_are_removed_at_one_day(registry: Registry, clock: FakeClock) -> None:

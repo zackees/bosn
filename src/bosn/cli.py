@@ -24,6 +24,32 @@ NOT_IMPLEMENTED_EXIT = 3
 # short enough not to look hung.
 DAEMON_STOP_TIMEOUT = 45.0
 
+
+def _policy_flags(opts: Options) -> dict[str, float | None]:
+    """The complete CLI layer of the policy precedence stack."""
+    from bosn.config import policy_keys
+
+    return {key: getattr(opts, key) for key in policy_keys()}
+
+
+_POLICY_FLAG_KEYS = (
+    "container_idle_stop",
+    "container_remove",
+    "warm_volume_ttl",
+    "superseded_cap",
+    "shared_cache_ceiling",
+    "run_max_duration",
+    "idle_retire_seconds",
+    "max_builds",
+    "build_ttl_seconds",
+)
+
+
+def _add_policy_flags(parser: argparse.ArgumentParser, *, default: object) -> None:
+    for key in _POLICY_FLAG_KEYS:
+        parser.add_argument(f"--{key.replace('_', '-')}", type=float, default=default)
+
+
 # verb -> (help text, phase that lands it)
 VERBS: dict[str, tuple[str, str]] = {
     "run": ("run an ad-hoc command in a stack", "implemented"),
@@ -66,9 +92,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--manifest", default=None, help="path to bosn.toml (default: nearest one upward)"
     )
+    # Policy is global because every command must resolve exactly the same snapshot.
+    # The daemon repeats its three operational flags after the verb for spawned argv
+    # compatibility; the remaining flags belong before the verb like --engine.
+    _add_policy_flags(parser, default=None)
     subparsers = parser.add_subparsers(dest="verb", metavar="VERB")
     for verb, (help_text, _) in VERBS.items():
         sub = subparsers.add_parser(verb, help=help_text)
+        _add_policy_flags(sub, default=argparse.SUPPRESS)
         sub.add_argument("args", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
         if verb in {"run", "tasks", "shell", "done", "ensure", "adopt"}:
             sub.add_argument("--stack", default=None, help="stack to use (default: the default)")
@@ -95,9 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     daemon_parser = subparsers.add_parser(DAEMON_VERB, help=argparse.SUPPRESS)
     daemon_parser.add_argument("--port", type=int, default=None)
-    daemon_parser.add_argument("--idle-retire-seconds", type=float, default=None)
-    daemon_parser.add_argument("--max-builds", type=int, default=None)
-    daemon_parser.add_argument("--build-ttl-seconds", type=float, default=None)
+    _add_policy_flags(daemon_parser, default=argparse.SUPPRESS)
     daemon_parser.add_argument("--stop", action="store_true", help="stop a running daemon")
     autostart = daemon_parser.add_mutually_exclusive_group()
     autostart.add_argument(
@@ -179,13 +208,7 @@ def cmd_daemon(opts: Options) -> int:
         return 0
 
     try:
-        config = load_config(
-            flags={
-                "idle_retire_seconds": opts.idle_retire_seconds,
-                "max_builds": opts.max_builds,
-                "build_ttl_seconds": opts.build_ttl_seconds,
-            }
-        )
+        config = load_config(flags=_policy_flags(opts))
         daemon = daemon_mod.Daemon(
             state_dir=state_dir,
             port=opts.port,
@@ -193,6 +216,7 @@ def cmd_daemon(opts: Options) -> int:
             max_builds=int(config.get("max_builds")),
             build_ttl_seconds=config.get("build_ttl_seconds"),
             engine_binary=opts.engine,
+            config=config,
         )
         return daemon.serve_forever()
     except ConfigError as exc:
@@ -359,6 +383,8 @@ def _converge_via_daemon(opts: Options, manifest, stack_name: str | None):
 
 def cmd_run(opts: Options) -> int:
     from bosn import daemon as daemon_mod
+    from bosn.config import ConfigError
+    from bosn.config import load as load_config
     from bosn.converge import Converger, workspace_of
     from bosn.engine import EngineError
     from bosn.manifest import ManifestError
@@ -375,6 +401,7 @@ def cmd_run(opts: Options) -> int:
         return 1
 
     try:
+        config = load_config(flags=_policy_flags(opts))
         if opts.task:
             task = manifest.task(opts.task)
             command = ["sh", "-c", task.cmd]
@@ -383,7 +410,12 @@ def cmd_run(opts: Options) -> int:
             stack_name = opts.stack
 
         converged = _converge_via_daemon(opts, manifest, stack_name)
-        converger = Converger(manifest, registry, Engine(opts.engine))
+        converger = Converger(
+            manifest,
+            registry,
+            Engine(opts.engine),
+            run_max_duration=config.get("run_max_duration"),
+        )
         _result, code, output = converger.run_converged(
             converged, command, stack_name=stack_name, workspace=workspace_of(manifest)
         )
@@ -393,7 +425,7 @@ def cmd_run(opts: Options) -> int:
     except (daemon_mod.DaemonError, ipc.TransportError) as exc:  # fail closed, stay visible
         print(f"cannot reach the bosn daemon: {exc}", file=sys.stderr)
         return 1
-    except (ManifestError, EngineError) as exc:
+    except (ManifestError, EngineError, ConfigError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     finally:
@@ -450,6 +482,7 @@ def cmd_cancel(opts: Options) -> int:
 
 def cmd_status(opts: Options) -> int:
     from bosn.config import ConfigError
+    from bosn.config import load as load_config
     from bosn.gc import status
     from bosn.registry import Registry, default_db_path
 
@@ -457,7 +490,14 @@ def cmd_status(opts: Options) -> int:
     db_path = (state_dir / "registry.sqlite3") if state_dir else default_db_path()
     try:
         with Registry(db_path) as registry:
-            print(json.dumps(status(registry, Engine(opts.engine)), indent=2))
+            print(
+                json.dumps(
+                    status(
+                        registry, Engine(opts.engine), config=load_config(flags=_policy_flags(opts))
+                    ),
+                    indent=2,
+                )
+            )
         return 0
     except ConfigError as exc:
         print(str(exc), file=sys.stderr)
@@ -465,14 +505,22 @@ def cmd_status(opts: Options) -> int:
 
 
 def cmd_gc(opts: Options) -> int:
+    from bosn.config import ConfigError
+    from bosn.config import load as load_config
     from bosn.gc import Collector
     from bosn.registry import Registry, default_db_path
 
     state_dir = opts.state_dir
     db_path = (state_dir / "registry.sqlite3") if state_dir else default_db_path()
-    with Registry(db_path) as registry:
-        collector = Collector(registry, Engine(opts.engine))
-        result = collector.collect(dry_run=opts.dry_run)
+    try:
+        with Registry(db_path) as registry:
+            collector = Collector(
+                registry, Engine(opts.engine), config=load_config(flags=_policy_flags(opts))
+            )
+            result = collector.collect(dry_run=opts.dry_run)
+    except ConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
     print(json.dumps({**result.summary(), "dry_run": result.dry_run}, indent=2))
     for name in result.would_stop:

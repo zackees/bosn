@@ -213,7 +213,7 @@ def test_maintenance_catches_up_then_runs_on_the_injected_clock(
             return EngineInfo(binary="docker", reachable=True)
 
     class RecordingCollector:
-        def __init__(self, _registry, _engine) -> None:
+        def __init__(self, _registry, _engine, *, config=None) -> None:
             pass
 
         def collect(self, **_kwargs):
