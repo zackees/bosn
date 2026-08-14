@@ -266,6 +266,7 @@ def _open_manifest_and_registry(opts: Options, *, read_only: bool = False):
 
 def cmd_tasks(opts: Options) -> int:
     from bosn.manifest import ManifestError, find_manifest, generation_digest, load
+    from bosn.registry import Registry, default_db_path
 
     try:
         manifest_path = opts.manifest or find_manifest()
@@ -277,6 +278,27 @@ def cmd_tasks(opts: Options) -> int:
     except ManifestError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+
+    db_path = (opts.state_dir / "registry.sqlite3") if opts.state_dir else default_db_path()
+    registered = []
+    registry_reason = "registry not initialized"
+    if db_path.exists():
+        with Registry(db_path, read_only=True) as registry:
+            registered = registry.list_resources()
+        registry_reason = "daemon job state unavailable; run `bosn jobs`"
+
+    def readiness(stack_name: str) -> dict[str, object]:
+        resources = [
+            resource
+            for resource in registered
+            if resource.stack == stack_name and resource.workspace == str(manifest.root)
+        ]
+        return {
+            "state": "ready" if resources else "unregistered",
+            "resources": len(resources),
+            "generations": sorted({resource.generation for resource in resources}),
+            "jobs": {"state": "unavailable", "reason": registry_reason},
+        }
 
     try:
         payload = {
@@ -292,10 +314,18 @@ def cmd_tasks(opts: Options) -> int:
                     # generation digest before job coalescing and registration.
                     "content_digest": generation_digest(manifest, stack),
                     "volumes": {v.name: v.scope for v in stack.volumes},
+                    "readiness": readiness(name),
                 }
                 for name, stack in manifest.stacks.items()
             },
-            "tasks": {name: {"stack": t.stack, "cmd": t.cmd} for name, t in manifest.tasks.items()},
+            "tasks": {
+                name: {
+                    "stack": t.stack,
+                    "cmd": t.cmd,
+                    "readiness": readiness(t.stack or manifest.default_stack().name),
+                }
+                for name, t in manifest.tasks.items()
+            },
         }
     except ManifestError as exc:
         print(str(exc), file=sys.stderr)
@@ -687,8 +717,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    raw_argv = list(argv if argv is not None else sys.argv[1:])
+    # A manifest task is the friendly front door: `bosn unit` is equivalent to
+    # `bosn run --task unit`.  Fixed verbs remain reserved, so adding a task called
+    # `status` never changes the meaning of `bosn status`.
+    if (
+        raw_argv
+        and not raw_argv[0].startswith("-")
+        and raw_argv[0]
+        not in {
+            *VERBS,
+            DAEMON_VERB,
+        }
+    ):
+        raw_argv = ["run", "--task", raw_argv[0], *raw_argv[1:]]
     parser = build_parser()
-    ns = parser.parse_args(argv if argv is not None else sys.argv[1:])
+    ns = parser.parse_args(raw_argv)
     opts = from_namespace(ns)
 
     if opts.verb is None:

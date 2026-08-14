@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from bosn import cli
@@ -45,6 +47,46 @@ def test_every_designed_verb_is_registered() -> None:
 def test_attach_and_cancel_are_no_longer_placeholders() -> None:
     """Both landed with daemon-owned jobs; `attach`'s stale 'phase 6' label went with them."""
     assert cli.VERBS["attach"][1] == "implemented"
+
+
+def test_one_word_manifest_task_dispatches_as_run(monkeypatch) -> None:
+    seen = {}
+
+    def run_task(opts) -> int:
+        seen["task"] = opts.task
+        return 17
+
+    monkeypatch.setattr(cli, "cmd_run", run_task)
+    assert cli.main(["unit"]) == 17
+    assert seen == {"task": "unit"}
+
+
+def test_builtin_verb_name_is_reserved_from_task_dispatch(monkeypatch) -> None:
+    seen = []
+    monkeypatch.setattr(cli, "cmd_run", lambda _opts: seen.append("run") or 0)
+    monkeypatch.setattr(cli, "cmd_status", lambda _opts: seen.append("status") or 0)
+
+    assert cli.main(["status"]) == 0
+    assert seen == ["status"]
+
+
+def test_tasks_json_reports_unregistered_readiness(tmp_path, capsys) -> None:
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    manifest = tmp_path / "bosn.toml"
+    manifest.write_text(
+        "[stack.dev]\ndockerfile = 'Dockerfile'\ndefault = true\n[task.unit]\ncmd = 'echo unit'\n",
+        encoding="utf-8",
+    )
+
+    assert (
+        cli.main(
+            ["--state-dir", str(tmp_path / "state"), "--manifest", str(manifest), "tasks", "--json"]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stacks"]["dev"]["readiness"]["state"] == "unregistered"
+    assert payload["tasks"]["unit"]["readiness"]["jobs"]["state"] == "unavailable"
     assert cli.VERBS["cancel"][1] == "implemented"
 
 
@@ -65,10 +107,9 @@ def test_cancel_fails_closed_when_no_daemon_is_running(tmp_path, capsys) -> None
     assert "cannot reach the bosn daemon" in capsys.readouterr().err
 
 
-def test_unknown_verb_is_rejected() -> None:
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["definitely-not-a-verb"])
-    assert exc.value.code != 0
+def test_unknown_first_token_is_diagnosed_as_an_unknown_manifest_task(capsys) -> None:
+    assert cli.main(["definitely-not-a-verb"]) == 1
+    assert "no bosn.toml" in capsys.readouterr().err
 
 
 def test_doctor_reports_unreachable_engine_and_scheduler_state_without_crashing(
