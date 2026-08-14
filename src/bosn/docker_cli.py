@@ -11,9 +11,8 @@ import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
-from bosn import __version__, labels
-from bosn.registry import Registry, default_db_path
-from bosn.resources import ResourceScanner, adopt
+from bosn import __version__, daemon, labels
+from bosn.registry import Registry
 
 
 class DockerFrontDoorError(ValueError):
@@ -67,7 +66,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _compose_overlay(registry: Registry, compose: Path) -> Path:
+def _compose_overlay(registry_id: str | Registry, compose: Path) -> Path:
+    if isinstance(registry_id, Registry):
+        registry_id = registry_id.registry_id
     """Generate an ephemeral Compose overlay that labels every service container."""
     names = re.findall(r"^  ([A-Za-z0-9_-]+):\s*$", compose.read_text(encoding="utf-8"), re.M)
     if not names:
@@ -77,7 +78,7 @@ def _compose_overlay(registry: Registry, compose: Path) -> Path:
     lines = ["services:"]
     for name in names:
         contract = labels.ResourceLabels(
-            registry=registry.registry_id,
+            registry=registry_id,
             kind="container",
             stack=name,
             generation="compose",
@@ -100,18 +101,21 @@ def _compose_overlay(registry: Registry, compose: Path) -> Path:
 def _run_compose(command: str, compose: Path, args: list[str]) -> int:
     if args:
         raise DockerFrontDoorError(f"unsupported compose flag or argument {args[0]!r}")
-    with Registry(default_db_path()) as registry:
-        overlay = _compose_overlay(registry, compose)
-        try:
-            completed = subprocess.run(
-                ["docker", "compose", "-f", str(compose), "-f", str(overlay), command], check=False
-            )
-            if command == "up" and completed.returncode == 0:
-                scan = ResourceScanner().scan(registry.registry_id)
-                adopt(registry, scan)
-            return completed.returncode
-        finally:
-            overlay.unlink(missing_ok=True)
+    reply = daemon.request("status")
+    if not reply.get("ok"):
+        raise DockerFrontDoorError(str(reply.get("error") or "cannot reach bosn daemon"))
+    overlay = _compose_overlay(str(reply["registry_id"]), compose)
+    try:
+        completed = subprocess.run(
+            ["docker", "compose", "-f", str(compose), "-f", str(overlay), command], check=False
+        )
+        if command == "up" and completed.returncode == 0:
+            adopted = daemon.request("compose-adopt")
+            if not adopted.get("ok"):
+                raise DockerFrontDoorError(str(adopted.get("error") or "compose adoption failed"))
+        return completed.returncode
+    finally:
+        overlay.unlink(missing_ok=True)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
