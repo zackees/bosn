@@ -196,3 +196,39 @@ def test_two_workspaces_build_in_parallel(served: Daemon, tmp_path: Path) -> Non
     for stream in streams:
         final = [e for e in stream if e.get("final")][-1]
         assert final["state"] == "succeeded", final.get("error")
+
+
+# -- the whole path, through the CLI ---------------------------------------
+
+
+@pytest.mark.slow
+def test_bosn_run_converges_through_the_daemon_then_runs_locally(
+    tmp_path: Path, project: Path, capsys
+) -> None:
+    """`bosn run` end to end: a real spawned daemon builds, this process runs the command.
+
+    The split is the design -- the daemon owns the build so it survives a killed CLI, and
+    the CLI runs the container itself so the command keeps this terminal and exit status.
+    Everything else here mocks one side or the other; this is the only test that exercises
+    the seam the way a user does.
+    """
+    from bosn import cli
+
+    write_dockerfile(project, seconds=0)
+    state_dir = tmp_path / "cli-state"
+    args = ["--state-dir", str(state_dir), "run", "--manifest", str(project / "bosn.toml")]
+    try:
+        code = cli.main([*args, "--", "echo", "hello-from-the-stack"])
+        assert code == 0, capsys.readouterr().err
+        assert "hello-from-the-stack" in capsys.readouterr().out
+
+        # ...and the second run reuses the image rather than rebuilding it
+        assert cli.main([*args, "--", "echo", "again"]) == 0
+        assert "again" in capsys.readouterr().out
+
+        listed = daemon_mod.request("jobs", state_dir)["jobs"]
+        assert listed, "the converge really did go through the daemon"
+        assert all(row["state"] == "succeeded" for row in listed), listed
+    finally:
+        daemon_mod.stop(state_dir, timeout=60)
+        _remove_built_images(Engine())
