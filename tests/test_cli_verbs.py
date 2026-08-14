@@ -61,6 +61,20 @@ def test_one_word_manifest_task_dispatches_as_run(monkeypatch) -> None:
     assert seen == {"task": "unit"}
 
 
+def test_one_word_task_keeps_leading_global_options(monkeypatch, tmp_path) -> None:
+    seen = {}
+
+    def run_task(opts) -> int:
+        seen["task"] = opts.task
+        seen["manifest"] = opts.manifest
+        return 0
+
+    manifest = tmp_path / "bosn.toml"
+    monkeypatch.setattr(cli, "cmd_run", run_task)
+    assert cli.main(["--manifest", str(manifest), "unit"]) == 0
+    assert seen == {"task": "unit", "manifest": manifest}
+
+
 def test_builtin_verb_name_is_reserved_from_task_dispatch(monkeypatch) -> None:
     seen = []
     monkeypatch.setattr(cli, "cmd_run", lambda _opts: seen.append("run") or 0)
@@ -100,7 +114,13 @@ def test_tasks_json_manifest_error_has_stable_remedy(tmp_path, capsys) -> None:
     }
 
 
-def test_gc_json_daemon_error_has_stable_remedy(tmp_path, capsys) -> None:
+def test_gc_json_daemon_error_has_stable_remedy(tmp_path, capsys, monkeypatch) -> None:
+    from bosn import daemon
+
+    def unavailable(*_args, **_kwargs):
+        raise daemon.DaemonError("down")
+
+    monkeypatch.setattr(daemon, "request", unavailable)
     assert cli.main(["--state-dir", str(tmp_path), "gc", "--json"]) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["code"] == "daemon.unreachable"

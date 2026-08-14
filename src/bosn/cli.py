@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from collections.abc import Callable, Sequence
 
@@ -43,6 +44,13 @@ _POLICY_FLAG_KEYS = (
     "max_builds",
     "build_ttl_seconds",
 )
+
+_GLOBAL_VALUE_FLAGS = {
+    "--engine",
+    "--state-dir",
+    "--manifest",
+    *(f"--{key.replace('_', '-')}" for key in _POLICY_FLAG_KEYS),
+}
 
 
 def _add_policy_flags(parser: argparse.ArgumentParser, *, default: object) -> None:
@@ -298,8 +306,16 @@ def cmd_tasks(opts: Options) -> int:
     registered = []
     registry_reason = "registry not initialized"
     if db_path.exists():
-        with Registry(db_path, read_only=True) as registry:
-            registered = registry.list_resources()
+        try:
+            with Registry(db_path, read_only=True) as registry:
+                registered = registry.list_resources()
+        except (OSError, sqlite3.DatabaseError) as exc:
+            return _error(
+                code="registry.unreadable",
+                message=f"cannot read registry: {exc}",
+                next_step="run `bosn doctor` and follow its SQLite recovery guidance",
+                as_json=opts.json,
+            )
         registry_reason = "daemon job state unavailable; run `bosn jobs`"
 
     def readiness(stack_name: str) -> dict[str, object]:
@@ -612,6 +628,23 @@ def cmd_gc(opts: Options) -> int:
             next_step="inspect `bosn status` and retry after resolving the reported error",
             as_json=opts.json,
         )
+    if opts.json:
+        print(
+            json.dumps(
+                {
+                    "ok": not bool(reply.get("errors")),
+                    "result": reply["result"],
+                    "dry_run": opts.dry_run,
+                    "would_stop": reply.get("would_stop", []),
+                    "stopped": reply.get("stopped", []),
+                    "removed": reply.get("removed", []),
+                    "errors": reply.get("errors", []),
+                    "advisories": reply.get("advisories", []),
+                },
+                indent=2,
+            )
+        )
+        return 1 if reply.get("errors") else 0
     print(json.dumps({**reply["result"], "dry_run": opts.dry_run}, indent=2))
     for name in reply.get("would_stop", []):
         print(f"would stop {name}")
@@ -752,16 +785,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     # A manifest task is the friendly front door: `bosn unit` is equivalent to
     # `bosn run --task unit`.  Fixed verbs remain reserved, so adding a task called
     # `status` never changes the meaning of `bosn status`.
-    if (
-        raw_argv
-        and not raw_argv[0].startswith("-")
-        and raw_argv[0]
-        not in {
-            *VERBS,
-            DAEMON_VERB,
-        }
-    ):
-        raw_argv = ["run", "--task", raw_argv[0], *raw_argv[1:]]
+    command_index: int | None = None
+    skip_value = False
+    for index, token in enumerate(raw_argv):
+        if skip_value:
+            skip_value = False
+            continue
+        if token in _GLOBAL_VALUE_FLAGS:
+            skip_value = True
+            continue
+        if token.startswith("--"):
+            continue
+        command_index = index
+        break
+    if command_index is not None and raw_argv[command_index] not in {*VERBS, DAEMON_VERB}:
+        task = raw_argv[command_index]
+        raw_argv[command_index : command_index + 1] = ["run", "--task", task]
     parser = build_parser()
     ns = parser.parse_args(raw_argv)
     opts = from_namespace(ns)
