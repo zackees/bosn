@@ -93,7 +93,12 @@ def served(tmp_path: Path, builder: ControlledBuilder) -> Iterator[Daemon]:
 def converge_events(daemon: Daemon, project: Path, **extra):
     return ipc.stream_request(
         daemon.port,
-        {"verb": "converge", "manifest": str(project / "bosn.toml"), **extra},
+        {
+            "verb": "converge",
+            "manifest": str(project / "bosn.toml"),
+            "auth": daemon.secret,
+            **extra,
+        },
         timeout=30,
     )
 
@@ -136,7 +141,11 @@ def test_an_unreadable_manifest_is_reported_not_swallowed(served: Daemon, tmp_pa
     events = drain(
         ipc.stream_request(
             served.port,
-            {"verb": "converge", "manifest": str(tmp_path / "nope" / "bosn.toml")},
+            {
+                "verb": "converge",
+                "manifest": str(tmp_path / "nope" / "bosn.toml"),
+                "auth": served.secret,
+            },
             timeout=30,
         )
     )
@@ -161,7 +170,7 @@ def test_hanging_up_mid_build_leaves_the_job_running(
 
     assert served.jobs.get(job_id).state == "running", "the daemon kept the work"
 
-    listed = ipc.send_request(served.port, {"verb": "jobs"})["jobs"]
+    listed = ipc.send_request(served.port, {"verb": "jobs", "auth": served.secret})["jobs"]
     assert [row for row in listed if row["id"] == job_id and row["state"] == "running"]
 
 
@@ -173,7 +182,9 @@ def test_attach_reconnects_to_a_surviving_job(
     assert builder.started.wait(10)
     stream.close()
 
-    reattached = ipc.stream_request(served.port, {"verb": "attach", "job": job_id}, timeout=30)
+    reattached = ipc.stream_request(
+        served.port, {"verb": "attach", "job": job_id, "auth": served.secret}, timeout=30
+    )
     first = next(reattached)
     assert first["event"] == "attached"
     assert first["job"] == job_id
@@ -199,7 +210,11 @@ def test_rerunning_the_same_verb_reattaches_instead_of_rebuilding(
 
 
 def test_attaching_to_an_unknown_job_says_so(served: Daemon) -> None:
-    events = drain(ipc.stream_request(served.port, {"verb": "attach", "job": "nope"}, timeout=10))
+    events = drain(
+        ipc.stream_request(
+            served.port, {"verb": "attach", "job": "nope", "auth": served.secret}, timeout=10
+        )
+    )
     assert events[-1]["ok"] is False
     assert "no such job" in events[-1]["error"]
 
@@ -214,7 +229,7 @@ def test_cancel_stops_a_running_build_and_tells_the_watcher(
     job_id = next(stream)["job"]
     assert builder.started.wait(10)
 
-    reply = ipc.send_request(served.port, {"verb": "cancel", "job": job_id})
+    reply = ipc.send_request(served.port, {"verb": "cancel", "job": job_id, "auth": served.secret})
     assert reply["ok"]
 
     final = [e for e in stream if e.get("final")]
@@ -234,7 +249,7 @@ def test_a_cancelled_build_leaves_no_generation_row(
     stream = converge_events(served, project)
     job_id = next(stream)["job"]
     assert builder.started.wait(10)
-    ipc.send_request(served.port, {"verb": "cancel", "job": job_id})
+    ipc.send_request(served.port, {"verb": "cancel", "job": job_id, "auth": served.secret})
     drain(stream)
 
     assert served.registry.generation_superseded_at(digest) is None
@@ -246,7 +261,9 @@ def test_a_cancelled_build_leaves_no_generation_row(
 
 
 def test_cancelling_an_unknown_job_is_an_error(served: Daemon) -> None:
-    reply = ipc.send_request(served.port, {"verb": "cancel", "job": "j0-nope"})
+    reply = ipc.send_request(
+        served.port, {"verb": "cancel", "job": "j0-nope", "auth": served.secret}
+    )
     assert reply["ok"] is False
     assert "no such job" in reply["error"]
 
@@ -267,7 +284,7 @@ def test_a_running_job_blocks_idle_retirement(
         assert wait_until(lambda: daemon_mod.is_serving(state_dir))
         stream = ipc.stream_request(
             daemon.port,
-            {"verb": "converge", "manifest": str(project / "bosn.toml")},
+            {"verb": "converge", "manifest": str(project / "bosn.toml"), "auth": daemon.secret},
             timeout=30,
         )
         next(stream)
@@ -311,7 +328,7 @@ def test_a_job_that_never_reports_cannot_pin_the_daemon_forever(
         assert wait_until(lambda: daemon_mod.is_serving(state_dir))
         stream = ipc.stream_request(
             daemon.port,
-            {"verb": "converge", "manifest": str(project / "bosn.toml")},
+            {"verb": "converge", "manifest": str(project / "bosn.toml"), "auth": daemon.secret},
             timeout=30,
         )
         next(stream)
@@ -339,7 +356,9 @@ def test_shutdown_tells_attached_clients_why_their_build_stopped(
     assert wait_until(lambda: daemon_mod.is_serving(state_dir))
 
     stream = ipc.stream_request(
-        daemon.port, {"verb": "converge", "manifest": str(project / "bosn.toml")}, timeout=30
+        daemon.port,
+        {"verb": "converge", "manifest": str(project / "bosn.toml"), "auth": daemon.secret},
+        timeout=30,
     )
     job_id = next(stream)["job"]
     assert builder.started.wait(10)
@@ -359,7 +378,7 @@ def test_shutdown_tells_attached_clients_why_their_build_stopped(
 def test_jobs_verb_reports_real_jobs_not_a_placeholder(
     served: Daemon, project: Path, builder: ControlledBuilder
 ) -> None:
-    reply = ipc.send_request(served.port, {"verb": "jobs"})
+    reply = ipc.send_request(served.port, {"verb": "jobs", "auth": served.secret})
     assert reply["jobs"] == []
     assert reply["max_builds"] >= 1
 
@@ -367,7 +386,7 @@ def test_jobs_verb_reports_real_jobs_not_a_placeholder(
     job_id = next(stream)["job"]
     assert builder.started.wait(10)
 
-    listed = ipc.send_request(served.port, {"verb": "jobs"})["jobs"]
+    listed = ipc.send_request(served.port, {"verb": "jobs", "auth": served.secret})["jobs"]
     assert [row for row in listed if row["id"] == job_id]
     assert listed[0]["stack"] == "dev"
     stream.close()

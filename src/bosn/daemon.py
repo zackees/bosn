@@ -18,6 +18,7 @@ import errno
 import hashlib
 import json
 import os
+import secrets
 import socket
 import socketserver
 import subprocess
@@ -62,6 +63,17 @@ def state_file(state_dir: Path | None = None) -> Path:
 def heartbeat_file(state_dir: Path | None = None) -> Path:
     """A host-visible heartbeat consumed by persistent container PID 1 watchdogs."""
     return (state_dir or default_state_dir()) / "daemon.heartbeat"
+
+
+def secret_file(state_dir: Path | None = None) -> Path:
+    return (state_dir or default_state_dir()) / "daemon.secret"
+
+
+def _secret(state_dir: Path | None = None) -> str:
+    try:
+        return secret_file(state_dir).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 def port_for(state_dir: Path | None = None) -> int:
@@ -109,7 +121,9 @@ class DaemonState:
 def is_serving(state_dir: Path | None = None, *, timeout: float = 2.0) -> bool:
     """True when something answers the ping on this state dir's port."""
     try:
-        reply = ipc.send_request(port_for(state_dir), {"verb": "ping"}, timeout=timeout)
+        reply = ipc.send_request(
+            port_for(state_dir), {"verb": "ping", "auth": _secret(state_dir)}, timeout=timeout
+        )
     except ipc.TransportError:
         return False
     return bool(reply.get("ok"))
@@ -129,8 +143,19 @@ def running_state(state_dir: Path | None = None) -> DaemonState | None:
         path.unlink(missing_ok=True)
         return None
     if state is None:
-        # Serving but no readable metadata: report what we can prove.
-        return DaemonState(pid=0, port=port_for(state_dir), started_at=0.0, version="unknown")
+        # Serving but no readable metadata: report what the authenticated ping proves.
+        try:
+            reply = ipc.send_request(
+                port_for(state_dir), {"verb": "ping", "auth": _secret(state_dir)}
+            )
+            return DaemonState(
+                pid=int(reply.get("pid") or 0),
+                port=port_for(state_dir),
+                started_at=0.0,
+                version=str(reply.get("version") or "unknown"),
+            )
+        except ipc.TransportError:
+            return None
     return state
 
 
@@ -142,6 +167,24 @@ class _Handler(socketserver.StreamRequestHandler):
         daemon_ref: Daemon = self.server.daemon_ref  # type: ignore[attr-defined]
         daemon_ref.note_activity()
         verb = str(request.get("verb", ""))
+        if not secrets.compare_digest(str(request.get("auth") or ""), daemon_ref.secret):
+            daemon_ref.registry.log_event("ipc.unauthenticated", verb)
+            ipc.send_response(
+                self.connection, {"ok": False, "error": "unauthenticated IPC request"}
+            )
+            return
+        if str(request.get("version") or __version__) != __version__ and verb in {
+            "cancel",
+            "shutdown",
+        }:
+            ipc.send_response(
+                self.connection,
+                {
+                    "ok": False,
+                    "error": "daemon version differs; restart the daemon before destructive use",
+                },
+            )
+            return
         try:
             if verb in STREAMING_VERBS:
                 self._stream(daemon_ref, verb, request)
@@ -230,6 +273,7 @@ class Daemon:
         self.heartbeat_at = self.started_at
         self._server: _Server | None = None
         self._stop = threading.Event()
+        self.secret = secrets.token_urlsafe(32)
         self.registry = Registry(self.state_dir / "registry.sqlite3")
         self.jobs = JobManager(
             self._build,
@@ -287,6 +331,11 @@ class Daemon:
             version=__version__,
         ).write(state_file(self.state_dir))
         self._write_heartbeat()
+        secret_file(self.state_dir).write_text(self.secret, encoding="utf-8")
+        try:
+            os.chmod(secret_file(self.state_dir), 0o600)
+        except OSError:
+            pass
         self.registry.log_event("daemon.started", f"pid={os.getpid()} port={self.port}")
 
         threading.Thread(target=self._idle_watchdog, daemon=True).start()
@@ -331,6 +380,7 @@ class Daemon:
             self._server = None
         state_file(self.state_dir).unlink(missing_ok=True)
         heartbeat_file(self.state_dir).unlink(missing_ok=True)
+        secret_file(self.state_dir).unlink(missing_ok=True)
         try:
             self.registry.log_event("daemon.stopped", "")
             self.registry.close()
@@ -562,7 +612,7 @@ def spawn(state_dir: Path | None = None, *, timeout: float = SPAWN_TIMEOUT_SECON
     state_dir = state_dir or default_state_dir()
     if is_serving(state_dir):
         state = running_state(state_dir)
-        if state is not None:
+        if state is not None and state.pid:
             return state
 
     _detach(state_dir)
@@ -570,7 +620,7 @@ def spawn(state_dir: Path | None = None, *, timeout: float = SPAWN_TIMEOUT_SECON
     deadline = time.time() + timeout
     while time.time() < deadline:
         state = running_state(state_dir)
-        if state is not None:
+        if state is not None and state.pid:
             return state
         time.sleep(0.1)
     raise DaemonError(f"daemon did not answer on port {port_for(state_dir)} within {timeout:.0f}s")
@@ -593,7 +643,10 @@ def request(
         if not autostart:
             raise DaemonError("no bosn daemon is running")
         spawn(state_dir)
-    return ipc.send_request(port_for(state_dir), {"verb": verb, **payload})
+    return ipc.send_request(
+        port_for(state_dir),
+        {"verb": verb, "auth": _secret(state_dir), "version": __version__, **payload},
+    )
 
 
 def stream(
@@ -609,7 +662,10 @@ def stream(
         if not autostart:
             raise DaemonError("no bosn daemon is running")
         spawn(state_dir)
-    return ipc.stream_request(port_for(state_dir), {"verb": verb, **payload})
+    return ipc.stream_request(
+        port_for(state_dir),
+        {"verb": verb, "auth": _secret(state_dir), "version": __version__, **payload},
+    )
 
 
 def stop(state_dir: Path | None = None, *, timeout: float = 10.0) -> bool:
@@ -618,7 +674,11 @@ def stop(state_dir: Path | None = None, *, timeout: float = 10.0) -> bool:
     if not is_serving(state_dir):
         return False
     try:
-        ipc.send_request(port_for(state_dir), {"verb": "shutdown"}, timeout=timeout)
+        ipc.send_request(
+            port_for(state_dir),
+            {"verb": "shutdown", "auth": _secret(state_dir), "version": __version__},
+            timeout=timeout,
+        )
     except ipc.TransportError:
         pass
     deadline = time.time() + timeout
