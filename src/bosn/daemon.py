@@ -20,14 +20,13 @@ import json
 import os
 import socket
 import socketserver
+import subprocess
 import sys
 import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
-
-from running_process import daemon as rp_daemon
 
 from bosn import __version__, ipc
 from bosn.registry import Registry, default_state_dir
@@ -291,48 +290,57 @@ class Daemon:
 # -- client side -----------------------------------------------------------
 
 
-def spawn_daemon_available() -> bool:
-    """True when running-process can actually detach on this platform.
-
-    `spawn_daemon` needs a trampoline binary shipped in the wheel's assets directory.
-    running-process 4.10.1 publishes wheels without it on every platform, so the blessed
-    spawner is present in the API but not yet usable. Probing keeps the failure legible
-    instead of surfacing as a FileNotFoundError deep inside a spawn.
-    """
-    try:
-        # The *bundled* path inside the installed wheel -- not assets_dir(), which is the
-        # runtime hard-link cache and can hold a trampoline the spawner will not look at.
-        return rp_daemon.trampoline_source_path().exists()
-    except KeyboardInterrupt:
-        raise
-    except Exception:  # noqa: BLE001 - probe must never crash a caller
-        return False
-
-
 def _detach(state_dir: Path) -> int:
-    """Start a detached `bosn __daemon` via running-process's daemon spawner.
+    """Start a detached `bosn __daemon`.
 
-    `running_process.daemon.spawn_daemon` is the platform-blessed path: it detaches without
-    a console window on Windows, sets up its own runtime dir and log sidecar, and tracks the
-    pid. Hand-rolling this with subprocess flags pops a console on Windows, which is exactly
-    what a background supervisor must never do.
+    bosn deliberately does **not** use running-process's broker/daemon framework for this.
+    Both of its detachment entry points are clients of that framework rather than plain
+    process launches: `daemon.spawn_daemon` needs a bundled trampoline binary plus its own
+    runtime directory and sidecar JSON, and `launch_detached` dials a broker over
+    `\\\\.\\pipe\\running-process-daemon-<user>`. bosn owns exactly one daemon whose
+    singleton is already enforced by the port bind, so a second supervisor underneath it
+    buys nothing and adds a dependency that must be running before ours can start.
+
+    running-process remains our process API for *running* commands (see `engine.py`); this
+    is only about detaching our own daemon.
+
+    The Windows flag here is `CREATE_NO_WINDOW`, not `DETACHED_PROCESS`. `DETACHED_PROCESS`
+    means "do not inherit the parent's console", and Windows honors it by giving the child a
+    console of its own -- a terminal window pops up on the user's screen. `CREATE_NO_WINDOW`
+    gives it no console at all, which is what a background supervisor wants.
     """
-    if not spawn_daemon_available():
-        raise DaemonError(
-            "running-process cannot detach on this platform: its installed wheel ships no "
-            "bundled daemon-trampoline binary. Install a running-process build that "
-            "includes it, or start the daemon manually with `bosn __daemon`."
-        )
-    env = rp_daemon.build_daemon_env(dict(os.environ))
-    env["BOSN_STATE_DIR"] = str(state_dir)
-    argv = [sys.executable, "-m", "bosn", "__daemon", "--state-dir", str(state_dir)]
-    handle = rp_daemon.spawn_daemon(
-        argv,
-        name=f"{DAEMON_NAME}-{port_for(state_dir)}",
-        env=env,
-        log_path=str(state_dir / "daemon.log"),
-    )
-    return handle.pid
+    # The port is passed explicitly rather than recomputed by the child. port_for() is
+    # relative to default_state_dir(), which reads BOSN_STATE_DIR -- so a child with a
+    # different environment can derive a different port for the same directory and then
+    # bind somewhere the parent is not listening. Passing it makes the two agree by
+    # construction, and for the same reason the child's environment is left alone.
+    env = dict(os.environ)
+    argv = [
+        sys.executable,
+        "-m",
+        "bosn",
+        "__daemon",
+        "--state-dir",
+        str(state_dir),
+        "--port",
+        str(port_for(state_dir)),
+    ]
+
+    kwargs: dict[str, Any] = {
+        "env": env,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if sys.platform.startswith("win"):
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        # setsid: the daemon leaves our session, so it survives the shell that started it
+        # and never receives the terminal's Ctrl-C.
+        kwargs["start_new_session"] = True
+
+    return subprocess.Popen(argv, **kwargs).pid
 
 
 def spawn(state_dir: Path | None = None, *, timeout: float = SPAWN_TIMEOUT_SECONDS) -> DaemonState:
