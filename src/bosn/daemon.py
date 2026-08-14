@@ -334,7 +334,11 @@ def _detach(state_dir: Path) -> int:
         "close_fds": True,
     }
     if sys.platform.startswith("win"):
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+        # getattr: these constants only exist on Windows, and a type checker running on
+        # Linux does not know them.
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        )
     else:
         # setsid: the daemon leaves our session, so it survives the shell that started it
         # and never receives the terminal's Ctrl-C.
