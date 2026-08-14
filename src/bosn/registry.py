@@ -133,6 +133,10 @@ class Lease:
         return (now - self.heartbeat_at) > self.ttl_seconds
 
 
+class RegistryError(RuntimeError):
+    """A schema migration could not be completed safely."""
+
+
 class Registry:
     """A WAL-mode sqlite registry. Use as a context manager or call close()."""
 
@@ -289,16 +293,40 @@ class Registry:
             "(resource_id, workspace, stack, generation, last_used, state) "
             "SELECT id, workspace, stack, generation, last_used, state FROM resources"
         )
-        self._relax_lease_proc_start_nullability()
+        # Not gated on SCHEMA_VERSION like the v1->v2 step above: this shape change is
+        # backward-compatible (a NOT-NULL writer's INSERT still satisfies a nullable column,
+        # so an old and a new binary can both operate on either shape) and it is safe to run
+        # every open, so `PRAGMA table_info` introspection is the simpler, idempotent gate.
+        # Bumping SCHEMA_VERSION would only be needed if a future change made the old shape
+        # actively unsafe to read/write, which this one does not.
+        try:
+            self._relax_lease_proc_start_nullability()
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            raise RegistryError(
+                "registry migration 'relax_lease_proc_start_nullability' failed: "
+                f"{type(exc).__name__}: {exc}; the database was left unchanged (the migration "
+                "runs in its own transaction), so retry opening the registry -- if this "
+                "persists, back up and remove the registry file to rebuild it by rescanning "
+                "engine labels"
+            ) from exc
 
     def _relax_lease_proc_start_nullability(self) -> None:
         """Allow ``proc_start`` to be NULL for PID-only leases.
 
-        Databases created before this change have ``leases.proc_start REAL NOT NULL``.
-        A wall-clock fallback there is dangerous: if the identity probe fails at acquire
-        time but succeeds later during a liveness check, the stored value would not match
-        the process's real start time and a live holder's lease could look expired. SQLite
-        has no ``ALTER COLUMN``, so relaxing the constraint means rebuilding the table.
+        Databases created before this change have ``leases.proc_start REAL NOT NULL``. Every
+        row already stored there is a wall-clock guess, not a real process identity: the
+        pre-migration ``converge.py`` wrote ``registry.clock.now()`` at acquire time, which
+        essentially never matches the holder's real process start time (that would require
+        acquiring the lease within the liveness check's tolerance of the process's own
+        launch). Carrying that guess forward as if it were identity is actively dangerous --
+        a later liveness check would compare it against the real start time, find a mismatch,
+        and judge a live holder's lease expired, letting GC reap an in-use resource. So this
+        rebuild does not preserve legacy ``proc_start`` values at all: every migrated lease
+        becomes PID-only (``proc_start IS NULL``), which is exactly the semantics the nullable
+        column exists to express, and falls through to the safe PID-only liveness check.
+        SQLite has no ``ALTER COLUMN``, so relaxing the constraint means rebuilding the table.
         """
         columns = self.conn.execute("PRAGMA table_info(leases)").fetchall()
         proc_start_column = next((c for c in columns if c["name"] == "proc_start"), None)
@@ -319,7 +347,7 @@ class Registry:
             self.conn.execute(
                 "INSERT INTO leases_nullable"
                 "(id, resource_id, pid, proc_start, acquired_at, heartbeat_at, ttl_seconds) "
-                "SELECT id, resource_id, pid, proc_start, acquired_at, heartbeat_at, "
+                "SELECT id, resource_id, pid, NULL, acquired_at, heartbeat_at, "
                 "ttl_seconds FROM leases"
             )
             self.conn.execute("DROP TABLE leases")

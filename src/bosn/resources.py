@@ -201,7 +201,7 @@ def _parse_linux_process_start(
             if line.startswith("btime ")
         )
         return boot + (ticks / clock_ticks_per_sec)
-    except (IndexError, ValueError, StopIteration):
+    except (IndexError, ValueError, StopIteration, ZeroDivisionError):
         return None
 
 
@@ -223,25 +223,36 @@ def process_start_time(pid: int) -> float | None:
     if pid <= 0:
         return None
     if os.name == "nt":
-        # WMIC is removed on current Windows; PowerShell's CIM provider is available on
-        # every supported v1 host and returns the creation time without name guessing.
+        # WMIC is removed on current Windows; the CIM provider (Get-CimInstance) is
+        # available on every supported v1 host and returns the creation time without name
+        # guessing *and* without throwing on another user's process the way
+        # `(Get-Process -Id $pid).StartTime` does (access-denied there surfaces as a
+        # null-valued-expression error on stderr, which is discarded below).
         # Note: this spawns a PowerShell process (~1s) per call. process_alive() only
         # invokes it once a lease's TTL has already elapsed, so it is not on the hot path
         # of a normal heartbeat -- but a maintenance sweep iterating many expired leases
         # pays this cost per lease. A cache is deliberately not added here: keying on pid
         # alone is unsafe across PID reuse in a long-lived daemon, and there is no cheap
         # cache key (pid, start) available before the very probe the cache would replace.
-        result = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                f"(Get-Process -Id {pid}).StartTime.ToUniversalTime().Ticks",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}')"
+                    ".CreationDate.ToUniversalTime().Ticks",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            # Probe unavailable (missing/wedged powershell, timeout): process_alive()
+            # treats a None start time as "identity unknown" and fails open rather than
+            # ever deleting a resource that might belong to a live process.
+            return None
         return _parse_windows_process_start(result.stdout)
     if sys.platform == "linux":
         try:
@@ -250,11 +261,25 @@ def process_start_time(pid: int) -> float | None:
             clock_ticks_per_sec = os.sysconf("SC_CLK_TCK")
         except OSError:
             return None
+        if clock_ticks_per_sec is None or clock_ticks_per_sec <= 0:
+            return None
         return _parse_linux_process_start(stat_text, proc_stat_text, clock_ticks_per_sec)
     if sys.platform == "darwin":
-        result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "lstart="], capture_output=True, text=True, check=False
-        )
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "lstart="],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+                # `ps`'s day/month names (%a/%b) follow LC_TIME; pin to the "C" locale so
+                # the fixed English format `_parse_darwin_process_start` expects can never
+                # silently degrade identity checking to PID-only under a non-English locale.
+                env={**os.environ, "LC_ALL": "C"},
+            )
+        except (OSError, subprocess.SubprocessError):
+            # See the Windows branch above: probe unavailable -> fail open, never deletes.
+            return None
         return _parse_darwin_process_start(result.stdout)
     return None
 
@@ -273,6 +298,13 @@ def process_alive(pid: int, proc_start: float | None = None) -> bool:
     except ProcessLookupError:
         return False
     except PermissionError:
+        return True
+    except SystemError:
+        # Windows: os.kill(pid, 0) on another user's/SYSTEM's process raises SystemError
+        # (CPython returns a result with ERROR_ACCESS_DENIED still set as an exception,
+        # which is not an OSError subclass and would otherwise escape every handler here).
+        # Access-denied means the process exists and we cannot see it: treat as alive, the
+        # same fail-open posture as PermissionError above.
         return True
     except OSError:
         return False

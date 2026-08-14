@@ -29,6 +29,31 @@ REGISTERED = "registered"
 ROLLED = "rolled"
 CONTAINER_HEARTBEAT_TIMEOUT_SECONDS = 600
 
+# process_start_time() is a subprocess-spawning probe (~0.35s measured on Windows via
+# PowerShell) but its answer is constant for the life of this process, so it is memoized
+# here rather than re-probed once per lease dependency. Keyed on pid so a fork into a child
+# process (a different pid) cannot reuse the parent's cached value.
+_own_process_start_time_cache: tuple[int, float | None] | None = None
+
+
+def _own_process_start_time() -> float | None:
+    """Memoized ``process_start_time(os.getpid())`` for the current process.
+
+    Deliberately does not cache a ``None`` result: a probe failure may be transient (e.g. a
+    momentarily unavailable PowerShell/WMI provider), and re-probing outside any lock is
+    cheap, whereas caching ``None`` would downgrade every lease acquired by this process for
+    its entire lifetime to PID-only identity.
+    """
+    global _own_process_start_time_cache
+    pid = os.getpid()
+    cached = _own_process_start_time_cache
+    if cached is not None and cached[0] == pid:
+        return cached[1]
+    value = process_start_time(pid)
+    if value is not None:
+        _own_process_start_time_cache = (pid, value)
+    return value
+
 
 @dataclass(frozen=True)
 class ConvergeResult:
@@ -866,6 +891,18 @@ class Converger:
     def _acquire_execution_container(
         self, converged: ConvergeResult, *, stack_name: str | None, workspace: str
     ) -> tuple[str, tuple[Lease, ...]]:
+        # Computed before the write lock, not inside it: process_start_time() spawns a
+        # subprocess (~0.35s measured via PowerShell on Windows), and lifecycle_guard() holds
+        # a cross-process `BEGIN IMMEDIATE` exclusive write lock. Probing once per dependency
+        # inside that lock would hold it for an extra ~1.5s per converge (container + image +
+        # N volumes), pushing concurrent daemon writers -- which only have a 5s busy_timeout
+        # -- toward "database is locked". The value is constant for the life of this process,
+        # so one memoized probe outside the lock serves every dependency's lease.
+        #
+        # None falls through to the PID-only liveness check rather than a wall-clock guess
+        # that could later mismatch the real process start and make a live holder's lease
+        # look expired (see process_alive).
+        proc_start = _own_process_start_time()
         with self.registry.lifecycle_guard():
             name, container_id, resource, created = self._ensure_container_locked(
                 converged, stack_name=stack_name, workspace=workspace
@@ -886,10 +923,7 @@ class Converger:
                     self.registry.acquire_lease(
                         dependency.id,
                         pid=os.getpid(),
-                        # None falls through to the PID-only liveness check rather than a
-                        # wall-clock guess that could later mismatch the real process start
-                        # and make a live holder's lease look expired (see process_alive).
-                        proc_start=process_start_time(os.getpid()),
+                        proc_start=proc_start,
                     )
                     for dependency in dependencies
                 )

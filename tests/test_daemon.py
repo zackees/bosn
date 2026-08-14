@@ -335,6 +335,110 @@ def test_maintenance_deadline_persists_across_scheduler_wake(monkeypatch, tmp_pa
         wake.registry.close()
 
 
+def test_maintenance_logs_prune_leases_started_and_finished(monkeypatch, tmp_path: Path) -> None:
+    """Issue #45's dead-lease cleanup must be observable, not just idempotent."""
+    clock = FakeClock()
+
+    class ReachableEngine:
+        def __init__(self, _binary: str) -> None:
+            pass
+
+        def info(self) -> EngineInfo:
+            return EngineInfo(binary="docker", reachable=True)
+
+    class RecordingCollector:
+        def __init__(self, _registry, _engine, *, config=None) -> None:
+            pass
+
+        def collect(self, **_kwargs):
+            class Result:
+                def summary(self):
+                    return {"removed": 0}
+
+            return Result()
+
+    import bosn.engine
+    import bosn.gc
+    import bosn.resources
+
+    monkeypatch.setattr(bosn.engine, "Engine", ReachableEngine)
+    monkeypatch.setattr(bosn.gc, "Collector", RecordingCollector)
+    monkeypatch.setattr(bosn.resources, "prune_dead_leases", lambda _registry: ["lease-1"])
+    daemon = Daemon(state_dir=tmp_path, clock=clock, maintenance_interval_seconds=60)
+    try:
+        assert daemon.run_maintenance_if_due() is True
+        # events() returns newest-first; reverse to read the pass in chronological order.
+        events = [(row["kind"], row["detail"]) for row in reversed(daemon.registry.events())]
+        kinds = [kind for kind, _detail in events]
+        assert "maintenance.prune_leases.started" in kinds
+        assert ("maintenance.prune_leases.finished", "pruned=1") in events
+        # Prune runs strictly between reap and gc.
+        assert kinds.index("maintenance.reap.finished") < kinds.index(
+            "maintenance.prune_leases.started"
+        )
+        assert kinds.index("maintenance.prune_leases.finished") < kinds.index(
+            "maintenance.gc.started"
+        )
+    finally:
+        daemon.registry.close()
+
+
+def test_maintenance_prune_leases_failure_is_logged_and_does_not_block_gc(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A pruning failure must be visible, and the pass must still continue on to GC."""
+    clock = FakeClock()
+
+    class ReachableEngine:
+        def __init__(self, _binary: str) -> None:
+            pass
+
+        def info(self) -> EngineInfo:
+            return EngineInfo(binary="docker", reachable=True)
+
+    gc_calls: list[str] = []
+
+    class RecordingCollector:
+        def __init__(self, _registry, _engine, *, config=None) -> None:
+            pass
+
+        def collect(self, **_kwargs):
+            gc_calls.append("gc")
+
+            class Result:
+                def summary(self):
+                    return {"removed": 0}
+
+            return Result()
+
+    def _boom(_registry):
+        raise RuntimeError("lease table is locked")
+
+    import bosn.engine
+    import bosn.gc
+    import bosn.resources
+
+    monkeypatch.setattr(bosn.engine, "Engine", ReachableEngine)
+    monkeypatch.setattr(bosn.gc, "Collector", RecordingCollector)
+    monkeypatch.setattr(bosn.resources, "prune_dead_leases", _boom)
+    daemon = Daemon(state_dir=tmp_path, clock=clock, maintenance_interval_seconds=60)
+    try:
+        assert daemon.run_maintenance_if_due() is True
+        events = [(row["kind"], row["detail"]) for row in daemon.registry.events()]
+        kinds = [kind for kind, _detail in events]
+        assert "maintenance.prune_leases.started" in kinds
+        assert any(
+            kind == "maintenance.prune_leases.error" and "lease table is locked" in detail
+            for kind, detail in events
+        )
+        assert "maintenance.prune_leases.finished" not in kinds
+        # A pruning failure must not block the rest of the maintenance pass.
+        assert "maintenance.gc.started" in kinds
+        assert gc_calls == ["gc"]
+    finally:
+        daemon.registry.close()
+
+
 def test_malformed_persisted_maintenance_deadline_recovers(tmp_path: Path) -> None:
     clock = FakeClock()
     registry_path = tmp_path / "registry.sqlite3"
