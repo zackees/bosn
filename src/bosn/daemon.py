@@ -45,6 +45,11 @@ SPAWN_TIMEOUT_SECONDS = 30.0
 # Verbs that hold the connection open and write many messages instead of one.
 STREAMING_VERBS = frozenset({"converge", "attach"})
 
+# How long shutdown waits for cancelled builds to finish tearing down and release the
+# registry. Must exceed a builder's worst case (Engine.stream waits 30s for the process,
+# then converge still has its registry writes and volume creation to finish).
+SHUTDOWN_DRAIN_SECONDS = 60.0
+
 
 class DaemonError(RuntimeError):
     """The daemon could not be started, reached, or stopped."""
@@ -301,9 +306,16 @@ class Daemon:
 
     def shutdown(self) -> None:
         self._stop.set()
-        # Cancel in-flight builds before closing the registry they write to. Each one tells
-        # its attached clients why it stopped rather than dying silently.
-        self.jobs.shutdown()
+        # Cancel in-flight builds and wait for them *before* closing the registry they
+        # write to. Each one tells its attached clients why it stopped rather than dying
+        # silently.
+        #
+        # The timeout has to cover a builder's whole teardown, not just the kill: a
+        # cancelled build waits up to 30s for the process to die and then still finishes
+        # its converge. Closing the registry underneath it would turn a build that actually
+        # succeeded into a failure, and leave the image and volumes Docker just created
+        # with no registry rows -- the untracked resources bosn exists to prevent.
+        self.jobs.shutdown(timeout=SHUTDOWN_DRAIN_SECONDS)
         if self._server is not None:
             self._server.server_close()
             self._server = None
@@ -425,6 +437,12 @@ class Daemon:
         This is where the registry actually becomes single-writer for converge: the build
         and the generation/resource rows it produces both happen here, in the process that
         outlives the CLI.
+
+        The manifest is re-read here rather than carried over from submission, so the
+        digest built is the one the spec has *now*. The job's own digest is a snapshot taken
+        at submit time and is only ever a coalescing key -- if the Dockerfile changed again
+        while this job sat in the pending slot, converging to the newer content is the
+        right answer, and the ConvergeResult reports the digest actually built.
         """
         from bosn.converge import Converger
         from bosn.engine import Engine, EngineError
@@ -444,13 +462,24 @@ class Daemon:
                 str(job.payload.get("stack") or "") or None, workspace=job.workspace
             )
         except EngineError as exc:
-            job.log(str(exc), stream="stderr")
+            # Truncated: a build failure's message embeds the failed command's whole
+            # output, which for `docker build` is the entire transcript -- already streamed
+            # line by line. Logging it whole would duplicate the build into one enormous
+            # event and evict real output from the ring buffer.
+            job.log(_clip(str(exc)), stream="stderr")
             return BuildOutcome(returncode=1)
         return BuildOutcome(returncode=0, result=result.to_dict())
 
     def _verb_shutdown(self, _request: dict[str, Any]) -> dict[str, Any]:
         self.request_stop()
         return {"ok": True, "stopping": True}
+
+
+def _clip(text: str, limit: int = 2000) -> str:
+    """Keep the tail of an over-long message -- the end of a build log is the useful part."""
+    if len(text) <= limit:
+        return text
+    return f"[...{len(text) - limit} characters elided...] {text[-limit:]}"
 
 
 # -- client side -----------------------------------------------------------

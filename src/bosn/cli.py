@@ -344,19 +344,19 @@ def cmd_attach(opts: Options) -> int:
         print("attach needs a job id; see `bosn jobs`", file=sys.stderr)
         return 2
     try:
-        final = _drive_job(daemon_mod.stream("attach", opts.state_dir, job=job_id))
+        # autostart=False: attaching asks about a job that already exists, and a daemon we
+        # just started cannot have one. Spawning here would spend 30s to answer "no such
+        # job" instead of the truth, which is that nothing is running.
+        final = _drive_job(daemon_mod.stream("attach", opts.state_dir, autostart=False, job=job_id))
+        # Same terminal-event handling as `run`, so a superseded job exits 4 here too
+        # rather than being flattened into a generic failure.
+        _result_or_raise(final)
     except JobFailed as exc:
         print(str(exc), file=sys.stderr)
         return exc.exit_code
     except (daemon_mod.DaemonError, ipc.TransportError) as exc:
         print(f"cannot reach the bosn daemon: {exc}", file=sys.stderr)
         return 1
-    state = final.get("state")
-    if state != "succeeded":
-        print(
-            f"job {job_id} ended as {state}: {final.get('error') or ''}".rstrip(), file=sys.stderr
-        )
-        return CANCELLED_EXIT if state == "cancelled" else BUILD_FAILED_EXIT
     print(f"job {job_id} succeeded", file=sys.stderr)
     return 0
 

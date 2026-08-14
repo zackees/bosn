@@ -204,6 +204,47 @@ class Job:
             if watcher in self._watchers:
                 self._watchers.remove(watcher)
 
+    def finalize(
+        self,
+        state: str,
+        *,
+        error: str | None,
+        returncode: int | None,
+        result: dict[str, Any] | None,
+    ) -> bool:
+        """Move to a terminal state and notify, as one atomic step. True if this call did it.
+
+        The atomicity is the point, and it is subtle. `watch()` decides whether to register
+        a watcher or hand back the terminal event directly, based on `self.state` -- so if
+        the terminal transition were spread over several statements, a `watch()` landing in
+        the middle would see the terminal state, synthesize an event from fields not yet
+        written (no returncode, no error, empty result), and skip registering, so the real
+        event never reached it. A client hitting that window would be told its build
+        succeeded and handed an empty ConvergeResult, i.e. an empty image tag.
+
+        Everything therefore happens under the same lock `watch()` takes, which leaves only
+        two orderings: watch-then-finalize (registered, gets the real event) and
+        finalize-then-watch (sees a fully written job and gets a complete summary).
+        """
+        with self._lock:
+            if self.state in TERMINAL_STATES:
+                return False
+            self.state = state
+            self.ended_at = time.time()
+            self.error = error
+            self.returncode = returncode
+            if result:
+                self.result = result
+            self.done.set()
+            event = self.summary(final=True)
+            watchers = list(self._watchers)
+            self._watchers.clear()
+        # Outside the lock only because it need not be inside; SimpleQueue.put is unbounded
+        # and never blocks, so holding it would also have been safe.
+        for watcher in watchers:
+            watcher.put(event)
+        return True
+
     def log(self, line: str, stream: str = "stdout") -> None:
         self.emit({"event": "log", "stream": stream, "line": line})
 
@@ -293,8 +334,20 @@ class JobManager:
                 raise JobError("the daemon is shutting down; no new jobs are accepted")
             slot = self._slots.setdefault((workspace, stack), _Slot())
 
-            # 2. identical work already in flight -- join it rather than build twice
-            if slot.active is not None and slot.active.digest == digest:
+            # 2. identical work already in flight -- join it rather than build twice.
+            #
+            # Unless it is already dying. A cancelled job stays `active` until its builder
+            # notices and tears down, which can take a while (killing a build, or a TTL
+            # reap of a build that is ignoring the kill). Joining it would hand the new
+            # request the corpse's CANCELLED event: `bosn cancel` immediately followed by
+            # `bosn run` would build nothing and exit 5, and after a TTL reap *every*
+            # subsequent run for that digest would do the same until the old process
+            # finally died -- an agent loop wedged by a job it never asked about.
+            if (
+                slot.active is not None
+                and slot.active.digest == digest
+                and not slot.active.cancelled.is_set()
+            ):
                 return Submission(slot.active, joined=True)
 
             # 1. nothing in flight for this key
@@ -346,6 +399,12 @@ class JobManager:
 
     def _pump(self) -> None:
         """Start as many queued jobs as the machine-wide cap allows. Caller holds the lock."""
+        # Never start new work while shutting down. `shutdown` cancels in-flight jobs one at
+        # a time, releasing the lock between each, so without this a job finishing in that
+        # gap would promote its pending successor and launch a fresh `docker build` for a
+        # daemon that is on its way out.
+        if self._stopped:
+            return
         while self._running < self.max_builds and self._cap_queue:
             job = self._cap_queue.popleft()
             if job.finished:
@@ -355,6 +414,9 @@ class JobManager:
             self._running += 1
             job.emit(job.summary())
             thread = threading.Thread(target=self._run, args=(job,), daemon=True)
+            # Dead threads are dropped here rather than accumulating for the daemon's
+            # lifetime; an agent loop starts one per edit.
+            self._threads = [t for t in self._threads if t.is_alive()]
             self._threads.append(thread)
             thread.start()
 
@@ -414,16 +476,8 @@ class JobManager:
         result: dict[str, Any] | None = None,
     ) -> None:
         """Move a job to a terminal state exactly once and tell everyone watching."""
-        if job.finished:
+        if not job.finalize(state, error=error, returncode=returncode, result=result):
             return
-        job.state = state
-        job.ended_at = time.time()
-        job.error = error
-        job.returncode = returncode
-        if result:
-            job.result = result
-        job.done.set()
-        job.emit(job.summary(final=True))
         self._prune_history()
 
     def _prune_history(self) -> None:
@@ -478,20 +532,27 @@ class JobManager:
         retires and resources that never get collected.
         """
         now = now if now is not None else time.time()
-        expired: list[Job] = []
+        candidates: list[Job] = []
         with self._lock:
             for job in list(self._jobs.values()):
                 if job.state != RUNNING or job.started_at is None:
                     continue
-                age = now - job.started_at
-                if age > self.ttl_seconds:
-                    expired.append(job)
-        for job in expired:
+                # Already reaped: a cancelled build stays RUNNING until its builder tears
+                # down, which can take tens of seconds. Without this the watchdog reaps it
+                # again on every 0.5s tick and writes an event row each time.
+                if job.cancelled.is_set():
+                    continue
+                if now - job.started_at > self.ttl_seconds:
+                    candidates.append(job)
+
+        reaped: list[Job] = []
+        for job in candidates:
             try:
                 self.cancel(job.id, reason=f"exceeded the {self.ttl_seconds:.0f}s build TTL")
             except JobError:
                 continue  # it finished on its own between the scan and the cancel
-        return expired
+            reaped.append(job)
+        return reaped
 
     # -- observation -------------------------------------------------------
 

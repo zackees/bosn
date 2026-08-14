@@ -424,6 +424,127 @@ def test_follow_heartbeats_so_a_quiet_build_is_not_mistaken_for_a_dead_daemon(
     assert any(e["event"] == "heartbeat" for e in seen)
 
 
+# -- regressions -----------------------------------------------------------
+
+
+def test_the_terminal_transition_is_atomic_against_watch(manager: JobManager) -> None:
+    """A job must never be observable as "terminal but not yet filled in".
+
+    `watch()` branches on the job's state: terminal means "hand back the summary and do not
+    register". So if the transition set the state first and the fields after, a `watch()`
+    landing between them would synthesize a summary with no returncode, no error and an
+    empty result -- and, having taken the terminal branch, would never be registered for
+    the real event. The client is told its build succeeded and handed an empty
+    ConvergeResult, which downstream becomes `docker run` against an empty image tag.
+
+    Racing that window directly is hopeless -- it is a handful of statements wide, and an
+    earlier version of this test ran 200 attempts without once landing in it. So this tests
+    the property instead: hold the lock `watch()` uses, and no part of the transition may
+    become visible while it is held.
+    """
+    job = submit(manager, "sha256:atomic").job
+    assert wait_until(lambda: job.state == RUNNING)
+
+    finalized = threading.Thread(
+        target=job.finalize,
+        args=(SUCCEEDED,),
+        kwargs={"error": None, "returncode": 0, "result": {"digest": "sha256:atomic"}},
+        daemon=True,
+    )
+    with job._lock:
+        finalized.start()
+        time.sleep(0.1)  # ample time for an unsynchronized write to land
+        assert job.state == RUNNING, "state changed while the watch() lock was held"
+        assert job.result == {}, "fields were written outside the lock"
+
+    finalized.join(timeout=5)
+    assert job.state == SUCCEEDED
+    assert job.result == {"digest": "sha256:atomic"}
+    assert job.returncode == 0
+
+
+def test_a_watcher_registered_before_the_job_settles_gets_the_complete_event(
+    manager: JobManager, builder: SlowBuilder
+) -> None:
+    """And the other ordering: a watcher already attached receives the full terminal event."""
+    job = submit(manager, "sha256:watched").job
+    assert wait_until(lambda: job.state == RUNNING)
+    watcher = job.watch()
+
+    builder.release.set()
+    assert wait_until(lambda: job.finished)
+
+    events = []
+    while True:
+        event = watcher.get(timeout=5)
+        events.append(event)
+        if event.get("final"):
+            break
+    assert events[-1]["state"] == SUCCEEDED
+    assert events[-1]["result"] == {"digest": "sha256:watched"}
+    assert events[-1]["returncode"] == 0
+
+
+def test_a_watcher_arriving_after_the_job_settles_gets_the_complete_event(
+    manager: JobManager, builder: SlowBuilder
+) -> None:
+    """...as does one that shows up late, which is what `bosn attach` does."""
+    job = submit(manager, "sha256:late").job
+    builder.release.set()
+    assert wait_until(lambda: job.finished)
+
+    watcher = job.watch()
+    events = []
+    while not watcher.empty():
+        events.append(watcher.get_nowait())
+    assert events[-1]["final"] is True
+    assert events[-1]["result"] == {"digest": "sha256:late"}
+    assert events[-1]["returncode"] == 0
+
+
+def test_a_new_request_does_not_join_a_job_that_is_already_being_cancelled(
+    manager: JobManager, builder: SlowBuilder
+) -> None:
+    """A cancelled build stays RUNNING until its builder tears down.
+
+    Joining it would hand the newcomer the corpse's CANCELLED event -- so `bosn cancel`
+    followed by `bosn run` would build nothing and exit 5, and after a TTL reap of a build
+    that ignores the kill, every subsequent run for that digest would do the same.
+    """
+    doomed = submit(manager, "sha256:doomed").job
+    assert wait_until(lambda: doomed.state == RUNNING)
+
+    doomed.cancelled.set()  # cancelled, but the builder has not noticed yet
+    assert doomed.state == RUNNING
+
+    again = submit(manager, "sha256:doomed")
+    assert not again.joined, "a dying job must not be joined"
+    assert again.job is not doomed
+    assert again.job.state == PENDING
+
+    builder.release.set()
+    assert wait_until(lambda: again.job.finished)
+    assert again.job.state == SUCCEEDED, "the newcomer got its own real build"
+
+
+def test_the_ttl_reaper_does_not_re_reap_a_build_that_is_still_dying(
+    builder: SlowBuilder,
+) -> None:
+    """reap_expired runs twice a second; a cancelled build can take tens of seconds to go."""
+    manager = JobManager(builder, max_builds=2, ttl_seconds=0.1)
+    job = manager.submit(workspace=WORKSPACE, stack=STACK, digest="sha256:wedged").job
+    try:
+        assert wait_until(lambda: job.state == RUNNING)
+        time.sleep(0.2)
+
+        assert manager.reap_expired() == [job], "the first pass reaps it"
+        job.state = RUNNING  # simulate a builder that has not torn down yet
+        assert manager.reap_expired() == [], "later passes must not reap it again"
+    finally:
+        job.state = CANCELLED
+        manager.shutdown(timeout=5)
+
+
 # -- reporting -------------------------------------------------------------
 
 

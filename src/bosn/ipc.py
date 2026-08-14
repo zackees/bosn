@@ -26,6 +26,8 @@ DEFAULT_TIMEOUT = 10.0
 # Generous, because a cold build is silent for long stretches -- but not infinite, because
 # a client must eventually notice a daemon that died. The daemon heartbeats well inside it.
 STREAM_TIMEOUT = 120.0
+# A connected client that has not sent its request by now is not going to.
+REQUEST_READ_TIMEOUT = 30.0
 
 
 class TransportError(RuntimeError):
@@ -121,11 +123,24 @@ def stream_request(
 
 
 def read_request(conn: socket.socket) -> dict[str, Any] | None:
-    """Server side: read one newline-delimited JSON request, or None on clean EOF."""
+    """Server side: read one newline-delimited JSON request, or None on clean EOF.
+
+    The read is deadlined even though the daemon is patient elsewhere. A client always
+    writes its request immediately, so a connection that opens and then says nothing is a
+    port scanner, a half-open socket, or a CLI killed mid-handshake -- and with no timeout
+    each one parks a handler thread in `recv` forever. Daemon threads keep that from
+    blocking process exit, but they accumulate without bound in a process meant to stay
+    resident for hours.
+
+    The deadline is then cleared: it governs reading the request, not the minutes or hours
+    of build output that a streaming verb may go on to write.
+    """
     try:
-        return MessageStream(conn, timeout=None).read()
+        request = MessageStream(conn, timeout=REQUEST_READ_TIMEOUT).read()
     except TransportError:
         return None
+    conn.settimeout(None)
+    return request
 
 
 def send_response(conn: socket.socket, response: dict[str, Any]) -> None:

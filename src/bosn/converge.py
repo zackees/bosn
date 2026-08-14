@@ -140,8 +140,18 @@ class Converger:
         # doing it before the build means one cancelled build marks the *previous, working*
         # image for early collection in favor of an image that never got built. Nothing
         # about this generation is written until `docker build` has exited 0.
+        self._abort_if_cancelled()
         image_tag = image_tag_for(stack, digest)
         self._ensure_image(stack, digest, image_tag, workspace)
+
+        # The last point at which stopping is free. Past here the registry gets written and
+        # volumes get created, and `docker build` is no longer the only slow step -- so
+        # without this checkpoint a cancel arriving during a *warm* converge (image already
+        # present, nothing to build, nothing that consults the cancel flag) would be
+        # reported as "cancelled" only after this generation had already superseded its
+        # predecessor. Telling a user nothing happened while their previous generation went
+        # on retention's 24-hour clock is worse than either outcome on its own.
+        self._abort_if_cancelled()
 
         self.registry.record_generation(digest, stack.name)
         volumes = self._ensure_volumes(stack, digest, workspace)
@@ -164,11 +174,15 @@ class Converger:
             superseded=superseded,
         )
 
+    def _abort_if_cancelled(self) -> None:
+        if self.cancelled is not None and self.cancelled.is_set():
+            raise EngineError("converge was cancelled")
+
     def _generation_recorded(self, digest: str) -> bool:
-        row = self.registry.conn.execute(
-            "SELECT 1 FROM generations WHERE digest = ?", (digest,)
-        ).fetchone()
-        return row is not None
+        # Through the registry's own accessor, not `registry.conn` directly: that accessor
+        # holds the lock keeping this one sqlite connection single-writer, and converge now
+        # runs on up to `max_builds` daemon threads at once rather than alone in the CLI.
+        return self.registry.generation_recorded(digest)
 
     def _resource_labels(
         self, stack: StackSpec, kind: str, digest: str, scope: str, workspace: str
