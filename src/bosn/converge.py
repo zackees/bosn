@@ -21,7 +21,7 @@ from bosn import labels
 from bosn.engine import Engine, EngineError
 from bosn.manifest import Manifest, StackSpec, dockerfile_external_images, generation_digest
 from bosn.registry import Lease, Registry, Resource
-from bosn.resources import ResourceScanner
+from bosn.resources import ResourceScanner, process_start_time
 
 # What converge did, in the order of increasing work.
 REUSED = "reused"
@@ -886,7 +886,7 @@ class Converger:
                     self.registry.acquire_lease(
                         dependency.id,
                         pid=os.getpid(),
-                        proc_start=self.registry.clock.now(),
+                        proc_start=process_start_time(os.getpid()) or self.registry.clock.now(),
                     )
                     for dependency in dependencies
                 )

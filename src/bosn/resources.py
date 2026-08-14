@@ -14,7 +14,11 @@ Automatic deletion requires complete ownership proof, which is why there is no `
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from bosn import labels
 from bosn.clock import Clock, SystemClock
@@ -166,6 +170,56 @@ class ResourceScanner:
 # -- leases ----------------------------------------------------------------
 
 
+PROCESS_START_TOLERANCE_SECONDS = 2.0
+
+
+def process_start_time(pid: int) -> float | None:
+    """Return an epoch creation time from an OS-owned process identity source."""
+    if pid <= 0:
+        return None
+    if os.name == "nt":
+        # WMIC is removed on current Windows; PowerShell's CIM provider is available on
+        # every supported v1 host and returns the creation time without name guessing.
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"(Get-Process -Id {pid}).StartTime.ToUniversalTime().Ticks",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        try:
+            return (int(result.stdout.strip()) / 10_000_000) - 62_135_596_800
+        except ValueError:
+            return None
+    if sys.platform == "linux":
+        try:
+            fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+            ticks = int(fields[19])
+            boot = next(
+                int(line.split()[1])
+                for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines()
+                if line.startswith("btime ")
+            )
+            return boot + (ticks / os.sysconf("SC_CLK_TCK"))
+        except (OSError, ValueError, StopIteration):
+            return None
+    if sys.platform == "darwin":
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="], capture_output=True, text=True, check=False
+        )
+        try:
+            import datetime as dt
+
+            return dt.datetime.strptime(result.stdout.strip(), "%a %b %d %H:%M:%S %Y").timestamp()
+        except ValueError:
+            return None
+    return None
+
+
 def process_alive(pid: int, proc_start: float | None = None) -> bool:
     """Liveness probe for a lease holder.
 
@@ -176,8 +230,6 @@ def process_alive(pid: int, proc_start: float | None = None) -> bool:
     if pid <= 0:
         return False
     try:
-        import os
-
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
@@ -185,7 +237,12 @@ def process_alive(pid: int, proc_start: float | None = None) -> bool:
         return True
     except OSError:
         return False
-    return True
+    if proc_start is None:
+        return True
+    actual = process_start_time(pid)
+    # An unavailable identity probe fails conservatively: it may leak a lease but never
+    # deletes resources belonging to a live process.
+    return actual is None or abs(actual - proc_start) <= PROCESS_START_TOLERANCE_SECONDS
 
 
 def lease_is_expired(
