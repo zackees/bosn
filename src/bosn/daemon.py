@@ -410,12 +410,12 @@ class Daemon:
             "stack": stack.name,
             "superseded": submission.superseded.id if submission.superseded else None,
         }
-        yield from self.jobs.follow(job, stop=self._stop)
+        yield from self.jobs.follow(job)
 
     def _verb_attach(self, request: dict[str, Any]) -> Iterator[dict[str, Any]]:
         job = self.jobs.get(str(request.get("job") or ""))
         yield {"event": "attached", "job": job.id, "state": job.state}
-        yield from self.jobs.follow(job, stop=self._stop)
+        yield from self.jobs.follow(job)
 
     # -- the builder -------------------------------------------------------
 

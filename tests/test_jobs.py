@@ -438,6 +438,42 @@ def test_list_jobs_reports_state_for_every_job(manager: JobManager, builder: Slo
     assert listed[running.id]["workspace"] == WORKSPACE
 
 
+def test_finished_jobs_do_not_accumulate_forever(builder: SlowBuilder) -> None:
+    """An agent loop keeps the daemon resident, so unbounded job history is a real leak."""
+    manager = JobManager(builder, max_builds=4, ttl_seconds=3600, max_history=5)
+    builder.release.set()
+    try:
+        jobs = []
+        for edit in range(20):
+            job = manager.submit(workspace=WORKSPACE, stack=STACK, digest=f"sha256:{edit:064x}").job
+            jobs.append(job)
+            assert wait_until(lambda j=job: j.finished or j.state == PENDING)
+        assert wait_until(lambda: manager.active_count() == 0)
+
+        assert len(manager.list_jobs()) <= 5, "old jobs must be forgotten"
+        newest = manager.list_jobs()[-1]
+        assert newest["id"] == jobs[-1].id, "the most recent job is the one kept"
+    finally:
+        manager.shutdown(timeout=5)
+
+
+def test_pruning_never_forgets_a_running_job(builder: SlowBuilder) -> None:
+    """Forgetting live work would lose the daemon's own build."""
+    manager = JobManager(builder, max_builds=4, ttl_seconds=3600, max_history=1)
+    try:
+        live = manager.submit(workspace="/w/live", stack=STACK, digest="sha256:live").job
+        assert wait_until(lambda: live.state == RUNNING)
+
+        for edit in range(5):
+            other = manager.submit(workspace=f"/w/{edit}", stack=STACK, digest=f"sha256:{edit}").job
+            manager.cancel(other.id)
+
+        assert manager.get(live.id) is live, "the running job survived every prune"
+        assert live.state == RUNNING
+    finally:
+        manager.shutdown(timeout=5)
+
+
 def test_a_builder_that_raises_fails_its_job_and_not_the_daemon() -> None:
     def explode(job: Job) -> BuildOutcome:
         raise RuntimeError("builder blew up")

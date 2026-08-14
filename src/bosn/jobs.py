@@ -70,6 +70,11 @@ DEFAULT_TTL_SECONDS = 3600.0
 # Keep the tail of a job's output for late attachers without letting a chatty build grow
 # the daemon's heap without bound.
 MAX_LOG_LINES = 5000
+# How many finished jobs stay listable and attachable. Bounding this matters for the same
+# reason the queue is bounded: an agent loop submits continuously and keeps the daemon
+# resident while it does, so "remember every job forever" is a leak that only shows up
+# under exactly the workload this design is for. Older jobs are forgotten, not their work.
+MAX_FINISHED_JOBS = 50
 
 
 def default_max_builds() -> int:
@@ -255,11 +260,13 @@ class JobManager:
         *,
         max_builds: int | None = None,
         ttl_seconds: float | None = None,
+        max_history: int = MAX_FINISHED_JOBS,
         on_settled: Callable[[], None] | None = None,
     ) -> None:
         self.builder = builder
         self.max_builds = max_builds if max_builds is not None else default_max_builds()
         self.ttl_seconds = ttl_seconds if ttl_seconds is not None else default_ttl_seconds()
+        self.max_history = max_history
         self.on_settled = on_settled
 
         self._lock = threading.RLock()
@@ -417,6 +424,22 @@ class JobManager:
             job.result = result
         job.done.set()
         job.emit(job.summary(final=True))
+        self._prune_history()
+
+    def _prune_history(self) -> None:
+        """Forget the oldest finished jobs. Caller holds the lock.
+
+        Only finished jobs are ever dropped, so this can never lose track of work that is
+        still running. A forgotten job id stops resolving, which `attach` and `cancel`
+        report as "no such job" -- the honest answer.
+        """
+        finished = [job for job in self._jobs.values() if job.finished]
+        excess = len(finished) - self.max_history
+        if excess <= 0:
+            return
+        finished.sort(key=lambda job: job.ended_at or job.created_at)
+        for job in finished[:excess]:
+            self._jobs.pop(job.id, None)
 
     # -- cancellation ------------------------------------------------------
 
@@ -511,20 +534,22 @@ class JobManager:
                 return 0
             return int(slot.active is not None) + int(slot.pending is not None)
 
-    def follow(
-        self, job: Job, *, heartbeat: float = 30.0, stop: threading.Event | None = None
-    ) -> Iterator[dict[str, Any]]:
+    def follow(self, job: Job, *, heartbeat: float = 30.0) -> Iterator[dict[str, Any]]:
         """Yield a job's events until it ends, with heartbeats so silence is not death.
 
         A cold build can go minutes without printing. Without a heartbeat the client cannot
         distinguish a quiet build from a daemon that died, and would have to choose between
         a timeout that kills long builds and one that hangs forever.
+
+        This deliberately ends only at the job's terminal event, and not on daemon
+        shutdown: shutdown cancels every in-flight job first, so waiting for the terminal
+        event is what lets an attached client be *told* it was cancelled. Bailing out on
+        the stop signal would race that message and leave the client with a bare dropped
+        connection instead of a reason.
         """
         watcher = job.watch()
         try:
             while True:
-                if stop is not None and stop.is_set():
-                    return
                 try:
                     event = watcher.get(timeout=heartbeat)
                 except queue.Empty:

@@ -114,7 +114,10 @@ class Engine:
                 if isinstance(line, rp.EndOfStream):
                     break
                 if line is None:
-                    if process.finished and not process.has_pending_output:
+                    # `finished` is a property but `has_pending_output` is a method -- calling
+                    # one and not the other silently turns this into `not <bound method>`,
+                    # i.e. never true, and the drain guard stops guarding anything.
+                    if process.finished and not process.has_pending_output():
                         break
                     time.sleep(STREAM_POLL_SECONDS)
                     continue
