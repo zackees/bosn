@@ -105,6 +105,26 @@ def test_second_run_reuses_and_does_not_rebuild(converger: Converger) -> None:
     assert second.action == "reused"
 
 
+def test_editing_a_copy_input_rolls_and_builds_a_new_image(
+    project: Path, converger: Converger, engine: Engine
+) -> None:
+    (project / "Dockerfile").write_text(
+        "FROM alpine:3.20\nCOPY payload /payload\n", encoding="utf-8"
+    )
+    payload = project / "payload"
+    payload.write_text("one", encoding="utf-8")
+    first = converger.converge()
+
+    payload.write_text("two", encoding="utf-8")
+    second = converger.converge()
+
+    assert second.digest != first.digest
+    assert second.action == "rolled"
+    assert second.image_tag != first.image_tag
+    assert engine.run(["image", "inspect", first.image_tag]).ok
+    assert engine.run(["image", "inspect", second.image_tag]).ok
+
+
 def test_a_manifest_task_runs(project: Path, registry: Registry, engine: Engine) -> None:
     _result, code, output = run_task(load(project), registry, "hello", engine=engine)
     try:
@@ -123,3 +143,21 @@ def test_a_manifest_task_runs(project: Path, registry: Registry, engine: Engine)
 def test_a_failing_command_propagates_its_exit_code(converger: Converger) -> None:
     _result, code, _output = converger.run(["sh", "-c", "exit 7"])
     assert code == 7
+
+
+def test_an_image_backed_stack_runs_the_declared_image(
+    tmp_path: Path, registry: Registry, engine: Engine
+) -> None:
+    (tmp_path / "bosn.toml").write_text(
+        '[stack.image]\nimage = "alpine:3.20"\ndefault = true\n', encoding="utf-8"
+    )
+    converger = Converger(load(tmp_path), registry, engine)
+    try:
+        result, code, output = converger.run(["cat", "/etc/alpine-release"])
+        assert code == 0, output
+        assert result.image_tag.startswith("sha256:")
+        assert output.strip()
+    finally:
+        for resource in registry.list_resources():
+            if resource.kind == "container":
+                engine.run(["rm", "--force", resource.name])

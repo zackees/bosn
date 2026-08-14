@@ -114,7 +114,7 @@ bosn shell                   # interactive session in the persistent container
 Everything else is lifecycle and introspection:
 
 ```bash
-bosn tasks --json            # discovery: tasks, stacks, digests, registration state
+bosn tasks --json            # discovery: tasks, stacks, content digests, registration state
 bosn status                  # tiers, leases, managed bytes vs ceiling, foreign registries
 bosn jobs / bosn attach <j>  # daemon-owned builds that survive a killed CLI
 bosn cancel <j>              # stop a build you no longer want

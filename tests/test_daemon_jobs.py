@@ -63,7 +63,9 @@ class ControlledBuilder:
 def project(tmp_path: Path) -> Path:
     root = tmp_path / "proj"
     root.mkdir()
-    (root / "Dockerfile").write_text("FROM alpine\n", encoding="utf-8")
+    # Keep transport/job-policy tests engine-free. Image-resolution behavior has focused
+    # fake-engine and Docker-backed coverage in the converge suites.
+    (root / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
     (root / "bosn.toml").write_text(SAMPLE, encoding="utf-8")
     return root
 
@@ -135,6 +137,37 @@ def test_a_second_identical_converge_joins_rather_than_rebuilding(
     builder.release.set()
     drain(stream)
     assert len(builder.digests) == 1, "one build served both requests"
+
+
+def test_image_resolved_digest_is_the_job_coalescing_key(
+    served: Daemon,
+    project: Path,
+    builder: ControlledBuilder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from bosn import converge as converge_mod
+
+    current = ["sha256:resolved-one"]
+
+    def fake_coalescing_key(*_args, **_kwargs):
+        return current[0]
+
+    monkeypatch.setattr(converge_mod, "generation_coalescing_key", fake_coalescing_key)
+    first_stream = converge_events(served, project)
+    first = next(first_stream)
+    assert builder.started.wait(10)
+
+    current[0] = "sha256:resolved-two"
+    second_stream = converge_events(served, project)
+    second = next(second_stream)
+
+    assert first["coalescing_key"] == "sha256:resolved-one"
+    assert second["coalescing_key"] == "sha256:resolved-two"
+    assert second["joined"] is False
+
+    builder.release.set()
+    drain(first_stream)
+    drain(second_stream)
 
 
 def test_an_unreadable_manifest_is_reported_not_swallowed(served: Daemon, tmp_path: Path) -> None:

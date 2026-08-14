@@ -10,14 +10,16 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import json
 import os
+import re
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 
 from bosn import labels
 from bosn.engine import Engine, EngineError
-from bosn.manifest import Manifest, StackSpec, generation_digest
+from bosn.manifest import Manifest, StackSpec, dockerfile_external_images, generation_digest
 from bosn.registry import Registry
 
 # What converge did, in the order of increasing work.
@@ -103,6 +105,161 @@ def _stable_key(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:10]
 
 
+def resolved_generation(
+    manifest: Manifest,
+    stack: StackSpec,
+    engine: Engine,
+    *,
+    progress: Callable[[str], None] | None = None,
+    cancelled: threading.Event | None = None,
+) -> tuple[str, str | None]:
+    """Resolve one canonical generation identity, including external image content."""
+    content_digest = generation_digest(manifest, stack)
+    references = _expanded_external_images(manifest, stack, engine)
+    if not references:
+        return content_digest, None
+
+    identities: list[dict[str, str | None]] = []
+    resolved_image: str | None = None
+    for reference, platform in references:
+        _abort_if_cancelled(cancelled)
+        identity = _resolve_image_identity(
+            engine,
+            reference,
+            platform=platform,
+            progress=progress,
+            cancelled=cancelled,
+        )
+        identities.append({"reference": reference, "platform": platform, "identity": identity})
+        if stack.image:
+            resolved_image = identity
+
+    return _generation_digest_from_images(content_digest, identities), resolved_image
+
+
+def generation_coalescing_key(manifest: Manifest, stack: StackSpec, engine: Engine) -> str:
+    """Compute a read-only key that separates locally resolved mutable image identities.
+
+    Missing images use a stable sentinel. Pulling them belongs to the managed build job,
+    where cancellation, TTL, max-build limits, and output streaming all apply.
+    """
+    content_digest = generation_digest(manifest, stack)
+    references = _expanded_external_images(manifest, stack, engine)
+    if not references:
+        return content_digest
+    identities = [
+        {
+            "reference": reference,
+            "platform": platform,
+            "identity": _inspect_image_identity(engine, reference, platform=platform),
+        }
+        for reference, platform in references
+    ]
+    return _generation_digest_from_images(content_digest, identities)
+
+
+def _generation_digest_from_images(
+    content_digest: str, identities: list[dict[str, str | None]]
+) -> str:
+    payload = {"content_digest": content_digest, "external_images": identities}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _expanded_external_images(
+    manifest: Manifest, stack: StackSpec, engine: Engine
+) -> list[tuple[str, str | None]]:
+    references = (
+        [(stack.image, None)] if stack.image else dockerfile_external_images(manifest.root, stack)
+    )
+    references = [(reference, platform) for reference, platform in references if reference]
+    platform_values: dict[str, str] | None = None
+
+    def expand_automatic(value: str | None) -> str | None:
+        nonlocal platform_values
+        if value is None or "$" not in value:
+            return value
+        if platform_values is None:
+            platform_values = _engine_platform_values(engine)
+        pattern = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([^}]+)\})")
+
+        def replace(match: re.Match[str]) -> str:
+            name = match.group(1) or match.group(2) or ""
+            assert platform_values is not None
+            try:
+                return platform_values[name]
+            except KeyError:
+                raise EngineError(f"cannot resolve automatic platform argument {name!r}") from None
+
+        return pattern.sub(replace, value)
+
+    return [
+        (expand_automatic(reference) or "", expand_automatic(platform))
+        for reference, platform in references
+    ]
+
+
+def _engine_platform_values(engine: Engine) -> dict[str, str]:
+    inspected = engine.run(["version", "--format", "{{.Server.Os}}/{{.Server.Arch}}"])
+    platform = inspected.stdout.strip()
+    if not inspected.ok or not platform or "/" not in platform:
+        raise EngineError(
+            "cannot resolve Dockerfile automatic platform arguments: "
+            f"{inspected.stderr or inspected.stdout or 'engine returned no platform'}"
+        )
+    os_name, architecture, *variant_parts = platform.split("/")
+    variant = "/".join(variant_parts)
+    return {
+        "BUILDPLATFORM": platform,
+        "BUILDOS": os_name,
+        "BUILDARCH": architecture,
+        "BUILDVARIANT": variant,
+        "TARGETPLATFORM": platform,
+        "TARGETOS": os_name,
+        "TARGETARCH": architecture,
+        "TARGETVARIANT": variant,
+    }
+
+
+def _resolve_image_identity(
+    engine: Engine,
+    reference: str,
+    *,
+    platform: str | None,
+    progress: Callable[[str], None] | None,
+    cancelled: threading.Event | None,
+) -> str:
+    identity = _inspect_image_identity(engine, reference, platform=platform)
+    if identity is None:
+        platform_args = ["--platform", platform] if platform else []
+        pulled = engine.stream(
+            ["pull", *platform_args, reference], on_line=progress, cancelled=cancelled
+        )
+        if not pulled.ok:
+            suffix = f" for platform {platform!r}" if platform else ""
+            raise EngineError(
+                f"resolving image {reference!r}{suffix} failed: {pulled.stderr or pulled.stdout}"
+            )
+        identity = _inspect_image_identity(engine, reference, platform=platform)
+    if not identity:
+        raise EngineError(f"image {reference!r} has no immutable engine identity after resolution")
+    return identity
+
+
+def _inspect_image_identity(engine: Engine, reference: str, *, platform: str | None) -> str | None:
+    platform_args = ["--platform", platform] if platform else []
+    inspected = engine.run(["image", "inspect", *platform_args, "--format", "{{.Id}}", reference])
+    identity = inspected.stdout.strip()
+    if not inspected.ok or not identity:
+        return None
+    return identity
+
+
+def _abort_if_cancelled(cancelled: threading.Event | None) -> None:
+    if cancelled is not None and cancelled.is_set():
+        raise EngineError("converge was cancelled")
+
+
 class Converger:
     """Brings engine and registry state in line with the manifest."""
 
@@ -127,7 +284,7 @@ class Converger:
         self, stack_name: str | None = None, *, workspace: str | None = None
     ) -> ConvergeResult:
         stack = self.manifest.stack(stack_name)
-        digest = generation_digest(self.manifest, stack)
+        digest, resolved_image = self._resolved_generation(stack)
         workspace = workspace or workspace_of(self.manifest)
 
         known = self.registry.generation_superseded_at(digest)
@@ -143,7 +300,7 @@ class Converger:
         # image for early collection in favor of an image that never got built. Nothing
         # about this generation is written until `docker build` has exited 0.
         self._abort_if_cancelled()
-        image_tag = image_tag_for(stack, digest)
+        image_tag = resolved_image or image_tag_for(stack, digest)
         self._ensure_image(stack, digest, image_tag, workspace)
 
         # The last point at which stopping is free. Past here the registry gets written and
@@ -174,6 +331,15 @@ class Converger:
             image_tag=image_tag,
             volumes=tuple(volumes),
             superseded=superseded,
+        )
+
+    def _resolved_generation(self, stack: StackSpec) -> tuple[str, str | None]:
+        return resolved_generation(
+            self.manifest,
+            stack,
+            self.engine,
+            progress=self.progress,
+            cancelled=self.cancelled,
         )
 
     def _abort_if_cancelled(self) -> None:

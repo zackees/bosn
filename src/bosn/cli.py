@@ -248,7 +248,10 @@ def cmd_tasks(opts: Options) -> int:
                     "image": stack.image,
                     "family": stack.family,
                     "default": stack.default,
-                    "digest": generation_digest(manifest, stack),
+                    # Discovery is engine-independent, so this is deliberately the local
+                    # content key. Converge resolves external images into the canonical
+                    # generation digest before job coalescing and registration.
+                    "content_digest": generation_digest(manifest, stack),
                     "volumes": {v.name: v.scope for v in stack.volumes},
                 }
                 for name, stack in manifest.stacks.items()
