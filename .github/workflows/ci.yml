@@ -10,6 +10,10 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Every lane only reads the checkout; none publishes anything.
+permissions:
+  contents: read
+
 jobs:
   linux:
     name: Linux (lint + unit + docker)

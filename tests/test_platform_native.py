@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -46,66 +47,76 @@ from bosn.resources import process_alive, process_start_time
 _GIT_BASH = Path(r"C:\Program Files\Git\bin\bash.exe")
 
 
-def _probe_dir() -> Path:
-    """A real temp directory outside any MSYS bind-mount alias.
+def _bash_pwd(directory: Path) -> str:
+    """Git Bash's own spelling of `directory`, passed as argv so quoting is bash's job."""
+    return subprocess.run(
+        [str(_GIT_BASH), "-c", 'cd "$1" && pwd', "_", str(directory)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
 
-    Deliberately rooted under the user's home rather than the OS temp dir: some Git Bash
-    installs remap /tmp to a non-cygdrive mount in /etc/fstab, which would make bash's pwd
-    output a spelling this module's normalizer was never meant to understand. Home is not
-    remapped, so `/c/Users/...` is what Git Bash actually reports there.
+
+def _msys_probe_dir(tmp_path: Path) -> tuple[Path, Path | None]:
+    """A directory whose Git Bash spelling is the drive-rooted `/c/...` form.
+
+    Prefers pytest's `tmp_path` and returns no cleanup owner for it. Some environments
+    point TMPDIR at a directory that Git Bash remaps via /etc/fstab, so bash reports
+    `/tmp/...` instead of `/c/Users/...` -- a spelling `normalize_workspace_path` never
+    claimed to handle. Only then does this fall back to a home-rooted directory, which is
+    never remapped, and return it as the caller's responsibility to remove.
     """
-    return Path(tempfile.mkdtemp(prefix="bosn_shell_probe_", dir=str(Path.home())))
+    if re.match(r"^/[a-zA-Z]/", _bash_pwd(tmp_path)):
+        return tmp_path, None
+    fallback = Path(tempfile.mkdtemp(prefix="bosn_shell_probe_", dir=str(Path.home())))
+    return fallback, fallback
 
 
 @pytest.mark.skipif(
     sys.platform != "win32", reason="native shell identity is only meaningful on Windows"
 )
-def test_cmd_and_powershell_agree_on_one_path_identity() -> None:
-    probe = _probe_dir()
-    try:
-        cmd_out = subprocess.run(
-            ["cmd", "/c", "cd"], cwd=probe, capture_output=True, text=True, check=True
-        ).stdout.strip()
-        ps_out = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", "(Get-Location).Path"],
-            cwd=probe,
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
+def test_native_windows_shells_agree_on_one_workspace_identity(tmp_path: Path) -> None:
+    """cmd.exe, PowerShell, and MSYS Git Bash must resolve to one cache identity.
 
-        expected = normalize_workspace_path(cmd_out)
-        assert normalize_workspace_path(ps_out) == expected
-    finally:
-        shutil.rmtree(probe, ignore_errors=True)
+    The value here is not that a normalizer regression gets caught -- the string fixtures
+    in test_paths.py already do that. It is that the *assumption baked into those fixtures*
+    gets checked against what the shells really emit. A fixture can only encode spellings
+    somebody already thought of; if a shell starts reporting a form nobody anticipated, a
+    real workspace silently splits into two caches and every string test still passes.
 
-
-@pytest.mark.skipif(
-    sys.platform != "win32", reason="native shell identity is only meaningful on Windows"
-)
-def test_git_bash_msys_spelling_agrees_with_the_native_identity() -> None:
-    """Skips gracefully (not a silent pass) when Git Bash is absent from this runner."""
+    The distinct-spelling assertion below is what keeps this honest: cmd and PowerShell
+    happen to emit byte-identical strings today, so without Git Bash's `/c/...` form this
+    would degrade into asserting `normalize(x) == normalize(x)`.
+    """
     if not _GIT_BASH.exists():
+        # windows-latest ships Git Bash; its absence in CI is a broken runner, not a
+        # reason to report success on a lane that then proves nothing about MSYS.
+        if os.environ.get("CI"):
+            pytest.fail(f"Git Bash missing at {_GIT_BASH} on a CI runner")
         pytest.skip(f"Git Bash not found at {_GIT_BASH}")
 
-    probe = _probe_dir()
+    probe, cleanup = _msys_probe_dir(tmp_path)
     try:
-        cmd_out = subprocess.run(
-            ["cmd", "/c", "cd"], cwd=probe, capture_output=True, text=True, check=True
-        ).stdout.strip()
-        expected = normalize_workspace_path(cmd_out)
+        spellings = [
+            subprocess.run(
+                ["cmd", "/c", "cd"], cwd=probe, capture_output=True, text=True, check=True
+            ).stdout.strip(),
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", "(Get-Location).Path"],
+                cwd=probe,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip(),
+            _bash_pwd(probe),
+        ]
 
-        forward = str(probe).replace("\\", "/")
-        bash_out = subprocess.run(
-            [str(_GIT_BASH), "-c", f"cd '{forward}' && pwd"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-
-        assert normalize_workspace_path(bash_out) == expected
+        assert len(set(spellings)) >= 2, f"no cross-shell divergence to test: {spellings}"
+        identities = {normalize_workspace_path(spelling) for spelling in spellings}
+        assert len(identities) == 1, f"{spellings} split into {identities}"
     finally:
-        shutil.rmtree(probe, ignore_errors=True)
+        if cleanup is not None:
+            shutil.rmtree(cleanup, ignore_errors=True)
 
 
 # -- 2. native process start identity ----------------------------------------
@@ -144,8 +155,10 @@ def test_native_process_start_pairs_matching_and_mismatched_identity_with_livene
 
 
 @pytest.mark.skipif(
-    sys.platform == "linux",
-    reason="linux enable() shells out to systemctl; already covered safely in test_autostart.py",
+    not (sys.platform.startswith("win") or sys.platform == "darwin"),
+    # Mirrors autostart.path()'s dispatch rather than excluding "linux" by name: the
+    # systemctl branch is the *fallback*, so any other POSIX platform takes it too.
+    reason="only win/darwin enable() is a pure file write; the rest shell out to systemctl",
 )
 def test_native_autostart_enable_and_disable_stay_under_the_injected_home(
     monkeypatch, tmp_path: Path

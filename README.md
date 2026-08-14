@@ -342,7 +342,7 @@ alone without an engine.
 
 ### Platform CI coverage
 
-CI gates merges on three lanes, run in parallel:
+CI runs three lanes in parallel on every pull request:
 
 | Lane | Runner | Steps | Docker-backed tests |
 | --- | --- | --- | --- |
@@ -353,8 +353,11 @@ CI gates merges on three lanes, run in parallel:
 The Windows and macOS lanes run `./install`, `./lint`, and `./test` under bash (the runners
 ship Git Bash / a POSIX shell), exercising native process, path, and filesystem behavior on
 real Windows and macOS runners instead of Linux-only string fixtures. Dedicated cmd.exe,
-PowerShell, and MSYS path/argv coverage lives in the test suite itself, not in the CI step
+PowerShell, and MSYS path coverage lives in the test suite itself, not in the CI step
 shell.
+
+These lanes are advisory until they are added to branch protection's required status
+checks; that is a repository setting, not something the workflow can assert for itself.
 
 **Docker-backed scenarios remain Linux-only.** Hosted macOS runners provide no Docker daemon,
 and hosted Windows runners cannot run Linux containers, so `ci/test.py` excludes the `docker`
