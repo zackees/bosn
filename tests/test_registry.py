@@ -336,3 +336,58 @@ def test_read_only_registry_refuses_missing_database_without_creating_it(tmp_pat
     with pytest.raises(sqlite3.OperationalError):
         Registry(path, read_only=True)
     assert not path.exists()
+
+
+def test_a_legacy_not_null_proc_start_column_is_rebuilt_as_nullable(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    """Databases created before PID-identity leases declared ``proc_start REAL NOT NULL``.
+
+    A failed identity probe must now store NULL rather than a wall-clock guess, so opening
+    an old database has to rebuild the table (sqlite has no ALTER COLUMN). The rebuild must
+    preserve existing lease rows, or reopening the registry after an upgrade would silently
+    drop every held lease and expose live resources to collection.
+    """
+    path = tmp_path / "registry.sqlite3"
+    with Registry(path, clock=clock) as reg:
+        resource = reg.register_resource(
+            kind="volume",
+            name="legacy-cache",
+            stack="test",
+            generation="sha256:g",
+            scope="spec",
+            workspace="/w",
+        )
+        resource_id = resource.id
+
+    # Recreate the pre-migration schema with a row in it, exactly as an old daemon left it.
+    legacy = sqlite3.connect(str(path), isolation_level=None)
+    legacy.execute("DROP TABLE leases")
+    legacy.execute(
+        "CREATE TABLE leases ("
+        "id TEXT PRIMARY KEY, "
+        "resource_id TEXT NOT NULL REFERENCES resources(id) ON DELETE CASCADE, "
+        "pid INTEGER NOT NULL, "
+        "proc_start REAL NOT NULL, "
+        "acquired_at REAL NOT NULL, "
+        "heartbeat_at REAL NOT NULL, "
+        "ttl_seconds REAL NOT NULL)"
+    )
+    legacy.execute(
+        "INSERT INTO leases VALUES ('old-lease', ?, 4242, 1.5, 0.0, 0.0, 900.0)", (resource_id,)
+    )
+    legacy.close()
+
+    with Registry(path, clock=clock) as reg:
+        survived = reg.get_lease("old-lease")
+        assert survived is not None, "the rebuild must not drop existing leases"
+        assert survived.pid == 4242
+        assert survived.proc_start == 1.5
+
+        # The whole point of the rebuild: NULL is now accepted.
+        pid_only = reg.acquire_lease(resource_id, pid=99, proc_start=None)
+        assert pid_only.proc_start is None
+
+        columns = reg.conn.execute("PRAGMA table_info(leases)").fetchall()
+        proc_start = next(c for c in columns if c["name"] == "proc_start")
+        assert not proc_start["notnull"]
