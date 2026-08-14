@@ -5,7 +5,12 @@ Unit tests drive a fake engine, so they run everywhere without Docker.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
+import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -18,6 +23,10 @@ from bosn.resources import DiscoveredResource, ResourceScanner, ScanResult
 
 OURS = "our-registry-uuid"
 THEIRS = "someone-elses-uuid"
+
+
+def _dead(pid, start=None):
+    return False
 
 
 def label_dict(registry: str = OURS, **overrides: str) -> dict[str, str]:
@@ -185,22 +194,289 @@ def test_a_live_holder_keeps_its_lease_past_the_ttl(registry: Registry, clock: F
 def test_a_dead_holder_releases_after_one_ttl(registry: Registry, clock: FakeClock) -> None:
     resource = _resource(registry)
     lease = registry.acquire_lease(resource.id, pid=999, proc_start=1.0, ttl_seconds=60)
-    dead = lambda pid, start=None: False  # noqa: E731
 
     clock.advance(59)
-    assert not resources.lease_is_expired(lease, clock.now(), alive_probe=dead)
+    assert not resources.lease_is_expired(lease, clock.now(), alive_probe=_dead)
 
     clock.advance(2)
-    assert resources.lease_is_expired(lease, clock.now(), alive_probe=dead)
-    assert not resources.resource_is_leased(registry, resource.id, alive_probe=dead)
+    assert resources.lease_is_expired(lease, clock.now(), alive_probe=_dead)
+    assert not resources.resource_is_leased(registry, resource.id, alive_probe=_dead)
+
+
+def test_pid_reuse_with_a_different_process_start_releases_expired_lease(
+    registry: Registry, clock: FakeClock, monkeypatch
+) -> None:
+    resource = _resource(registry)
+    lease = registry.acquire_lease(resource.id, pid=os.getpid(), proc_start=1.0, ttl_seconds=60)
+    monkeypatch.setattr(resources, "process_start_time", lambda _pid: 99.0)
+
+    clock.advance(61)
+    assert resources.lease_is_expired(lease, clock.now())
 
 
 def test_process_alive_probe_is_true_for_this_process() -> None:
-    import os
-
     assert resources.process_alive(os.getpid())
     assert not resources.process_alive(2**31 - 1)
     assert not resources.process_alive(0)
+
+
+def test_matching_pid_and_process_start_stays_protected_beyond_the_ttl(
+    registry: Registry, clock: FakeClock, monkeypatch
+) -> None:
+    """A holder whose stored identity still matches reality is never mistaken for reuse."""
+    resource = _resource(registry)
+    lease = registry.acquire_lease(resource.id, pid=os.getpid(), proc_start=1.0, ttl_seconds=60)
+    monkeypatch.setattr(resources, "process_start_time", lambda _pid: 1.0)
+
+    clock.advance(10_000)
+    assert lease.expired_by_time(clock.now())  # TTL elapsed...
+    assert not resources.lease_is_expired(lease, clock.now())  # ...but identity matches
+    assert resources.resource_is_leased(registry, resource.id)
+
+
+def test_acquire_lease_accepts_a_none_proc_start(registry: Registry, clock: FakeClock) -> None:
+    """A failed identity probe at acquire time stores None rather than a wall-clock guess.
+
+    ``process_alive`` treats a None ``proc_start`` as PID-only liveness, so a lease acquired
+    without a usable identity probe still protects a live holder past its TTL.
+    """
+    resource = _resource(registry)
+    lease = registry.acquire_lease(resource.id, pid=os.getpid(), proc_start=None, ttl_seconds=60)
+    assert lease.proc_start is None
+    stored = registry.get_lease(lease.id)
+    assert stored is not None
+    assert stored.proc_start is None
+
+    clock.advance(10_000)
+    assert lease.expired_by_time(clock.now())
+    assert not resources.lease_is_expired(lease, clock.now())
+    assert resources.resource_is_leased(registry, resource.id)
+
+
+# -- process start parsing helpers ------------------------------------------
+
+
+def test_parse_windows_process_start_converts_dotnet_ticks() -> None:
+    # 2026-08-13T09:41:02.500Z as .NET DateTime.Ticks (100ns units since 0001-01-01).
+    epoch_ticks = 62_135_596_800
+    seconds_since_epoch = 1_786_699_262.5
+    ticks = int((seconds_since_epoch + epoch_ticks) * 10_000_000)
+    result = resources._parse_windows_process_start(f"{ticks}\r\n")
+    assert result is not None
+    assert abs(result - seconds_since_epoch) < 1e-3
+
+
+@pytest.mark.parametrize("raw", ["", "not-a-number", "NaN", "Get-Process : Cannot find a process"])
+def test_parse_windows_process_start_rejects_malformed_input(raw: str) -> None:
+    assert resources._parse_windows_process_start(raw) is None
+
+
+def test_parse_linux_process_start_computes_epoch_from_ticks_and_boot() -> None:
+    # A realistic /proc/<pid>/stat line: comm can contain spaces/parens, hence the
+    # rsplit-on-")" parsing. Field 22 (index 19 after the split) is starttime in ticks.
+    stat_text = (
+        "1234 (my proc (weird)) S 1 1234 1234 0 -1 4194304 100 0 0 0 "
+        "10 2 0 0 20 0 4 0 5000 123456789 0 0 0 0 0 0 0 0 0 0 0 0 0 17 2 0 0 0 0 0"
+    )
+    proc_stat_text = "cpu  0 0 0 0 0 0 0 0 0 0\nbtime 1700000000\nprocesses 500\n"
+    result = resources._parse_linux_process_start(stat_text, proc_stat_text, 100.0)
+    assert result == 1700000000 + (5000 / 100.0)
+
+
+@pytest.mark.parametrize(
+    "stat_text,proc_stat_text,clk_tck",
+    [
+        ("", "btime 1700000000\n", 100.0),
+        ("garbage no parens or fields", "btime 1700000000\n", 100.0),
+        ("1234 (ok) S 1 1234", "btime 1700000000\n", 100.0),  # too few fields
+        ("1234 (ok) S " + " ".join(["0"] * 30), "no btime line here\n", 100.0),
+    ],
+)
+def test_parse_linux_process_start_rejects_malformed_input(
+    stat_text: str, proc_stat_text: str, clk_tck: float
+) -> None:
+    assert resources._parse_linux_process_start(stat_text, proc_stat_text, clk_tck) is None
+
+
+def test_parse_darwin_process_start_parses_lstart_format() -> None:
+    result = resources._parse_darwin_process_start("Thu Aug 13 09:41:02 2026\n")
+    assert result is not None
+
+    expected = dt.datetime.strptime("Thu Aug 13 09:41:02 2026", "%a %b %d %H:%M:%S %Y").timestamp()
+    assert result == expected
+
+
+@pytest.mark.parametrize("raw", ["", "not a date", "2026-08-13 09:41:02"])
+def test_parse_darwin_process_start_rejects_malformed_input(raw: str) -> None:
+    assert resources._parse_darwin_process_start(raw) is None
+
+
+def test_process_start_time_returns_a_plausible_epoch_for_this_process() -> None:
+    """Integration: the current platform's dispatch produces a real, recent epoch time."""
+    result = resources.process_start_time(os.getpid())
+    assert result is not None
+    now = time.time()
+    assert result <= now + resources.PROCESS_START_TOLERANCE_SECONDS
+    # Generous ceiling: CI machines can have long uptimes, but this *process* is young.
+    assert now - result < 30 * 24 * 3600
+
+
+# -- probe robustness (#45 pre-push review findings) ------------------------
+
+
+def test_process_alive_treats_windows_access_denied_system_error_as_alive(monkeypatch) -> None:
+    """os.kill(pid, 0) raises SystemError (not OSError) for another user's process on
+    Windows -- CPython returns a result with ERROR_ACCESS_DENIED still set as an exception.
+    SystemError escapes every existing except clause, so a poisoned lease aborted the whole
+    prune_dead_leases loop. Access-denied means the process exists: treat it as alive, same
+    fail-open posture as the PermissionError branch.
+    """
+
+    def _raises_system_error(pid: int, sig: int) -> None:
+        raise SystemError("<class 'OSError'> returned a result with an exception set")
+
+    monkeypatch.setattr(os, "kill", _raises_system_error)
+    assert resources.process_alive(4) is True
+
+
+def test_windows_process_start_probe_uses_cim_not_get_process(monkeypatch) -> None:
+    """Get-Process's .StartTime throws access-denied on another user's process, silently
+    yielding an empty stdout (stderr is discarded). Get-CimInstance does not have this
+    problem, and the code comment already claimed it was in use -- assert the real command.
+    """
+    captured: dict[str, list[str]] = {}
+
+    def _fake_run(args, **kwargs):
+        captured["args"] = args
+        return subprocess.CompletedProcess(args, 0, stdout="0\n", stderr="")
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    resources.process_start_time(4)
+
+    command = captured["args"][-1]
+    assert "Get-CimInstance" in command
+    assert "Win32_Process" in command
+    assert "Get-Process" not in command
+
+
+def test_windows_probe_subprocess_call_has_a_timeout(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_run(args, **kwargs):
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(args, 0, stdout="0\n", stderr="")
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    resources.process_start_time(4)
+
+    assert captured.get("timeout") == 5
+
+
+def test_windows_probe_wedged_or_missing_powershell_returns_none_not_raise(monkeypatch) -> None:
+    def _times_out(args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args, timeout=5)
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(subprocess, "run", _times_out)
+    assert resources.process_start_time(4) is None
+
+    def _missing(args, **kwargs):
+        raise FileNotFoundError("powershell not found")
+
+    monkeypatch.setattr(subprocess, "run", _missing)
+    assert resources.process_start_time(4) is None
+
+
+def test_darwin_probe_subprocess_call_has_a_timeout_and_pins_locale(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_run(args, **kwargs):
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(args, 0, stdout="Thu Aug 13 09:41:02 2026\n", stderr="")
+
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    resources.process_start_time(4)
+
+    assert captured.get("timeout") == 5
+    env = captured.get("env")
+    assert isinstance(env, dict)
+    assert env.get("LC_ALL") == "C"
+
+
+def test_darwin_probe_missing_ps_returns_none_not_raise(monkeypatch) -> None:
+    def _missing(args, **kwargs):
+        raise FileNotFoundError("ps not found")
+
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(subprocess, "run", _missing)
+    assert resources.process_start_time(4) is None
+
+
+def test_parse_linux_process_start_rejects_zero_clock_ticks() -> None:
+    """A zero SC_CLK_TCK would otherwise raise ZeroDivisionError, escaping process_alive."""
+    stat_text = (
+        "1234 (proc) S 1 1234 1234 0 -1 4194304 100 0 0 0 "
+        "10 2 0 0 20 0 4 0 5000 123456789 0 0 0 0 0 0 0 0 0 0 0 0 0 17 2 0 0 0 0 0"
+    )
+    proc_stat_text = "cpu  0 0 0 0 0 0 0 0 0 0\nbtime 1700000000\nprocesses 500\n"
+    assert resources._parse_linux_process_start(stat_text, proc_stat_text, 0.0) is None
+
+
+# -- dead lease pruning ------------------------------------------------------
+
+
+def test_prune_dead_leases_deletes_and_logs_an_expired_confirmed_dead_lease(
+    registry: Registry, clock: FakeClock
+) -> None:
+    resource = _resource(registry)
+    lease = registry.acquire_lease(resource.id, pid=999, proc_start=1.0, ttl_seconds=60)
+
+    clock.advance(61)
+    pruned = resources.prune_dead_leases(registry, alive_probe=_dead)
+
+    assert pruned == [lease.id]
+    assert registry.get_lease(lease.id) is None
+    assert any(
+        row["kind"] == "lease.pruned" and row["detail"] == lease.id for row in registry.events()
+    )
+
+
+def test_prune_dead_leases_never_touches_a_live_or_unexpired_lease(
+    registry: Registry, clock: FakeClock
+) -> None:
+    resource = _resource(registry)
+    live_holder = registry.acquire_lease(resource.id, pid=999, proc_start=1.0, ttl_seconds=60)
+    unexpired = registry.acquire_lease(resource.id, pid=998, proc_start=1.0, ttl_seconds=6000)
+    clock.advance(61)
+
+    # Expired by time, but the holder is still reported alive: never pruned.
+    always_alive = lambda pid, start=None: True  # noqa: E731
+    pruned = resources.prune_dead_leases(registry, alive_probe=always_alive)
+    assert pruned == []
+    assert registry.get_lease(live_holder.id) is not None
+    assert registry.get_lease(unexpired.id) is not None
+
+    # Confirmed dead, but the TTL has not elapsed for the long-lived lease: still untouched.
+    pruned = resources.prune_dead_leases(registry, alive_probe=_dead)
+    assert pruned == [live_holder.id]
+    assert registry.get_lease(unexpired.id) is not None
+
+
+def test_prune_dead_leases_is_idempotent(registry: Registry, clock: FakeClock) -> None:
+    resource = _resource(registry)
+    registry.acquire_lease(resource.id, pid=999, proc_start=1.0, ttl_seconds=60)
+    clock.advance(61)
+
+    first = resources.prune_dead_leases(registry, alive_probe=_dead)
+    assert len(first) == 1
+
+    second = resources.prune_dead_leases(registry, alive_probe=_dead)
+    assert second == []
 
 
 # -- adoption --------------------------------------------------------------

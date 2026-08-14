@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from bosn.clock import FakeClock
-from bosn.registry import Registry
+from bosn.registry import Registry, RegistryError
 
 
 @pytest.fixture
@@ -336,3 +336,102 @@ def test_read_only_registry_refuses_missing_database_without_creating_it(tmp_pat
     with pytest.raises(sqlite3.OperationalError):
         Registry(path, read_only=True)
     assert not path.exists()
+
+
+def test_a_legacy_not_null_proc_start_column_is_rebuilt_as_nullable(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    """Databases created before PID-identity leases declared ``proc_start REAL NOT NULL``.
+
+    A failed identity probe must now store NULL rather than a wall-clock guess, so opening
+    an old database has to rebuild the table (sqlite has no ALTER COLUMN). The rebuild must
+    preserve existing lease *rows*, or reopening the registry after an upgrade would silently
+    drop every held lease and expose live resources to collection. But it must NOT preserve
+    the legacy ``proc_start`` *value*: every pre-migration value is a wall-clock guess (the
+    old ``converge.py`` stored ``registry.clock.now()`` at acquire time, not a real process
+    start time), so carrying it forward would let a later liveness check compare a live
+    holder's real start time against that guess, find a mismatch, and treat the lease as
+    expired -- exactly the bug this migration exists to prevent. The migration therefore
+    rewrites every legacy row's ``proc_start`` to NULL, downgrading it to a PID-only lease
+    rather than preserving bogus identity.
+    """
+    path = tmp_path / "registry.sqlite3"
+    with Registry(path, clock=clock) as reg:
+        resource = reg.register_resource(
+            kind="volume",
+            name="legacy-cache",
+            stack="test",
+            generation="sha256:g",
+            scope="spec",
+            workspace="/w",
+        )
+        resource_id = resource.id
+
+    # Recreate the pre-migration schema with a row in it, exactly as an old daemon left it.
+    legacy = sqlite3.connect(str(path), isolation_level=None)
+    legacy.execute("DROP TABLE leases")
+    legacy.execute(
+        "CREATE TABLE leases ("
+        "id TEXT PRIMARY KEY, "
+        "resource_id TEXT NOT NULL REFERENCES resources(id) ON DELETE CASCADE, "
+        "pid INTEGER NOT NULL, "
+        "proc_start REAL NOT NULL, "
+        "acquired_at REAL NOT NULL, "
+        "heartbeat_at REAL NOT NULL, "
+        "ttl_seconds REAL NOT NULL)"
+    )
+    legacy.execute(
+        "INSERT INTO leases VALUES ('old-lease', ?, 4242, 1.5, 0.0, 0.0, 900.0)", (resource_id,)
+    )
+    legacy.close()
+
+    with Registry(path, clock=clock) as reg:
+        survived = reg.get_lease("old-lease")
+        assert survived is not None, "the rebuild must not drop existing leases"
+        assert survived.pid == 4242
+        assert survived.proc_start is None, "legacy proc_start is a wall-clock guess, not identity"
+
+        # The whole point of the rebuild: NULL is now accepted.
+        pid_only = reg.acquire_lease(resource_id, pid=99, proc_start=None)
+        assert pid_only.proc_start is None
+
+        columns = reg.conn.execute("PRAGMA table_info(leases)").fetchall()
+        proc_start = next(c for c in columns if c["name"] == "proc_start")
+        assert not proc_start["notnull"]
+
+
+def test_a_failed_proc_start_migration_raises_a_named_recoverable_error(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    """A migration failure must not brick the registry behind an opaque sqlite traceback.
+
+    Simulate a realistic trigger: an orphan ``leases`` row (its ``resource_id`` points at a
+    resource that no longer exists) fails the foreign key check when copied into the rebuilt
+    table. The failure must surface as a ``RegistryError`` that names the migration and gives
+    a next step, not a bare ``sqlite3.IntegrityError`` from deep inside ``__init__``.
+    """
+    path = tmp_path / "registry.sqlite3"
+    with Registry(path, clock=clock):
+        pass  # create a fresh v2+ database with the current schema
+
+    legacy = sqlite3.connect(str(path), isolation_level=None)
+    legacy.execute("DROP TABLE leases")
+    legacy.execute(
+        "CREATE TABLE leases ("
+        "id TEXT PRIMARY KEY, "
+        "resource_id TEXT NOT NULL REFERENCES resources(id) ON DELETE CASCADE, "
+        "pid INTEGER NOT NULL, "
+        "proc_start REAL NOT NULL, "
+        "acquired_at REAL NOT NULL, "
+        "heartbeat_at REAL NOT NULL, "
+        "ttl_seconds REAL NOT NULL)"
+    )
+    # foreign_keys defaults to off on a raw connection, so this orphan insert is allowed here
+    # but will fail the FK check once the migration rebuilds the table under foreign_keys=ON.
+    legacy.execute(
+        "INSERT INTO leases VALUES ('orphan-lease', 'no-such-resource', 1, 1.0, 0.0, 0.0, 900.0)"
+    )
+    legacy.close()
+
+    with pytest.raises(RegistryError, match="relax_lease_proc_start_nullability"):
+        Registry(path, clock=clock)

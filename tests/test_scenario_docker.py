@@ -24,6 +24,7 @@ from bosn.manifest import load
 from bosn.registry import Registry
 from bosn.resources import ResourceScanner
 from bosn.retention import DAY
+from conftest import live_proc_start
 
 pytestmark = pytest.mark.docker
 
@@ -119,7 +120,9 @@ def test_full_lifecycle_run_lease_done_ttl_gc(
         # -- lease held: nothing is collectable, however old ------------------
         target = next(r for r in spec_volumes if r.kind == "volume")
         # This process is the lease holder, so the liveness probe genuinely succeeds.
-        lease = registry.acquire_lease(target.id, pid=os.getpid(), proc_start=1.0, ttl_seconds=900)
+        lease = registry.acquire_lease(
+            target.id, pid=os.getpid(), proc_start=live_proc_start(), ttl_seconds=900
+        )
         clock.advance(10 * DAY)
 
         collector = Collector(registry, engine)

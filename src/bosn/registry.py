@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS leases (
     id            TEXT PRIMARY KEY,
     resource_id   TEXT NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
     pid           INTEGER NOT NULL,
-    proc_start    REAL NOT NULL,
+    proc_start    REAL,
     acquired_at   REAL NOT NULL,
     heartbeat_at  REAL NOT NULL,
     ttl_seconds   REAL NOT NULL
@@ -124,13 +124,17 @@ class Lease:
     id: str
     resource_id: str
     pid: int
-    proc_start: float
+    proc_start: float | None
     acquired_at: float
     heartbeat_at: float
     ttl_seconds: float
 
     def expired_by_time(self, now: float) -> bool:
         return (now - self.heartbeat_at) > self.ttl_seconds
+
+
+class RegistryError(RuntimeError):
+    """A schema migration could not be completed safely."""
 
 
 class Registry:
@@ -289,6 +293,75 @@ class Registry:
             "(resource_id, workspace, stack, generation, last_used, state) "
             "SELECT id, workspace, stack, generation, last_used, state FROM resources"
         )
+        # Not gated on SCHEMA_VERSION like the v1->v2 step above: this shape change is
+        # backward-compatible (a NOT-NULL writer's INSERT still satisfies a nullable column,
+        # so an old and a new binary can both operate on either shape) and it is safe to run
+        # every open, so `PRAGMA table_info` introspection is the simpler, idempotent gate.
+        # Bumping SCHEMA_VERSION would only be needed if a future change made the old shape
+        # actively unsafe to read/write, which this one does not.
+        try:
+            self._relax_lease_proc_start_nullability()
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            raise RegistryError(
+                "registry migration 'relax_lease_proc_start_nullability' failed: "
+                f"{type(exc).__name__}: {exc}; the database was left unchanged (the migration "
+                "runs in its own transaction), so retry opening the registry -- if this "
+                "persists, back up and remove the registry file to rebuild it by rescanning "
+                "engine labels"
+            ) from exc
+
+    def _relax_lease_proc_start_nullability(self) -> None:
+        """Allow ``proc_start`` to be NULL for PID-only leases.
+
+        Databases created before this change have ``leases.proc_start REAL NOT NULL``. Every
+        row already stored there is a wall-clock guess, not a real process identity: the
+        pre-migration ``converge.py`` wrote ``registry.clock.now()`` at acquire time, which
+        essentially never matches the holder's real process start time (that would require
+        acquiring the lease within the liveness check's tolerance of the process's own
+        launch). Carrying that guess forward as if it were identity is actively dangerous --
+        a later liveness check would compare it against the real start time, find a mismatch,
+        and judge a live holder's lease expired, letting GC reap an in-use resource. So this
+        rebuild does not preserve legacy ``proc_start`` values at all: every migrated lease
+        becomes PID-only (``proc_start IS NULL``), which is exactly the semantics the nullable
+        column exists to express, and falls through to the safe PID-only liveness check.
+        SQLite has no ``ALTER COLUMN``, so relaxing the constraint means rebuilding the table.
+        """
+        columns = self.conn.execute("PRAGMA table_info(leases)").fetchall()
+        proc_start_column = next((c for c in columns if c["name"] == "proc_start"), None)
+        if proc_start_column is None or not proc_start_column["notnull"]:
+            return
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.conn.execute(
+                "CREATE TABLE leases_nullable ("
+                "id TEXT PRIMARY KEY, "
+                "resource_id TEXT NOT NULL REFERENCES resources(id) ON DELETE CASCADE, "
+                "pid INTEGER NOT NULL, "
+                "proc_start REAL, "
+                "acquired_at REAL NOT NULL, "
+                "heartbeat_at REAL NOT NULL, "
+                "ttl_seconds REAL NOT NULL)"
+            )
+            self.conn.execute(
+                "INSERT INTO leases_nullable"
+                "(id, resource_id, pid, proc_start, acquired_at, heartbeat_at, ttl_seconds) "
+                "SELECT id, resource_id, pid, NULL, acquired_at, heartbeat_at, "
+                "ttl_seconds FROM leases"
+            )
+            self.conn.execute("DROP TABLE leases")
+            self.conn.execute("ALTER TABLE leases_nullable RENAME TO leases")
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_leases_resource ON leases(resource_id)"
+            )
+            self.conn.execute("COMMIT")
+        except KeyboardInterrupt:
+            self.conn.execute("ROLLBACK")
+            raise
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
 
     def _deduplicate_resources(self) -> None:
         duplicates = self.conn.execute(
@@ -644,7 +717,7 @@ class Registry:
         resource_id: str,
         *,
         pid: int,
-        proc_start: float,
+        proc_start: float | None,
         ttl_seconds: float = 900.0,
     ) -> Lease:
         now = self.clock.now()
@@ -673,12 +746,26 @@ class Registry:
         rows = self._exec("SELECT * FROM leases WHERE resource_id = ?", (resource_id,)).fetchall()
         return [_lease_from_row(row) for row in rows]
 
+    def all_leases(self) -> list[Lease]:
+        rows = self._exec("SELECT * FROM leases").fetchall()
+        return [_lease_from_row(row) for row in rows]
+
     def heartbeat(self, lease_id: str) -> None:
         self._exec("UPDATE leases SET heartbeat_at = ? WHERE id = ?", (self.clock.now(), lease_id))
 
     def release_lease(self, lease_id: str) -> None:
         self._exec("DELETE FROM leases WHERE id = ?", (lease_id,))
         self.log_event("lease.released", lease_id)
+
+    def prune_lease(self, lease_id: str) -> None:
+        """Delete a confirmed-dead lease found during maintenance.
+
+        A distinct event from ``lease.released`` -- that one is a holder's own graceful
+        release, this one is the daemon reclaiming a lease whose holder is gone. Deleting a
+        row that is already gone is a silent no-op, which is what keeps pruning idempotent.
+        """
+        self._exec("DELETE FROM leases WHERE id = ?", (lease_id,))
+        self.log_event("lease.pruned", lease_id)
 
     # -- generations -------------------------------------------------------
 
