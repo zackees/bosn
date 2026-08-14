@@ -1,8 +1,9 @@
+import re
 from pathlib import Path
 
 import pytest
 
-from bosn.compose import ComposeError, load_compose
+from bosn.compose import ComposeError, content_digest, load_compose, project_identity
 
 
 def test_anchors_and_merge_keys_resolve() -> None:
@@ -204,3 +205,183 @@ def test_extension_fields_are_accepted_wherever_compose_allows_them() -> None:
 
     assert doc.services["app"].image == "alpine:3.20"
     assert doc.volumes == ("data",)
+
+
+# -- project_identity ---------------------------------------------------------------
+
+
+def test_project_identity_is_stable_across_repeated_calls(tmp_path: Path) -> None:
+    compose_path = tmp_path / "compose.yaml"
+    compose_path.write_text("services:\n  app:\n    image: alpine\n", encoding="utf-8")
+
+    assert project_identity(compose_path) == project_identity(compose_path)
+
+
+def test_project_identity_differs_for_same_basename_different_directory(tmp_path: Path) -> None:
+    """Compose itself would give both of these the same project name (the directory
+    basename); bosn's identity must not collide the way Compose's own does."""
+    first = tmp_path / "one" / "myapp"
+    second = tmp_path / "two" / "myapp"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    (first / "compose.yaml").write_text("services:\n  app:\n    image: alpine\n", encoding="utf-8")
+    (second / "compose.yaml").write_text("services:\n  app:\n    image: alpine\n", encoding="utf-8")
+
+    assert project_identity(first / "compose.yaml") != project_identity(second / "compose.yaml")
+
+
+def test_project_identity_same_for_same_directory_regardless_of_spelling(tmp_path: Path) -> None:
+    directory = tmp_path / "proj"
+    directory.mkdir()
+    compose_path = directory / "compose.yaml"
+    compose_path.write_text("services:\n  app:\n    image: alpine\n", encoding="utf-8")
+
+    indirect = tmp_path / "proj" / ".." / "proj" / "compose.yaml"
+
+    assert project_identity(compose_path) == project_identity(indirect)
+
+
+def test_project_identity_sanitizes_an_uppercase_basename(tmp_path: Path) -> None:
+    """The identity is meant to double as a project name/label value, so it must stay
+    inside the character set Compose itself enforces on project names."""
+    directory = tmp_path / "MyApp"
+    directory.mkdir()
+    compose_path = directory / "compose.yaml"
+    compose_path.write_text("services:\n  app:\n    image: alpine\n", encoding="utf-8")
+
+    identity = project_identity(compose_path)
+
+    assert identity == identity.lower()
+    assert re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", identity)
+
+
+# -- content_digest -------------------------------------------------------------------
+
+
+def test_content_digest_is_stable_for_the_same_file(tmp_path: Path) -> None:
+    compose_path = tmp_path / "compose.yaml"
+    compose_path.write_text("services:\n  app:\n    image: alpine:3.20\n", encoding="utf-8")
+
+    assert content_digest(compose_path) == content_digest(compose_path)
+
+
+def test_content_digest_handles_an_unquoted_date_like_scalar(tmp_path: Path) -> None:
+    """`yaml.safe_load` turns an unquoted `2024-06-27` into a `datetime.date`, which
+    `load_compose` never rejects (it doesn't type-check leaf values) but which
+    `json.dumps` cannot serialize without a `default=` fallback -- must not raise."""
+    compose_path = tmp_path / "compose.yaml"
+    compose_path.write_text(
+        "services:\n  app:\n    image: alpine\n    labels:\n      build-date: 2024-06-27\n",
+        encoding="utf-8",
+    )
+
+    assert content_digest(compose_path) == content_digest(compose_path)
+
+
+def test_content_digest_ignores_reformatting(tmp_path: Path) -> None:
+    original = tmp_path / "a.yaml"
+    original.write_text(
+        "services:\n  app:\n    image: alpine:3.20\n    networks:\n      - back\n"
+        "networks:\n  back:\n",
+        encoding="utf-8",
+    )
+    reformatted = tmp_path / "b.yaml"
+    reformatted.write_text(
+        "networks:\n  back:\nservices:\n  app:\n"
+        '    networks: ["back"]\n'
+        "    image: 'alpine:3.20'\n",
+        encoding="utf-8",
+    )
+
+    assert content_digest(original) == content_digest(reformatted)
+
+
+def test_content_digest_changes_with_image_tag(tmp_path: Path) -> None:
+    original = tmp_path / "compose.yaml"
+    original.write_text("services:\n  app:\n    image: alpine:3.20\n", encoding="utf-8")
+    changed = tmp_path / "compose2.yaml"
+    changed.write_text("services:\n  app:\n    image: alpine:3.21\n", encoding="utf-8")
+
+    assert content_digest(original) != content_digest(changed)
+
+
+def test_content_digest_changes_when_top_level_volume_added(tmp_path: Path) -> None:
+    without = tmp_path / "without.yaml"
+    without.write_text("services:\n  app:\n    image: alpine\n", encoding="utf-8")
+    with_volume = tmp_path / "with.yaml"
+    with_volume.write_text(
+        "services:\n  app:\n    image: alpine\n    volumes:\n      - data:/data\n"
+        "volumes:\n  data:\n",
+        encoding="utf-8",
+    )
+
+    assert content_digest(without) != content_digest(with_volume)
+
+
+def test_content_digest_changes_when_top_level_network_removed(tmp_path: Path) -> None:
+    with_network = tmp_path / "with.yaml"
+    with_network.write_text(
+        "services:\n  app:\n    image: alpine\n    networks:\n      - back\nnetworks:\n  back:\n",
+        encoding="utf-8",
+    )
+    without_network = tmp_path / "without.yaml"
+    without_network.write_text("services:\n  app:\n    image: alpine\n", encoding="utf-8")
+
+    assert content_digest(with_network) != content_digest(without_network)
+
+
+def test_content_digest_reorders_top_level_services_without_rolling(tmp_path: Path) -> None:
+    """Canonical JSON sorts mapping keys, so reordering *service declarations* -- a pure
+    reformat -- must not roll the digest, even though it does change list-valued fields."""
+    first = tmp_path / "first.yaml"
+    first.write_text(
+        "services:\n  web:\n    image: nginx\n  api:\n    image: alpine\n", encoding="utf-8"
+    )
+    second = tmp_path / "second.yaml"
+    second.write_text(
+        "services:\n  api:\n    image: alpine\n  web:\n    image: nginx\n", encoding="utf-8"
+    )
+
+    assert content_digest(first) == content_digest(second)
+
+
+def test_content_digest_rolls_when_list_order_changes(tmp_path: Path) -> None:
+    """Unlike mapping-key reordering, list order is part of identity (#48: "ordered ...
+    digest")."""
+    first = tmp_path / "first.yaml"
+    first.write_text(
+        'services:\n  app:\n    image: alpine\n    command: ["a", "b"]\n', encoding="utf-8"
+    )
+    second = tmp_path / "second.yaml"
+    second.write_text(
+        'services:\n  app:\n    image: alpine\n    command: ["b", "a"]\n', encoding="utf-8"
+    )
+
+    assert content_digest(first) != content_digest(second)
+
+
+def test_content_digest_folds_in_build_context_file_content(tmp_path: Path) -> None:
+    """Editing application source under a service's `build:` context must roll the
+    generation -- otherwise a Compose-managed build silently never supersedes (#48)."""
+    (tmp_path / "worker").mkdir()
+    dockerfile = tmp_path / "worker" / "Dockerfile"
+    dockerfile.write_text("FROM alpine\nCOPY app.py /app.py\n", encoding="utf-8")
+    source = tmp_path / "worker" / "app.py"
+    source.write_text("print('v1')\n", encoding="utf-8")
+    compose_path = tmp_path / "compose.yaml"
+    compose_path.write_text("services:\n  worker:\n    build: ./worker\n", encoding="utf-8")
+
+    before = content_digest(compose_path)
+    source.write_text("print('v2')\n", encoding="utf-8")
+    after = content_digest(compose_path)
+
+    assert before != after
+
+
+def test_content_digest_build_context_folding_is_skipped_for_literal_text() -> None:
+    """A `str` is treated as literal YAML text (matching `load_compose`'s own contract),
+    so there is no directory to resolve a relative `build:` context against; this must not
+    raise, and must simply omit build-context content from the digest."""
+    text = "services:\n  worker:\n    build: ./worker\n"
+
+    assert content_digest(text) == content_digest(text)
