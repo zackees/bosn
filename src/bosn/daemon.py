@@ -323,6 +323,32 @@ class Daemon:
             on_settled=self.note_activity,
         )
 
+    def _reconcile_startup_resources(self) -> None:
+        """Repair create-before-registry crashes without making engine absence fatal."""
+        from bosn.engine import Engine, EngineError
+        from bosn.resources import ResourceScanner, reconcile_owned
+
+        try:
+            engine = Engine(self.engine_binary)
+            # Maintenance tests provide a minimal reachability probe.  Those test
+            # doubles intentionally are not a resource-listing engine.
+            if not callable(getattr(engine, "run", None)):
+                return
+            prior_resources = self.registry.list_resources()
+            scan = ResourceScanner(engine).scan(self.registry.registry_id)
+            if self._stop.is_set():
+                return
+            repaired = reconcile_owned(self.registry, scan, prior_resources=prior_resources)
+        except EngineError as exc:
+            self.registry.log_event("recovery.scan.unavailable", str(exc))
+            return
+        except Exception as exc:  # background recovery must never take down IPC
+            if not self._stop.is_set():
+                self.registry.log_event("recovery.scan.failed", str(exc))
+            return
+        if repaired:
+            self.registry.log_event("recovery.startup", ",".join(repaired))
+
     # -- lifecycle ---------------------------------------------------------
 
     @property
@@ -378,6 +404,10 @@ class Daemon:
         except OSError:
             pass
         self.registry.log_event("daemon.started", f"pid={os.getpid()} port={self.port}")
+
+        # Docker can be unavailable or taking a long time to wake.  Recovery must not
+        # postpone serving IPC; this daemon-owned worker is cancelled by normal shutdown.
+        threading.Thread(target=self._reconcile_startup_resources, daemon=True).start()
 
         self._watchdog_thread = threading.Thread(target=self._idle_watchdog, daemon=True)
         self._watchdog_thread.start()
@@ -610,9 +640,26 @@ class Daemon:
         registries = scan.foreign_registries
         if not registries:
             return {"ok": True, "adopted": [], "registry_id": None}
-        if len(registries) != 1:
-            return {"ok": False, "error": "adopt refused: multiple foreign registry ids found"}
-        registry_id = next(iter(registries))
+        selected = str(request.get("source_registry") or "")
+        if selected:
+            if selected not in registries:
+                return {"ok": False, "error": f"adopt source registry not found: {selected}"}
+            registry_id = selected
+        elif len(registries) == 1:
+            registry_id = next(iter(registries))
+        else:
+            commands = "; ".join(
+                f"bosn adopt --from-registry {candidate}" for candidate in sorted(registries)
+            )
+            return {"ok": False, "error": f"choose a source registry: {commands}"}
+        if self.registry.list_resources() and registry_id != self.registry.registry_id:
+            return {
+                "ok": False,
+                "error": (
+                    "adopt recovery requires an empty registry; current identity is preserved. "
+                    "Use an explicit ownership-transfer workflow instead."
+                ),
+            }
         self.registry.set_meta("registry_id", registry_id)
         names = adopt(self.registry, ResourceScanner(engine).scan(registry_id))
         return {"ok": True, "adopted": names, "registry_id": registry_id}

@@ -506,6 +506,40 @@ def test_adoption_is_idempotent(registry: Registry, clock: FakeClock) -> None:
     assert len(registry.list_resources()) == 1
 
 
+def test_startup_reconciliation_repairs_create_before_registry_crash(
+    registry: Registry, clock: FakeClock
+) -> None:
+    """A complete owned engine object is sufficient to repair a missing SQLite row."""
+    scan = ScanResult(owned=[DiscoveredResource("volume", "created-first", label_dict())])
+
+    assert resources.reconcile_owned(registry, scan) == ["created-first"]
+    recovered = registry.get_resource_by_engine_identity("volume", "created-first")
+    assert recovered is not None
+    assert recovered.state == "adopted"
+    assert registry.generation_recorded(recovered.generation, recovered.stack, recovered.workspace)
+
+    assert resources.reconcile_owned(registry, scan) == []
+    assert len(registry.list_resources()) == 1
+
+
+def test_startup_reconciliation_repairs_remove_before_registry_crash(
+    registry: Registry,
+) -> None:
+    stale = registry.register_resource(
+        kind="volume",
+        name="removed-first",
+        stack="dev",
+        generation="digest",
+        scope="spec",
+        workspace="workspace",
+    )
+    prior = registry.list_resources()
+    scan = ScanResult(scanned_kinds={"volume"})
+
+    assert resources.reconcile_owned(registry, scan, prior_resources=prior) == []
+    assert registry.get_resource(stale.id) is None
+
+
 def test_adopted_resources_are_protected_by_the_quiet_period(clock: FakeClock) -> None:
     """Recovery is never followed by a mass age-out."""
     adopted_at = clock.now()

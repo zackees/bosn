@@ -145,6 +145,13 @@ def build_parser(*, json_errors: bool = False) -> argparse.ArgumentParser:
             sub.add_argument("--task", default=None, help="run a manifest task by name")
             sub.add_argument("--manifest", default=None, dest="sub_manifest")
         sub.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+        if verb == "adopt":
+            sub.add_argument(
+                "--from-registry",
+                dest="source_registry",
+                default=None,
+                help="recover this lost registry identity (required when several are found)",
+            )
         if verb == "gc":
             group = sub.add_mutually_exclusive_group()
             group.add_argument(
@@ -214,8 +221,13 @@ def cmd_doctor(opts: Options) -> int:
     scan = ResourceScanner(Engine(opts.engine)).scan(registry_id or "")
     if scan.foreign_registries:
         state = f" --state-dir {opts.state_dir}" if opts.state_dir else ""
+        commands = "; ".join(
+            f"bosn{state} adopt --from-registry {candidate}"
+            for candidate in sorted(scan.foreign_registries)
+        )
         print(
-            f"complete resources from foreign registry ids found; recover with: bosn{state} adopt",
+            "complete resources from foreign registry ids found; "
+            f"choose recovery source: {commands}",
             file=sys.stderr,
         )
     return 0
@@ -707,7 +719,9 @@ def cmd_adopt(opts: Options) -> int:
     from bosn import daemon as daemon_mod
 
     try:
-        reply = daemon_mod.request("adopt", opts.state_dir, engine=opts.engine)
+        reply = daemon_mod.request(
+            "adopt", opts.state_dir, engine=opts.engine, source_registry=opts.source_registry
+        )
     except (daemon_mod.DaemonError, ipc.TransportError) as exc:
         print(f"cannot reach the bosn daemon: {exc}", file=sys.stderr)
         return 1

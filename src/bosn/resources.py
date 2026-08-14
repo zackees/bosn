@@ -24,7 +24,7 @@ from pathlib import Path
 from bosn import labels
 from bosn.clock import Clock, SystemClock
 from bosn.engine import Engine
-from bosn.registry import Registry
+from bosn.registry import Registry, Resource
 
 # Docker CLI list commands per resource kind, formatted as one JSON object per line.
 _LIST_COMMANDS: dict[str, list[str]] = {
@@ -68,6 +68,7 @@ class ScanResult:
     owned: list[DiscoveredResource] = field(default_factory=list)
     foreign: list[DiscoveredResource] = field(default_factory=list)
     unlabeled: list[DiscoveredResource] = field(default_factory=list)
+    scanned_kinds: set[str] = field(default_factory=set)
 
     @property
     def foreign_registries(self) -> set[str]:
@@ -116,13 +117,13 @@ class ResourceScanner:
     def __init__(self, engine: Engine | None = None) -> None:
         self.engine = engine or Engine()
 
-    def discover(self, kind: str) -> list[DiscoveredResource]:
+    def _discover(self, kind: str) -> tuple[list[DiscoveredResource], bool]:
         args = _LIST_COMMANDS.get(kind)
         if args is None:
             raise ValueError(f"cannot enumerate unknown kind {kind!r}")
         result = self.engine.run(args)
         if not result.ok:
-            return []
+            return [], False
 
         discovered: list[DiscoveredResource] = []
         for line in result.stdout.splitlines():
@@ -144,6 +145,11 @@ class ResourceScanner:
                 # before concluding a resource is unlabeled.
                 raw = self.inspect_labels(kind, name) or raw
             discovered.append(DiscoveredResource(kind=kind, name=name, raw_labels=raw))
+        return discovered, True
+
+    def discover(self, kind: str) -> list[DiscoveredResource]:
+        """List one kind; callers needing safety metadata should use :meth:`scan`."""
+        discovered, _success = self._discover(kind)
         return discovered
 
     def inspect_labels(self, kind: str, name: str) -> dict[str, str]:
@@ -158,7 +164,10 @@ class ResourceScanner:
     def scan(self, registry_id: str, kinds: list[str] | None = None) -> ScanResult:
         scan = ScanResult()
         for kind in kinds or list(_LIST_COMMANDS):
-            for resource in self.discover(kind):
+            discovered, success = self._discover(kind)
+            if success:
+                scan.scanned_kinds.add(kind)
+            for resource in discovered:
                 if not resource.complete:
                     scan.unlabeled.append(resource)
                 elif resource.owned_by(registry_id):
@@ -396,6 +405,44 @@ def adopt(
         registry.log_event("resource.adopted", f"{resource.kind}:{resource.name}")
         adopted.append(resource.name)
     return adopted
+
+
+def reconcile_owned(
+    registry: Registry, scan: ScanResult, *, prior_resources: list[Resource] | None = None
+) -> list[str]:
+    """Make registry state agree with complete resources carrying our identity.
+
+    This is deliberately additive: a failed or unavailable engine listing must never
+    turn an empty scan into permission to forget registry rows.  Engine deletion is
+    already idempotently handled by collection; startup reconciliation repairs the
+    other crash boundary, where Docker accepted a create but the process died before
+    SQLite recorded it.
+    """
+    reconciled: list[str] = []
+    for resource in scan.owned:
+        parsed = resource.parsed()
+        existing = registry.get_resource_by_engine_identity(resource.kind, resource.name)
+        registered = registry.reconcile_resource(
+            kind=resource.kind,
+            name=resource.name,
+            stack=parsed.stack,
+            generation=parsed.generation,
+            scope=parsed.scope,
+            workspace=parsed.workspace,
+        )
+        registry.record_generation(parsed.generation, parsed.stack, parsed.workspace)
+        if existing is None:
+            registry.set_resource_state(registered.id, "adopted")
+            registry.log_event("resource.recovered", f"{resource.kind}:{resource.name}")
+            reconciled.append(resource.name)
+    discovered = {(resource.kind, resource.name) for resource in scan.owned}
+    # Only rows observed before the scan are candidates.  A concurrent converge may
+    # create a new engine object after listing completes; deleting that fresh row from a
+    # stale scan would reintroduce the crash boundary this function repairs.
+    for resource in prior_resources or []:
+        if resource.kind in scan.scanned_kinds and (resource.kind, resource.name) not in discovered:
+            registry.remove_resource(resource.id)
+    return reconciled
 
 
 def within_quiet_period(adopted_at: float, now: float) -> bool:

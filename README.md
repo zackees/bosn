@@ -248,10 +248,13 @@ reports each effective value and its origin.
 ## Registry recovery
 
 Run `bosn doctor` after an unclean shutdown. If it finds complete labels from a prior
-registry it prints `bosn adopt`, the only ownership-transfer command. SQLite diagnosis is
+registry it prints a source-specific `bosn adopt --from-registry <uuid>` command. This is
+lost-database recovery only: it restores that identity into an empty registry and never
+replaces the identity of a registry that already has rows. SQLite diagnosis is
 non-destructive: run `sqlite3 registry.sqlite3 "PRAGMA integrity_check"`; if recovery is
-needed, copy the database first and use SQLite's `.recover` output to build a replacement.
-Adopted resources receive a 24-hour quiet period before normal age-based retention resumes.
+needed, first copy `registry.sqlite3` (including its `-wal` and `-shm` siblings), then use
+the copy as input to `sqlite3 copy.sqlite3 ".recover"`. Adopted resources receive a
+24-hour quiet period before normal age-based retention resumes.
 
 Enable the per-user login launcher once with `bosn __daemon --autostart`; it writes a
 Startup launcher on Windows, a LaunchAgent on macOS, or a user systemd unit on Linux.

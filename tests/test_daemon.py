@@ -456,6 +456,88 @@ def test_malformed_persisted_maintenance_deadline_recovers(tmp_path: Path) -> No
         daemon.registry.close()
 
 
+def test_adopt_preserves_a_nonempty_registry_identity(monkeypatch, tmp_path: Path) -> None:
+    """Recovery of a lost database must never strand rows in an existing one."""
+    from bosn import labels
+    from bosn.resources import DiscoveredResource, ScanResult
+
+    lost = "lost-registry"
+    raw = labels.ResourceLabels(
+        registry=lost,
+        kind="volume",
+        stack="dev",
+        generation="digest",
+        scope="spec",
+        workspace="workspace",
+        created="2026-01-01T00:00:00Z",
+    ).to_dict()
+
+    class Scanner:
+        def __init__(self, _engine) -> None:
+            pass
+
+        def scan(self, registry_id: str, **_kwargs):
+            resource = DiscoveredResource("volume", "cache", raw)
+            return ScanResult(owned=[resource] if registry_id == lost else [], foreign=[resource])
+
+    import bosn.resources
+
+    monkeypatch.setattr(bosn.resources, "ResourceScanner", Scanner)
+    daemon = Daemon(state_dir=tmp_path)
+    try:
+        original = daemon.registry.registry_id
+        daemon.registry.register_resource(
+            kind="volume",
+            name="current-cache",
+            stack="dev",
+            generation="current",
+            scope="spec",
+            workspace="workspace",
+        )
+        reply = daemon._verb_adopt({"engine": "docker", "source_registry": lost})
+        assert not reply["ok"]
+        assert daemon.registry.registry_id == original
+        assert "empty registry" in str(reply["error"])
+    finally:
+        daemon.registry.close()
+
+
+def test_adopt_recovers_the_selected_lost_identity(monkeypatch, tmp_path: Path) -> None:
+    from bosn import labels
+    from bosn.resources import DiscoveredResource, ScanResult
+
+    lost = "lost-registry"
+    raw = labels.ResourceLabels(
+        registry=lost,
+        kind="volume",
+        stack="dev",
+        generation="digest",
+        scope="spec",
+        workspace="workspace",
+        created="2026-01-01T00:00:00Z",
+    ).to_dict()
+
+    class Scanner:
+        def __init__(self, _engine) -> None:
+            pass
+
+        def scan(self, registry_id: str, **_kwargs):
+            resource = DiscoveredResource("volume", "cache", raw)
+            return ScanResult(owned=[resource] if registry_id == lost else [], foreign=[resource])
+
+    import bosn.resources
+
+    monkeypatch.setattr(bosn.resources, "ResourceScanner", Scanner)
+    daemon = Daemon(state_dir=tmp_path)
+    try:
+        reply = daemon._verb_adopt({"engine": "docker", "source_registry": lost})
+        assert reply["ok"]
+        assert daemon.registry.registry_id == lost
+        assert daemon.registry.get_resource_by_engine_identity("volume", "cache") is not None
+    finally:
+        daemon.registry.close()
+
+
 # -- client behavior -------------------------------------------------------
 
 

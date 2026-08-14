@@ -128,3 +128,7 @@ def test_policy_flags_work_before_or_after_the_verb() -> None:
 def test_gc_apply_flips_dry_run() -> None:
     assert opts(["gc"]).dry_run is True
     assert opts(["gc", "--apply"]).dry_run is False
+
+
+def test_adopt_can_select_a_lost_registry_identity() -> None:
+    assert opts(["adopt", "--from-registry", "lost-registry"]).source_registry == "lost-registry"
