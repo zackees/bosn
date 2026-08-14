@@ -17,6 +17,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import math
 import os
 import secrets
 import socket
@@ -282,12 +283,21 @@ class Daemon:
         self.last_activity = self.started_at
         self.heartbeat_at = self.started_at
         self.maintenance_interval_seconds = maintenance_interval_seconds
-        self._next_maintenance_at = self.started_at  # catch up immediately after downtime
         self._maintenance_backoff_seconds = MAINTENANCE_BACKOFF_INITIAL_SECONDS
         self._server: _Server | None = None
         self._stop = threading.Event()
+        self._watchdog_thread: threading.Thread | None = None
         self.secret = secrets.token_urlsafe(32)
         self.registry = Registry(self.state_dir / "registry.sqlite3", clock=self.clock)
+        stored_deadline = self.registry.meta("maintenance.next_deadline")
+        try:
+            deadline = float(stored_deadline) if stored_deadline else self.started_at
+            if not math.isfinite(deadline):
+                raise ValueError("deadline must be finite")
+            self._next_maintenance_at = deadline
+        except (TypeError, ValueError):
+            self._next_maintenance_at = self.started_at
+            self.registry.log_event("maintenance.deadline.recovered", stored_deadline or "")
         self.jobs = JobManager(
             self._build,
             max_builds=max_builds,
@@ -351,7 +361,8 @@ class Daemon:
             pass
         self.registry.log_event("daemon.started", f"pid={os.getpid()} port={self.port}")
 
-        threading.Thread(target=self._idle_watchdog, daemon=True).start()
+        self._watchdog_thread = threading.Thread(target=self._idle_watchdog, daemon=True)
+        self._watchdog_thread.start()
         try:
             self._server.serve_forever(poll_interval=0.2)
         finally:
@@ -399,7 +410,7 @@ class Daemon:
             raise
         except Exception as exc:  # noqa: BLE001 - a scheduler failure must be visible
             self.registry.log_event("maintenance.reap.error", f"{type(exc).__name__}: {exc}")
-            self._next_maintenance_at = self.clock.now() + self.maintenance_interval_seconds
+            self._set_next_maintenance(self.clock.now() + self.maintenance_interval_seconds)
             return
 
         engine = Engine(self.engine_binary)
@@ -410,7 +421,7 @@ class Daemon:
                 "maintenance.engine_down",
                 f"retry_in={self._maintenance_backoff_seconds:g}s {detail}",
             )
-            self._next_maintenance_at = self.clock.now() + self._maintenance_backoff_seconds
+            self._set_next_maintenance(self.clock.now() + self._maintenance_backoff_seconds)
             self._maintenance_backoff_seconds = min(
                 self._maintenance_backoff_seconds * 2, MAINTENANCE_BACKOFF_MAX_SECONDS
             )
@@ -426,7 +437,11 @@ class Daemon:
         else:
             self.registry.log_event("maintenance.gc.finished", json.dumps(result.summary()))
         self._maintenance_backoff_seconds = MAINTENANCE_BACKOFF_INITIAL_SECONDS
-        self._next_maintenance_at = self.clock.now() + self.maintenance_interval_seconds
+        self._set_next_maintenance(self.clock.now() + self.maintenance_interval_seconds)
+
+    def _set_next_maintenance(self, deadline: float) -> None:
+        self._next_maintenance_at = deadline
+        self.registry.set_meta("maintenance.next_deadline", f"{deadline:.6f}")
 
     def request_stop(self) -> None:
         self._stop.set()
@@ -435,6 +450,9 @@ class Daemon:
 
     def shutdown(self) -> None:
         self._stop.set()
+        watchdog = self._watchdog_thread
+        if watchdog is not None and watchdog is not threading.current_thread():
+            watchdog.join(timeout=2)
         # Cancel in-flight builds and wait for them *before* closing the registry they
         # write to. Each one tells its attached clients why it stopped rather than dying
         # silently.

@@ -149,19 +149,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def cmd_doctor(opts: Options) -> int:
+    from bosn import autostart
+
     info = Engine(opts.engine).info()
     print(f"engine binary:  {info.binary}")
     print(f"client version: {info.client_version or '-'}")
     print(f"server version: {info.server_version or '-'}")
     print(f"reachable:      {'yes' if info.reachable else 'no'}")
-    if not info.reachable:
-        print(f"diagnosis:      {info.detail}", file=sys.stderr)
-        return 1
     from bosn.registry import Registry, default_db_path
-    from bosn.resources import ResourceScanner
 
     db_path = (opts.state_dir / "registry.sqlite3") if opts.state_dir else default_db_path()
     with Registry(db_path) as registry:
+        deadline = registry.meta("maintenance.next_deadline")
+        print(f"scheduler manifest installed: {autostart.manifest_installed()}")
+        print(f"scheduler next deadline: {deadline or '-'}")
+        if not info.reachable:
+            print(f"diagnosis:      {info.detail}", file=sys.stderr)
+            return 1
+        from bosn.resources import ResourceScanner
+
         scan = ResourceScanner(Engine(opts.engine)).scan(registry.registry_id)
         if scan.foreign_registries:
             state = f" --state-dir {opts.state_dir}" if opts.state_dir else ""

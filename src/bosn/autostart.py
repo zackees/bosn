@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 NAME = "bosn-daemon"
+MAINTENANCE_INTERVAL_SECONDS = 300
 
 
 def command() -> list[str]:
@@ -33,7 +34,12 @@ def enable(*, platform: str | None = None, home: Path | None = None) -> Path:
     if platform.startswith("win"):
         target.mkdir(parents=True, exist_ok=True)
         launcher = target / "bosn-daemon.cmd"
-        launcher.write_text(f"@echo off\r\n{invocation}\r\n", encoding="utf-8")
+        launcher.write_text(
+            "@echo off\r\n:loop\r\n"
+            f"{invocation}\r\ntimeout /t {MAINTENANCE_INTERVAL_SECONDS} /nobreak >nul\r\n"
+            "goto loop\r\n",
+            encoding="utf-8",
+        )
         return launcher
     target.parent.mkdir(parents=True, exist_ok=True)
     if platform == "darwin":
@@ -42,17 +48,27 @@ def enable(*, platform: str | None = None, home: Path | None = None) -> Path:
             '<plist version="1.0"><dict><key>Label</key>'
             "<string>io.github.zackees.bosn</string><key>ProgramArguments</key><array>"
             f"{''.join(f'<string>{part}</string>' for part in command())}"
-            "</array><key>RunAtLoad</key><true/></dict></plist>\n",
+            "</array><key>RunAtLoad</key><true/><key>StartInterval</key>"
+            f"<integer>{MAINTENANCE_INTERVAL_SECONDS}</integer></dict></plist>\n",
             encoding="utf-8",
         )
         return target
     target.write_text(
         "[Unit]\nDescription=bosn container lifecycle supervisor\n\n"
-        "[Service]\nType=simple\nExecStart=" + invocation + "\nRestart=on-failure\n\n"
-        "[Install]\nWantedBy=default.target\n",
+        + "[Service]\nType=simple\nExecStart="
+        + invocation
+        + "\n",
         encoding="utf-8",
     )
-    subprocess.run(["systemctl", "--user", "enable", "--now", target.name], check=False)
+    timer = target.with_name("bosn-daemon.timer")
+    timer.write_text(
+        "[Unit]\nDescription=run bosn maintenance regularly\n\n[Timer]\n"
+        "OnBootSec=1min\nOnUnitInactiveSec="
+        + str(MAINTENANCE_INTERVAL_SECONDS)
+        + "s\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["systemctl", "--user", "enable", "--now", timer.name], check=False)
     return target
 
 
@@ -63,6 +79,28 @@ def disable(*, platform: str | None = None, home: Path | None = None) -> Path:
     if platform.startswith("win"):
         target = target / "bosn-daemon.cmd"
     elif platform != "darwin":
-        subprocess.run(["systemctl", "--user", "disable", "--now", target.name], check=False)
+        timer = target.with_name("bosn-daemon.timer")
+        subprocess.run(["systemctl", "--user", "disable", "--now", timer.name], check=False)
+        timer.unlink(missing_ok=True)
     target.unlink(missing_ok=True)
     return target
+
+
+def manifest_installed(*, platform: str | None = None, home: Path | None = None) -> bool:
+    """Whether the recurring scheduler's launcher files are installed.
+
+    This intentionally does not claim the operating-system scheduler is currently
+    enabled: a user can disable a systemd timer after its unit files are written.
+    """
+    platform = platform or sys.platform
+    target = path(platform=platform, home=home)
+    if platform.startswith("win"):
+        return (target / "bosn-daemon.cmd").exists()
+    if platform == "darwin":
+        return target.exists()
+    return target.exists() and target.with_name("bosn-daemon.timer").exists()
+
+
+def enabled(*, platform: str | None = None, home: Path | None = None) -> bool:
+    """Backward-compatible alias for :func:`manifest_installed`."""
+    return manifest_installed(platform=platform, home=home)
