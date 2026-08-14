@@ -5,6 +5,7 @@ Docker-marked: Linux CI only.
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -12,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from bosn import labels
-from bosn.converge import Converger, run_task
+from bosn.converge import Converger, run_task, workspace_of
 from bosn.engine import Engine
 from bosn.manifest import load
 from bosn.registry import Registry
@@ -123,6 +124,37 @@ def test_editing_a_copy_input_rolls_and_builds_a_new_image(
     assert second.image_tag != first.image_tag
     assert engine.run(["image", "inspect", first.image_tag]).ok
     assert engine.run(["image", "inspect", second.image_tag]).ok
+
+
+def test_run_after_copy_roll_uses_a_recreated_current_container(
+    project: Path, converger: Converger, registry: Registry, engine: Engine
+) -> None:
+    (project / "Dockerfile").write_text(
+        "FROM alpine:3.20\nCOPY payload /payload\n", encoding="utf-8"
+    )
+    payload = project / "payload"
+    payload.write_text("one", encoding="utf-8")
+    first, code, output = converger.run(["cat", "/payload"])
+    assert code == 0, output
+    assert output.strip() == "one"
+
+    payload.write_text("two", encoding="utf-8")
+    second, code, output = converger.run(["cat", "/payload"])
+
+    assert code == 0, output
+    assert output.strip() == "two"
+    assert second.digest != first.digest
+    name = converger.container_name(workspace_of(converger.manifest), second.stack)
+    inspected = engine.run(["container", "inspect", "--format", "{{json .}}", name])
+    assert inspected.ok
+    details = json.loads(inspected.stdout)
+    expected_image = engine.run(
+        ["image", "inspect", "--format", "{{.Id}}", second.image_tag]
+    ).stdout
+    assert details["Image"] == expected_image
+    assert details["Config"]["Labels"][labels.GENERATION] == second.digest
+    rows = [row for row in registry.list_resources() if row.kind == "container"]
+    assert rows and {row.generation for row in rows} == {second.digest}
 
 
 def test_a_manifest_task_runs(project: Path, registry: Registry, engine: Engine) -> None:
