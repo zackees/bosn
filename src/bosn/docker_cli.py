@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from bosn import __version__, daemon, labels
-from bosn.compose import ComposeError, load_compose
+from bosn.compose import ComposeError, content_digest, load_compose
 from bosn.registry import Registry
 
 
@@ -103,6 +103,12 @@ def _compose_overlay(registry_id: str | Registry, compose: Path) -> Path:
         )
     created = dt.datetime.now(dt.UTC).isoformat().replace("+00:00", "Z")
     workspace = str(compose.parent.resolve())
+    # Every Compose resource used to carry the constant generation "compose", so every
+    # project on the machine shared one generation string and nothing could ever be
+    # superseded: editing the compose file rolled nothing, and the old resources stayed
+    # current forever. A content digest gives Compose the same identity the manifest path
+    # already has -- two invocations are compatible iff their digests are byte-equal.
+    generation = content_digest(compose)
 
     def label_block(resource_names: list[str], kind: str) -> list[str]:
         block: list[str] = []
@@ -111,7 +117,7 @@ def _compose_overlay(registry_id: str | Registry, compose: Path) -> Path:
                 registry=registry_id,
                 kind=kind,
                 stack=name,
-                generation="compose",
+                generation=generation,
                 scope="stack",
                 workspace=workspace,
                 created=created,
@@ -141,6 +147,46 @@ def _compose_overlay(registry_id: str | Registry, compose: Path) -> Path:
         handle.close()
 
 
+def _reconcile_after_compose(command: str) -> None:
+    """Adopt any labeled-but-unregistered resource left behind by a Compose invocation.
+
+    Runs unconditionally -- on a clean exit, a non-zero exit, and on the way out of a
+    KeyboardInterrupt -- because Compose labels (and creates) containers, networks, and
+    volumes incrementally as it works through the file. A run that fails partway through
+    pulling images, or is killed by Ctrl-C during a foreground `up`, can still leave fully
+    labeled resources on the engine that the registry has never heard of: exactly the
+    ungoverned accumulation bosn exists to prevent. Gating this on `command == "up" and
+    returncode == 0` is precisely how those resources went unregistered.
+
+    Paying for the scan on `down`/`logs`/`ps` too is a non-issue: those commands don't
+    label new resources, adoption only registers what is not already known, so the scan
+    finds nothing to do and returns immediately.
+
+    A failure here is reported to stderr but never raised. Raising would surface as a
+    `DockerFrontDoorError` in `main()`, which maps to exit code 1 regardless of what the
+    compose command itself returned -- masking `up`'s real exit status behind a
+    bookkeeping error the caller didn't ask about.
+    """
+    try:
+        adopted = daemon.request("compose-adopt")
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:  # daemon unreachable, IPC failure, etc.
+        print(
+            f"bosn-docker compose: reconcile after {command} failed: {exc}; "
+            "resources created by this run may be unregistered",
+            file=sys.stderr,
+        )
+        return
+    if not adopted.get("ok"):
+        print(
+            f"bosn-docker compose: reconcile after {command} failed: "
+            f"{adopted.get('error') or 'compose adoption failed'}; "
+            "resources created by this run may be unregistered",
+            file=sys.stderr,
+        )
+
+
 def _run_compose(command: str, compose: Path, args: list[str]) -> int:
     if args:
         raise DockerFrontDoorError(f"unsupported compose flag or argument {args[0]!r}")
@@ -149,13 +195,16 @@ def _run_compose(command: str, compose: Path, args: list[str]) -> int:
         raise DockerFrontDoorError(str(reply.get("error") or "cannot reach bosn daemon"))
     overlay = _compose_overlay(str(reply["registry_id"]), compose)
     try:
-        completed = subprocess.run(
-            ["docker", "compose", "-f", str(compose), "-f", str(overlay), command], check=False
-        )
-        if command == "up" and completed.returncode == 0:
-            adopted = daemon.request("compose-adopt")
-            if not adopted.get("ok"):
-                raise DockerFrontDoorError(str(adopted.get("error") or "compose adoption failed"))
+        # The inner try/finally is the load-bearing part: it reconciles whether the
+        # subprocess returns normally, raises, or is unwound by a KeyboardInterrupt from
+        # Ctrl-C -- the single most likely way a foreground `up` never reaches a clean
+        # exit. The outer finally still removes the overlay file in every case.
+        try:
+            completed = subprocess.run(
+                ["docker", "compose", "-f", str(compose), "-f", str(overlay), command], check=False
+            )
+        finally:
+            _reconcile_after_compose(command)
         return completed.returncode
     finally:
         overlay.unlink(missing_ok=True)
