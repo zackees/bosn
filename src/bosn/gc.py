@@ -38,9 +38,19 @@ from bosn.retention import (
 
 _REMOVE_COMMANDS: dict[str, list[str]] = {
     "container": ["rm", "--force"],
+    # `docker network rm` has no `--force`: a network attached to a running container
+    # simply refuses removal, which is exactly the dependency check GC relies on if
+    # `_REMOVAL_ORDER` below is ever wrong.
+    "network": ["network", "rm"],
     "volume": ["volume", "rm", "--force"],
     "image": ["image", "rm", "--force"],
 }
+
+# Dependency-ordered GC removal: a container holds a network endpoint and a volume mount,
+# so both must go before the network/volume can be removed; images are least constrained
+# and go last. Lower sorts first. Kinds absent here (e.g. "builder") keep their relative
+# scan order via the default in the sort key below.
+_REMOVAL_ORDER: dict[str, int] = {"container": 0, "network": 1, "volume": 2, "image": 3}
 
 
 @dataclass
@@ -210,10 +220,14 @@ class Collector:
                         result.errors.append(message)
                         self.registry.log_event("container.stop_error", message)
 
-        # Containers retain their volumes even after they have stopped. Remove them
-        # first so a done workspace can be collected in one pass.
+        # Containers retain their volumes and network endpoints even after they have
+        # stopped, and a network with an attached endpoint refuses removal. Remove in
+        # dependency order -- containers, then networks, then volumes/images -- so a done
+        # workspace can be collected in one pass instead of leaving stranded networks
+        # behind for the next GC pass to retry.
         for verdict in sorted(
-            collectable(verdicts), key=lambda verdict: verdict.resource.kind != "container"
+            collectable(verdicts),
+            key=lambda verdict: _REMOVAL_ORDER.get(verdict.resource.kind, 99),
         ):
             with self.registry.lifecycle_guard():
                 resource = self.registry.get_resource(verdict.resource.id)

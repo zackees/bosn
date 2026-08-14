@@ -22,7 +22,7 @@ CREATED = f"{NAMESPACE}.created"
 
 REQUIRED_LABELS: tuple[str, ...] = (REGISTRY, KIND, STACK, GENERATION, SCOPE, WORKSPACE, CREATED)
 
-KINDS: frozenset[str] = frozenset({"container", "volume", "image", "builder"})
+KINDS: frozenset[str] = frozenset({"container", "volume", "image", "builder", "network"})
 SCOPES: frozenset[str] = frozenset({"spec", "stack", "machine"})
 
 

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 
-from bosn.accounting import StorageInventory, desktop_vhdx, engine_storage_path
+from bosn.accounting import StorageInventory, desktop_vhdx, engine_storage_path, resource_bytes
 from bosn.engine import EngineResult
+from bosn.registry import Resource
 
 
 class Engine:
@@ -69,6 +70,34 @@ def test_engine_storage_path_prefers_the_engine_root_over_registry_state(tmp_pat
     state.mkdir()
 
     assert engine_storage_path(RootEngine(str(root)), state) == root  # type: ignore[arg-type]
+
+
+def test_network_bytes_are_known_zero_not_permanently_unmeasured() -> None:
+    """`system df -v` has no row shape for networks; that must read as measured-zero.
+
+    `gc.collect` refuses to declare byte pressure resolved while any resource is
+    unmeasured (`resource_bytes(...) is None`). If a network fell through to that
+    "unknown" path, every project with a Compose-created network would wedge byte
+    pressure resolution forever -- there is no inventory row that could ever fill it in.
+    """
+    engine = Engine()
+    network = Resource(
+        id="r1",
+        kind="network",
+        name="proj_default",
+        stack="s",
+        generation="g",
+        scope="spec",
+        workspace="/w",
+        created_at=0.0,
+        last_used=0.0,
+    )
+
+    size = resource_bytes(engine, network)  # type: ignore[arg-type]
+
+    assert size == 0
+    # No inventory lookup was needed to answer -- and none is possible for a network.
+    assert engine.calls == []
 
 
 def test_desktop_vhdx_finds_docker_data_disk_in_configured_directory(tmp_path) -> None:

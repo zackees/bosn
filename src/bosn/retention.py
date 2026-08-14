@@ -5,6 +5,7 @@ seconds to recreate from a warm image. A cache volume is the asset that turns a 
 cold build into 30 seconds. They get separate clocks:
 
 - containers idle-stop at 1 h and are removed at 24 h
+- networks share the container's 24 h removal clock -- disposable, not a cache
 - warm volumes live 72 h
 - superseded generations are capped at 24 h
 - machine-shared caches age only under pressure
@@ -103,7 +104,12 @@ def container_should_stop(resource: Resource, now: float, *, config: Config | No
 
 
 def _ttl_for(resource: Resource, *, config: Config) -> float:
-    if resource.kind == "container":
+    if resource.kind in ("container", "network"):
+        # A network is cheap to recreate -- `docker compose up` (or a plain `docker
+        # network create`) rebuilds it in milliseconds with no data to lose. It is
+        # disposable infrastructure like a container, not a warm cache asset like a
+        # volume, so it shares the container's short removal clock rather than the
+        # volume's 72 h warm TTL.
         return config.get("container_remove")
     return config.get("warm_volume_ttl")
 

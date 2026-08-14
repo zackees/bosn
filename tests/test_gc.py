@@ -47,7 +47,7 @@ class FakeEngine:
             if name in self.fail_on:
                 return EngineResult(1, "", "stop failed")
             return EngineResult(0, name, "")
-        if args[0] in {"rm", "volume", "image"} and "rm" in args:
+        if args[0] in {"rm", "volume", "image", "network"} and "rm" in args:
             name = args[-1]
             if name in self.fail_on:
                 return EngineResult(1, "", "device or resource busy")
@@ -251,6 +251,56 @@ def test_there_is_no_force_flag_on_gc() -> None:
     assert "force" not in help_text
     with pytest.raises(SystemExit):
         build_parser().parse_args(["gc", "--force"])
+
+
+# -- network governance -----------------------------------------------------
+
+
+def test_network_removal_is_ordered_after_container_removal(
+    registry: Registry, clock: FakeClock
+) -> None:
+    """Docker refuses to remove a network with an attached endpoint.
+
+    RED before this slice: `network` was not a governed kind at all -- absent from
+    `labels.KINDS`, `resources._LIST_COMMANDS`/`_INSPECT_COMMANDS`, and
+    `gc._REMOVE_COMMANDS` -- so a network resource could never be scanned, labeled, or
+    removed by GC in the first place. GREEN now: a network is fully governed, and the
+    dependency-ordered removal in `gc._REMOVAL_ORDER` places it after `container` (which
+    may hold an attached endpoint on it) and before `volume`/`image`.
+    """
+    add(registry, "proj_net", kind="network")
+    add(registry, "proj_ctr", kind="container")
+    engine = FakeEngine(
+        {
+            "proj_net": label_dict(registry=registry.registry_id, kind="network"),
+            "proj_ctr": label_dict(registry=registry.registry_id, kind="container"),
+        }
+    )
+    clock.advance(10 * DAY)
+
+    result = Collector(registry, engine).collect(dry_run=False)  # type: ignore[arg-type]
+
+    removal_order = [c[-1] for c in engine.commands if "rm" in c and c[0] != "container"]
+    assert removal_order == ["proj_ctr", "proj_net"], (
+        "container must be removed before the network that was attached to it"
+    )
+    assert set(result.removed) == {"proj_net", "proj_ctr"}
+
+
+def test_network_is_removable_via_gc_without_a_force_flag(
+    registry: Registry, clock: FakeClock
+) -> None:
+    add(registry, "proj_net", kind="network")
+    engine = FakeEngine({"proj_net": label_dict(registry=registry.registry_id, kind="network")})
+    clock.advance(10 * DAY)
+
+    result = Collector(registry, engine).collect(dry_run=False)  # type: ignore[arg-type]
+
+    assert result.removed == ["proj_net"]
+    assert ["network", "rm", "proj_net"] in engine.commands
+    assert not any("--force" in cmd for cmd in engine.commands if cmd[0] == "network")
+    assert registry.list_resources() == []
+    assert any(row["kind"] == "gc.removed" for row in registry.events())
 
 
 # -- dry run ---------------------------------------------------------------

@@ -79,7 +79,16 @@ class StorageInventory:
 def resource_bytes(
     engine: Engine, resource: Resource, inventory: StorageInventory | None = None
 ) -> int | None:
-    """Return a resource's managed bytes, or None when the engine cannot attribute it."""
+    """Return a resource's managed bytes, or None when the engine cannot attribute it.
+
+    `docker system df -v` has no row shape for networks -- they hold no data, so there is
+    nothing to size. That absence must read as "known: zero bytes", not "unmeasured": `gc`
+    refuses to declare byte pressure resolved while any managed resource is unmeasured, so
+    treating every network as permanently unmeasured would wedge pressure resolution for
+    good on any project with a Compose-created network.
+    """
+    if resource.kind == "network":
+        return 0
     inventory = inventory or StorageInventory.collect(engine)
     return inventory.sizes.get((resource.kind, resource.name))
 
