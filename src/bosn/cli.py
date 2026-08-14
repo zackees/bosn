@@ -539,6 +539,8 @@ def cmd_gc(opts: Options) -> int:
         print(("would remove " if result.dry_run else "removed ") + name)
     for message in result.errors:
         print(f"error: {message}", file=sys.stderr)
+    for advisory in result.advisories:
+        print(f"advisory: {advisory}", file=sys.stderr)
     return 1 if result.errors else 0
 
 
