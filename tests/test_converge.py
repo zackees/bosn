@@ -44,6 +44,7 @@ class FakeEngine:
 
     def __init__(self) -> None:
         self.commands: list[list[str]] = []
+        self.timeouts: list[float | None] = []
         self.existing: set[str] = set()
         self.image_ids: dict[str, str] = {"alpine": "sha256:alpine-v1"}
         self.image_platforms: dict[str, str] = {"alpine": "linux/amd64"}
@@ -51,8 +52,11 @@ class FakeEngine:
         self.resource_labels: dict[tuple[str, str], dict[str, str]] = {}
         self.container_serial = 0
 
-    def run(self, args: list[str], *, check: bool = False) -> EngineResult:
+    def run(
+        self, args: list[str], *, check: bool = False, timeout: float | None = None
+    ) -> EngineResult:
         self.commands.append(list(args))
+        self.timeouts.append(timeout)
         if args[:2] == ["version", "--format"]:
             return EngineResult(0, "linux/amd64", "")
         if args[:2] == ["container", "inspect"] and "{{json .}}" in args:
@@ -1014,8 +1018,10 @@ def test_failed_new_container_is_removed_by_immutable_id(
             super().__init__()
             self.created_id = ""
 
-        def run(self, args: list[str], *, check: bool = False) -> EngineResult:
-            result = super().run(args, check=check)
+        def run(
+            self, args: list[str], *, check: bool = False, timeout: float | None = None
+        ) -> EngineResult:
+            result = super().run(args, check=check, timeout=timeout)
             if args[0] == "create":
                 self.created_id = result.stdout
                 if failure == "validation":
@@ -1047,8 +1053,10 @@ def test_new_container_is_removed_if_lease_acquisition_fails(
             super().__init__()
             self.created_id = ""
 
-        def run(self, args: list[str], *, check: bool = False) -> EngineResult:
-            result = super().run(args, check=check)
+        def run(
+            self, args: list[str], *, check: bool = False, timeout: float | None = None
+        ) -> EngineResult:
+            result = super().run(args, check=check, timeout=timeout)
             if args[0] == "create":
                 self.created_id = result.stdout
             return result
@@ -1196,4 +1204,14 @@ def test_persistent_container_has_daemon_loss_and_run_duration_watchdogs(
     create = engine.ran("create")[0]
     assert "--rm" in create
     assert any("daemon.heartbeat:/bosn-daemon/heartbeat:ro" in arg for arg in create)
-    assert any("stat -c %Y" in arg and "started" in arg for arg in create)
+    assert any("stat -c %Y" in arg for arg in create)
+    assert "started=$(date +%s)" not in create[-1]
+
+
+def test_execution_uses_configured_deadline_not_engine_control_timeout(
+    converger: Converger,
+) -> None:
+    converger.run_max_duration = 123.0
+    converger.run(["true"])
+    engine: FakeEngine = converger.engine  # type: ignore[assignment]
+    assert engine.timeouts[-1] == 123.0

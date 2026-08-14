@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from bosn.config import Config
 from bosn.registry import Lease, Registry, Resource
 from bosn.resources import (
     QUIET_PERIOD_SECONDS,
@@ -92,20 +93,19 @@ class Pressure:
         )
 
 
-def container_should_stop(resource: Resource, now: float) -> bool:
+def container_should_stop(resource: Resource, now: float, *, config: Config | None = None) -> bool:
     from bosn.config import load
 
-    return resource.kind == "container" and (now - resource.last_used) >= load().get(
+    config = config or load()
+    return resource.kind == "container" and (now - resource.last_used) >= config.get(
         "container_idle_stop"
     )
 
 
-def _ttl_for(resource: Resource) -> float:
-    from bosn.config import load
-
+def _ttl_for(resource: Resource, *, config: Config) -> float:
     if resource.kind == "container":
-        return load().get("container_remove")
-    return load().get("warm_volume_ttl")
+        return config.get("container_remove")
+    return config.get("warm_volume_ttl")
 
 
 def evaluate(
@@ -116,11 +116,16 @@ def evaluate(
     superseded: bool = False,
     workspace_done: bool = False,
     pressure: Pressure | None = None,
+    config: Config | None = None,
     alive_probe=process_alive,
 ) -> Verdict:
     """Decide a single resource's fate. Never mutates anything."""
     now = registry.clock.now() if now is None else now
     pressure = pressure or Pressure()
+    if config is None:
+        from bosn.config import load
+
+        config = load()
 
     leases: list[Lease] = registry.leases_for(resource.id)
     if any(not lease_is_expired(lease, now, alive_probe=alive_probe) for lease in leases):
@@ -134,9 +139,7 @@ def evaluate(
         return Verdict(resource, False, KEPT_QUIET_PERIOD)
 
     if superseded:
-        from bosn.config import load
-
-        if age >= load().get("superseded_cap"):
+        if age >= config.get("superseded_cap"):
             return Verdict(resource, True, COLLECT_SUPERSEDED)
         return Verdict(resource, False, KEPT_WARM)
 
@@ -152,7 +155,7 @@ def evaluate(
         # Machine-shared caches age only under pressure.
         return Verdict(resource, False, KEPT_MACHINE_SCOPE)
 
-    if age >= _ttl_for(resource):
+    if age >= _ttl_for(resource, config=config):
         return Verdict(resource, True, COLLECT_IDLE)
 
     return Verdict(resource, False, KEPT_WARM)
@@ -164,6 +167,7 @@ def plan(
     now: float | None = None,
     done_workspaces: set[str] | None = None,
     pressure: Pressure | None = None,
+    config: Config | None = None,
     alive_probe=process_alive,
 ) -> list[Verdict]:
     """Evaluate every registered resource. Pure: the registry is not modified."""
@@ -183,6 +187,7 @@ def plan(
                 superseded=superseded,
                 workspace_done=workspace_done,
                 pressure=pressure,
+                config=config,
                 alive_probe=alive_probe,
             )
         )

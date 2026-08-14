@@ -79,6 +79,12 @@ def test_doctor_reports_unreachable_engine_without_crashing(capsys) -> None:
     assert "not on PATH" in captured.err
 
 
+def test_gc_reports_invalid_policy_without_a_traceback(monkeypatch, tmp_path, capsys) -> None:
+    monkeypatch.setenv("BOSN_WARM_VOLUME_TTL", "not-a-number")
+    assert cli.main(["--state-dir", str(tmp_path), "gc"]) == 1
+    assert "warm_volume_ttl" in capsys.readouterr().err
+
+
 def test_stopping_a_daemon_that_was_not_running_says_so(tmp_path, capsys) -> None:
     assert cli.main(["--state-dir", str(tmp_path), "__daemon", "--stop"]) == 0
     assert "no daemon was running" in capsys.readouterr().out

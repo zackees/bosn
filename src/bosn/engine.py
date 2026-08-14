@@ -56,15 +56,20 @@ class Engine:
         """True when the engine binary is on PATH. Does not prove the daemon is up."""
         return shutil.which(self.binary) is not None
 
-    def run(self, args: list[str], *, check: bool = False) -> EngineResult:
+    def run(
+        self, args: list[str], *, check: bool = False, timeout: float | None = None
+    ) -> EngineResult:
         if not self.available():
             raise EngineError(f"{self.binary!r} is not on PATH")
-        completed = rp.subprocess_run(
-            [self.binary, *args],
-            cwd=None,
-            check=False,
-            timeout=self.timeout,
-        )
+        effective_timeout = self.timeout if timeout is None else max(1, int(timeout))
+        try:
+            completed = rp.subprocess_run(
+                [self.binary, *args], cwd=None, check=False, timeout=effective_timeout
+            )
+        except RuntimeError as exc:
+            raise EngineError(
+                f"{self.binary} {' '.join(args)} exceeded its {effective_timeout}-second deadline"
+            ) from exc
         result = EngineResult(
             returncode=completed.returncode,
             stdout=(completed.stdout or "").strip(),

@@ -44,6 +44,14 @@ class Options:
     stop: bool = False
     autostart: bool | None = None
 
+    # policy overrides (file < environment < CLI flag)
+    container_idle_stop: float | None = None
+    container_remove: float | None = None
+    warm_volume_ttl: float | None = None
+    superseded_cap: float | None = None
+    shared_cache_ceiling: float | None = None
+    run_max_duration: float | None = None
+
     extras: tuple[str, ...] = field(default=())
 
     @property
@@ -65,6 +73,19 @@ def _as_path(value: object) -> Path | None:
 
 def _as_str(value: object) -> str | None:
     return None if value is None else str(value)
+
+
+def _float_or_none(value: object) -> float | None:
+    return None if value is None else float(str(value))
+
+
+def _int_or_none(value: object) -> int | None:
+    if value is None:
+        return None
+    number = float(str(value))
+    if not number.is_integer():
+        raise ValueError(f"expected an integer, got {value!r}")
+    return int(number)
 
 
 def from_namespace(ns: argparse.Namespace) -> Options:
@@ -107,8 +128,14 @@ def from_namespace(ns: argparse.Namespace) -> Options:
         dry_run=bool(get("dry_run", True)),
         port=None if port is None else int(str(port)),
         idle_retire_seconds=None if idle is None else float(str(idle)),
-        max_builds=None if max_builds is None else int(str(max_builds)),
+        max_builds=_int_or_none(max_builds),
         build_ttl_seconds=None if build_ttl is None else float(str(build_ttl)),
         stop=bool(get("stop", False)),
         autostart=autostart,
+        container_idle_stop=_float_or_none(get("container_idle_stop")),
+        container_remove=_float_or_none(get("container_remove")),
+        warm_volume_ttl=_float_or_none(get("warm_volume_ttl")),
+        superseded_cap=_float_or_none(get("superseded_cap")),
+        shared_cache_ceiling=_float_or_none(get("shared_cache_ceiling")),
+        run_max_duration=_float_or_none(get("run_max_duration")),
     )

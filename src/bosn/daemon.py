@@ -32,6 +32,7 @@ from typing import Any
 
 from bosn import __version__, ipc
 from bosn.clock import Clock, SystemClock
+from bosn.config import Config
 from bosn.jobs import BuildOutcome, Job, JobError, JobManager
 from bosn.registry import Registry, default_state_dir
 
@@ -269,8 +270,10 @@ class Daemon:
         engine_binary: str = "docker",
         maintenance_interval_seconds: float = DEFAULT_MAINTENANCE_INTERVAL_SECONDS,
         clock: Clock | None = None,
+        config: Config | None = None,
     ) -> None:
         self.engine_binary = engine_binary
+        self.config = config
         self.clock = clock or SystemClock()
         self.state_dir = state_dir or default_state_dir()
         self.bind_port = port_for(self.state_dir) if port is None else port
@@ -415,7 +418,7 @@ class Daemon:
 
         self.registry.log_event("maintenance.gc.started")
         try:
-            result = Collector(self.registry, engine).collect(dry_run=False)
+            result = Collector(self.registry, engine, config=self.config).collect(dry_run=False)
         except KeyboardInterrupt:
             raise
         except Exception as exc:  # noqa: BLE001 - never claim a failed GC succeeded
@@ -490,6 +493,7 @@ class Daemon:
             "uptime_seconds": time.time() - self.started_at,
             "idle_seconds": self.idle_seconds(),
             "resources": len(self.registry.list_resources()),
+            "config": self.config.report() if self.config is not None else None,
         }
 
     def _verb_jobs(self, request: dict[str, Any]) -> dict[str, Any]:
