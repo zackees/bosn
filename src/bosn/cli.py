@@ -472,6 +472,10 @@ def cmd_gc(opts: Options) -> int:
         result = collector.collect(dry_run=opts.dry_run, done_workspaces=done_workspaces(registry))
 
     print(json.dumps({**result.summary(), "dry_run": result.dry_run}, indent=2))
+    for name in result.would_stop:
+        print(f"would stop {name}")
+    for name in result.stopped:
+        print(f"stopped {name}")
     for name in result.removed:
         print(("would remove " if result.dry_run else "removed ") + name)
     for message in result.errors:
