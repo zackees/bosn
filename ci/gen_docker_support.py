@@ -89,7 +89,68 @@ def render() -> str:
                 lines.append(f"| `{entry['verb']}` | {entry['summary']} |")
         lines.append("")
 
+    lines += _render_compose_flags(payload["compose"])
+
     return "\n".join(lines) + "\n"
+
+
+def _render_flag_table(flags: list[dict]) -> list[str]:
+    """One flag table, accepted and refused rows together -- `Status`/`Remedy` columns
+    make the refused rows self-explanatory without a second table per command.
+    """
+    lines = ["| Flag | Aliases | Takes value | Status | Summary | Remedy |"]
+    lines.append("| --- | --- | --- | --- | --- | --- |")
+    for entry in flags:
+        aliases = ", ".join(f"`{alias}`" for alias in entry["aliases"]) or "--"
+        takes_value = "yes" if entry["takes_value"] else "no"
+        remedy = entry["remedy"] or "--"
+        lines.append(
+            f"| `{entry['flag']}` | {aliases} | {takes_value} | {entry['status']} | "
+            f"{entry['summary']} | {remedy} |"
+        )
+    return lines
+
+
+def _render_compose_flags(compose: dict) -> list[str]:
+    """Render the `compose` verb's flag surface (#47): its sub-verb list, the flags shared
+    across every sub-verb, and each sub-verb's own accepted/refused flags.
+
+    A pure function of `frontdoor.supported()`'s `"compose"` key, same discipline
+    `render()` holds itself to for the verb table above -- nothing typed here that isn't
+    already in the payload.
+    """
+    lines: list[str] = []
+    lines.append("## Compose flags")
+    lines.append("")
+    lines.append(
+        "The `compose` verb's own sub-verb and flag surface (#47). A flag not listed as "
+        "`accepted` for a sub-verb -- including one this table has never heard of -- is "
+        "refused, named, with a remedy; see `bosn.frontdoor.resolve_compose_flag`."
+    )
+    lines.append("")
+    lines.append("Sub-verbs: " + ", ".join(f"`{command}`" for command in compose["commands"]))
+    lines.append("")
+    lines.append("### Global flags")
+    lines.append("")
+    lines.append(
+        "Apply to every sub-verb identically; parsed ahead of the sub-verb "
+        "(`bosn-docker compose -f compose.yaml up`)."
+    )
+    lines.append("")
+    lines += _render_flag_table(compose["global_flags"])
+    lines.append("")
+    for command in compose["commands"]:
+        lines.append(f"### `compose {command}`")
+        lines.append("")
+        flags = compose["flags"][command]
+        if flags:
+            lines += _render_flag_table(flags)
+        else:
+            lines.append(
+                "No sub-verb-specific flags are declared; only the global flags above apply."
+            )
+        lines.append("")
+    return lines
 
 
 def _write(text: str) -> None:

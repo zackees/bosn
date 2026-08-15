@@ -797,9 +797,28 @@ class Daemon:
         recompute_manifest_generations(self.registry, recovered)
         return {"ok": True, "adopted": names, "registry_id": registry_id}
 
-    def _verb_compose_adopt(self, _request: dict[str, Any]) -> dict[str, Any]:
-        from bosn.resources import ResourceScanner, adopt
+    def _verb_compose_adopt(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Reconcile the registry against what Compose actually left on the engine.
 
+        Additive by default (`adopt()`): a failed or partial engine listing must never be
+        read as permission to forget rows, so plain reconcile-after-compose (every `up`,
+        `down`, `logs`, `ps`) only ever registers what it finds.
+
+        `prune_missing=True` is the opt-in exception, sent only when the caller just told
+        Compose to *delete* something (`down -v`/`--volumes`): it additionally removes rows
+        for previously-registered resources that the scan's kinds cover but did not find,
+        via `reconcile_owned`'s `prior_resources` path -- the same crash-boundary repair
+        `_reconcile_startup_resources` already trusts. Never used unconditionally here:
+        that would turn an engine hiccup on an ordinary `up`/`logs`/`ps` into silent row
+        loss for resources that never left the engine at all.
+        """
+        from bosn.resources import ResourceScanner, adopt, reconcile_owned
+
+        if bool(request.get("prune_missing")):
+            prior_resources = self.registry.list_resources()
+            scan = ResourceScanner().scan(self.registry.registry_id)
+            reconciled = reconcile_owned(self.registry, scan, prior_resources=prior_resources)
+            return {"ok": True, "adopted": reconciled}
         scan = ResourceScanner().scan(self.registry.registry_id)
         return {"ok": True, "adopted": adopt(self.registry, scan)}
 

@@ -432,6 +432,240 @@ def test_a_clean_up_reconciles_exactly_as_before(
     ]
 
 
+# -- the decided v1 compose flag subset (#47) --------------------------------
+
+
+@pytest.mark.parametrize("flag", ["-d", "--detach", "--wait"])
+def test_up_flags_reach_the_engine_intact(
+    flag: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_daemon = _FakeDaemon()
+    monkeypatch.setattr(daemon, "request", fake_daemon.request)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "bosn.docker_cli.subprocess.run",
+        lambda argv, **_k: (calls.append(argv), _FakeCompleted(returncode=0))[1],
+    )
+
+    returncode = _run_compose("up", _compose_file(tmp_path), [flag])
+
+    assert returncode == 0
+    assert calls[0][-1] == flag
+    assert calls[0][-2] == "up"
+
+
+@pytest.mark.parametrize("flag", ["-v", "--volumes", "--remove-orphans"])
+def test_down_flags_reach_the_engine_intact(
+    flag: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_daemon = _FakeDaemon()
+    monkeypatch.setattr(daemon, "request", fake_daemon.request)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "bosn.docker_cli.subprocess.run",
+        lambda argv, **_k: (calls.append(argv), _FakeCompleted(returncode=0))[1],
+    )
+
+    returncode = _run_compose("down", _compose_file(tmp_path), [flag])
+
+    assert returncode == 0
+    assert calls[0][-1] == flag
+    assert calls[0][-2] == "down"
+
+
+def test_an_unsupported_flag_still_refuses_naming_it(tmp_path: Path) -> None:
+    with pytest.raises(DockerFrontDoorError, match="--scale"):
+        _run_compose("up", tmp_path / "compose.yaml", ["--scale"])
+
+
+def test_a_flag_valid_for_the_other_verb_still_refuses(tmp_path: Path) -> None:
+    """`-v`/`--volumes` only means something on `down`; `up -v` is not in the decided
+    subset and must refuse exactly like any other unrecognized argument."""
+    with pytest.raises(DockerFrontDoorError, match="-v"):
+        _run_compose("up", tmp_path / "compose.yaml", ["-v"])
+
+
+def test_logs_and_ps_still_accept_no_arguments(tmp_path: Path) -> None:
+    """`logs`/`ps` never grew an accepted subset -- only `up`/`down` did."""
+    with pytest.raises(DockerFrontDoorError, match="-f"):
+        _run_compose("logs", tmp_path / "compose.yaml", ["-f"])
+
+
+# -- detached `up -d`/`up --wait` still releases its lease immediately (#47) --
+
+
+@pytest.mark.parametrize("flag", ["-d", "--wait"])
+def test_detached_up_still_releases_the_lease_immediately(
+    flag: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The decided posture: a detached `up` releases its lease exactly like a blocking one,
+    because the lease is held under *this* process's identity and this process is about to
+    exit -- keeping it "alive" here would only delay reclaim by one TTL, not protect the
+    project durably, and re-homing it onto the daemon would be the permanent pin leases
+    exist to prevent (see `_verb_compose_acquire`'s docstring). A detached project's
+    containers are left protected only by their age tier after this call returns; that gap
+    is documented in `_run_compose` and tracked as a follow-up, not silently absorbed here.
+    """
+    fake_daemon = _FakeDaemon()
+    monkeypatch.setattr(daemon, "request", fake_daemon.request)
+    monkeypatch.setattr(
+        "bosn.docker_cli.subprocess.run", lambda *a, **k: _FakeCompleted(returncode=0)
+    )
+
+    returncode = _run_compose("up", _compose_file(tmp_path), [flag])
+
+    assert returncode == 0
+    assert fake_daemon.calls == [
+        "status",
+        "compose-adopt",
+        "compose-acquire",
+        "compose-release",
+        "compose-adopt",
+    ]
+
+
+# -- `down -v` leaves the registry consistent (#47) ---------------------------
+
+
+def test_down_v_sends_prune_missing_on_the_closing_reconcile_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pre-command reconcile runs before Compose has touched anything this invocation
+    and must stay additive; only the closing reconcile, after Compose has actually deleted
+    the volumes, may prune rows for what is now gone.
+    """
+    fake_daemon = _FakeDaemon()
+    monkeypatch.setattr(daemon, "request", fake_daemon.request)
+    monkeypatch.setattr(
+        "bosn.docker_cli.subprocess.run", lambda *a, **k: _FakeCompleted(returncode=0)
+    )
+
+    returncode = _run_compose("down", _compose_file(tmp_path), ["-v"])
+
+    assert returncode == 0
+    adopt_requests = [
+        req
+        for call, req in zip(fake_daemon.calls, fake_daemon.requests, strict=True)
+        if call == "compose-adopt"
+    ]
+    assert len(adopt_requests) == 2
+    assert adopt_requests[0]["prune_missing"] is False
+    assert adopt_requests[1]["prune_missing"] is True
+
+
+def test_plain_down_never_sends_prune_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_daemon = _FakeDaemon()
+    monkeypatch.setattr(daemon, "request", fake_daemon.request)
+    monkeypatch.setattr(
+        "bosn.docker_cli.subprocess.run", lambda *a, **k: _FakeCompleted(returncode=0)
+    )
+
+    _run_compose("down", _compose_file(tmp_path), [])
+
+    adopt_requests = [
+        req
+        for call, req in zip(fake_daemon.calls, fake_daemon.requests, strict=True)
+        if call == "compose-adopt"
+    ]
+    assert all(req["prune_missing"] is False for req in adopt_requests)
+
+
+def test_down_v_removes_the_registry_row_for_a_volume_compose_actually_deleted(
+    tmp_path: Path,
+) -> None:
+    """The correctness test for Problem 2: after `down -v`, a volume the registry still has
+    a row for but that no longer exists on the engine must be gone from the registry too.
+
+    Exercises the real daemon handler (`Daemon._verb_compose_adopt`), not the `_FakeDaemon`
+    test double the other tests in this file use -- this is exactly the crash-boundary
+    staleness `reconcile_owned` (#41) was written to repair, applied here to a resource
+    Compose itself removed rather than one that vanished from an engine crash.
+    """
+    from bosn import daemon as daemon_module
+    from bosn.resources import ScanResult
+
+    instance = daemon_module.Daemon(state_dir=tmp_path / "state")
+    try:
+        instance.registry.register_resource(
+            kind="volume",
+            name="proj_data",
+            stack="proj",
+            generation="gen-1",
+            scope="stack",
+            workspace=str(tmp_path),
+        )
+        assert any(r.name == "proj_data" for r in instance.registry.list_resources())
+
+        class _EmptyVolumeScan:
+            def scan(self, _registry_id: str) -> ScanResult:
+                # The volume is gone from the engine -- Compose just deleted it -- but the
+                # scan still covers the "volume" kind, so its absence here is what
+                # `reconcile_owned` reads as "remove the row", not "engine unreachable".
+                return ScanResult(owned=[], scanned_kinds={"volume", "container", "network"})
+
+        def _fake_scanner(*_a: object, **_k: object) -> _EmptyVolumeScan:
+            return _EmptyVolumeScan()
+
+        import bosn.resources as resources_module
+
+        original_scanner = resources_module.ResourceScanner
+        resources_module.ResourceScanner = _fake_scanner  # type: ignore[assignment]
+        try:
+            reply = instance._verb_compose_adopt({"prune_missing": True})
+        finally:
+            resources_module.ResourceScanner = original_scanner  # type: ignore[assignment]
+
+        assert reply["ok"] is True
+        assert not any(r.name == "proj_data" for r in instance.registry.list_resources())
+    finally:
+        instance.registry.close()
+
+
+def test_a_plain_compose_adopt_never_prunes_rows_for_a_resource_the_scan_missed(
+    tmp_path: Path,
+) -> None:
+    """The default (`prune_missing` absent/False) must stay purely additive: a failed or
+    partial engine listing is never permission to forget a row for a resource that never
+    actually left the engine.
+    """
+    from bosn import daemon as daemon_module
+    from bosn.resources import ScanResult
+
+    instance = daemon_module.Daemon(state_dir=tmp_path / "state")
+    try:
+        instance.registry.register_resource(
+            kind="volume",
+            name="proj_data",
+            stack="proj",
+            generation="gen-1",
+            scope="stack",
+            workspace=str(tmp_path),
+        )
+
+        class _EmptyVolumeScan:
+            def scan(self, _registry_id: str) -> ScanResult:
+                return ScanResult(owned=[], scanned_kinds={"volume"})
+
+        def _fake_scanner(*_a: object, **_k: object) -> _EmptyVolumeScan:
+            return _EmptyVolumeScan()
+
+        import bosn.resources as resources_module
+
+        original_scanner = resources_module.ResourceScanner
+        resources_module.ResourceScanner = _fake_scanner  # type: ignore[assignment]
+        try:
+            reply = instance._verb_compose_adopt({})
+        finally:
+            resources_module.ResourceScanner = original_scanner  # type: ignore[assignment]
+
+        assert reply["ok"] is True
+        assert any(r.name == "proj_data" for r in instance.registry.list_resources())
+    finally:
+        instance.registry.close()
+
+
 # -- category-table dispatch (#46) --------------------------------------------
 #
 # `bosn.frontdoor` supplies the category table itself (a separate agent's slice of #46,

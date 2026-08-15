@@ -84,7 +84,10 @@ _GOVERNED: tuple[VerbSpec, ...] = (
     VerbSpec(
         verb="compose",
         category=Category.GOVERNED,
-        summary="managed Compose subset (up/down/logs/ps); every resource labeled and leased",
+        summary=(
+            "managed Compose subset (up/down/logs/ps/build/run/exec/config); every "
+            "resource labeled and leased"
+        ),
     ),
 )
 
@@ -406,6 +409,296 @@ def _index_by_verb(verbs: tuple[VerbSpec, ...]) -> dict[str, VerbSpec]:
 _BY_VERB: dict[str, VerbSpec] = _index_by_verb(VERBS)
 
 
+# ---------------------------------------------------------------------------------------
+# Compose flag surface (#47) -- the GOVERNED `compose` verb's own sub-table.
+#
+# `compose` is one row above, but it is not a leaf: it has its own sub-verbs (`up`,
+# `down`, ...) and each of those has its own flag surface. Before this table existed,
+# `_run_compose` refused *any* token after the sub-verb -- "unsupported compose flag or
+# argument" for literally anything, including `-d`. That satisfied #47's "no silent
+# ignoring" half by refusing everything, but not its "decided subset" half: `up -d --wait`
+# and `down -v --remove-orphans` are named in the issue as flags bosn must actually accept.
+#
+# Same shape as the verb table above, for the same reason: a flag a caller might type is
+# either ACCEPTED (bosn understands it and passes it through) or REFUSED (named, with a
+# remedy) -- there is no third "silently drop it" option, because that is exactly the
+# failure mode #47's last acceptance criterion exists to prevent.
+# ---------------------------------------------------------------------------------------
+
+
+class FlagStatus(Enum):
+    """Whether a compose sub-verb's flag is understood, mirroring `Category` above.
+
+    There is no FORWARD equivalent here: a flag either round-trips through bosn's overlay
+    machinery (ACCEPTED) or it does not exist as far as bosn is concerned (REFUSED). Values
+    are lowercase strings for the same JSON-round-trip reason `Category` gives.
+    """
+
+    ACCEPTED = "accepted"
+    REFUSED = "refused"
+
+
+@dataclass(frozen=True)
+class ComposeFlagSpec:
+    """One flag a `compose` sub-verb (`up`, `down`, ...) either accepts or refuses.
+
+    `aliases` holds the flag's other spellings (`-d` and `--detach` are one spec, not
+    two) so a lookup can resolve either without the table declaring the same flag twice.
+    `takes_value` says whether the flag consumes a following token as its argument
+    (`--file compose.yaml`) or stands alone (`--wait`) -- callers building an argv parser
+    for a sub-verb need this to know how many tokens a flag occupies.
+
+    `remedy` is required for REFUSED (same contract `VerbSpec` enforces for REFUSE: there
+    is always something else to do or say) and left `None` for ACCEPTED, where "the flag
+    works" already is the remedy.
+    """
+
+    flag: str
+    status: FlagStatus
+    takes_value: bool = False
+    summary: str = ""
+    remedy: str | None = None
+    aliases: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.status is FlagStatus.REFUSED and not self.remedy:
+            raise ValueError(f"REFUSED flag {self.flag!r} must carry a remedy")
+        if self.status is FlagStatus.ACCEPTED and self.remedy is not None:
+            raise ValueError(f"ACCEPTED flag {self.flag!r} must not carry a remedy")
+
+    def names(self) -> tuple[str, ...]:
+        """Every spelling this spec answers to: the primary flag plus its aliases."""
+        return (self.flag, *self.aliases)
+
+
+# The remedy for a flag this table has never heard of, for a `compose` sub-verb it does
+# recognize. Parallel to `_UNKNOWN_VERB_REMEDY`: generic, because there is no specific
+# governed alternative to point at for a flag this table doesn't know exists.
+def _unknown_compose_flag_remedy(command: str) -> str:
+    return (
+        f"not part of bosn's managed `compose {command}` flag subset; run `bosn-docker "
+        "--supported --json` to see every accepted flag per compose command, or use the "
+        "real `docker compose` binary directly if you accept the resources it creates "
+        "will be unmanaged"
+    )
+
+
+# `-f`/`--file` selects which compose file to read. It is parsed ahead of the sub-verb
+# (`bosn-docker compose -f compose.yaml up`, not `... up -f compose.yaml`) and applies to
+# every sub-verb identically, so it lives here once rather than being copied into all
+# eight per-command tuples below -- the same reasoning `_ESCAPE_HATCH` gives for sharing
+# one remedy string across REFUSE rows instead of retyping it.
+COMPOSE_GLOBAL_FLAGS: tuple[ComposeFlagSpec, ...] = (
+    ComposeFlagSpec(
+        flag="-f",
+        status=FlagStatus.ACCEPTED,
+        takes_value=True,
+        summary="path to the compose file (already wired; predates #47)",
+        aliases=("--file",),
+    ),
+)
+
+# `up`: the issue names `-d`/`--wait` explicitly ("up -d --wait"). `--build`,
+# `--force-recreate`, `--no-recreate`, and `--scale` are all real `docker compose up`
+# flags, but none is named in #47, and each has a bosn-shaped reason to stay out of v1:
+# `--build` would rebuild an image bosn did not track through `bosn ensure`'s spec-digest
+# keying (see the `build` REFUSE row above), and `--remove-orphans` is accepted on `down`
+# below, not here, matching the issue's own pairing of that flag with `down -v`.
+_COMPOSE_UP_FLAGS: tuple[ComposeFlagSpec, ...] = (
+    ComposeFlagSpec(
+        flag="-d",
+        status=FlagStatus.ACCEPTED,
+        summary="run containers in the background instead of attaching to their output",
+        aliases=("--detach",),
+    ),
+    ComposeFlagSpec(
+        flag="--wait",
+        status=FlagStatus.ACCEPTED,
+        summary="wait for services to report healthy/running before returning",
+    ),
+    ComposeFlagSpec(
+        flag="--build",
+        status=FlagStatus.REFUSED,
+        summary="rebuild images before starting",
+        remedy=(
+            "would rebuild an image outside `bosn ensure`'s spec-digest tracking; declare "
+            "the build in bosn.toml and run `bosn ensure` first, then `compose up`"
+        ),
+    ),
+    ComposeFlagSpec(
+        flag="--remove-orphans",
+        status=FlagStatus.REFUSED,
+        summary="remove containers for services not defined in the compose file",
+        remedy=(
+            "accepted on `compose down`, not `up`, in this subset; run "
+            "`bosn-docker compose down --remove-orphans`"
+        ),
+    ),
+)
+
+# `down`: the issue names `-v`/`--remove-orphans` explicitly ("down -v --remove-orphans").
+# `--rmi` is refused for the same reason the top-level `rmi` verb is refused above:
+# deleting images outside lease/GC bookkeeping. `-t`/`--timeout` is real but unnamed by the
+# issue; kept out per "prefer the smaller set" rather than guessed at.
+_COMPOSE_DOWN_FLAGS: tuple[ComposeFlagSpec, ...] = (
+    ComposeFlagSpec(
+        flag="-v",
+        status=FlagStatus.ACCEPTED,
+        summary="remove named volumes declared in the compose file's `volumes` section",
+        aliases=("--volumes",),
+    ),
+    ComposeFlagSpec(
+        flag="--remove-orphans",
+        status=FlagStatus.ACCEPTED,
+        summary="remove containers for services not defined in the compose file",
+    ),
+    ComposeFlagSpec(
+        flag="--rmi",
+        status=FlagStatus.REFUSED,
+        takes_value=True,
+        summary="remove images used by services",
+        remedy=(
+            "deletes images outside lease/GC bookkeeping; use `bosn gc` to reclaim "
+            "managed resources safely"
+        ),
+    ),
+    ComposeFlagSpec(
+        flag="-t",
+        status=FlagStatus.REFUSED,
+        takes_value=True,
+        summary="shutdown timeout in seconds before a container is killed",
+        remedy=_unknown_compose_flag_remedy("down"),
+        aliases=("--timeout",),
+    ),
+)
+
+# `logs`: the issue names no flags for it, so the accepted set is empty -- "prefer the
+# smaller set" per the task brief. `-f` is called out by name (not left to the generic
+# fallback) because it collides with the global `-f`/`--file` above: in real
+# `docker compose logs`, `-f` means `--follow`, a different flag entirely from the file
+# selector every other sub-verb reads `-f` as. Naming it here stops that collision from
+# reading as bosn silently reinterpreting `-f` rather than refusing it outright.
+_COMPOSE_LOGS_FLAGS: tuple[ComposeFlagSpec, ...] = (
+    ComposeFlagSpec(
+        flag="-f",
+        status=FlagStatus.REFUSED,
+        summary="follow log output (docker compose's meaning; NOT bosn's global --file)",
+        remedy=(
+            "`-f` is bosn's global compose-file selector, not `--follow`, in this "
+            "subset; `--follow` itself is not part of the managed flag surface -- "
+            + _unknown_compose_flag_remedy("logs")
+        ),
+        aliases=("--follow",),
+    ),
+)
+
+# `ps`, `build`, `run`, `exec`, `config`: the issue names these as sub-verbs bosn must
+# accept (#47: "build/run/exec/config") but names no flags for any of them. Empty accepted
+# sets, same "prefer the smaller set" call as `logs` -- every flag on these four falls
+# through to the generic per-command remedy until a future issue names one specifically.
+_COMPOSE_PS_FLAGS: tuple[ComposeFlagSpec, ...] = ()
+_COMPOSE_BUILD_FLAGS: tuple[ComposeFlagSpec, ...] = ()
+_COMPOSE_RUN_FLAGS: tuple[ComposeFlagSpec, ...] = ()
+_COMPOSE_EXEC_FLAGS: tuple[ComposeFlagSpec, ...] = ()
+_COMPOSE_CONFIG_FLAGS: tuple[ComposeFlagSpec, ...] = ()
+
+# The single source of truth for both the sub-verb surface (`COMPOSE_COMMANDS` below is
+# derived from these keys, not hand-copied) and each sub-verb's flags. Order is
+# deliberate and matches the order the `compose` row's summary lists them in.
+COMPOSE_FLAGS: dict[str, tuple[ComposeFlagSpec, ...]] = {
+    "up": _COMPOSE_UP_FLAGS,
+    "down": _COMPOSE_DOWN_FLAGS,
+    "logs": _COMPOSE_LOGS_FLAGS,
+    "ps": _COMPOSE_PS_FLAGS,
+    "build": _COMPOSE_BUILD_FLAGS,
+    "run": _COMPOSE_RUN_FLAGS,
+    "exec": _COMPOSE_EXEC_FLAGS,
+    "config": _COMPOSE_CONFIG_FLAGS,
+}
+
+# `docker_cli._parse_compose_args` builds its `choices=[...]` from this instead of
+# hand-maintaining a second list that could drift from the one above it dispatches
+# against -- the same "one source of truth" argument the module docstring makes for verbs.
+COMPOSE_COMMANDS: tuple[str, ...] = tuple(COMPOSE_FLAGS.keys())
+
+
+def _index_compose_flags(
+    flags: tuple[ComposeFlagSpec, ...],
+) -> dict[str, ComposeFlagSpec]:
+    index: dict[str, ComposeFlagSpec] = {}
+    for spec in flags:
+        for name in spec.names():
+            if name in index:
+                raise ValueError(f"duplicate compose flag spelling: {name!r}")
+            index[name] = spec
+    return index
+
+
+_COMPOSE_GLOBAL_INDEX: dict[str, ComposeFlagSpec] = _index_compose_flags(COMPOSE_GLOBAL_FLAGS)
+
+
+def _merge_with_globals(flags: tuple[ComposeFlagSpec, ...]) -> dict[str, ComposeFlagSpec]:
+    """Merge one sub-verb's flags over the globals, letting the sub-verb win a collision.
+
+    A plain concatenate-then-index would raise on `logs`' `-f`, which deliberately reuses
+    the `-f` spelling the globals already claim for `--file` -- see `_COMPOSE_LOGS_FLAGS`'s
+    comment on why that collision is named as a REFUSED row instead of silently inheriting
+    the global meaning. "Sub-verb wins" is what makes that override actually take effect
+    instead of the duplicate-spelling guard rejecting it as a table bug.
+    """
+    merged = dict(_COMPOSE_GLOBAL_INDEX)
+    merged.update(_index_compose_flags(flags))
+    return merged
+
+
+# Per-command index, each pre-merged with the globals so a lookup never has to check two
+# tables. Built once at import time from `COMPOSE_FLAGS`/`COMPOSE_GLOBAL_FLAGS` -- there is
+# no second copy of this merge anywhere else for it to drift from.
+_COMPOSE_FLAGS_BY_COMMAND: dict[str, dict[str, ComposeFlagSpec]] = {
+    command: _merge_with_globals(flags) for command, flags in COMPOSE_FLAGS.items()
+}
+
+
+def compose_flag_spec_for(command: str, flag: str) -> ComposeFlagSpec | None:
+    """Look up `flag`'s spec for `command` (its primary spelling or any alias).
+
+    Raw lookup, `spec_for`'s compose-flag counterpart: `None` means the table has no
+    opinion, and callers must not treat that as "safe to pass through" -- see
+    `resolve_compose_flag` for the fail-closed wrapper. `command` must be a member of
+    `COMPOSE_COMMANDS`; anything else is a caller bug (an unrecognized sub-verb never
+    reaches flag parsing at all, since it fails sub-verb resolution first), so this raises
+    rather than silently returning `None` for a command as well as a flag.
+
+    `flag` must already be the bare flag spelling with any `=value` split off by the
+    caller (`--file=compose.yaml` -> pass `"--file"`, not the raw token) -- this table
+    only knows flag identity, not how a caller chose to spell a value onto it.
+    """
+    if command not in _COMPOSE_FLAGS_BY_COMMAND:
+        raise ValueError(f"{command!r} is not a compose sub-verb; see COMPOSE_COMMANDS")
+    return _COMPOSE_FLAGS_BY_COMMAND[command].get(flag)
+
+
+def resolve_compose_flag(command: str, flag: str) -> ComposeFlagSpec:
+    """The fail-closed caller-facing entry point for a compose sub-verb's flag.
+
+    Always returns a `ComposeFlagSpec`, never `None`: a flag present in `command`'s table
+    (or the globals) returns its row; a flag absent from both is unknown, and this
+    function's job is to make "unknown" resolve to REFUSED, with a usable remedy, as an
+    explicit branch here -- the same fail-closed shape `resolve()` gives verbs, for the
+    same reason. Dispatch code should call this, not `compose_flag_spec_for`, so an
+    un-cataloged flag can never fall through to "pass it to the real engine" by accident.
+    """
+    spec = compose_flag_spec_for(command, flag)
+    if spec is not None:
+        return spec
+    return ComposeFlagSpec(
+        flag=flag,
+        status=FlagStatus.REFUSED,
+        summary="unrecognized compose flag",
+        remedy=_unknown_compose_flag_remedy(command),
+    )
+
+
 def spec_for(verb: str) -> VerbSpec | None:
     """Look up `verb`'s table row. `None` means the table has no opinion -- callers must
     not treat that as "safe to forward"; see `resolve()` for the fail-closed wrapper.
@@ -441,13 +734,30 @@ def resolve(verb: str) -> VerbSpec:
     )
 
 
+def _compose_flag_payload(spec: ComposeFlagSpec) -> dict:
+    return {
+        "flag": spec.flag,
+        "aliases": list(spec.aliases),
+        "status": spec.status.value,
+        "takes_value": spec.takes_value,
+        "summary": spec.summary,
+        "remedy": spec.remedy,
+    }
+
+
 def supported() -> dict:
     """The payload behind `bosn-docker --supported --json`.
 
-    `VERBS` is the only source for it -- there is no second, hand-maintained list for
-    parser help text, generated docs, or this JSON to drift out of sync with. Every field
-    here is JSON-primitive (str/None), so `json.dumps(supported())` always round-trips for
-    the agent this is written for.
+    `VERBS` is the only source for the verb table, and `COMPOSE_FLAGS`/
+    `COMPOSE_GLOBAL_FLAGS` are the only source for the `compose` verb's flag surface --
+    there is no second, hand-maintained list for parser help text, generated docs, or this
+    JSON to drift out of sync with. Every field here is JSON-primitive (str/bool/None/list
+    of same), so `json.dumps(supported())` always round-trips for the agent this is
+    written for.
+
+    Adding the `compose` key below is an additive change to this payload's shape: existing
+    consumers reading `schema_version`/`verbs` see no field renamed or removed underneath
+    them, so `SCHEMA_VERSION` does not move -- see its module-level comment.
     """
     return {
         "schema_version": SCHEMA_VERSION,
@@ -460,4 +770,12 @@ def supported() -> dict:
             }
             for spec in VERBS
         ],
+        "compose": {
+            "commands": list(COMPOSE_COMMANDS),
+            "global_flags": [_compose_flag_payload(spec) for spec in COMPOSE_GLOBAL_FLAGS],
+            "flags": {
+                command: [_compose_flag_payload(spec) for spec in flags]
+                for command, flags in COMPOSE_FLAGS.items()
+            },
+        },
     }
