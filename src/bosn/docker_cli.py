@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,12 +15,71 @@ from pathlib import Path
 
 from bosn import __version__, daemon, labels
 from bosn.compose import ComposeError, content_digest, load_compose
+
+# The category table (#46): every verb bosn-docker knows about, and whether it is
+# implemented here (GOVERNED), passed verbatim to the real engine (FORWARD), or
+# explicitly refused with a remedy (REFUSE). `resolve()` is the fail-closed entry point --
+# it always returns a VerbSpec, turning a verb the table has never heard of into a REFUSE
+# with a generic remedy rather than a `None` a dispatcher could mistake for "safe to
+# forward". Dispatch below calls `resolve()`, never `spec_for()`, for that reason.
+from bosn.frontdoor import Category, resolve, supported
 from bosn.registry import Registry
 from bosn.resources import process_start_time
 
 
 class DockerFrontDoorError(ValueError):
     pass
+
+
+# Environment marker set on the child's environment for exactly the duration bosn-docker
+# spawns a forwarded command. Its purpose is narrow: catch a `docker` shim (a future slice)
+# that turns out to *be* bosn-docker resolving itself off PATH and calling back in here --
+# without it, that resolution loops forever. See `_forward` for the full guard and its
+# blind spots.
+_RECURSION_GUARD_ENV = "BOSN_DOCKER_FORWARDING"
+
+
+def _this_program() -> Path:
+    """Best-effort absolute path to the file backing the running `bosn-docker` process."""
+    return Path(sys.argv[0]).resolve()
+
+
+def _resolve_real_engine(binary: str = "docker") -> Path | None:
+    """Resolve `binary` to an absolute path via PATH, or None if nothing is found."""
+    found = shutil.which(binary)
+    if found is None:
+        return None
+    return Path(found).resolve()
+
+
+def _is_this_program(candidate: Path) -> bool:
+    """True when `candidate` is the same file as the running `bosn-docker` program.
+
+    `Path.samefile` is preferred (works across symlinks/hardlinks, the way a shim would
+    likely be installed) and falls back to a plain path comparison when the candidate
+    does not exist or the filesystem does not support the identity check (e.g. across
+    drives on Windows).
+    """
+    this = _this_program()
+    try:
+        return candidate.samefile(this)
+    except OSError:
+        return candidate == this
+
+
+def _envelope(*, code: str, message: str, next_step: str, as_json: bool) -> int:
+    """Emit the repo's stable refusal envelope, or readable prose when not asked for JSON.
+
+    Deliberately not imported from `bosn.cli`: `bosn-docker` is a separate console entry
+    point (see pyproject.toml), and reaching into another module's private helper would
+    couple two independently-invoked programs for a four-line dict. The shape is copied,
+    not the function.
+    """
+    if as_json:
+        print(json.dumps({"ok": False, "code": code, "message": message, "next": next_step}))
+    else:
+        print(message, file=sys.stderr)
+    return 1
 
 
 def compose_to_manifest(source: Path) -> str:
@@ -43,17 +104,46 @@ def compose_to_manifest(source: Path) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """The top-level parser deliberately does not hard-code the verb surface.
+
+    It used to: `sub.add_parser("init", ...)` / `sub.add_parser("compose", ...)` via
+    `add_subparsers`, which makes argparse itself reject anything it didn't register --
+    including verbs that should reach the REFUSE path with a structured remedy, and
+    unknown verbs, which must refuse rather than bounce off argparse with a bare exit 2.
+    So the verb is a plain optional positional and everything after it is REMAINDER;
+    `bosn.frontdoor.VERBS` is consulted in `main()`, and is the only place a verb is
+    declared. `init`/`compose` still get their own dedicated sub-parsing once the verb is
+    known (see `_parse_init_args`/`_parse_compose_args`), so their flag surfaces and error
+    messages are unchanged.
+    """
     parser = argparse.ArgumentParser(prog="bosn-docker", description=__doc__)
     parser.add_argument("--version", action="version", version=__version__)
-    sub = parser.add_subparsers(dest="verb")
-    init = sub.add_parser("init", help="generate bosn.toml from compose.yaml")
-    init.add_argument("--compose", default="compose.yaml")
-    init.add_argument("--output", default="bosn.toml")
-    compose = sub.add_parser("compose", help="managed Compose subset: up, down, logs, ps")
-    compose.add_argument("command", choices=["up", "down", "logs", "ps"])
-    compose.add_argument("args", nargs=argparse.REMAINDER)
-    compose.add_argument("-f", "--file", default="compose.yaml")
+    parser.add_argument(
+        "--supported",
+        action="store_true",
+        help="print the supported verb table (see bosn.frontdoor) and exit",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="emit structured machine-readable output"
+    )
+    parser.add_argument("verb", nargs="?", help="docker verb; see --supported")
+    parser.add_argument("args", nargs=argparse.REMAINDER, help="verb-specific arguments")
     return parser
+
+
+def _parse_init_args(args: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="bosn-docker init")
+    parser.add_argument("--compose", default="compose.yaml")
+    parser.add_argument("--output", default="bosn.toml")
+    return parser.parse_args(args)
+
+
+def _parse_compose_args(args: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="bosn-docker compose")
+    parser.add_argument("command", choices=["up", "down", "logs", "ps"])
+    parser.add_argument("args", nargs=argparse.REMAINDER)
+    parser.add_argument("-f", "--file", default="compose.yaml")
+    return parser.parse_args(args)
 
 
 def _yaml_scalar(value: str) -> str:
@@ -286,16 +376,126 @@ def _run_compose(command: str, compose: Path, args: list[str]) -> int:
         overlay.unlink(missing_ok=True)
 
 
+def _forward(verb: str, args: list[str], *, as_json: bool) -> int:
+    """Pass a FORWARD verb's argv verbatim to the real engine.
+
+    Recursion guard, two layers, because #46 explicitly calls out that a later slice
+    installs a `docker` shim that *is* `bosn-docker` -- if resolving "docker" off PATH
+    can land back on this program, forwarding becomes a fork bomb the moment that shim
+    ships, so the guard has to exist before it does:
+
+    1. `_RECURSION_GUARD_ENV` in the environment: set on every child this function spawns.
+       A shim invoked as that child inherits it and refuses immediately, before touching
+       PATH resolution at all -- this is what stops a chain of self-invocations once one
+       has already started.
+    2. `_is_this_program()`: resolves "docker" via PATH and compares it, by file identity,
+       against this program's own path. This is what stops the *first* hop -- the case
+       where PATH's "docker" already is (a copy or symlink of) bosn-docker before any
+       forwarding has happened yet, so there is no inherited env var to catch it.
+
+    What this cannot catch: a shim that (a) is a distinct file from bosn-docker's own
+    script -- so `samefile` does not match -- *and* (b) clears its inherited environment
+    before re-invoking bosn-docker, dropping the marker. Neither mechanism alone covers
+    that combination; it would need the shim itself to cooperate (e.g. by also checking
+    its own resolved identity), which is out of scope for this slice.
+
+    This guard does not cover `_run_compose`, which still spawns bare `["docker",
+    "compose", ...]` resolved off PATH with neither absolute resolution nor the marker --
+    `compose` is GOVERNED, not FORWARD, so it never reaches this function. Once a shim
+    ships, `bosn-docker compose up` -> shim `docker` -> GOVERNED dispatch -> `_run_compose`
+    -> bare `docker` is an unguarded loop. Leaving it unguarded here is deliberate (this
+    slice's brief pins compose's existing behavior unchanged); the shim-installing slice
+    must route `_run_compose`'s engine invocation through `_resolve_real_engine` and this
+    same marker before any shim is installed.
+    """
+    if os.environ.get(_RECURSION_GUARD_ENV):
+        return _envelope(
+            code="docker.recursion",
+            message=(
+                f"bosn-docker {verb}: refusing to forward -- this process is already inside "
+                "a bosn-docker forward, so the `docker` on PATH would call back into itself"
+            ),
+            next_step=(
+                "run `bosn doctor` to check the docker shim, or invoke the real engine directly"
+            ),
+            as_json=as_json,
+        )
+    real = _resolve_real_engine("docker")
+    if real is None:
+        return _envelope(
+            code="docker.no-engine",
+            message=f"bosn-docker {verb}: no `docker` found on PATH",
+            next_step="install Docker (or podman) and ensure `docker` is on PATH",
+            as_json=as_json,
+        )
+    if _is_this_program(real):
+        return _envelope(
+            code="docker.recursion",
+            message=(
+                f"bosn-docker {verb}: the `docker` resolved from PATH is bosn-docker itself "
+                f"({real}); forwarding would call back into this program"
+            ),
+            next_step=(
+                "run `bosn doctor` to check the docker shim, or repair PATH to reach the "
+                "real engine"
+            ),
+            as_json=as_json,
+        )
+    env = dict(os.environ)
+    env[_RECURSION_GUARD_ENV] = str(os.getpid())
+    completed = subprocess.run([str(real), verb, *args], check=False, env=env)
+    return completed.returncode
+
+
+def _dispatch_from_table(verb: str, args: list[str], *, as_json: bool) -> int:
+    """Route every verb that is not one of the two GOVERNED verbs implemented directly
+    in `main()`. Uses `frontdoor.resolve()`, not `spec_for()`: `resolve()` is the
+    fail-closed wrapper that turns a verb the table has never heard of into an explicit
+    REFUSE row with a generic remedy, so there is no `None` case here to get wrong --
+    unknown never means forward.
+    """
+    spec = resolve(verb)
+    if spec.category is Category.FORWARD:
+        return _forward(verb, args, as_json=as_json)
+    if spec.category is Category.REFUSE:
+        return _envelope(
+            code="docker.refused",
+            message=f"bosn-docker {verb}: {spec.summary}",
+            next_step=spec.remedy or "run `bosn-docker --supported --json` for supported verbs",
+            as_json=as_json,
+        )
+    # spec.category is Category.GOVERNED here: declared in the table but not one of the
+    # verbs main() implements directly (init/compose). Refuse rather than silently no-op.
+    return _envelope(
+        code="docker.not-implemented",
+        message=f"bosn-docker {verb}: declared governed but not yet wired in this build",
+        next_step=spec.remedy or "see the project tracker for this verb's landing phase",
+        as_json=as_json,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    raw_argv = list(argv if argv is not None else sys.argv[1:])
+    # Scanned from the raw tokens, the same way `bosn.cli` decides `json_errors` -- not
+    # read off the parsed namespace. `args` is `argparse.REMAINDER`, so a `--json` typed
+    # after the verb (`bosn-docker rm --json`, the natural place to put it) is swallowed
+    # into the verb's own argv rather than bound to the top-level flag; forwarded verbs
+    # need that swallowing intact so the flag reaches the real engine verbatim, but
+    # refusals still need to know the caller asked for JSON however it was spelled.
+    as_json = "--json" in raw_argv
     parser = build_parser()
-    ns = parser.parse_args(argv if argv is not None else sys.argv[1:])
+    ns = parser.parse_args(raw_argv)
+    if ns.supported:
+        print(json.dumps(supported()))
+        return 0
     if ns.verb is None:
         parser.print_help()
         return 0
     if ns.verb == "init":
+        init_ns = _parse_init_args(ns.args)
         try:
-            text = compose_to_manifest(Path(ns.compose))
-            output = Path(ns.output)
+            text = compose_to_manifest(Path(init_ns.compose))
+            output = Path(init_ns.output)
             if output.exists():
                 raise DockerFrontDoorError(f"refusing to overwrite {output}; choose --output")
             output.write_text(text, encoding="utf-8")
@@ -305,9 +505,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"wrote {output}")
         return 0
     if ns.verb == "compose":
+        compose_ns = _parse_compose_args(ns.args)
         try:
-            return _run_compose(ns.command, Path(ns.file), list(ns.args))
+            return _run_compose(compose_ns.command, Path(compose_ns.file), list(compose_ns.args))
         except (OSError, DockerFrontDoorError) as exc:
             print(f"bosn-docker compose: {exc}", file=sys.stderr)
             return 1
-    return 2
+    return _dispatch_from_table(ns.verb, ns.args, as_json=as_json)

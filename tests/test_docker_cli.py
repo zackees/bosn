@@ -1,3 +1,4 @@
+import json
 import os
 import re
 from pathlib import Path
@@ -5,13 +6,15 @@ from typing import Any
 
 import pytest
 
-from bosn import daemon
+from bosn import daemon, docker_cli
 from bosn.docker_cli import (
     DockerFrontDoorError,
     _compose_overlay,
     _run_compose,
     compose_to_manifest,
+    main,
 )
+from bosn.frontdoor import Category, VerbSpec
 from bosn.registry import Registry
 
 
@@ -415,3 +418,229 @@ def test_a_clean_up_reconciles_exactly_as_before(
         "compose-release",
         "compose-adopt",
     ]
+
+
+# -- category-table dispatch (#46) --------------------------------------------
+#
+# `bosn.frontdoor` supplies the category table itself (a separate agent's slice of #46,
+# landed alongside this one). `bosn.docker_cli` dispatches through its `resolve()` -- the
+# fail-closed wrapper that always returns a `VerbSpec`, so an unknown verb is just another
+# REFUSE row rather than a `None` a caller could mistake for "safe to forward". These tests
+# do not depend on the real table's contents -- every test below monkeypatches
+# `docker_cli.resolve` (and, where relevant, `docker_cli.supported`) with a small fake of
+# its own, per the brief, so they do not break when the real table gains entries.
+
+
+def _fake_spec(verb: str, category: Category, summary: str, remedy: str | None) -> VerbSpec:
+    return VerbSpec(verb=verb, category=category, summary=summary, remedy=remedy)
+
+
+def test_a_governed_verb_still_runs_its_implementation_through_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`compose` is GOVERNED and implemented directly in `main()`, not through the table
+    dispatch -- this exercises the new `main()` -> `_parse_compose_args` -> `_run_compose`
+    path end to end, proving the table rewiring didn't disturb it.
+    """
+    fake_daemon = _FakeDaemon()
+    monkeypatch.setattr(daemon, "request", fake_daemon.request)
+    monkeypatch.setattr("bosn.docker_cli.process_start_time", lambda pid: 123.0)
+    monkeypatch.setattr(
+        "bosn.docker_cli.subprocess.run", lambda *a, **k: _FakeCompleted(returncode=0)
+    )
+    compose = _compose_file(tmp_path)
+
+    returncode = main(["compose", "-f", str(compose), "up"])
+
+    assert returncode == 0
+    assert "compose-adopt" in fake_daemon.calls
+
+
+def test_a_forward_verb_invokes_the_real_engine_with_argv_passed_verbatim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_docker = tmp_path / "real-docker"
+    real_docker.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        docker_cli, "resolve", lambda verb: _fake_spec("version", Category.FORWARD, "v", None)
+    )
+    monkeypatch.setattr(docker_cli, "_resolve_real_engine", lambda binary="docker": real_docker)
+    calls: list[list[str]] = []
+    envs: list[dict[str, str]] = []
+
+    def _fake_run(argv: list[str], **kwargs: Any) -> _FakeCompleted:
+        calls.append(argv)
+        envs.append(kwargs["env"])
+        return _FakeCompleted(returncode=0)
+
+    monkeypatch.setattr(docker_cli.subprocess, "run", _fake_run)
+
+    returncode = main(["version", "--format", "{{.Server.Version}}"])
+
+    assert returncode == 0
+    assert calls == [[str(real_docker), "version", "--format", "{{.Server.Version}}"]]
+    # The recursion guard's first layer: every forwarded child must carry the marker, or a
+    # future `docker` shim resolving back to this program would never see it and loop.
+    assert envs[0][docker_cli._RECURSION_GUARD_ENV] == str(os.getpid())
+
+
+def test_a_refuse_verb_emits_the_envelope_with_the_specs_remedy_and_exits_non_zero(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        docker_cli,
+        "resolve",
+        lambda verb: _fake_spec(
+            "rm", Category.REFUSE, "forcibly removes containers bosn tracks", "use `bosn done`"
+        ),
+    )
+
+    returncode = main(["rm", "--json", "some-container"])
+
+    assert returncode != 0
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["ok"] is False
+    assert envelope["next"] == "use `bosn done`"
+    assert "rm" in envelope["message"]
+
+
+def test_an_unknown_verb_refuses_and_never_forwards(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The safety property: a verb absent from the table must never reach the engine.
+
+    Mirrors what the real `frontdoor.resolve()` does for a verb it has never heard of:
+    return an explicit REFUSE row rather than `None` -- this is the fail-closed contract
+    dispatch relies on, exercised here with a fake so the test does not depend on the
+    real table's contents.
+    """
+    monkeypatch.setattr(
+        docker_cli,
+        "resolve",
+        lambda verb: _fake_spec(
+            verb, Category.REFUSE, "unrecognized docker verb", "see --supported"
+        ),
+    )
+
+    def _fail_if_called(*_a: Any, **_k: Any) -> _FakeCompleted:
+        raise AssertionError("an unknown verb must never invoke the real engine")
+
+    monkeypatch.setattr(docker_cli.subprocess, "run", _fail_if_called)
+
+    returncode = main(["totally-made-up-verb"])
+
+    assert returncode != 0
+    err = capsys.readouterr().err
+    assert "totally-made-up-verb" in err
+    assert "unrecognized" in err.lower()
+
+
+def test_an_unknown_verb_refuses_and_never_forwards_against_the_real_table(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Same safety property, exercised against the real `bosn.frontdoor` table this time
+    (no monkeypatch of `resolve`) -- proves the wiring, not just a fake standing in for it.
+    """
+
+    def _fail_if_called(*_a: Any, **_k: Any) -> _FakeCompleted:
+        raise AssertionError("an unknown verb must never invoke the real engine")
+
+    monkeypatch.setattr(docker_cli.subprocess, "run", _fail_if_called)
+
+    returncode = main(["totally-made-up-verb"])
+
+    assert returncode != 0
+    assert "totally-made-up-verb" in capsys.readouterr().err
+
+
+def test_supported_json_emits_parseable_json(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_table = {"verbs": [{"verb": "init", "category": "governed"}]}
+    monkeypatch.setattr(docker_cli, "supported", lambda: fake_table)
+
+    returncode = main(["--supported", "--json"])
+
+    assert returncode == 0
+    assert json.loads(capsys.readouterr().out) == fake_table
+
+
+# -- recursion guard: absolute real-engine resolution (#46) -------------------
+
+
+def test_recursion_guard_refuses_when_the_environment_marker_is_already_set(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A child of a bosn-docker forward that is itself asked to forward -- because the
+    resolved `docker` turned out to be a shim calling back into bosn-docker -- must refuse
+    immediately, before even resolving PATH again.
+    """
+    monkeypatch.setattr(
+        docker_cli, "resolve", lambda verb: _fake_spec("version", Category.FORWARD, "v", None)
+    )
+    monkeypatch.setenv(docker_cli._RECURSION_GUARD_ENV, "1234")
+
+    def _fail_if_called(*_a: Any, **_k: Any) -> Path | None:
+        raise AssertionError("must not resolve PATH again once the recursion marker is set")
+
+    monkeypatch.setattr(docker_cli, "_resolve_real_engine", _fail_if_called)
+
+    def _fail_if_run(*_a: Any, **_k: Any) -> _FakeCompleted:
+        raise AssertionError("must not execute the resolved engine")
+
+    monkeypatch.setattr(docker_cli.subprocess, "run", _fail_if_run)
+
+    returncode = main(["version", "--json"])
+
+    assert returncode != 0
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["ok"] is False
+    assert envelope["code"] == "docker.recursion"
+
+
+def test_recursion_guard_refuses_when_the_resolved_docker_is_bosns_own_shim(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The first-hop case: PATH's `docker` already is bosn-docker (a future shim), before
+    any forwarding -- and therefore any inherited environment marker -- has happened.
+    """
+    monkeypatch.setattr(
+        docker_cli, "resolve", lambda verb: _fake_spec("version", Category.FORWARD, "v", None)
+    )
+    monkeypatch.setattr(docker_cli, "_resolve_real_engine", lambda binary="docker": Path("shim"))
+    monkeypatch.setattr(docker_cli, "_is_this_program", lambda candidate: True)
+
+    def _fail_if_run(*_a: Any, **_k: Any) -> _FakeCompleted:
+        raise AssertionError("must not execute a `docker` that resolves to bosn-docker itself")
+
+    monkeypatch.setattr(docker_cli.subprocess, "run", _fail_if_run)
+
+    returncode = main(["version", "--json"])
+
+    assert returncode != 0
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["ok"] is False
+    assert envelope["code"] == "docker.recursion"
+    assert "bosn-docker" in envelope["message"]
+
+
+def test_json_refusals_emit_the_envelope_non_json_emit_readable_prose(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        docker_cli,
+        "resolve",
+        lambda verb: _fake_spec("kill", Category.REFUSE, "kills containers bosn tracks", "x"),
+    )
+
+    prose_returncode = main(["kill"])
+    prose_err = capsys.readouterr().err
+    assert prose_returncode != 0
+    assert "kill" in prose_err
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(prose_err)
+
+    json_returncode = main(["kill", "--json"])
+    envelope = json.loads(capsys.readouterr().out)
+    assert json_returncode != 0
+    assert envelope["ok"] is False
