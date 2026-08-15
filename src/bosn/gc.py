@@ -19,7 +19,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from bosn import labels
+from bosn import labels, resources
 from bosn.accounting import StorageInventory, probe, resource_bytes
 from bosn.config import Config
 from bosn.engine import Engine
@@ -28,6 +28,7 @@ from bosn.resources import ResourceScanner
 from bosn.retention import (
     KEPT_LEASED,
     KEPT_QUIET_PERIOD,
+    KEPT_RUNNING,
     Pressure,
     Verdict,
     collectable,
@@ -104,16 +105,21 @@ class Collector:
 
         config = self.config or load_config()
         inventory = StorageInventory.collect(self.engine)
-        resources = self.registry.list_resources()
+        resource_rows = self.registry.list_resources()
         measured = {
-            resource.id: resource_bytes(self.engine, resource, inventory) for resource in resources
+            resource.id: resource_bytes(self.engine, resource, inventory)
+            for resource in resource_rows
         }
         storage = probe(self.engine, self.registry.path.parent)
+        # One engine call per pass, not one per resource -- a pass covers hundreds of rows.
+        # `None` means the engine could not answer (unreachable, non-zero exit, unparseable);
+        # that is a reason to protect every container, never a reason to treat none as running.
+        running_containers = resources.running_container_names(self.engine)
         # Pressure is intentionally derived here for every pass. The argument remains only
         # as a compatibility shim for callers from older releases and cannot override policy.
         _ = pressure
         pressure = Pressure.assess(
-            resource_count=len(resources),
+            resource_count=len(resource_rows),
             managed_bytes=sum(size for size in measured.values() if size is not None),
             free_bytes=storage.free_bytes,
             managed_bytes_ceiling=int(config.get("shared_cache_ceiling")),
@@ -145,7 +151,9 @@ class Collector:
                 )
             return updated
 
-        verdicts: list[Verdict] = plan(self.registry, pressure=pressure, config=config)
+        verdicts: list[Verdict] = plan(
+            self.registry, pressure=pressure, config=config, running_containers=running_containers
+        )
         result = GCResult(dry_run=dry_run)
         reclaimable = sum(
             measured.get(verdict.resource.id, 0) or 0 for verdict in collectable(verdicts)
@@ -167,7 +175,12 @@ class Collector:
                 count_exceeded=pressure.count_exceeded,
                 bytes_exceeded=pressure.bytes_exceeded,
             )
-            verdicts = plan(self.registry, pressure=pressure, config=config)
+            verdicts = plan(
+                self.registry,
+                pressure=pressure,
+                config=config,
+                running_containers=running_containers,
+            )
 
         for verdict in verdicts:
             if not verdict.collect:
@@ -194,8 +207,12 @@ class Collector:
                         workspace_done=workspace_done,
                         pressure=pressure,
                         config=config,
+                        running_containers=running_containers,
                     )
-                    protected = current.reason in {KEPT_LEASED, KEPT_QUIET_PERIOD}
+                    # A running container must never receive `docker container stop` for
+                    # being idle -- KEPT_RUNNING sits beside the lease/quiet-period signals
+                    # here, not among the reasons that merely defer removal.
+                    protected = current.reason in {KEPT_LEASED, KEPT_QUIET_PERIOD, KEPT_RUNNING}
                     if (
                         current.collect
                         or protected
@@ -241,6 +258,7 @@ class Collector:
                     workspace_done=workspace_done,
                     pressure=pressure,
                     config=config,
+                    running_containers=running_containers,
                 )
                 if not current.collect:
                     result.kept.append(resource.name)
@@ -308,7 +326,10 @@ def status(
         free_bytes=storage.free_bytes,
         managed_bytes_ceiling=int(config.get("shared_cache_ceiling")),
     )
-    verdicts = plan(registry, pressure=pressure, config=config)
+    running_containers = resources.running_container_names(engine)
+    verdicts = plan(
+        registry, pressure=pressure, config=config, running_containers=running_containers
+    )
     reclaimable = sum(measured[v.resource.id] or 0 for v in collectable(verdicts))
     advisory = (
         "Backing-store slack exceeds managed reclaimable bytes; compact the Docker VHDX manually."

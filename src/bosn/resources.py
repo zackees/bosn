@@ -24,7 +24,7 @@ from pathlib import Path
 
 from bosn import labels
 from bosn.clock import Clock, SystemClock
-from bosn.engine import Engine
+from bosn.engine import Engine, EngineError
 from bosn.registry import Registry, Resource
 
 # Docker CLI list commands per resource kind, formatted as one JSON object per line.
@@ -180,6 +180,56 @@ class ResourceScanner:
                 else:
                     scan.foreign.append(resource)
         return scan
+
+
+# -- run state ---------------------------------------------------------------
+
+
+def running_container_names(engine: Engine) -> frozenset[str] | None:
+    """Container names the engine reports as currently running, or ``None`` if unknown.
+
+    Uses ``docker ps`` *without* ``--all`` -- unlike :data:`_LIST_COMMANDS`\\ 's
+    ``container`` entry, which passes ``--all`` because enumeration needs every container
+    regardless of state. Omitting it here is what makes the result "running right now"
+    rather than "exists". Parsing follows the same one-JSON-object-per-line format as
+    :meth:`ResourceScanner._discover`, reusing :func:`_name_of` for the row shape.
+
+    One engine call for the whole pass: callers (GC) evaluate potentially hundreds of
+    resources per run and must not turn this into one subprocess per container.
+
+    ``None`` and an empty ``frozenset`` are deliberately NOT interchangeable, and this is
+    the entire safety property this function exists for:
+
+    - ``frozenset()`` means the engine answered and reported nothing running. It is safe
+      to treat every resource as unprotected by this check.
+    - ``None`` means the engine could not answer -- unreachable, non-zero exit, timeout,
+      or output that cannot be parsed as the expected JSON-lines format. Callers MUST
+      treat ``None`` as "protect everything", because the alternative -- silently
+      returning an empty set on failure -- would make every container collectable at
+      exactly the moment bosn cannot see the engine, which is the bug this function
+      exists to prevent. Do not "simplify" this to always return a set.
+    """
+    try:
+        result = engine.run(["ps", "--format", "{{json .}}"])
+    except EngineError:
+        return None
+    if not result.ok:
+        return None
+    names: set[str] = set()
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(row, dict):
+            return None
+        name = _name_of("container", row)
+        if name:
+            names.add(name)
+    return frozenset(names)
 
 
 # -- leases ----------------------------------------------------------------

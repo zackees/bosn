@@ -9,6 +9,9 @@ cold build into 30 seconds. They get separate clocks:
 - warm volumes live 72 h
 - superseded generations are capped at 24 h
 - machine-shared caches age only under pressure
+- a container the engine reports as running is exempt from all of the above -- the tiers
+  assume "disposable, cheap to recreate," which is false the instant something is executing
+  inside it
 
 Nothing here deletes anything. This module decides; `gc` executes, and only against
 resources carrying complete ownership proof.
@@ -40,6 +43,7 @@ SUPERSEDED_CAP = 1 * DAY
 
 # Reasons a resource is kept. Ordered by how strongly they bind.
 KEPT_LEASED = "leased"
+KEPT_RUNNING = "running"
 KEPT_QUIET_PERIOD = "quiet-period"
 KEPT_WARM = "warm"
 KEPT_MACHINE_SCOPE = "machine-scope"
@@ -124,8 +128,20 @@ def evaluate(
     pressure: Pressure | None = None,
     config: Config | None = None,
     alive_probe=process_alive,
+    running_containers: frozenset[str] | None = frozenset(),
 ) -> Verdict:
-    """Decide a single resource's fate. Never mutates anything."""
+    """Decide a single resource's fate. Never mutates anything.
+
+    ``running_containers`` is the per-pass snapshot from
+    ``resources.running_container_names``: the set of container names the engine reports as
+    currently running, or ``None`` when the engine could not answer. The default of an empty
+    frozenset means "no run-state information was supplied" -- callers that never touch
+    containers, and the large majority of existing tests, get exactly today's behavior. A
+    caller that *does* thread engine state through must pass ``None`` explicitly to get the
+    fail-safe "protect everything" behavior; an empty set and ``None`` are deliberately kept
+    on separate branches below so a falsy check can never conflate "nothing is running" with
+    "the engine could not say".
+    """
     now = registry.clock.now() if now is None else now
     pressure = pressure or Pressure()
     if config is None:
@@ -138,6 +154,19 @@ def evaluate(
         # Leased resources are untouchable, full stop -- this outranks every other signal,
         # including an explicit `done`.
         return Verdict(resource, False, KEPT_LEASED)
+
+    if resource.kind == "container":
+        running = True if running_containers is None else resource.name in running_containers
+        if running:
+            # A running container is doing work right now -- it is not the "cheap to
+            # recreate from a warm image" object the age tiers were designed around. This
+            # sits ahead of quiet-period/superseded/done/pressure so none of them can
+            # override it: registry-derived signals (done, superseded generation) are
+            # inherently stale the moment `compose up -d` returns and releases its lease,
+            # while the engine's own run state is first-party and current. The cost of
+            # waiting is bounded -- the very next pass that observes the container stopped
+            # lets it rejoin the normal tiers.
+            return Verdict(resource, False, KEPT_RUNNING)
 
     age = now - resource.last_used
 
@@ -175,6 +204,7 @@ def plan(
     pressure: Pressure | None = None,
     config: Config | None = None,
     alive_probe=process_alive,
+    running_containers: frozenset[str] | None = frozenset(),
 ) -> list[Verdict]:
     """Evaluate every registered resource. Pure: the registry is not modified."""
     now = registry.clock.now() if now is None else now
@@ -195,6 +225,7 @@ def plan(
                 pressure=pressure,
                 config=config,
                 alive_probe=alive_probe,
+                running_containers=running_containers,
             )
         )
     return verdicts

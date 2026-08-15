@@ -18,7 +18,7 @@ from bosn.config import load as load_config
 from bosn.engine import EngineResult
 from bosn.gc import Collector, done_workspaces, mark_done, status
 from bosn.registry import Registry
-from bosn.retention import DAY
+from bosn.retention import DAY, KEPT_RUNNING
 from conftest import live_proc_start
 
 OURS = "our-registry"
@@ -27,16 +27,30 @@ OURS = "our-registry"
 class FakeEngine:
     """Serves labels per resource name and records removals."""
 
-    def __init__(self, label_map: dict[str, dict[str, str]]):
+    def __init__(
+        self,
+        label_map: dict[str, dict[str, str]],
+        *,
+        running: frozenset[str] | None = frozenset(),
+    ):
         self.label_map = label_map
         self.commands: list[list[str]] = []
         self.fail_on: set[str] = set()
         self.on_inspect: Callable[[], None] | None = None
         self.lease_acquired = threading.Event()
         self.lease_was_active_when_stopped = False
+        # `None` means "the engine could not answer `docker ps`" -- distinct from an empty
+        # set, which means "the engine answered: nothing is running". See
+        # `resources.running_container_names` for the contract this mirrors.
+        self.running = running
 
     def run(self, args: list[str], *, check: bool = False) -> EngineResult:
         self.commands.append(list(args))
+        if args == ["ps", "--format", "{{json .}}"]:
+            if self.running is None:
+                return EngineResult(1, "", "engine unreachable")
+            lines = "\n".join(json.dumps({"Names": name}) for name in self.running)
+            return EngineResult(0, lines, "")
         if "inspect" in args:
             if self.on_inspect is not None:
                 self.on_inspect()
@@ -538,3 +552,89 @@ def test_status_reports_counts_and_foreign_registries(registry: Registry) -> Non
         {"workspace": "/w", "stack": "s", "role": "volume", "count": 1, "bytes": 0, "unmeasured": 1}
     ]
     assert report["decisions"][0]["reason"] == "warm"
+
+
+# -- run state (issue #90) --------------------------------------------------
+#
+# GC must probe the engine's run state once per pass -- not once per resource, since a pass
+# covers hundreds -- and a container it finds running must survive both the idle-stop path
+# and the removal path, under both age and pressure, while a stopped container of identical
+# age/scope is collected exactly as before.
+
+
+def test_gc_protects_a_running_container_under_pressure_but_still_removes_a_stopped_one(
+    monkeypatch, registry: Registry
+) -> None:
+    """RED before the fix: both were pressure-eligible regardless of run state."""
+    running = add(registry, "running", kind="container")
+    stopped = add(registry, "stopped", kind="container")
+    engine = FakeEngine(
+        {
+            "running": label_dict(registry=registry.registry_id, kind="container"),
+            "stopped": label_dict(registry=registry.registry_id, kind="container"),
+        },
+        running=frozenset({"running"}),
+    )
+    monkeypatch.setattr(
+        gc_mod.StorageInventory,
+        "collect",
+        classmethod(
+            lambda _cls, _engine: StorageInventory(
+                {("container", "running"): 10, ("container", "stopped"): 10}
+            )
+        ),
+    )
+    config = load_config(flags={"shared_cache_ceiling": 10})
+
+    result = Collector(registry, engine, config=config).collect(dry_run=False)  # type: ignore[arg-type]
+
+    assert result.removed == [stopped.name]
+    assert stopped.name in engine.removals()
+    assert running.name not in engine.removals()
+    assert registry.get_resource(running.id) is not None
+    assert running.name in result.kept
+
+
+def test_gc_never_idle_stops_a_running_container(registry: Registry, clock: FakeClock) -> None:
+    add(registry, "busy", kind="container")
+    engine = FakeEngine(
+        {"busy": label_dict(registry=registry.registry_id, kind="container")},
+        running=frozenset({"busy"}),
+    )
+    clock.advance(2 * 3600)  # past the 1h idle-stop clock
+
+    result = Collector(registry, engine).collect(dry_run=False)  # type: ignore[arg-type]
+
+    assert result.kept == ["busy"]
+    assert result.stopped == []
+    assert [cmd for cmd in engine.commands if cmd[:2] == ["container", "stop"]] == []
+
+
+def test_gc_protects_every_container_when_the_engine_cannot_report_run_state(
+    registry: Registry, clock: FakeClock
+) -> None:
+    """`None` (engine unreachable/unparseable) means protect, never means nothing is running."""
+    add(registry, "mystery", kind="container")
+    engine = FakeEngine(
+        {"mystery": label_dict(registry=registry.registry_id, kind="container")}, running=None
+    )
+    clock.advance(2 * DAY)  # well past both the idle-stop and removal clocks
+
+    result = Collector(registry, engine).collect(dry_run=False)  # type: ignore[arg-type]
+
+    assert result.kept == ["mystery"]
+    assert result.removed == []
+    assert result.stopped == []
+
+
+def test_status_reports_running_as_the_kept_reason(registry: Registry) -> None:
+    add(registry, "busy", kind="container")
+    engine = FakeEngine(
+        {"busy": label_dict(registry=registry.registry_id, kind="container")},
+        running=frozenset({"busy"}),
+    )
+
+    report = status(registry, engine)  # type: ignore[arg-type]
+
+    assert report["decisions"][0]["reason"] == KEPT_RUNNING
+    assert report["by_reason"].get(KEPT_RUNNING) == 1

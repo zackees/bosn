@@ -18,6 +18,7 @@ from bosn.retention import (
     KEPT_LEASED,
     KEPT_MACHINE_SCOPE,
     KEPT_QUIET_PERIOD,
+    KEPT_RUNNING,
     KEPT_WARM,
     Pressure,
     evaluate,
@@ -266,3 +267,173 @@ def test_plan_is_pure(registry: Registry, clock: FakeClock) -> None:
     before = len(registry.list_resources())
     retention.plan(registry, alive_probe=DEAD)
     assert len(registry.list_resources()) == before, "planning must not mutate the registry"
+
+
+# -- run state (issue #90) --------------------------------------------------
+#
+# `compose up -d` releases its project lease the moment the command returns, while the
+# containers it started keep running. From that point on, age/pressure/done alone cannot
+# tell a container mid-execution apart from an idle one -- only the engine's own run state
+# can. These pin the run-state floor: it protects a *running* container from every signal
+# that would otherwise collect it, without making a *stopped* container of identical age
+# immortal.
+
+
+def test_a_running_container_survives_a_pressure_pass_that_would_otherwise_collect_it(
+    registry: Registry, clock: FakeClock
+) -> None:
+    """RED before the fix: this collected under COLLECT_PRESSURE like any other resource."""
+    resource = make(registry, kind="container")
+    clock.advance(10 * DAY)
+
+    verdict = evaluate(
+        registry,
+        resource,
+        pressure=Pressure(under_pressure=True),
+        alive_probe=DEAD,
+        running_containers=frozenset({resource.name}),
+    )
+
+    assert not verdict.collect
+    assert verdict.reason == KEPT_RUNNING
+
+
+def test_a_running_container_is_never_collected_on_age_alone(
+    registry: Registry, clock: FakeClock
+) -> None:
+    resource = make(registry, kind="container")
+    clock.advance(2 * DAY)  # well past the 24h container removal clock
+
+    verdict = evaluate(
+        registry, resource, alive_probe=DEAD, running_containers=frozenset({resource.name})
+    )
+
+    assert not verdict.collect
+    assert verdict.reason == KEPT_RUNNING
+
+
+def test_a_stopped_container_of_identical_age_and_scope_is_still_collected(
+    registry: Registry, clock: FakeClock
+) -> None:
+    """The anti-over-reach case: run-state protection must not become blanket immortality."""
+    resource = make(registry, kind="container")
+    clock.advance(2 * DAY)
+
+    verdict = evaluate(
+        registry,
+        resource,
+        pressure=Pressure(under_pressure=True),
+        alive_probe=DEAD,
+        running_containers=frozenset(),  # engine answered: nothing is running
+    )
+
+    assert verdict.collect
+    assert verdict.reason == COLLECT_PRESSURE
+
+
+def test_an_unavailable_engine_protects_every_container(
+    registry: Registry, clock: FakeClock
+) -> None:
+    """`None` from the probe means the engine could not answer -- fail safe, not fail open."""
+    resource = make(registry, kind="container")
+    clock.advance(2 * DAY)
+
+    verdict = evaluate(
+        registry,
+        resource,
+        pressure=Pressure(under_pressure=True),
+        alive_probe=DEAD,
+        running_containers=None,
+    )
+
+    assert not verdict.collect
+    assert verdict.reason == KEPT_RUNNING
+
+
+def test_none_and_empty_set_are_not_interchangeable(registry: Registry, clock: FakeClock) -> None:
+    """Pinning the distinction directly: same resource, same age, opposite outcome."""
+    resource = make(registry, kind="container")
+    clock.advance(2 * DAY)
+
+    unknown = evaluate(registry, resource, alive_probe=DEAD, running_containers=None)
+    answered_idle = evaluate(registry, resource, alive_probe=DEAD, running_containers=frozenset())
+
+    assert not unknown.collect and unknown.reason == KEPT_RUNNING
+    assert answered_idle.collect and answered_idle.reason == COLLECT_IDLE
+
+
+def test_non_container_kinds_are_unaffected_by_run_state(
+    registry: Registry, clock: FakeClock
+) -> None:
+    """`running_containers` only ever gates `kind == 'container'`."""
+    volume = make(registry, kind="volume")
+    clock.advance(100 * DAY)
+
+    verdict = evaluate(
+        registry,
+        volume,
+        alive_probe=DEAD,
+        # Even a matching name (and even `None`, the fail-safe value for containers) must
+        # not touch a volume's own tier.
+        running_containers=None,
+    )
+
+    assert verdict.collect
+    assert verdict.reason == COLLECT_IDLE
+
+
+def test_a_running_container_is_not_collected_by_an_explicit_done(
+    registry: Registry, clock: FakeClock
+) -> None:
+    """Executing work is not disposable, even on the strongest first-party signal there is.
+
+    `workspace_done` is a first-party signal, but it is set on the *workspace*, not
+    observed on the *container* -- it says nothing about whether the process inside the
+    container has finished. Run state is fresher and more specific, so it wins.
+    """
+    resource = make(registry, kind="container")
+
+    verdict = evaluate(
+        registry,
+        resource,
+        workspace_done=True,
+        alive_probe=DEAD,
+        running_containers=frozenset({resource.name}),
+    )
+
+    assert not verdict.collect
+    assert verdict.reason == KEPT_RUNNING
+
+
+def test_a_running_container_is_not_collected_by_supersession(
+    registry: Registry, clock: FakeClock
+) -> None:
+    resource = make(registry, kind="container")
+    clock.advance(2 * DAY)  # past the superseded cap
+
+    verdict = evaluate(
+        registry,
+        resource,
+        superseded=True,
+        alive_probe=DEAD,
+        running_containers=frozenset({resource.name}),
+    )
+
+    assert not verdict.collect
+    assert verdict.reason == KEPT_RUNNING
+
+
+def test_a_lease_outranks_running_in_the_reported_reason(
+    registry: Registry, clock: FakeClock
+) -> None:
+    """Both protect the resource; the stronger, longer-standing signal names itself."""
+    resource = make(registry, kind="container")
+    registry.acquire_lease(resource.id, pid=1, proc_start=1.0, ttl_seconds=60)
+    clock.advance(10 * DAY)
+
+    verdict = evaluate(
+        registry, resource, alive_probe=ALIVE, running_containers=frozenset({resource.name})
+    )
+
+    assert not verdict.collect
+    assert verdict.reason == KEPT_LEASED
