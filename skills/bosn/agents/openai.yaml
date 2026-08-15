@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bosn Docker Workflow"
+  short_description: "Run safe Linux Docker test stacks"
+  default_prompt: "Use $bosn to run this project in a managed Linux Docker test stack."
