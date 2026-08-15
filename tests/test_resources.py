@@ -181,6 +181,77 @@ def test_engine_failure_yields_no_resources_rather_than_guesses() -> None:
     assert scan.counts() == {"owned": 0, "foreign": 0, "unlabeled": 0}
 
 
+# -- run state ---------------------------------------------------------------
+
+
+class _RecordingEngine:
+    """Records issued commands and replays one canned result for every call."""
+
+    def __init__(self, result: EngineResult) -> None:
+        self.result = result
+        self.commands: list[list[str]] = []
+
+    def run(self, args: list[str], *, check: bool = False) -> EngineResult:
+        self.commands.append(list(args))
+        return self.result
+
+
+def test_running_container_names_returns_running_containers_by_name() -> None:
+    rows = [{"Names": "web"}, {"Names": "worker"}]
+    engine = _RecordingEngine(EngineResult(0, "\n".join(json.dumps(r) for r in rows), ""))
+
+    names = resources.running_container_names(engine)  # type: ignore[arg-type]
+
+    assert names == frozenset({"web", "worker"})
+
+
+def test_running_container_names_does_not_pass_all_and_issues_one_call() -> None:
+    """A stopped container must not appear -- proven by the command never adding --all."""
+    engine = _RecordingEngine(EngineResult(0, "", ""))
+
+    resources.running_container_names(engine)  # type: ignore[arg-type]
+
+    assert len(engine.commands) == 1
+    assert engine.commands[0][0] == "ps"
+    assert "--all" not in engine.commands[0]
+
+
+def test_running_container_names_is_none_on_engine_failure() -> None:
+    engine = _RecordingEngine(EngineResult(1, "", "engine down"))
+
+    result = resources.running_container_names(engine)  # type: ignore[arg-type]
+
+    assert result is None
+
+
+def test_running_container_names_is_none_when_engine_raises() -> None:
+    class Raising:
+        def run(self, args: list[str], *, check: bool = False) -> EngineResult:
+            raise resources.EngineError("docker unreachable")
+
+    result = resources.running_container_names(Raising())  # type: ignore[arg-type]
+
+    assert result is None
+
+
+def test_running_container_names_is_none_on_unparseable_output() -> None:
+    engine = _RecordingEngine(EngineResult(0, "not json at all {", ""))
+
+    result = resources.running_container_names(engine)  # type: ignore[arg-type]
+
+    assert result is None
+
+
+def test_running_container_names_is_empty_set_not_none_when_nothing_runs() -> None:
+    """The pair with the failure case above: this is what pins None apart from empty."""
+    engine = _RecordingEngine(EngineResult(0, "", ""))
+
+    result = resources.running_container_names(engine)  # type: ignore[arg-type]
+
+    assert result == frozenset()
+    assert result is not None
+
+
 # -- leases ----------------------------------------------------------------
 
 
