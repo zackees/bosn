@@ -13,7 +13,7 @@ Schema version: `1` (the shape of the `--supported --json` payload this doc refl
 | Verb | Summary |
 | --- | --- |
 | `init` | translate compose.yaml into a starting bosn.toml manifest |
-| `compose` | managed Compose subset (up/down/logs/ps); every resource labeled and leased |
+| `compose` | managed Compose subset (up/down/logs/ps/build/run/exec/config); every resource labeled and leased |
 
 ## Forwarded
 
@@ -64,4 +64,62 @@ Schema version: `1` (the shape of the `--supported --json` payload this doc refl
 | `diff` | list changed files in a container's filesystem | targets a raw container name outside bosn's registry; use `bosn shell` to inspect a managed container directly |
 | `wait` | block until a container stops, then print its exit code | targets a raw container name outside bosn's registry; use `bosn jobs`/`bosn attach` to wait on a daemon-owned job |
 | `search` | search Docker Hub for images | not part of the managed subset; use the real `docker` binary directly if you accept the resources it creates will be unmanaged, or add it to bosn.toml so bosn can create it tracked |
+
+## Compose flags
+
+The `compose` verb's own sub-verb and flag surface (#47). A flag not listed as `accepted` for a sub-verb -- including one this table has never heard of -- is refused, named, with a remedy; see `bosn.frontdoor.resolve_compose_flag`.
+
+Sub-verbs: `up`, `down`, `logs`, `ps`, `build`, `run`, `exec`, `config`
+
+### Global flags
+
+Apply to every sub-verb identically; parsed ahead of the sub-verb (`bosn-docker compose -f compose.yaml up`).
+
+| Flag | Aliases | Takes value | Status | Summary | Remedy |
+| --- | --- | --- | --- | --- | --- |
+| `-f` | `--file` | yes | accepted | path to the compose file (already wired; predates #47) | -- |
+
+### `compose up`
+
+| Flag | Aliases | Takes value | Status | Summary | Remedy |
+| --- | --- | --- | --- | --- | --- |
+| `-d` | `--detach` | no | accepted | run containers in the background instead of attaching to their output | -- |
+| `--wait` | -- | no | accepted | wait for services to report healthy/running before returning | -- |
+| `--build` | -- | no | refused | rebuild images before starting | would rebuild an image outside `bosn ensure`'s spec-digest tracking; declare the build in bosn.toml and run `bosn ensure` first, then `compose up` |
+| `--remove-orphans` | -- | no | refused | remove containers for services not defined in the compose file | accepted on `compose down`, not `up`, in this subset; run `bosn-docker compose down --remove-orphans` |
+
+### `compose down`
+
+| Flag | Aliases | Takes value | Status | Summary | Remedy |
+| --- | --- | --- | --- | --- | --- |
+| `-v` | `--volumes` | no | accepted | remove named volumes declared in the compose file's `volumes` section | -- |
+| `--remove-orphans` | -- | no | accepted | remove containers for services not defined in the compose file | -- |
+| `--rmi` | -- | yes | refused | remove images used by services | deletes images outside lease/GC bookkeeping; use `bosn gc` to reclaim managed resources safely |
+| `-t` | `--timeout` | yes | refused | shutdown timeout in seconds before a container is killed | not part of bosn's managed `compose down` flag subset; run `bosn-docker --supported --json` to see every accepted flag per compose command, or use the real `docker compose` binary directly if you accept the resources it creates will be unmanaged |
+
+### `compose logs`
+
+| Flag | Aliases | Takes value | Status | Summary | Remedy |
+| --- | --- | --- | --- | --- | --- |
+| `-f` | `--follow` | no | refused | follow log output (docker compose's meaning; NOT bosn's global --file) | `-f` is bosn's global compose-file selector, not `--follow`, in this subset; `--follow` itself is not part of the managed flag surface -- not part of bosn's managed `compose logs` flag subset; run `bosn-docker --supported --json` to see every accepted flag per compose command, or use the real `docker compose` binary directly if you accept the resources it creates will be unmanaged |
+
+### `compose ps`
+
+No sub-verb-specific flags are declared; only the global flags above apply.
+
+### `compose build`
+
+No sub-verb-specific flags are declared; only the global flags above apply.
+
+### `compose run`
+
+No sub-verb-specific flags are declared; only the global flags above apply.
+
+### `compose exec`
+
+No sub-verb-specific flags are declared; only the global flags above apply.
+
+### `compose config`
+
+No sub-verb-specific flags are declared; only the global flags above apply.
 

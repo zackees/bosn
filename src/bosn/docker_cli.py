@@ -338,7 +338,7 @@ def _compose_overlay(registry_id: str | Registry, compose: Path) -> Path:
         handle.close()
 
 
-def _reconcile_after_compose(command: str) -> None:
+def _reconcile_after_compose(command: str, *, prune_missing: bool = False) -> None:
     """Adopt any labeled-but-unregistered resource left behind by a Compose invocation.
 
     Runs unconditionally -- on a clean exit, a non-zero exit, and on the way out of a
@@ -353,13 +353,21 @@ def _reconcile_after_compose(command: str) -> None:
     label new resources, adoption only registers what is not already known, so the scan
     finds nothing to do and returns immediately.
 
+    `prune_missing` is the opt-in the closing reconcile after `down -v`/`--volumes` sets:
+    that flag tells Compose to *delete* named volumes bosn has registry rows for, and the
+    plain adopt-only path here never removes a row for something that vanished (see
+    `daemon._verb_compose_adopt`). Left `False` everywhere else -- including the
+    pre-command reconcile above `_run_compose`'s lease acquisition, which runs before
+    Compose has touched anything this invocation and must not treat an engine hiccup as
+    permission to forget resources that never left.
+
     A failure here is reported to stderr but never raised. Raising would surface as a
     `DockerFrontDoorError` in `main()`, which maps to exit code 1 regardless of what the
     compose command itself returned -- masking `up`'s real exit status behind a
     bookkeeping error the caller didn't ask about.
     """
     try:
-        adopted = daemon.request("compose-adopt")
+        adopted = daemon.request("compose-adopt", prune_missing=prune_missing)
     except KeyboardInterrupt:
         raise
     except Exception as exc:  # daemon unreachable, IPC failure, etc.
@@ -438,9 +446,46 @@ def _release_compose_lease(session: str | None) -> None:
         print(f"bosn-docker compose: could not release project lease: {exc}", file=sys.stderr)
 
 
+# The decided v1 subset (#47): `up -d/--detach --wait` and `down -v/--volumes
+# --remove-orphans`. Anything else after the verb still refuses, named specifically, via
+# `_validate_compose_flags` below -- this table is deliberately not sourced from
+# `bosn.frontdoor`, which does not yet expose per-verb flag data; parsed locally here
+# instead of blocking on that.
+_COMPOSE_ALLOWED_FLAGS: dict[str, frozenset[str]] = {
+    "up": frozenset({"-d", "--detach", "--wait"}),
+    "down": frozenset({"-v", "--volumes", "--remove-orphans"}),
+}
+
+# `-v`/`--volumes` is the flag that makes `down` delete named volumes bosn has registry rows
+# for -- the trigger for the `prune_missing` reconcile below. `--remove-orphans` also
+# removes engine objects (containers for services no longer in the file) but is
+# deliberately not included here: without `-v` a plain `down`/`down --remove-orphans` still
+# reconciles adopt-only, so a row for an orphan container Compose just removed goes stale
+# until the next opportunity to prune it -- currently the daemon's own startup recovery
+# (`_reconcile_startup_resources`, which does pass `prior_resources`), not this call.
+# Widening `prune_missing` to cover it is a separate, deliberate decision, not a gap to
+# close here: it would mean trusting every `down` (not just `-v`) to treat an engine
+# listing failure as removal-worthy, and Problem 2 as scoped is about the volumes `-v`
+# names explicitly.
+_COMPOSE_VOLUME_REMOVAL_FLAGS = frozenset({"-v", "--volumes"})
+
+
+def _validate_compose_flags(command: str, args: list[str]) -> None:
+    """Refuse anything outside the decided per-verb subset, naming the exact flag.
+
+    `command` here is always `up`/`down`/`logs`/`ps` (`_parse_compose_args` already
+    constrains `command` via `choices=`); `logs`/`ps` have no entry in the table above, so
+    `_COMPOSE_ALLOWED_FLAGS.get(command, frozenset())` refuses every argument for them, same
+    as before this change -- only `up`/`down` grew an accepted, non-empty subset.
+    """
+    allowed = _COMPOSE_ALLOWED_FLAGS.get(command, frozenset())
+    for arg in args:
+        if arg not in allowed:
+            raise DockerFrontDoorError(f"unsupported compose flag or argument {arg!r}")
+
+
 def _run_compose(command: str, compose: Path, args: list[str]) -> int:
-    if args:
-        raise DockerFrontDoorError(f"unsupported compose flag or argument {args[0]!r}")
+    _validate_compose_flags(command, args)
     # Resolved before touching the daemon at all: once a `docker` shim that is
     # bosn-docker itself exists on PATH (a later slice of #46), spawning bare
     # `["docker", "compose", ...]` below would resolve to that shim, which re-enters
@@ -454,6 +499,9 @@ def _run_compose(command: str, compose: Path, args: list[str]) -> int:
         raise DockerFrontDoorError(str(reply.get("error") or "cannot reach bosn daemon"))
     overlay = _compose_overlay(str(reply["registry_id"]), compose)
     workspace = str(compose.parent.resolve())
+    prune_missing = command == "down" and any(
+        flag in _COMPOSE_VOLUME_REMOVAL_FLAGS for flag in args
+    )
     try:
         # Reconcile before acquiring: a lease can only protect a resource the registry
         # already knows about, and a project that is already up -- this is a second
@@ -463,7 +511,7 @@ def _run_compose(command: str, compose: Path, args: list[str]) -> int:
         session = _acquire_compose_lease(workspace)
         try:
             completed = subprocess.run(
-                [str(real), "compose", "-f", str(compose), "-f", str(overlay), command],
+                [str(real), "compose", "-f", str(compose), "-f", str(overlay), command, *args],
                 check=False,
                 env=engine_env,
             )
@@ -476,10 +524,37 @@ def _run_compose(command: str, compose: Path, args: list[str]) -> int:
             # propagates -- same ordering guarantee `try/finally` always gives, just applied
             # twice. Release goes first only because it can't discover anything reconcile's
             # scan doesn't need: releasing does not add or remove resource rows.
+            #
+            # This release is unconditional even for `up -d`/`up --wait`, and that is a
+            # considered decision, not an oversight (#47). Those flags make Compose return
+            # as soon as containers start -- the project keeps running after this process
+            # exits, so releasing here stops protecting it via the lease from this point on.
+            # Two ways to keep the lease alive past this call were rejected:
+            #   - hold it open under this process's pid/proc_start anyway: this process is
+            #     about to exit (that is the point of `-d`), so `lease_is_expired` reclaims
+            #     it within one TTL regardless -- "kept" would only mean "kept for a few
+            #     minutes by accident," not durable protection.
+            #   - re-acquire it under the daemon's own identity so it outlives this process:
+            #     `_verb_compose_acquire`'s docstring calls this out explicitly as the one
+            #     thing a Compose lease must never become -- there is no `finally` inside the
+            #     daemon that would ever release it, so it would pin the resources until the
+            #     daemon itself restarts. A lease nothing can release is worse than no lease.
+            #   - refuse `-d`/`--wait` outright: defensible, but it disables the most common
+            #     way people actually run `compose up`, which defeats the point of fronting
+            #     Compose at all.
+            # So: release, exactly as for a blocking `up`. From here, a detached project's
+            # resources are protected only by their age tier -- and that is a real gap, not
+            # a theoretical one: neither retention.py nor gc.py inspects whether a container
+            # is currently running, and non-machine resources are eligible under pressure
+            # regardless of age tier. A freshly-started detached project is indistinguishable
+            # from an idle one to GC the moment this function returns. Closing that gap means
+            # teaching retention/GC about container run state, which is out of scope for this
+            # slice (see the report accompanying this change); it is called out here so the
+            # behavior is documented, not silently accepted.
             try:
                 _release_compose_lease(session)
             finally:
-                _reconcile_after_compose(command)
+                _reconcile_after_compose(command, prune_missing=prune_missing)
         return completed.returncode
     finally:
         overlay.unlink(missing_ok=True)
