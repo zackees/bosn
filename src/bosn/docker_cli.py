@@ -32,10 +32,10 @@ class DockerFrontDoorError(ValueError):
 
 
 # Environment marker set on the child's environment for exactly the duration bosn-docker
-# spawns a forwarded command. Its purpose is narrow: catch a `docker` shim (a future slice)
-# that turns out to *be* bosn-docker resolving itself off PATH and calling back in here --
-# without it, that resolution loops forever. See `_forward` for the full guard and its
-# blind spots.
+# spawns a forwarded or compose-invoked command. Its purpose is narrow: catch a `docker`
+# shim (a future slice) that turns out to *be* bosn-docker resolving itself off PATH and
+# calling back in here -- without it, that resolution loops forever. See
+# `_resolve_forwarding_engine` for the full guard and its blind spots.
 _RECURSION_GUARD_ENV = "BOSN_DOCKER_FORWARDING"
 
 
@@ -65,6 +65,86 @@ def _is_this_program(candidate: Path) -> bool:
         return candidate.samefile(this)
     except OSError:
         return candidate == this
+
+
+class _EngineResolutionError(DockerFrontDoorError):
+    """Raised by `_resolve_forwarding_engine` when spawning the real engine is refused.
+
+    Carries the structured `code`/`next_step` pair `_forward` needs for its JSON envelope,
+    while still being a plain `DockerFrontDoorError` -- so a caller with no `--json` surface
+    of its own (`_run_compose`) can simply let it propagate and rely on `str(exc)` reading
+    as ordinary prose, the same as any other refusal `main()` already catches.
+    """
+
+    def __init__(self, *, code: str, message: str, next_step: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.next_step = next_step
+
+
+def _resolve_forwarding_engine() -> tuple[Path, dict[str, str]]:
+    """Resolve the real engine binary and prepare its child env, refusing on recursion.
+
+    Shared by `_forward` (FORWARD verbs, e.g. `bosn-docker version`) and `_run_compose`
+    (the GOVERNED `compose` verb) -- both ultimately spawn "the real `docker`", and both
+    must refuse identically once a `docker` shim that *is* bosn-docker exists on PATH.
+    Before this function existed, `_run_compose` spawned bare `["docker", "compose", ...]`
+    with neither check: a shim resolving back to this program would re-enter
+    `bosn-docker compose`, which would spawn bare `docker compose` again -- an unbounded
+    fork bomb. Factored once here rather than copied into both call sites, since two
+    guards that can drift independently is how the second one quietly stops matching the
+    first.
+
+    Two layers, in order:
+
+    1. `_RECURSION_GUARD_ENV` in the environment: set on every child this function's
+       caller spawns. A shim invoked as that child inherits it and refuses immediately,
+       before touching PATH resolution at all -- this is what stops a chain of
+       self-invocations once one has already started.
+    2. `_is_this_program()`: resolves "docker" via PATH and compares it, by file identity,
+       against this program's own path. This is what stops the *first* hop -- the case
+       where PATH's "docker" already is (a copy or symlink of) bosn-docker before any
+       forwarding has happened yet, so there is no inherited env var to catch it.
+
+    What this cannot catch: a shim that (a) is a distinct file from bosn-docker's own
+    script -- so `samefile` does not match -- *and* (b) clears its inherited environment
+    before re-invoking bosn-docker, dropping the marker. Neither mechanism alone covers
+    that combination; it would need the shim itself to cooperate (e.g. by also checking
+    its own resolved identity), which is out of scope for this slice.
+    """
+    if os.environ.get(_RECURSION_GUARD_ENV):
+        raise _EngineResolutionError(
+            code="docker.recursion",
+            message=(
+                "refusing to forward -- this process is already inside a bosn-docker "
+                "forward, so the `docker` on PATH would call back into itself"
+            ),
+            next_step=(
+                "run `bosn doctor` to check the docker shim, or invoke the real engine directly"
+            ),
+        )
+    real = _resolve_real_engine("docker")
+    if real is None:
+        raise _EngineResolutionError(
+            code="docker.no-engine",
+            message="no `docker` found on PATH",
+            next_step="install Docker (or podman) and ensure `docker` is on PATH",
+        )
+    if _is_this_program(real):
+        raise _EngineResolutionError(
+            code="docker.recursion",
+            message=(
+                f"the `docker` resolved from PATH is bosn-docker itself ({real}); "
+                "forwarding would call back into this program"
+            ),
+            next_step=(
+                "run `bosn doctor` to check the docker shim, or repair PATH to reach the "
+                "real engine"
+            ),
+        )
+    env = dict(os.environ)
+    env[_RECURSION_GUARD_ENV] = str(os.getpid())
+    return real, env
 
 
 def _envelope(*, code: str, message: str, next_step: str, as_json: bool) -> int:
@@ -101,6 +181,22 @@ def compose_to_manifest(source: Path) -> str:
         default = str(len(stacks) == 0).lower()
         stacks.append(f'[stack.{name}]\nimage = "{image}"\ndefault = {default}\n')
     return "# Generated by bosn-docker init; review before committing.\n\n" + "\n".join(stacks)
+
+
+def run_init(compose: Path, output: Path) -> Path:
+    """Translate `compose` and write the manifest to `output`; the whole `init` verb.
+
+    `compose_to_manifest` above already takes a plain `Path` and returns text, with no
+    argparse or `bosn-docker`-specific handling in its way. This wraps the file-write and
+    the no-clobber refusal around it so `bosn init` (#46: "Move Compose migration to `bosn
+    init`") is a matter of `cli.py` calling this one function and catching
+    `(OSError, DockerFrontDoorError)` -- not reimplementing `main()`'s `init` block.
+    """
+    text = compose_to_manifest(compose)
+    if output.exists():
+        raise DockerFrontDoorError(f"refusing to overwrite {output}; choose --output")
+    output.write_text(text, encoding="utf-8")
+    return output
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -342,6 +438,14 @@ def _release_compose_lease(session: str | None) -> None:
 def _run_compose(command: str, compose: Path, args: list[str]) -> int:
     if args:
         raise DockerFrontDoorError(f"unsupported compose flag or argument {args[0]!r}")
+    # Resolved before touching the daemon at all: once a `docker` shim that is
+    # bosn-docker itself exists on PATH (a later slice of #46), spawning bare
+    # `["docker", "compose", ...]` below would resolve to that shim, which re-enters
+    # `bosn-docker compose`, which spawns bare `docker compose` again -- an unbounded
+    # fork bomb. `_EngineResolutionError` is a `DockerFrontDoorError`, so a refusal here
+    # propagates straight through to `main()`'s existing except clause with no `--json`
+    # handling of its own to add.
+    real, engine_env = _resolve_forwarding_engine()
     reply = daemon.request("status")
     if not reply.get("ok"):
         raise DockerFrontDoorError(str(reply.get("error") or "cannot reach bosn daemon"))
@@ -356,7 +460,9 @@ def _run_compose(command: str, compose: Path, args: list[str]) -> int:
         session = _acquire_compose_lease(workspace)
         try:
             completed = subprocess.run(
-                ["docker", "compose", "-f", str(compose), "-f", str(overlay), command], check=False
+                [str(real), "compose", "-f", str(compose), "-f", str(overlay), command],
+                check=False,
+                env=engine_env,
             )
         finally:
             # Release and reconcile both have to happen -- whether the subprocess returned
@@ -379,70 +485,20 @@ def _run_compose(command: str, compose: Path, args: list[str]) -> int:
 def _forward(verb: str, args: list[str], *, as_json: bool) -> int:
     """Pass a FORWARD verb's argv verbatim to the real engine.
 
-    Recursion guard, two layers, because #46 explicitly calls out that a later slice
-    installs a `docker` shim that *is* `bosn-docker` -- if resolving "docker" off PATH
-    can land back on this program, forwarding becomes a fork bomb the moment that shim
-    ships, so the guard has to exist before it does:
-
-    1. `_RECURSION_GUARD_ENV` in the environment: set on every child this function spawns.
-       A shim invoked as that child inherits it and refuses immediately, before touching
-       PATH resolution at all -- this is what stops a chain of self-invocations once one
-       has already started.
-    2. `_is_this_program()`: resolves "docker" via PATH and compares it, by file identity,
-       against this program's own path. This is what stops the *first* hop -- the case
-       where PATH's "docker" already is (a copy or symlink of) bosn-docker before any
-       forwarding has happened yet, so there is no inherited env var to catch it.
-
-    What this cannot catch: a shim that (a) is a distinct file from bosn-docker's own
-    script -- so `samefile` does not match -- *and* (b) clears its inherited environment
-    before re-invoking bosn-docker, dropping the marker. Neither mechanism alone covers
-    that combination; it would need the shim itself to cooperate (e.g. by also checking
-    its own resolved identity), which is out of scope for this slice.
-
-    This guard does not cover `_run_compose`, which still spawns bare `["docker",
-    "compose", ...]` resolved off PATH with neither absolute resolution nor the marker --
-    `compose` is GOVERNED, not FORWARD, so it never reaches this function. Once a shim
-    ships, `bosn-docker compose up` -> shim `docker` -> GOVERNED dispatch -> `_run_compose`
-    -> bare `docker` is an unguarded loop. Leaving it unguarded here is deliberate (this
-    slice's brief pins compose's existing behavior unchanged); the shim-installing slice
-    must route `_run_compose`'s engine invocation through `_resolve_real_engine` and this
-    same marker before any shim is installed.
+    The recursion guard itself lives in `_resolve_forwarding_engine`, shared with
+    `_run_compose` -- see that function's docstring for why the two must not drift apart.
+    This wrapper only translates a refusal into `_forward`'s own JSON-or-prose envelope,
+    prefixed with the verb the caller typed.
     """
-    if os.environ.get(_RECURSION_GUARD_ENV):
+    try:
+        real, env = _resolve_forwarding_engine()
+    except _EngineResolutionError as exc:
         return _envelope(
-            code="docker.recursion",
-            message=(
-                f"bosn-docker {verb}: refusing to forward -- this process is already inside "
-                "a bosn-docker forward, so the `docker` on PATH would call back into itself"
-            ),
-            next_step=(
-                "run `bosn doctor` to check the docker shim, or invoke the real engine directly"
-            ),
+            code=exc.code,
+            message=f"bosn-docker {verb}: {exc}",
+            next_step=exc.next_step,
             as_json=as_json,
         )
-    real = _resolve_real_engine("docker")
-    if real is None:
-        return _envelope(
-            code="docker.no-engine",
-            message=f"bosn-docker {verb}: no `docker` found on PATH",
-            next_step="install Docker (or podman) and ensure `docker` is on PATH",
-            as_json=as_json,
-        )
-    if _is_this_program(real):
-        return _envelope(
-            code="docker.recursion",
-            message=(
-                f"bosn-docker {verb}: the `docker` resolved from PATH is bosn-docker itself "
-                f"({real}); forwarding would call back into this program"
-            ),
-            next_step=(
-                "run `bosn doctor` to check the docker shim, or repair PATH to reach the "
-                "real engine"
-            ),
-            as_json=as_json,
-        )
-    env = dict(os.environ)
-    env[_RECURSION_GUARD_ENV] = str(os.getpid())
     completed = subprocess.run([str(real), verb, *args], check=False, env=env)
     return completed.returncode
 
@@ -494,11 +550,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if ns.verb == "init":
         init_ns = _parse_init_args(ns.args)
         try:
-            text = compose_to_manifest(Path(init_ns.compose))
-            output = Path(init_ns.output)
-            if output.exists():
-                raise DockerFrontDoorError(f"refusing to overwrite {output}; choose --output")
-            output.write_text(text, encoding="utf-8")
+            output = run_init(Path(init_ns.compose), Path(init_ns.output))
         except (OSError, DockerFrontDoorError) as exc:
             print(f"bosn-docker init: {exc}", file=sys.stderr)
             return 1
@@ -512,3 +564,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"bosn-docker compose: {exc}", file=sys.stderr)
             return 1
     return _dispatch_from_table(ns.verb, ns.args, as_json=as_json)
+
+
+def compose_main(argv: Sequence[str] | None = None) -> int:
+    """Entry point for the `bosn-compose` console script (#46).
+
+    `bosn-compose up` is exactly `bosn-docker compose up` -- reuses `main()`'s own verb
+    dispatch by prepending the `compose` verb, rather than forking a second implementation
+    of overlay generation, leasing, and reconcile that could drift from the one above.
+    """
+    raw_argv = list(argv if argv is not None else sys.argv[1:])
+    return main(["compose", *raw_argv])

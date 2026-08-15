@@ -22,6 +22,7 @@ Homepage = "https://github.com/zackees/bosn"
 [project.scripts]
 bosn = "bosn.cli:main"
 bosn-docker = "bosn.docker_cli:main"
+bosn-compose = "bosn.docker_cli:compose_main"
 
 [dependency-groups]
 dev = [

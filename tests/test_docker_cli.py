@@ -219,6 +219,18 @@ def _fixed_process_start_time(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("bosn.docker_cli.process_start_time", lambda pid: 123.0)
 
 
+@pytest.fixture(autouse=True)
+def _fake_real_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_run_compose` now resolves the real engine through the same guard `_forward` uses
+    (the fork-bomb fix below), instead of spawning a bare `"docker"` off PATH. Fake that
+    resolution here so the many existing compose tests do not depend on a real `docker`
+    being installed in CI -- per the no-Docker-in-tests rule, only `subprocess.run` itself
+    is faked by each test; engine *resolution* is faked once, here, for all of them.
+    Individual recursion-guard tests below override this fixture's patches themselves.
+    """
+    monkeypatch.setattr(docker_cli, "_resolve_real_engine", lambda binary="docker": Path("docker"))
+
+
 def test_a_failed_up_still_reconciles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """RED before the fix: adoption only ran when `up` exited 0.
 
@@ -622,6 +634,104 @@ def test_recursion_guard_refuses_when_the_resolved_docker_is_bosns_own_shim(
     assert envelope["ok"] is False
     assert envelope["code"] == "docker.recursion"
     assert "bosn-docker" in envelope["message"]
+
+
+def test_run_compose_refuses_when_the_resolved_docker_is_bosns_own_shim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fork bomb this guard exists to close: once a `docker` shim that *is*
+    bosn-docker exists on PATH, an unguarded `_run_compose` spawning bare
+    `["docker", "compose", ...]` would resolve to that shim, which re-enters
+    `bosn-docker compose`, which spawns bare `docker compose` again -- forever. Without
+    the fix, `_fail_if_called` below would fire, proving `subprocess.run` was reached;
+    with it, `_run_compose` must refuse before ever spawning anything.
+    """
+    monkeypatch.setattr(
+        docker_cli, "_resolve_real_engine", lambda binary="docker": Path(tmp_path / "docker-shim")
+    )
+    monkeypatch.setattr(docker_cli, "_is_this_program", lambda candidate: True)
+
+    def _fail_if_called(*_a: Any, **_k: Any) -> _FakeCompleted:
+        raise AssertionError(
+            "compose must refuse before spawning the engine, or this is a fork bomb"
+        )
+
+    monkeypatch.setattr(docker_cli.subprocess, "run", _fail_if_called)
+
+    with pytest.raises(DockerFrontDoorError, match="bosn-docker itself"):
+        _run_compose("up", _compose_file(tmp_path), [])
+
+
+def test_run_compose_refuses_when_the_recursion_marker_is_already_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The second layer of the same guard: a child spawned mid-forward that is somehow
+    re-invoked as `bosn-docker compose` must refuse immediately from the inherited
+    environment marker, without resolving PATH again.
+    """
+    monkeypatch.setenv(docker_cli._RECURSION_GUARD_ENV, "1234")
+
+    def _fail_if_resolved(binary: str = "docker") -> Path | None:
+        raise AssertionError("must not resolve PATH again once the recursion marker is set")
+
+    monkeypatch.setattr(docker_cli, "_resolve_real_engine", _fail_if_resolved)
+
+    def _fail_if_called(*_a: Any, **_k: Any) -> _FakeCompleted:
+        raise AssertionError(
+            "compose must refuse before spawning the engine, or this is a fork bomb"
+        )
+
+    monkeypatch.setattr(docker_cli.subprocess, "run", _fail_if_called)
+
+    with pytest.raises(DockerFrontDoorError, match="already inside a bosn-docker forward"):
+        _run_compose("up", _compose_file(tmp_path), [])
+
+
+def test_run_compose_passes_the_resolved_engine_and_recursion_marker_to_the_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The happy path of the same fix: a real (non-shim) engine still gets invoked, now via
+    its resolved absolute path and carrying the recursion marker for its own children.
+    """
+    fake_daemon = _FakeDaemon()
+    monkeypatch.setattr(daemon, "request", fake_daemon.request)
+    real_docker = tmp_path / "real-docker"
+    monkeypatch.setattr(docker_cli, "_resolve_real_engine", lambda binary="docker": real_docker)
+    calls: list[list[str]] = []
+    envs: list[dict[str, str]] = []
+
+    def _fake_run(argv: list[str], **kwargs: Any) -> _FakeCompleted:
+        calls.append(argv)
+        envs.append(kwargs["env"])
+        return _FakeCompleted(returncode=0)
+
+    monkeypatch.setattr(docker_cli.subprocess, "run", _fake_run)
+
+    returncode = _run_compose("up", _compose_file(tmp_path), [])
+
+    assert returncode == 0
+    assert calls[0][0] == str(real_docker)
+    assert calls[0][1] == "compose"
+    assert envs[0][docker_cli._RECURSION_GUARD_ENV] == str(os.getpid())
+
+
+def test_compose_main_entry_point_dispatches_to_bosn_docker_compose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`bosn-compose up` (#46's declared-but-missing entry point) must reuse the exact
+    same `_run_compose` path `bosn-docker compose up` takes, not a second implementation.
+    """
+    fake_daemon = _FakeDaemon()
+    monkeypatch.setattr(daemon, "request", fake_daemon.request)
+    monkeypatch.setattr(
+        "bosn.docker_cli.subprocess.run", lambda *a, **k: _FakeCompleted(returncode=0)
+    )
+    compose = _compose_file(tmp_path)
+
+    returncode = docker_cli.compose_main(["-f", str(compose), "up"])
+
+    assert returncode == 0
+    assert "compose-adopt" in fake_daemon.calls
 
 
 def test_json_refusals_emit_the_envelope_non_json_emit_readable_prose(

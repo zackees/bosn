@@ -249,6 +249,20 @@ def cmd_doctor(opts: Options) -> int:
     print(f"scheduler manifest installed: {autostart.manifest_installed()}")
     print(f"scheduler next deadline: {deadline or '-'}")
     print(f"registry integrity: {integrity}")
+    # A `docker` shim redirects every Docker invocation on the machine, so whether one is
+    # installed -- and whether the real engine is still reachable past it -- is exactly the
+    # kind of thing you want stated plainly when something is behaving strangely.
+    # `shims.status()` is documented never to raise or mutate, which is what makes it safe
+    # to call from a read-only diagnostic.
+    from bosn import shims
+
+    shim_status = shims.status()
+    print(f"docker shims: {shim_status.detail}")
+    if shim_status.conflicts:
+        print(
+            f"  not installed by bosn, left untouched: {', '.join(shim_status.conflicts)}",
+            file=sys.stderr,
+        )
     if db_path.exists() and integrity != "ok":
         backup = db_path.with_suffix(".backup.sqlite3")
         recovered = db_path.with_suffix(".recovered.sql")
