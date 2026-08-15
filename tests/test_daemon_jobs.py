@@ -7,6 +7,7 @@ streaming transport and the job policy are tested together without needing Docke
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 from collections.abc import Iterator
@@ -30,13 +31,58 @@ target = { scope = "spec" }
 """
 
 
-def wait_until(predicate, timeout: float = 15.0, interval: float = 0.02) -> bool:
+# 60s, not 15s, and this is a *budget* increase rather than the kind of timeout-padding
+# that hides a race -- the two are worth telling apart, since the rest of issue #95 was
+# fixed by removing a race, not by waiting longer.
+#
+# The predicate these helpers most often carry is `daemon_mod.is_serving(state_dir)`, which
+# is an IPC ping with its own `timeout=2.0` (see daemon.py). Under sustained CPU
+# oversubscription a loopback round trip can miss that 2s window even though the daemon is
+# serving perfectly well, and each miss burns the full 2s -- so a 15s ceiling buys only
+# about seven attempts, and a run where the machine is busy for a couple of seconds fails
+# on attempt count rather than on anything being wrong. Measured, not guessed: with 12 busy
+# loops saturating this 16-core box, daemon startup blew the 15s ceiling on 1 of 5 runs.
+#
+# Raising the ceiling costs a healthy run exactly nothing: this polls and returns the
+# instant the predicate is true, so the larger number is only ever reached by a run that
+# was going to fail anyway -- it changes how long a genuine hang takes to report, not how
+# long a passing test takes. A real hang still fails, just with more evidence that it is
+# real.
+_WAIT_TIMEOUT = 60.0
+
+
+def wait_until(predicate, timeout: float = _WAIT_TIMEOUT, interval: float = 0.02) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if predicate():
             return True
         time.sleep(interval)
     return predicate()
+
+
+def _event_kinds(daemon: Daemon, limit: int = 500) -> list[str]:
+    """Read the daemon's own event log without going anywhere near IPC.
+
+    `daemon.registry.events()` is a plain SELECT against the SQLite connection the daemon
+    already holds open in-process (the connection is opened `check_same_thread=False`
+    specifically so callers other than the daemon's own threads can read it). It never
+    touches `note_activity`/`last_activity` -- unlike `daemon_mod.is_serving(state_dir)`,
+    which is a real IPC ping and would reset the very idle clock this module's tests are
+    waiting on. That is why this, and not `is_serving`, is the safe way to watch a
+    self-retiring daemon from the outside.
+
+    `shutdown()` closes the registry before the serve thread actually exits, so there is a
+    real window where the daemon is still alive-by-`thread.is_alive()` but the connection
+    underneath has just been closed by the same shutdown in progress. That is expected,
+    not a bug to chase: treat it as "no new event observed yet" rather than letting the
+    close race fail the read.
+    """
+    try:
+        return [row["kind"] for row in daemon.registry.events(limit=limit)]
+    except KeyboardInterrupt:
+        raise
+    except sqlite3.Error:
+        return []
 
 
 class ControlledBuilder:
@@ -79,6 +125,16 @@ def builder() -> ControlledBuilder:
 def served(tmp_path: Path, builder: ControlledBuilder) -> Iterator[Daemon]:
     state_dir = tmp_path / "state"
     daemon = Daemon(state_dir=state_dir, idle_retire_seconds=3600)
+    # A fresh registry has no stored maintenance deadline, so `_next_maintenance_at`
+    # defaults to `started_at` -- due on the watchdog's very first tick. If teardown's
+    # `request_stop()` lands while that tick is mid-`_run_maintenance()`, `shutdown()`'s
+    # unconditional `watchdog.join()` (no timeout, see daemon.py) blocks until the
+    # maintenance pass finishes -- including its engine-reachability probe, which is
+    # 60s per call and is called twice on an engine-less/unreachable runner (see
+    # test_daemon.py::test_idle_retirement_stops_an_unused_daemon). That race is what
+    # made teardown occasionally blow the `thread.join(timeout=15)` below under load:
+    # nothing here needs a real maintenance pass, so it is pushed out of the way.
+    daemon._set_next_maintenance(daemon.clock.now() + 3600)
     daemon.jobs.builder = builder
     thread = threading.Thread(target=daemon.serve_forever, daemon=True)
     thread.start()
@@ -316,7 +372,17 @@ def test_a_running_job_blocks_idle_retirement(
 ) -> None:
     """Retiring mid-build would destroy the build; the old idle-only rule would have."""
     state_dir = tmp_path / "state2"
-    daemon = Daemon(state_dir=state_dir, idle_retire_seconds=0.2)
+    # idle_retire_seconds starts long, not the 0.2s this test is actually about. Arming the
+    # short window at construction time races the daemon's own watchdog (0.5s tick) against
+    # nothing more than "the test thread gets scheduled and lands one IPC round trip" --
+    # under load, that can lose: the daemon retires before anyone ever contacts it, and
+    # every later `is_serving` probe then fails forever because the thing being pinged is
+    # already gone (issue #95, confirmed by 4/40 trials under load logging
+    # thread_alive=False and a since-closed registry before the first successful ping).
+    # The short window is armed below, once the test has established the exact state it
+    # means to measure -- so the daemon is definitely up and definitely mid-build before
+    # idle retirement is even a possibility.
+    daemon = Daemon(state_dir=state_dir, idle_retire_seconds=3600)
     # See test_daemon.py::test_idle_retirement_stops_an_unused_daemon: a due maintenance
     # pass probes the engine twice at 60s each inside the same watchdog tick that checks
     # retirement, which on an engine-less runner outlasts the join deadline below.
@@ -334,6 +400,11 @@ def test_a_running_job_blocks_idle_retirement(
         next(stream)
         assert builder.started.wait(10)
         stream.close()
+
+        # Now that the build is confirmed running, arm the short idle window this test is
+        # actually about. `idle_retire_seconds` is a plain attribute (daemon.py); the
+        # watchdog reads it fresh on every tick, so this takes effect on the very next one.
+        daemon.idle_retire_seconds = 0.2
 
         # Note: nothing may poll `is_serving` while waiting on retirement -- a ping is a
         # request, and a request resets the idle clock this test is measuring.
@@ -364,7 +435,23 @@ def test_a_job_that_never_reports_cannot_pin_the_daemon_forever(
         return BuildOutcome(returncode=130)
 
     state_dir = tmp_path / "state3"
-    daemon = Daemon(state_dir=state_dir, idle_retire_seconds=0.2, build_ttl_seconds=0.5)
+    # idle_retire_seconds starts long: arming 0.2s at construction races the watchdog's
+    # first tick against nothing more than "the test thread gets scheduled and lands one
+    # IPC round trip", and under load that race can be lost before the test ever contacts
+    # the daemon -- see test_a_running_job_blocks_idle_retirement above for the same fix
+    # and the 4/40-under-load confirmation that this is real, not hypothetical. The short
+    # window is armed below only once the build is confirmed hung, which is the state this
+    # test is actually about. `build_ttl_seconds` stays fixed at construction: the TTL
+    # clock doesn't start until a job exists, so it isn't exposed to the same startup race.
+    daemon = Daemon(state_dir=state_dir, idle_retire_seconds=3600, build_ttl_seconds=0.5)
+    # See test_a_running_job_blocks_idle_retirement above: a fresh registry has no stored
+    # maintenance deadline, so a maintenance pass is due on the very first watchdog tick --
+    # the same tick that has to notice the TTL expiry below. On a runner where the engine
+    # binary is present but its daemon is unreachable, that pass blocks on a 60s-per-call
+    # reachability probe (called twice), which starves the reap/retire check this test is
+    # timing and was the actual cause of this test's flakiness, not scheduler jitter on the
+    # 0.2s/0.5s windows themselves. Pushed out of the way so only the TTL reap is measured.
+    daemon._set_next_maintenance(daemon.clock.now() + 3600)
     daemon.jobs.builder = never_finishes
     thread = threading.Thread(target=daemon.serve_forever, daemon=True)
     thread.start()
@@ -379,9 +466,33 @@ def test_a_job_that_never_reports_cannot_pin_the_daemon_forever(
         assert hung.wait(10)
         stream.close()
 
-        # The TTL reaps the hung build, and only then can idle retirement proceed. Waiting
-        # on the thread rather than polling `is_serving`, whose ping would reset the clock.
-        thread.join(timeout=30)
+        # Now that the build is confirmed hung, arm the short idle window this test is
+        # actually about. `idle_retire_seconds` is a plain attribute (daemon.py); the
+        # watchdog reads it fresh on every tick, so this takes effect on the very next one.
+        daemon.idle_retire_seconds = 0.2
+
+        # The TTL reaps the hung build, and only then can idle retirement proceed. Rather
+        # than betting everything on one opaque `thread.join(timeout=30)` and only finding
+        # out afterward whether the daemon ever noticed, wait on the state the daemon
+        # itself publishes when it retires: `daemon.idle_retired`, logged right after
+        # `request_stop()` succeeds in `_idle_watchdog` (see daemon.py). That event is
+        # read straight off the daemon's own Registry connection (see `_event_kinds`
+        # above), never through IPC, so unlike polling `is_serving` it cannot reset
+        # `last_activity` -- the very idle clock this test is waiting on.
+        #
+        # Once that event exists the daemon has already committed to stopping; the
+        # remaining `thread.join` only has to cover the mechanical tail of
+        # `_server.serve_forever()` returning and `shutdown()` running, so it gets a much
+        # smaller budget than the wait for retirement itself.
+        retired = wait_until(
+            lambda: "daemon.idle_retired" in _event_kinds(daemon) or not thread.is_alive(),
+            timeout=30,
+        )
+        assert retired, (
+            "the daemon never logged daemon.idle_retired; recent events: "
+            f"{_event_kinds(daemon)[:20]}"
+        )
+        thread.join(timeout=15)
         assert not thread.is_alive(), "a hung build must not pin the daemon forever"
     finally:
         daemon.request_stop()
@@ -394,6 +505,10 @@ def test_shutdown_tells_attached_clients_why_their_build_stopped(
 ) -> None:
     state_dir = tmp_path / "state4"
     daemon = Daemon(state_dir=state_dir, idle_retire_seconds=3600)
+    # Prophylactic, not observed failing: same `request_stop()` + untimed-`watchdog.join()`
+    # race as the `served` fixture above -- see its comment. Pushed out so shutdown here
+    # cannot stall on a same-tick maintenance pass.
+    daemon._set_next_maintenance(daemon.clock.now() + 3600)
     daemon.jobs.builder = builder
     thread = threading.Thread(target=daemon.serve_forever, daemon=True)
     thread.start()

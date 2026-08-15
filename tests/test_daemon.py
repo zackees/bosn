@@ -46,7 +46,16 @@ def _detach_code() -> str:
     return "\n".join(ast.unparse(node) for node in body)
 
 
-def _wait_until(predicate, timeout: float = 15.0, interval: float = 0.05) -> bool:
+# 60s rather than 15s -- a budget increase, not race-hiding padding. `is_serving` is an IPC
+# ping with its own 2s timeout, so under CPU oversubscription each failed attempt burns 2s
+# and a 15s ceiling is only ~7 tries; a busy stretch then fails on attempt count rather than
+# on anything being broken. Polling means a healthy run returns immediately regardless, so
+# the higher ceiling only changes how long a genuine hang takes to report. Same reasoning,
+# at more length, on `wait_until` in test_daemon_jobs.py (issue #95).
+_WAIT_TIMEOUT = 60.0
+
+
+def _wait_until(predicate, timeout: float = _WAIT_TIMEOUT, interval: float = 0.05) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if predicate():
@@ -58,6 +67,17 @@ def _wait_until(predicate, timeout: float = 15.0, interval: float = 0.05) -> boo
 @pytest.fixture
 def served(tmp_path: Path) -> Iterator[Daemon]:
     daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=3600)
+    # A fresh registry has no stored maintenance deadline, so `_next_maintenance_at`
+    # defaults to `started_at` -- due on the watchdog's very first tick. `shutdown()`
+    # joins the watchdog thread with no timeout at all, so if `request_stop()` below lands
+    # while that first tick is mid-`_run_maintenance()`, teardown blocks until the pass
+    # finishes -- including its engine-reachability probe, which is 60s per call and is
+    # called twice on an engine-less/unreachable runner (see
+    # test_idle_retirement_stops_an_unused_daemon below). That race, not a fixed-budget
+    # timing issue, is what made `thread.join(timeout=15)` occasionally fail under load
+    # (see issue #95). Nothing in this fixture exercises maintenance, so it is pushed out
+    # of the way for every test that uses `served`.
+    daemon._set_next_maintenance(daemon.clock.now() + 3600)
     thread = threading.Thread(target=daemon.serve_forever, daemon=True)
     thread.start()
     assert _wait_until(lambda: daemon_mod.is_serving(tmp_path)), "daemon never came up"
@@ -196,6 +216,12 @@ def test_registry_is_usable_from_the_server_threads(served: Daemon) -> None:
 
 def test_shutdown_verb_stops_the_daemon_and_clears_state(tmp_path: Path) -> None:
     daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=3600)
+    # See the `served` fixture above: a due first-tick maintenance pass can make
+    # `shutdown()`'s untimed `watchdog.join()` stall for up to ~2 minutes (two 60s engine
+    # probes) if `daemon_mod.stop()` below lands mid-pass. This is the test that was
+    # actually observed flaking that way (issue #95); nothing here exercises maintenance,
+    # so it is pushed out of the way.
+    daemon._set_next_maintenance(daemon.clock.now() + 3600)
     thread = threading.Thread(target=daemon.serve_forever, daemon=True)
     thread.start()
     assert _wait_until(lambda: daemon_mod.is_serving(tmp_path))
@@ -211,6 +237,9 @@ def test_the_port_is_released_for_the_next_daemon(tmp_path: Path) -> None:
     """A retired daemon must not leave its port wedged, or the singleton becomes a lockout."""
     for _ in range(2):
         daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=3600)
+        # Prophylactic, not observed failing: same untimed-`watchdog.join()`-vs-first-tick-
+        # maintenance race as `test_shutdown_verb_stops_the_daemon_and_clears_state` above.
+        daemon._set_next_maintenance(daemon.clock.now() + 3600)
         thread = threading.Thread(target=daemon.serve_forever, daemon=True)
         thread.start()
         assert _wait_until(lambda: daemon_mod.is_serving(tmp_path))
@@ -228,11 +257,21 @@ def test_idle_retirement_stops_an_unused_daemon(tmp_path: Path) -> None:
     hosted Windows/macOS runner -- that blocks the tick for up to two minutes and this
     assertion times out having measured engine probing rather than idle retirement.
     """
-    daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=0.5)
+    # idle_retire_seconds starts long, not the 0.5s this test is actually about. Arming the
+    # short window at construction races the watchdog's first tick (also ~0.5s) against
+    # nothing more than "the test thread gets scheduled and lands one IPC round trip" --
+    # under load that race can be lost: the daemon retires before anyone ever contacts it,
+    # and the `is_serving` wait below then fails forever pinging something already gone
+    # (issue #95; see test_a_running_job_blocks_idle_retirement in test_daemon_jobs.py for
+    # the same fix and a 4/40-under-load confirmation this actually happens). The short
+    # window is armed only once the daemon is confirmed up, so "unused" is measured from a
+    # point the test can actually observe, which is what this test means by it anyway.
+    daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=3600)
     daemon._set_next_maintenance(daemon.clock.now() + 3600)
     thread = threading.Thread(target=daemon.serve_forever, daemon=True)
     thread.start()
     assert _wait_until(lambda: daemon_mod.is_serving(tmp_path))
+    daemon.idle_retire_seconds = 0.5
     thread.join(timeout=30)
     assert not thread.is_alive(), "idle daemon should have retired itself"
     assert not daemon_mod.is_serving(tmp_path)
