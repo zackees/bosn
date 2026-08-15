@@ -616,10 +616,31 @@ COMPOSE_FLAGS: dict[str, tuple[ComposeFlagSpec, ...]] = {
     "config": _COMPOSE_CONFIG_FLAGS,
 }
 
-# `docker_cli._parse_compose_args` builds its `choices=[...]` from this instead of
-# hand-maintaining a second list that could drift from the one above it dispatches
-# against -- the same "one source of truth" argument the module docstring makes for verbs.
+# `docker_cli._run_compose` checks membership in this instead of hand-maintaining a second
+# list that could drift from the one above it dispatches against -- the same "one source of
+# truth" argument the module docstring makes for verbs. (It is deliberately *not* wired into
+# `_parse_compose_args` as an argparse `choices=`: that would refuse an unknown sub-verb with
+# a bare `SystemExit(2)` and a usage dump instead of bosn's structured refusal. See that
+# function's docstring.)
 COMPOSE_COMMANDS: tuple[str, ...] = tuple(COMPOSE_FLAGS.keys())
+
+# Sub-verbs whose grammar is `<verb> [OPTIONS] SERVICE [COMMAND [ARGS...]]` rather than
+# `<verb> [OPTIONS]`. Docker requires a SERVICE for both -- `docker compose run` with no
+# service is an error from Compose itself -- so a front door that validated every token
+# against the flag table would refuse these verbs their own mandatory argument and leave
+# them declared-but-unusable, which is the #47 bug in a different disguise.
+#
+# The split this drives (in `docker_cli._validate_compose_flags`): tokens are checked as
+# flags only up to the first non-`-` token; that token is the SERVICE, and everything after
+# it is the *container's* argv, forwarded untouched. `compose exec app ls -la` must reach
+# the engine with `-la` intact -- it belongs to `ls`, not to `compose exec`, and running it
+# through `resolve_compose_flag` would refuse a legitimate command line.
+#
+# Lives here rather than as a literal in `docker_cli` so the sub-verb surface and its
+# grammar stay described in one place. `logs`/`ps` are deliberately absent: they accept
+# optional service names from Docker, but bosn has always scoped them to the whole project
+# and widening that is not part of #47.
+COMPOSE_SERVICE_COMMANDS: frozenset[str] = frozenset({"run", "exec"})
 
 
 def _index_compose_flags(

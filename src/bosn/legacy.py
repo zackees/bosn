@@ -26,8 +26,9 @@ machine, not inferred or guessed:
   creation. There is no schema/version label -- clud has never needed to change this
   contract's shape.
 - **soldr** (`io.soldr.perf-local`) -- ``soldr/ci/perf_local.py``. ``LABEL_PREFIX =
-  "io.soldr.perf-local"``, ``RUNNER_SCHEMA = "2"`` ("Bumped from '1': schema 1 runners are
-  the pre-per-root shared containers" -- a real breaking change in what the labels mean).
+  "io.soldr.perf-local"``. ``RUNNER_SCHEMA`` was ``"2"`` when this module was written
+  ("Bumped from '1': schema 1 runners are the pre-per-root shared containers" -- a real
+  breaking change in what the labels mean) and is ``"7"`` as of soldr 75d7cc80.
   The *runner container* gets ``.managed``, ``.schema``, ``.image-id``, ``.source-root``,
   ``.ptrace``, ``.dockerfile-sha256``. Its *volumes* (target/cargo-home/soldr-home) get only
   ``.managed`` and ``.source-root`` -- notably **not** ``.schema``. Since volumes are the only
@@ -193,10 +194,20 @@ SOLDR = LegacyFamily(
     stack_label=None,  # soldr has no stack concept of its own.
     stack_sentinel="soldr-perf-local",
     schema_label="io.soldr.perf-local.schema",
-    # Only RUNNER_SCHEMA "2" (current, as of this module's writing) is recognized. "1"
-    # is documented in the producer as "the pre-per-root shared containers" -- a real
-    # structural change in what .source-root means -- so it is deliberately excluded
-    # rather than assumed compatible.
+    # Only RUNNER_SCHEMA "2" is recognized. "1" is documented in the producer as "the
+    # pre-per-root shared containers" -- a real structural change in what .source-root
+    # means -- so it is deliberately excluded rather than assumed compatible.
+    #
+    # soldr has since jumped straight to "7" (commit 75d7cc80, one bump, not five), and
+    # this set has deliberately NOT been widened to follow: nothing was audited about what
+    # 3..7 changed, and inventing compatibility is exactly the assumption excluding "1"
+    # exists to prevent. That is safe *today* only because of the paragraph below -- soldr
+    # volumes still emit only .managed and .source-root, verified against perf_local.py at
+    # 75d7cc80, so this allowlist is unreachable for every object bosn actually adopts.
+    # If soldr ever stamps .schema on its volumes, adoption starts refusing them with the
+    # "unrecognized schema" error until someone audits 3..7 and widens this set. That
+    # refusal is the intended failure mode, not a bug -- but it is the thing to look up
+    # when a soldr adoption suddenly starts refusing.
     #
     # soldr's *volumes* (the only object this module ever relabels) never carry .schema --
     # only the runner *container* does, and containers are never adopted (see module

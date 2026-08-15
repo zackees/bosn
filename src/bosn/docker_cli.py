@@ -22,7 +22,16 @@ from bosn.compose import ComposeError, content_digest, load_compose
 # it always returns a VerbSpec, turning a verb the table has never heard of into a REFUSE
 # with a generic remedy rather than a `None` a dispatcher could mistake for "safe to
 # forward". Dispatch below calls `resolve()`, never `spec_for()`, for that reason.
-from bosn.frontdoor import Category, resolve, supported
+from bosn.frontdoor import (
+    COMPOSE_COMMANDS,
+    COMPOSE_GLOBAL_FLAGS,
+    COMPOSE_SERVICE_COMMANDS,
+    Category,
+    FlagStatus,
+    resolve,
+    resolve_compose_flag,
+    supported,
+)
 from bosn.registry import Registry
 from bosn.resources import process_start_time
 
@@ -238,8 +247,25 @@ def _parse_init_args(args: list[str]) -> argparse.Namespace:
 
 
 def _parse_compose_args(args: list[str]) -> argparse.Namespace:
+    """`command` is not constrained here; `_run_compose` validates it against
+    `frontdoor.COMPOSE_COMMANDS` and refuses with bosn's own structured envelope.
+
+    Used to hardcode `choices=["up", "down", "logs", "ps"]` -- four sub-verbs behind what
+    `frontdoor.COMPOSE_COMMANDS` (and therefore the generated docs and `--supported --json`)
+    already declared, so `build`/`run`/`exec`/`config` were advertised as supported and
+    rejected by argparse before ever reaching dispatch (#47). Switching the literal list for
+    `choices=list(COMPOSE_COMMANDS)` would have fixed that, but traded it for a worse bug: an
+    *invalid* sub-verb (a typo, or a verb this table has never heard of) would then hit
+    argparse's own `parser.error()` -- a bare `SystemExit(2)` and a usage dump, not the
+    prose-or-JSON refusal every other unrecognized verb/flag in this module produces (see
+    `build_parser`'s docstring, which makes exactly this argument for the top-level verb).
+    So `command` is parsed as a plain positional with no `choices=`, and `_run_compose`
+    checks membership in `COMPOSE_COMMANDS` itself, before doing anything else -- reusing
+    the same `DockerFrontDoorError` path `main()` already catches for every other compose
+    refusal.
+    """
     parser = argparse.ArgumentParser(prog="bosn-docker compose")
-    parser.add_argument("command", choices=["up", "down", "logs", "ps"])
+    parser.add_argument("command")
     parser.add_argument("args", nargs=argparse.REMAINDER)
     parser.add_argument("-f", "--file", default="compose.yaml")
     return parser.parse_args(args)
@@ -268,6 +294,20 @@ def _compose_overlay(registry_id: str | Registry, compose: Path) -> Path:
     `networks:` section at all. Anonymous service-level volumes have no top-level
     key to attach labels to, so they cannot be governed through this overlay; the
     front door refuses to run rather than let them come up unlabeled.
+
+    A service's `labels:` (what `label_block` below writes under each service key)
+    land on the *container* Compose creates from that service -- never on an image
+    `build:` produces. Left at that, `bosn-docker compose build` (#47) would produce
+    a fully unlabeled, unregistered image: exactly the ungoverned resource #48 exists
+    to prevent, created by bosn's own front door. The Compose spec's `build.labels`
+    (verified against a real `docker compose config` merge: a base file's `build:` as
+    either a bare string or a mapping both merge cleanly with an override's
+    `build: {labels: ...}`, preserving `context`/`dockerfile`/`args`) is the image-side
+    equivalent, so every service with a `build:` key also gets a `build.labels` block,
+    `kind="image"`. This runs unconditionally, not only when the sub-verb is literally
+    `build`: `compose up` also builds a service's image implicitly when it has no
+    `image:` (`is_build_only`) or the named image is missing locally, so gating this on
+    the sub-verb string would let exactly that path produce an unlabeled image again.
     """
     if isinstance(registry_id, Registry):
         registry_id = registry_id.registry_id
@@ -301,26 +341,45 @@ def _compose_overlay(registry_id: str | Registry, compose: Path) -> Path:
     # already has -- two invocations are compatible iff their digests are byte-equal.
     generation = content_digest(compose)
 
+    def contract_lines(name: str, kind: str, indent: str) -> list[str]:
+        contract = labels.ResourceLabels(
+            registry=registry_id,
+            kind=kind,
+            stack=name,
+            generation=generation,
+            scope="stack",
+            workspace=workspace,
+            created=created,
+        )
+        return [
+            f"{indent}{key}: {_yaml_scalar(value)}" for key, value in contract.to_dict().items()
+        ]
+
     def label_block(resource_names: list[str], kind: str) -> list[str]:
         block: list[str] = []
         for name in resource_names:
-            contract = labels.ResourceLabels(
-                registry=registry_id,
-                kind=kind,
-                stack=name,
-                generation=generation,
-                scope="stack",
-                workspace=workspace,
-                created=created,
-            )
             block += [f"  {name}:", "    labels:"]
-            block += [
-                f"      {key}: {_yaml_scalar(value)}" for key, value in contract.to_dict().items()
-            ]
+            block += contract_lines(name, kind, "      ")
+        return block
+
+    build_names = {service.name for service in parsed.services.values() if service.has_build}
+
+    def service_block(resource_names: list[str]) -> list[str]:
+        block: list[str] = []
+        for name in resource_names:
+            block += [f"  {name}:", "    labels:"]
+            block += contract_lines(name, "container", "      ")
+            if name in build_names:
+                # `kind="image"`, not "container": this is the label contract for the
+                # image `build:` produces, attached where Compose's `build.labels`
+                # merge rule (see the docstring above) actually reads it -- nested
+                # under the service's own `build:` key, not a sibling of `labels:`.
+                block += ["    build:", "      labels:"]
+                block += contract_lines(name, "image", "        ")
         return block
 
     lines = ["services:"]
-    lines += label_block(names, "container")
+    lines += service_block(names)
     if volume_names:
         lines.append("volumes:")
         lines += label_block(volume_names, "volume")
@@ -446,16 +505,6 @@ def _release_compose_lease(session: str | None) -> None:
         print(f"bosn-docker compose: could not release project lease: {exc}", file=sys.stderr)
 
 
-# The decided v1 subset (#47): `up -d/--detach --wait` and `down -v/--volumes
-# --remove-orphans`. Anything else after the verb still refuses, named specifically, via
-# `_validate_compose_flags` below -- this table is deliberately not sourced from
-# `bosn.frontdoor`, which does not yet expose per-verb flag data; parsed locally here
-# instead of blocking on that.
-_COMPOSE_ALLOWED_FLAGS: dict[str, frozenset[str]] = {
-    "up": frozenset({"-d", "--detach", "--wait"}),
-    "down": frozenset({"-v", "--volumes", "--remove-orphans"}),
-}
-
 # `-v`/`--volumes` is the flag that makes `down` delete named volumes bosn has registry rows
 # for -- the trigger for the `prune_missing` reconcile below. `--remove-orphans` also
 # removes engine objects (containers for services no longer in the file) but is
@@ -469,22 +518,87 @@ _COMPOSE_ALLOWED_FLAGS: dict[str, frozenset[str]] = {
 # names explicitly.
 _COMPOSE_VOLUME_REMOVAL_FLAGS = frozenset({"-v", "--volumes"})
 
+# `-f`/`--file` selects the compose file, and `_parse_compose_args` already consumes it
+# ahead of the sub-verb (`bosn-docker compose -f FILE up`, not `... up -f FILE`) -- so a
+# spelling of it that survives into a sub-verb's own REMAINDER args is always in the wrong
+# position, never a legitimate use of the flag. `resolve_compose_flag` alone cannot catch
+# this: the global row is ACCEPTED (it is a real, understood flag -- just not here), and
+# every sub-verb except `logs` inherits it unchanged through `_merge_with_globals`, so a
+# plain ACCEPTED/REFUSED check would let `compose up -f x` silently pass validation and
+# reach the engine after `up`, where Compose reads it as nothing bosn intended. Named here
+# by the global table's own flag spellings, not a second hand-copied `{"-f", "--file"}`
+# literal, so it can never drift from `COMPOSE_GLOBAL_FLAGS` itself.
+_GLOBAL_COMPOSE_FLAG_NAMES = frozenset(
+    name for spec in COMPOSE_GLOBAL_FLAGS for name in spec.names()
+)
+
 
 def _validate_compose_flags(command: str, args: list[str]) -> None:
-    """Refuse anything outside the decided per-verb subset, naming the exact flag.
+    """Refuse anything outside `frontdoor`'s per-verb accepted-flag table, naming the flag.
 
-    `command` here is always `up`/`down`/`logs`/`ps` (`_parse_compose_args` already
-    constrains `command` via `choices=`); `logs`/`ps` have no entry in the table above, so
-    `_COMPOSE_ALLOWED_FLAGS.get(command, frozenset())` refuses every argument for them, same
-    as before this change -- only `up`/`down` grew an accepted, non-empty subset.
+    Used to check a locally hand-maintained `_COMPOSE_ALLOWED_FLAGS` dict covering only
+    `up`/`down`, written before `bosn.frontdoor.COMPOSE_FLAGS` existed. That table is now
+    the single source of truth for every sub-verb's flag surface -- `up`/`down`'s decided
+    subset, `logs`' empty one plus its named `-f` collision, and `build`/`run`/`exec`/
+    `config`'s currently-empty ones -- so this is the only place flags are validated
+    against it; `resolve_compose_flag` is the fail-closed lookup, so an unrecognized flag
+    always resolves to REFUSED rather than falling through as "unknown means allowed".
+
+    For the `COMPOSE_SERVICE_COMMANDS` sub-verbs (`run`/`exec`), validation stops at the
+    first non-`-` token: that is the SERVICE, and every token after it is the container's
+    own argv, forwarded untouched. Without that split these verbs refuse their own mandatory
+    service name -- `compose run app` resolving `'app'` as an unknown flag -- which would
+    leave them shipped-but-unusable. See `COMPOSE_SERVICE_COMMANDS` for the grammar.
     """
-    allowed = _COMPOSE_ALLOWED_FLAGS.get(command, frozenset())
+    takes_service = command in COMPOSE_SERVICE_COMMANDS
     for arg in args:
-        if arg not in allowed:
-            raise DockerFrontDoorError(f"unsupported compose flag or argument {arg!r}")
+        if takes_service and not arg.startswith("-"):
+            # The SERVICE token. Everything past it is the container's command line, so it
+            # is deliberately never looked up in the flag table -- `exec app ls -la` has to
+            # keep its `-la`. Compose owns the grammar from here on.
+            return
+        spec = resolve_compose_flag(command, arg)
+        if spec.status is FlagStatus.ACCEPTED and arg in _GLOBAL_COMPOSE_FLAG_NAMES:
+            # `logs` already overrides this spelling with its own REFUSED row (the
+            # `--follow` collision), so this branch is unreachable for `logs` -- the
+            # ACCEPTED status here only ever comes from the unmodified global row every
+            # other sub-verb inherits.
+            raise DockerFrontDoorError(
+                f"{arg!r} is bosn's global compose-file selector and must come before the "
+                f"sub-verb, not after it -- use `bosn-docker compose {arg} FILE {command} "
+                f"...`, not `... {command} {arg} FILE`"
+            )
+        if spec.status is not FlagStatus.ACCEPTED:
+            raise DockerFrontDoorError(
+                f"unsupported compose flag or argument {arg!r} for `compose {command}`: "
+                f"{spec.remedy}"
+            )
+    if takes_service:
+        # Falling out of the loop means no SERVICE token was ever seen (the `return` above
+        # is the only path that consumes one). Refused here, in bosn's own envelope, rather
+        # than forwarded for Compose to reject: the refusal is about *bosn's* declared
+        # grammar, and it costs an engine spawn plus an overlay render to learn nothing.
+        # Deeper grammar -- `exec`'s required COMMAND, whether the service exists in the
+        # file -- is left to Compose, which owns it and reports it better.
+        raise DockerFrontDoorError(
+            f"`compose {command}` requires a service name: "
+            f"`bosn-docker compose {command} SERVICE"
+            f"{' COMMAND' if command == 'exec' else ' [COMMAND]'}`"
+        )
 
 
 def _run_compose(command: str, compose: Path, args: list[str]) -> int:
+    if command not in COMPOSE_COMMANDS:
+        # `_parse_compose_args` no longer constrains `command` via argparse `choices=` (see
+        # its docstring) precisely so an unrecognized sub-verb lands here instead of exiting
+        # via a bare `SystemExit(2)` -- every other compose refusal in this module raises
+        # `DockerFrontDoorError`, which `main()` already catches and reports as prose on
+        # stderr with exit code 1, so an unknown sub-verb gets that same shape rather than
+        # an argparse usage dump.
+        raise DockerFrontDoorError(
+            f"unrecognized compose sub-verb {command!r}; run `bosn-docker --supported "
+            "--json` to see every accepted compose sub-verb"
+        )
     _validate_compose_flags(command, args)
     # Resolved before touching the daemon at all: once a `docker` shim that is
     # bosn-docker itself exists on PATH (a later slice of #46), spawning bare
