@@ -14,7 +14,7 @@ import pytest
 
 from bosn import labels
 from bosn.converge import Converger, run_task, workspace_of
-from bosn.engine import Engine
+from bosn.engine import Engine, EngineError
 from bosn.manifest import load
 from bosn.registry import Registry
 from bosn.resources import ResourceScanner
@@ -175,6 +175,28 @@ def test_a_manifest_task_runs(project: Path, registry: Registry, engine: Engine)
 def test_a_failing_command_propagates_its_exit_code(converger: Converger) -> None:
     _result, code, _output = converger.run(["sh", "-c", "exit 7"])
     assert code == 7
+
+
+def test_a_timed_out_exec_removes_the_container_and_its_process(
+    converger: Converger, engine: Engine
+) -> None:
+    converged = converger.converge()
+    container_id, leases = converger._acquire_execution_container(
+        converged,
+        stack_name=None,
+        workspace=workspace_of(converger.manifest),
+    )
+    try:
+        with pytest.raises(EngineError, match="1-second deadline"):
+            engine.execute(
+                ["exec", container_id, "sh", "-c", "while :; do sleep 1; done"],
+                timeout=1,
+                abort_container=container_id,
+            )
+        assert not engine.run(["container", "inspect", container_id]).ok
+    finally:
+        for lease in leases:
+            converger.registry.release_lease(lease.id)
 
 
 def test_an_image_backed_stack_runs_the_declared_image(

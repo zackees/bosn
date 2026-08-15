@@ -103,7 +103,8 @@ def test_tasks_json_reports_unregistered_readiness(tmp_path, capsys) -> None:
     assert payload["tasks"]["unit"]["readiness"]["jobs"]["state"] == "unavailable"
 
 
-def test_tasks_json_manifest_error_has_stable_remedy(tmp_path, capsys) -> None:
+def test_tasks_json_manifest_error_has_stable_remedy(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
     assert cli.main(["--state-dir", str(tmp_path), "tasks", "--json"]) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload == {
@@ -127,7 +128,8 @@ def test_gc_json_daemon_error_has_stable_remedy(tmp_path, capsys, monkeypatch) -
     assert payload["next"] == "start or restart the daemon, then retry"
 
 
-def test_done_json_error_uses_the_common_envelope(tmp_path, capsys) -> None:
+def test_done_json_error_uses_the_common_envelope(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
     assert cli.main(["--state-dir", str(tmp_path), "done", "--json"]) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["code"] == "command.failed"
@@ -138,6 +140,156 @@ def test_doctor_json_failure_emits_one_parseable_envelope(tmp_path, capsys) -> N
     assert cli.main(["--json", "--engine", "definitely-not-an-engine", "doctor"]) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["code"] == "command.failed"
+
+
+def test_run_json_failure_reserves_stdout_for_one_envelope(tmp_path, monkeypatch, capsys) -> None:
+    from bosn import daemon
+    from bosn.converge import ConvergeResult
+    from bosn.engine import EngineResult
+
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    manifest = tmp_path / "bosn.toml"
+    manifest.write_text(
+        "[stack.dev]\ndockerfile = 'Dockerfile'\ndefault = true\n",
+        encoding="utf-8",
+    )
+    converged = ConvergeResult("dev", "sha256:g", "reused", "image")
+    monkeypatch.setattr(cli, "_converge_via_daemon", lambda *_args: converged)
+
+    def request(verb, *_args, **_kwargs):
+        if verb == "execution-acquire":
+            assert isinstance(_kwargs["pid"], int)
+            assert "proc_start" in _kwargs
+            return {"ok": True, "container": "sha256:container", "session": "session"}
+        if verb == "execution-release":
+            return {"ok": True}
+        raise AssertionError(f"unexpected daemon request: {verb}")
+
+    monkeypatch.setattr(daemon, "request", request)
+
+    class FailingEngine:
+        def __init__(self, _binary="docker") -> None:
+            pass
+
+        def run(self, *_args, **_kwargs):
+            return EngineResult(7, "partial stdout", "partial stderr")
+
+        def execute(self, *_args, **_kwargs):
+            raise AssertionError("JSON mode must reserve stdout instead of inheriting it")
+
+    monkeypatch.setattr(cli, "Engine", FailingEngine)
+
+    code = cli.main(
+        [
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--manifest",
+            str(manifest),
+            "--json",
+            "run",
+            "--",
+            "false",
+        ]
+    )
+
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["code"] == "command.failed"
+    assert "partial stdout" in payload["message"]
+    assert "partial stderr" in payload["message"]
+
+
+@pytest.mark.parametrize(("verb", "engine_method"), [("run", "execute"), ("shell", "interactive")])
+def test_successful_foreground_command_fails_visibly_when_release_fails(
+    verb, engine_method, tmp_path, monkeypatch, capsys
+) -> None:
+    from bosn import daemon, resources
+    from bosn.converge import ConvergeResult
+
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    manifest = tmp_path / "bosn.toml"
+    manifest.write_text(
+        "[stack.dev]\ndockerfile = 'Dockerfile'\ndefault = true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        cli,
+        "_converge_via_daemon",
+        lambda *_args: ConvergeResult("dev", "sha256:g", "reused", "image"),
+    )
+    monkeypatch.setattr(resources, "process_start_time", lambda _pid: 10.0)
+
+    def request(requested_verb, *_args, **_kwargs):
+        if requested_verb == "execution-acquire":
+            return {"ok": True, "container": "sha256:container", "session": "stuck-session"}
+        if requested_verb == "execution-release":
+            return {"ok": False, "error": "database is locked"}
+        raise AssertionError(f"unexpected daemon request: {requested_verb}")
+
+    monkeypatch.setattr(daemon, "request", request)
+
+    class SuccessfulEngine:
+        def __init__(self, _binary="docker") -> None:
+            pass
+
+        def execute(self, *_args, **_kwargs) -> int:
+            assert engine_method == "execute"
+            return 0
+
+        def interactive(self, *_args, **_kwargs) -> int:
+            assert engine_method == "interactive"
+            return 0
+
+    monkeypatch.setattr(cli, "Engine", SuccessfulEngine)
+    args = ["--manifest", str(manifest), verb]
+    if verb == "run":
+        args.extend(["--", "true"])
+
+    assert cli.main(args) == 1
+    error = capsys.readouterr().err
+    assert "execution cleanup failed for session stuck-session" in error
+    assert "database is locked" in error
+
+
+def test_failed_command_keeps_its_exit_code_when_release_also_fails(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    from bosn import daemon, resources
+    from bosn.converge import ConvergeResult
+
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    manifest = tmp_path / "bosn.toml"
+    manifest.write_text(
+        "[stack.dev]\ndockerfile = 'Dockerfile'\ndefault = true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        cli,
+        "_converge_via_daemon",
+        lambda *_args: ConvergeResult("dev", "sha256:g", "reused", "image"),
+    )
+    monkeypatch.setattr(resources, "process_start_time", lambda _pid: 10.0)
+    monkeypatch.setattr(
+        daemon,
+        "request",
+        lambda verb, *_args, **_kwargs: (
+            {"ok": True, "container": "sha256:container", "session": "stuck-session"}
+            if verb == "execution-acquire"
+            else {"ok": False, "error": "database is locked"}
+        ),
+    )
+
+    class FailedEngine:
+        def __init__(self, _binary="docker") -> None:
+            pass
+
+        def execute(self, *_args, **_kwargs) -> int:
+            return 7
+
+    monkeypatch.setattr(cli, "Engine", FailedEngine)
+
+    assert cli.main(["--manifest", str(manifest), "run", "--", "false"]) == 7
+    assert "execution cleanup failed" in capsys.readouterr().err
 
 
 def test_json_parse_error_has_the_stable_envelope(capsys) -> None:
@@ -165,7 +317,10 @@ def test_cancel_fails_closed_when_no_daemon_is_running(tmp_path, capsys) -> None
     assert "cannot reach the bosn daemon" in capsys.readouterr().err
 
 
-def test_unknown_first_token_is_diagnosed_as_an_unknown_manifest_task(capsys) -> None:
+def test_unknown_first_token_is_diagnosed_as_an_unknown_manifest_task(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    monkeypatch.chdir(tmp_path)
     assert cli.main(["definitely-not-a-verb"]) == 1
     assert "no bosn.toml" in capsys.readouterr().err
 
@@ -182,6 +337,36 @@ def test_doctor_reports_unreachable_engine_and_scheduler_state_without_crashing(
     assert "scheduler manifest installed:" in captured.out
     assert "scheduler next deadline: -" in captured.out
     assert "not on PATH" in captured.err
+
+
+def test_doctor_fails_with_actionable_warning_when_engine_clock_is_skewed(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    from bosn.engine import EngineInfo
+
+    class SkewedEngine:
+        def __init__(self, binary: str = "docker") -> None:
+            self.binary = binary
+
+        def info(self):
+            return EngineInfo(
+                binary=self.binary,
+                reachable=True,
+                client_version="28.5.1",
+                server_version="28.5.1",
+                clock_skew_seconds=2.25,
+            )
+
+    monkeypatch.setattr(cli, "Engine", SkewedEngine)
+    _stub_scan(monkeypatch, {})
+
+    code = cli.main(["--state-dir", str(tmp_path), "doctor"])
+
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "clock skew:     +2.250s" in captured.out
+    assert "incremental builds" in captured.err
+    assert "synchronize" in captured.err
 
 
 def _stub_reachable_engine(monkeypatch) -> None:

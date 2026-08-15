@@ -1,0 +1,21 @@
+[stack.test]
+dockerfile = "docker/test.Dockerfile"
+family = "python"
+default = true
+
+[stack.test.mounts]
+repo = { source = ".", destination = "/repo", readonly = true }
+
+[stack.test.volumes]
+venv = { scope = "stack", destination = "/venv" }
+uv-cache = { scope = "machine", destination = "/root/.cache/uv" }
+ruff-cache = { scope = "machine", destination = "/root/.cache/ruff" }
+pyright-cache = { scope = "machine", destination = "/root/.cache/pyright-python" }
+
+[task.test]
+stack = "test"
+cmd = "uv sync --frozen --all-groups && uv run --no-sync pytest -q -m 'not docker' -p no:cacheprovider"
+
+[task.lint]
+stack = "test"
+cmd = "uv sync --frozen --all-groups && uv run --no-sync python ci/lint.py"

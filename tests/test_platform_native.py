@@ -6,8 +6,8 @@ not by their native shells or service managers." Every test in this module is ei
 skip-marked to a no-op on platforms where it cannot exercise the real thing, or it spawns
 a real shell / real OS probe / real daemon process. None of it is fakeable with fixtures
 alone -- that is the point: a green Linux-only run must not be able to hide a Windows- or
-macOS-only regression, the way `os.kill(pid, 0)` raising `SystemError` on Windows and
-`PRAGMA integrity_check` raising on Linux both did this week.
+macOS-only regression, the way POSIX-style `os.kill(pid, 0)` terminating another Windows
+process and `PRAGMA integrity_check` raising on Linux both did this week.
 """
 
 from __future__ import annotations
@@ -144,36 +144,38 @@ def test_native_process_start_pairs_matching_and_mismatched_identity_with_livene
     assert process_alive(pid, proc_start=start - 10_000) is False
 
 
-# -- 2b. Windows access-denied liveness path (issue #68) ---------------------
+# -- 2b. Windows read-only liveness path ------------------------------------
 #
-# process_alive()'s SystemError handler exists because os.kill(pid, 0) on another
-# user's/SYSTEM's process raises SystemError on Windows -- not an OSError, so it escapes
-# every ordinary handler. The existing unit tests only prove the handler catches what a
-# monkeypatch hands it; they never prove real CPython on a real Windows host still throws
-# that (as opposed to, say, PermissionError, which CPython's Windows os.kill also produces
-# depending on the OS/runtime privilege level and would take a different -- but still
-# fail-open -- branch in process_alive). PID 4 is the Windows "System" process: always
-# present, always owned by SYSTEM, and never killable/inspectable by an ordinary user, so
-# it reliably exercises this branch without any monkeypatching.
+# Windows cannot use the POSIX `os.kill(pid, 0)` idiom: CPython may translate it to
+# TerminateProcess and kill the process being "checked" with a success code. The native
+# tests prove both halves of the replacement: protected PID 4 fails open as live, and a
+# normal child remains running after process_alive inspects it.
 
 
 @pytest.mark.skipif(
     sys.platform != "win32", reason="the access-denied liveness branch is Windows-only"
 )
 def test_native_windows_access_denied_pid_reads_as_alive() -> None:
-    """A live, other-user process must never read as dead, however os.kill reports it.
+    """A live, other-user process must never read as dead.
 
     PID 4 is the Windows System process: always present, always owned by another user, and
-    never openable. What os.kill(4, 0) raises depends on the host -- SystemError on an
-    ordinary developer box, OSError [WinError 87] on an elevated CI runner (issue #68).
-    Both mean "cannot tell", and both must fail open, because judging a live holder dead
-    expires its lease and lets GC reap resources that are still in use.
-
-    Deliberately asserts only the outward behavior, not the exception type: that is exactly
-    the detail that legitimately differs between hosts, and pinning it is what made the
-    first version of this test fail on CI while passing locally.
+    not queryable by an ordinary user. Access denied proves it exists and must fail open,
+    because judging a live holder dead expires its lease under active work.
     """
     assert process_alive(4) is True
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows process probing is unique")
+def test_native_windows_liveness_probe_does_not_terminate_the_target() -> None:
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        start = process_start_time(child.pid)
+        assert start is not None
+        assert process_alive(child.pid, start) is True
+        assert child.poll() is None, "a read-only liveness check terminated its target"
+    finally:
+        child.terminate()
+        child.wait(timeout=10)
 
 
 # -- 3. autostart adapters without mutating system-wide state ----------------

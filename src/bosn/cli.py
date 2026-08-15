@@ -11,13 +11,14 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import sqlite3
 import sys
 from collections.abc import Callable, Sequence
 from typing import NoReturn
 
 from bosn import __version__, ipc
-from bosn.engine import Engine
+from bosn.engine import CLOCK_SKEW_BUDGET_SECONDS, Engine
 from bosn.options import Options, from_namespace
 
 DAEMON_VERB = "__daemon"
@@ -27,6 +28,10 @@ NOT_IMPLEMENTED_EXIT = 3
 # Long enough to cover a daemon draining a cancelled build (see SHUTDOWN_DRAIN_SECONDS),
 # short enough not to look hung.
 DAEMON_STOP_TIMEOUT = 45.0
+# Execution acquire may have to remove an orphaned persistent container and recreate it.
+# That bounded recovery legitimately exceeds the generic 10-second IPC control timeout on
+# Docker Desktop, while the preceding image build already has its own streamed job timeout.
+EXECUTION_ACQUIRE_TIMEOUT = 120.0
 
 
 def _policy_flags(opts: Options) -> dict[str, float | None]:
@@ -235,6 +240,19 @@ def cmd_doctor(opts: Options) -> int:
     print(f"client version: {info.client_version or '-'}")
     print(f"server version: {info.server_version or '-'}")
     print(f"reachable:      {'yes' if info.reachable else 'no'}")
+    if info.clock_skew_seconds is None:
+        print("clock skew:     unavailable")
+        clock_unsafe = False
+    else:
+        print(f"clock skew:     {info.clock_skew_seconds:+.3f}s")
+        clock_unsafe = abs(info.clock_skew_seconds) > CLOCK_SKEW_BUDGET_SECONDS
+        if clock_unsafe:
+            print(
+                f"engine clock differs from the client by more than "
+                f"{CLOCK_SKEW_BUDGET_SECONDS:.1f}s; synchronize the Docker host clock "
+                "before relying on warm incremental builds",
+                file=sys.stderr,
+            )
     from bosn.registry import Registry, default_db_path
 
     db_path = (opts.state_dir / "registry.sqlite3") if opts.state_dir else default_db_path()
@@ -296,7 +314,7 @@ def cmd_doctor(opts: Options) -> int:
     scan = ResourceScanner(Engine(opts.engine)).scan(registry_id or "")
     if scan.foreign_registries:
         _report_foreign_registries(scan, opts)
-    return 0
+    return 1 if clock_unsafe else 0
 
 
 # A foreign label only proves "not this registry" -- it is not, and cannot be, proof of
@@ -609,6 +627,19 @@ def _converge_via_daemon(opts: Options, manifest, stack_name: str | None):
     return _result_or_raise(_drive_job(events))
 
 
+def _release_execution(daemon_mod, state_dir, session: object) -> str | None:
+    """Release a foreground session without silently flattening cleanup failures."""
+    try:
+        released = daemon_mod.request("execution-release", state_dir, session=session)
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:  # the caller decides whether another failure is authoritative
+        return str(exc)
+    if released.get("ok"):
+        return None
+    return str(released.get("error") or f"could not release execution session {session}")
+
+
 def cmd_run(opts: Options) -> int:
     from bosn import daemon as daemon_mod
     from bosn.config import ConfigError
@@ -616,6 +647,7 @@ def cmd_run(opts: Options) -> int:
     from bosn.converge import workspace_of
     from bosn.engine import EngineError
     from bosn.manifest import ManifestError, find_manifest, load
+    from bosn.resources import process_start_time
 
     command = opts.command
     if not command and not opts.task:
@@ -649,17 +681,53 @@ def cmd_run(opts: Options) -> int:
             stack=stack_name,
             workspace=workspace_of(manifest),
             engine=opts.engine,
+            pid=os.getpid(),
+            proc_start=process_start_time(os.getpid()),
+            request_timeout=EXECUTION_ACQUIRE_TIMEOUT,
         )
         if not acquired.get("ok"):
             raise EngineError(str(acquired.get("error") or "execution acquire failed"))
+        code: int | None = None
         try:
-            result = Engine(opts.engine).run(
-                ["exec", str(acquired["container"]), *command],
-                timeout=config.get("run_max_duration"),
-            )
+            engine = Engine(opts.engine)
+            exec_args = ["exec", str(acquired["container"]), *command]
+            if opts.json:
+                # JSON errors reserve stdout for exactly one parseable envelope. Capturing
+                # is intentionally limited to this machine-facing mode; ordinary runs use
+                # ``execute`` below and remain live on both native streams.
+                try:
+                    result = engine.run(exec_args, timeout=config.get("run_max_duration"))
+                except KeyboardInterrupt:
+                    engine._abort_container(str(acquired["container"]))
+                    raise
+                except EngineError as exc:
+                    cleanup_error = engine._abort_container(str(acquired["container"]))
+                    if cleanup_error:
+                        raise EngineError(f"{exc}; {cleanup_error}") from exc
+                    raise
+                code = result.returncode
+                if result.stdout:
+                    print(result.stdout, file=sys.stderr if code else sys.stdout)
+                if result.stderr:
+                    print(result.stderr, file=sys.stderr)
+            else:
+                code = engine.execute(
+                    exec_args,
+                    timeout=config.get("run_max_duration"),
+                    abort_container=str(acquired["container"]),
+                )
         finally:
-            daemon_mod.request("execution-release", opts.state_dir, session=acquired["session"])
-        code, output = result.returncode, result.stdout or result.stderr
+            cleanup_error = _release_execution(daemon_mod, opts.state_dir, acquired["session"])
+            if cleanup_error:
+                detail = (
+                    f"execution cleanup failed for session {acquired['session']}: {cleanup_error}"
+                )
+                # Never replace the command's own exception or non-zero exit. A successful
+                # command, however, must not claim success while leaving reuse blocked.
+                if sys.exception() is not None or (code is not None and code != 0):
+                    print(detail, file=sys.stderr)
+                else:
+                    raise EngineError(detail)
     except JobFailed as exc:
         print(str(exc), file=sys.stderr)
         return exc.exit_code
@@ -669,8 +737,7 @@ def cmd_run(opts: Options) -> int:
     except (ManifestError, EngineError, ConfigError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    if output:
-        print(output)
+    assert code is not None
     return code
 
 
@@ -1010,6 +1077,7 @@ def cmd_shell(opts: Options) -> int:
     from bosn.converge import workspace_of
     from bosn.engine import EngineError
     from bosn.manifest import ManifestError, find_manifest, load
+    from bosn.resources import process_start_time
 
     try:
         manifest_path = opts.manifest or find_manifest()
@@ -1029,15 +1097,29 @@ def cmd_shell(opts: Options) -> int:
             stack=opts.stack,
             workspace=workspace_of(manifest),
             engine=opts.engine,
+            pid=os.getpid(),
+            proc_start=process_start_time(os.getpid()),
+            request_timeout=EXECUTION_ACQUIRE_TIMEOUT,
         )
         if not acquired.get("ok"):
             raise EngineError(str(acquired.get("error") or "execution acquire failed"))
+        code: int | None = None
         try:
-            return Engine(opts.engine).interactive(
+            code = Engine(opts.engine).interactive(
                 ["exec", "-it", str(acquired["container"]), "sh"]
             )
         finally:
-            daemon_mod.request("execution-release", opts.state_dir, session=acquired["session"])
+            cleanup_error = _release_execution(daemon_mod, opts.state_dir, acquired["session"])
+            if cleanup_error:
+                detail = (
+                    f"execution cleanup failed for session {acquired['session']}: {cleanup_error}"
+                )
+                if sys.exception() is not None or (code is not None and code != 0):
+                    print(detail, file=sys.stderr)
+                else:
+                    raise EngineError(detail)
+        assert code is not None
+        return code
     except JobFailed as exc:
         print(str(exc), file=sys.stderr)
         return exc.exit_code

@@ -13,6 +13,7 @@ Automatic deletion requires complete ownership proof, which is why there is no `
 
 from __future__ import annotations
 
+import ctypes
 import datetime as dt
 import json
 import os
@@ -238,6 +239,47 @@ def running_container_names(engine: Engine) -> frozenset[str] | None:
 PROCESS_START_TOLERANCE_SECONDS = 2.0
 
 
+def _windows_process_exists(pid: int) -> bool | None:
+    """Read-only Windows liveness probe: True/False, or None when unavailable.
+
+    `os.kill(pid, 0)` is a POSIX idiom, not a safe Windows probe: CPython may route a
+    non-console signal through TerminateProcess, so asking whether another process exists
+    can terminate it with exit code zero. OpenProcess with query-only rights cannot mutate
+    the target and distinguishes a missing pid from a protected live process.
+    """
+    try:
+        win_dll = getattr(ctypes, "WinDLL", None)
+        get_last_error = getattr(ctypes, "get_last_error", None)
+        if win_dll is None or get_last_error is None:
+            return None
+        kernel32 = win_dll("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+        open_process.restype = ctypes.c_void_p
+        handle = open_process(0x1000, 0, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if handle:
+            exit_code = ctypes.c_ulong()
+            get_exit_code = kernel32.GetExitCodeProcess
+            get_exit_code.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+            get_exit_code.restype = ctypes.c_int
+            queried = bool(get_exit_code(handle, ctypes.byref(exit_code)))
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = [ctypes.c_void_p]
+            close_handle.restype = ctypes.c_int
+            close_handle(handle)
+            if not queried:
+                return None
+            return exit_code.value == 259  # STILL_ACTIVE
+        error = get_last_error()
+    except (AttributeError, OSError):
+        return None
+    if error == 87:  # ERROR_INVALID_PARAMETER: no such process
+        return False
+    if error == 5:  # ERROR_ACCESS_DENIED: protected, but demonstrably present
+        return True
+    return None
+
+
 def _parse_windows_process_start(ticks_text: str) -> float | None:
     """Parse .NET ``DateTime.Ticks`` (100ns units since 0001-01-01) into an epoch float."""
     try:
@@ -357,33 +399,26 @@ def process_alive(pid: int, proc_start: float | None = None) -> bool:
     """
     if pid <= 0:
         return False
+    if os.name == "nt":
+        exists = _windows_process_exists(pid)
+        if exists is False:
+            return False
+        if exists is None:
+            return True  # the read-only probe was unavailable: fail open
+        if proc_start is None:
+            return True
+        actual = process_start_time(pid)
+        return actual is None or abs(actual - proc_start) <= PROCESS_START_TOLERANCE_SECONDS
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
-    except SystemError:
-        # Windows: os.kill(pid, 0) on another user's/SYSTEM's process raises SystemError
-        # (CPython returns a result with ERROR_ACCESS_DENIED still set as an exception,
-        # which is not an OSError subclass and would otherwise escape every handler here).
-        # Access-denied means the process exists and we cannot see it: treat as alive, the
-        # same fail-open posture as PermissionError above.
-        return True
-    except OSError:
-        # Only ProcessLookupError above proves the process is gone. Every other OSError
-        # means this probe could not answer, so ask the OS-owned identity source instead
-        # of guessing -- in either direction.
-        #
-        # Observed on an elevated Windows CI runner (issue #68): os.kill(4, 0) against the
-        # live System process raises OSError [WinError 87] "The parameter is incorrect",
-        # while tasklist lists the process and process_start_time() returns a valid
-        # creation time for it. Answering "dead" there called a demonstrably live process
-        # dead, expiring its lease. Answering "alive" unconditionally is no better: a
-        # long-gone pid also lands here on Windows, and its lease would never expire.
-        #
-        # A creation time is positive evidence the process exists; its absence, after
-        # os.kill already failed, means two independent probes could not find it.
+    except (SystemError, OSError):
+        # A non-Windows runtime can still report ambiguous permission/platform errors.
+        # Ask the OS-owned identity source rather than guessing: a creation time is positive
+        # evidence of life; no process from two independent probes is enough to reclaim.
         return process_start_time(pid) is not None
     if proc_start is None:
         return True

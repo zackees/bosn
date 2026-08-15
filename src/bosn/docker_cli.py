@@ -389,8 +389,8 @@ def _reconcile_after_compose(command: str, *, prune_missing: bool = False) -> No
 def _acquire_compose_lease(workspace: str) -> str | None:
     """Lease every resource already registered for this Compose project before it runs.
 
-    Held under bosn-docker's own pid/start-time, sent explicitly in the request, rather
-    than the daemon acquiring with its own `os.getpid()` the way `execution-acquire` does.
+    Held under bosn-docker's own pid/start-time, sent explicitly in the request, just as
+    `execution-acquire` now tracks the foreground client that owns its remote process.
     `bosn-docker` runs the (possibly long, foreground) compose command itself; if it is
     SIGKILLed mid-run, no `finally` here ever executes and no release request is ever sent.
     A daemon-held lease would then sit pinned until the daemon itself restarts -- a

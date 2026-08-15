@@ -57,10 +57,28 @@ def normalize_workspace_path(path: str | Path) -> str:
     return os.path.normcase(str(Path(raw).resolve()))
 
 
+def _running_in_container() -> bool:
+    return bool(os.environ.get("container")) or any(
+        marker.exists() for marker in (Path("/.dockerenv"), Path("/run/.containerenv"))
+    )
+
+
+def _kernel_release() -> str:
+    try:
+        return Path("/proc/sys/kernel/osrelease").read_text()
+    except OSError:
+        return ""
+
+
 def in_wsl() -> bool:
+    # Explicit environment signals describe the caller and are authoritative. Container
+    # detection only disambiguates the kernel-name heuristic below.
     if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
         return True
-    try:
-        return "microsoft" in Path("/proc/sys/kernel/osrelease").read_text().lower()
-    except OSError:
+    # Docker Desktop's Linux containers inherit its microsoft-standard-WSL2 kernel name,
+    # but they do not use the unsupported Windows-loopback transport that makes an actual
+    # WSL shell unsafe. Refusing them prevents bosn from running inside the very Linux test
+    # environments it is meant to supervise.
+    if _running_in_container():
         return False
+    return "microsoft" in _kernel_release().lower()

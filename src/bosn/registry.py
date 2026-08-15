@@ -10,6 +10,7 @@ authoritative only for time and leases, so a lost registry rebuilds by rescannin
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -68,6 +69,15 @@ CREATE TABLE IF NOT EXISTS leases (
 );
 
 CREATE INDEX IF NOT EXISTS idx_leases_resource ON leases(resource_id);
+
+CREATE TABLE IF NOT EXISTS execution_sessions (
+    id             TEXT PRIMARY KEY,
+    container_id   TEXT NOT NULL,
+    engine_binary  TEXT NOT NULL,
+    client_pid     INTEGER NOT NULL,
+    client_start   REAL,
+    lease_ids      TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS generations (
     workspace   TEXT NOT NULL,
@@ -131,6 +141,16 @@ class Lease:
 
     def expired_by_time(self, now: float) -> bool:
         return (now - self.heartbeat_at) > self.ttl_seconds
+
+
+@dataclass(frozen=True)
+class ExecutionSession:
+    id: str
+    container_id: str
+    engine_binary: str
+    client_pid: int
+    client_start: float | None
+    lease_ids: tuple[str, ...]
 
 
 class RegistryError(RuntimeError):
@@ -772,6 +792,48 @@ class Registry:
     def release_lease(self, lease_id: str) -> None:
         self._exec("DELETE FROM leases WHERE id = ?", (lease_id,))
         self.log_event("lease.released", lease_id)
+
+    def save_execution_session(self, session: ExecutionSession) -> None:
+        """Persist ownership before a foreground client may start its remote command."""
+        self._exec(
+            "INSERT INTO execution_sessions"
+            "(id, container_id, engine_binary, client_pid, client_start, lease_ids) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                session.id,
+                session.container_id,
+                session.engine_binary,
+                session.client_pid,
+                session.client_start,
+                json.dumps(session.lease_ids),
+            ),
+        )
+
+    def delete_execution_session(self, session_id: str) -> None:
+        self._exec("DELETE FROM execution_sessions WHERE id = ?", (session_id,))
+
+    def execution_sessions(self) -> list[ExecutionSession]:
+        rows = self._exec("SELECT * FROM execution_sessions ORDER BY id").fetchall()
+        sessions: list[ExecutionSession] = []
+        for row in rows:
+            raw_lease_ids = json.loads(row["lease_ids"])
+            if not isinstance(raw_lease_ids, list) or not all(
+                isinstance(lease_id, str) for lease_id in raw_lease_ids
+            ):
+                raise RegistryError(
+                    f"execution session {row['id']!r} has invalid persisted lease ids"
+                )
+            sessions.append(
+                ExecutionSession(
+                    id=row["id"],
+                    container_id=row["container_id"],
+                    engine_binary=row["engine_binary"],
+                    client_pid=row["client_pid"],
+                    client_start=row["client_start"],
+                    lease_ids=tuple(raw_lease_ids),
+                )
+            )
+        return sessions
 
     def prune_lease(self, lease_id: str) -> None:
         """Delete a confirmed-dead lease found during maintenance.

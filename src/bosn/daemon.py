@@ -303,10 +303,24 @@ class Daemon:
         self._stop = threading.Event()
         self._watchdog_thread: threading.Thread | None = None
         self._execution_sessions: dict[str, tuple[str, ...]] = {}
+        self._execution_containers: dict[str, str] = {}
+        self._execution_owners: dict[str, tuple[int, float | None]] = {}
+        self._execution_engines: dict[str, str] = {}
         self._execution_lock = threading.RLock()
         self._stopping = False
         self.secret = secrets.token_urlsafe(32)
         self.registry = Registry(self.state_dir / "registry.sqlite3", clock=self.clock)
+        # Foreground command ownership must outlive the daemon process itself. A restarted
+        # daemon restores this proof before serving, so it cannot overlap a still-running
+        # remote exec or clean up a Podman session through Docker (or vice versa).
+        for persisted in self.registry.execution_sessions():
+            self._execution_sessions[persisted.id] = persisted.lease_ids
+            self._execution_containers[persisted.id] = persisted.container_id
+            self._execution_owners[persisted.id] = (
+                persisted.client_pid,
+                persisted.client_start,
+            )
+            self._execution_engines[persisted.id] = persisted.engine_binary
         stored_deadline = self.registry.meta("maintenance.next_deadline")
         try:
             deadline = float(stored_deadline) if stored_deadline else self.started_at
@@ -512,6 +526,10 @@ class Daemon:
             )
             return
 
+        self.registry.log_event("maintenance.execution_reap.started")
+        reaped = self._reap_dead_execution_sessions()
+        self.registry.log_event("maintenance.execution_reap.finished", f"reaped={reaped}")
+
         self.registry.log_event("maintenance.gc.started")
         try:
             result = Collector(self.registry, engine, config=self.config).collect(dry_run=False)
@@ -586,6 +604,13 @@ class Daemon:
         self.registry.set_meta("maintenance.next_deadline", f"{deadline:.6f}")
 
     def request_stop(self) -> bool:
+        # A SIGKILLed client cannot send execution-release. Reap only sessions whose
+        # exact process identity is confirmed dead before deciding that active work must
+        # block an explicit shutdown.
+        with self._execution_lock:
+            has_reapable_sessions = bool(self._execution_owners)
+        if has_reapable_sessions:
+            self._reap_dead_execution_sessions()
         with self._execution_lock:
             if self._execution_sessions:
                 return False
@@ -827,64 +852,187 @@ class Daemon:
         from bosn.engine import Engine
         from bosn.manifest import load
         from bosn.paths import normalize_workspace_path
+        from bosn.registry import ExecutionSession
+        from bosn.resources import process_alive
 
         manifest = load(Path(str(request.get("manifest") or "")))
         converged = ConvergeResult.from_dict(dict(request.get("result") or {}))
         workspace = str(request.get("workspace") or "")
         if not workspace:
             return {"ok": False, "error": "execution-acquire requires workspace"}
+        pid = request.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            return {"ok": False, "error": "execution-acquire requires a client pid"}
+        proc_start_raw = request.get("proc_start")
+        proc_start = float(proc_start_raw) if proc_start_raw is not None else None
         # Same boundary gap as `done`, on the write side: an un-normalized spelling here
         # would record the container's registry row under an identity that `done` (which
         # does normalize) can never match, permanently pinning the resource. Normalizing is
         # a no-op for the CLI's already-canonical value.
         workspace = normalize_workspace_path(workspace)
+        engine_binary = str(request.get("engine") or self.engine_binary)
+        engine = Engine(engine_binary)
+        # Recover a previous client that died without reaching its finally/release path
+        # before considering this container busy. The immutable id is retained alongside
+        # the session, so cleanup can never broaden into a label/name-based deletion.
+        self._reap_dead_execution_sessions()
         session = str(uuid.uuid4())
         with self._execution_lock:
             if self._stopping:
                 return {"ok": False, "error": "daemon is stopping; retry after it restarts"}
             # Reserve before engine/registry work so shutdown sees this as active immediately.
             self._execution_sessions[session] = ()
+            self._execution_owners[session] = (pid, proc_start)
+            self._execution_engines[session] = engine_binary
         try:
-            name, leases = Converger(
-                manifest, self.registry, Engine(str(request.get("engine") or self.engine_binary))
+            container_id, leases = Converger(
+                manifest, self.registry, engine
             )._acquire_execution_container(
-                converged, stack_name=request.get("stack") or None, workspace=workspace
+                converged,
+                stack_name=request.get("stack") or None,
+                workspace=workspace,
+                lease_pid=pid,
+                lease_proc_start=proc_start,
             )
         except KeyboardInterrupt:
             with self._execution_lock:
                 self._execution_sessions.pop(session, None)
+                self._execution_containers.pop(session, None)
+                self._execution_owners.pop(session, None)
+                self._execution_engines.pop(session, None)
             raise
         except Exception:
             with self._execution_lock:
                 self._execution_sessions.pop(session, None)
+                self._execution_containers.pop(session, None)
+                self._execution_owners.pop(session, None)
+                self._execution_engines.pop(session, None)
             raise
         with self._execution_lock:
-            self._execution_sessions[session] = tuple(lease.id for lease in leases)
-        return {"ok": True, "container": name, "session": session}
+            # Container IDs are effectively unique, and global serialization is the safe
+            # answer for alias spellings such as `docker` versus its absolute executable
+            # path. The original engine spelling remains session metadata only for cleanup.
+            conflict = container_id in self._execution_containers.values()
+            if conflict:
+                self._execution_sessions.pop(session, None)
+                self._execution_owners.pop(session, None)
+                self._execution_engines.pop(session, None)
+            else:
+                lease_ids = tuple(lease.id for lease in leases)
+                self._execution_sessions[session] = lease_ids
+                self._execution_containers[session] = container_id
+                try:
+                    self.registry.save_execution_session(
+                        ExecutionSession(
+                            id=session,
+                            container_id=container_id,
+                            engine_binary=engine_binary,
+                            client_pid=pid,
+                            client_start=proc_start,
+                            lease_ids=lease_ids,
+                        )
+                    )
+                except KeyboardInterrupt:
+                    # Retain the provisional in-memory proof. The client never received
+                    # this session, so it cannot start a remote exec; maintenance can still
+                    # retry exact-container and lease cleanup if this daemon keeps running.
+                    raise
+                except Exception as exc:
+                    self.registry.log_event(
+                        "execution.persistence.error",
+                        f"session={session} container={container_id} {type(exc).__name__}: {exc}",
+                    )
+                    raise
+        if conflict:
+            for lease in leases:
+                self.registry.release_lease(lease.id)
+            return {
+                "ok": False,
+                "error": "another command is already running in this stack; retry after it exits",
+            }
+        # The caller can die while converge/acquire is in flight. Do not return a session
+        # that was already orphaned; route it through the same fail-closed cleanup path.
+        if not process_alive(pid, proc_start):
+            self._reap_dead_execution_sessions()
+            return {"ok": False, "error": "execution client exited during container acquire"}
+        return {"ok": True, "container": container_id, "session": session}
+
+    def _reap_dead_execution_sessions(self) -> int:
+        """Stop and release execution sessions whose exact client identity is gone.
+
+        Cleanup stays serialized with acquire/release. If Docker or the registry refuses
+        any part of cleanup, the session remains active and continues to block reuse; an
+        uncertain cleanup must never permit two commands in one persistent container.
+        """
+        from bosn.engine import Engine
+        from bosn.resources import process_alive
+
+        reaped = 0
+        with self._execution_lock:
+            dead = [
+                session
+                for session, (pid, proc_start) in self._execution_owners.items()
+                if session in self._execution_containers and not process_alive(pid, proc_start)
+            ]
+            for session in dead:
+                container_id = self._execution_containers[session]
+                engine_binary = self._execution_engines[session]
+                try:
+                    engine = Engine(engine_binary)
+                    removed = engine.run(["container", "rm", "--force", container_id], timeout=10)
+                    detail = removed.stderr or removed.stdout
+                    if not removed.ok and "no such container" not in detail.lower():
+                        raise RuntimeError(detail or "container removal failed")
+                    for lease_id in self._execution_sessions[session]:
+                        self.registry.release_lease(lease_id)
+                    self.registry.delete_execution_session(session)
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - ambiguity must fail closed
+                    self.registry.log_event(
+                        "execution.orphan_reap.error",
+                        f"session={session} container={container_id} {type(exc).__name__}: {exc}",
+                    )
+                    continue
+                self._execution_sessions.pop(session, None)
+                self._execution_containers.pop(session, None)
+                self._execution_owners.pop(session, None)
+                self._execution_engines.pop(session, None)
+                self.registry.log_event(
+                    "execution.orphan_reaped",
+                    f"session={session} container={container_id}",
+                )
+                reaped += 1
+        return reaped
 
     def _verb_execution_release(self, request: dict[str, Any]) -> dict[str, Any]:
         session = str(request.get("session") or "")
         with self._execution_lock:
-            leases = self._execution_sessions.pop(session, None)
-        if leases is None:
-            return {"ok": False, "error": "unknown execution session"}
-        for lease_id in leases:
-            self.registry.release_lease(lease_id)
+            leases = self._execution_sessions.get(session)
+            if leases is None:
+                return {"ok": False, "error": "unknown execution session"}
+            try:
+                for lease_id in leases:
+                    self.registry.release_lease(lease_id)
+                self.registry.delete_execution_session(session)
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:  # retain every proof so cleanup can be retried
+                return {"ok": False, "error": f"execution release failed: {exc}"}
+            self._execution_sessions.pop(session, None)
+            self._execution_containers.pop(session, None)
+            self._execution_owners.pop(session, None)
+            self._execution_engines.pop(session, None)
         return {"ok": True}
 
     def _verb_compose_acquire(self, request: dict[str, Any]) -> dict[str, Any]:
         """Lease every resource currently registered for a Compose project's workspace.
 
-        Diverges from `execution-acquire` on purpose: that path leases with
-        `pid=os.getpid()` -- the *daemon's* pid -- because the daemon is the one that holds
-        the lease open until an explicit release. Compose has no such holder inside the
-        daemon; `bosn-docker` runs the (possibly long, foreground) compose command itself,
-        so the lease is acquired here on behalf of *its* pid/proc_start, supplied by the
-        caller. If that client is SIGKILLed mid-run, no `finally` there ever fires and no
-        release ever arrives -- held under the daemon's identity that would pin the lease
-        until the daemon itself restarts, exactly the leak leases exist to prevent. Held
-        under the client's identity instead, `lease_is_expired` reclaims it after one TTL
-        once the pid (and start time, when available) stop matching a live process.
+        Both foreground execution paths carry the client's pid/start identity so a SIGKILL
+        cannot create an immortal daemon-owned lease. Compose differs because its resources
+        are independently safe to prune through the normal TTL-plus-liveness rule; a run or
+        shell also owns a remote process inside a shared persistent container, so its
+        orphan-recovery path must first force-remove that exact immutable container id.
         """
         from bosn.paths import normalize_workspace_path
 
@@ -1158,6 +1306,7 @@ def request(
     state_dir: Path | None = None,
     *,
     autostart: bool = True,
+    request_timeout: float = ipc.DEFAULT_TIMEOUT,
     **payload: Any,
 ) -> dict[str, Any]:
     """Send a verb to the daemon, spawning it first when allowed.
@@ -1173,6 +1322,7 @@ def request(
     return ipc.send_request(
         port_for(state_dir),
         {"verb": verb, "auth": _secret(state_dir), "version": __version__, **payload},
+        timeout=request_timeout,
     )
 
 

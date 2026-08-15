@@ -13,12 +13,14 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 
 import running_process as rp
 
 DEFAULT_TIMEOUT = 60
 # How often a streaming command checks whether it has been cancelled.
 STREAM_POLL_SECONDS = 0.05
+CLOCK_SKEW_BUDGET_SECONDS = 1.0
 
 
 class EngineError(RuntimeError):
@@ -42,7 +44,19 @@ class EngineInfo:
     reachable: bool
     client_version: str | None = None
     server_version: str | None = None
+    clock_skew_seconds: float | None = None
     detail: str | None = None
+
+
+def _engine_timestamp(value: str) -> float | None:
+    """Parse Docker's RFC3339 ``SystemTime`` without making diagnostics fragile."""
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return None
+        return parsed.timestamp()
+    except (OSError, OverflowError, ValueError):
+        return None
 
 
 class Engine:
@@ -145,6 +159,72 @@ class Engine:
             return EngineResult(returncode=returncode or -1, stdout=output, stderr="cancelled")
         return EngineResult(returncode=returncode, stdout=output, stderr="")
 
+    def execute(
+        self,
+        args: list[str],
+        *,
+        timeout: float | None = None,
+        abort_container: str | None = None,
+    ) -> int:
+        """Run a user command with its stdout and stderr attached to the caller.
+
+        Container commands are different from engine control calls: their output is the
+        product the caller asked for, and a long test must stay observable while it runs.
+        Tagged capture plus continuous echo preserves the two streams and makes them live.
+        If a deadline or Ctrl-C kills the local ``docker exec`` client, removing the
+        already-proven immutable container id also kills the remote process; cache volumes
+        survive and the next converge recreates the cheap container.
+        """
+        if not self.available():
+            raise EngineError(f"{self.binary!r} is not on PATH")
+        effective_timeout = self.timeout if timeout is None else max(1.0, float(timeout))
+        # running-process's native `capture=False` mode discards output rather than
+        # inheriting the parent's handles. Capture and continuously drain both tagged
+        # streams instead: `echo=True` relays each line while the process is still alive,
+        # preserving stdout/stderr routing without waiting for command completion.
+        process = rp.RunningProcess([self.binary, *args], check=False, capture=True, stderr=rp.PIPE)
+        # A child choosing exit 130 is still an ordinary command result. Disable
+        # running-process's exit-code-to-KeyboardInterrupt translation for this instance;
+        # Python will continue to raise a real KeyboardInterrupt when the parent receives
+        # Ctrl-C, giving this method an unambiguous cleanup boundary.
+        process.KEYBOARD_INTERRUPT_EXIT_CODES = set()  # pyright: ignore[reportAttributeAccessIssue]
+        try:
+            waited = process.wait(timeout=effective_timeout, echo=True)
+        except KeyboardInterrupt:
+            if not process.finished:
+                process.kill()
+            self._abort_container(abort_container)
+            raise
+        except TimeoutError as exc:
+            cleanup_error = self._abort_container(abort_container)
+            cleanup_suffix = f"; {cleanup_error}" if cleanup_error else ""
+            raise EngineError(
+                f"{self.binary} {' '.join(args)} exceeded its "
+                f"{effective_timeout:g}-second deadline{cleanup_suffix}"
+            ) from exc
+        if not isinstance(waited, int):
+            raise EngineError(f"{self.binary} {' '.join(args)} ended without an exit status")
+        return waited
+
+    def _abort_container(self, container_id: str | None) -> str | None:
+        if not container_id:
+            return None
+        try:
+            removed = self.run(
+                ["container", "rm", "--force", container_id],
+                timeout=10,
+            )
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the original abort stays authoritative
+            return f"failed to stop timed-out container {container_id}: {exc}"
+        if removed.ok:
+            return None
+        detail = removed.stderr or removed.stdout
+        if "no such container" in detail.lower():
+            return None
+        return f"failed to stop timed-out container {container_id}: {detail}"
+
     def interactive(self, args: list[str]) -> int:
         """Run an engine command attached to this process's terminal.
 
@@ -177,11 +257,29 @@ class Engine:
                 client_version=client.stdout or None,
                 detail=server.stderr or server.stdout or "engine daemon unreachable",
             )
+        # ``docker info`` exposes the daemon's own nanosecond wall clock. Sampling the
+        # client clock on both sides and comparing with the midpoint removes ordinary CLI
+        # round-trip time from the estimate. Unlike launching a probe container, this is
+        # read-only, creates no resource bosn would then need to govern, and does not round
+        # away the sub-second precision that decides whether an incremental builder is safe.
+        try:
+            started_at = time.time()
+            system_time = self.run(["info", "--format", "{{.SystemTime}}"])
+            finished_at = time.time()
+            engine_time = _engine_timestamp(system_time.stdout) if system_time.ok else None
+            clock_skew = (
+                engine_time - ((started_at + finished_at) / 2) if engine_time is not None else None
+            )
+        except KeyboardInterrupt:
+            raise
+        except Exception:  # noqa: BLE001 - optional diagnostics must not hide reachability
+            clock_skew = None
         return EngineInfo(
             binary=self.binary,
             reachable=True,
             client_version=client.stdout or None,
             server_version=server.stdout or None,
+            clock_skew_seconds=clock_skew,
         )
 
 

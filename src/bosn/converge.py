@@ -914,20 +914,25 @@ class Converger:
             )
 
     def _acquire_execution_container(
-        self, converged: ConvergeResult, *, stack_name: str | None, workspace: str
+        self,
+        converged: ConvergeResult,
+        *,
+        stack_name: str | None,
+        workspace: str,
+        lease_pid: int | None = None,
+        lease_proc_start: float | None = None,
     ) -> tuple[str, tuple[Lease, ...]]:
-        # Computed before the write lock, not inside it: process_start_time() spawns a
-        # subprocess (~0.35s measured via PowerShell on Windows), and lifecycle_guard() holds
-        # a cross-process `BEGIN IMMEDIATE` exclusive write lock. Probing once per dependency
-        # inside that lock would hold it for an extra ~1.5s per converge (container + image +
-        # N volumes), pushing concurrent daemon writers -- which only have a 5s busy_timeout
-        # -- toward "database is locked". The value is constant for the life of this process,
-        # so one memoized probe outside the lock serves every dependency's lease.
+        # When no explicit holder is supplied, compute our identity before the write lock:
+        # process_start_time() spawns a subprocess (~0.35s measured via PowerShell on
+        # Windows), and lifecycle_guard() holds a cross-process `BEGIN IMMEDIATE` lock.
+        # Daemon-mediated foreground execution supplies the client's already-probed
+        # identity instead, which lets its leases survive a daemon restart safely.
         #
         # None falls through to the PID-only liveness check rather than a wall-clock guess
         # that could later mismatch the real process start and make a live holder's lease
         # look expired (see process_alive).
-        proc_start = _own_process_start_time()
+        holder_pid = os.getpid() if lease_pid is None else lease_pid
+        proc_start = _own_process_start_time() if lease_pid is None else lease_proc_start
         with self.registry.lifecycle_guard():
             name, container_id, resource, created = self._ensure_container_locked(
                 converged, stack_name=stack_name, workspace=workspace
@@ -947,7 +952,7 @@ class Converger:
                 leases = tuple(
                     self.registry.acquire_lease(
                         dependency.id,
-                        pid=os.getpid(),
+                        pid=holder_pid,
                         proc_start=proc_start,
                     )
                     for dependency in dependencies

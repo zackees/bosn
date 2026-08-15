@@ -392,9 +392,9 @@ message naming what happened: `4` superseded, `5` cancelled, `1` build failed. N
 `bosn run` returns *your command's* exit code, so a test suite that itself exits 4 or 5 is
 indistinguishable from these.
 
-**Known rough edge:** your command's own output is buffered and printed after it exits, and
-stdout wins over stderr when both are non-empty — so a long test run shows nothing until it
-finishes. Build output streams; command output does not.
+**Output stays live.** Build output streams to stderr, while the command's tagged stdout
+and stderr are continuously relayed to the caller's matching streams. A long test therefore
+remains observable and preserves the two streams instead of withholding its log until exit.
 
 **Rapid edits must not pile up** — which is the concurrency policy below.
 
@@ -548,6 +548,21 @@ git clone https://github.com/zackees/bosn && cd bosn
 ./lint        # ruff format --check, ruff check, pyright, KeyboardInterrupt checker
 ./test        # pytest; passthrough args work, e.g. ./test -k registry
 ```
+
+To run the project through a consistent Linux test entry point on every host, use the
+checked-in bosn stack:
+
+```bash
+bosn ensure   # build once and create the managed caches
+bosn test     # Linux unit suite; real-Docker integration stays on the outer Linux CI host
+bosn lint
+```
+
+This is also the smallest complete example of the intended edit loop. The checkout is
+mounted read-only at `/repo`, so source edits are visible immediately without changing the
+image generation. The virtual environment is stack-scoped at `/venv`, while the uv, Ruff,
+and Pyright caches are machine-scoped and shared with other Python stacks. None of those
+caches is written through Docker Desktop's host bind-mount translation layer.
 
 `./install` sets up the development environment; run the CLI from the clone with
 `uv run bosn`. Linting includes an AST checker (`ci/lint_kbi.py`) that enforces a sibling

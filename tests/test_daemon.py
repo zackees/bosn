@@ -504,6 +504,356 @@ def test_a_failed_acquire_does_not_leave_a_session_pinning_the_daemon_forever(
         daemon.registry.close()
 
 
+def test_execution_acquire_serializes_commands_in_one_persistent_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from bosn import resources
+    from bosn.converge import Converger, ConvergeResult
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    manifest = project / "bosn.toml"
+    manifest.write_text(
+        "[stack.dev]\ndockerfile = 'Dockerfile'\ndefault = true\n",
+        encoding="utf-8",
+    )
+    result = ConvergeResult("dev", "sha256:g", "reused", "image")
+    monkeypatch.setattr(
+        Converger,
+        "_acquire_execution_container",
+        lambda *_args, **_kwargs: ("sha256:immutable-container", ()),
+    )
+    monkeypatch.setattr(resources, "process_alive", lambda *_args: True)
+    request = {
+        "manifest": str(manifest),
+        "result": result.to_dict(),
+        "workspace": str(project),
+        "pid": 111,
+        "proc_start": 10.0,
+    }
+    daemon = Daemon(state_dir=tmp_path / "state")
+    try:
+        first = daemon.dispatch("execution-acquire", request)
+        second = daemon.dispatch(
+            "execution-acquire", {**request, "engine": "C:/Program Files/Docker/docker.exe"}
+        )
+
+        assert first["ok"] is True
+        assert second["ok"] is False
+        assert "already running" in str(second["error"])
+
+        assert daemon.dispatch("execution-release", {"session": first["session"]})["ok"]
+        third = daemon.dispatch("execution-acquire", request)
+        assert third["ok"] is True
+        assert daemon.dispatch("execution-release", {"session": third["session"]})["ok"]
+    finally:
+        daemon.registry.close()
+
+
+def test_dead_execution_owner_is_stopped_and_reaped_before_next_acquire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import bosn.engine
+    from bosn import resources
+    from bosn.converge import Converger, ConvergeResult
+    from bosn.engine import EngineResult
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    manifest = project / "bosn.toml"
+    manifest.write_text(
+        "[stack.dev]\ndockerfile = 'Dockerfile'\ndefault = true\n",
+        encoding="utf-8",
+    )
+    result = ConvergeResult("dev", "sha256:g", "reused", "image")
+    alive = {111: True, 222: True}
+    removals: list[tuple[str, list[str]]] = []
+
+    class FakeEngine:
+        def __init__(self, binary: str = "docker", **_kwargs: object) -> None:
+            self.binary = binary
+
+        def run(self, args: list[str], **_kwargs: object) -> EngineResult:
+            removals.append((self.binary, args))
+            return EngineResult(0, "sha256:immutable-container", "")
+
+    daemon = Daemon(state_dir=tmp_path / "state")
+    resource = daemon.registry.register_resource(
+        kind="container",
+        name="dev",
+        stack="dev",
+        generation="g",
+        scope="stack",
+        workspace=str(project),
+    )
+
+    def acquire(*_args: object, **_kwargs: object):
+        lease = daemon.registry.acquire_lease(resource.id, pid=os.getpid(), proc_start=None)
+        return "sha256:immutable-container", (lease,)
+
+    monkeypatch.setattr(Converger, "_acquire_execution_container", acquire)
+    monkeypatch.setattr(resources, "process_alive", lambda pid, _start: alive[pid])
+    monkeypatch.setattr(bosn.engine, "Engine", FakeEngine)
+    base_request = {
+        "manifest": str(manifest),
+        "result": result.to_dict(),
+        "workspace": str(project),
+        "proc_start": 10.0,
+    }
+    try:
+        first = daemon.dispatch(
+            "execution-acquire", {**base_request, "pid": 111, "engine": "podman"}
+        )
+        assert first["ok"] is True
+        first_lease = daemon.registry.all_leases()[0]
+
+        alive[111] = False
+        second = daemon.dispatch(
+            "execution-acquire", {**base_request, "pid": 222, "engine": "docker"}
+        )
+
+        assert second["ok"] is True
+        assert removals == [
+            ("podman", ["container", "rm", "--force", "sha256:immutable-container"])
+        ]
+        assert daemon.registry.get_lease(first_lease.id) is None
+        assert first["session"] not in daemon._execution_sessions
+        assert daemon.dispatch("execution-release", {"session": second["session"]})["ok"]
+    finally:
+        daemon.registry.close()
+
+
+def test_execution_session_survives_daemon_restart_and_still_serializes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from bosn import resources
+    from bosn.converge import Converger, ConvergeResult
+    from bosn.resources import prune_dead_leases
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    manifest = project / "bosn.toml"
+    manifest.write_text(
+        "[stack.dev]\ndockerfile = 'Dockerfile'\ndefault = true\n",
+        encoding="utf-8",
+    )
+    result = ConvergeResult("dev", "sha256:g", "reused", "image")
+    monkeypatch.setattr(resources, "process_alive", lambda *_args: True)
+    clock = FakeClock()
+    request = {
+        "manifest": str(manifest),
+        "result": result.to_dict(),
+        "workspace": str(project),
+        "pid": 111,
+        "proc_start": 10.0,
+        "engine": "podman",
+    }
+
+    first_daemon = Daemon(state_dir=tmp_path / "state", clock=clock)
+    resource = first_daemon.registry.register_resource(
+        kind="container",
+        name="dev",
+        stack="dev",
+        generation="g",
+        scope="stack",
+        workspace=str(project),
+    )
+
+    def acquire(converger, *_args: object, **kwargs: object):
+        lease_pid = kwargs["lease_pid"]
+        lease_start = kwargs["lease_proc_start"]
+        assert isinstance(lease_pid, int)
+        assert isinstance(lease_start, float)
+        lease = converger.registry.acquire_lease(
+            resource.id,
+            pid=lease_pid,
+            proc_start=lease_start,
+        )
+        return "sha256:immutable-container", (lease,)
+
+    monkeypatch.setattr(Converger, "_acquire_execution_container", acquire)
+    first = first_daemon.dispatch("execution-acquire", request)
+    assert first["ok"] is True
+    original_lease = first_daemon.registry.all_leases()[0]
+    assert (original_lease.pid, original_lease.proc_start) == (111, 10.0)
+    first_daemon.registry.close()  # simulate the daemon process disappearing mid-exec
+
+    restarted = Daemon(state_dir=tmp_path / "state", clock=clock)
+    try:
+        clock.advance(original_lease.ttl_seconds + 1)
+        assert (
+            prune_dead_leases(
+                restarted.registry, alive_probe=lambda pid, start: (pid, start) == (111, 10.0)
+            )
+            == []
+        )
+        assert restarted.registry.get_lease(original_lease.id) is not None
+
+        blocked = restarted.dispatch(
+            "execution-acquire", {**request, "pid": 222, "proc_start": 20.0}
+        )
+        assert blocked["ok"] is False
+        assert "already running" in str(blocked["error"])
+        assert first["session"] in restarted._execution_sessions
+
+        assert restarted.dispatch("execution-release", {"session": first["session"]})["ok"]
+        next_acquire = restarted.dispatch(
+            "execution-acquire", {**request, "pid": 222, "proc_start": 20.0}
+        )
+        assert next_acquire["ok"] is True
+        assert restarted.dispatch("execution-release", {"session": next_acquire["session"]})["ok"]
+    finally:
+        restarted.registry.close()
+
+
+def test_persistence_and_compensating_release_failures_keep_provisional_tracking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import bosn.engine
+    from bosn import resources
+    from bosn.converge import Converger, ConvergeResult
+    from bosn.engine import EngineResult
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    manifest = project / "bosn.toml"
+    manifest.write_text(
+        "[stack.dev]\ndockerfile = 'Dockerfile'\ndefault = true\n",
+        encoding="utf-8",
+    )
+    result = ConvergeResult("dev", "sha256:g", "reused", "image")
+    alive = True
+
+    class FakeEngine:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def run(self, *_args: object, **_kwargs: object) -> EngineResult:
+            return EngineResult(0, "", "")
+
+    daemon = Daemon(state_dir=tmp_path / "state")
+    resource = daemon.registry.register_resource(
+        kind="container",
+        name="dev",
+        stack="dev",
+        generation="g",
+        scope="stack",
+        workspace=str(project),
+    )
+
+    def acquire(*_args: object, **_kwargs: object):
+        lease = daemon.registry.acquire_lease(resource.id, pid=111, proc_start=10.0)
+        return "sha256:immutable-container", (lease,)
+
+    monkeypatch.setattr(Converger, "_acquire_execution_container", acquire)
+    monkeypatch.setattr(resources, "process_alive", lambda *_args: alive)
+    monkeypatch.setattr(bosn.engine, "Engine", FakeEngine)
+    monkeypatch.setattr(
+        daemon.registry,
+        "save_execution_session",
+        lambda _session: (_ for _ in ()).throw(RuntimeError("persistence failed")),
+    )
+    original_release = daemon.registry.release_lease
+    monkeypatch.setattr(
+        daemon.registry,
+        "release_lease",
+        lambda _lease_id: (_ for _ in ()).throw(RuntimeError("release failed")),
+    )
+    request = {
+        "manifest": str(manifest),
+        "result": result.to_dict(),
+        "workspace": str(project),
+        "pid": 111,
+        "proc_start": 10.0,
+    }
+    try:
+        with pytest.raises(RuntimeError, match="persistence failed"):
+            daemon.dispatch("execution-acquire", request)
+
+        session = next(iter(daemon._execution_sessions))
+        assert daemon.registry.all_leases()
+        assert session in daemon._execution_containers
+        assert daemon._reap_dead_execution_sessions() == 0
+        assert session in daemon._execution_sessions
+
+        alive = False
+        assert daemon._reap_dead_execution_sessions() == 0
+        assert session in daemon._execution_sessions
+        monkeypatch.setattr(daemon.registry, "release_lease", original_release)
+        assert daemon._reap_dead_execution_sessions() == 1
+        assert daemon._execution_sessions == {}
+    finally:
+        daemon.registry.close()
+
+
+def test_execution_release_failure_retains_retryable_session_tracking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from bosn import resources
+    from bosn.converge import Converger, ConvergeResult
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    manifest = project / "bosn.toml"
+    manifest.write_text(
+        "[stack.dev]\ndockerfile = 'Dockerfile'\ndefault = true\n",
+        encoding="utf-8",
+    )
+    result = ConvergeResult("dev", "sha256:g", "reused", "image")
+    daemon = Daemon(state_dir=tmp_path / "state")
+    resource = daemon.registry.register_resource(
+        kind="container",
+        name="dev",
+        stack="dev",
+        generation="g",
+        scope="stack",
+        workspace=str(project),
+    )
+
+    def acquire(*_args: object, **_kwargs: object):
+        lease = daemon.registry.acquire_lease(resource.id, pid=os.getpid(), proc_start=None)
+        return "sha256:immutable-container", (lease,)
+
+    monkeypatch.setattr(resources, "process_alive", lambda *_args: True)
+    monkeypatch.setattr(Converger, "_acquire_execution_container", acquire)
+    request = {
+        "manifest": str(manifest),
+        "result": result.to_dict(),
+        "workspace": str(project),
+        "pid": 111,
+        "proc_start": 10.0,
+    }
+    try:
+        acquired = daemon.dispatch("execution-acquire", request)
+        session = str(acquired["session"])
+        original_release = daemon.registry.release_lease
+        monkeypatch.setattr(
+            daemon.registry,
+            "release_lease",
+            lambda _lease_id: (_ for _ in ()).throw(RuntimeError("database is locked")),
+        )
+
+        failed = daemon.dispatch("execution-release", {"session": session})
+
+        assert failed["ok"] is False
+        assert "database is locked" in str(failed["error"])
+        assert session in daemon._execution_sessions
+        assert session in daemon._execution_containers
+        assert session in daemon._execution_owners
+        assert session in daemon._execution_engines
+        assert {item.id for item in daemon.registry.execution_sessions()} == {session}
+
+        monkeypatch.setattr(daemon.registry, "release_lease", original_release)
+        assert daemon.dispatch("execution-release", {"session": session})["ok"]
+    finally:
+        daemon.registry.close()
+
+
 # -- unattended maintenance ------------------------------------------------
 
 

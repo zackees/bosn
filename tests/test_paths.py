@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from bosn.paths import normalize_workspace_path
+from bosn.paths import in_wsl, normalize_workspace_path
 
 
 def test_windows_native_msys_wsl_and_extended_spellings_share_an_identity() -> None:
@@ -31,6 +31,23 @@ def test_wsl_is_rejected_with_the_transport_explanation(monkeypatch, capsys) -> 
     monkeypatch.setattr("bosn.paths.in_wsl", lambda: True)
     assert bosn.cli.main(["--version"]) == 1
     assert "does not support WSL" in capsys.readouterr().err
+
+
+def test_container_on_a_docker_desktop_wsl_kernel_is_not_rejected(monkeypatch) -> None:
+    """Docker Desktop containers share its WSL2 kernel but not WSL's host transport."""
+    monkeypatch.delenv("WSL_DISTRO_NAME", raising=False)
+    monkeypatch.delenv("WSL_INTEROP", raising=False)
+    monkeypatch.setattr("bosn.paths._running_in_container", lambda: True)
+    monkeypatch.setattr("bosn.paths._kernel_release", lambda: "microsoft-standard-WSL2")
+
+    assert not in_wsl()
+
+
+def test_explicit_wsl_environment_still_wins_inside_a_container(monkeypatch) -> None:
+    monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
+    monkeypatch.setattr("bosn.paths._running_in_container", lambda: True)
+
+    assert in_wsl()
 
 
 # -- shell spellings must be interchangeable, not just comparable ------------

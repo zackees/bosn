@@ -431,8 +431,42 @@ def test_process_alive_treats_windows_access_denied_system_error_as_alive(monkey
     def _raises_system_error(pid: int, sig: int) -> None:
         raise SystemError("<class 'OSError'> returned a result with an exception set")
 
+    monkeypatch.setattr(os, "name", "posix")
     monkeypatch.setattr(os, "kill", _raises_system_error)
+    monkeypatch.setattr(resources, "process_start_time", lambda _pid: 1234.5)
     assert resources.process_alive(4) is True
+
+
+def test_windows_missing_pid_system_error_without_creation_time_is_dead(monkeypatch) -> None:
+    def _raises_system_error(pid: int, sig: int) -> None:
+        raise SystemError("<class 'OSError'> returned a result with an exception set")
+
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(os, "kill", _raises_system_error)
+    monkeypatch.setattr(resources, "process_start_time", lambda _pid: None)
+    assert resources.process_alive(4) is False
+
+
+def test_windows_process_alive_never_uses_os_kill(monkeypatch) -> None:
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(resources, "_windows_process_exists", lambda _pid: True)
+    monkeypatch.setattr(resources, "process_start_time", lambda _pid: 1234.5)
+    monkeypatch.setattr(
+        os,
+        "kill",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("Windows liveness must be read-only")),
+    )
+
+    assert resources.process_alive(123, 1234.5) is True
+
+
+def test_windows_read_only_probe_distinguishes_missing_and_unknown(monkeypatch) -> None:
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(resources, "_windows_process_exists", lambda _pid: False)
+    assert resources.process_alive(123, 1234.5) is False
+
+    monkeypatch.setattr(resources, "_windows_process_exists", lambda _pid: None)
+    assert resources.process_alive(123, 1234.5) is True
 
 
 def test_process_alive_treats_an_ambiguous_oserror_as_alive(monkeypatch) -> None:
@@ -448,6 +482,7 @@ def test_process_alive_treats_an_ambiguous_oserror_as_alive(monkeypatch) -> None
     def _raises_winerror_87(pid: int, sig: int) -> None:
         raise OSError(22, "The parameter is incorrect")
 
+    monkeypatch.setattr(os, "name", "posix")
     monkeypatch.setattr(os, "kill", _raises_winerror_87)
     monkeypatch.setattr(resources, "process_start_time", lambda _pid: 1234.5)
     assert resources.process_alive(4) is True
@@ -465,6 +500,7 @@ def test_an_ambiguous_oserror_without_a_creation_time_is_dead(monkeypatch) -> No
     def _raises_winerror_87(pid: int, sig: int) -> None:
         raise OSError(22, "The parameter is incorrect")
 
+    monkeypatch.setattr(os, "name", "posix")
     monkeypatch.setattr(os, "kill", _raises_winerror_87)
     monkeypatch.setattr(resources, "process_start_time", lambda _pid: None)
     assert resources.process_alive(4) is False
@@ -476,6 +512,7 @@ def test_process_alive_still_reports_a_missing_process_as_dead(monkeypatch) -> N
     def _raises_lookup(pid: int, sig: int) -> None:
         raise ProcessLookupError
 
+    monkeypatch.setattr(os, "name", "posix")
     monkeypatch.setattr(os, "kill", _raises_lookup)
     assert resources.process_alive(4) is False
 
