@@ -101,6 +101,7 @@ VERBS: dict[str, tuple[str, str]] = {
     "ensure": ("pre-warm a stack without running a command", "implemented"),
     "adopt": ("recover labeled resources into this registry", "implemented"),
     "doctor": ("engine health and reachability", "implemented"),
+    "init": ("translate a Compose file into bosn.toml (alias: bosn-docker init)", "implemented"),
 }
 
 
@@ -175,6 +176,15 @@ def build_parser(*, json_errors: bool = False) -> argparse.ArgumentParser:
                 action="store_true",
                 default=False,
                 help="apply the adoption; without it, only report what would be adopted",
+            )
+        if verb == "init":
+            # Matches `bosn-docker init`'s flag surface (see docker_cli._parse_init_args)
+            # so the two verbs are interchangeable per #46.
+            sub.add_argument("--compose", default="compose.yaml", help="Compose file to read")
+            sub.add_argument(
+                "--output",
+                default="bosn.toml",
+                help="manifest path to write (refuses to overwrite)",
             )
         if verb == "gc":
             group = sub.add_mutually_exclusive_group()
@@ -1064,6 +1074,30 @@ def cmd_ensure(opts: Options) -> int:
     return 0
 
 
+def cmd_init(opts: Options) -> int:
+    """Translate a Compose file into a manifest; #46 moves this on-ramp under `bosn`.
+
+    `bosn-docker init` remains a working alias (`docker_cli.main`'s own `init` branch),
+    since both call the same `run_init` -- there is exactly one implementation of the
+    translation, the write, and the no-clobber refusal to keep in sync.
+    """
+    from pathlib import Path
+
+    from bosn.docker_cli import DockerFrontDoorError, run_init
+
+    try:
+        output = run_init(Path(opts.compose or "compose.yaml"), Path(opts.output or "bosn.toml"))
+    except (OSError, DockerFrontDoorError) as exc:
+        return _error(
+            code="init.failed",
+            message=str(exc),
+            next_step="fix the Compose file, or pass --output to pick a different path, and retry",
+            as_json=opts.json,
+        )
+    print(f"wrote {output}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     from bosn.paths import in_wsl
 
@@ -1116,10 +1150,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "gc": cmd_gc,
         "done": cmd_done,
         "adopt": cmd_adopt,
+        "init": cmd_init,
     }
     handler = handlers.get(opts.verb)
     if handler is not None:
-        if opts.json and opts.verb not in {"tasks", "gc", "adopt"}:
+        if opts.json and opts.verb not in {"tasks", "gc", "adopt", "init"}:
             # Older human-oriented verbs already return useful exit codes and write
             # diagnostics to stderr.  Adapt that boundary once so JSON callers never
             # need to parse prose while those commands are migrated individually.

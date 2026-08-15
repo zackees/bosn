@@ -32,7 +32,7 @@ policy instead of a blunt instrument.
 > daemon-owned build jobs with `bosn attach`. All covered end to end against a real Docker
 > engine on Linux CI.
 >
-> **Partial:** the Docker front door — `bosn-docker init` and `bosn-docker compose
+> **Partial:** the Docker front door — `bosn init` (alias: `bosn-docker init`) and `bosn-docker compose
 > {up,down,logs,ps}` only, over a small compose subset. See
 > [Coming from Docker](#coming-from-docker).
 >
@@ -206,7 +206,7 @@ at two spaces, and an `image:` key. **A `ports:`, `environment:`, `volumes:`, or
 skeleton generator for image-only services, not a migration tool.
 
 ```bash
-bosn-docker init --compose compose.yaml   # also: --output
+bosn init --compose compose.yaml          # also: --output; alias: bosn-docker init
 bosn-docker compose -f other.yaml up      # also: down, logs, ps
 ```
 

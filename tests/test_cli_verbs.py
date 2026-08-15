@@ -324,3 +324,89 @@ def test_a_daemon_still_draining_is_not_reported_as_absent(tmp_path, monkeypatch
     err = capsys.readouterr().err
     assert "still shutting down" in err
     assert "bosn jobs" in err
+
+
+# -- init: Compose migration moved under `bosn` (#46) -------------------------------------
+
+
+def _write_compose(tmp_path, image: str = "alpine:3.20"):
+    compose = tmp_path / "compose.yaml"
+    compose.write_text(f"services:\n  app:\n    image: {image}\n", encoding="utf-8")
+    return compose
+
+
+def test_init_writes_a_manifest_from_a_compose_file(tmp_path, capsys) -> None:
+    compose = _write_compose(tmp_path)
+    output = tmp_path / "bosn.toml"
+
+    code = cli.main(["init", "--compose", str(compose), "--output", str(output)])
+
+    assert code == 0
+    assert output.exists()
+    assert 'image = "alpine:3.20"' in output.read_text(encoding="utf-8")
+    assert str(output) in capsys.readouterr().out
+
+
+def test_init_refuses_to_overwrite_an_existing_output(tmp_path, capsys) -> None:
+    compose = _write_compose(tmp_path)
+    output = tmp_path / "bosn.toml"
+    output.write_text("# pre-existing\n", encoding="utf-8")
+
+    code = cli.main(["init", "--compose", str(compose), "--output", str(output)])
+
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "refusing to overwrite" in err
+    assert str(output) in err
+
+
+def test_init_refuses_to_overwrite_with_the_json_envelope(tmp_path, capsys) -> None:
+    compose = _write_compose(tmp_path)
+    output = tmp_path / "bosn.toml"
+    output.write_text("# pre-existing\n", encoding="utf-8")
+
+    code = cli.main(["init", "--compose", str(compose), "--output", str(output), "--json"])
+
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["code"] == "init.failed"
+    assert "refusing to overwrite" in payload["message"]
+    assert payload["next"]
+
+
+def test_init_malformed_compose_produces_the_envelope_not_a_traceback(tmp_path, capsys) -> None:
+    compose = tmp_path / "compose.yaml"
+    compose.write_text("services:\n  app:\n    build: {}\n", encoding="utf-8")
+    output = tmp_path / "bosn.toml"
+
+    code = cli.main(["init", "--compose", str(compose), "--output", str(output), "--json"])
+
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["code"] == "init.failed"
+    assert payload["next"]
+    assert not output.exists()
+
+
+def test_bosn_docker_init_alias_still_works(tmp_path, capsys) -> None:
+    from bosn import docker_cli
+
+    compose = _write_compose(tmp_path)
+    output = tmp_path / "bosn.toml"
+
+    code = docker_cli.main(["init", "--compose", str(compose), "--output", str(output)])
+
+    assert code == 0
+    assert output.exists()
+    assert 'image = "alpine:3.20"' in output.read_text(encoding="utf-8")
+
+
+def test_init_help_lists_the_compose_and_output_flags(capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["init", "--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "--compose" in out
+    assert "--output" in out
