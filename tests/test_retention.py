@@ -382,14 +382,19 @@ def test_non_container_kinds_are_unaffected_by_run_state(
     assert verdict.reason == COLLECT_IDLE
 
 
-def test_a_running_container_is_not_collected_by_an_explicit_done(
+def test_an_explicit_done_collects_a_running_container(
     registry: Registry, clock: FakeClock
 ) -> None:
-    """Executing work is not disposable, even on the strongest first-party signal there is.
+    """`done` outranks run state, because "running" is not the same as "doing work".
 
-    `workspace_done` is a first-party signal, but it is set on the *workspace*, not
-    observed on the *container* -- it says nothing about whether the process inside the
-    container has finished. Run state is fresher and more specific, so it wins.
+    bosn's own persistent container idles in a running state indefinitely. Treating run
+    state as absolute meant `bosn done` reclaimed nothing at all for a workspace whose
+    container was merely up -- the normal case, and the whole point of the verb. A real
+    Docker scenario test caught exactly that.
+
+    `done` is a first-party statement that the workspace is finished. Run state overrides
+    age and pressure, which are only guesses about idleness; it does not override someone
+    saying outright that they are done.
     """
     resource = make(registry, kind="container")
 
@@ -401,15 +406,19 @@ def test_a_running_container_is_not_collected_by_an_explicit_done(
         running_containers=frozenset({resource.name}),
     )
 
-    assert not verdict.collect
-    assert verdict.reason == KEPT_RUNNING
+    assert verdict.collect
+    assert verdict.reason == COLLECT_DONE
 
 
-def test_a_running_container_is_not_collected_by_supersession(
-    registry: Registry, clock: FakeClock
-) -> None:
+def test_supersession_collects_a_running_container(registry: Registry, clock: FakeClock) -> None:
+    """Same rule as `done`: a superseded generation is a statement, not a guess.
+
+    The old generation's container may still be up, but the manifest has already rolled
+    forward past it. Holding it because it happens to be running would keep every
+    superseded generation alive for as long as its container idles.
+    """
     resource = make(registry, kind="container")
-    clock.advance(2 * DAY)  # past the superseded cap
+    clock.advance(2 * DAY)
 
     verdict = evaluate(
         registry,
@@ -419,8 +428,8 @@ def test_a_running_container_is_not_collected_by_supersession(
         running_containers=frozenset({resource.name}),
     )
 
-    assert not verdict.collect
-    assert verdict.reason == KEPT_RUNNING
+    assert verdict.collect
+    assert verdict.reason == COLLECT_SUPERSEDED
 
 
 def test_a_lease_outranks_running_in_the_reported_reason(

@@ -155,18 +155,22 @@ def evaluate(
         # including an explicit `done`.
         return Verdict(resource, False, KEPT_LEASED)
 
-    if resource.kind == "container":
-        running = True if running_containers is None else resource.name in running_containers
-        if running:
-            # A running container is doing work right now -- it is not the "cheap to
-            # recreate from a warm image" object the age tiers were designed around. This
-            # sits ahead of quiet-period/superseded/done/pressure so none of them can
-            # override it: registry-derived signals (done, superseded generation) are
-            # inherently stale the moment `compose up -d` returns and releases its lease,
-            # while the engine's own run state is first-party and current. The cost of
-            # waiting is bounded -- the very next pass that observes the container stopped
-            # lets it rejoin the normal tiers.
-            return Verdict(resource, False, KEPT_RUNNING)
+    running = resource.kind == "container" and (
+        True if running_containers is None else resource.name in running_containers
+    )
+    if running and not (workspace_done or superseded):
+        # A running container is not the "cheap to recreate from a warm image" object the
+        # age tiers were designed around, so run state outranks age and pressure. It does
+        # *not* outrank an explicit `done` or a superseded generation, and the distinction
+        # is the difference between "running" and "doing work": bosn's own persistent
+        # container idles in a running state indefinitely, so treating running as absolute
+        # meant `bosn done` reclaimed nothing at all for a workspace whose container was
+        # merely up -- which is the normal case, and the whole point of the verb.
+        #
+        # `done` and supersession are first-party statements that this workspace or
+        # generation is finished. Age and pressure are only guesses about idleness, and
+        # those are exactly the guesses a running container should override.
+        return Verdict(resource, False, KEPT_RUNNING)
 
     age = now - resource.last_used
 
