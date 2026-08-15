@@ -14,7 +14,7 @@ from bosn.docker_cli import (
     compose_to_manifest,
     main,
 )
-from bosn.frontdoor import Category, VerbSpec
+from bosn.frontdoor import COMPOSE_COMMANDS, Category, VerbSpec
 from bosn.registry import Registry
 
 
@@ -489,6 +489,230 @@ def test_logs_and_ps_still_accept_no_arguments(tmp_path: Path) -> None:
     """`logs`/`ps` never grew an accepted subset -- only `up`/`down` did."""
     with pytest.raises(DockerFrontDoorError, match="-f"):
         _run_compose("logs", tmp_path / "compose.yaml", ["-f"])
+
+
+# -- the four verbs #47 declared but never wired: build/run/exec/config ------
+
+
+def test_parser_accepts_exactly_what_compose_commands_declares(tmp_path: Path) -> None:
+    """The parser used to hardcode `choices=["up", "down", "logs", "ps"]` -- four of the
+    eight sub-verbs `frontdoor.COMPOSE_COMMANDS` (and therefore the generated docs and
+    `--supported --json`) already declared, so `build`/`run`/`exec`/`config` were
+    advertised as supported and rejected by argparse before ever reaching dispatch.
+
+    Asserted directly against the table, not a literal copy of its current contents, so a
+    future ninth sub-verb added to `COMPOSE_FLAGS` without the parser being touched fails
+    this test instead of silently going unimplemented again. The negative half is exercised
+    against `_run_compose`, not the parser: an invalid sub-verb must not raise `SystemExit`
+    (argparse's own bare exit-2 usage dump) -- it must refuse through the same
+    `DockerFrontDoorError` path every other compose refusal in this module uses. See
+    `test_an_undeclared_compose_subcommand_refuses_with_the_structured_envelope` below.
+    """
+    parser = docker_cli._parse_compose_args
+    for command in COMPOSE_COMMANDS:
+        ns = parser([command])
+        assert ns.command == command
+
+
+def test_an_undeclared_compose_subcommand_refuses_with_the_structured_envelope(
+    tmp_path: Path,
+) -> None:
+    """An unrecognized compose sub-verb (a typo, or one this table has never heard of) must
+    refuse the same way every other unsupported compose flag/argument does: a
+    `DockerFrontDoorError` `main()` turns into prose-on-stderr and exit code 1, not
+    argparse's bare `SystemExit(2)` usage dump the parser alone would give.
+    """
+    with pytest.raises(DockerFrontDoorError, match="frobnicate"):
+        _run_compose("frobnicate", _compose_file(tmp_path), [])
+
+
+def test_main_refuses_an_undeclared_compose_subcommand(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Same refusal, exercised end to end through `main()` -- the compose branch has no
+    `--json` envelope of its own (see `_run_compose`'s dispatch comment), so this is prose
+    on stderr and exit code 1, exactly like `test_compose_subset_refuses_unknown_argument`.
+    """
+
+    def _fail_if_called(*_a: Any, **_k: Any) -> _FakeCompleted:
+        raise AssertionError("an unrecognized sub-verb must never reach the engine")
+
+    monkeypatch.setattr(docker_cli.subprocess, "run", _fail_if_called)
+
+    returncode = main(["compose", "frobnicate"])
+
+    assert returncode == 1
+    assert "frobnicate" in capsys.readouterr().err
+
+
+def test_a_global_file_flag_typed_after_the_subverb_still_refuses_naming_it(
+    tmp_path: Path,
+) -> None:
+    """`-f`/`--file` is parsed ahead of the sub-verb (`compose -f FILE up`, not
+    `compose up -f FILE`). It is `resolve_compose_flag`'s ACCEPTED global row for every
+    sub-verb except `logs` (which overrides it), so a naive ACCEPTED/REFUSED check on that
+    lookup alone would let it silently pass validation here and reach the engine positioned
+    after the sub-verb, where Compose does not read it as bosn intends. Must still refuse,
+    naming the flag, exactly like any other out-of-place argument.
+    """
+    with pytest.raises(DockerFrontDoorError, match="-f"):
+        _run_compose("up", _compose_file(tmp_path), ["-f", "other-compose.yaml"])
+
+    with pytest.raises(DockerFrontDoorError, match="--file"):
+        _run_compose("down", _compose_file(tmp_path), ["--file", "other-compose.yaml"])
+
+
+@pytest.mark.parametrize(
+    ("command", "extra"),
+    [
+        ("build", []),
+        ("config", []),
+        # `run`/`exec` take a mandatory SERVICE (`COMPOSE_SERVICE_COMMANDS`); passing none
+        # is its own refusal, covered below, so the reach-the-engine case has to supply one.
+        ("exec", ["app", "sh"]),
+        ("run", ["app"]),
+    ],
+)
+def test_the_four_newly_governed_verbs_reach_the_engine_with_the_verb_intact(
+    command: str, extra: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`build`/`config`/`exec`/`run` used to refuse before reaching `_run_compose` at all
+    (blocked by the hardcoded `choices=` above); now they route through the same governed
+    path `up`/`down`/`logs`/`ps` already use.
+    """
+    fake_daemon = _FakeDaemon()
+    monkeypatch.setattr(daemon, "request", fake_daemon.request)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "bosn.docker_cli.subprocess.run",
+        lambda argv, **_k: (calls.append(argv), _FakeCompleted(returncode=0))[1],
+    )
+
+    returncode = _run_compose(command, _compose_file(tmp_path), list(extra))
+
+    assert returncode == 0
+    # The verb sits immediately before its own arguments, and those arrive in order --
+    # asserting on the tail rather than `[-1]` so the SERVICE/COMMAND tokens are pinned too.
+    assert calls[0][-1 - len(extra) :] == [command, *extra]
+
+
+def test_a_built_services_image_carries_the_bosn_label_contract_in_the_overlay(
+    tmp_path: Path,
+) -> None:
+    """A service's plain `labels:` land on the *container* Compose creates, never on an
+    image `build:` produces -- `compose build` would otherwise hand back a fully
+    unlabeled, unregistered image, exactly the ungoverned resource #48 exists to prevent.
+    The overlay must also carry a `build.labels` block, `kind="image"`, for any service
+    with a `build:` key.
+    """
+    (tmp_path / "ctx").mkdir()
+    (tmp_path / "ctx" / "Dockerfile").write_text("FROM alpine\n", encoding="utf-8")
+    text = _overlay_text(
+        tmp_path,
+        "services:\n  app:\n    build: ./ctx\n    labels:\n      existing: yes\n",
+    )
+    # The container-side contract is untouched.
+    assert _labelled(text)["app"]["kind"] == "container"
+
+    build_labels_index = text.index("build:")
+    assert build_labels_index != -1
+    build_block = text[build_labels_index:]
+    kind_line = next(line for line in build_block.splitlines() if "com.zackees.bosn.kind" in line)
+    assert kind_line.split(":", 1)[1].strip().strip("'\"") == "image"
+
+
+def test_a_build_only_service_also_gets_an_image_label_block(tmp_path: Path) -> None:
+    """`is_build_only` services (`build:` with no `image:`) are exactly the class of
+    service `compose build`/an implicit build under `up` targets -- they must be governed
+    too, not just services that also declare an `image:`.
+    """
+    (tmp_path / "ctx").mkdir()
+    (tmp_path / "ctx" / "Dockerfile").write_text("FROM alpine\n", encoding="utf-8")
+    text = _overlay_text(
+        tmp_path,
+        "services:\n  app:\n    build: ./ctx\n",
+    )
+    assert "build:" in text
+    services_section = text.split("networks:", 1)[0]
+    assert services_section.count("com.zackees.bosn.kind") == 2  # container + image
+
+
+def test_a_service_with_no_build_key_gets_no_build_labels_block(tmp_path: Path) -> None:
+    text = _overlay_text(tmp_path, "services:\n  app:\n    image: alpine\n")
+    assert "build:" not in text
+
+
+def test_run_acquires_and_releases_the_project_lease_like_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`run` creates a container, so it must be leased and reconciled exactly like `up` --
+    verified against a real `docker compose run` merge, which does apply a service's
+    `labels:` to the container it starts (same mechanism `up` relies on), so no separate
+    label plumbing is needed for `run` -- only the same lease/reconcile treatment.
+    """
+    fake_daemon = _FakeDaemon()
+    monkeypatch.setattr(daemon, "request", fake_daemon.request)
+    monkeypatch.setattr(
+        "bosn.docker_cli.subprocess.run", lambda *a, **k: _FakeCompleted(returncode=0)
+    )
+
+    returncode = _run_compose("run", _compose_file(tmp_path), ["app"])
+
+    assert returncode == 0
+    assert fake_daemon.calls == [
+        "status",
+        "compose-adopt",
+        "compose-acquire",
+        "compose-release",
+        "compose-adopt",
+    ]
+
+
+def test_a_container_command_survives_flag_validation_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Everything after the SERVICE token belongs to the *container*, not to `compose exec`.
+
+    `exec app ls -la` must reach the engine with `-la` attached to `ls`. Running trailing
+    tokens through `resolve_compose_flag` would refuse `-la` as an unsupported compose flag
+    and make every non-trivial command line unusable -- so this pins the boundary against a
+    future "validate all the args" simplification.
+    """
+    fake_daemon = _FakeDaemon()
+    monkeypatch.setattr(daemon, "request", fake_daemon.request)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "bosn.docker_cli.subprocess.run",
+        lambda argv, **_k: (calls.append(argv), _FakeCompleted(returncode=0))[1],
+    )
+
+    assert _run_compose("exec", _compose_file(tmp_path), ["app", "ls", "-la"]) == 0
+    assert calls[0][-4:] == ["exec", "app", "ls", "-la"]
+
+
+@pytest.mark.parametrize("command", ["run", "exec"])
+def test_a_service_scoped_verb_refuses_when_no_service_is_named(
+    command: str, tmp_path: Path
+) -> None:
+    """Docker itself errors on `compose run` with no service, so bosn refuses in its own
+    envelope rather than spending an engine spawn and an overlay render to learn nothing.
+    """
+    with pytest.raises(DockerFrontDoorError, match="requires a service name"):
+        _run_compose(command, _compose_file(tmp_path), [])
+
+
+@pytest.mark.parametrize("command", ["run", "exec"])
+def test_a_service_scoped_verb_still_refuses_flags_before_the_service(
+    command: str, tmp_path: Path
+) -> None:
+    """The SERVICE split must not become a hole: tokens *before* the service are still
+    flags, and `run`/`exec` accept none, so they refuse exactly as they did before.
+    """
+    with pytest.raises(DockerFrontDoorError, match="-d"):
+        _run_compose(command, _compose_file(tmp_path), ["-d", "app"])
+
+    with pytest.raises(DockerFrontDoorError, match="must come before the sub-verb"):
+        _run_compose(command, _compose_file(tmp_path), ["-f", "other.yaml", "app"])
 
 
 # -- detached `up -d`/`up --wait` still releases its lease immediately (#47) --

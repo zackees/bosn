@@ -55,8 +55,8 @@ policy instead of a blunt instrument.
 
 This is not hypothetical. It happened, on one developer machine, in the summer of 2026.
 
-Every agent-created git worktree spawned its own five-volume Rust cache group (`target`,
-`CARGO_HOME`, `RUSTUP_HOME`, cargo-chef, `.soldr`). Retained history showed **268 Docker
+Every agent-created git worktree spawned its own five-volume cache group (`target`,
+`cargo-home`, `soldr-home`, `uv-cache`, `venv`). Retained history showed **268 Docker
 invocations and zero cleanup calls.** Nothing had a TTL, so nothing was ever deleted:
 
 | Date | State |
@@ -273,8 +273,12 @@ Every volume declares a **scope**, which decides what it is keyed on:
 `target/` is a cold build after every source edit, which is the opposite of what you want
 from a cache. Use `stack` for anything whose value is being warm.
 
-That drops the soldr stack from **five per-worktree volumes to two**. With ten worktrees,
-50 volumes become 23 — and the shared ones are the big ones.
+Applied to soldr's own five (`target`, `cargo-home`, `soldr-home`, `uv-cache`, `venv`,
+per `Runner.volumes` in `ci/perf_local.py`): `cargo-home`, `soldr-home`, and `uv-cache` are
+content-identical per machine and become `machine`-scoped; `target` and `venv` are built
+from the checkout's own source and stay `stack`-scoped. That drops the stack from **five
+per-worktree volumes to two**. With ten worktrees, 50 volumes become 23 — and the shared
+ones are the big ones.
 
 **`family` is the sharing key, and it is easy to get wrong.** A `machine` volume is named
 from the stack's `family`, falling back to the stack *name* when no family is set. So two

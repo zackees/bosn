@@ -203,6 +203,118 @@ def test_a_real_soldr_volume_adopts_even_though_it_carries_no_schema_label() -> 
     assert mapped.kind == "volume"
 
 
+def test_all_five_real_soldr_volume_names_from_one_root_adopt_to_one_workspace() -> None:
+    """Shaped like an actual checkout, not the two-label fixture in isolation.
+
+    `Runner.volumes` in soldr/ci/perf_local.py returns exactly these five names for one
+    checkout root (`target`, `cargo-home`, `soldr-home`, `uv-cache`, `venv`), each created
+    with only `.managed` and `.source-root` (verified in `ensure_runner`'s `docker volume
+    create` call -- no other label is ever passed to a volume). All five must adopt and
+    land in the same workspace, or the family is dead on arrival against soldr's real shape.
+    """
+    root = "/home/dev/soldr"
+    names = [
+        "soldr-perf-target-soldr-a6c74af0",
+        "soldr-perf-cargo-home-soldr-a6c74af0",
+        "soldr-perf-soldr-home-soldr-a6c74af0",
+        "soldr-perf-uv-cache-soldr-a6c74af0",
+        "soldr-perf-venv-soldr-a6c74af0",
+    ]
+    engine = FakeEngine(
+        {
+            "volume": [
+                {
+                    "Name": name,
+                    "Labels": json.dumps(
+                        soldr_volume_labels(
+                            **{
+                                "io.soldr.perf-local.source-root": root,
+                            }
+                        )
+                    ),
+                }
+                for name in names
+            ]
+        }
+    )
+    plan = legacy.plan_adoption(
+        ResourceScanner(engine),  # type: ignore[arg-type]
+        legacy.SOLDR,
+        registry_id=OURS,
+        now=1000.0,
+    )
+    assert {entry.resource.name for entry in plan.eligible} == set(names)
+    assert {entry.new_labels.workspace for entry in plan.eligible} == {root}
+    assert plan.refused == ()
+    assert plan.skipped_immutable == ()
+
+
+def test_two_checkout_roots_map_to_two_distinct_workspaces_not_one() -> None:
+    """The per-worktree duplication issue #75 measures: two checkouts' volumes must never
+    collide into a single adopted workspace, even though both carry the same producer
+    labels and only differ by `.source-root`."""
+    root_a = "/home/dev/soldr"
+    root_b = "/home/dev/soldr2"
+    engine = FakeEngine(
+        {
+            "volume": [
+                {
+                    "Name": "soldr-perf-target-soldr-a6c74af0",
+                    "Labels": json.dumps(
+                        soldr_volume_labels(**{"io.soldr.perf-local.source-root": root_a})
+                    ),
+                },
+                {
+                    "Name": "soldr-perf-target-soldr2-b1c2d3e4",
+                    "Labels": json.dumps(
+                        soldr_volume_labels(**{"io.soldr.perf-local.source-root": root_b})
+                    ),
+                },
+            ]
+        }
+    )
+    plan = legacy.plan_adoption(
+        ResourceScanner(engine),  # type: ignore[arg-type]
+        legacy.SOLDR,
+        registry_id=OURS,
+        now=1000.0,
+    )
+    workspaces_by_name = {
+        entry.resource.name: entry.new_labels.workspace for entry in plan.eligible
+    }
+    assert workspaces_by_name == {
+        "soldr-perf-target-soldr-a6c74af0": root_a,
+        "soldr-perf-target-soldr2-b1c2d3e4": root_b,
+    }
+    assert len(set(workspaces_by_name.values())) == 2
+
+
+def test_a_volume_from_a_different_producer_namespace_is_not_adopted_by_legacy_soldr() -> None:
+    """Label-gated, never name-gated: a volume shaped like soldr's real target volume but
+    stamped under a different producer's namespace (e.g. clud, which manages the same kind
+    of Rust cache) must not qualify for `--legacy soldr`."""
+    engine = FakeEngine(
+        {
+            "volume": [
+                {
+                    "Name": "clud-docker-build-soldr-abc123-target",
+                    "Labels": json.dumps(
+                        clud_volume_labels(**{"com.clud.docker-build.cache-role": "target"})
+                    ),
+                },
+            ]
+        }
+    )
+    plan = legacy.plan_adoption(
+        ResourceScanner(engine),  # type: ignore[arg-type]
+        legacy.SOLDR,
+        registry_id=OURS,
+        now=1000.0,
+    )
+    assert plan.eligible == ()
+    assert plan.is_empty()
+
+
 def test_a_soldr_volume_missing_its_source_root_still_fails_closed() -> None:
     """Relaxing the schema rule must not relax the required fields it sat in front of."""
     without_root = soldr_volume_labels()
