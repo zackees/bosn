@@ -38,6 +38,10 @@ class Options:
     args: tuple[str, ...] = ()
     json: bool = False
 
+    # init (Compose migration)
+    compose: str | None = None
+    output: str | None = None
+
     # gc
     dry_run: bool = True
 
@@ -135,6 +139,8 @@ def from_namespace(ns: argparse.Namespace) -> Options:
         yes=bool(get("yes", False)),
         args=get_list("args"),
         json=bool(get("json", False)),
+        compose=_as_str(get("compose")),
+        output=_as_str(get("output")),
         dry_run=bool(get("dry_run", True)),
         port=None if port is None else int(str(port)),
         idle_retire_seconds=None if idle is None else float(str(idle)),
