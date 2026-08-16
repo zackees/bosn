@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from bosn import cli
+from bosn import cli, ipc
 
 UNIMPLEMENTED = sorted(v for v, (_, phase) in cli.VERBS.items() if phase != "implemented")
 
@@ -126,6 +126,52 @@ def test_gc_json_daemon_error_has_stable_remedy(tmp_path, capsys, monkeypatch) -
     payload = json.loads(capsys.readouterr().out)
     assert payload["code"] == "daemon.unreachable"
     assert payload["next"] == "start or restart the daemon, then retry"
+
+
+def test_gc_timeout_is_not_reported_as_an_unreachable_daemon(tmp_path, capsys, monkeypatch) -> None:
+    """A busy daemon and an absent one have opposite remedies (#110).
+
+    `ipc.TransportTimeout` subclasses `TransportError`, so before this distinction existed
+    a `gc` that simply took longer than its budget fell into the clause above and told the
+    user to "start or restart the daemon" -- the one action that would interrupt the
+    collection being waited on, which continues regardless of this client giving up. I hit
+    this for real running `bosn gc` on a host with ~280 Docker objects.
+    """
+    from bosn import daemon
+
+    def slow(*_args, **_kwargs):
+        raise ipc.TransportTimeout("timed out waiting for the daemon")
+
+    monkeypatch.setattr(daemon, "request", slow)
+    assert cli.main(["--state-dir", str(tmp_path), "gc", "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["code"] == "gc.timeout"
+    assert "do not restart it" in payload["next"]
+    assert "restart the daemon, then retry" not in payload["next"]
+
+
+def test_gc_asks_the_daemon_for_more_than_the_shared_default_budget(tmp_path, monkeypatch) -> None:
+    """`gc`'s daemon-side cost is unrelated to what every other verb needs (#110).
+
+    Measured on a ~280-object host, `docker system df -v` alone is 5.2s and the scan adds
+    7-24s more, so the shared 10s default could not cover even the first step. Asserting on
+    the request rather than on the constant, so the wiring is what is pinned -- defining
+    the constant and forgetting to pass it would leave the bug in place.
+    """
+    from bosn import daemon
+
+    seen: dict[str, object] = {}
+
+    def capture(verb, *_args, **kwargs):
+        seen["verb"] = verb
+        seen["request_timeout"] = kwargs.get("request_timeout")
+        return {"ok": True, "result": {"collected": [], "kept": []}}
+
+    monkeypatch.setattr(daemon, "request", capture)
+    cli.main(["--state-dir", str(tmp_path), "gc", "--dry-run", "--json"])
+    assert seen["verb"] == "gc"
+    assert seen["request_timeout"] == cli.GC_REQUEST_TIMEOUT_SECONDS
+    assert cli.GC_REQUEST_TIMEOUT_SECONDS > ipc.DEFAULT_TIMEOUT
 
 
 def test_done_json_error_uses_the_common_envelope(tmp_path, monkeypatch, capsys) -> None:

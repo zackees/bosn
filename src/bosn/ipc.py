@@ -34,6 +34,19 @@ class TransportError(RuntimeError):
     """The daemon could not be reached or spoke nonsense."""
 
 
+class TransportTimeout(TransportError):
+    """The daemon was reached but did not answer inside the caller's budget.
+
+    Deliberately a *subclass*, so every existing `except TransportError` keeps catching
+    it and no caller has to learn about this distinction to stay correct. It exists for
+    the callers that should: "the daemon is not there" and "the daemon is busy" have
+    opposite remedies, and conflating them produced actively harmful advice -- `bosn gc`
+    reported "cannot reach the bosn daemon ... start or restart the daemon" for a daemon
+    that was reachable and mid-collection, where restarting is the one thing that would
+    interrupt the work being waited on (#110).
+    """
+
+
 class MessageStream:
     """Reads newline-delimited JSON objects off a socket, buffering across messages."""
 
@@ -49,7 +62,7 @@ class MessageStream:
             try:
                 chunk = self.sock.recv(65536)
             except TimeoutError as exc:
-                raise TransportError("timed out waiting for the daemon") from exc
+                raise TransportTimeout("timed out waiting for the daemon") from exc
             except OSError as exc:
                 raise TransportError(f"connection to the daemon failed: {exc}") from exc
             if not chunk:
