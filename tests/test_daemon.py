@@ -23,7 +23,8 @@ from bosn import daemon as daemon_mod
 from bosn import ipc
 from bosn.clock import FakeClock
 from bosn.daemon import Daemon, DaemonError, DaemonState
-from bosn.engine import EngineInfo
+from bosn.engine import EngineError, EngineInfo
+from bosn.registry import Registry
 
 
 def _detach_code() -> str:
@@ -1088,6 +1089,175 @@ def test_shutdown_does_not_hang_on_a_blocked_engine_probe(monkeypatch, tmp_path:
             assert not watchdog.is_alive(), "watchdog never noticed the probe unblocking"
 
     assert exceptions == [], f"watchdog raised unhandled exception(s): {exceptions}"
+
+
+def test_shutdown_does_not_close_registry_while_startup_reconcile_still_running(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #101: `shutdown()` must not close the registry while the startup-reconcile
+    thread (`_reconcile_startup_resources`) can still write to it.
+
+    The captured traceback that opened #101 was not "nothing catches the scan failure" --
+    the handler *is* guarded (`except EngineError`, logging the failure). The actual crash
+    was the guard's own logging call: `shutdown()` had already closed the registry by the
+    time the handler ran, so `self.registry.log_event(...)` raised
+    `sqlite3.ProgrammingError: Cannot operate on a closed database` from a background
+    thread with nothing positioned to catch it.
+
+    This reproduces that race deterministically instead of trying to win it against a real
+    engine scan: `ResourceScanner.scan` is replaced with a version that blocks on a
+    `threading.Event` until the test releases it, so the test controls exactly when the
+    scan (and thus the `EngineError` it raises) happens relative to `shutdown()` -- release
+    it only after `shutdown()` has already run and decided what to do about the registry.
+
+    `RECONCILE_JOIN_TIMEOUT_SECONDS` is monkeypatched to 0.0 (its shipped default, as of
+    the fix for the shutdown-latency regression a first version of this bound introduced --
+    see the constant's own comment for the measurements) rather than left to whatever the
+    module happens to define. That is deliberate, not redundant: pinning it here means this
+    test stays fast and keeps exercising the deferred-close path even if a future change
+    raises the production default back into the seconds -- exactly the kind of "helpful"
+    edit the constant's comment warns against. Without this pin, that edit would slip in
+    silently, this test would just get slower, and the doubling-of-the-suite regression the
+    constant's comment describes could recur without any test catching it. `raising=False`
+    because on the pre-fix code this constant does not exist at all -- the startup-reconcile
+    thread was never tracked or joined by `shutdown()` in the first place, which is exactly
+    the bug.
+    """
+    import bosn.engine
+    import bosn.resources
+
+    scan_entered = threading.Event()
+    release_scan = threading.Event()
+    exceptions: list[BaseException] = []
+
+    def record_exception(args: threading.ExceptHookArgs) -> None:
+        if args.exc_value is not None:
+            exceptions.append(args.exc_value)
+
+    monkeypatch.setattr(threading, "excepthook", record_exception)
+    monkeypatch.setattr(daemon_mod, "RECONCILE_JOIN_TIMEOUT_SECONDS", 0.0, raising=False)
+
+    class MinimalEngine:
+        """Has a callable `.run` so `_reconcile_startup_resources` doesn't take its
+        "test double, not a resource-listing engine" early return. `.run` itself is never
+        actually invoked -- the scan below is what blocks and then raises.
+        """
+
+        def __init__(self, _binary: str, **_kwargs: object) -> None:
+            pass
+
+        def run(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError("engine.run should not be reached; the scan is mocked")
+
+    def blocking_scan(self, _registry_id: str) -> None:
+        scan_entered.set()
+        release_scan.wait(30)
+        raise EngineError("engine unreachable")
+
+    monkeypatch.setattr(bosn.engine, "Engine", MinimalEngine)
+    monkeypatch.setattr(bosn.resources.ResourceScanner, "scan", blocking_scan)
+
+    daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=3600)
+    # Keep the watchdog's own maintenance pass from firing during this test -- it is not
+    # what is under test here, and a fresh registry's first tick is otherwise due
+    # immediately (issue #95/#98's deflaking pattern).
+    daemon._set_next_maintenance(daemon.clock.now() + 3600)
+    thread = threading.Thread(target=daemon.serve_forever, daemon=True)
+    thread.start()
+    try:
+        assert _wait_until(lambda: daemon_mod.is_serving(tmp_path)), "daemon never came up"
+        assert scan_entered.wait(10), "startup reconcile never reached the blocked scan"
+
+        daemon.request_stop()
+        # thread runs serve_forever() -> finally: self.shutdown(). The scan is still
+        # blocked at this point, so this is exercising the exact moment the pre-fix code
+        # would already have closed the registry out from under the reconcile thread.
+        thread.join(timeout=15)
+        assert not thread.is_alive(), "shutdown() hung instead of returning within its bound"
+        assert not daemon_mod.is_serving(tmp_path)
+    finally:
+        # Let the blocked scan raise now, so the handler's `log_event` call runs -- either
+        # into a still-open registry (fixed) or a closed one (the bug). Either way, let it
+        # finish before this test ends so it cannot leak into a later test.
+        release_scan.set()
+        # getattr, not attribute access: on the pre-fix code `_reconcile_startup_resources`
+        # runs on a bare, untracked `threading.Thread` -- there is no `_reconcile_thread`
+        # attribute to join, which is exactly the bug. Fall back to a short sleep so the
+        # background thread still gets a chance to run its (crashing, pre-fix) handler
+        # before this test's assertions run.
+        reconcile = getattr(daemon, "_reconcile_thread", None)
+        if reconcile is not None:
+            reconcile.join(timeout=15)
+            assert not reconcile.is_alive(), "startup reconcile never noticed the scan unblocking"
+        else:
+            time.sleep(0.5)
+
+    assert exceptions == [], f"startup reconcile raised unhandled exception(s): {exceptions}"
+
+    # Not just "nothing crashed" -- the diagnostic the handler exists to record must have
+    # actually landed. A fix that silently swallowed the log (e.g. by guarding it on
+    # `_stop.is_set()` alone, which the #101 comment thread explicitly rejected as
+    # insufficient) would pass a crash-only assertion while losing the event. Read through
+    # a fresh read-only connection rather than `daemon.registry`: by this point the
+    # deferred-close thread may already have closed the daemon's own connection.
+    reader = Registry(tmp_path / "registry.sqlite3", read_only=True)
+    try:
+        kinds = [row["kind"] for row in reader.events()]
+    finally:
+        reader.close()
+    assert "recovery.scan.unavailable" in kinds
+
+
+def test_a_second_shutdown_after_a_deferred_close_does_not_raise(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """`shutdown()` must survive being called again after a deferred close already ran.
+
+    `shutdown()` runs twice in normal operation -- once from `serve_forever`'s `finally`,
+    once explicitly by a caller or fixture. When the first call defers the registry close
+    to a background thread, that thread can close the connection at a moment the second
+    call has no way to observe. The second call then reaches its own
+    `shutdown.background_join_timeout` event and writes to a connection that is already
+    gone.
+
+    CI caught exactly that as a teardown error -- `sqlite3.ProgrammingError: Cannot
+    operate on a closed database` raised from `shutdown()` itself -- which is the very
+    failure class #101 set out to remove, reappearing one line away from where it was
+    fixed. The lesson of that issue is that a *diagnostic* must never be the thing that
+    crashes, and it applies to the code doing the fixing too.
+
+    A first version of this test drove two real `shutdown()` calls around a thread that
+    finished in between. It passed against the unguarded code: by the second call the
+    thread was done, `outstanding` was empty, and the unguarded line was never reached at
+    all. Running it against the unguarded code before trusting it is the only reason that
+    was caught -- which is the same discipline the fix's own RED check applies.
+    """
+    release = threading.Event()
+    monkeypatch.setattr(daemon_mod, "RECONCILE_JOIN_TIMEOUT_SECONDS", 0.0, raising=False)
+
+    daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=3600)
+    daemon._set_next_maintenance(daemon.clock.now() + 3600)
+    busy = threading.Thread(target=lambda: release.wait(30), daemon=True)
+    busy.start()
+    try:
+        # The two conditions are established directly rather than raced for. The real
+        # sequence is narrow -- an earlier call's deferred close has to land between this
+        # call's `_bounded_join` deciding a thread is outstanding and its logging of that
+        # decision -- and a test that tried to hit that window by timing would be the
+        # flaky, proves-nothing kind this suite has already had to fix once (#95). What
+        # must hold is simpler than the race that exposes it: `shutdown()` must not raise
+        # when a thread is outstanding and the registry is already closed, however those
+        # two came to be true together.
+        daemon._reconcile_thread = busy  # outstanding: alive, and the bound above is zero
+        daemon.registry.close()  # exactly what an earlier deferred close leaves behind
+
+        # Must not raise. Against the unguarded code this is `sqlite3.ProgrammingError`
+        # straight out of `shutdown()` -- the CI teardown error this test exists for.
+        daemon.shutdown()
+    finally:
+        release.set()
+        busy.join(timeout=15)
+        assert not busy.is_alive()
 
 
 def test_maintenance_deadline_persists_across_scheduler_wake(monkeypatch, tmp_path: Path) -> None:

@@ -77,6 +77,50 @@ MAINTENANCE_ENGINE_PROBE_TIMEOUT_SECONDS = 5
 # if this bound is ever actually exceeded.
 WATCHDOG_JOIN_TIMEOUT_SECONDS = 15.0
 
+# Upper bound on how long shutdown() waits for the startup-reconciliation thread (see
+# `_reconcile_startup_resources`) to notice `_stop` and exit, before handing the registry
+# close off to the same deferred-close path used when the watchdog overruns its own bound
+# (see `_close_registry_after_background_threads`).
+#
+# This is deliberately much shorter than `WATCHDOG_JOIN_TIMEOUT_SECONDS`, and is 0.0 --
+# not "small", zero -- on purpose. Do not "helpfully" raise this back into the seconds; a
+# non-zero value here was tried and measured, and it does not buy what it looks like it
+# should buy. Read on before changing it.
+#
+# The watchdog's maintenance pass is broken into phases with a cooperative `_stop` check
+# between each (see `_run_maintenance`), so a bounded wait on it can be sized to the worst
+# *remaining* phase and expect to usually succeed -- that is what
+# `WATCHDOG_JOIN_TIMEOUT_SECONDS` is for, and it stays as-is. The startup scan has no such
+# structure: `ResourceScanner(engine).scan(...)` is one call, not a sequence of abandonable
+# phases, so there is no "remaining phase" to bound against.
+#
+# What that call actually does is bimodal, not "usually fast, occasionally slow": either
+# the engine is unreachable and it fails in well under a millisecond (`Engine.available()`
+# checks PATH before ever spawning anything), in which case the thread has *already*
+# exited by the time `shutdown()` gets around to checking it and any positive bound is
+# pure waste -- or the engine is reachable and it is doing a real scan, which issue #99
+# tracks as slow on object-heavy hosts, in which case no bound measured in tens or hundreds
+# of milliseconds has a realistic chance of covering it either. A first version of this
+# constant used 2.0s on the theory that it would "usually" cover the reconcile thread; measuring it
+# against this repo's own test suite showed that theory was wrong -- there is essentially no
+# middle ground of shutdowns that are *almost* done and just need a couple hundred
+# milliseconds more, so a positive bound here mostly just pays its own cost for no benefit:
+# `test_daemon.py` + `test_daemon_jobs.py` went from ~37s to ~132s, and the full non-docker
+# suite from ~93s to ~192s, i.e. the entire suite roughly doubled from a bound that was
+# supposed to only matter in the (deliberately rare, per the comment on the watchdog's own
+# bound above) "still running" case. In production this is worse than test-time waste: it
+# is up to 2 extra seconds tacked onto every `bosn stop` whose reconcile thread has not yet
+# finished, which for a slow scan on an object-heavy host (#99) is exactly the case #97
+# already fixed shutdown latency for -- this constant was quietly re-introducing it.
+#
+# So: zero. If the thread has already exited, `thread.join(timeout=0.0)` observes that
+# immediately and the ordinary close path is taken with no wait at all. If it has not, this
+# defers to `_close_registry_after_background_threads` immediately rather than waiting to
+# confirm what the bimodal reasoning above already predicts -- deferring costs nothing here
+# (the actual close happens on its own daemon thread; `shutdown()` does not block on it),
+# so there is nothing to gain by delaying the decision to defer.
+RECONCILE_JOIN_TIMEOUT_SECONDS = 0.0
+
 
 class DaemonError(RuntimeError):
     """The daemon could not be started, reached, or stopped."""
@@ -321,6 +365,7 @@ class Daemon:
         self._server: _Server | None = None
         self._stop = threading.Event()
         self._watchdog_thread: threading.Thread | None = None
+        self._reconcile_thread: threading.Thread | None = None
         self._execution_sessions: dict[str, tuple[str, ...]] = {}
         self._execution_containers: dict[str, str] = {}
         self._execution_owners: dict[str, tuple[int, float | None]] = {}
@@ -376,13 +421,39 @@ class Daemon:
             repaired = reconcile_owned(self.registry, scan, prior_resources=prior_resources)
             recompute_manifest_generations(self.registry, scan)
         except EngineError as exc:
+            # #101: this call used to be the one that actually crashed. The scan failing
+            # with `EngineError` (an unreachable engine is the most common way it fails) is
+            # entirely expected -- that is what this whole `try` exists to catch -- but
+            # `shutdown()` used to close the registry without ever waiting for this thread,
+            # so `self.registry.log_event(...)` here could run after the connection was
+            # already gone, raising `sqlite3.ProgrammingError: Cannot operate on a closed
+            # database` from a background thread with nothing positioned to catch it.
+            #
+            # An `if not self._stop.is_set():` guard was considered here (to match the
+            # `except Exception` branch below, which had one) and rejected: `_stop` is set
+            # at the very start of `shutdown()`, before it even begins waiting for this
+            # thread, so by the time this branch's `log_event` call could ever race a real
+            # close, `_stop` is already set -- meaning the guard would suppress the log on
+            # essentially every real occurrence of the race it was trying to protect
+            # against, not just the unsafe ones. That trade only made sense when there was
+            # no other way to reduce the crash's frequency. Now there is: `shutdown()`
+            # tracks and joins this thread before it ever closes the registry (see
+            # `RECONCILE_JOIN_TIMEOUT_SECONDS` and `_close_registry_after_background_
+            # threads`), so by the time this line runs, the registry is guaranteed to still
+            # be open regardless of `_stop` -- logging unconditionally is what "the branches
+            # should agree" resolves to once the actual close-ordering bug is fixed, not
+            # copying a guard whose only remaining effect would be silently dropping a
+            # diagnostic that safely could have been recorded.
             self.registry.log_event("recovery.scan.unavailable", str(exc))
             return
         except KeyboardInterrupt:
             raise
         except Exception as exc:  # background recovery must never take down IPC
-            if not self._stop.is_set():
-                self.registry.log_event("recovery.scan.failed", str(exc))
+            # See the `except EngineError` branch above for why this no longer guards on
+            # `_stop.is_set()` either -- the two branches must agree, and unconditional
+            # logging (now safe, thanks to `shutdown()` joining this thread first) is the
+            # agreement that does not cost a diagnostic every time this races shutdown.
+            self.registry.log_event("recovery.scan.failed", str(exc))
             return
         if repaired:
             self.registry.log_event("recovery.startup", ",".join(repaired))
@@ -444,8 +515,19 @@ class Daemon:
         self.registry.log_event("daemon.started", f"pid={os.getpid()} port={self.port}")
 
         # Docker can be unavailable or taking a long time to wake.  Recovery must not
-        # postpone serving IPC; this daemon-owned worker is cancelled by normal shutdown.
-        threading.Thread(target=self._reconcile_startup_resources, daemon=True).start()
+        # postpone serving IPC, so this runs on a background thread rather than blocking
+        # here. The comment that used to sit on this line claimed the thread "is cancelled
+        # by normal shutdown" -- it never was: nothing sets an event this thread checks
+        # before or during its one real blocking call, `ResourceScanner(...).scan(...)`,
+        # and issue #101 is the background-thread crash that resulted from believing that
+        # claim. `shutdown()` now tracks this thread the same way it tracks the watchdog
+        # (see `RECONCILE_JOIN_TIMEOUT_SECONDS`) and folds it into the same deferred-close
+        # decision, so the registry is never closed while this thread could still be using
+        # it -- waited on, not cancelled.
+        self._reconcile_thread = threading.Thread(
+            target=self._reconcile_startup_resources, daemon=True
+        )
+        self._reconcile_thread.start()
 
         self._watchdog_thread = threading.Thread(target=self._idle_watchdog, daemon=True)
         self._watchdog_thread.start()
@@ -677,25 +759,24 @@ class Daemon:
 
     def shutdown(self) -> None:
         self._stop.set()
+        # Both background threads get the same treatment: a bounded join here, and -- if
+        # either one is still running once its bound expires -- the registry close is
+        # deferred to a background thread that waits for *all* outstanding threads with no
+        # bound of its own. Bounding the join alone (`thread.join(timeout=N)` with nothing
+        # else) was considered and rejected for the watchdog originally (#97) and applies
+        # equally here: falling through to closing the registry a few lines down while a
+        # background thread is still reading/writing through that same connection turns a
+        # bounded *hang* (annoying, but internally consistent) into an unbounded *crash*
+        # (`sqlite3.ProgrammingError: Cannot operate on a closed database`, raised from a
+        # background thread with no one positioned to handle it -- worse than the bug this
+        # fix exists to close). See `WATCHDOG_JOIN_TIMEOUT_SECONDS` and
+        # `RECONCILE_JOIN_TIMEOUT_SECONDS` for why each bound is sized the way it is; they
+        # are deliberately not the same value, because the two threads' ability to finish
+        # promptly once `_stop` is set is not the same.
         watchdog = self._watchdog_thread
-        watchdog_finished = True
-        if watchdog is not None and watchdog is not threading.current_thread():
-            # Bounding this join alone -- `watchdog.join(timeout=N)` with no other change
-            # -- was considered and rejected. If the timeout expired the old code would
-            # simply fall through to closing the registry a few lines down while the
-            # watchdog thread was still inside a maintenance pass that reads and writes
-            # through that same connection. That turns a bounded *hang* (annoying, but the
-            # daemon is still internally consistent) into an unbounded *crash*
-            # (`sqlite3.ProgrammingError: Cannot operate on a closed database`, raised from
-            # a background thread with no one positioned to handle it -- worse than the bug
-            # this fix exists to close). A bounded join is only safe once the thing being
-            # joined actually responds to `_stop` promptly, which is what the cooperative
-            # checks in `_run_maintenance` and the short probe timeout above are for. With
-            # those in place this join should essentially always succeed well within
-            # WATCHDOG_JOIN_TIMEOUT_SECONDS; the `else` branch below is the last-resort
-            # fallback for the case where it somehow still doesn't.
-            watchdog.join(timeout=WATCHDOG_JOIN_TIMEOUT_SECONDS)
-            watchdog_finished = not watchdog.is_alive()
+        watchdog_finished = self._bounded_join(watchdog, WATCHDOG_JOIN_TIMEOUT_SECONDS)
+        reconcile = self._reconcile_thread
+        reconcile_finished = self._bounded_join(reconcile, RECONCILE_JOIN_TIMEOUT_SECONDS)
         # Cancel in-flight builds and wait for them *before* closing the registry they
         # write to. Each one tells its attached clients why it stopped rather than dying
         # silently.
@@ -713,25 +794,60 @@ class Daemon:
         heartbeat_file(self.state_dir).unlink(missing_ok=True)
         secret_file(self.state_dir).unlink(missing_ok=True)
 
-        if not watchdog_finished:
-            assert watchdog is not None  # implied by watchdog_finished being set False above
-            # The watchdog is still running past our patience. Closing the registry here
-            # would race whatever it is doing right now -- possibly nothing worse than one
-            # more `log_event`, but there is no way from here to know that, and guessing
-            # wrong means a background-thread crash. So instead of closing, hand the close
-            # off to a thread that waits for the watchdog however long that actually takes
-            # (unbounded is fine: this thread is itself daemonic, so it cannot keep the
-            # process alive) and only then performs the close this method would otherwise
-            # have done immediately below. This should be unreachable in ordinary
-            # operation -- see the comment on the join above -- so reaching it at all is
-            # itself worth a loud, findable event before we return.
-            self.registry.log_event(
-                "shutdown.watchdog_join_timeout",
-                f"watchdog still running after {WATCHDOG_JOIN_TIMEOUT_SECONDS:g}s; "
-                "deferring registry close until it exits",
+        outstanding = [
+            (name, thread)
+            for name, thread, finished in (
+                ("watchdog", watchdog, watchdog_finished),
+                ("startup-reconcile", reconcile, reconcile_finished),
             )
+            if thread is not None and not finished
+        ]
+        if outstanding:
+            # At least one background thread is still running past its own patience.
+            # Closing the registry here would race whatever it is doing right now --
+            # possibly nothing worse than one more `log_event`, but there is no way from
+            # here to know that, and guessing wrong means a background-thread crash. So
+            # instead of closing, hand the close off to a thread that waits for *every*
+            # outstanding thread however long that actually takes (unbounded is fine: this
+            # thread is itself daemonic, so it cannot keep the process alive) and only then
+            # performs the close this method would otherwise have done immediately below.
+            #
+            # Reaching this branch for the watchdog should be rare in ordinary operation
+            # (see the comment on `WATCHDOG_JOIN_TIMEOUT_SECONDS`'s join above); reaching it
+            # for startup-reconcile is the *expected* outcome whenever `shutdown()` runs
+            # while the startup scan is still genuinely in flight (see
+            # `RECONCILE_JOIN_TIMEOUT_SECONDS`). Either way it is worth a loud, findable
+            # event before we return.
+            names = ", ".join(name for name, _ in outstanding)
+            # Guarded for the same reason this whole issue exists (#101): a diagnostic must
+            # never be the thing that crashes.
+            #
+            # `shutdown()` runs twice in normal operation (once from `serve_forever`'s
+            # `finally`, once explicitly), and a deferred close spawned by an earlier call
+            # can complete at any moment -- including between this call's `_bounded_join`
+            # deciding a thread is still outstanding and this line running. The connection
+            # is then already gone, and there is no flag to test for it that would not
+            # itself be racy. Every other registry write on the shutdown path is already
+            # wrapped; this "loud event" was not, and CI caught it as exactly the
+            # `sqlite3.ProgrammingError: Cannot operate on a closed database` this change
+            # set out to eliminate, relocated one line away from the fix.
+            #
+            # Best-effort is the right contract here: the event explains a deferral that
+            # has already been decided, so losing it costs a log line, while raising costs
+            # the shutdown.
+            try:
+                self.registry.log_event(
+                    "shutdown.background_join_timeout",
+                    f"{names} still running; deferring registry close until they exit",
+                )
+            except KeyboardInterrupt:
+                raise
+            except Exception:  # noqa: BLE001 - shutdown must not raise
+                pass
             threading.Thread(
-                target=self._close_registry_after_watchdog, args=(watchdog,), daemon=True
+                target=self._close_registry_after_background_threads,
+                args=(tuple(thread for _, thread in outstanding),),
+                daemon=True,
             ).start()
             return
 
@@ -743,24 +859,49 @@ class Daemon:
         except Exception:  # noqa: BLE001 - shutdown must not raise
             pass
 
-    def _close_registry_after_watchdog(self, watchdog: threading.Thread) -> None:
-        """Finish a shutdown whose bounded watchdog join gave up. See `shutdown()`.
+    @staticmethod
+    def _bounded_join(thread: threading.Thread | None, timeout: float) -> bool:
+        """True once `thread` has exited, given up to `timeout` seconds for it to do so.
 
-        Reached only from the timeout branch above. Waits for the watchdog with no
-        timeout of its own -- by this point there is nothing left to bound against, the
-        goal is simply to never close the registry while that thread might still be
-        touching it. `shutdown()` may itself run again after spawning this (the
+        Also true when there is no thread to wait for (`None`) or when called from inside
+        the thread itself -- `Thread.join` on the current thread deadlocks, and `shutdown()`
+        can legitimately run on a thread it is also tracking (a verb handler calling
+        `request_stop()` runs on a request-handling thread, never on the watchdog or
+        reconcile thread, but this guard is cheap enough to keep unconditionally rather than
+        rely on that staying true).
+        """
+        if thread is None or thread is threading.current_thread():
+            return True
+        thread.join(timeout=timeout)
+        return not thread.is_alive()
+
+    def _close_registry_after_background_threads(
+        self, threads: tuple[threading.Thread, ...]
+    ) -> None:
+        """Finish a shutdown whose bounded joins gave up. See `shutdown()`.
+
+        Reached only from the timeout branch above, carrying whichever of the watchdog and
+        startup-reconcile threads (one or both) had not exited within their own bounded
+        join. Waits for every one of them with no timeout of its own -- by this point there
+        is nothing left to bound against, the goal is simply to never close the registry
+        while any of them might still be touching it. Waiting for only the thread that
+        triggered this call and ignoring any other still-outstanding one would reintroduce
+        exactly the race this method exists to close, just for the thread that got left out.
+
+        `shutdown()` may itself run again after spawning this (the
         `serve_forever`/`served`-fixture pattern of calling `shutdown()` both from
         `serve_forever`'s `finally` and again explicitly is already relied on elsewhere in
-        this codebase); a second call would see `watchdog_finished` true almost
-        immediately -- since by then this thread will usually have long since joined it --
-        and take the ordinary close path itself. If both somehow race, sqlite's `close()`
-        is a no-op on an already-closed connection and the surrounding `except Exception`
-        here and in `shutdown()` swallow the `log_event` that could otherwise fire twice.
+        this codebase); a second call sees each already-finished thread's bounded join
+        return immediately, and -- once this method has joined whatever was still
+        outstanding -- takes the ordinary close path itself. If both somehow race, sqlite's
+        `close()` is a no-op on an already-closed connection and the surrounding
+        `except Exception` here and in `shutdown()` swallow the `log_event` that could
+        otherwise fire twice.
         """
-        watchdog.join()
+        for thread in threads:
+            thread.join()
         try:
-            self.registry.log_event("shutdown.watchdog_finished_late", "")
+            self.registry.log_event("shutdown.background_thread_finished_late", "")
             self.registry.log_event("daemon.stopped", "")
             self.registry.close()
         except KeyboardInterrupt:
