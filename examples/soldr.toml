@@ -10,13 +10,13 @@
 # `<soldr-checkout>/bosn.toml` (the `source = "."` bind below assumes the manifest sits at
 # the checkout root, exactly like bosn's own dogfood `bosn.toml` mounts `.` at `/repo`).
 #
-# Ground truth for every destination and scope below was read directly from soldr's own
-# source on this machine, not inferred or guessed:
+# Ground truth for every destination, scope, ENV, and workdir claim below was read directly
+# from soldr's own source on this machine, not inferred or guessed:
 #   - `ci/perf_local.py`, `Runner` / `runner_for()` / `create_command()` (the six `-v`
-#     mounts and the container's `-e` environment)
+#     mounts, the `-w /repo`, and the container's `-e` environment)
 #   - `docker/cook-shared-cache/Dockerfile` (which of those container paths are also baked
-#     in as image `ENV`, and which are not -- see the `target`/`cargo-target-dir` comment
-#     below for the one gap that leaves)
+#     in as image `ENV`, and which are not -- see `[stack.perf.env]` below for the one
+#     that was not, and how it is expressed now that bosn's manifest can say so (#105))
 
 [stack.perf]
 # The image `ci/perf_local.py`'s own `ensure_image()` builds and tags locally. bosn does
@@ -30,6 +30,21 @@
 image = "soldr-cook-dev"
 family = "soldr"
 default = true
+# perf_local.py's create_command() supplies `-w /repo` itself at container-create time
+# (the image's own WORKDIR is `/work`, an empty directory soldr never repoints -- see
+# docs/soldr-integration.md). bosn now has the same knob (#105): declaring it here means
+# `[task.check]` below no longer needs a `cd /repo &&` workaround to run in the right place.
+workdir = "/repo"
+
+[stack.perf.env]
+# perf_local.py's create_command() also passes `-e CARGO_TARGET_DIR=/target`, and that ENV
+# is not baked into the Dockerfile the way CARGO_HOME is (grepped; absent) -- see the
+# `target` volume comment below. Before #105, bosn's manifest had no way to declare
+# container environment at all, so this stack alone did not make cargo use the `/target`
+# volume: `cd /repo && cargo check` ran in the right directory but still built into
+# `/repo/target` inside the bind mount, silently missing the cache the volume exists to
+# keep warm. Declaring it here closes that gap for real, instead of working around it.
+CARGO_TARGET_DIR = "/target"
 
 [stack.perf.mounts]
 # soldr's edit-in-place bind (perf_local.py: `-v {source_root.resolve()}:/repo`). This is
@@ -61,27 +76,23 @@ uv-cache   = { scope = "machine", destination = "/root/.cache/uv" }
 # granularity for `Runner.volumes`, just reachable from a *different* set of checkouts (see
 # docs/soldr-integration.md for why those two granularities are not the same claim).
 #
-# NOTE: mounting `target` here reproduces soldr's *volume*, not its *behavior*. Cargo only
-# writes to `/target` because `perf_local.py`'s `create_command()` also passes
-# `-e CARGO_TARGET_DIR=/target` at container-create time -- and that ENV is not baked into
-# the Dockerfile the way CARGO_HOME is (grepped; absent). bosn's manifest has no mechanism
-# to declare container environment variables, so this stack alone does not make cargo use
-# this volume -- see docs/soldr-integration.md, "What this does not govern."
+# NOTE: mounting `target` here reproduces soldr's *volume*, not (on its own) its
+# *behavior*. Cargo only writes to `/target` because `perf_local.py`'s `create_command()`
+# also passes `-e CARGO_TARGET_DIR=/target` at container-create time -- and that ENV is not
+# baked into the Dockerfile the way CARGO_HOME is (grepped; absent). `[stack.perf.env]`
+# above supplies that same variable through bosn's own `env` table (#105), which is what
+# actually makes this volume the one Cargo writes into.
 target = { scope = "stack", destination = "/target" }
 venv   = { scope = "stack", destination = "/venv" }
 
 [task.check]
 stack = "perf"
-# Two things `perf_local.py` sets at container-create time have no bosn.toml equivalent
-# today (bosn's manifest has no way to declare container ENV, and neither `converge.py`'s
-# `docker create` nor its `docker exec` pass a `-w`/workdir override -- see
-# docs/soldr-integration.md, "What this does not govern"):
-#   - CARGO_TARGET_DIR=/target -- without it Cargo defaults to `<cwd>/target`, so this task
-#     works around the gap with `cd /repo` (the image's baked-in WORKDIR is `/work`, an
-#     empty directory -- soldr's own Dockerfile never sets `WORKDIR /repo` because
-#     perf_local.py always supplies `-w /repo` itself) but STILL builds into `/repo/target`
-#     inside the bind mount, not the `/target` volume above. That volume is real; nothing
-#     in this stack makes Cargo use it.
-#   - TMPDIR=/target/tmp, CARGO_BUILD_JOBS, SOLDR_JOBS, NEXTEST_TEST_THREADS -- degrade
-#     behavior (e.g. temp files fall back to the container overlay) rather than break it.
-cmd = "cd /repo && cargo check --workspace"
+# perf_local.py sets four more `-e` flags at container-create time that this task still
+# does not reproduce: TMPDIR=/target/tmp, CARGO_BUILD_JOBS, SOLDR_JOBS,
+# NEXTEST_TEST_THREADS. All four degrade behavior rather than break it (e.g. temp files
+# fall back to the container overlay instead of the target volume; nextest picks its own
+# default thread count) -- see docs/soldr-integration.md, "What this does not govern".
+# CARGO_TARGET_DIR and the working directory, the two that used to be silent-wrongness and
+# outright-failure gaps respectively, are now closed above via `[stack.perf.env]` and
+# `workdir = "/repo"` -- no `cd /repo &&` workaround needed any more.
+cmd = "cargo check --workspace"

@@ -49,6 +49,30 @@ def _validate_destination(destination: str, *, what: str, name: str) -> str:
     return normalized
 
 
+def _validate_workdir(workdir: str, *, stack: str) -> str:
+    """A stack's `workdir` must be an absolute path, same as any mount destination.
+
+    Reuses `_validate_destination` wholesale rather than re-deriving "absolute, and not
+    inside bosn's reserved namespace" a second time. The reserved-namespace half is a
+    freebie, not the point (nothing stops `sh -c` from `cd`-ing there once running), but
+    there is no legitimate reason a task would want its cwd to start inside `/bosn/*` or
+    at the heartbeat file, so refusing it here is consistent with why mounts refuse it.
+    """
+    return _validate_destination(workdir, what="workdir", name=stack)
+
+
+def _validate_env_key(key: str, *, stack: str) -> None:
+    """`docker create -e` splits its argument on the first `=`; an empty or `=`-bearing
+    key would either be silently misparsed by the engine or collide with the value it is
+    supposed to precede. Catching it here, at manifest load, is a much better failure mode
+    than a wrong container running and 1000 miles from the missing environment variable.
+    """
+    if not key:
+        raise ManifestError(f"[stack.{stack}.env] has an empty key")
+    if "=" in key:
+        raise ManifestError(f"[stack.{stack}.env] key {key!r} must not contain '='")
+
+
 @dataclass(frozen=True)
 class VolumeSpec:
     name: str
@@ -136,6 +160,26 @@ class StackSpec:
     default: bool = False
     volumes: tuple[VolumeSpec, ...] = ()
     mounts: tuple[MountSpec, ...] = ()
+    # Container-level `-e KEY=VALUE` pairs, applied at `docker create` (see converge.py).
+    # A dict, not a tuple of a small dataclass like VolumeSpec/MountSpec: there is nothing
+    # here to validate per-entry beyond the key shape (`_validate_env_key`), no destination,
+    # no scope, no readonly flag -- the extra structure those specs carry would be empty
+    # ceremony for a bare key/value pair. `field(default_factory=dict)` is safe on a frozen
+    # dataclass: frozen only blocks *reassigning* `self.env`, not mutating the dict object,
+    # and nothing here ever mutates it after construction.
+    env: dict[str, str] = field(default_factory=dict)
+    # Container-level `-w` override, applied at `docker exec` (see converge.py). Unlike
+    # `env`, this is not baked into the persistent container at `docker create` time -- it
+    # is supplied fresh on every `exec`, the same way a task's `cmd` is. See
+    # `generation_digest`'s comment on why that puts it on the opposite side of the digest
+    # boundary from `env`.
+    workdir: str | None = None
+
+    def __post_init__(self) -> None:
+        for key in self.env:
+            _validate_env_key(key, stack=self.name)
+        if self.workdir is not None:
+            object.__setattr__(self, "workdir", _validate_workdir(self.workdir, stack=self.name))
 
     def referenced_files(self, root: Path) -> list[Path]:
         """Files whose byte content folds into this stack's digest."""
@@ -277,6 +321,14 @@ def parse(raw: dict, root: Path) -> Manifest:
             for mount_name, mount_body in (body.get("mounts") or {}).items()
         )
         _refuse_duplicate_destinations(name, volumes, mounts)
+        env: dict[str, str] = {}
+        for env_key, env_value in (body.get("env") or {}).items():
+            if isinstance(env_value, (dict, list)):
+                raise ManifestError(
+                    f"[stack.{name}.env] key {env_key!r} must be a scalar, not a table or array"
+                )
+            env[str(env_key)] = str(env_value)
+        workdir = body.get("workdir")
         stack = StackSpec(
             name=name,
             dockerfile=body.get("dockerfile"),
@@ -285,6 +337,8 @@ def parse(raw: dict, root: Path) -> Manifest:
             default=bool(body.get("default", False)),
             volumes=volumes,
             mounts=mounts,
+            env=env,
+            workdir=str(workdir) if workdir else None,
         )
         if stack.dockerfile is None and stack.image is None:
             raise ManifestError(f"[stack.{name}] must set either `dockerfile` or `image`")
@@ -331,6 +385,35 @@ def generation_digest(manifest: Manifest, stack: StackSpec) -> str:
         # content identity -- and hashing it would be both enormous and never stable.
         "volumes": sorted((v.name, v.scope, v.mount_at()) for v in stack.volumes),
         "mounts": sorted((m.name, m.source, m.destination, m.readonly) for m in stack.mounts),
+        # `env` IS digested; `workdir` (below `referenced_files`, not in this dict at all)
+        # is NOT. Both look like "just another stack attribute" but they land on opposite
+        # sides of `docker create` vs `docker exec`, and that is what decides this, not
+        # convenience:
+        #
+        # `env` is baked into the persistent container at `docker create` time, exactly
+        # like the image tag or a volume mount -- Docker has no "update the env of a
+        # running container" verb, so once created, a container serves its create-time env
+        # forever. If `env` were excluded from the digest the way a bind's *contents* are
+        # (see the comment on `mounts` above), an env edit would change nothing this
+        # function hashes, `_container_stale_reasons` would see the same generation and
+        # happily reuse the old container, and every task run against it would keep
+        # observing the stale environment indefinitely -- silently, with no error, in
+        # exactly the same shape as the `CARGO_TARGET_DIR` bug that motivated this feature
+        # in the first place (issue #105). That risk -- an unrelated env tweak forcing an
+        # otherwise-warm generation to roll -- is real but bounded and visible: the task
+        # rebuilds once, obviously, and moves on. A stale env silently steering a build
+        # into the wrong place is unbounded and invisible. Digesting it is the smaller cost.
+        #
+        # `workdir` is supplied fresh on every `docker exec` (see `converge.py`), never
+        # baked into the container at create time -- it is closer to a task's `cmd` than to
+        # `env`, and `cmd` (on `TaskSpec`, not `StackSpec`) was never part of this digest
+        # either. There is no "stale workdir survives in an old container" failure mode to
+        # guard against: the very next `exec` picks up whatever `workdir` currently reads.
+        # Digesting it anyway would force a container replacement for a change that cannot
+        # make the existing container wrong, which is exactly the kind of unrelated-cache-
+        # invalidation cost `env`'s comment above accepts only because the alternative is
+        # worse. For `workdir` the alternative is not worse, so it stays out.
+        "env": sorted(stack.env.items()),
     }
     _hash_field(
         hasher,
