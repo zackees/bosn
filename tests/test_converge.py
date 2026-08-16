@@ -1079,6 +1079,101 @@ secrets = { source = "secrets", destination = "/etc/app", readonly = true }
     assert f"{source}:/etc/app:ro" in create
 
 
+def test_declared_env_reaches_docker_create_as_env_flags(
+    tmp_path: Path, registry: Registry
+) -> None:
+    """The #105 gap: `converge.py` used to pass no `-e` at all, so a manifest `env` table
+    was silently invisible to the container regardless of what it declared."""
+    (tmp_path / "Dockerfile").write_text("FROM alpine\n", encoding="utf-8")
+    (tmp_path / "bosn.toml").write_text(
+        """
+[stack.test]
+dockerfile = "Dockerfile"
+default = true
+
+[stack.test.env]
+CARGO_TARGET_DIR = "/target"
+TMPDIR = "/target/tmp"
+""",
+        encoding="utf-8",
+    )
+    engine = FakeEngine()
+    converger = Converger(load(tmp_path), registry, engine)  # type: ignore[arg-type]
+
+    converger.run(["true"])
+
+    create = engine.ran("create")[0]
+    assert "--env" in create
+    assert "CARGO_TARGET_DIR=/target" in create
+    assert "TMPDIR=/target/tmp" in create
+
+
+def test_no_env_table_means_no_env_flags(converger: Converger) -> None:
+    converger.run(["true"])
+    engine: FakeEngine = converger.engine  # type: ignore[assignment]
+
+    assert "--env" not in engine.ran("create")[0]
+
+
+def test_declared_workdir_reaches_docker_exec_as_a_workdir_flag(
+    tmp_path: Path, registry: Registry
+) -> None:
+    """The #105 gap: `converge.py` used to pass no `-w` at all, so any command assuming it
+    started inside a manifest-declared `workdir` would run from the image's own `WORKDIR`
+    (or its default) instead."""
+    (tmp_path / "Dockerfile").write_text("FROM alpine\n", encoding="utf-8")
+    (tmp_path / "bosn.toml").write_text(
+        """
+[stack.test]
+dockerfile = "Dockerfile"
+default = true
+workdir = "/repo"
+""",
+        encoding="utf-8",
+    )
+    engine = FakeEngine()
+    converger = Converger(load(tmp_path), registry, engine)  # type: ignore[arg-type]
+
+    converger.run(["cargo", "check"])
+
+    exec_cmd = engine.ran("exec")[0]
+    assert exec_cmd == ["exec", "--workdir", "/repo", exec_cmd[3], "cargo", "check"]
+
+
+def test_declared_workdir_also_reaches_an_interactive_shell(
+    tmp_path: Path, registry: Registry
+) -> None:
+    (tmp_path / "Dockerfile").write_text("FROM alpine\n", encoding="utf-8")
+    (tmp_path / "bosn.toml").write_text(
+        """
+[stack.test]
+dockerfile = "Dockerfile"
+default = true
+workdir = "/repo"
+""",
+        encoding="utf-8",
+    )
+    engine = FakeEngine()
+    converger = Converger(load(tmp_path), registry, engine)  # type: ignore[arg-type]
+    converged = converger.converge()
+
+    converger.shell_converged(
+        converged, stack_name=None, workspace=workspace_of(converger.manifest)
+    )
+
+    exec_cmd = engine.ran("exec")[0]
+    assert exec_cmd[1:3] == ["-it", "--workdir"]
+    assert exec_cmd[3] == "/repo"
+
+
+def test_no_workdir_means_no_workdir_flag(converger: Converger) -> None:
+    converger.run(["true"])
+    engine: FakeEngine = converger.engine  # type: ignore[assignment]
+
+    exec_cmd = engine.ran("exec")[0]
+    assert "--workdir" not in exec_cmd
+
+
 def test_bind_mount_source_is_never_registered_labeled_or_collected(
     bind_project: Path, registry: Registry
 ) -> None:

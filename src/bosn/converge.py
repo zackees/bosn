@@ -599,6 +599,12 @@ class Converger:
             for mount in expected_mounts.values():
                 suffix = ":ro" if not mount["rw"] else ""
                 args += ["--volume", f"{mount['source']}:{mount['destination']}{suffix}"]
+            # Sorted for a deterministic argv (helps tests and log-reading humans), not for
+            # correctness: `stack.env` is part of `converged.digest` (see
+            # `generation_digest`'s comment on why), so any change here already forces a
+            # fresh container through `_container_stale_reasons` before this code runs.
+            for key, value in sorted(stack.env.items()):
+                args += ["--env", f"{key}={value}"]
             # PID 1 exits only when the daemon heartbeat goes stale. Execution deadlines
             # belong to the individual `docker exec`, not the container's creation time:
             # a warm container may correctly serve many later sessions.
@@ -1000,7 +1006,12 @@ class Converger:
         name, leases = self._acquire_execution_container(
             converged, stack_name=stack_name, workspace=workspace
         )
-        args = ["exec", name, *command]
+        # `workdir` is not baked into the container at create time (see
+        # `generation_digest`'s comment on why it is excluded from the digest) -- it is
+        # supplied here, fresh, on every `exec`, the same way `command` itself is.
+        workdir = self.manifest.stack(converged.stack).workdir
+        workdir_args = ["--workdir", workdir] if workdir else []
+        args = ["exec", *workdir_args, name, *command]
         try:
             result = self.engine.run(args, timeout=self.run_max_duration)
         finally:
@@ -1016,8 +1027,10 @@ class Converger:
         name, leases = self._acquire_execution_container(
             converged, stack_name=stack_name, workspace=workspace
         )
+        workdir = self.manifest.stack(converged.stack).workdir
+        workdir_args = ["--workdir", workdir] if workdir else []
         try:
-            return self.engine.interactive(["exec", "-it", name, "sh"])
+            return self.engine.interactive(["exec", "-it", *workdir_args, name, "sh"])
         finally:
             for lease in leases:
                 self.registry.release_lease(lease.id)

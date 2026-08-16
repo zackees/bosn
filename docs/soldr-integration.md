@@ -30,8 +30,10 @@ Both blockers on (b) were resolved before this work started (`MountSpec`/`bosn.t
 
 Loaded through the real loader (`bosn.manifest.load`), `examples/soldr.toml`'s `perf`
 stack expresses exactly the six *mounts* `Runner.volumes` / `create_command()` wire in
-`ci/perf_local.py` (the container's environment and working directory are a separate
-story — see "What it does not govern" below):
+`ci/perf_local.py`, plus, since #105, the two container-create-time knobs that used to
+have no bosn.toml equivalent at all — `CARGO_TARGET_DIR` via `[stack.perf.env]` and the
+working directory via `workdir = "/repo"` (see "What it does not govern" below for what is
+still left over, which is narrower than it used to be).
 
 | Host (soldr) | Container | soldr wires it by | bosn expresses it as |
 | --- | --- | --- | --- |
@@ -78,14 +80,13 @@ doesn't on its own.
 
 ## What it does not govern
 
-**`bosn.toml` cannot declare container environment or a working directory at all.**
-`src/bosn/manifest.py` has no `env`/`environment` table, and neither `converge.py`'s
-`docker create` (`args = ["create", "--rm", "--name", name, *labels, ...]`, no `-e`) nor
-its `docker exec` (`args = ["exec", name, *command]`, no `-w`) pass either. Everything a
-container gets on either axis comes from what its *image* bakes in via `ENV` /
-`WORKDIR` — which is exactly why bosn's own dogfood image (`docker/test.Dockerfile`) sets
-`WORKDIR /repo` explicitly, line 17. soldr's image does not need to, because
-`perf_local.py` supplies both axes itself at container-create time
+**Historical note (resolved by #105): `bosn.toml` used to be unable to declare container
+environment or a working directory at all.** `src/bosn/manifest.py` had no `env` table or
+`workdir` key, and neither `converge.py`'s `docker create` nor its `docker exec` passed
+`-e`/`-w`. Everything a container got on either axis came from what its *image* baked in
+via `ENV` / `WORKDIR` — which is exactly why bosn's own dogfood image
+(`docker/test.Dockerfile`) sets `WORKDIR /repo` explicitly, line 17. soldr's image does
+not need to, because `perf_local.py` supplies both axes itself at container-create time
 (`create_command()` in `ci/perf_local.py`): `-w /repo`, plus eight `-e` flags —
 `CARGO_TARGET_DIR=/target`, `TMPDIR=/target/tmp`, `CARGO_BUILD_JOBS=2`, `SOLDR_JOBS=2`,
 `UV_CACHE_DIR=/root/.cache/uv`, `UV_PROJECT_ENVIRONMENT=/venv`, `NEXTEST_TEST_THREADS=2`
@@ -94,31 +95,41 @@ Checked against `docker/cook-shared-cache/Dockerfile` line by line (not just gre
 the file's `ENV` blocks span backslash-continued lines that a naive grep for `ENV` would
 miss part of):
 
-| create-time flag | baked into the image's own `ENV`? | consequence if bosn supplies neither |
-| --- | --- | --- |
-| `CARGO_HOME` | yes (line 86) | none — the volume above lands correctly regardless |
-| `UV_CACHE_DIR`, `UV_PROJECT_ENVIRONMENT` | yes (lines 133–134) | none, same reason |
-| `CARGO_BUILD_JOBS`, `SOLDR_JOBS` | yes (lines 91–92) | none, same reason |
-| `CARGO_TARGET_DIR` | **no** | **breaks cache correctness**: Cargo falls back to `<cwd>/target`, not the `/target` volume |
-| `TMPDIR` | no | smoke-suite temp binaries fall back to the container overlay instead of the target volume (perf, not correctness) |
-| `NEXTEST_TEST_THREADS` | no | nextest picks its own default thread count instead of 2 (perf, not correctness) |
-| working directory (`-w /repo`) | no (image `WORKDIR` is `/work`, an empty dir) | any command that assumes it starts inside the repo fails outright |
+| create-time flag | baked into the image's own `ENV`? | consequence if bosn supplies neither | bosn's #105 fix |
+| --- | --- | --- | --- |
+| `CARGO_HOME` | yes (line 86) | none — the volume above lands correctly regardless | not needed |
+| `UV_CACHE_DIR`, `UV_PROJECT_ENVIRONMENT` | yes (lines 133–134) | none, same reason | not needed |
+| `CARGO_BUILD_JOBS`, `SOLDR_JOBS` | yes (lines 91–92) | none, same reason | not needed |
+| `CARGO_TARGET_DIR` | **no** | **breaks cache correctness**: Cargo falls back to `<cwd>/target`, not the `/target` volume | closed — `[stack.perf.env]` in `examples/soldr.toml` |
+| `TMPDIR` | no | smoke-suite temp binaries fall back to the container overlay instead of the target volume (perf, not correctness) | still open (see below) |
+| `NEXTEST_TEST_THREADS` | no | nextest picks its own default thread count instead of 2 (perf, not correctness) | still open (see below) |
+| working directory (`-w /repo`) | no (image `WORKDIR` is `/work`, an empty dir) | any command that assumes it starts inside the repo fails outright | closed — `workdir = "/repo"` in `examples/soldr.toml` |
 
-So the picture is narrower than "one missing variable": three of soldr's four
-container-side ENV needs are already covered by the image's own defaults and need nothing
-from bosn, one (`CARGO_TARGET_DIR`) silently breaks cache correctness if unaddressed, two
-more degrade performance without breaking correctness, and the working directory is a
-separate, unrelated gap that breaks outright rather than silently. `examples/soldr.toml`'s
-`[task.check]` works around the workdir gap with `cd /repo &&` (cmd runs via `sh -c`, see
-`cli.py`/`converge.py`), which is enough to make `cargo check` run in the right place —
-but *not* enough to make it use the `/target` volume, because `cd` cannot set
-`CARGO_TARGET_DIR`. That specific combination — task runs successfully, uses the wrong
-target dir, builds inside the `/repo` bind on the host instead of the cache volume — is
-the one place this manifest "looks right" while doing the wrong thing, and it is called
-out at the point of use in `examples/soldr.toml`. Closing it for real needs either (a) a
-thin Dockerfile layered on soldr's own that adds `ENV CARGO_TARGET_DIR=/target` (and,
-optionally, `WORKDIR /repo`), or (b) bosn growing a way to declare container environment
-and/or working directory — neither exists today.
+`src/bosn/manifest.py` now has a `[stack.X.env]` table (validated: an empty key or a key
+containing `=` is a manifest error) and a `workdir` key on the stack (validated: must be an
+absolute path, sharing its validator with `MountSpec`/`VolumeSpec`'s destination check).
+`converge.py`'s `docker create` now emits `--env KEY=VALUE` for every declared entry, and
+its `docker exec` (both the task path and the interactive shell path) now emits `--workdir`
+when one is declared. `examples/soldr.toml` uses both: `[stack.perf.env]` declares
+`CARGO_TARGET_DIR = "/target"`, and `workdir = "/repo"` replaced `[task.check]`'s old
+`cd /repo &&` workaround with a real working directory. That workaround was never enough
+on its own — `cd` gets `cargo check` running in the right place but cannot set
+`CARGO_TARGET_DIR`, so the task used to run successfully while still quietly building into
+`/repo/target` on the bind mount instead of the `/target` volume. Both halves of that gap
+are closed now.
+
+Two things remain genuinely open, and are unrelated to #105's fix:
+
+- `TMPDIR`, `CARGO_BUILD_JOBS`, `SOLDR_JOBS`, `NEXTEST_TEST_THREADS` are not declared in
+  `examples/soldr.toml`'s `env` table. All four are perf-only (see table above), not
+  correctness gaps like `CARGO_TARGET_DIR` was, so leaving them out is a choice, not an
+  oversight — the reference manifest declares only what changes correctness.
+- The issue's own "suggested direction" also raised a speculative idea: bosn could warn
+  when a well-known cache-path env var (`CARGO_TARGET_DIR` and friends) points somewhere no
+  declared mount destination covers, which is really what would have caught soldr's
+  original gap structurally instead of by manual line-by-line audit. That is explicitly out
+  of scope for #105 (needs its own design for what "well-known" means and how false
+  positives are avoided) and is not implemented here.
 
 **Adoption was not exercised against real soldr volumes.** #75 also asked to run
 `bosn adopt --legacy soldr --yes` against real soldr cache volumes and measure the result.

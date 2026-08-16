@@ -471,6 +471,95 @@ def test_a_git_bash_spelled_bind_source_resolves(tmp_path: Path) -> None:
     assert stack.mounts[0].resolve_source(root) == (root / "src").resolve()
 
 
+# -- container env and workdir (#105) ---------------------------------------
+
+ENV_SAMPLE = """
+[stack.test]
+dockerfile = "docker/test.Dockerfile"
+default = true
+workdir = "/repo"
+
+[stack.test.env]
+CARGO_TARGET_DIR = "/target"
+TMPDIR = "/target/tmp"
+"""
+
+
+def test_env_and_workdir_parse(project: Path) -> None:
+    (project / "bosn.toml").write_text(ENV_SAMPLE, encoding="utf-8")
+    stack = load(project).stacks["test"]
+
+    assert stack.env == {"CARGO_TARGET_DIR": "/target", "TMPDIR": "/target/tmp"}
+    assert stack.workdir == "/repo"
+
+
+def test_env_and_workdir_default_to_empty_and_none(project: Path) -> None:
+    stack = load(project).stacks["test"]
+
+    assert stack.env == {}
+    assert stack.workdir is None
+
+
+def test_an_empty_env_key_is_rejected(tmp_path: Path) -> None:
+    # TOML requires a quoted key to spell an empty string; a bare empty key is a syntax
+    # error caught by the TOML parser itself, not by bosn's own validation.
+    body = ENV_SAMPLE.replace('CARGO_TARGET_DIR = "/target"', '"" = "/target"')
+    with pytest.raises(ManifestError, match="empty key"):
+        load(_write(tmp_path, body))
+
+
+def test_an_env_key_containing_equals_is_rejected(tmp_path: Path) -> None:
+    # Same reasoning as the empty-key test above: a bare TOML key cannot contain '=', so
+    # the offending key must be quoted to reach bosn's own validation at all.
+    body = ENV_SAMPLE.replace('CARGO_TARGET_DIR = "/target"', '"CARGO=TARGET_DIR" = "/target"')
+    with pytest.raises(ManifestError, match="must not contain '='"):
+        load(_write(tmp_path, body))
+
+
+def test_an_env_value_that_is_a_table_is_rejected(tmp_path: Path) -> None:
+    body = ENV_SAMPLE.replace('CARGO_TARGET_DIR = "/target"', "CARGO_TARGET_DIR = { nested = 1 }")
+    with pytest.raises(ManifestError, match="must be a scalar"):
+        load(_write(tmp_path, body))
+
+
+def test_a_relative_workdir_is_refused(tmp_path: Path) -> None:
+    body = ENV_SAMPLE.replace('workdir = "/repo"', 'workdir = "repo"')
+    with pytest.raises(ManifestError, match="absolute"):
+        load(_write(tmp_path, body))
+
+
+def test_a_workdir_inside_bosns_own_namespace_is_refused(tmp_path: Path) -> None:
+    body = ENV_SAMPLE.replace('workdir = "/repo"', 'workdir = "/bosn/target"')
+    with pytest.raises(ManifestError, match="reserved"):
+        load(_write(tmp_path, body))
+
+
+def test_editing_env_rolls_the_generation(tmp_path: Path) -> None:
+    """`env` is baked into the persistent container at create time -- see the comment on
+    `generation_digest` for why an env edit must roll the generation rather than silently
+    leaving an already-warm container serving its old environment forever."""
+    before = load(_write(tmp_path, ENV_SAMPLE))
+    after = load(_write(tmp_path, ENV_SAMPLE.replace('"/target"', '"/elsewhere"')))
+
+    assert generation_digest(before, before.stacks["test"]) != generation_digest(
+        after, after.stacks["test"]
+    )
+
+
+def test_editing_workdir_does_not_roll_the_generation(tmp_path: Path) -> None:
+    """`workdir` is supplied fresh on every `docker exec`, never baked into the container
+    at create time -- see the comment on `generation_digest` for why it deliberately sits
+    on the opposite side of the digest boundary from `env`."""
+    before = load(_write(tmp_path, ENV_SAMPLE))
+    after = load(
+        _write(tmp_path, ENV_SAMPLE.replace('workdir = "/repo"', 'workdir = "/elsewhere"'))
+    )
+
+    assert generation_digest(before, before.stacks["test"]) == generation_digest(
+        after, after.stacks["test"]
+    )
+
+
 # -- examples/soldr.toml expresses soldr's actual perf-local mount table (#75) ----------
 #
 # `Runner.volumes`/`create_command()` in soldr's `ci/perf_local.py` mount six paths: one
