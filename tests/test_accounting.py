@@ -41,6 +41,39 @@ class Engine:
         )
 
 
+class FailingEngine:
+    """Simulates `docker system df -v` failing outright (non-zero exit)."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def run(self, args: list[str]) -> EngineResult:
+        self.calls.append(args)
+        return EngineResult(1, "", "Cannot connect to the Docker daemon")
+
+
+class RaisingEngine:
+    """Simulates the engine call itself raising (e.g. `EngineError` on timeout)."""
+
+    def run(self, args: list[str]) -> EngineResult:
+        raise RuntimeError("docker system df -v exceeded its 60-second deadline")
+
+
+class UnparseableEngine:
+    """Simulates `ok` output that is not valid JSON."""
+
+    def run(self, args: list[str]) -> EngineResult:
+        return EngineResult(0, "not json", "")
+
+
+class EmptyOutputEngine:
+    """Simulates a successful exit with no output at all -- not the documented healthy
+    shape (one JSON line, even on an empty host), so it must not be trusted either."""
+
+    def run(self, args: list[str]) -> EngineResult:
+        return EngineResult(0, "", "")
+
+
 class RootEngine:
     def __init__(self, root: str) -> None:
         self.root = root
@@ -61,6 +94,56 @@ def test_system_df_inventory_attributes_volume_without_a_positional_argument() -
         == 20_000_000
     )
     assert inventory.sizes[("container", "c")] == 4_000
+
+
+def test_a_successful_measurement_is_marked_measured() -> None:
+    """Regression guard: the common, healthy path must not start reporting `measured=False`."""
+    inventory = StorageInventory.collect(Engine())  # type: ignore[arg-type]
+    assert inventory.measured is True
+
+
+def test_a_nonzero_exit_is_unmeasured_not_zero_bytes() -> None:
+    """Issue #106: `docker system df -v` failing must not read as "measured, and it is
+    zero" -- an empty `sizes` dict on failure was indistinguishable from a healthy, empty
+    host until `measured` existed to tell them apart."""
+    inventory = StorageInventory.collect(FailingEngine())  # type: ignore[arg-type]
+    assert inventory.sizes == {}
+    assert inventory.measured is False
+
+
+def test_an_engine_exception_is_unmeasured() -> None:
+    inventory = StorageInventory.collect(RaisingEngine())  # type: ignore[arg-type]
+    assert inventory.sizes == {}
+    assert inventory.measured is False
+
+
+def test_unparseable_output_is_unmeasured() -> None:
+    inventory = StorageInventory.collect(UnparseableEngine())  # type: ignore[arg-type]
+    assert inventory.sizes == {}
+    assert inventory.measured is False
+
+
+def test_a_successful_exit_with_no_output_at_all_is_unmeasured() -> None:
+    """A `returncode == 0` exit that produced zero parseable lines is not the documented
+    healthy shape (one JSON object per invocation, even on an empty host) -- treat it as
+    unmeasured rather than trusting a result that cannot be explained."""
+    inventory = StorageInventory.collect(EmptyOutputEngine())  # type: ignore[arg-type]
+    assert inventory.sizes == {}
+    assert inventory.measured is False
+
+
+def test_a_genuinely_empty_host_is_still_measured() -> None:
+    """The legitimate "nothing to report" case (a fresh host, or every category empty)
+    must stay indistinguishable from any other successful small measurement -- it is not
+    itself evidence of a problem, and must not be conflated with collection failure."""
+
+    class EmptyHostEngine:
+        def run(self, args: list[str]) -> EngineResult:
+            return EngineResult(0, json.dumps({"Volumes": [], "Containers": [], "Images": []}), "")
+
+    inventory = StorageInventory.collect(EmptyHostEngine())  # type: ignore[arg-type]
+    assert inventory.sizes == {}
+    assert inventory.measured is True
 
 
 def test_engine_storage_path_prefers_the_engine_root_over_registry_state(tmp_path) -> None:

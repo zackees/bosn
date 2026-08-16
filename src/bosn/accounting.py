@@ -19,6 +19,25 @@ from bosn.registry import Resource
 _INVENTORY_COMMAND = ["system", "df", "-v", "--format", "{{json .}}"]
 _SIZE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)\s*([kmgtpe]?b)$", re.I)
 
+# `StorageInventory.collect` deliberately does not pass a bespoke `timeout=` to
+# `engine.run` here, unlike `compose-adopt` (#99), which needed one because its 45s figure
+# was measured against a documented failure: the batched scan reliably landed past the
+# shared 10s *IPC client* budget, so a shorter deadline was silently returning stale
+# bookkeeping to the caller while `compose build` still reported success. That specific
+# failure mode does not apply to this call in the same way: `engine.run` already has its
+# own 60s default (`Engine.DEFAULT_TIMEOUT`), and after this issue's fix (#106) a command
+# that runs past *that* deadline lands in `collect`'s `except Exception` branch below,
+# which now returns `measured=False` and is logged by `gc.py` as `gc.inventory_unmeasured`
+# rather than silently reading as "zero bytes, no pressure". The failure changed from
+# silent-fail-open to loud-abstain, which was the actual problem -- a slow `system df -v`
+# no longer needs a bigger deadline to be safe, it needs its slowness to stop lying.
+#
+# A real widening of `ipc.DEFAULT_TIMEOUT` for the `gc` verb specifically (the same
+# category of problem #99 fixed for `compose-adopt`: the CLI's `bosn gc` waits only the
+# shared 10s IPC budget while the daemon-side `Collector.collect` can legitimately run
+# past it, including this call) is a separate, pre-existing gap that lives in
+# `daemon.request`/`cli.py`'s `cmd_gc`, not in this module, and is out of scope here.
+
 
 @dataclass(frozen=True)
 class StorageProbe:
@@ -40,9 +59,27 @@ def _bytes(value: object) -> int | None:
 
 @dataclass(frozen=True)
 class StorageInventory:
-    """One `system df -v` snapshot, avoiding per-resource commands and layer double counting."""
+    """One `system df -v` snapshot, avoiding per-resource commands and layer double counting.
+
+    ``measured`` is the whole point of this dataclass existing separately from a bare dict
+    (issue #106). Before it existed, `collect` returned `cls({})` on every failure path --
+    engine unreachable, non-zero exit, unparseable JSON -- and an *empty-because-nothing-to-
+    measure* host produced exactly the same `sizes == {}` as an *empty-because-the-command-
+    failed* host. Those two situations must never be conflated: an empty dict fed
+    `Pressure.assess` as `managed_bytes=0`, which reads as "measured, and it is zero" --
+    "no byte pressure" -- when what actually happened is "unmeasured, so silence about
+    pressure, not a clean bill of health". The condition GC exists to relieve (a host with
+    hundreds of Docker objects) is also the condition that makes `system df -v` slowest and
+    likeliest to fail or time out, so this is a directional failure: exactly the hosts that
+    most need reclamation are the ones most likely to look, incorrectly, like they don't.
+
+    `measured=True` with `sizes=={}` is a legitimate, common state (a fresh host with no
+    Docker objects at all) and must stay indistinguishable from any other successful-but-
+    small measurement -- it is not itself evidence of a problem.
+    """
 
     sizes: dict[tuple[str, str], int]
+    measured: bool = True
 
     @classmethod
     def collect(cls, engine: Engine) -> StorageInventory:
@@ -51,14 +88,27 @@ class StorageInventory:
         except KeyboardInterrupt:
             raise
         except Exception:  # noqa: BLE001 - status must still expose unknown measurements offline
-            return cls({})
+            return cls({}, measured=False)
         if not result.ok:
-            return cls({})
+            return cls({}, measured=False)
         sizes: dict[tuple[str, str], int] = {}
         try:
             rows = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
         except json.JSONDecodeError:
-            return cls({})
+            return cls({}, measured=False)
+        if not rows:
+            # A healthy `system df -v --format {{json .}}` emits exactly one JSON object per
+            # invocation -- verified live against a real, busy Docker host (a single line,
+            # keys `Images`/`Containers`/`Volumes`/`BuildCache` all present and non-empty
+            # there). That host had objects in every category, so "keys present as empty
+            # arrays when a category is genuinely empty" is inferred from the fixed format
+            # struct rather than observed directly; `test_a_genuinely_empty_host_is_still_
+            # measured` below pins that inferred contract as the assumption this code relies
+            # on. Either way, zero parseable lines on a `returncode == 0` exit is not that
+            # shape -- it is indistinguishable from a client that silently produced no
+            # output -- so treat it as unmeasured rather than trusting an empty result we
+            # cannot explain.
+            return cls({}, measured=False)
         for row in rows:
             if not isinstance(row, dict):
                 continue

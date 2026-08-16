@@ -216,6 +216,89 @@ def test_pressure_assessment_keeps_count_bytes_and_free_space_distinct() -> None
     assert pressure.free_space_exceeded
 
 
+# -- issue #106: an unmeasurable byte inventory must not read as "zero, no pressure" ------
+
+
+def test_a_successful_measurement_over_ceiling_is_unchanged_by_the_new_flag() -> None:
+    """Regression guard: this is the behavior that matters most, since pressure drives
+    deletion. `bytes_measured` defaults to True, so every existing caller that never
+    mentions it keeps today's exact decision."""
+    pressure = Pressure.assess(
+        resource_count=1,
+        managed_bytes=200,
+        free_bytes=100,
+        min_free_bytes=10,
+        managed_bytes_ceiling=100,
+    )
+    assert pressure.bytes_exceeded
+    assert pressure.under_pressure
+    assert not pressure.bytes_unknown
+
+
+def test_a_successful_measurement_under_ceiling_is_unchanged_by_the_new_flag() -> None:
+    pressure = Pressure.assess(resource_count=1, managed_bytes=5, free_bytes=100, min_free_bytes=10)
+    assert not pressure.bytes_exceeded
+    assert not pressure.under_pressure
+    assert not pressure.bytes_unknown
+
+
+def test_an_unmeasured_byte_total_does_not_read_as_confirmed_under_ceiling() -> None:
+    """The core fix: `managed_bytes` from a failed inventory collection would otherwise sum
+    to 0, which looks exactly like "measured, confirmed zero". `bytes_unknown` is what makes
+    the two distinguishable downstream."""
+    pressure = Pressure.assess(
+        resource_count=1, managed_bytes=0, free_bytes=100, min_free_bytes=10, bytes_measured=False
+    )
+    assert not pressure.bytes_exceeded
+    assert pressure.bytes_unknown
+
+
+def test_an_unmeasured_byte_total_never_invents_pressure() -> None:
+    """The safe direction is "refuse to conclude no pressure", never "assume there is
+    pressure and start deleting" -- even a huge `managed_bytes` figure must be distrusted
+    entirely when `bytes_measured=False`, not just capped at the ceiling."""
+    pressure = Pressure.assess(
+        resource_count=1,
+        managed_bytes=10**12,
+        free_bytes=100,
+        min_free_bytes=10,
+        bytes_measured=False,
+    )
+    assert not pressure.bytes_exceeded
+    assert not pressure.under_pressure
+    assert pressure.bytes_unknown
+
+
+def test_count_and_free_space_signals_still_decide_independently_when_bytes_are_unknown() -> None:
+    """The third design option (see `Pressure.bytes_unknown`'s docstring): an unmeasurable
+    byte signal suppresses itself but must not suppress the other two, since they come from
+    different sources (resource count, `shutil.disk_usage`) and may still be valid."""
+    by_count = Pressure.assess(
+        resource_count=5,
+        managed_bytes=0,
+        free_bytes=100,
+        resource_ceiling=1,
+        min_free_bytes=10,
+        bytes_measured=False,
+    )
+    assert by_count.under_pressure
+    assert by_count.count_exceeded
+    assert by_count.bytes_unknown
+    assert not by_count.bytes_exceeded
+
+    by_free_space = Pressure.assess(
+        resource_count=1,
+        managed_bytes=0,
+        free_bytes=1,
+        min_free_bytes=10,
+        bytes_measured=False,
+    )
+    assert by_free_space.under_pressure
+    assert by_free_space.free_space_exceeded
+    assert by_free_space.bytes_unknown
+    assert not by_free_space.bytes_exceeded
+
+
 def test_done_never_collects_machine_scoped_caches(registry: Registry, clock: FakeClock) -> None:
     """One workspace finishing must not evict the machine-wide cargo registry."""
     resource = make(registry, scope="machine")
