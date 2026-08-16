@@ -27,6 +27,7 @@ up, not replaces.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import threading
 import time
@@ -88,6 +89,15 @@ def served(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[daemon_m
     monkeypatch.setenv("BOSN_PORT", str(port))
 
     instance = daemon_mod.Daemon(state_dir=state_dir, idle_retire_seconds=3600)
+    # A fresh registry has no stored maintenance deadline, so a pass is due on the very
+    # first watchdog tick -- and that pass runs real GC against a reachable engine. This
+    # module is about the compose lifecycle, not about unattended reclamation, so leaving
+    # it armed means an unrelated GC pass can delete resources mid-test and fail an
+    # assertion about compose's own behavior. It did exactly that on the Linux CI lane:
+    # the bystander volume below was collected between its registration and the `down -v`
+    # assertion that depends on it still being there. Pushed out of the way for the same
+    # reason and in the same way the daemon tests do it (issue #95).
+    instance._set_next_maintenance(instance.clock.now() + 3600)
     thread = threading.Thread(target=instance.serve_forever, daemon=True)
     thread.start()
     assert wait_until(lambda: daemon_mod.is_serving(state_dir), timeout=30), (
@@ -213,7 +223,11 @@ def test_compose_lifecycle_through_the_real_front_door(
         generation="g",
         scope="spec",
         workspace=bystander_workspace,
-        created="2026-08-13T00:00:00Z",
+        # Stamped now, not a fixed past date. A hardcoded timestamp ages relative to
+        # whenever the suite happens to run, so it silently drifts past the 72h warm TTL
+        # and turns this control volume into a GC candidate -- which is a property of the
+        # calendar, not of anything this test means to assert.
+        created=dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
     engine.run(["volume", "create", *bystander_labels.to_docker_args(), bystander_name], check=True)
 

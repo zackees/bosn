@@ -103,6 +103,14 @@ def test_run_reports_an_actual_timeout_as_a_deadline(monkeypatch) -> None:
     def fake_subprocess_run(*_args, **_kwargs):
         raise wrapped
 
+    # `run` checks `available()` (a PATH lookup for the binary) before it ever reaches the
+    # faked `subprocess_run`, and raises a different EngineError -- "'docker' is not on
+    # PATH" -- when that lookup fails. On a machine with Docker installed the fake is
+    # reached and this test passes; on one without it (the macOS CI lane) the test would
+    # fail against a message it was never about. This test is about how `run` classifies a
+    # RuntimeError from the spawn, not about whether the host has Docker, so the PATH
+    # question is answered here rather than inherited from the runner.
+    monkeypatch.setattr(engine_mod.Engine, "available", lambda _self: True)
     monkeypatch.setattr(engine_mod.rp, "subprocess_run", fake_subprocess_run)
 
     with pytest.raises(EngineError, match="7-second deadline") as raised:
@@ -126,6 +134,14 @@ def test_run_distinguishes_a_spawn_failure_from_a_timeout(monkeypatch) -> None:
     def fake_subprocess_run(*_args, **_kwargs):
         raise spawn_failure
 
+    # `run` checks `available()` (a PATH lookup for the binary) before it ever reaches the
+    # faked `subprocess_run`, and raises a different EngineError -- "'docker' is not on
+    # PATH" -- when that lookup fails. On a machine with Docker installed the fake is
+    # reached and this test passes; on one without it (the macOS CI lane) the test would
+    # fail against a message it was never about. This test is about how `run` classifies a
+    # RuntimeError from the spawn, not about whether the host has Docker, so the PATH
+    # question is answered here rather than inherited from the runner.
+    monkeypatch.setattr(engine_mod.Engine, "available", lambda _self: True)
     monkeypatch.setattr(engine_mod.rp, "subprocess_run", fake_subprocess_run)
 
     with pytest.raises(EngineError) as raised:
