@@ -20,6 +20,7 @@ import os
 import subprocess
 import sys
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -44,6 +45,64 @@ _INSPECT_COMMANDS: dict[str, list[str]] = {
     "image": ["image", "inspect", "--format", "{{json .Config.Labels}}"],
     "network": ["network", "inspect", "--format", "{{json .Labels}}"],
 }
+
+# Batch inspect commands, one per kind, that accept N names/ids on the command line and
+# emit one JSON line per *found* object -- see `_batch_inspect_labels`. Each format string
+# hand-builds a JSON object (`{"<id-field>": {{json .X}}, "Labels": {{json .Y}}}`) rather
+# than relying on line position to recover which name a line belongs to. That is not
+# cosmetic: verified against real Docker, a batch inspect where one of N names does not
+# exist prints output for the ones that *were* found, writes an error for the missing one
+# to stderr, and exits 1 -- and the missing name produces no line at all. With a plain
+# `{{json .Labels}}` format (the single-name shape `_INSPECT_COMMANDS` still uses, since a
+# single-name call has nothing to misalign), N names in and fewer than N lines out would
+# make "which line is whose" a guess. Embedding the identity turns each line into a
+# self-describing (name, labels) pair, so mapping is a dict build, not a zip().
+#
+# The identity field differs per kind because Docker's inspect JSON does: containers and
+# volumes expose `.Name` (containers with a leading "/", stripped in
+# `_batch_inspect_labels`),
+# images expose only `.Id` -- there is no name at the image-inspect layer, mirroring why
+# `_LIST_COMMANDS["image"]` passes `--no-trunc` and `_name_of` reads `.ID` for images --
+# and networks expose `.Name`. Each was checked against a real `docker <kind> inspect`
+# invocation rather than assumed from the single-name formats above, which is what caught
+# the container leading-slash and the image having no `.Name` at all.
+_BATCH_INSPECT_COMMANDS: dict[str, tuple[list[str], str]] = {
+    "container": (
+        ["inspect"],
+        '{"Name":{{json .Name}},"Labels":{{json .Config.Labels}}}',
+    ),
+    "volume": (
+        ["volume", "inspect"],
+        '{"Name":{{json .Name}},"Labels":{{json .Labels}}}',
+    ),
+    "image": (
+        ["image", "inspect"],
+        '{"Id":{{json .Id}},"Labels":{{json .Config.Labels}}}',
+    ),
+    "network": (
+        ["network", "inspect"],
+        '{"Name":{{json .Name}},"Labels":{{json .Labels}}}',
+    ),
+}
+
+# The JSON key `_BATCH_INSPECT_COMMANDS`' format string uses for each kind's identity,
+# needed to read the right field back out of the parsed line in `_batch_inspect_labels`.
+_BATCH_IDENTITY_KEY: dict[str, str] = {
+    "container": "Name",
+    "volume": "Name",
+    "image": "Id",
+    "network": "Name",
+}
+
+# Names per `docker <kind> inspect` invocation. Chunking exists purely so a host with
+# thousands of unlabeled objects (this is exactly the population `_discover` is scanning
+# when it falls back to inspect at all -- see the module docstring) cannot build a command
+# line past the OS argv-length limit; it is not a batching-effectiveness knob. A few hundred
+# is comfortably under every platform's limit (Windows CreateProcess ~32K chars is the
+# tightest of the three) even for the longest identifiers this code handles (a 64-hex-char
+# `sha256:` image id), and it still collapses a 255-object host from ~255 subprocesses down
+# to a small constant per kind (issue #99).
+INSPECT_BATCH_SIZE = 200
 
 
 @dataclass(frozen=True)
@@ -107,6 +166,33 @@ def _parse_labels(blob: str) -> dict[str, str]:
     return result
 
 
+def _chunked(items: list[str], size: int) -> Iterator[list[str]]:
+    """Split `items` into consecutive slices of at most `size`, preserving order.
+
+    Extracted purely so `_batch_inspect_labels` reads as "for each chunk" rather than
+    hand-rolled range/slice arithmetic at the call site -- there is no other behavior here.
+    """
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
+def _labels_from_row(value: object) -> dict[str, str]:
+    """Normalize a `Labels` field already parsed out of a batch-inspect JSON line.
+
+    Unlike `_parse_labels`, the input here is a Python object (dict or `None`), not a raw
+    string blob -- `_BATCH_INSPECT_COMMANDS`' hand-built format strings emit `{{json
+    .Labels}}` as a nested JSON value inside the already-parsed outer object, so by the time
+    this runs `json.loads` has already turned it into `dict | None` (Docker renders an
+    unlabeled object's `.Labels` as JSON `null`, confirmed against real `docker image
+    inspect`/`docker network inspect` output). Re-serializing back to a string just to hand
+    it to `_parse_labels` would work but adds a pointless round trip for no shared logic
+    beyond "stringify values, drop Nones", which is inlined here instead.
+    """
+    if not isinstance(value, dict):
+        return {}
+    return {str(k): str(v) for k, v in value.items() if v is not None}
+
+
 def _name_of(kind: str, row: dict[str, object]) -> str:
     if kind == "volume":
         return str(row.get("Name", ""))
@@ -131,7 +217,17 @@ class ResourceScanner:
         if not result.ok:
             return [], False
 
-        discovered: list[DiscoveredResource] = []
+        # Two passes rather than one: the list format truncates labels for some kinds, and
+        # confirming a truncated-looking row used to mean "call `inspect_labels` right here,
+        # one subprocess per such row" (issue #99). On a host with hundreds of foreign or
+        # unlabeled objects -- not bounded by anything bosn owns, since it is whatever else
+        # happens to exist on the machine -- that made a single `scan()` cost tens of
+        # seconds and blow the IPC client's timeout. Collecting every name that needs
+        # confirming first and resolving them together in one batched (and internally
+        # chunked) call per kind is what turns that into O(kinds) subprocesses instead of
+        # O(resources).
+        rows: list[tuple[str, dict[str, str]]] = []
+        incomplete_names: list[str] = []
         for line in result.stdout.splitlines():
             line = line.strip()
             if not line:
@@ -146,10 +242,15 @@ class ResourceScanner:
             if not name:
                 continue
             raw = _parse_labels(str(row.get("Labels", "")))
+            rows.append((name, raw))
             if not labels.is_complete(raw):
-                # The list format truncates labels for some kinds; confirm via inspect
-                # before concluding a resource is unlabeled.
-                raw = self.inspect_labels(kind, name) or raw
+                incomplete_names.append(name)
+
+        confirmed = self._batch_inspect_labels(kind, incomplete_names) if incomplete_names else {}
+        discovered: list[DiscoveredResource] = []
+        for name, raw in rows:
+            if not labels.is_complete(raw):
+                raw = confirmed.get(name) or raw
             discovered.append(DiscoveredResource(kind=kind, name=name, raw_labels=raw))
         return discovered, True
 
@@ -159,6 +260,7 @@ class ResourceScanner:
         return discovered
 
     def inspect_labels(self, kind: str, name: str) -> dict[str, str]:
+        """Single-name inspect: the fallback path, not the hot path (see `_discover`)."""
         args = _INSPECT_COMMANDS.get(kind)
         if args is None:
             return {}
@@ -166,6 +268,69 @@ class ResourceScanner:
         if not result.ok:
             return {}
         return _parse_labels(result.stdout)
+
+    def _batch_inspect_labels(self, kind: str, names: list[str]) -> dict[str, dict[str, str]]:
+        """Resolve labels for many names in a handful of `docker <kind> inspect` calls.
+
+        Chunked per `INSPECT_BATCH_SIZE` so this stays a small constant number of
+        subprocesses regardless of host size, rather than one per name (the O(resources)
+        cost issue #99 is about) or one unbounded command line (a host with thousands of
+        objects could otherwise exceed the OS argv-length limit).
+
+        Every name in `names` was just observed to exist by `_discover`'s `ls`, but Docker
+        objects are not frozen between that listing and this inspect -- something else on
+        the host (or a concurrent bosn operation) can remove one in between. Verified
+        against real Docker: when that happens the batch command still prints a JSON line
+        for every name it *did* find, writes an error to stderr for the one it didn't, and
+        exits 1 for the whole invocation. So a nonzero exit does not mean "discard this
+        chunk's output" -- `_BATCH_INSPECT_COMMANDS`' format embeds each row's identity
+        precisely so the lines that did come back can still be trusted and mapped correctly
+        even when the process itself reports failure.
+
+        For whatever names a chunk's output did *not* account for -- true removal, or some
+        other reason the whole invocation failed (permissions, a transient engine hiccup) --
+        this falls back to `inspect_labels` one name at a time, i.e. exactly today's
+        pre-#99 per-resource behavior. That fallback is scoped to the unresolved names only,
+        not the whole chunk: names the batch call did resolve are not re-fetched just
+        because a sibling name in the same chunk failed.
+        """
+        command = _BATCH_INSPECT_COMMANDS.get(kind)
+        if command is None:
+            return {}
+        args_prefix, fmt = command
+        identity_key = _BATCH_IDENTITY_KEY[kind]
+        recovered: dict[str, dict[str, str]] = {}
+        for chunk in _chunked(names, INSPECT_BATCH_SIZE):
+            result = self.engine.run([*args_prefix, "--format", fmt, *chunk])
+            found_in_chunk: set[str] = set()
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                identity = row.get(identity_key)
+                if not isinstance(identity, str):
+                    continue
+                if kind == "container":
+                    # `docker inspect`'s `.Name` carries a leading "/" that `docker ps`'s
+                    # `.Names` does not (confirmed against real Docker) -- without this the
+                    # identity would never match what `_name_of` put in `names`.
+                    identity = identity.lstrip("/")
+                recovered[identity] = _labels_from_row(row.get("Labels"))
+                found_in_chunk.add(identity)
+            if not result.ok:
+                for name in chunk:
+                    if name in found_in_chunk:
+                        continue
+                    single = self.inspect_labels(kind, name)
+                    if single:
+                        recovered[name] = single
+        return recovered
 
     def scan(self, registry_id: str, kinds: list[str] | None = None) -> ScanResult:
         scan = ScanResult()

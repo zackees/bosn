@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from bosn import daemon, docker_cli
+from bosn import daemon, docker_cli, ipc
 from bosn.docker_cli import (
     DockerFrontDoorError,
     _compose_overlay,
@@ -248,6 +248,38 @@ def test_a_failed_up_still_reconciles(tmp_path: Path, monkeypatch: pytest.Monkey
 
     assert returncode == 1
     assert "compose-adopt" in fake_daemon.calls
+
+
+def test_compose_adopt_uses_its_own_timeout_not_the_shared_ipc_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#99: `compose-adopt`'s daemon-side scan cost is a poor fit for `ipc.DEFAULT_TIMEOUT`.
+
+    Batching `_discover`'s inspect fallback (#99) made the scan O(kinds) instead of
+    O(host-object-count), but a batched `docker image inspect` call is still measurably slow
+    on an object-heavy host -- comfortably past 10s in repeated on-host measurement -- so
+    `_reconcile_after_compose` gives this one verb its own named budget via `request_timeout`
+    rather than the global default every other verb still uses. Regression guard: a future
+    edit that reverted to the bare `daemon.request("compose-adopt", ...)` call would still
+    pass every other compose test in this file, since none of them assert on the timeout.
+    """
+    fake_daemon = _FakeDaemon()
+    monkeypatch.setattr(daemon, "request", fake_daemon.request)
+    monkeypatch.setattr(
+        "bosn.docker_cli.subprocess.run", lambda *a, **k: _FakeCompleted(returncode=0)
+    )
+
+    _run_compose("up", _compose_file(tmp_path), [])
+
+    adopt_requests = [
+        req
+        for verb, req in zip(fake_daemon.calls, fake_daemon.requests, strict=True)
+        if verb == "compose-adopt"
+    ]
+    assert adopt_requests, "compose-adopt was never called"
+    for req in adopt_requests:
+        assert req.get("request_timeout") == docker_cli.COMPOSE_ADOPT_TIMEOUT_SECONDS
+        assert req["request_timeout"] > ipc.DEFAULT_TIMEOUT
 
 
 def test_an_interrupted_up_still_reconciles_and_the_interrupt_still_propagates(

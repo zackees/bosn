@@ -35,6 +35,44 @@ from bosn.frontdoor import (
 from bosn.registry import Registry
 from bosn.resources import process_start_time
 
+# `compose-adopt`'s daemon-side cost is `ResourceScanner.scan`, which -- after #99's
+# batching fix collapsed the per-resource `docker inspect` fallback into one batched call
+# per kind -- is O(kinds) subprocesses rather than O(host-object-count). That fix alone was
+# not enough to make `ipc.DEFAULT_TIMEOUT` (10s) safe here: measured on the same ~280-object
+# development host the batching fix was validated against, a full scan still took 7-11s
+# across repeated runs (the batched `docker image inspect` call is the dominant cost --
+# image inspect output is far larger per object than volume/network/container, roughly
+# 70ms/image vs 10ms/volume here), meaning it sometimes lands past the 10s client budget by
+# itself before any daemon-side scheduling delay or host load is added on top. Raising
+# `ipc.DEFAULT_TIMEOUT` itself was rejected: that constant is shared by every verb, and
+# widening it to cover this one daemon-side cost would silently loosen the budget for verbs
+# that have no reason to need it. `daemon.request` already accepts a per-call
+# `request_timeout` override for exactly this situation.
+#
+# Sized against two measurement regimes on the same ~280-object host, because they differ
+# by more than 2x and only the slower one is safe to size against:
+#   - quiet host:   7.1-11.5s across repeated runs
+#   - loaded host: 23.7s, measured while a full test suite ran concurrently
+# The loaded figure is not a pathological outlier to be discounted -- a developer running
+# `compose build` while their own build, test suite, or editor indexes is running IS the
+# loaded case, and it is exactly when this call is most likely to be issued.
+#
+# 45s is ~2x the loaded measurement and ~4x the quiet one. 30s was the first value here,
+# derived from the quiet numbers alone; against the loaded measurement that is only ~1.25x,
+# which is thin next to the ~40% run-to-run swing observed even on a quiet host.
+#
+# Raising `ipc.DEFAULT_TIMEOUT` instead was rejected: it is shared by every verb, and
+# widening it to cover this one daemon-side cost would silently loosen budgets for verbs
+# with no reason to need it. `daemon.request` already takes a per-call `request_timeout`.
+#
+# This is a bound on how long the CLI *waits for bookkeeping*, and the trade is deliberate:
+# the timeout is non-fatal, so a shorter one does not fail the command, it just returns
+# before the registry has caught up -- which is the silent staleness #99 exists to fix.
+# Waiting is the lesser cost. If a future host pushes the batched scan past this too, that
+# is a signal the O(kinds) approach has hit its own limit and needs the "partial results" or
+# "async adopt" directions #99 discusses, not another timeout bump.
+COMPOSE_ADOPT_TIMEOUT_SECONDS = 45.0
+
 
 class DockerFrontDoorError(ValueError):
     pass
@@ -426,7 +464,11 @@ def _reconcile_after_compose(command: str, *, prune_missing: bool = False) -> No
     bookkeeping error the caller didn't ask about.
     """
     try:
-        adopted = daemon.request("compose-adopt", prune_missing=prune_missing)
+        adopted = daemon.request(
+            "compose-adopt",
+            prune_missing=prune_missing,
+            request_timeout=COMPOSE_ADOPT_TIMEOUT_SECONDS,
+        )
     except KeyboardInterrupt:
         raise
     except Exception as exc:  # daemon unreachable, IPC failure, etc.
