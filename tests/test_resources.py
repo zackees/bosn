@@ -44,15 +44,57 @@ def label_dict(registry: str = OURS, **overrides: str) -> dict[str, str]:
 
 
 class FakeEngine:
-    """Records commands and replays canned output."""
+    """Records commands and replays canned output.
 
-    def __init__(self, listings: dict[str, list[dict]], inspects: dict[str, dict] | None = None):
+    Batch inspect (`resources._BATCH_INSPECT_COMMANDS`) is modeled after real Docker
+    behavior verified for issue #99: a requested name that is not in `self.inspects` simply
+    produces no output line (rather than an empty/error line), and the command's exit code
+    goes non-zero whenever any requested name in the batch was missing -- mirroring "found
+    ones print, missing ones don't, and the process still reports failure overall". Names in
+    `batch_command_failures` skip straight to a total failure (empty stdout, exit 1) with no
+    lines at all, modeling a batch call that failed for a reason unrelated to any single
+    name (permissions, a transient engine error) -- the case `_batch_inspect_labels`'s
+    per-name fallback exists for.
+    """
+
+    def __init__(
+        self,
+        listings: dict[str, list[dict]],
+        inspects: dict[str, dict] | None = None,
+        batch_command_failures: set[str] | None = None,
+    ):
         self.listings = listings
         self.inspects = inspects or {}
+        self.batch_command_failures = batch_command_failures or set()
         self.commands: list[list[str]] = []
 
-    def run(self, args: list[str], *, check: bool = False) -> EngineResult:
+    def run(
+        self, args: list[str], *, check: bool = False, timeout: float | None = None
+    ) -> EngineResult:
         self.commands.append(list(args))
+        for kind, (prefix, fmt) in resources._BATCH_INSPECT_COMMANDS.items():
+            if args[: len(prefix)] != prefix or "--format" not in args:
+                continue
+            fmt_index = args.index("--format")
+            if args[fmt_index + 1] != fmt:
+                continue
+            if kind in self.batch_command_failures:
+                return EngineResult(1, "", "simulated total batch failure")
+            names = args[fmt_index + 2 :]
+            identity_key = resources._BATCH_IDENTITY_KEY[kind]
+            lines: list[str] = []
+            any_missing = False
+            for name in names:
+                label_map = self.inspects.get(name)
+                if label_map is None:
+                    any_missing = True
+                    continue
+                # Container inspect's `.Name` carries a leading "/" in real Docker; the
+                # other kinds' identity field is the bare name/id.
+                identity = f"/{name}" if kind == "container" else name
+                lines.append(json.dumps({identity_key: identity, "Labels": label_map}))
+            returncode = 1 if any_missing else 0
+            return EngineResult(returncode, "\n".join(lines), "missing name" if any_missing else "")
         if "inspect" in args:
             name = args[-1]
             return EngineResult(0, json.dumps(self.inspects.get(name, {})), "")
@@ -119,6 +161,89 @@ def test_labels_are_confirmed_by_inspect_when_the_listing_truncates_them() -> No
     scan = ResourceScanner(engine).scan(OURS, kinds=["volume"])  # type: ignore[arg-type]
     assert [r.name for r in scan.owned] == ["ours"]
     assert any("inspect" in cmd for cmd in engine.commands)
+
+
+def test_inspect_confirmation_is_batched_not_one_call_per_resource() -> None:
+    """The #99 regression guard: N incomplete-label resources must cost O(chunks), not N.
+
+    A future refactor that silently reintroduces a per-resource `inspect_labels` call
+    inside `_discover`'s loop would still pass every ownership-bucketing test in this file
+    -- those only check where a resource lands, not how many subprocesses it took to get
+    there. This asserts on the recorded engine calls directly, which is the only thing that
+    would catch that regression.
+    """
+    count = resources.INSPECT_BATCH_SIZE * 2 + 30  # forces exactly 3 chunks
+    names = [f"vol-{i}" for i in range(count)]
+    engine = FakeEngine(
+        {"volume": [{"Name": name, "Labels": ""} for name in names]},
+        inspects={name: label_dict() for name in names},
+    )
+    scan = ResourceScanner(engine).scan(OURS, kinds=["volume"])  # type: ignore[arg-type]
+
+    assert len(scan.owned) == count
+    inspect_calls = [cmd for cmd in engine.commands if "inspect" in cmd]
+    assert len(inspect_calls) == 3, inspect_calls
+    for call in inspect_calls:
+        assert call[: len(resources._BATCH_INSPECT_COMMANDS["volume"][0])] == ["volume", "inspect"]
+
+
+def test_batch_inspect_maps_labels_to_the_correct_resource_when_a_name_is_missing() -> None:
+    """The positional-mapping hazard: Docker prints no line for a name it can't find.
+
+    Real Docker, verified for #99: when one of several requested names does not exist, the
+    batch inspect command prints output only for the ones it *did* find, and exits non-zero
+    overall. A naive implementation that zipped output lines to input names positionally
+    would silently misattribute every name after the missing one. This asserts each
+    surviving resource's labels landed on the resource with the matching name, not merely
+    that the right *count* of labels came back (which the positional bug would not catch).
+    """
+    engine = FakeEngine(
+        {
+            "volume": [
+                {"Name": "alpha", "Labels": ""},
+                {"Name": "removed-between-ls-and-inspect", "Labels": ""},
+                {"Name": "gamma", "Labels": ""},
+            ]
+        },
+        inspects={
+            "alpha": label_dict(**{labels.STACK: "alpha-stack"}),
+            # "removed-between-ls-and-inspect" deliberately absent: gone by inspect time.
+            "gamma": label_dict(**{labels.STACK: "gamma-stack"}),
+        },
+    )
+    scan = ResourceScanner(engine).scan(OURS, kinds=["volume"])  # type: ignore[arg-type]
+
+    owned_by_name = {r.name: r for r in scan.owned}
+    assert owned_by_name["alpha"].parsed().stack == "alpha-stack"
+    assert owned_by_name["gamma"].parsed().stack == "gamma-stack"
+    assert [r.name for r in scan.unlabeled] == ["removed-between-ls-and-inspect"]
+    # One batched call covering all three names, plus exactly one per-name fallback call
+    # for the single name that call could not account for -- not three per-name calls,
+    # and not a wholesale re-fetch of the two names the batch call already resolved.
+    inspect_calls = [cmd for cmd in engine.commands if "inspect" in cmd]
+    assert len(inspect_calls) == 2, inspect_calls
+    assert inspect_calls[1][-1] == "removed-between-ls-and-inspect"
+
+
+def test_batch_inspect_falls_back_to_per_name_when_the_whole_batch_command_fails() -> None:
+    """Mitigation #2: a batch call that fails outright degrades to pre-#99 behavior.
+
+    Distinct from the missing-name case above -- here the batch command fails for a reason
+    unrelated to any single name (simulated: total failure, no output lines at all), so
+    every name in the batch is unresolved from that call's own output. The fallback must
+    still recover labels via one inspect per name, exactly like the pre-#99 code path.
+    """
+    engine = FakeEngine(
+        {"volume": [{"Name": "solo", "Labels": ""}]},
+        inspects={"solo": label_dict()},
+        batch_command_failures={"volume"},
+    )
+    scan = ResourceScanner(engine).scan(OURS, kinds=["volume"])  # type: ignore[arg-type]
+
+    assert [r.name for r in scan.owned] == ["solo"]
+    inspect_calls = [cmd for cmd in engine.commands if "inspect" in cmd]
+    # One failed batch call, then one per-name fallback call for the sole unresolved name.
+    assert len(inspect_calls) == 2, inspect_calls
 
 
 def test_image_discovery_requests_and_keeps_the_full_immutable_id() -> None:
