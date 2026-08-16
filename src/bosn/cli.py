@@ -23,6 +23,28 @@ from bosn.options import Options, from_namespace
 
 DAEMON_VERB = "__daemon"
 
+# `gc` waits on a daemon-side `Collector.collect`, whose cost is nothing like the shared
+# `ipc.DEFAULT_TIMEOUT` (10s) that every other verb inherits. Measured on a ~280-object
+# development host: `docker system df -v` alone is 5.2s, the resource scan is 7-11s quiet
+# and ~24s under load (see #99), and removals come on top of both and scale with how much
+# there is to delete. 10s could not cover the *first* step, so `bosn gc` reported failure
+# for collections that were proceeding normally (#110).
+#
+# 120s is sized to cover inventory plus a loaded scan plus a substantial removal pass with
+# room to spare, rather than to the median case -- a `gc` that has real work to do is
+# exactly when this budget matters, and exactly when the host is slowest.
+#
+# It is deliberately a per-call override rather than a bump to `ipc.DEFAULT_TIMEOUT`, for
+# the same reason `compose-adopt` got its own in #99: that constant is shared by every
+# verb, and widening it to fit the slowest one would silently loosen budgets for verbs
+# that answer in milliseconds and should fail fast when they do not.
+#
+# Any fixed number here is ultimately a guess, because `gc`'s runtime scales with how much
+# it deletes. #110 records the alternative -- making `gc` job-backed the way builds already
+# are (`jobs.py`), so progress streams and no budget is needed at all -- as the real fix if
+# this one ever proves too small.
+GC_REQUEST_TIMEOUT_SECONDS = 120.0
+
 NOT_IMPLEMENTED_EXIT = 3
 
 # Long enough to cover a daemon draining a cancelled build (see SHUTDOWN_DRAIN_SECONDS),
@@ -821,13 +843,36 @@ def cmd_gc(opts: Options) -> int:
         flags = _policy_flags(opts)
         load_config(flags=flags)
         reply = daemon_mod.request(
-            "gc", opts.state_dir, engine=opts.engine, dry_run=opts.dry_run, policy_flags=flags
+            "gc",
+            opts.state_dir,
+            engine=opts.engine,
+            dry_run=opts.dry_run,
+            policy_flags=flags,
+            request_timeout=GC_REQUEST_TIMEOUT_SECONDS,
         )
     except ConfigError as exc:
         return _error(
             code="policy.invalid",
             message=str(exc),
             next_step="correct the named policy value and retry",
+            as_json=opts.json,
+        )
+    except ipc.TransportTimeout as exc:
+        # Ordered before the `TransportError` clause below, which it is a subclass of.
+        # A timeout here does not mean the daemon is absent -- it means it is still
+        # collecting -- so it must not inherit that clause's "start or restart the daemon"
+        # remedy. Restarting is the one action that would interrupt the very work being
+        # waited on, and the collection continues regardless of this client giving up.
+        return _error(
+            code="gc.timeout",
+            message=(
+                f"the daemon did not finish collecting within "
+                f"{GC_REQUEST_TIMEOUT_SECONDS:g}s: {exc}"
+            ),
+            next_step=(
+                "the daemon is still collecting -- do not restart it; check `bosn status` "
+                "or the event log, and retry once it settles"
+            ),
             as_json=opts.json,
         )
     except (daemon_mod.DaemonError, ipc.TransportError) as exc:
