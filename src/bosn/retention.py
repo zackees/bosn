@@ -74,6 +74,40 @@ class Pressure:
     count_exceeded: bool = False
     bytes_exceeded: bool = False
     free_space_exceeded: bool = False
+    # True when `managed_bytes` was not a real measurement (`accounting.StorageInventory`
+    # could not run/parse `docker system df -v` -- issue #106). Kept separate from
+    # `bytes_exceeded` rather than folded into it: three designs were considered for what an
+    # unmeasurable byte total should do to pressure, and this field is the artifact of
+    # picking the third one.
+    #
+    #   1. Unknown-as-pressure (`bytes_exceeded=True` when unmeasured). Rejected: GC deletes
+    #      things. This would start reclaiming warm caches on a host that is not actually
+    #      short on space, purely because `docker system df -v` had a slow or flaky moment --
+    #      trading a false negative for a false positive that does real, irreversible damage.
+    #      The task's own doctrine is explicit about this direction being off-limits.
+    #   2. Unknown-as-zero (`bytes_exceeded=False`, nothing else changes). This is *today's
+    #      bug*: an unmeasurable inventory reads identically to "measured, and it is zero",
+    #      so `bytes_exceeded` silently settles on "no pressure" for the one signal most
+    #      likely to be genuinely true on exactly the hosts where measurement is likeliest to
+    #      fail (object-heavy hosts are both the ones GC exists to relieve and the ones
+    #      `system df -v` is slowest and flakiest on).
+    #   3. Unknown-as-a-distinct-state (chosen). `bytes_exceeded` stays `False` -- still no
+    #      invented pressure, still no aggressive deletion -- but that `False` is now
+    #      distinguishable from a real "confirmed under ceiling" via `bytes_unknown=True`.
+    #      `count_exceeded` and `free_space_exceeded` come from independent sources
+    #      (`len(resource_rows)` and `shutil.disk_usage`/engine `info`, not `system df -v`)
+    #      and keep deciding `under_pressure` on their own merits, exactly as they already do
+    #      for each other -- this mirrors the existing deliberate separation of the three
+    #      `_exceeded` flags rather than introducing a new mechanism.
+    #
+    # This does *not* make `under_pressure` swing to True on an unmeasured inventory by
+    # itself -- the formula below is unchanged, so a caller that only reads `under_pressure`
+    # gets exactly today's conservative behavior. `bytes_unknown` exists for callers who must
+    # not treat "no byte pressure detected" as "byte pressure ruled out": `gc.py` logs an
+    # event so the condition is visible instead of inferred from GC quietly doing nothing,
+    # and status output surfaces it so an operator watching a busy host does not mistake
+    # silence for a clean bill of health.
+    bytes_unknown: bool = False
 
     @classmethod
     def assess(
@@ -85,16 +119,28 @@ class Pressure:
         resource_ceiling: int = DEFAULT_RESOURCE_CEILING,
         managed_bytes_ceiling: int = DEFAULT_MANAGED_BYTES_CEILING,
         min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
+        bytes_measured: bool = True,
     ) -> Pressure:
-        """Evaluate all three pressure signals without conflating bytes and free space."""
+        """Evaluate all three pressure signals without conflating bytes and free space.
+
+        ``bytes_measured=False`` means ``managed_bytes`` is not a real measurement (the
+        inventory it was summed from could not be collected -- see
+        ``accounting.StorageInventory.measured``). In that case ``managed_bytes`` is not
+        trusted at all: `bytes_exceeded` is forced `False` (never invent pressure from a
+        number that might be entirely wrong) and `bytes_unknown` records that this `False`
+        is an abstention, not a confirmation. `count_exceeded` and `free_space_exceeded` are
+        computed exactly as usual -- they are read from different sources and remain valid
+        even when the byte measurement is not.
+        """
         count_exceeded = resource_count > resource_ceiling
-        bytes_exceeded = managed_bytes > managed_bytes_ceiling
+        bytes_exceeded = bytes_measured and managed_bytes > managed_bytes_ceiling
         free_space_exceeded = free_bytes < min_free_bytes
         return cls(
             under_pressure=count_exceeded or bytes_exceeded or free_space_exceeded,
             count_exceeded=count_exceeded,
             bytes_exceeded=bytes_exceeded,
             free_space_exceeded=free_space_exceeded,
+            bytes_unknown=not bytes_measured,
         )
 
 

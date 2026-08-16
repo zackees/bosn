@@ -115,6 +115,17 @@ class Collector:
         # `None` means the engine could not answer (unreachable, non-zero exit, unparseable);
         # that is a reason to protect every container, never a reason to treat none as running.
         running_containers = resources.running_container_names(self.engine)
+        if not inventory.measured:
+            # Visible in the event log, not inferred from GC quietly doing nothing (#106):
+            # `docker system df -v` failed, timed out, or returned output we could not
+            # trust, so every resource this pass attributes to `system df -v` reads as
+            # unmeasured rather than zero. `Pressure.assess(bytes_measured=False)` below is
+            # what keeps that from silently reading as "no byte pressure".
+            self.registry.log_event(
+                "gc.inventory_unmeasured",
+                "docker system df -v failed or returned unusable output; "
+                "byte-based pressure detection is blind this pass",
+            )
         # Pressure is intentionally derived here for every pass. The argument remains only
         # as a compatibility shim for callers from older releases and cannot override policy.
         _ = pressure
@@ -123,6 +134,7 @@ class Collector:
             managed_bytes=sum(size for size in measured.values() if size is not None),
             free_bytes=storage.free_bytes,
             managed_bytes_ceiling=int(config.get("shared_cache_ceiling")),
+            bytes_measured=inventory.measured,
         )
         byte_pressure_started = pressure.bytes_exceeded
 
@@ -133,12 +145,14 @@ class Collector:
                 managed_bytes=sum(size for size in measured.values() if size is not None),
                 free_bytes=storage.free_bytes,
                 managed_bytes_ceiling=int(config.get("shared_cache_ceiling")),
+                bytes_measured=inventory.measured,
             )
             if storage.vhdx_slack_bytes is not None and storage.vhdx_slack_bytes > reclaimable:
                 updated = Pressure(
                     under_pressure=updated.count_exceeded or updated.bytes_exceeded,
                     count_exceeded=updated.count_exceeded,
                     bytes_exceeded=updated.bytes_exceeded,
+                    bytes_unknown=updated.bytes_unknown,
                 )
             if any(size is None for size in measured.values()):
                 # Unknown resources cannot prove that a byte target is now satisfied.
@@ -148,6 +162,7 @@ class Collector:
                     or byte_pressure_started,
                     count_exceeded=updated.count_exceeded,
                     bytes_exceeded=updated.bytes_exceeded or byte_pressure_started,
+                    bytes_unknown=updated.bytes_unknown,
                 )
             return updated
 
@@ -174,6 +189,7 @@ class Collector:
                 under_pressure=pressure.count_exceeded or pressure.bytes_exceeded,
                 count_exceeded=pressure.count_exceeded,
                 bytes_exceeded=pressure.bytes_exceeded,
+                bytes_unknown=pressure.bytes_unknown,
             )
             verdicts = plan(
                 self.registry,
@@ -320,11 +336,18 @@ def status(
             bucket["bytes"] += size
     managed_bytes = sum(size for size in measured.values() if size is not None)
     storage = probe(engine, registry.path.parent)
+    # `status` is read-only (works with the daemon dead, opens the registry
+    # `read_only=True`) so it cannot `log_event` the way `Collector.collect` does when the
+    # inventory is unmeasured -- there is no writer available here. `pressure.bytes_unknown`
+    # below is this function's equivalent visibility: a caller inspecting `status()` output
+    # sees explicitly that byte pressure is unproven this pass, rather than reading
+    # `bytes_exceeded: false` as a clean, confirmed "under ceiling".
     pressure = Pressure.assess(
         resource_count=len(measured),
         managed_bytes=managed_bytes,
         free_bytes=storage.free_bytes,
         managed_bytes_ceiling=int(config.get("shared_cache_ceiling")),
+        bytes_measured=inventory.measured,
     )
     running_containers = resources.running_container_names(engine)
     verdicts = plan(
@@ -365,6 +388,7 @@ def status(
             "count_exceeded": pressure.count_exceeded,
             "bytes_exceeded": pressure.bytes_exceeded,
             "free_space_exceeded": pressure.free_space_exceeded,
+            "bytes_unknown": pressure.bytes_unknown,
         },
         "storage": {
             "free_bytes": storage.free_bytes,
