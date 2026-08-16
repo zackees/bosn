@@ -7,7 +7,13 @@ from pathlib import Path
 import pytest
 
 from bosn import manifest as manifest_mod
-from bosn.manifest import ManifestError, dockerfile_external_images, generation_digest, load
+from bosn.manifest import (
+    ManifestError,
+    StackSpec,
+    dockerfile_external_images,
+    generation_digest,
+    load,
+)
 
 SAMPLE = """
 [stack.test]
@@ -463,3 +469,109 @@ def test_a_git_bash_spelled_bind_source_resolves(tmp_path: Path) -> None:
     stack = load(_write(tmp_path, body)).stacks["test"]
 
     assert stack.mounts[0].resolve_source(root) == (root / "src").resolve()
+
+
+# -- examples/soldr.toml expresses soldr's actual perf-local mount table (#75) ----------
+#
+# `Runner.volumes`/`create_command()` in soldr's `ci/perf_local.py` mount six paths: one
+# bind (the checkout itself, at `/repo`) and five named volumes (`target`, `cargo_home`,
+# `soldr_home`, `uv_cache`, `venv`). These tests load the checked-in example through the
+# real loader -- the same `load()` a `bosn ensure`/`bosn run` invocation uses -- and pin
+# every destination and scope this deliverable claims to soldr's real ones, so a drift
+# between the example and soldr's actual harness fails a test instead of going unnoticed.
+
+EXAMPLES_ROOT = Path(__file__).resolve().parent.parent / "examples"
+
+# Exactly soldr's six container-side paths, read from `create_command()`'s `-v` flags in
+# ci/perf_local.py (bind: /repo; volumes: /root/.cargo, /root/.soldr, /root/.cache/uv,
+# /venv, /target).
+SOLDR_MOUNT_DESTINATIONS = {
+    "repo": "/repo",
+    "cargo-home": "/root/.cargo",
+    "soldr-home": "/root/.soldr",
+    "uv-cache": "/root/.cache/uv",
+    "target": "/target",
+    "venv": "/venv",
+}
+
+
+def _soldr_stack() -> StackSpec:
+    return load(EXAMPLES_ROOT / "soldr.toml").stack("perf")
+
+
+def test_soldr_example_mounts_all_six_soldr_paths_at_soldr_destinations() -> None:
+    stack = _soldr_stack()
+
+    by_destination = {v.name: v.mount_at() for v in stack.volumes}
+    by_destination.update({m.name: m.destination for m in stack.mounts})
+
+    assert by_destination == SOLDR_MOUNT_DESTINATIONS
+
+
+def test_soldr_example_repo_is_a_bind_never_a_volume() -> None:
+    """bosn *references* the checkout; it must never own, label, or delete it (MountSpec).
+
+    Proven both directions: `repo` is absent from `volumes` (so it is never registered,
+    labeled, or GC'd as bosn's own), and present in `mounts` (so it is a bind).
+    """
+    stack = _soldr_stack()
+
+    assert "repo" not in {v.name for v in stack.volumes}
+    assert {m.name for m in stack.mounts} == {"repo"}
+    mount = stack.mounts[0]
+    assert mount.source == "."
+    assert mount.destination == "/repo"
+
+
+def test_soldr_example_scopes_match_the_readme_sharing_claim() -> None:
+    """README.md ("How the disk savings actually work" -> "1. Sharing") claims applying
+    bosn's scopes to soldr's own five volumes drops five per-checkout volumes to two,
+    with cargo-home/soldr-home/uv-cache machine-scoped and target/venv stack-scoped. This
+    pins the claim against the checked-in example so an edit to either one that breaks the
+    correspondence fails a test rather than silently diverging.
+    """
+    stack = _soldr_stack()
+    scopes = {v.name: v.scope for v in stack.volumes}
+
+    assert scopes == {
+        "cargo-home": "machine",
+        "soldr-home": "machine",
+        "uv-cache": "machine",
+        "target": "stack",
+        "venv": "stack",
+    }
+    machine_scoped = {name for name, scope in scopes.items() if scope == "machine"}
+    stack_scoped = {name for name, scope in scopes.items() if scope == "stack"}
+    assert len(machine_scoped) == 3
+    assert len(stack_scoped) == 2
+
+
+def test_soldr_example_destinations_outside_bosns_namespace_are_all_accepted() -> None:
+    """None of soldr's real destinations collide with /bosn/* or the heartbeat file --
+    loading the example at all is already partial proof of this, but the point of this
+    test is to pin it against the exact set rather than "it didn't raise."""
+    stack = _soldr_stack()
+    destinations = {v.mount_at() for v in stack.volumes} | {m.destination for m in stack.mounts}
+
+    for destination in destinations:
+        assert not destination.startswith(manifest_mod.RESERVED_PREFIX)
+        assert destination != manifest_mod.RESERVED_HEARTBEAT
+
+    assert destinations == set(SOLDR_MOUNT_DESTINATIONS.values())
+
+
+def test_soldr_example_reserved_namespace_guard_still_rejects_a_bosn_destination(
+    tmp_path: Path,
+) -> None:
+    """The guard soldr's manifest relies on staying silent is still live: redirect one of
+    its own volumes into bosn's reserved namespace and confirm the loader still refuses.
+    """
+    body = (
+        (EXAMPLES_ROOT / "soldr.toml")
+        .read_text(encoding="utf-8")
+        .replace('"/root/.cargo"', '"/bosn/cargo-home"')
+    )
+    (tmp_path / "bosn.toml").write_text(body, encoding="utf-8")
+
+    with pytest.raises(ManifestError, match="reserved"):
+        load(tmp_path)

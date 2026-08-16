@@ -1,0 +1,87 @@
+# Reference manifest for GitHub issue #75: express soldr's `ci/perf_local.py` perf-local
+# workload as a bosn stack, using bind mounts (MountSpec) and configurable volume
+# destinations (VolumeSpec.destination) -- both landed after #75 was filed, which is why
+# this file exists now and did not before. See docs/soldr-integration.md for what running
+# this actually validates and what it deliberately does not.
+#
+# This file is a *reference*, not something bosn's own test suite runs against real soldr
+# volumes -- doing that mutates a developer's real caches and needs the user's explicit
+# go-ahead (see docs/soldr-integration.md). To use it for real: copy it to
+# `<soldr-checkout>/bosn.toml` (the `source = "."` bind below assumes the manifest sits at
+# the checkout root, exactly like bosn's own dogfood `bosn.toml` mounts `.` at `/repo`).
+#
+# Ground truth for every destination and scope below was read directly from soldr's own
+# source on this machine, not inferred or guessed:
+#   - `ci/perf_local.py`, `Runner` / `runner_for()` / `create_command()` (the six `-v`
+#     mounts and the container's `-e` environment)
+#   - `docker/cook-shared-cache/Dockerfile` (which of those container paths are also baked
+#     in as image `ENV`, and which are not -- see the `target`/`cargo-target-dir` comment
+#     below for the one gap that leaves)
+
+[stack.perf]
+# The image `ci/perf_local.py`'s own `ensure_image()` builds and tags locally. bosn does
+# not build it here: soldr's Dockerfile bakes CARGO_HOME, UV_CACHE_DIR, and
+# UV_PROJECT_ENVIRONMENT in as ENV (see docker/cook-shared-cache/Dockerfile lines 86,
+# 133-134), which is exactly what lets the volumes below land at the right paths with zero
+# Dockerfile change. Declaring `dockerfile = "docker/cook-shared-cache/Dockerfile"` instead
+# would work identically once this file sits inside the soldr checkout; `image` is used
+# here so the manifest also loads (and its mounts assert cleanly) from inside the bosn repo,
+# which has no such Dockerfile.
+image = "soldr-cook-dev"
+family = "soldr"
+default = true
+
+[stack.perf.mounts]
+# soldr's edit-in-place bind (perf_local.py: `-v {source_root.resolve()}:/repo`). This is
+# a MountSpec, not a VolumeSpec: bosn references this host path and never labels,
+# registers, or deletes it (see MountSpec's docstring in src/bosn/manifest.py) -- soldr's
+# own working tree stays soldr's to own, exactly like the real harness's bind mount.
+repo = { source = ".", destination = "/repo" }
+
+[stack.perf.volumes]
+# -- machine-scoped: content-identical regardless of which checkout asked for it ---------
+#
+# A cargo registry/toolchain cache, a uv wheel cache, and soldr's own `~/.soldr` state
+# directory do not depend on *which* repo produced them -- only on the family (`family =
+# "soldr"` above) that names the shared volume. `machine` scope keys a volume by
+# (family, volume name) alone, so every soldr checkout on this machine shares one copy
+# instead of duplicating it per checkout. This is the split the README's "50 volumes
+# become 23" claim (see "How the disk savings actually work" -> "1. Sharing") rests on;
+# docs/soldr-integration.md re-derives that number against this exact file.
+cargo-home = { scope = "machine", destination = "/root/.cargo" }
+soldr-home = { scope = "machine", destination = "/root/.soldr" }
+uv-cache   = { scope = "machine", destination = "/root/.cache/uv" }
+
+# -- stack-scoped: built from *this* checkout's own source --------------------------------
+#
+# A cargo target dir and a uv-managed venv are only valid for the code that produced them;
+# sharing them across checkouts would mean one branch's build silently poisoning another's.
+# `stack` scope keys a volume by (workspace, stack), where bosn's `workspace` is this
+# manifest's own root -- i.e. per checkout, matching soldr's own `shared_source_root()`
+# granularity for `Runner.volumes`, just reachable from a *different* set of checkouts (see
+# docs/soldr-integration.md for why those two granularities are not the same claim).
+#
+# NOTE: mounting `target` here reproduces soldr's *volume*, not its *behavior*. Cargo only
+# writes to `/target` because `perf_local.py`'s `create_command()` also passes
+# `-e CARGO_TARGET_DIR=/target` at container-create time -- and that ENV is not baked into
+# the Dockerfile the way CARGO_HOME is (grepped; absent). bosn's manifest has no mechanism
+# to declare container environment variables, so this stack alone does not make cargo use
+# this volume -- see docs/soldr-integration.md, "What this does not govern."
+target = { scope = "stack", destination = "/target" }
+venv   = { scope = "stack", destination = "/venv" }
+
+[task.check]
+stack = "perf"
+# Two things `perf_local.py` sets at container-create time have no bosn.toml equivalent
+# today (bosn's manifest has no way to declare container ENV, and neither `converge.py`'s
+# `docker create` nor its `docker exec` pass a `-w`/workdir override -- see
+# docs/soldr-integration.md, "What this does not govern"):
+#   - CARGO_TARGET_DIR=/target -- without it Cargo defaults to `<cwd>/target`, so this task
+#     works around the gap with `cd /repo` (the image's baked-in WORKDIR is `/work`, an
+#     empty directory -- soldr's own Dockerfile never sets `WORKDIR /repo` because
+#     perf_local.py always supplies `-w /repo` itself) but STILL builds into `/repo/target`
+#     inside the bind mount, not the `/target` volume above. That volume is real; nothing
+#     in this stack makes Cargo use it.
+#   - TMPDIR=/target/tmp, CARGO_BUILD_JOBS, SOLDR_JOBS, NEXTEST_TEST_THREADS -- degrade
+#     behavior (e.g. temp files fall back to the container overlay) rather than break it.
+cmd = "cd /repo && cargo check --workspace"
