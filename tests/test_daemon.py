@@ -1208,6 +1208,58 @@ def test_shutdown_does_not_close_registry_while_startup_reconcile_still_running(
     assert "recovery.scan.unavailable" in kinds
 
 
+def test_a_second_shutdown_after_a_deferred_close_does_not_raise(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """`shutdown()` must survive being called again after a deferred close already ran.
+
+    `shutdown()` runs twice in normal operation -- once from `serve_forever`'s `finally`,
+    once explicitly by a caller or fixture. When the first call defers the registry close
+    to a background thread, that thread can close the connection at a moment the second
+    call has no way to observe. The second call then reaches its own
+    `shutdown.background_join_timeout` event and writes to a connection that is already
+    gone.
+
+    CI caught exactly that as a teardown error -- `sqlite3.ProgrammingError: Cannot
+    operate on a closed database` raised from `shutdown()` itself -- which is the very
+    failure class #101 set out to remove, reappearing one line away from where it was
+    fixed. The lesson of that issue is that a *diagnostic* must never be the thing that
+    crashes, and it applies to the code doing the fixing too.
+
+    A first version of this test drove two real `shutdown()` calls around a thread that
+    finished in between. It passed against the unguarded code: by the second call the
+    thread was done, `outstanding` was empty, and the unguarded line was never reached at
+    all. Running it against the unguarded code before trusting it is the only reason that
+    was caught -- which is the same discipline the fix's own RED check applies.
+    """
+    release = threading.Event()
+    monkeypatch.setattr(daemon_mod, "RECONCILE_JOIN_TIMEOUT_SECONDS", 0.0, raising=False)
+
+    daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=3600)
+    daemon._set_next_maintenance(daemon.clock.now() + 3600)
+    busy = threading.Thread(target=lambda: release.wait(30), daemon=True)
+    busy.start()
+    try:
+        # The two conditions are established directly rather than raced for. The real
+        # sequence is narrow -- an earlier call's deferred close has to land between this
+        # call's `_bounded_join` deciding a thread is outstanding and its logging of that
+        # decision -- and a test that tried to hit that window by timing would be the
+        # flaky, proves-nothing kind this suite has already had to fix once (#95). What
+        # must hold is simpler than the race that exposes it: `shutdown()` must not raise
+        # when a thread is outstanding and the registry is already closed, however those
+        # two came to be true together.
+        daemon._reconcile_thread = busy  # outstanding: alive, and the bound above is zero
+        daemon.registry.close()  # exactly what an earlier deferred close leaves behind
+
+        # Must not raise. Against the unguarded code this is `sqlite3.ProgrammingError`
+        # straight out of `shutdown()` -- the CI teardown error this test exists for.
+        daemon.shutdown()
+    finally:
+        release.set()
+        busy.join(timeout=15)
+        assert not busy.is_alive()
+
+
 def test_maintenance_deadline_persists_across_scheduler_wake(monkeypatch, tmp_path: Path) -> None:
     clock = FakeClock()
     calls: list[str] = []

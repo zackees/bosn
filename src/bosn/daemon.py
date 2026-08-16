@@ -819,10 +819,31 @@ class Daemon:
             # `RECONCILE_JOIN_TIMEOUT_SECONDS`). Either way it is worth a loud, findable
             # event before we return.
             names = ", ".join(name for name, _ in outstanding)
-            self.registry.log_event(
-                "shutdown.background_join_timeout",
-                f"{names} still running; deferring registry close until they exit",
-            )
+            # Guarded for the same reason this whole issue exists (#101): a diagnostic must
+            # never be the thing that crashes.
+            #
+            # `shutdown()` runs twice in normal operation (once from `serve_forever`'s
+            # `finally`, once explicitly), and a deferred close spawned by an earlier call
+            # can complete at any moment -- including between this call's `_bounded_join`
+            # deciding a thread is still outstanding and this line running. The connection
+            # is then already gone, and there is no flag to test for it that would not
+            # itself be racy. Every other registry write on the shutdown path is already
+            # wrapped; this "loud event" was not, and CI caught it as exactly the
+            # `sqlite3.ProgrammingError: Cannot operate on a closed database` this change
+            # set out to eliminate, relocated one line away from the fix.
+            #
+            # Best-effort is the right contract here: the event explains a deferral that
+            # has already been decided, so losing it costs a log line, while raising costs
+            # the shutdown.
+            try:
+                self.registry.log_event(
+                    "shutdown.background_join_timeout",
+                    f"{names} still running; deferring registry close until they exit",
+                )
+            except KeyboardInterrupt:
+                raise
+            except Exception:  # noqa: BLE001 - shutdown must not raise
+                pass
             threading.Thread(
                 target=self._close_registry_after_background_threads,
                 args=(tuple(thread for _, thread in outstanding),),
