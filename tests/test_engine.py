@@ -91,6 +91,54 @@ def test_engine_execute_returns_an_ordinary_child_exit_130() -> None:
     assert Engine(sys.executable).execute(["-c", "raise SystemExit(130)"], timeout=10) == 130
 
 
+def test_run_reports_an_actual_timeout_as_a_deadline(monkeypatch) -> None:
+    """`rp.subprocess_run` re-raises a real timeout as `RuntimeError(...) from exc`, with
+    `exc` being an `rp.TimeoutExpired`. `Engine.run` must still report this as the deadline
+    message -- only the *other* kind of `RuntimeError` (see the sibling test below) changed.
+    """
+    cause = engine_mod.rp.TimeoutExpired(cmd=["docker", "ps"], timeout=7)
+    wrapped = RuntimeError("CRITICAL: Process timed out after 7 seconds: ['docker', 'ps']")
+    wrapped.__cause__ = cause
+
+    def fake_subprocess_run(*_args, **_kwargs):
+        raise wrapped
+
+    monkeypatch.setattr(engine_mod.rp, "subprocess_run", fake_subprocess_run)
+
+    with pytest.raises(EngineError, match="7-second deadline") as raised:
+        Engine("docker", timeout=7).run(["ps"])
+
+    assert raised.value.__cause__ is wrapped
+    assert wrapped.__cause__ is cause
+
+
+def test_run_distinguishes_a_spawn_failure_from_a_timeout(monkeypatch) -> None:
+    """Issue #101: a captured traceback showed a missing-binary spawn failure --
+    `RuntimeError: failed to spawn process: program not found`, raised immediately, with
+    no `TimeoutExpired` anywhere in its cause chain -- reported as
+    "exceeded its 60-second deadline". That sends someone debugging a missing binary
+    looking for a slow Docker daemon instead. `Engine.run` must describe this failure for
+    what it is, and must still chain the original exception so the real cause survives in
+    a traceback.
+    """
+    spawn_failure = RuntimeError("failed to spawn process: program not found")
+
+    def fake_subprocess_run(*_args, **_kwargs):
+        raise spawn_failure
+
+    monkeypatch.setattr(engine_mod.rp, "subprocess_run", fake_subprocess_run)
+
+    with pytest.raises(EngineError) as raised:
+        Engine("docker", timeout=60).run(["ps"])
+
+    message = str(raised.value)
+    assert "exceeded its" not in message
+    assert "60-second deadline" not in message
+    assert "could not start" in message
+    assert "failed to spawn process: program not found" in message
+    assert raised.value.__cause__ is spawn_failure
+
+
 class AbortingProcess:
     finished = False
     returncode: int | None = None

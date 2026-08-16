@@ -81,9 +81,37 @@ class Engine:
                 [self.binary, *args], cwd=None, check=False, timeout=effective_timeout
             )
         except RuntimeError as exc:
-            raise EngineError(
-                f"{self.binary} {' '.join(args)} exceeded its {effective_timeout}-second deadline"
-            ) from exc
+            # `rp.subprocess_run` collapses two very different failures into the same
+            # `RuntimeError`: a command that actually ran for `effective_timeout` seconds
+            # and was killed, and a command that never started running at all (missing
+            # binary, a PATH entry pointing at something not executable, a broken exec
+            # environment -- anything the underlying spawn can raise before there is a
+            # process to wait on). A captured traceback for issue #101 showed the second
+            # case reported as the first: the real cause was
+            # `RuntimeError: failed to spawn process: program not found`, raised
+            # immediately, but this code used to describe every `RuntimeError` here as
+            # "exceeded its N-second deadline" -- sending whoever read that message looking
+            # for a slow Docker daemon instead of a missing binary.
+            #
+            # `subprocess_run` only distinguishes the two internally: it catches
+            # `rp.TimeoutExpired` specifically and re-raises it as `RuntimeError(...) from
+            # exc`, chaining the original in. Any other failure propagates as whatever it
+            # already was (typically a plain `RuntimeError`) with no such cause. Reading
+            # `exc.__cause__`'s type recovers that distinction without depending on message
+            # wording -- string-matching `subprocess_run`'s message text was considered and
+            # rejected as brittle, since a wording change in that dependency would silently
+            # break the distinction with no test pinning it here.
+            #
+            # `available()` above already rules out the binary being absent from PATH at
+            # call time, but that check and the actual spawn are not atomic (the binary can
+            # disappear, or a PATH entry can point at something non-executable, in between),
+            # so this branch still matters even with that guard in place.
+            if isinstance(exc.__cause__, rp.TimeoutExpired):
+                raise EngineError(
+                    f"{self.binary} {' '.join(args)} exceeded its "
+                    f"{effective_timeout}-second deadline"
+                ) from exc
+            raise EngineError(f"{self.binary} {' '.join(args)} could not start: {exc}") from exc
         result = EngineResult(
             returncode=completed.returncode,
             stdout=(completed.stdout or "").strip(),
