@@ -58,6 +58,25 @@ STREAMING_VERBS = frozenset({"converge", "attach"})
 # then converge still has its registry writes and volume creation to finish).
 SHUTDOWN_DRAIN_SECONDS = 60.0
 
+# The watchdog's periodic maintenance pass asks "is the engine reachable" before doing any
+# real GC work through it. That is a liveness question, not a build or a GC operation, and
+# it does not need Engine.DEFAULT_TIMEOUT's 60s -- a docker/podman CLI that is going to
+# answer at all answers in well under this on every engine this project targets. Kept an
+# int (not a float) because Engine.__init__'s `timeout` parameter is typed int.
+MAINTENANCE_ENGINE_PROBE_TIMEOUT_SECONDS = 5
+
+# Upper bound on how long shutdown() waits for the watchdog thread to notice `_stop` and
+# exit, once the cooperative checks in `_run_maintenance` and the bounded probe above are
+# both in place. `EngineInfo.info()` can make the probe call up to twice before it decides
+# the engine is unreachable (client version, then server version), so the worst case the
+# watchdog can still be doing engine I/O after `_stop` is set is roughly
+# 2 * MAINTENANCE_ENGINE_PROBE_TIMEOUT_SECONDS. This is set well above that with slack for
+# the (fast, non-networked) phases before it, rather than pinned exactly to 2x -- a bound
+# that just barely covers the worst case would make an ordinary stop-during-probe look like
+# the timeout path this constant exists to guard against. See `shutdown()` for what happens
+# if this bound is ever actually exceeded.
+WATCHDOG_JOIN_TIMEOUT_SECONDS = 15.0
+
 
 class DaemonError(RuntimeError):
     """The daemon could not be started, reached, or stopped."""
@@ -465,10 +484,26 @@ class Daemon:
         return True
 
     def _run_maintenance(self) -> None:
-        """Execute a maintenance pass, recording every outcome and scheduling its retry."""
+        """Execute a maintenance pass, recording every outcome and scheduling its retry.
+
+        Checks `self._stop` between every phase so a pass already in progress when
+        shutdown begins abandons itself promptly instead of running to completion.
+        `shutdown()` joins this thread with a bounded timeout on the assumption that it
+        responds to `_stop` quickly; without these checks a pass could hold the watchdog
+        thread for the sum of every phase (including the engine probe below) regardless
+        of how long ago `_stop` was set. Each abandonment is logged -- a pass that gave up
+        partway through must be visible as such, not indistinguishable from one that
+        quietly ran to completion.
+        """
         from bosn.engine import Engine
         from bosn.gc import Collector
         from bosn.resources import prune_dead_leases
+
+        def abandoned_after(phase: str) -> bool:
+            if not self._stop.is_set():
+                return False
+            self.registry.log_event("maintenance.aborted", f"stop requested after {phase}")
+            return True
 
         self.registry.log_event("maintenance.reap.started")
         try:
@@ -482,6 +517,8 @@ class Daemon:
             self.registry.log_event("maintenance.reap.error", f"{type(exc).__name__}: {exc}")
             self._set_next_maintenance(self.clock.now() + self.maintenance_interval_seconds)
             return
+        if abandoned_after("reap"):
+            return
 
         self.registry.log_event("maintenance.prune_leases.started")
         try:
@@ -493,6 +530,8 @@ class Daemon:
             self.registry.log_event(
                 "maintenance.prune_leases.error", f"{type(exc).__name__}: {exc}"
             )
+        if abandoned_after("prune_leases"):
+            return
 
         # Derived done-signals run before GC (so a workspace reclaimed in this very pass is
         # eligible for the same pass's collection) and before the engine reachability check
@@ -511,9 +550,22 @@ class Daemon:
             self.registry.log_event(
                 "maintenance.derived_done.error", f"{type(exc).__name__}: {exc}"
             )
+        if abandoned_after("derived_done"):
+            return
 
-        engine = Engine(self.engine_binary)
-        info = engine.info()
+        # This probe only answers "is the engine there", so it gets the short named
+        # timeout above rather than Engine's 60s default -- that default is right for the
+        # real GC work below (`engine`, a *separate* instance kept at the normal timeout),
+        # which legitimately needs however long a real docker/podman operation takes.
+        # Reusing one Engine instance and mutating its `.timeout` around this call was
+        # considered and rejected: it would leave a window where a concurrent reader of
+        # `engine.timeout` (there are none today, but the next contributor to touch this
+        # method would have no way to know that) sees the wrong value, for a saving of one
+        # cheap, I/O-free constructor call.
+        probe_engine = Engine(self.engine_binary, timeout=MAINTENANCE_ENGINE_PROBE_TIMEOUT_SECONDS)
+        info = probe_engine.info()
+        if abandoned_after("engine reachability probe"):
+            return
         if not info.reachable:
             detail = info.detail or "engine daemon unreachable"
             self.registry.log_event(
@@ -526,9 +578,12 @@ class Daemon:
             )
             return
 
+        engine = Engine(self.engine_binary)
         self.registry.log_event("maintenance.execution_reap.started")
         reaped = self._reap_dead_execution_sessions()
         self.registry.log_event("maintenance.execution_reap.finished", f"reaped={reaped}")
+        if abandoned_after("execution_reap"):
+            return
 
         self.registry.log_event("maintenance.gc.started")
         try:
@@ -623,8 +678,24 @@ class Daemon:
     def shutdown(self) -> None:
         self._stop.set()
         watchdog = self._watchdog_thread
+        watchdog_finished = True
         if watchdog is not None and watchdog is not threading.current_thread():
-            watchdog.join()
+            # Bounding this join alone -- `watchdog.join(timeout=N)` with no other change
+            # -- was considered and rejected. If the timeout expired the old code would
+            # simply fall through to closing the registry a few lines down while the
+            # watchdog thread was still inside a maintenance pass that reads and writes
+            # through that same connection. That turns a bounded *hang* (annoying, but the
+            # daemon is still internally consistent) into an unbounded *crash*
+            # (`sqlite3.ProgrammingError: Cannot operate on a closed database`, raised from
+            # a background thread with no one positioned to handle it -- worse than the bug
+            # this fix exists to close). A bounded join is only safe once the thing being
+            # joined actually responds to `_stop` promptly, which is what the cooperative
+            # checks in `_run_maintenance` and the short probe timeout above are for. With
+            # those in place this join should essentially always succeed well within
+            # WATCHDOG_JOIN_TIMEOUT_SECONDS; the `else` branch below is the last-resort
+            # fallback for the case where it somehow still doesn't.
+            watchdog.join(timeout=WATCHDOG_JOIN_TIMEOUT_SECONDS)
+            watchdog_finished = not watchdog.is_alive()
         # Cancel in-flight builds and wait for them *before* closing the registry they
         # write to. Each one tells its attached clients why it stopped rather than dying
         # silently.
@@ -641,7 +712,55 @@ class Daemon:
         state_file(self.state_dir).unlink(missing_ok=True)
         heartbeat_file(self.state_dir).unlink(missing_ok=True)
         secret_file(self.state_dir).unlink(missing_ok=True)
+
+        if not watchdog_finished:
+            assert watchdog is not None  # implied by watchdog_finished being set False above
+            # The watchdog is still running past our patience. Closing the registry here
+            # would race whatever it is doing right now -- possibly nothing worse than one
+            # more `log_event`, but there is no way from here to know that, and guessing
+            # wrong means a background-thread crash. So instead of closing, hand the close
+            # off to a thread that waits for the watchdog however long that actually takes
+            # (unbounded is fine: this thread is itself daemonic, so it cannot keep the
+            # process alive) and only then performs the close this method would otherwise
+            # have done immediately below. This should be unreachable in ordinary
+            # operation -- see the comment on the join above -- so reaching it at all is
+            # itself worth a loud, findable event before we return.
+            self.registry.log_event(
+                "shutdown.watchdog_join_timeout",
+                f"watchdog still running after {WATCHDOG_JOIN_TIMEOUT_SECONDS:g}s; "
+                "deferring registry close until it exits",
+            )
+            threading.Thread(
+                target=self._close_registry_after_watchdog, args=(watchdog,), daemon=True
+            ).start()
+            return
+
         try:
+            self.registry.log_event("daemon.stopped", "")
+            self.registry.close()
+        except KeyboardInterrupt:
+            raise
+        except Exception:  # noqa: BLE001 - shutdown must not raise
+            pass
+
+    def _close_registry_after_watchdog(self, watchdog: threading.Thread) -> None:
+        """Finish a shutdown whose bounded watchdog join gave up. See `shutdown()`.
+
+        Reached only from the timeout branch above. Waits for the watchdog with no
+        timeout of its own -- by this point there is nothing left to bound against, the
+        goal is simply to never close the registry while that thread might still be
+        touching it. `shutdown()` may itself run again after spawning this (the
+        `serve_forever`/`served`-fixture pattern of calling `shutdown()` both from
+        `serve_forever`'s `finally` and again explicitly is already relied on elsewhere in
+        this codebase); a second call would see `watchdog_finished` true almost
+        immediately -- since by then this thread will usually have long since joined it --
+        and take the ordinary close path itself. If both somehow race, sqlite's `close()`
+        is a no-op on an already-closed connection and the surrounding `except Exception`
+        here and in `shutdown()` swallow the `log_event` that could otherwise fire twice.
+        """
+        watchdog.join()
+        try:
+            self.registry.log_event("shutdown.watchdog_finished_late", "")
             self.registry.log_event("daemon.stopped", "")
             self.registry.close()
         except KeyboardInterrupt:

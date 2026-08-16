@@ -904,7 +904,7 @@ def test_maintenance_catches_up_then_runs_on_the_injected_clock(
     calls: list[str] = []
 
     class ReachableEngine:
-        def __init__(self, _binary: str) -> None:
+        def __init__(self, _binary: str, **_kwargs: object) -> None:
             pass
 
         def info(self) -> EngineInfo:
@@ -952,7 +952,7 @@ def test_maintenance_engine_down_is_visible_and_uses_exponential_backoff(
     clock = FakeClock()
 
     class DownEngine:
-        def __init__(self, _binary: str) -> None:
+        def __init__(self, _binary: str, **_kwargs: object) -> None:
             pass
 
         def info(self) -> EngineInfo:
@@ -975,12 +975,127 @@ def test_maintenance_engine_down_is_visible_and_uses_exponential_backoff(
         daemon.registry.close()
 
 
+def test_maintenance_pass_abandoned_for_stop_is_logged(monkeypatch, tmp_path: Path) -> None:
+    """Issue #97: a pass in progress when shutdown begins must give up, visibly.
+
+    `_stop` is set before the pass even starts here, which is the simplest way to prove
+    the cooperative check fires without needing real threads or timing: the reap phase
+    (deliberately left unpatched, so `maintenance.reap.started`/`.finished` prove the pass
+    did begin) still runs to completion, but everything after the first `abandoned_after`
+    check -- prune_leases, derived_done, the engine probe, GC -- must never start.
+    """
+    clock = FakeClock()
+
+    class ExplodingEngine:
+        """Any construction proves the pass ran past the point it should have stopped."""
+
+        def __init__(self, _binary: str, **_kwargs: object) -> None:
+            raise AssertionError("engine must not be constructed once _stop is set")
+
+    import bosn.engine
+
+    monkeypatch.setattr(bosn.engine, "Engine", ExplodingEngine)
+    daemon = Daemon(state_dir=tmp_path, clock=clock, maintenance_interval_seconds=60)
+    try:
+        daemon._stop.set()
+        daemon._run_maintenance()
+        events = [row["kind"] for row in daemon.registry.events()]
+        assert "maintenance.reap.started" in events
+        assert "maintenance.reap.finished" in events
+        assert "maintenance.aborted" in events
+        detail = next(
+            row["detail"]
+            for row in daemon.registry.events()
+            if row["kind"] == "maintenance.aborted"
+        )
+        assert detail == "stop requested after reap"
+        # Nothing past the abandonment point may have run.
+        assert "maintenance.prune_leases.started" not in events
+        assert "maintenance.derived_done.started" not in events
+        assert "maintenance.gc.started" not in events
+    finally:
+        daemon.registry.close()
+
+
+def test_shutdown_does_not_hang_on_a_blocked_engine_probe(monkeypatch, tmp_path: Path) -> None:
+    """Issue #97: `shutdown()` must not wait out an unbounded engine-reachability probe.
+
+    The old `watchdog.join()` had no timeout at all, so a maintenance pass stuck in
+    `Engine.info()` (60s per call, called up to twice) could block `shutdown()` for up to
+    two minutes. The engine probe is monkeypatched to block on a `threading.Event` this
+    test controls -- deterministic and instant to release, unlike racing a real 60s
+    subprocess timeout -- so the pass hangs indefinitely until the test says otherwise.
+
+    `WATCHDOG_JOIN_TIMEOUT_SECONDS` is monkeypatched down so this test (and the repeated
+    runs the task asks for) stays fast; `shutdown()` reads the module-level constant by
+    name at call time, so patching the module attribute changes what it sees.
+
+    After the bounded shutdown returns, the test releases the blocked probe and lets the
+    watchdog thread actually finish, then asserts no exception escaped it unhandled --
+    proving the deferred-close path did not hand the watchdog a closed registry to write
+    into (`sqlite3.ProgrammingError`-style fallout).
+    """
+    import bosn.engine
+
+    probe_entered = threading.Event()
+    release_probe = threading.Event()
+    exceptions: list[BaseException] = []
+
+    def record_exception(args: threading.ExceptHookArgs) -> None:
+        if args.exc_value is not None:
+            exceptions.append(args.exc_value)
+
+    monkeypatch.setattr(threading, "excepthook", record_exception)
+    # raising=False: on the pre-fix code this constant does not exist at all (the join had
+    # no timeout to configure), and the point of this test is to observe that difference
+    # via the assertions below, not via an AttributeError from monkeypatch itself.
+    monkeypatch.setattr(daemon_mod, "WATCHDOG_JOIN_TIMEOUT_SECONDS", 1.0, raising=False)
+
+    class BlockingEngine:
+        def __init__(self, _binary: str, **_kwargs: object) -> None:
+            pass
+
+        def info(self) -> EngineInfo:
+            probe_entered.set()
+            release_probe.wait(30)
+            return EngineInfo(binary="docker", reachable=True)
+
+    monkeypatch.setattr(bosn.engine, "Engine", BlockingEngine)
+
+    # Deliberately do NOT push the maintenance deadline out -- a fresh registry's first
+    # tick is due immediately, which is exactly the scenario this issue is about.
+    daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=3600)
+    thread = threading.Thread(target=daemon.serve_forever, daemon=True)
+    thread.start()
+    try:
+        assert _wait_until(lambda: daemon_mod.is_serving(tmp_path)), "daemon never came up"
+        assert probe_entered.wait(10), "watchdog never reached the blocked engine probe"
+
+        daemon.request_stop()
+        # thread runs serve_forever() -> finally: self.shutdown(), which does the bounded
+        # watchdog join. A generous outer bound catches a genuine regression without
+        # making the test itself flaky under load.
+        thread.join(timeout=15)
+        assert not thread.is_alive(), "shutdown() hung instead of returning within its bound"
+        assert not daemon_mod.is_serving(tmp_path)
+    finally:
+        # Let the stuck watchdog finish so it does not leak into later tests, and so any
+        # exception it raises is observed by our excepthook above.
+        release_probe.set()
+        watchdog = daemon._watchdog_thread
+        if watchdog is not None:
+            watchdog.join(timeout=15)
+            assert not watchdog.is_alive(), "watchdog never noticed the probe unblocking"
+
+    assert exceptions == [], f"watchdog raised unhandled exception(s): {exceptions}"
+
+
 def test_maintenance_deadline_persists_across_scheduler_wake(monkeypatch, tmp_path: Path) -> None:
     clock = FakeClock()
     calls: list[str] = []
 
     class Engine:
-        def __init__(self, *_args):
+        def __init__(self, *_args, **_kwargs):
             pass
 
         def info(self):
@@ -1026,7 +1141,7 @@ def test_maintenance_logs_prune_leases_started_and_finished(monkeypatch, tmp_pat
     clock = FakeClock()
 
     class ReachableEngine:
-        def __init__(self, _binary: str) -> None:
+        def __init__(self, _binary: str, **_kwargs: object) -> None:
             pass
 
         def info(self) -> EngineInfo:
@@ -1076,7 +1191,7 @@ def test_maintenance_prune_leases_failure_is_logged_and_does_not_block_gc(
     clock = FakeClock()
 
     class ReachableEngine:
-        def __init__(self, _binary: str) -> None:
+        def __init__(self, _binary: str, **_kwargs: object) -> None:
             pass
 
         def info(self) -> EngineInfo:
@@ -1305,7 +1420,7 @@ def test_derived_done_raising_classifier_protects_and_does_not_block_gc(
     clock = FakeClock()
 
     class ReachableEngine:
-        def __init__(self, _binary: str) -> None:
+        def __init__(self, _binary: str, **_kwargs: object) -> None:
             pass
 
         def info(self) -> EngineInfo:
