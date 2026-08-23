@@ -918,9 +918,17 @@ def test_explicit_volume_transfer_stages_data_before_recreating_labels(
     class TransferEngine:
         def __init__(self) -> None:
             self.commands: list[list[str]] = []
+            self.timeouts: list[float | None] = []
 
-        def run(self, args: list[str], *, check: bool = False) -> EngineResult:
+        def run(
+            self,
+            args: list[str],
+            *,
+            check: bool = False,
+            timeout: float | None = None,
+        ) -> EngineResult:
             self.commands.append(args)
+            self.timeouts.append(timeout)
             return EngineResult(0, "", "")
 
     engine = TransferEngine()
@@ -936,6 +944,16 @@ def test_explicit_volume_transfer_stages_data_before_recreating_labels(
         if command[:2] == ["volume", "create"] and command[-1] == "foreign-cache"
     )
     assert any(f"{labels.REGISTRY}={registry.registry_id}" in arg for arg in recreated)
+    copy_timeouts = [
+        timeout
+        for command, timeout in zip(engine.commands, engine.timeouts, strict=True)
+        if command[:2] == ["run", "--rm"]
+    ]
+    assert copy_timeouts == [
+        resources.VOLUME_TRANSFER_COPY_TIMEOUT_SECONDS,
+        resources.VOLUME_TRANSFER_COPY_TIMEOUT_SECONDS,
+    ]
+    assert resources.VOLUME_TRANSFER_COPY_TIMEOUT_SECONDS > 60
 
 
 def test_explicit_volume_transfer_refuses_an_attached_volume(registry: Registry) -> None:

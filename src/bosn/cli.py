@@ -45,6 +45,21 @@ DAEMON_VERB = "__daemon"
 # this one ever proves too small.
 GC_REQUEST_TIMEOUT_SECONDS = 120.0
 
+# `adopt` always scans the engine, then processes each explicit transfer sequentially. Reserve a
+# loaded-host scan/reconciliation margin here; `adopt_request_timeout_seconds()` adds both
+# transfer-sized copy legs for every selected volume. Keeping this operation-specific preserves
+# the shared 10-second control-plane budget used by ordinary verbs.
+ADOPT_SCAN_REQUEST_TIMEOUT_SECONDS = 15 * 60.0
+
+
+def adopt_request_timeout_seconds(transfer_count: int) -> float:
+    from bosn.resources import VOLUME_TRANSFER_COPY_TIMEOUT_SECONDS
+
+    return ADOPT_SCAN_REQUEST_TIMEOUT_SECONDS + (
+        max(0, transfer_count) * 2 * VOLUME_TRANSFER_COPY_TIMEOUT_SECONDS
+    )
+
+
 NOT_IMPLEMENTED_EXIT = 3
 
 # Long enough to cover a daemon draining a cancelled build (see SHUTDOWN_DRAIN_SECONDS),
@@ -1077,6 +1092,7 @@ def cmd_adopt(opts: Options) -> int:
     if opts.legacy:
         return cmd_adopt_legacy(opts)
 
+    request_timeout = adopt_request_timeout_seconds(len(opts.transfer))
     try:
         reply = daemon_mod.request(
             "adopt",
@@ -1084,6 +1100,17 @@ def cmd_adopt(opts: Options) -> int:
             engine=opts.engine,
             source_registry=opts.source_registry,
             transfer=list(opts.transfer),
+            request_timeout=request_timeout,
+        )
+    except ipc.TransportTimeout as exc:
+        return _error(
+            code="adopt.timeout",
+            message=(f"the daemon did not finish adoption within {request_timeout:g}s: {exc}"),
+            next_step=(
+                "the daemon may still be transferring data -- do not restart it or start an "
+                "overlapping adoption; inspect `bosn status` and the preserved staging volume"
+            ),
+            as_json=opts.json,
         )
     except (daemon_mod.DaemonError, ipc.TransportError) as exc:
         return _error(

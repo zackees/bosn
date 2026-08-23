@@ -174,6 +174,57 @@ def test_gc_asks_the_daemon_for_more_than_the_shared_default_budget(tmp_path, mo
     assert cli.GC_REQUEST_TIMEOUT_SECONDS > ipc.DEFAULT_TIMEOUT
 
 
+def test_adopt_asks_the_daemon_for_a_transfer_sized_budget(tmp_path, monkeypatch) -> None:
+    from bosn import daemon, resources
+
+    seen: dict[str, object] = {}
+
+    def capture(verb, *_args, **kwargs):
+        seen["verb"] = verb
+        seen["request_timeout"] = kwargs.get("request_timeout")
+        return {"ok": True, "transferred": ["cache"], "registry_id": "ours"}
+
+    monkeypatch.setattr(daemon, "request", capture)
+    assert (
+        cli.main(
+            [
+                "--state-dir",
+                str(tmp_path),
+                "adopt",
+                "--transfer",
+                "volume:cache",
+                "--transfer",
+                "volume:second-cache",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    assert seen["verb"] == "adopt"
+    expected = cli.ADOPT_SCAN_REQUEST_TIMEOUT_SECONDS + (
+        4 * resources.VOLUME_TRANSFER_COPY_TIMEOUT_SECONDS
+    )
+    assert seen["request_timeout"] == expected
+    assert seen["request_timeout"] == cli.adopt_request_timeout_seconds(2)
+    assert expected > ipc.DEFAULT_TIMEOUT
+
+
+def test_adopt_timeout_does_not_misreport_the_daemon_as_unreachable(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    from bosn import daemon
+
+    def slow(*_args, **_kwargs):
+        raise ipc.TransportTimeout("timed out waiting for the daemon")
+
+    monkeypatch.setattr(daemon, "request", slow)
+    assert cli.main(["--state-dir", str(tmp_path), "adopt", "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["code"] == "adopt.timeout"
+    assert "do not restart" in payload["next"]
+    assert "retry" not in payload["next"]
+
+
 def test_done_json_error_uses_the_common_envelope(tmp_path, monkeypatch, capsys) -> None:
     monkeypatch.chdir(tmp_path)
     assert cli.main(["--state-dir", str(tmp_path), "done", "--json"]) == 1

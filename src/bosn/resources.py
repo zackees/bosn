@@ -29,6 +29,13 @@ from bosn.clock import Clock, SystemClock
 from bosn.engine import Engine, EngineError
 from bosn.registry import Registry, Resource
 
+# A staged ownership transfer copies the complete cache twice: foreign volume -> staging,
+# then staging -> same-named volume with the current registry labels. Warm compiler caches
+# routinely exceed the generic 60-second engine-command budget; one real Rust target cache
+# reproduced that cutoff in #113. Keep metadata operations fail-fast and give only the two
+# data-plane copies a size-appropriate ceiling.
+VOLUME_TRANSFER_COPY_TIMEOUT_SECONDS = 30 * 60.0
+
 # Docker CLI list commands per resource kind, formatted as one JSON object per line.
 _LIST_COMMANDS: dict[str, list[str]] = {
     "container": ["ps", "--all", "--format", "{{json .}}"],
@@ -710,7 +717,8 @@ def recreate_volume_with_labels(
             "sh",
             "-c",
             "cp -a /from/. /to/",
-        ]
+        ],
+        timeout=VOLUME_TRANSFER_COPY_TIMEOUT_SECONDS,
     )
     if not copy_to_staging.ok:
         raise TransferError(f"copy to staging failed; preserved staging volume {staging}")
@@ -732,7 +740,8 @@ def recreate_volume_with_labels(
             "sh",
             "-c",
             "cp -a /from/. /to/",
-        ]
+        ],
+        timeout=VOLUME_TRANSFER_COPY_TIMEOUT_SECONDS,
     )
     if not copy_back.ok:
         raise TransferError(
