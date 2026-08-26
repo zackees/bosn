@@ -174,6 +174,66 @@ def test_gc_asks_the_daemon_for_more_than_the_shared_default_budget(tmp_path, mo
     assert cli.GC_REQUEST_TIMEOUT_SECONDS > ipc.DEFAULT_TIMEOUT
 
 
+def test_gc_json_reports_images_deferred_by_container_dependencies(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    from bosn import daemon
+
+    def deferred(*_args, **_kwargs):
+        image_decisions = [
+            {
+                "name": "sha256:current",
+                "action": "kept",
+                "eligible": False,
+                "reason": "current-image",
+            },
+            {
+                "name": "sha256:eager",
+                "action": "would-remove",
+                "eligible": True,
+                "reason": "superseded-image",
+            },
+            {
+                "name": "sha256:referenced",
+                "action": "deferred",
+                "eligible": False,
+                "reason": "image-referenced",
+                "candidate_reason": "superseded-image",
+                "referenced_by": ["stopped-container"],
+            },
+            {
+                "name": "sha256:unknown",
+                "action": "deferred",
+                "eligible": False,
+                "reason": "image-dependency-unknown",
+                "candidate_reason": "superseded-image",
+            },
+        ]
+        return {
+            "ok": True,
+            "result": {"removed": 0, "image_dependency_deferred": 2},
+            "image_dependency_deferred": ["sha256:referenced", "sha256:unknown"],
+            "image_decisions": image_decisions,
+        }
+
+    monkeypatch.setattr(daemon, "request", deferred)
+
+    assert cli.main(["--state-dir", str(tmp_path), "gc", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert {decision["reason"] for decision in payload["image_decisions"]} == {
+        "current-image",
+        "superseded-image",
+        "image-referenced",
+        "image-dependency-unknown",
+    }
+    referenced = next(
+        decision
+        for decision in payload["image_decisions"]
+        if decision["reason"] == "image-referenced"
+    )
+    assert referenced["referenced_by"] == ["stopped-container"]
+
+
 def test_adopt_asks_the_daemon_for_a_transfer_sized_budget(tmp_path, monkeypatch) -> None:
     from bosn import daemon, resources
 

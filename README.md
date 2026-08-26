@@ -296,7 +296,9 @@ Docker has no TTL. bosn gives every resource one, tiered by **what it costs to r
 | --- | --- | --- |
 | Container | idle-stop 1 h, removed 24 h | disposable — seconds to recreate from a warm image |
 | Warm volume | 72 h | this is the asset: a 20-minute cold build becomes 30 seconds |
-| Superseded generation | capped 24 h | the old image after you edited the Dockerfile |
+| Current leaf image | kept until replaced or `done` | fastest path for the next run |
+| Superseded leaf image | eligible immediately after a successful replacement | prevents edit loops from piling up final images |
+| Other superseded resources | capped 24 h | conservative treatment for volumes and container state |
 | Machine-shared cache | under pressure, and only once past the warm TTL | most expensive to refill, most widely reused |
 
 Containers are cheap and die fast; caches are expensive and live long. A single global TTL
@@ -306,7 +308,7 @@ would either delete your caches or keep your junk.
 
 TTLs bound age, not total size. Three ceilings bound size — **1,000 resources**, **100 GiB
 managed bytes**, or **under 10 GiB free**. Any one puts the machine under pressure, and
-eviction then proceeds superseded → done → idle → pressure, taking non-machine resources
+eviction then proceeds superseded image → superseded → done → idle → pressure, taking non-machine resources
 before machine-scoped ones. (Only the byte ceiling is configurable, as
 `shared_cache_ceiling`; the other two are constants.)
 
@@ -344,9 +346,15 @@ Two consequences worth knowing up front:
   `ADD` needs `--checksum`, or the command fails. A digest that cannot be reproduced is not
   an identity.
 
-Edit the Dockerfile and a new generation rolls forward; the old one keeps serving its live
-leases, then ages out as *superseded* under the 24-hour cap. Without this, an agent's
-edit-and-rerun loop leaves one image per edit, forever.
+Edit the Dockerfile and a new generation rolls forward. Once the replacement build succeeds,
+the old leaf image becomes immediately eligible for collection; the current leaf remains
+sticky for reuse. Live leases still win, and any running **or stopped** container referencing
+the old immutable image ID defers deletion. If bosn cannot obtain a complete container-to-image
+snapshot, it fails closed and reports the deferral. Volumes and other superseded resources
+retain the conservative 24-hour cap.
+
+BuildKit's layer cache is intentionally unmanaged and is never pruned by bosn. That cache can
+therefore accelerate reconstruction even though obsolete final images are retired aggressively.
 
 ### 5. Leases: never delete something in use
 

@@ -914,6 +914,8 @@ def cmd_gc(opts: Options) -> int:
                     "would_stop": reply.get("would_stop", []),
                     "stopped": reply.get("stopped", []),
                     "removed": reply.get("removed", []),
+                    "image_dependency_deferred": reply.get("image_dependency_deferred", []),
+                    "image_decisions": reply.get("image_decisions", []),
                     "errors": reply.get("errors", []),
                     "advisories": reply.get("advisories", []),
                 },
@@ -928,6 +930,8 @@ def cmd_gc(opts: Options) -> int:
         print(f"stopped {name}")
     for name in reply.get("removed", []):
         print(("would remove " if opts.dry_run else "removed ") + name)
+    for name in reply.get("image_dependency_deferred", []):
+        print(f"deferred image {name}")
     for message in reply.get("errors", []):
         print(f"error: {message}", file=sys.stderr)
     for advisory in reply.get("advisories", []):

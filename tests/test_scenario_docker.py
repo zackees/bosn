@@ -172,6 +172,67 @@ def test_status_sees_the_engine_and_reports_foreign_registries(
         _cleanup(registry, engine)
 
 
+def test_successful_replacement_eagerly_retires_the_old_leaf_image(
+    project: Path, registry: Registry, engine: Engine, clock: FakeClock
+) -> None:
+    manifest = load(project)
+    first = Converger(manifest, registry, engine).converge()
+    old_id = engine.run(
+        ["image", "inspect", "--format", "{{.Id}}", first.image_tag], check=True
+    ).stdout.strip()
+    old = registry.get_resource_by_engine_identity("image", old_id)
+    assert old is not None
+    old_container = f"bosn-old-{uuid.uuid4().hex[:8]}"
+    old_container_labels = labels.ResourceLabels(
+        registry=registry.registry_id,
+        kind="container",
+        stack=first.stack,
+        generation=first.digest,
+        scope="spec",
+        workspace=str(manifest.root),
+        created="2026-08-25T00:00:00Z",
+    )
+    engine.run(
+        [
+            "create",
+            "--name",
+            old_container,
+            *old_container_labels.to_docker_args(),
+            old.name,
+            "true",
+        ],
+        check=True,
+    )
+    registry.register_resource(
+        kind="container",
+        name=old_container,
+        stack=first.stack,
+        generation=first.digest,
+        scope="spec",
+        workspace=str(manifest.root),
+    )
+    try:
+        (project / "Dockerfile").write_text(
+            f"FROM alpine:3.20\nRUN echo {uuid.uuid4().hex[:8]} > /m\n", encoding="utf-8"
+        )
+        second = Converger(load(project), registry, engine).converge()
+        current_id = engine.run(
+            ["image", "inspect", "--format", "{{.Id}}", second.image_tag], check=True
+        ).stdout.strip()
+        clock.advance(2 * DAY)
+
+        result = Collector(registry, engine).collect(dry_run=False)
+
+        assert old.name in result.removed
+        assert result.removed.index(old_container) < result.removed.index(old.name)
+        assert current_id not in result.removed
+        assert result.errors == []
+        assert not engine.run(["image", "inspect", old.name]).ok
+        assert engine.run(["image", "inspect", current_id]).ok
+    finally:
+        _cleanup(registry, engine)
+
+
 def test_a_lost_registry_rebuilds_from_labels(
     project: Path, registry: Registry, engine: Engine, tmp_path: Path, clock: FakeClock
 ) -> None:

@@ -986,6 +986,8 @@ class Daemon:
             "removed": result.removed,
             "stopped": result.stopped,
             "would_stop": result.would_stop,
+            "image_dependency_deferred": result.image_dependency_deferred,
+            "image_decisions": result.image_decisions,
             "errors": result.errors,
             "advisories": result.advisories,
         }

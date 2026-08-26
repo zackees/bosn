@@ -405,6 +405,53 @@ def running_container_names(engine: Engine) -> frozenset[str] | None:
     return frozenset(names)
 
 
+def container_image_references(engine: Engine) -> dict[str, str] | None:
+    """Map every container name to its immutable image ID, or fail closed with ``None``.
+
+    Stopped containers pin images just as running ones do, so this deliberately lists all
+    containers. The list and every batched inspect must be complete and parseable; GC uses
+    an unknown result to defer image removal rather than guessing that no dependency exists.
+    """
+    try:
+        listed = engine.run(["ps", "--all", "--quiet", "--no-trunc"])
+    except EngineError:
+        return None
+    if not listed.ok:
+        return None
+    identities = [line.strip() for line in listed.stdout.splitlines() if line.strip()]
+    if len(identities) != len(set(identities)):
+        return None
+
+    references: dict[str, str] = {}
+    fmt = '{"Name":{{json .Name}},"Image":{{json .Image}}}'
+    for chunk in _chunked(identities, INSPECT_BATCH_SIZE):
+        try:
+            inspected = engine.run(["container", "inspect", "--format", fmt, *chunk])
+        except EngineError:
+            return None
+        if not inspected.ok:
+            return None
+        rows = [line.strip() for line in inspected.stdout.splitlines() if line.strip()]
+        if len(rows) != len(chunk):
+            return None
+        for line in rows:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(row, dict):
+                return None
+            name = row.get("Name")
+            image_id = row.get("Image")
+            if not isinstance(name, str) or not isinstance(image_id, str):
+                return None
+            name = name.lstrip("/")
+            if not name or not image_id or name in references:
+                return None
+            references[name] = image_id
+    return references
+
+
 # -- leases ----------------------------------------------------------------
 
 

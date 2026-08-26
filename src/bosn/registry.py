@@ -686,8 +686,9 @@ class Registry:
         """Return (superseded, done) only when every consumer is inactive.
 
         A mixed object whose A consumer is done and B consumer is superseded is safe to
-        retire, but uses the conservative superseded warm cap rather than immediate done
-        collection. Any one active/current consumer keeps the shared engine object.
+        retire using superseded policy -- eager for images, conservatively capped otherwise
+        -- rather than immediate done collection. Any one active/current consumer keeps the
+        shared engine object.
         """
         done_workspaces = done_workspaces or set()
         uses = self._exec(

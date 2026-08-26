@@ -18,10 +18,24 @@ from bosn.config import load as load_config
 from bosn.engine import EngineResult
 from bosn.gc import Collector, done_workspaces, mark_done, status
 from bosn.registry import Registry
-from bosn.retention import DAY, KEPT_RUNNING
+from bosn.retention import (
+    COLLECT_SUPERSEDED_IMAGE,
+    DAY,
+    KEPT_CURRENT_IMAGE,
+    KEPT_IMAGE_DEPENDENCY_UNKNOWN,
+    KEPT_IMAGE_REFERENCED,
+    KEPT_RUNNING,
+)
 from conftest import live_proc_start
 
 OURS = "our-registry"
+
+
+class _DefaultContainerImages:
+    pass
+
+
+_DEFAULT_CONTAINER_IMAGES = _DefaultContainerImages()
 
 
 class FakeEngine:
@@ -32,6 +46,9 @@ class FakeEngine:
         label_map: dict[str, dict[str, str]],
         *,
         running: frozenset[str] | None = frozenset(),
+        container_images: dict[str, str] | None | _DefaultContainerImages = (
+            _DEFAULT_CONTAINER_IMAGES
+        ),
     ):
         self.label_map = label_map
         self.commands: list[list[str]] = []
@@ -43,6 +60,11 @@ class FakeEngine:
         # set, which means "the engine answered: nothing is running". See
         # `resources.running_container_names` for the contract this mirrors.
         self.running = running
+        self.container_images: dict[str, str] | None
+        if isinstance(container_images, _DefaultContainerImages):
+            self.container_images = {}
+        else:
+            self.container_images = container_images
 
     def run(self, args: list[str], *, check: bool = False) -> EngineResult:
         self.commands.append(list(args))
@@ -51,6 +73,19 @@ class FakeEngine:
                 return EngineResult(1, "", "engine unreachable")
             lines = "\n".join(json.dumps({"Names": name}) for name in self.running)
             return EngineResult(0, lines, "")
+        if args == ["ps", "--all", "--quiet", "--no-trunc"]:
+            if self.container_images is None:
+                return EngineResult(1, "", "engine unreachable")
+            return EngineResult(0, "\n".join(self.container_images), "")
+        if args[:2] == ["container", "inspect"] and "--format" in args:
+            if self.container_images is None:
+                return EngineResult(1, "", "engine unreachable")
+            rows = [
+                json.dumps({"Name": f"/{name}", "Image": self.container_images[name]})
+                for name in args[args.index("--format") + 2 :]
+                if name in self.container_images
+            ]
+            return EngineResult(0, "\n".join(rows), "")
         if "inspect" in args:
             if self.on_inspect is not None:
                 self.on_inspect()
@@ -65,6 +100,8 @@ class FakeEngine:
             name = args[-1]
             if name in self.fail_on:
                 return EngineResult(1, "", "device or resource busy")
+            if args[0] == "rm" and isinstance(self.container_images, dict):
+                self.container_images.pop(name, None)
             return EngineResult(0, "", "")
         return EngineResult(0, "", "")
 
@@ -517,6 +554,178 @@ def test_removal_errors_are_recorded_not_discarded(registry: Registry, clock: Fa
     assert "busy" in result.errors[0]
     assert any(row["kind"] == "gc.error" for row in registry.events())
     assert len(registry.list_resources()) == 1, "a failed removal must not deregister"
+
+
+# -- eager superseded image retirement (issue #114) -----------------------
+
+
+def _supersede(registry: Registry, resource_id: str) -> None:
+    resource = registry.get_resource(resource_id)
+    assert resource is not None
+    registry.record_generation(resource.generation, resource.stack, resource.workspace)
+    registry.record_generation("next", resource.stack, resource.workspace)
+    registry.supersede_generations(resource.stack, "next", resource.workspace)
+
+
+def test_gc_eagerly_removes_an_unreferenced_superseded_image(registry: Registry) -> None:
+    old = add(registry, "sha256:old", kind="image")
+    current = registry.register_resource(
+        kind="image",
+        name="sha256:current",
+        stack="s",
+        generation="next",
+        scope="spec",
+        workspace="/w",
+    )
+    _supersede(registry, old.id)
+    engine = FakeEngine(
+        {
+            old.name: label_dict(registry=registry.registry_id, kind="image"),
+            current.name: label_dict(
+                registry=registry.registry_id, kind="image", generation="next"
+            ),
+        }
+    )
+
+    result = Collector(registry, engine).collect(dry_run=False)  # type: ignore[arg-type]
+
+    assert result.removed == [old.name]
+    assert registry.get_resource(old.id) is None
+    assert registry.get_resource(current.id) is not None
+    assert result.image_decisions == [
+        {
+            "name": current.name,
+            "action": "kept",
+            "eligible": False,
+            "reason": KEPT_CURRENT_IMAGE,
+        },
+        {
+            "name": old.name,
+            "action": "removed",
+            "eligible": True,
+            "reason": COLLECT_SUPERSEDED_IMAGE,
+        },
+    ]
+
+
+def test_gc_defers_image_referenced_by_any_container_without_logging_an_error(
+    registry: Registry,
+) -> None:
+    old = add(registry, "sha256:old", kind="image")
+    _supersede(registry, old.id)
+    engine = FakeEngine(
+        {old.name: label_dict(registry=registry.registry_id, kind="image")},
+        container_images={"stopped-container": old.name},
+    )
+
+    result = Collector(registry, engine).collect(dry_run=False)  # type: ignore[arg-type]
+
+    assert result.removed == []
+    assert result.errors == []
+    assert result.image_dependency_deferred == [old.name]
+    assert result.image_decisions == [
+        {
+            "name": old.name,
+            "action": "deferred",
+            "eligible": False,
+            "reason": KEPT_IMAGE_REFERENCED,
+            "candidate_reason": COLLECT_SUPERSEDED_IMAGE,
+            "referenced_by": ["stopped-container"],
+        }
+    ]
+    assert registry.get_resource(old.id) is not None
+    assert any(row["kind"] == "gc.image_dependency_deferred" for row in registry.events())
+
+
+def test_gc_fails_closed_when_container_image_references_are_unknown(
+    registry: Registry,
+) -> None:
+    old = add(registry, "sha256:old", kind="image")
+    _supersede(registry, old.id)
+    engine = FakeEngine(
+        {old.name: label_dict(registry=registry.registry_id, kind="image")},
+        container_images=None,
+    )
+
+    result = Collector(registry, engine).collect(dry_run=False)  # type: ignore[arg-type]
+
+    assert result.removed == []
+    assert result.errors == []
+    assert result.image_dependency_deferred == [old.name]
+    assert result.image_decisions == [
+        {
+            "name": old.name,
+            "action": "deferred",
+            "eligible": False,
+            "reason": KEPT_IMAGE_DEPENDENCY_UNKNOWN,
+            "candidate_reason": COLLECT_SUPERSEDED_IMAGE,
+        }
+    ]
+
+
+def test_gc_removes_collectable_containers_before_rescanning_image_dependencies(
+    registry: Registry, clock: FakeClock
+) -> None:
+    old_image = add(registry, "sha256:old", kind="image")
+    old_container = add(registry, "old-container", kind="container")
+    current = registry.register_resource(
+        kind="image",
+        name="sha256:current",
+        stack="s",
+        generation="next",
+        scope="spec",
+        workspace="/w",
+    )
+    _supersede(registry, old_image.id)
+    clock.advance(2 * DAY)
+    labels_by_name = {
+        old_image.name: label_dict(registry=registry.registry_id, kind="image"),
+        old_container.name: label_dict(registry=registry.registry_id, kind="container"),
+        current.name: label_dict(registry=registry.registry_id, kind="image", generation="next"),
+    }
+    engine = FakeEngine(labels_by_name, container_images={old_container.name: old_image.name})
+
+    preview = Collector(registry, engine).collect(dry_run=True)  # type: ignore[arg-type]
+    applied = Collector(registry, engine).collect(dry_run=False)  # type: ignore[arg-type]
+
+    assert preview.removed == applied.removed == [old_container.name, old_image.name]
+    assert preview.image_dependency_deferred == applied.image_dependency_deferred == []
+
+
+def test_status_distinguishes_current_eager_and_dependency_blocked_images(
+    registry: Registry,
+) -> None:
+    old = add(registry, "sha256:old", kind="image")
+    current = registry.register_resource(
+        kind="image",
+        name="sha256:current",
+        stack="s",
+        generation="next",
+        scope="spec",
+        workspace="/w",
+    )
+    _supersede(registry, old.id)
+    labels_by_name = {
+        old.name: label_dict(registry=registry.registry_id, kind="image"),
+        current.name: label_dict(registry=registry.registry_id, kind="image", generation="next"),
+    }
+
+    unblocked = status(registry, FakeEngine(labels_by_name))  # type: ignore[arg-type]
+    blocked = status(
+        registry,
+        FakeEngine(  # type: ignore[arg-type]
+            labels_by_name, container_images={"old-container": old.name}
+        ),
+    )  # type: ignore[arg-type]
+    unknown = status(
+        registry,
+        FakeEngine(labels_by_name, container_images=None),  # type: ignore[arg-type]
+    )
+
+    assert unblocked["by_reason"][COLLECT_SUPERSEDED_IMAGE] == 1
+    assert unblocked["by_reason"][KEPT_CURRENT_IMAGE] == 1
+    assert blocked["by_reason"][KEPT_IMAGE_REFERENCED] == 1
+    assert unknown["by_reason"][KEPT_IMAGE_DEPENDENCY_UNKNOWN] == 1
 
 
 # -- done ------------------------------------------------------------------

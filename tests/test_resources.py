@@ -377,6 +377,52 @@ def test_running_container_names_is_empty_set_not_none_when_nothing_runs() -> No
     assert result is not None
 
 
+class _ContainerReferenceEngine:
+    def __init__(self, *, fail_list: bool = False, fail_inspect: bool = False) -> None:
+        self.fail_list = fail_list
+        self.fail_inspect = fail_inspect
+        self.commands: list[list[str]] = []
+
+    def run(self, args: list[str], *, check: bool = False) -> EngineResult:
+        self.commands.append(list(args))
+        if args[:3] == ["ps", "--all", "--quiet"]:
+            return (
+                EngineResult(1, "", "down") if self.fail_list else EngineResult(0, "c1\nc2\n", "")
+            )
+        if args[:2] == ["container", "inspect"]:
+            if self.fail_inspect:
+                return EngineResult(1, "", "inspect failed")
+            return EngineResult(
+                0,
+                "\n".join(
+                    [
+                        json.dumps({"Name": "/first", "Image": "sha256:old"}),
+                        json.dumps({"Name": "/second", "Image": "sha256:current"}),
+                    ]
+                ),
+                "",
+            )
+        raise AssertionError(args)
+
+
+def test_container_image_references_include_running_and_stopped_containers() -> None:
+    engine = _ContainerReferenceEngine()
+
+    references = resources.container_image_references(engine)  # type: ignore[arg-type]
+
+    assert references == {"first": "sha256:old", "second": "sha256:current"}
+    assert "--all" in engine.commands[0]
+
+
+@pytest.mark.parametrize("failure", ["list", "inspect"])
+def test_container_image_references_fail_closed(failure: str) -> None:
+    engine = _ContainerReferenceEngine(
+        fail_list=failure == "list", fail_inspect=failure == "inspect"
+    )
+
+    assert resources.container_image_references(engine) is None  # type: ignore[arg-type]
+
+
 # -- leases ----------------------------------------------------------------
 
 

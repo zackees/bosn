@@ -15,6 +15,8 @@ from bosn.retention import (
     COLLECT_IDLE,
     COLLECT_PRESSURE,
     COLLECT_SUPERSEDED,
+    COLLECT_SUPERSEDED_IMAGE,
+    KEPT_CURRENT_IMAGE,
     KEPT_LEASED,
     KEPT_MACHINE_SCOPE,
     KEPT_QUIET_PERIOD,
@@ -159,6 +161,32 @@ def test_superseded_generations_are_capped_at_one_day(registry: Registry, clock:
     assert verdict.collect and verdict.reason == COLLECT_SUPERSEDED
 
 
+def test_superseded_image_is_eagerly_collectable_but_volume_stays_warm(
+    registry: Registry, clock: FakeClock
+) -> None:
+    """Issue #114 RED: one edit sequence must not retain every final image for 24h."""
+    image = make(registry, kind="image")
+    volume = make(registry, kind="volume")
+
+    image_verdict = evaluate(registry, image, superseded=True, alive_probe=DEAD)
+    volume_verdict = evaluate(registry, volume, superseded=True, alive_probe=DEAD)
+
+    assert image_verdict.collect and image_verdict.reason == COLLECT_SUPERSEDED_IMAGE
+    assert not volume_verdict.collect and volume_verdict.reason == KEPT_WARM
+
+
+def test_current_leaf_image_is_sticky_even_under_pressure(
+    registry: Registry, clock: FakeClock
+) -> None:
+    image = make(registry, kind="image")
+    clock.advance(100 * DAY)
+
+    verdict = evaluate(registry, image, pressure=Pressure(under_pressure=True), alive_probe=DEAD)
+
+    assert not verdict.collect
+    assert verdict.reason == KEPT_CURRENT_IMAGE
+
+
 def test_a_superseded_generation_still_serving_a_lease_is_kept(
     registry: Registry, clock: FakeClock
 ) -> None:
@@ -167,6 +195,16 @@ def test_a_superseded_generation_still_serving_a_lease_is_kept(
     registry.acquire_lease(resource.id, pid=1, proc_start=1.0, ttl_seconds=60)
     clock.advance(10 * DAY)
     assert not evaluate(registry, resource, superseded=True, alive_probe=ALIVE).collect
+
+
+def test_a_superseded_image_still_serving_a_lease_is_kept(registry: Registry) -> None:
+    resource = make(registry, kind="image")
+    registry.acquire_lease(resource.id, pid=1, proc_start=1.0, ttl_seconds=60)
+
+    verdict = evaluate(registry, resource, superseded=True, alive_probe=ALIVE)
+
+    assert not verdict.collect
+    assert verdict.reason == KEPT_LEASED
 
 
 # -- machine scope ---------------------------------------------------------

@@ -333,8 +333,8 @@ class Converger:
         # build can now be cancelled (by `bosn cancel`, daemon shutdown, or the job TTL),
         # and a cancelled build must leave nothing behind that implies a usable image.
         #
-        # Superseding is the sharp edge. Recording this generation retires every sibling,
-        # and retention puts superseded generations on a 24-hour collection clock -- so
+        # Superseding is the sharp edge. Recording this generation retires every sibling:
+        # final images become eager GC candidates, while other resources keep a warm cap. So
         # doing it before the build means one cancelled build marks the *previous, working*
         # image for early collection in favor of an image that never got built. Nothing
         # about this generation is written until `docker build` has exited 0.
@@ -347,8 +347,9 @@ class Converger:
         # without this checkpoint a cancel arriving during a *warm* converge (image already
         # present, nothing to build, nothing that consults the cancel flag) would be
         # reported as "cancelled" only after this generation had already superseded its
-        # predecessor. Telling a user nothing happened while their previous generation went
-        # on retention's 24-hour clock is worse than either outcome on its own.
+        # predecessor and made its image eligible for eager collection. Telling a user
+        # nothing happened while retiring their previous working image is worse than either
+        # outcome on its own.
         self._abort_if_cancelled()
 
         self.registry.record_generation(digest, stack.name, workspace)

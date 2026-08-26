@@ -26,6 +26,8 @@ from bosn.engine import Engine
 from bosn.registry import Registry
 from bosn.resources import ResourceScanner
 from bosn.retention import (
+    KEPT_IMAGE_DEPENDENCY_UNKNOWN,
+    KEPT_IMAGE_REFERENCED,
     KEPT_LEASED,
     KEPT_QUIET_PERIOD,
     KEPT_RUNNING,
@@ -62,6 +64,8 @@ class GCResult:
     removed: list[str] = field(default_factory=list)
     kept: list[str] = field(default_factory=list)
     skipped_unproven: list[str] = field(default_factory=list)
+    image_dependency_deferred: list[str] = field(default_factory=list)
+    image_decisions: list[dict[str, object]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     advisories: list[str] = field(default_factory=list)
 
@@ -72,6 +76,7 @@ class GCResult:
             "removed": len(self.removed),
             "kept": len(self.kept),
             "skipped_unproven": len(self.skipped_unproven),
+            "image_dependency_deferred": len(self.image_dependency_deferred),
             "errors": len(self.errors),
             "advisories": len(self.advisories),
         }
@@ -201,6 +206,15 @@ class Collector:
         for verdict in verdicts:
             if not verdict.collect:
                 result.kept.append(verdict.name)
+                if verdict.resource.kind == "image":
+                    result.image_decisions.append(
+                        {
+                            "name": verdict.name,
+                            "action": "kept",
+                            "eligible": False,
+                            "reason": verdict.reason,
+                        }
+                    )
                 if not container_should_stop(
                     verdict.resource, self.registry.clock.now(), config=config
                 ):
@@ -258,6 +272,9 @@ class Collector:
         # dependency order -- containers, then networks, then volumes/images -- so a done
         # workspace can be collected in one pass instead of leaving stranded networks
         # behind for the next GC pass to retry.
+        image_references: dict[str, str] | None = None
+        image_references_loaded = False
+        simulated_removed_containers: set[str] = set()
         for verdict in sorted(
             collectable(verdicts),
             key=lambda verdict: _REMOVAL_ORDER.get(verdict.resource.kind, 99),
@@ -278,14 +295,87 @@ class Collector:
                 )
                 if not current.collect:
                     result.kept.append(resource.name)
+                    if resource.kind == "image":
+                        result.image_decisions.append(
+                            {
+                                "name": resource.name,
+                                "action": "kept",
+                                "eligible": False,
+                                "reason": current.reason,
+                            }
+                        )
                     continue
+                if resource.kind == "image":
+                    if not image_references_loaded:
+                        image_references = resources.container_image_references(self.engine)
+                        image_references_loaded = True
+                        if dry_run and image_references is not None:
+                            image_references = {
+                                name: image_id
+                                for name, image_id in image_references.items()
+                                if name not in simulated_removed_containers
+                            }
+                    referenced_by = (
+                        []
+                        if image_references is None
+                        else sorted(
+                            name
+                            for name, image_id in image_references.items()
+                            if image_id == resource.name
+                        )
+                    )
+                    if image_references is None or referenced_by:
+                        reason = (
+                            KEPT_IMAGE_DEPENDENCY_UNKNOWN
+                            if image_references is None
+                            else KEPT_IMAGE_REFERENCED
+                        )
+                        detail = reason
+                        if referenced_by:
+                            detail += f" by {', '.join(referenced_by)}"
+                        result.kept.append(resource.name)
+                        result.image_dependency_deferred.append(resource.name)
+                        decision: dict[str, object] = {
+                            "name": resource.name,
+                            "action": "deferred",
+                            "eligible": False,
+                            "reason": reason,
+                            "candidate_reason": current.reason,
+                        }
+                        if referenced_by:
+                            decision["referenced_by"] = referenced_by
+                        result.image_decisions.append(decision)
+                        self.registry.log_event(
+                            "gc.image_dependency_deferred", f"{resource.name}: {detail}"
+                        )
+                        continue
                 if not self._ownership_proven(resource.kind, resource.name):
                     result.skipped_unproven.append(resource.name)
+                    if resource.kind == "image":
+                        result.image_decisions.append(
+                            {
+                                "name": resource.name,
+                                "action": "skipped-unproven",
+                                "eligible": True,
+                                "reason": current.reason,
+                            }
+                        )
                     self.registry.log_event("gc.skipped_unproven", resource.name)
                     continue
 
                 if dry_run:
                     result.removed.append(resource.name)
+                    if resource.kind == "image":
+                        result.image_decisions.append(
+                            {
+                                "name": resource.name,
+                                "action": "would-remove",
+                                "eligible": True,
+                                "reason": current.reason,
+                            }
+                        )
+                    if resource.kind == "container":
+                        simulated_removed_containers.add(resource.name)
                     measured.pop(resource.id, None)
                     pressure = reassess_pressure()
                     continue
@@ -300,11 +390,29 @@ class Collector:
                     self.registry.remove_resource(resource.id)
                     self.registry.log_event("gc.removed", f"{resource.kind}:{resource.name}")
                     result.removed.append(resource.name)
+                    if resource.kind == "image":
+                        result.image_decisions.append(
+                            {
+                                "name": resource.name,
+                                "action": "removed",
+                                "eligible": True,
+                                "reason": current.reason,
+                            }
+                        )
                     measured.pop(resource.id, None)
                     pressure = reassess_pressure()
                 else:
                     message = f"{resource.name}: {removal.stderr or removal.stdout}"
                     result.errors.append(message)
+                    if resource.kind == "image":
+                        result.image_decisions.append(
+                            {
+                                "name": resource.name,
+                                "action": "error",
+                                "eligible": True,
+                                "reason": current.reason,
+                            }
+                        )
                     self.registry.log_event("gc.error", message)
 
         return result
@@ -353,6 +461,22 @@ def status(
     verdicts = plan(
         registry, pressure=pressure, config=config, running_containers=running_containers
     )
+    image_references = resources.container_image_references(engine)
+    adjusted_verdicts: list[Verdict] = []
+    for verdict in verdicts:
+        if not verdict.collect or verdict.resource.kind != "image":
+            adjusted_verdicts.append(verdict)
+            continue
+        if image_references is None:
+            adjusted_verdicts.append(
+                Verdict(verdict.resource, False, KEPT_IMAGE_DEPENDENCY_UNKNOWN)
+            )
+            continue
+        if verdict.resource.name in image_references.values():
+            adjusted_verdicts.append(Verdict(verdict.resource, False, KEPT_IMAGE_REFERENCED))
+            continue
+        adjusted_verdicts.append(verdict)
+    verdicts = adjusted_verdicts
     reclaimable = sum(measured[v.resource.id] or 0 for v in collectable(verdicts))
     advisory = (
         "Backing-store slack exceeds managed reclaimable bytes; compact the Docker VHDX manually."

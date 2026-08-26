@@ -7,7 +7,7 @@ cold build into 30 seconds. They get separate clocks:
 - containers idle-stop at 1 h and are removed at 24 h
 - networks share the container's 24 h removal clock -- disposable, not a cache
 - warm volumes live 72 h
-- superseded generations are capped at 24 h
+- superseded final images are immediately eligible; other superseded resources are capped at 24 h
 - machine-shared caches age only under pressure
 - a container the engine reports as running is exempt from all of the above -- the tiers
   assume "disposable, cheap to recreate," which is false the instant something is executing
@@ -45,11 +45,15 @@ SUPERSEDED_CAP = 1 * DAY
 KEPT_LEASED = "leased"
 KEPT_RUNNING = "running"
 KEPT_QUIET_PERIOD = "quiet-period"
+KEPT_CURRENT_IMAGE = "current-image"
+KEPT_IMAGE_REFERENCED = "image-referenced"
+KEPT_IMAGE_DEPENDENCY_UNKNOWN = "image-dependency-unknown"
 KEPT_WARM = "warm"
 KEPT_MACHINE_SCOPE = "machine-scope"
 
 # Reasons a resource is collectable.
 COLLECT_SUPERSEDED = "superseded"
+COLLECT_SUPERSEDED_IMAGE = "superseded-image"
 COLLECT_IDLE = "idle"
 COLLECT_DONE = "workspace-done"
 COLLECT_PRESSURE = "pressure"
@@ -224,12 +228,22 @@ def evaluate(
         return Verdict(resource, False, KEPT_QUIET_PERIOD)
 
     if superseded:
+        if resource.kind == "image":
+            return Verdict(resource, True, COLLECT_SUPERSEDED_IMAGE)
         if age >= config.get("superseded_cap"):
             return Verdict(resource, True, COLLECT_SUPERSEDED)
         return Verdict(resource, False, KEPT_WARM)
 
     if workspace_done and resource.scope != "machine":
         return Verdict(resource, True, COLLECT_DONE)
+
+    # The active leaf image is the cheapest way to start the next command and the most
+    # expensive disposable resource to recreate. BuildKit's layer cache remains unmanaged,
+    # but it is not a promise that this exact tagged result can be reconstructed cheaply.
+    # Keep the current image until a successful replacement supersedes it or the workspace
+    # explicitly says it is done.
+    if resource.kind == "image":
+        return Verdict(resource, False, KEPT_CURRENT_IMAGE)
 
     # Pressure can evict warm resources, but never leases/adoption quiet-period resources.
     # Machine-wide caches are deliberately considered after all workspace-scoped caches.
@@ -284,7 +298,13 @@ def plan(
 def collectable(verdicts: list[Verdict]) -> list[Verdict]:
     # A single order is essential under pressure: clearly obsolete first, then completed
     # worktrees, then ordinary pressure candidates, with shared machine caches last.
-    order = {COLLECT_SUPERSEDED: 0, COLLECT_DONE: 1, COLLECT_IDLE: 2, COLLECT_PRESSURE: 3}
+    order = {
+        COLLECT_SUPERSEDED_IMAGE: 0,
+        COLLECT_SUPERSEDED: 1,
+        COLLECT_DONE: 2,
+        COLLECT_IDLE: 3,
+        COLLECT_PRESSURE: 4,
+    }
     return sorted(
         (v for v in verdicts if v.collect),
         key=lambda v: (
