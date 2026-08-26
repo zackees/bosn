@@ -8,6 +8,7 @@ import os
 import sys
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -22,9 +23,9 @@ from bosn.converge import (
     volume_name_for,
     workspace_of,
 )
-from bosn.engine import EngineError, EngineResult
-from bosn.manifest import load
-from bosn.registry import Registry
+from bosn.engine import Engine, EngineError, EngineResult
+from bosn.manifest import Manifest, load
+from bosn.registry import Registry, VolumeCreationIntent
 from conftest import live_proc_start
 
 SAMPLE = """
@@ -60,6 +61,8 @@ class FakeEngine:
         self.timeouts.append(timeout)
         if args[:2] == ["version", "--format"]:
             return EngineResult(0, "linux/amd64", "")
+        if args[:3] == ["ps", "--all", "--filter"]:
+            return EngineResult(0, "", "")
         if args[:2] == ["container", "inspect"] and "{{json .}}" in args:
             spec = self.container_specs.get(args[-1])
             return EngineResult(0 if spec else 1, json.dumps(spec) if spec else "", "")
@@ -235,6 +238,69 @@ def converger(project: Path, registry: Registry) -> Converger:
 
 
 # -- convergence is idempotent ---------------------------------------------
+
+
+def test_recorded_partial_volume_is_safely_recreated_on_ensure(tmp_path: Path) -> None:
+    """#120: an interrupted create is recoverable only with durable matching proof."""
+    engine = FakeEngine()
+    with Registry(tmp_path / "registry.sqlite3") as registry:
+        expected = labels.ResourceLabels(
+            registry=registry.registry_id,
+            kind="volume",
+            stack="test",
+            generation="sha256:g",
+            scope="stack",
+            workspace=str(tmp_path),
+            created="2026-08-26T00:00:00Z",
+        )
+        name = "bosn-test-interrupted"
+        partial = expected.to_dict()
+        del partial[labels.STACK]
+        engine.existing.add(name)
+        engine.resource_labels[("volume", name)] = partial
+        registry.save_volume_creation_intent(
+            VolumeCreationIntent(
+                name, expected.to_dict(), "test", "sha256:g", "stack", str(tmp_path)
+            )
+        )
+        converger = Converger(cast(Manifest, None), registry, cast(Engine, engine))
+        # A retry naturally has a different current timestamp; recovery must retain the
+        # original intent's creation label rather than treating that as a conflict.
+        converger._recover_interrupted_volume(
+            name, replace(expected, created="2026-08-26T01:00:00Z")
+        )
+
+        assert engine.resource_labels[("volume", name)] == expected.to_dict()
+        assert registry.volume_creation_intent(name) is None
+
+
+def test_interrupted_volume_recovery_refuses_an_unlabeled_collision(tmp_path: Path) -> None:
+    """An intent plus a generated name never authorizes taking an unlabeled volume."""
+    engine = FakeEngine()
+    with Registry(tmp_path / "registry.sqlite3") as registry:
+        expected = labels.ResourceLabels(
+            registry=registry.registry_id,
+            kind="volume",
+            stack="test",
+            generation="sha256:g",
+            scope="stack",
+            workspace=str(tmp_path),
+            created="2026-08-26T00:00:00Z",
+        )
+        name = "bosn-test-unlabeled"
+        engine.existing.add(name)
+        engine.resource_labels[("volume", name)] = {}
+        registry.save_volume_creation_intent(
+            VolumeCreationIntent(
+                name, expected.to_dict(), "test", "sha256:g", "stack", str(tmp_path)
+            )
+        )
+        converger = Converger(cast(Manifest, None), registry, cast(Engine, engine))
+
+        with pytest.raises(EngineError, match="refusing unsafe recovery"):
+            converger._recover_interrupted_volume(name, expected)
+
+        assert registry.volume_creation_intent(name) is not None
 
 
 def test_first_converge_registers_then_reuses(converger: Converger) -> None:

@@ -427,6 +427,42 @@ def status(
 
     config = config or load_config()
     scan = ResourceScanner(engine).scan(registry.registry_id)
+    # Foreground commands are deliberately *not* jobs: they execute in a persistent
+    # container and must retain exclusive ownership until the exact client process has
+    # released it (or the daemon has proved that client dead and removed that exact
+    # container).  Expose that separate ledger here; otherwise `jobs` can truthfully say
+    # "nothing running" while a foreground session still protects the stack (#119).
+    execution_sessions = []
+    for session in registry.execution_sessions():
+        alive = resources.process_alive(session.client_pid, session.client_start)
+        execution_sessions.append(
+            {
+                "id": session.id,
+                "container_id": session.container_id,
+                "engine": session.engine_binary,
+                "client_pid": session.client_pid,
+                "client_start": session.client_start,
+                "client_alive": alive,
+                "lease_ids": list(session.lease_ids),
+                "blocking_reason": (
+                    "client is live"
+                    if alive
+                    else "client is dead; awaiting safe exact-container reap"
+                ),
+            }
+        )
+    # Incomplete labels are not ownership proof and therefore are never candidates for
+    # automatic collection.  They must nevertheless be named: a generic count leaves an
+    # operator unable to tell which resource is blocking convergence (#120).
+    unproven_resources = [
+        {
+            "kind": resource.kind,
+            "name": resource.name,
+            "registry_id": resource.registry,
+            "reason": "incomplete ownership labels; protected from automatic recovery",
+        }
+        for resource in scan.unlabeled
+    ]
     inventory = StorageInventory.collect(engine)
 
     attributed: dict[tuple[str, str, str], dict[str, int]] = defaultdict(
@@ -495,6 +531,9 @@ def status(
         "collectable": len(collectable(verdicts)),
         "by_reason": by_reason,
         "engine": scan.counts(),
+        "scanned_kinds": sorted(scan.scanned_kinds),
+        "unproven_resources": unproven_resources,
+        "execution_sessions": execution_sessions,
         "foreign_registries": sorted(scan.foreign_registries),
         "foreign_registry_totals": {
             "count": len(scan.foreign),

@@ -91,6 +91,31 @@ def test_builtin_verb_name_is_reserved_from_task_dispatch(monkeypatch) -> None:
     assert seen == ["status"]
 
 
+def test_status_surfaces_a_foreground_session_without_waiting_for_engine_scan(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    from bosn import daemon
+
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "registry.sqlite3").touch()
+    monkeypatch.setattr(
+        daemon,
+        "request",
+        lambda *_args, **_kwargs: {
+            "registry_id": "registry",
+            "execution_sessions": [
+                {"id": "session", "client_alive": False, "blocking_reason": "awaiting reap"}
+            ],
+        },
+    )
+    monkeypatch.setattr(cli, "Engine", lambda *_args: (_ for _ in ()).throw(AssertionError()))
+
+    assert cli.main(["--state-dir", str(state), "status", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["execution_sessions"][0]["id"] == "session"
+
+
 def test_tasks_json_reports_unregistered_readiness(tmp_path, capsys) -> None:
     (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
     manifest = tmp_path / "bosn.toml"
