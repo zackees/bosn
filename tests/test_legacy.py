@@ -26,7 +26,9 @@ class FakeEngine:
         self.inspects = inspects or {}
         self.commands: list[list[str]] = []
 
-    def run(self, args: list[str], *, check: bool = False) -> EngineResult:
+    def run(
+        self, args: list[str], *, check: bool = False, timeout: float | None = None
+    ) -> EngineResult:
         self.commands.append(list(args))
         if "inspect" in args:
             name = args[-1]
@@ -50,13 +52,17 @@ class TransferEngine:
     def __init__(self) -> None:
         self.commands: list[list[str]] = []
 
-    def run(self, args: list[str], *, check: bool = False) -> EngineResult:
+    def run(
+        self, args: list[str], *, check: bool = False, timeout: float | None = None
+    ) -> EngineResult:
         self.commands.append(list(args))
         return EngineResult(0, "", "")
 
 
 class AttachedEngine:
-    def run(self, args: list[str], *, check: bool = False) -> EngineResult:
+    def run(
+        self, args: list[str], *, check: bool = False, timeout: float | None = None
+    ) -> EngineResult:
         if args[:2] == ["ps", "--all"]:
             return EngineResult(0, "container-id", "")
         return EngineResult(0, "", "")
@@ -503,7 +509,9 @@ def test_cli_legacy_adoption_applies_and_registers_through_compose_adopt(
             def __init__(self) -> None:
                 self.commands: list[list[str]] = []
 
-            def run(self, args: list[str], *, check: bool = False) -> EngineResult:
+            def run(
+                self, args: list[str], *, check: bool = False, timeout: float | None = None
+            ) -> EngineResult:
                 self.commands.append(list(args))
                 if "inspect" in args:
                     return EngineResult(0, "{}", "")
