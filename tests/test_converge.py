@@ -117,6 +117,7 @@ class FakeEngine:
                 if value == "--label"
             }
             mounts: list[dict[str, object]] = []
+            tmpfs: dict[str, str] = {}
             for index, value in enumerate(args[:-1]):
                 if value != "--volume":
                     continue
@@ -144,27 +145,16 @@ class FakeEngine:
                     continue
                 rendered = args[index + 1]
                 destination, _, options = rendered.partition(":")
-                readwrite = True
-                for option in options.split(",") if options else ():
-                    if option == "ro":
-                        readwrite = False
-                    elif option == "rw":
-                        readwrite = True
-                mounts.append(
-                    {
-                        "Type": "tmpfs",
-                        "Name": "",
-                        "Source": "",
-                        "Destination": destination,
-                        "RW": readwrite,
-                    }
-                )
+                # Docker does not report `--tmpfs` entries in `.Mounts`; it round-trips
+                # them through `.HostConfig.Tmpfs` as destination -> option string (#116).
+                tmpfs[destination] = options
             image = args[-4]
             self.container_specs[name] = {
                 "Id": container_id,
                 "Config": {"Labels": raw_labels, "Image": image},
                 "Image": self.image_ids.get(image, image),
                 "Mounts": mounts,
+                "HostConfig": {"Tmpfs": tmpfs},
             }
             return EngineResult(0, container_id, "")
         if args[0] == "build":
@@ -903,6 +893,7 @@ def test_run_mounts_every_declared_volume(converger: Converger) -> None:
 
 
 def test_run_mounts_declared_tmpfs(tmp_path: Path) -> None:
+    """Issue #116: Docker's HostConfig.Tmpfs round trip must validate after create."""
     (tmp_path / "bosn.toml").write_text(
         '[stack.mysql]\nimage = "alpine"\ntmpfs = ["/var/lib/mysql"]\n',
         encoding="utf-8",
@@ -930,6 +921,32 @@ def test_read_only_tmpfs_reuses_the_persistent_container(tmp_path: Path) -> None
     assert engine.ran("create")[0][engine.ran("create")[0].index("--tmpfs") + 1] == (
         "/run/scratch:ro,size=16m"
     )
+
+
+def test_conflicting_tmpfs_and_mount_inspect_data_fails_closed() -> None:
+    expected = {
+        "/scratch": {
+            "type": "tmpfs",
+            "source": "",
+            "destination": "/scratch",
+            "rw": True,
+        }
+    }
+    contradictory_mounts = [
+        {
+            "Type": "bind",
+            "Source": "/host/scratch",
+            "Destination": "/scratch",
+            "RW": True,
+        }
+    ]
+
+    assert (
+        Converger._container_mounts_match(contradictory_mounts, expected, {"/scratch": ""}) is False
+    )
+    matching_mounts = [{"Type": "tmpfs", "Destination": "/scratch", "RW": True}]
+    assert Converger._container_mounts_match(matching_mounts, expected, {"/scratch": 123}) is False
+    assert Converger._container_mounts_match(matching_mounts, expected, []) is False
 
 
 def test_second_run_reuses_the_same_persistent_container(converger: Converger) -> None:

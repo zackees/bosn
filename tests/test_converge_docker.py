@@ -215,3 +215,37 @@ def test_an_image_backed_stack_runs_the_declared_image(
         for resource in registry.list_resources():
             if resource.kind == "container":
                 engine.run(["rm", "--force", resource.name])
+
+
+def test_tmpfs_round_trips_through_real_docker_inspect(
+    tmp_path: Path, registry: Registry, engine: Engine
+) -> None:
+    """Issue #116: Docker reports `--tmpfs` through HostConfig, not Mounts."""
+    (tmp_path / "bosn.toml").write_text(
+        '[stack.demo]\nimage = "alpine:3.20"\ndefault = true\ntmpfs = ["/scratch"]\n',
+        encoding="utf-8",
+    )
+    converger = Converger(load(tmp_path), registry, engine)
+    try:
+        first, code, output = converger.run(
+            ["sh", "-c", "echo tmpfs-ok > /scratch/probe && cat /scratch/probe"]
+        )
+        assert code == 0, output
+        assert output.strip() == "tmpfs-ok"
+        name = converger.container_name(workspace_of(converger.manifest), first.stack)
+        initial = engine.run(["container", "inspect", "--format", "{{json .}}", name])
+        assert initial.ok
+        initial_spec = json.loads(initial.stdout)
+        assert initial_spec["HostConfig"]["Tmpfs"]["/scratch"] == ""
+        assert all(mount["Destination"] != "/scratch" for mount in initial_spec["Mounts"])
+
+        _second, code, output = converger.run(["cat", "/scratch/probe"])
+
+        assert code == 0, output
+        assert output.strip() == "tmpfs-ok"
+        reused = engine.run(["container", "inspect", "--format", "{{.Id}}", name])
+        assert reused.stdout.strip() == initial_spec["Id"]
+    finally:
+        for resource in registry.list_resources():
+            if resource.kind == "container":
+                engine.run(["rm", "--force", resource.name])

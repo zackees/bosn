@@ -853,13 +853,17 @@ class Converger:
             stale.append("generation changed")
         if str(inspected.get("Image") or "") != image_id:
             stale.append("image changed")
-        if not self._container_mounts_match(inspected.get("Mounts"), mounts):
+        host_config = inspected.get("HostConfig")
+        raw_tmpfs = host_config.get("Tmpfs") if isinstance(host_config, dict) else None
+        if not self._container_mounts_match(inspected.get("Mounts"), mounts, raw_tmpfs):
             stale.append("mounts changed")
         return stale
 
     @staticmethod
     def _container_mounts_match(
-        raw_mounts: object, expected: dict[str, dict[str, str | bool]]
+        raw_mounts: object,
+        expected: dict[str, dict[str, str | bool]],
+        raw_tmpfs: object = None,
     ) -> bool:
         if not isinstance(raw_mounts, list):
             return False
@@ -868,6 +872,34 @@ class Converger:
             for mount in raw_mounts
             if isinstance(mount, dict) and mount.get("Destination")
         }
+        # Docker's `--tmpfs` mounts do not appear in `.Mounts`; inspect reports them as
+        # `.HostConfig.Tmpfs`, mapping each destination to its canonical option string.
+        # Merge that alternate representation into the same shape used for bind/volume
+        # comparison. Engines that already expose tmpfs in `.Mounts` remain supported.
+        if raw_tmpfs is not None and not isinstance(raw_tmpfs, dict):
+            return False
+        if isinstance(raw_tmpfs, dict):
+            for destination, options in raw_tmpfs.items():
+                if not isinstance(destination, str) or not isinstance(options, str):
+                    return False
+                readwrite = True
+                for option in options.split(",") if options else ():
+                    if option == "ro":
+                        readwrite = False
+                    elif option == "rw":
+                        readwrite = True
+                normalized = {
+                    "Type": "tmpfs",
+                    "Destination": destination,
+                    "RW": readwrite,
+                }
+                existing = actual.get(destination)
+                if existing is not None and (
+                    str(existing.get("Type") or "") != "tmpfs"
+                    or bool(existing.get("RW")) != readwrite
+                ):
+                    return False
+                actual[destination] = normalized
         # "Managed" is whatever this generation declares, plus anything still sitting in
         # bosn's reserved namespace even if the current declaration no longer names it --
         # that catches a volume whose default destination moved. A dropped bind mount is
