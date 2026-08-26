@@ -1,6 +1,6 @@
 [project]
 name = "bosn"
-version = "0.1.0a3"
+version = "0.1.0a4"
 description = "Let your agents use Docker all day without filling the disk"
 readme = "README.md"
 license = { text = "MIT" }
