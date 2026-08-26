@@ -139,6 +139,26 @@ class FakeEngine:
                         "RW": not read_only,
                     }
                 )
+            for index, value in enumerate(args[:-1]):
+                if value != "--tmpfs":
+                    continue
+                rendered = args[index + 1]
+                destination, _, options = rendered.partition(":")
+                readwrite = True
+                for option in options.split(",") if options else ():
+                    if option == "ro":
+                        readwrite = False
+                    elif option == "rw":
+                        readwrite = True
+                mounts.append(
+                    {
+                        "Type": "tmpfs",
+                        "Name": "",
+                        "Source": "",
+                        "Destination": destination,
+                        "RW": readwrite,
+                    }
+                )
             image = args[-4]
             self.container_specs[name] = {
                 "Id": container_id,
@@ -880,6 +900,36 @@ def test_run_mounts_every_declared_volume(converger: Converger) -> None:
     engine: FakeEngine = converger.engine  # type: ignore[assignment]
     mounts = [a for a in engine.ran("create")[0] if a.startswith("bosn-") and ":/bosn/" in a]
     assert len(mounts) == 3
+
+
+def test_run_mounts_declared_tmpfs(tmp_path: Path) -> None:
+    (tmp_path / "bosn.toml").write_text(
+        '[stack.mysql]\nimage = "alpine"\ntmpfs = ["/var/lib/mysql"]\n',
+        encoding="utf-8",
+    )
+    engine = FakeEngine()
+    with Registry(tmp_path / "tmpfs.sqlite3") as registry:
+        Converger(load(tmp_path), registry, engine).run(["true"])  # type: ignore[arg-type]
+
+    create = engine.ran("create")[0]
+    assert create[create.index("--tmpfs") + 1] == "/var/lib/mysql"
+
+
+def test_read_only_tmpfs_reuses_the_persistent_container(tmp_path: Path) -> None:
+    (tmp_path / "bosn.toml").write_text(
+        '[stack.app]\nimage = "alpine"\ntmpfs = ["/run/scratch:ro,size=16m"]\n',
+        encoding="utf-8",
+    )
+    engine = FakeEngine()
+    with Registry(tmp_path / "readonly-tmpfs.sqlite3") as registry:
+        converger = Converger(load(tmp_path), registry, engine)  # type: ignore[arg-type]
+        converger.run(["true"])
+        converger.run(["true"])
+
+    assert len(engine.ran("create")) == 1
+    assert engine.ran("create")[0][engine.ran("create")[0].index("--tmpfs") + 1] == (
+        "/run/scratch:ro,size=16m"
+    )
 
 
 def test_second_run_reuses_the_same_persistent_container(converger: Converger) -> None:

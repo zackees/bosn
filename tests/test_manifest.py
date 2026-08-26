@@ -664,3 +664,24 @@ def test_soldr_example_reserved_namespace_guard_still_rejects_a_bosn_destination
 
     with pytest.raises(ManifestError, match="reserved"):
         load(tmp_path)
+
+
+@pytest.mark.parametrize("rendered", ['""', "false", "0", "{}"])
+def test_falsey_non_array_tmpfs_is_refused(tmp_path: Path, rendered: str) -> None:
+    (tmp_path / "bosn.toml").write_text(
+        f'[stack.test]\nimage = "alpine"\ntmpfs = {rendered}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ManifestError, match="tmpfs must be an array of strings"):
+        load(tmp_path)
+
+
+def test_tmpfs_trailing_slash_alias_is_refused_as_a_duplicate(tmp_path: Path) -> None:
+    (tmp_path / "bosn.toml").write_text(
+        '[stack.test]\nimage = "alpine"\ntmpfs = ["/data", "/data/"]\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ManifestError, match="mounts '/data' twice"):
+        load(tmp_path)

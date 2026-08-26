@@ -218,15 +218,23 @@ def compose_to_manifest(source: Path) -> str:
     #47 opens with -- was reported as an unsupported key rather than parsed.
     """
     try:
-        services = load_compose(source).image_pairs()
+        parsed = load_compose(source)
+        services = [
+            (name, service.image, service.tmpfs)
+            for name, service in parsed.services.items()
+            if service.image is not None
+        ]
     except ComposeError as exc:
         raise DockerFrontDoorError(str(exc)) from exc
     if not services:
         raise DockerFrontDoorError("compose file has no supported service image")
     stacks = []
-    for name, image in services:
+    for name, image, tmpfs in services:
         default = str(len(stacks) == 0).lower()
-        stacks.append(f'[stack.{name}]\nimage = "{image}"\ndefault = {default}\n')
+        tmpfs_line = (
+            "tmpfs = [" + ", ".join(json.dumps(entry) for entry in tmpfs) + "]\n" if tmpfs else ""
+        )
+        stacks.append(f'[stack.{name}]\nimage = "{image}"\ndefault = {default}\n{tmpfs_line}')
     # Names `bosn init`, not `bosn-docker init`: #46 makes the former the documented
     # migration command and the latter a retained alias, so the banner a user finds at the
     # top of their committed manifest should point at the command the docs tell them to run.

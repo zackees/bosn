@@ -20,6 +20,39 @@ def test_profiles_parse_instead_of_raising() -> None:
     assert compose.services["app"].profiles == ("debug", "test")
 
 
+def test_project_name_and_short_form_tmpfs_parse() -> None:
+    """Issue #115: standard Compose keys must be represented, not silently dropped."""
+    text = (
+        "name: twp-e2e\nservices:\n  mysql:\n    image: mysql:8.0.45\n    tmpfs: [/var/lib/mysql]\n"
+    )
+
+    compose = load_compose(text)
+
+    assert compose.name == "twp-e2e"
+    assert compose.services["mysql"].tmpfs == ("/var/lib/mysql",)
+
+
+def test_short_form_tmpfs_accepts_a_bare_string() -> None:
+    compose = load_compose(
+        "services:\n  mysql:\n    image: mysql:8.0.45\n    tmpfs: /var/lib/mysql\n"
+    )
+
+    assert compose.services["mysql"].tmpfs == ("/var/lib/mysql",)
+
+
+def test_long_form_tmpfs_is_normalized_to_the_same_model() -> None:
+    compose = load_compose(
+        "services:\n"
+        "  mysql:\n"
+        "    image: mysql:8.0.45\n"
+        "    volumes:\n"
+        "      - type: tmpfs\n"
+        "        target: /var/lib/mysql\n"
+    )
+
+    assert compose.services["mysql"].tmpfs == ("/var/lib/mysql",)
+
+
 def test_top_level_volumes_and_networks_are_not_service_references() -> None:
     """The ghost-service bug: a service's nested references must never populate the
     top-level declaration list, and vice versa."""

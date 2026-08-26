@@ -597,6 +597,12 @@ class Converger:
             # Docker removes an orphan automatically once PID 1's watchdog exits.
             args = ["create", "--rm", "--name", name, *resource_labels.to_docker_args()]
             for mount in expected_mounts.values():
+                if mount["type"] == "tmpfs":
+                    entry = next(
+                        item for item in stack.tmpfs if item.destination == mount["destination"]
+                    )
+                    args += ["--tmpfs", entry.value]
+                    continue
                 suffix = ":ro" if not mount["rw"] else ""
                 args += ["--volume", f"{mount['source']}:{mount['destination']}{suffix}"]
             # Sorted for a deterministic argv (helps tests and log-reading humans), not for
@@ -726,6 +732,13 @@ class Converger:
                 "source": str(mount.resolve_source(self.manifest.root)),
                 "destination": mount.destination,
                 "rw": not mount.readonly,
+            }
+        for entry in stack.tmpfs:
+            mounts[entry.destination] = {
+                "type": "tmpfs",
+                "source": "",
+                "destination": entry.destination,
+                "rw": entry.readwrite,
             }
         heartbeat = (self.registry.path.parent / "daemon.heartbeat").resolve()
         heartbeat.touch(exist_ok=True)
@@ -881,7 +894,7 @@ class Converger:
             if wanted["type"] == "volume":
                 if str(found.get("Name") or "") != wanted["source"]:
                     return False
-            elif not Converger._bind_sources_match(
+            elif wanted["type"] == "bind" and not Converger._bind_sources_match(
                 str(found.get("Source") or ""), str(wanted["source"])
             ):
                 return False

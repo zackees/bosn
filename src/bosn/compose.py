@@ -62,7 +62,9 @@ class ComposeError(ValueError):
 # environment, ports, and both mount styles. Anything else -- `deploy`, `secrets`,
 # `configs`, `extends`, etc. -- is out of scope for this slice and must be refused,
 # not guessed at.
-SUPPORTED_TOP_LEVEL_KEYS: frozenset[str] = frozenset({"version", "services", "volumes", "networks"})
+SUPPORTED_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
+    {"name", "version", "services", "volumes", "networks"}
+)
 
 # Compose reserves the `x-` prefix for user extension fields, at the top level and inside
 # service/volume/network definitions. Refusing them would refuse the ordinary way anchors
@@ -88,6 +90,7 @@ SUPPORTED_SERVICE_KEYS: frozenset[str] = frozenset(
         "entrypoint",
         "restart",
         "container_name",
+        "tmpfs",
     }
 )
 
@@ -136,6 +139,7 @@ class Service:
     referenced_networks: tuple[str, ...] = ()
     # Mounts Compose names at runtime; ungovernable through a label overlay.
     anonymous_volumes: tuple[str, ...] = ()
+    tmpfs: tuple[str, ...] = ()
 
     @property
     def is_build_only(self) -> bool:
@@ -161,6 +165,7 @@ class ComposeFile:
     indentation levels that a real parser simply never conflates.
     """
 
+    name: str | None = None
     services: dict[str, Service] = field(default_factory=dict)
     volumes: tuple[str, ...] = ()
     networks: tuple[str, ...] = ()
@@ -179,8 +184,10 @@ class ComposeFile:
 # -- parsing ----------------------------------------------------------------------
 
 
-def _referenced_volume_names(raw_volumes: list[Any], path: str) -> tuple[tuple[str, ...], ...]:
-    """Split a service's volume list into (named references, anonymous entries).
+def _referenced_volume_names(
+    raw_volumes: list[Any], path: str
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Split mounts into named-volume references, anonymous volumes, and tmpfs entries.
 
     Anonymous entries are reported rather than dropped because they are the one mount kind
     the label overlay cannot govern: Compose names them at runtime, so there is no stable
@@ -189,6 +196,7 @@ def _referenced_volume_names(raw_volumes: list[Any], path: str) -> tuple[tuple[s
     """
     names: list[str] = []
     anonymous: list[str] = []
+    tmpfs: list[str] = []
     for i, entry in enumerate(raw_volumes):
         if isinstance(entry, str):
             # Short syntax: "source:target[:mode]", "./host:target" (bind, not named), or
@@ -209,7 +217,20 @@ def _referenced_volume_names(raw_volumes: list[Any], path: str) -> tuple[tuple[s
                 "this slice supports type/source/target/read_only/bind/volume/tmpfs mount keys",
             )
             source = entry.get("source")
-            if entry.get("type") == "volume":
+            if entry.get("type") == "tmpfs":
+                target = entry.get("target")
+                if not isinstance(target, str) or not target:
+                    raise ComposeError(
+                        f"{path}[{i}].target must be a non-empty string for a tmpfs mount"
+                    )
+                options = entry.get("tmpfs")
+                if options not in (None, {}):
+                    _refuse(
+                        f"{path}[{i}].tmpfs",
+                        "tmpfs size/mode options are not yet representable in bosn.toml",
+                    )
+                tmpfs.append(target)
+            elif entry.get("type") == "volume":
                 if isinstance(source, str):
                     names.append(source)
                 else:
@@ -218,7 +239,16 @@ def _referenced_volume_names(raw_volumes: list[Any], path: str) -> tuple[tuple[s
                     anonymous.append(str(entry.get("target") or "<anonymous>"))
             continue
         _refuse(f"{path}[{i}]", "volume list entries must be a string or a mapping")
-    return tuple(names), tuple(anonymous)
+    return tuple(names), tuple(anonymous), tuple(tmpfs)
+
+
+def _parse_tmpfs(raw: Any, path: str) -> tuple[str, ...]:
+    entries = [raw] if isinstance(raw, str) else raw
+    if not isinstance(entries, list) or not all(isinstance(entry, str) for entry in entries):
+        raise ComposeError(f"{path} must be a string or a list of strings")
+    if any(not entry for entry in entries):
+        raise ComposeError(f"{path} entries must not be empty")
+    return tuple(entries)
 
 
 def _referenced_network_names(raw_networks: Any, path: str) -> tuple[str, ...]:
@@ -251,16 +281,18 @@ def _parse_service(name: str, raw: Any) -> Service:
         raise ComposeError(f"{path}.profiles must be a list of strings")
     referenced_volumes: tuple[str, ...] = ()
     anonymous_volumes: tuple[str, ...] = ()
+    long_tmpfs: tuple[str, ...] = ()
     if "volumes" in raw:
         raw_volumes = raw["volumes"]
         if not isinstance(raw_volumes, list):
             raise ComposeError(f"{path}.volumes must be a list")
-        referenced_volumes, anonymous_volumes = _referenced_volume_names(
+        referenced_volumes, anonymous_volumes, long_tmpfs = _referenced_volume_names(
             raw_volumes, f"{path}.volumes"
         )
     referenced_networks: tuple[str, ...] = ()
     if "networks" in raw:
         referenced_networks = _referenced_network_names(raw["networks"], f"{path}.networks")
+    short_tmpfs = _parse_tmpfs(raw["tmpfs"], f"{path}.tmpfs") if "tmpfs" in raw else ()
     return Service(
         name=name,
         image=image,
@@ -269,6 +301,7 @@ def _parse_service(name: str, raw: Any) -> Service:
         referenced_volumes=referenced_volumes,
         anonymous_volumes=anonymous_volumes,
         referenced_networks=referenced_networks,
+        tmpfs=(*long_tmpfs, *short_tmpfs),
     )
 
 
@@ -336,6 +369,10 @@ def load_compose(path_or_text: Path | str) -> ComposeFile:
         raise ComposeError("compose file has no services")
     services = {name: _parse_service(name, body) for name, body in services_raw.items()}
 
+    project_name = raw.get("name")
+    if project_name is not None and not isinstance(project_name, str):
+        raise ComposeError("name must be a string")
+
     volumes = _parse_top_level_resource(
         raw.get("volumes"), "volumes", SUPPORTED_TOP_LEVEL_VOLUME_KEYS
     )
@@ -343,7 +380,7 @@ def load_compose(path_or_text: Path | str) -> ComposeFile:
         raw.get("networks"), "networks", SUPPORTED_TOP_LEVEL_NETWORK_KEYS
     )
 
-    return ComposeFile(services=services, volumes=volumes, networks=networks)
+    return ComposeFile(name=project_name, services=services, volumes=volumes, networks=networks)
 
 
 # -- identity ---------------------------------------------------------------------

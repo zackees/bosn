@@ -131,6 +131,7 @@ This is the part most likely to surprise you, and it decides how you write the D
 | --- | --- | --- |
 | `[stack.X.volumes]` | `/bosn/<name>`, or an explicit `destination` | owns it — labels, tracks, and may delete it |
 | `[stack.X.mounts]` | the `destination` you give | only references it — never labeled, never deleted |
+| `stack.X.tmpfs = ["/path"]` | each listed container path | RAM-backed and disposable — never creates a Docker volume |
 | *(automatic)* | `/bosn-daemon/heartbeat`, read-only | the daemon's liveness file |
 
 That distinction is the whole reason binds are a separate table: bosn deletes Docker objects

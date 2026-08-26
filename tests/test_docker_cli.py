@@ -15,6 +15,7 @@ from bosn.docker_cli import (
     main,
 )
 from bosn.frontdoor import COMPOSE_COMMANDS, Category, VerbSpec
+from bosn.manifest import load
 from bosn.registry import Registry
 
 
@@ -22,6 +23,26 @@ def test_init_translates_compose_images(tmp_path: Path) -> None:
     compose = tmp_path / "compose.yaml"
     compose.write_text("services:\n  app:\n    image: alpine:3.20\n", encoding="utf-8")
     assert 'image = "alpine:3.20"' in compose_to_manifest(compose)
+
+
+def test_init_preserves_short_form_tmpfs_and_accepts_project_name(tmp_path: Path) -> None:
+    """Issue #115: the generated native stack must keep tmpfs's disposable semantics."""
+    compose = tmp_path / "compose.yaml"
+    compose.write_text(
+        "name: twp-e2e\n"
+        "services:\n"
+        "  mysql:\n"
+        "    image: mysql:8.0.45\n"
+        "    tmpfs: [/var/lib/mysql]\n",
+        encoding="utf-8",
+    )
+
+    generated = compose_to_manifest(compose)
+
+    assert 'tmpfs = ["/var/lib/mysql"]' in generated
+    manifest_path = tmp_path / "bosn.toml"
+    manifest_path.write_text(generated, encoding="utf-8")
+    assert load(manifest_path).stacks["mysql"].tmpfs[0].destination == "/var/lib/mysql"
 
 
 def test_compose_overlay_has_the_complete_label_contract(tmp_path: Path) -> None:

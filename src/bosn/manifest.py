@@ -152,6 +152,41 @@ class MountSpec:
 
 
 @dataclass(frozen=True)
+class TmpfsSpec:
+    """A container-local RAM filesystem rendered through Docker's `--tmpfs` option."""
+
+    value: str
+
+    def __post_init__(self) -> None:
+        if not self.value:
+            raise ManifestError("tmpfs entry must not be empty")
+        raw_destination, separator, raw_options = self.value.partition(":")
+        destination = _validate_destination(raw_destination, what="tmpfs", name=raw_destination)
+        if separator and (not raw_options or any(not item for item in raw_options.split(","))):
+            raise ManifestError(f"tmpfs {self.value!r} has an empty mount option")
+        object.__setattr__(
+            self,
+            "value",
+            f"{destination}:{raw_options}" if separator else destination,
+        )
+
+    @property
+    def destination(self) -> str:
+        return self.value.split(":", 1)[0]
+
+    @property
+    def readwrite(self) -> bool:
+        readwrite = True
+        options = self.value.partition(":")[2]
+        for option in options.split(",") if options else ():
+            if option == "ro":
+                readwrite = False
+            elif option == "rw":
+                readwrite = True
+        return readwrite
+
+
+@dataclass(frozen=True)
 class StackSpec:
     name: str
     dockerfile: str | None = None
@@ -160,6 +195,7 @@ class StackSpec:
     default: bool = False
     volumes: tuple[VolumeSpec, ...] = ()
     mounts: tuple[MountSpec, ...] = ()
+    tmpfs: tuple[TmpfsSpec, ...] = ()
     # Container-level `-e KEY=VALUE` pairs, applied at `docker create` (see converge.py).
     # A dict, not a tuple of a small dataclass like VolumeSpec/MountSpec: there is nothing
     # here to validate per-entry beyond the key shape (`_validate_env_key`), no destination,
@@ -269,7 +305,10 @@ def load(path: Path | str) -> Manifest:
 
 
 def _refuse_duplicate_destinations(
-    stack: str, volumes: tuple[VolumeSpec, ...], mounts: tuple[MountSpec, ...]
+    stack: str,
+    volumes: tuple[VolumeSpec, ...],
+    mounts: tuple[MountSpec, ...],
+    tmpfs: tuple[TmpfsSpec, ...] = (),
 ) -> None:
     """Two mounts at one destination is last-writer-wins in Docker; refuse it here.
 
@@ -287,6 +326,13 @@ def _refuse_duplicate_destinations(
                 f"{previous} and mount {mount.name!r}"
             )
         seen[mount.destination] = f"mount {mount.name!r}"
+    for entry in tmpfs:
+        previous = seen.get(entry.destination)
+        if previous is not None:
+            raise ManifestError(
+                f"[stack.{stack}] mounts {entry.destination!r} twice: {previous} and tmpfs"
+            )
+        seen[entry.destination] = "tmpfs"
     destinations = [v.mount_at() for v in volumes]
     if len(set(destinations)) != len(destinations):
         duplicated = sorted({d for d in destinations if destinations.count(d) > 1})
@@ -320,7 +366,13 @@ def parse(raw: dict, root: Path) -> Manifest:
             )
             for mount_name, mount_body in (body.get("mounts") or {}).items()
         )
-        _refuse_duplicate_destinations(name, volumes, mounts)
+        raw_tmpfs = body["tmpfs"] if "tmpfs" in body else []
+        if not isinstance(raw_tmpfs, list) or not all(
+            isinstance(entry, str) for entry in raw_tmpfs
+        ):
+            raise ManifestError(f"[stack.{name}].tmpfs must be an array of strings")
+        tmpfs = tuple(TmpfsSpec(entry) for entry in raw_tmpfs)
+        _refuse_duplicate_destinations(name, volumes, mounts, tmpfs)
         env: dict[str, str] = {}
         for env_key, env_value in (body.get("env") or {}).items():
             if isinstance(env_value, (dict, list)):
@@ -337,6 +389,7 @@ def parse(raw: dict, root: Path) -> Manifest:
             default=bool(body.get("default", False)),
             volumes=volumes,
             mounts=mounts,
+            tmpfs=tmpfs,
             env=env,
             workdir=str(workdir) if workdir else None,
         )
@@ -385,6 +438,7 @@ def generation_digest(manifest: Manifest, stack: StackSpec) -> str:
         # content identity -- and hashing it would be both enormous and never stable.
         "volumes": sorted((v.name, v.scope, v.mount_at()) for v in stack.volumes),
         "mounts": sorted((m.name, m.source, m.destination, m.readonly) for m in stack.mounts),
+        "tmpfs": sorted(entry.value for entry in stack.tmpfs),
         # `env` IS digested; `workdir` (below `referenced_files`, not in this dict at all)
         # is NOT. Both look like "just another stack attribute" but they land on opposite
         # sides of `docker create` vs `docker exec`, and that is what decides this, not
