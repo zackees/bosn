@@ -22,7 +22,7 @@ from pathlib import Path
 
 from bosn.clock import Clock, SystemClock
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -77,6 +77,15 @@ CREATE TABLE IF NOT EXISTS execution_sessions (
     client_pid     INTEGER NOT NULL,
     client_start   REAL,
     lease_ids      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS volume_creation_intents (
+    name            TEXT PRIMARY KEY,
+    labels          TEXT NOT NULL,
+    stack           TEXT NOT NULL,
+    generation      TEXT NOT NULL,
+    scope           TEXT NOT NULL,
+    workspace       TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS generations (
@@ -151,6 +160,16 @@ class ExecutionSession:
     client_pid: int
     client_start: float | None
     lease_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class VolumeCreationIntent:
+    name: str
+    labels: dict[str, str]
+    stack: str
+    generation: str
+    scope: str
+    workspace: str
 
 
 class RegistryError(RuntimeError):
@@ -297,6 +316,22 @@ class Registry:
             except KeyboardInterrupt:
                 self.conn.execute("ROLLBACK")
                 raise
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+
+        if version < 3:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                self.conn.execute(
+                    "CREATE TABLE IF NOT EXISTS volume_creation_intents ("
+                    "name TEXT PRIMARY KEY, labels TEXT NOT NULL, stack TEXT NOT NULL, "
+                    "generation TEXT NOT NULL, scope TEXT NOT NULL, workspace TEXT NOT NULL)"
+                )
+                self.conn.execute(
+                    "UPDATE meta SET value = ? WHERE key = 'schema_version'", ("3",)
+                )
+                self.conn.execute("COMMIT")
             except Exception:
                 self.conn.execute("ROLLBACK")
                 raise
@@ -835,6 +870,40 @@ class Registry:
                 )
             )
         return sessions
+
+    def save_volume_creation_intent(self, intent: VolumeCreationIntent) -> None:
+        self._exec(
+            "INSERT OR REPLACE INTO volume_creation_intents "
+            "(name, labels, stack, generation, scope, workspace) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                intent.name,
+                json.dumps(intent.labels, sort_keys=True),
+                intent.stack,
+                intent.generation,
+                intent.scope,
+                intent.workspace,
+            ),
+        )
+
+    def volume_creation_intent(self, name: str) -> VolumeCreationIntent | None:
+        row = self._exec(
+            "SELECT * FROM volume_creation_intents WHERE name = ?", (name,)
+        ).fetchone()
+        if row is None:
+            return None
+        raw_labels = json.loads(row["labels"])
+        if not isinstance(raw_labels, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in raw_labels.items()
+        ):
+            raise RegistryError(f"volume creation intent {name!r} has invalid labels")
+        return VolumeCreationIntent(
+            name=row["name"], labels=raw_labels, stack=row["stack"],
+            generation=row["generation"], scope=row["scope"], workspace=row["workspace"]
+        )
+
+    def delete_volume_creation_intent(self, name: str) -> None:
+        self._exec("DELETE FROM volume_creation_intents WHERE name = ?", (name,))
 
     def prune_lease(self, lease_id: str) -> None:
         """Delete a confirmed-dead lease found during maintenance.

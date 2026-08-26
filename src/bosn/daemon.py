@@ -942,6 +942,28 @@ class Daemon:
         return {"ok": True, "pong": True, "pid": os.getpid(), "version": __version__}
 
     def _verb_status(self, _request: dict[str, Any]) -> dict[str, Any]:
+        from bosn.resources import process_alive
+
+        with self._execution_lock:
+            sessions = []
+            for session, owner in self._execution_owners.items():
+                alive = process_alive(*owner)
+                sessions.append(
+                    {
+                        "id": session,
+                        "container_id": self._execution_containers.get(session),
+                        "engine": self._execution_engines.get(session),
+                        "client_pid": owner[0],
+                        "client_start": owner[1],
+                        "client_alive": alive,
+                        "lease_ids": list(self._execution_sessions.get(session, ())),
+                        "blocking_reason": (
+                            "client is live"
+                            if alive
+                            else "client is dead; awaiting safe exact-container reap"
+                        ),
+                    }
+                )
         return {
             "ok": True,
             "pid": os.getpid(),
@@ -951,6 +973,7 @@ class Daemon:
             "uptime_seconds": time.time() - self.started_at,
             "idle_seconds": self.idle_seconds(),
             "resources": len(self.registry.list_resources()),
+            "execution_sessions": sessions,
             "config": self.config.report() if self.config is not None else None,
         }
 

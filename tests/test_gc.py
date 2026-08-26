@@ -178,6 +178,55 @@ def test_a_resource_with_incomplete_labels_is_never_removed(
     assert result.skipped_unproven == ["partial"]
 
 
+def test_status_names_unproven_resources_and_execution_sessions(
+    registry: Registry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#119/#120: neither protected state may be hidden behind aggregate counts."""
+    from bosn.registry import ExecutionSession
+
+    registry.save_execution_session(
+        ExecutionSession("session", "immutable-id", "docker", 4242, 9.0, ("lease",))
+    )
+    engine = FakeEngine({})
+    monkeypatch.setattr(gc_mod.resources, "process_alive", lambda *_args: False)
+    from bosn.resources import DiscoveredResource, ScanResult
+
+    monkeypatch.setattr(
+        gc_mod.ResourceScanner,
+        "scan",
+        lambda *_args, **_kwargs: ScanResult(
+            unlabeled=[
+                DiscoveredResource(
+                    "volume", "partial", {labels.REGISTRY: registry.registry_id}
+                )
+            ],
+            scanned_kinds={"volume"},
+        ),
+    )
+    report = status(registry, engine)  # type: ignore[arg-type]
+
+    assert report["unproven_resources"] == [
+        {
+            "kind": "volume",
+            "name": "partial",
+            "registry_id": registry.registry_id,
+            "reason": "incomplete ownership labels; protected from automatic recovery",
+        }
+    ]
+    assert report["execution_sessions"] == [
+        {
+            "id": "session",
+            "container_id": "immutable-id",
+            "engine": "docker",
+            "client_pid": 4242,
+            "client_start": 9.0,
+            "client_alive": False,
+            "lease_ids": ["lease"],
+            "blocking_reason": "client is dead; awaiting safe exact-container reap",
+        }
+    ]
+
+
 def test_gc_never_issues_a_system_prune(registry: Registry, clock: FakeClock) -> None:
     add(registry, "ours")
     engine = FakeEngine({"ours": label_dict(registry=registry.registry_id)})

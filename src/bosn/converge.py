@@ -468,7 +468,11 @@ class Converger:
                 family=stack.family,
             )
             created.append(name)
+            expected_labels = self._resource_labels(
+                stack, "volume", digest, volume.scope, workspace
+            )
             if self.engine.run(["volume", "inspect", name]).ok:
+                self._recover_interrupted_volume(name, expected_labels)
                 self._reconcile_reused_resource(
                     stack,
                     kind="volume",
@@ -479,14 +483,67 @@ class Converger:
                     workspace=workspace,
                 )
                 continue
-            label_args = self._resource_labels(
-                stack, "volume", digest, volume.scope, workspace
-            ).to_docker_args()
+            # Record the exact intended identity before Docker creation.  If the process
+            # dies after Docker created a partially labelled volume but before registry
+            # registration, a later `ensure` can prove and repair this one object (#120).
+            from bosn.registry import VolumeCreationIntent
+
+            self.registry.save_volume_creation_intent(
+                VolumeCreationIntent(
+                    name, expected_labels.to_dict(), stack.name, digest, volume.scope, workspace
+                )
+            )
+            label_args = expected_labels.to_docker_args()
             result = self.engine.run(["volume", "create", *label_args, name])
             if not result.ok:
                 raise EngineError(f"creating volume {name} failed: {result.stderr}")
             self._register(stack, "volume", name, digest, volume.scope, workspace)
+            self.registry.delete_volume_creation_intent(name)
         return created
+
+    def _recover_interrupted_volume(self, name: str, expected: labels.ResourceLabels) -> None:
+        """Repair only an exactly recorded, partially-labelled Bosn volume.
+
+        The durable intent makes the generated name insufficient on its own: the existing
+        volume must also retain our exact registry label and every surviving Bosn label
+        must agree with the pre-recorded contract.  Any ambiguity stays protected.
+        """
+        intent = self.registry.volume_creation_intent(name)
+        if intent is None:
+            return
+        # `created` is deliberately the resource's creation timestamp, not this retry's
+        # time. Compare the semantic identity only, then restore the original complete
+        # contract from the durable intent.
+        intent_labels = labels.ResourceLabels.from_dict(intent.labels)
+        if (
+            intent_labels.registry != expected.registry
+            or intent_labels.kind != expected.kind
+            or intent_labels.stack != expected.stack
+            or intent_labels.generation != expected.generation
+            or intent_labels.scope != expected.scope
+            or intent_labels.workspace != expected.workspace
+        ):
+            raise EngineError(f"volume {name!r} has a conflicting interrupted creation intent")
+        raw = ResourceScanner(self.engine).inspect_labels("volume", name)
+        if labels.is_owned_by(raw, self.registry.registry_id):
+            self.registry.delete_volume_creation_intent(name)
+            return
+        bosn_labels = {key: value for key, value in raw.items() if key.startswith(labels.NAMESPACE)}
+        if (
+            raw.get(labels.REGISTRY) != self.registry.registry_id
+            or not bosn_labels
+            or any(intent.labels.get(key) != value for key, value in bosn_labels.items())
+        ):
+            raise EngineError(
+                f"existing volume {name!r} has incomplete or contradictory ownership labels; "
+                "refusing unsafe recovery"
+            )
+        from bosn.resources import DiscoveredResource, recreate_volume_with_labels
+
+        recreate_volume_with_labels(
+            self.engine, DiscoveredResource("volume", name, raw), intent_labels
+        )
+        self.registry.delete_volume_creation_intent(name)
 
     def _reconcile_reused_resource(
         self,

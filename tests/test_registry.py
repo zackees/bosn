@@ -314,7 +314,7 @@ def test_v1_migration_deduplicates_engine_objects_and_preserves_leases(tmp_path:
         assert resources[0].id == "new"
         assert resources[0].created_at == 1
         assert migrated.leases_for("new")[0].id == "lease-old"
-        assert migrated.meta("schema_version") == "2"
+        assert migrated.meta("schema_version") == "3"
         assert migrated.generation_superseded_at("sha256:g", stack="test", workspace="/w") is None
         index_columns = migrated.conn.execute(
             "PRAGMA index_info(idx_resources_engine_identity)"

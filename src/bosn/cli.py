@@ -830,6 +830,7 @@ def cmd_cancel(opts: Options) -> int:
 
 
 def cmd_status(opts: Options) -> int:
+    from bosn import daemon as daemon_mod
     from bosn.config import ConfigError
     from bosn.config import load as load_config
     from bosn.gc import status
@@ -839,6 +840,30 @@ def cmd_status(opts: Options) -> int:
     db_path = (state_dir / "registry.sqlite3") if state_dir else default_db_path()
     if not db_path.exists():
         print(json.dumps({"registered": 0, "storage": "not initialized"}, indent=2))
+        return 0
+    # A foreground execution session is a small daemon-owned control-plane record.  Report
+    # it before the direct engine inventory below: on a loaded Docker Desktop host that
+    # inventory can be slow, while the session is the exact fact an operator needs to
+    # understand why an otherwise terminal-only `jobs` list still blocks the stack (#119).
+    # Do not autostart merely to optimize a read-only status command.
+    try:
+        daemon_status = daemon_mod.request("status", state_dir, autostart=False)
+    except (daemon_mod.DaemonError, ipc.TransportError):
+        daemon_status = None
+    if daemon_status and daemon_status.get("execution_sessions"):
+        print(
+            json.dumps(
+                {
+                    "registry_id": daemon_status.get("registry_id"),
+                    "execution_sessions": daemon_status["execution_sessions"],
+                    "next": (
+                        "a live session remains protected; if its client is dead, retry "
+                        "after Bosn safely reaps its exact container"
+                    ),
+                },
+                indent=2,
+            )
+        )
         return 0
     try:
         with Registry(db_path, read_only=True) as registry:
