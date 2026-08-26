@@ -1613,13 +1613,16 @@ def stop(state_dir: Path | None = None, *, timeout: float = 10.0) -> bool:
     if not is_serving(state_dir):
         return False
     try:
-        ipc.send_request(
+        reply = ipc.send_request(
             port_for(state_dir),
             {"verb": "shutdown", "auth": _secret(state_dir), "version": __version__},
             timeout=timeout,
         )
     except ipc.TransportError:
         pass
+    else:
+        if not reply.get("ok"):
+            raise DaemonError(str(reply.get("error") or "daemon refused shutdown"))
     deadline = time.time() + timeout
     while time.time() < deadline:
         if not is_serving(state_dir):

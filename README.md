@@ -473,7 +473,7 @@ bosn doctor                  # engine reachability, registry integrity, recovery
 bosn adopt --legacy <family> # import pre-bosn volumes; --yes to apply
 
 bosn __daemon --autostart    # install the login launcher (also --no-autostart)
-bosn __daemon --stop         # stop the daemon — needed after upgrading bosn
+bosn daemon-stop             # stop the daemon — needed after upgrading bosn
 ```
 
 `status`, `tasks`, and `doctor` read the sqlite registry directly, so they keep working when

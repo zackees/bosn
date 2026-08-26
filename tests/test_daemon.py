@@ -1942,6 +1942,21 @@ def test_stop_returns_false_when_nothing_is_running(tmp_path: Path) -> None:
     assert daemon_mod.stop(tmp_path) is False
 
 
+def test_stop_raises_immediately_when_daemon_refuses_shutdown(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(daemon_mod, "is_serving", lambda *a, **k: True)
+    monkeypatch.setattr(
+        ipc,
+        "send_request",
+        lambda *a, **k: {
+            "ok": False,
+            "error": "daemon has active execution session(s); wait for run or shell to exit",
+        },
+    )
+
+    with pytest.raises(DaemonError, match="active execution session"):
+        daemon_mod.stop(tmp_path, timeout=0.0)
+
+
 def test_detach_does_not_depend_on_the_running_process_broker() -> None:
     """Detachment must not require a broker daemon or a bundled trampoline binary.
 

@@ -44,6 +44,13 @@ def test_every_designed_verb_is_registered() -> None:
     assert designed <= set(cli.VERBS)
 
 
+def test_daemon_stop_is_a_public_help_visible_verb() -> None:
+    help_text = cli.build_parser().format_help()
+
+    assert "daemon-stop" in cli.VERBS
+    assert "daemon-stop" in help_text
+
+
 def test_attach_and_cancel_are_no_longer_placeholders() -> None:
     """Both landed with daemon-owned jobs; `attach`'s stale 'phase 6' label went with them."""
     assert cli.VERBS["attach"][1] == "implemented"
@@ -666,6 +673,26 @@ def test_a_daemon_still_draining_is_not_reported_as_absent(tmp_path, monkeypatch
     err = capsys.readouterr().err
     assert "still shutting down" in err
     assert "bosn jobs" in err
+
+
+def test_daemon_stop_surfaces_an_active_session_refusal(tmp_path, monkeypatch, capsys) -> None:
+    from bosn import daemon as daemon_mod
+
+    monkeypatch.setattr(daemon_mod, "is_serving", lambda *a, **k: True)
+    monkeypatch.setattr(
+        daemon_mod,
+        "stop",
+        lambda *a, **k: (_ for _ in ()).throw(
+            daemon_mod.DaemonError(
+                "daemon has active execution session(s); wait for run or shell to exit"
+            )
+        ),
+    )
+
+    assert cli.main(["--state-dir", str(tmp_path), "daemon-stop"]) == 1
+    err = capsys.readouterr().err
+    assert "active execution session" in err
+    assert "still shutting down" not in err
 
 
 # -- init: Compose migration moved under `bosn` (#46) -------------------------------------

@@ -143,6 +143,7 @@ VERBS: dict[str, tuple[str, str]] = {
     "ensure": ("pre-warm a stack without running a command", "implemented"),
     "adopt": ("recover labeled resources into this registry", "implemented"),
     "doctor": ("engine health and reachability", "implemented"),
+    "daemon-stop": ("stop the running daemon (needed after upgrades)", "implemented"),
     "init": ("translate a Compose file into bosn.toml (alias: bosn-docker init)", "implemented"),
 }
 
@@ -244,6 +245,8 @@ def build_parser(*, json_errors: bool = False) -> argparse.ArgumentParser:
                 help="actually reclaim. There is deliberately no --force: automatic "
                 "deletion always requires complete ownership proof",
             )
+        if verb == "daemon-stop":
+            sub.set_defaults(stop=True)
 
     daemon_parser = subparsers.add_parser(DAEMON_VERB, help=argparse.SUPPRESS)
     daemon_parser.add_argument("--port", type=int, default=None)
@@ -426,7 +429,11 @@ def cmd_daemon(opts: Options) -> int:
         # reporting that as "no daemon was running" would be a plainly wrong answer to the
         # question the user asked.
         was_running = daemon_mod.is_serving(state_dir)
-        stopped = daemon_mod.stop(state_dir, timeout=DAEMON_STOP_TIMEOUT)
+        try:
+            stopped = daemon_mod.stop(state_dir, timeout=DAEMON_STOP_TIMEOUT)
+        except daemon_mod.DaemonError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
         if stopped:
             print("daemon stopped")
         elif was_running:
@@ -1296,6 +1303,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     handlers: dict[str, Callable[[Options], int]] = {
         DAEMON_VERB: cmd_daemon,
+        "daemon-stop": cmd_daemon,
         "doctor": cmd_doctor,
         "jobs": cmd_jobs,
         "attach": cmd_attach,
