@@ -196,9 +196,7 @@ def test_status_names_unproven_resources_and_execution_sessions(
         "scan",
         lambda *_args, **_kwargs: ScanResult(
             unlabeled=[
-                DiscoveredResource(
-                    "volume", "partial", {labels.REGISTRY: registry.registry_id}
-                )
+                DiscoveredResource("volume", "partial", {labels.REGISTRY: registry.registry_id})
             ],
             scanned_kinds={"volume"},
         ),

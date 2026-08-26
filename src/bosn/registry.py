@@ -328,10 +328,11 @@ class Registry:
                     "name TEXT PRIMARY KEY, labels TEXT NOT NULL, stack TEXT NOT NULL, "
                     "generation TEXT NOT NULL, scope TEXT NOT NULL, workspace TEXT NOT NULL)"
                 )
-                self.conn.execute(
-                    "UPDATE meta SET value = ? WHERE key = 'schema_version'", ("3",)
-                )
+                self.conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", ("3",))
                 self.conn.execute("COMMIT")
+            except KeyboardInterrupt:
+                self.conn.execute("ROLLBACK")
+                raise
             except Exception:
                 self.conn.execute("ROLLBACK")
                 raise
@@ -886,20 +887,21 @@ class Registry:
         )
 
     def volume_creation_intent(self, name: str) -> VolumeCreationIntent | None:
-        row = self._exec(
-            "SELECT * FROM volume_creation_intents WHERE name = ?", (name,)
-        ).fetchone()
+        row = self._exec("SELECT * FROM volume_creation_intents WHERE name = ?", (name,)).fetchone()
         if row is None:
             return None
         raw_labels = json.loads(row["labels"])
         if not isinstance(raw_labels, dict) or not all(
-            isinstance(key, str) and isinstance(value, str)
-            for key, value in raw_labels.items()
+            isinstance(key, str) and isinstance(value, str) for key, value in raw_labels.items()
         ):
             raise RegistryError(f"volume creation intent {name!r} has invalid labels")
         return VolumeCreationIntent(
-            name=row["name"], labels=raw_labels, stack=row["stack"],
-            generation=row["generation"], scope=row["scope"], workspace=row["workspace"]
+            name=row["name"],
+            labels=raw_labels,
+            stack=row["stack"],
+            generation=row["generation"],
+            scope=row["scope"],
+            workspace=row["workspace"],
         )
 
     def delete_volume_creation_intent(self, name: str) -> None:
