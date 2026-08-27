@@ -104,6 +104,7 @@ def test_status_surfaces_a_foreground_session_without_waiting_for_engine_scan(
         "request",
         lambda *_args, **_kwargs: {
             "registry_id": "registry",
+            "resources": 3,
             "execution_sessions": [
                 {"id": "session", "client_alive": False, "blocking_reason": "awaiting reap"}
             ],
@@ -113,7 +114,43 @@ def test_status_surfaces_a_foreground_session_without_waiting_for_engine_scan(
 
     assert cli.main(["--state-dir", str(state), "status", "--json"]) == 0
     report = json.loads(capsys.readouterr().out)
+    assert report["mode"] == "online"
+    assert report["registered"] == 3
     assert report["execution_sessions"][0]["id"] == "session"
+
+
+def test_status_returns_a_healthy_empty_session_report_without_engine_inventory(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """#119: an idle healthy daemon is a complete status answer, not a Docker scan."""
+    from bosn import daemon
+
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "registry.sqlite3").touch()
+    monkeypatch.setattr(
+        daemon,
+        "request",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "registry_id": "registry",
+            "resources": 0,
+            "execution_sessions": [],
+            "pid": 42,
+            "version": "test",
+        },
+    )
+    monkeypatch.setattr(cli, "Engine", lambda *_args: (_ for _ in ()).throw(AssertionError()))
+
+    assert cli.main(["--state-dir", str(state), "status", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "mode": "online",
+        "registry_id": "registry",
+        "registered": 0,
+        "execution_sessions": [],
+        "daemon": {"reachable": True, "pid": 42, "version": "test"},
+        "next": "no foreground execution session is blocking the daemon",
+    }
 
 
 def test_status_uses_persisted_session_proof_when_daemon_control_stream_is_lost(
@@ -180,8 +217,34 @@ def test_status_is_bounded_when_a_daemon_stream_is_lost_without_a_session(
     assert cli.main(["--state-dir", str(state), "status", "--json"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["mode"] == "degraded"
+    assert report["registered"] == 0
     assert report["execution_sessions"] == []
-    assert "Restart the daemon" in report["next"]
+    assert "Restore or restart Bosn" in report["next"]
+
+
+def test_status_returns_an_offline_empty_session_report_without_engine_inventory(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """#119: no daemon is still a bounded registry report, never an engine scan."""
+    from bosn import daemon
+    from bosn.registry import Registry
+
+    state = tmp_path / "state"
+    with Registry(state / "registry.sqlite3"):
+        pass
+    monkeypatch.setattr(
+        daemon,
+        "request",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(daemon.DaemonError("no daemon")),
+    )
+    monkeypatch.setattr(cli, "Engine", lambda *_args: (_ for _ in ()).throw(AssertionError()))
+
+    assert cli.main(["--state-dir", str(state), "status", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["mode"] == "offline"
+    assert report["registered"] == 0
+    assert report["execution_sessions"] == []
+    assert report["daemon"]["reachable"] is False
 
 
 def test_tasks_json_reports_unregistered_readiness(tmp_path, capsys) -> None:

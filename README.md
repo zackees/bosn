@@ -464,11 +464,11 @@ bosn shell                   # interactive session in the persistent container
 bosn ensure                  # converge and register without running anything
 
 bosn tasks --json            # tasks, stacks, content digests, registration state
-bosn status                  # tiers, leases, bytes vs ceiling, foreign registries
+bosn status --json           # bounded daemon/registry state; never scans the engine
 bosn jobs / bosn attach <j>  # daemon-owned builds that survive a killed CLI
 bosn cancel <j>              # stop a build you no longer want
 bosn done                    # this workspace is finished; its caches become collectable
-bosn gc                      # dry-run by default; --apply to reclaim (there is no --force)
+bosn gc --dry-run --json     # rich engine/storage inventory; --apply reclaims (no --force)
 bosn doctor                  # engine reachability, registry integrity, recovery commands
 bosn adopt --legacy <family> # import pre-bosn volumes; --yes to apply
 
@@ -476,12 +476,13 @@ bosn __daemon --autostart    # install the login launcher (also --no-autostart)
 bosn daemon-stop             # stop the daemon — needed after upgrading bosn
 ```
 
-`tasks` and `doctor` read the SQLite registry directly. `status` first makes a short, read-only
-daemon query so it can show live foreground ownership without an engine scan. If that control
-stream is unavailable and the registry contains a persisted foreground session, `status --json`
-returns a bounded `mode: "degraded"` report from the registry instead of falling through to a
-slow Docker inventory. `gc` and `jobs` are read-only but go through the daemon and fail closed
-if it is unreachable.
+`tasks` and `doctor` read the SQLite registry directly. `status --json` is always a short,
+control-plane/registry-only report: it returns stable `mode`, `registry_id`, `registered`,
+`execution_sessions`, and `daemon` fields without touching the container engine. A healthy
+daemon returns `mode: "online"`; an absent daemon returns `mode: "offline"`; and a lost control
+stream returns `mode: "degraded"` with persisted session diagnostics. For the rich engine,
+ownership, and storage inventory, use `bosn gc --dry-run --json` instead. `gc` and `jobs` are
+read-only but go through the daemon and fail closed if it is unreachable.
 
 When ordinary `status` can reach the daemon and says the client is dead, run `bosn daemon-stop`:
 Bosn first proves the owner is dead, then removes only that session's exact immutable container
