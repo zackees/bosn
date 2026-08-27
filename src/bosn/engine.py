@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -46,6 +47,48 @@ class EngineInfo:
     server_version: str | None = None
     clock_skew_seconds: float | None = None
     detail: str | None = None
+    failure_category: str | None = None
+    desktop_evidence: DesktopEvidence | None = None
+
+
+@dataclass(frozen=True)
+class DesktopEvidence:
+    """Best-effort native Windows observations for a Docker Desktop wedge."""
+
+    desktop_running: bool | None
+    wsl_distro_running: bool | None
+
+
+def _read_only_command(args: list[str]) -> str | None:
+    try:
+        completed = subprocess.run(args, capture_output=True, text=True, timeout=3, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return f"{completed.stdout}\n{completed.stderr}"
+
+
+def docker_desktop_evidence() -> DesktopEvidence:
+    """Read-only, bounded Windows support evidence for an HTTP-5xx server probe."""
+    if sys.platform != "win32":
+        return DesktopEvidence(desktop_running=None, wsl_distro_running=None)
+    desktop = _read_only_command(
+        ["tasklist", "/FI", "IMAGENAME eq Docker Desktop.exe", "/FO", "CSV", "/NH"]
+    )
+    wsl = _read_only_command(["wsl.exe", "--list", "--verbose"])
+    return DesktopEvidence(
+        desktop_running=("Docker Desktop.exe" in desktop) if desktop is not None else None,
+        wsl_distro_running=("docker-desktop" in wsl and "Running" in wsl)
+        if wsl is not None
+        else None,
+    )
+
+
+def _server_failure_category(detail: str, evidence: DesktopEvidence) -> str:
+    lowered = detail.lower()
+    http_5xx = ("http" in lowered and "500" in detail) or "500 internal server error" in lowered
+    if http_5xx and evidence.desktop_running is True and evidence.wsl_distro_running is True:
+        return "docker_desktop_wedged"
+    return "server_error"
 
 
 def _engine_timestamp(value: str) -> float | None:
@@ -270,6 +313,7 @@ class Engine:
                 binary=self.binary,
                 reachable=False,
                 detail=f"{self.binary!r} is not on PATH",
+                failure_category="binary_unavailable",
             )
         try:
             client = self.run(["version", "--format", "{{.Client.Version}}"])
@@ -277,13 +321,23 @@ class Engine:
         except KeyboardInterrupt:
             raise
         except Exception as exc:  # noqa: BLE001 - doctor must never crash
-            return EngineInfo(binary=self.binary, reachable=False, detail=str(exc))
+            detail = str(exc)
+            return EngineInfo(
+                binary=self.binary,
+                reachable=False,
+                detail=detail,
+                failure_category="deadline" if "deadline" in detail else "probe_error",
+            )
         if not server.ok:
+            detail = server.stderr or server.stdout or "engine daemon unreachable"
+            evidence = docker_desktop_evidence()
             return EngineInfo(
                 binary=self.binary,
                 reachable=False,
                 client_version=client.stdout or None,
-                detail=server.stderr or server.stdout or "engine daemon unreachable",
+                detail=detail,
+                failure_category=_server_failure_category(detail, evidence),
+                desktop_evidence=evidence,
             )
         # ``docker info`` exposes the daemon's own nanosecond wall clock. Sampling the
         # client clock on both sides and comparing with the midpoint removes ordinary CLI

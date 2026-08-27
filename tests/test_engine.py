@@ -7,7 +7,7 @@ import sys
 import pytest
 
 from bosn import engine as engine_mod
-from bosn.engine import Engine, EngineError, EngineResult
+from bosn.engine import DesktopEvidence, Engine, EngineError, EngineResult
 
 
 class FakeEngine(Engine):
@@ -69,6 +69,69 @@ def test_engine_info_stays_reachable_when_clock_probe_fails(monkeypatch) -> None
 
     assert info.reachable
     assert info.clock_skew_seconds is None
+
+
+def test_engine_info_classifies_a_windows_desktop_server_500_only_with_supporting_evidence(
+    monkeypatch,
+) -> None:
+    """#136: a live client plus Desktop/WSL evidence is not generic unreachable.
+
+    The raw CLI response remains operator evidence.  A server HTTP 5xx alone is not
+    enough to claim a Docker Desktop wedge, because a remote/context engine can emit
+    the same text without a local Desktop recovery path.
+    """
+
+    class WedgeEngine(Engine):
+        def available(self) -> bool:
+            return True
+
+        def run(self, args, **_kwargs):
+            if args == ["version", "--format", "{{.Client.Version}}"]:
+                return EngineResult(0, "28.5.1", "")
+            if args == ["version", "--format", "{{.Server.Version}}"]:
+                return EngineResult(
+                    1,
+                    "",
+                    "request returned 500 Internal Server Error for API route and version",
+                )
+            raise AssertionError(f"unexpected engine call: {args}")
+
+    monkeypatch.setattr(
+        engine_mod,
+        "docker_desktop_evidence",
+        lambda: DesktopEvidence(desktop_running=True, wsl_distro_running=True),
+    )
+    info = WedgeEngine().info()
+
+    assert not info.reachable
+    assert info.failure_category == "docker_desktop_wedged"
+    assert info.client_version == "28.5.1"
+    assert "500 Internal Server Error" in (info.detail or "")
+    assert info.desktop_evidence == DesktopEvidence(desktop_running=True, wsl_distro_running=True)
+
+
+def test_engine_info_keeps_server_500_generic_without_windows_desktop_evidence(monkeypatch) -> None:
+    class ServerErrorEngine(Engine):
+        def available(self) -> bool:
+            return True
+
+        def run(self, args, **_kwargs):
+            if args == ["version", "--format", "{{.Client.Version}}"]:
+                return EngineResult(0, "28.5.1", "")
+            if args == ["version", "--format", "{{.Server.Version}}"]:
+                return EngineResult(1, "", "request returned 500 Internal Server Error")
+            raise AssertionError(f"unexpected engine call: {args}")
+
+    monkeypatch.setattr(
+        engine_mod,
+        "docker_desktop_evidence",
+        lambda: DesktopEvidence(desktop_running=None, wsl_distro_running=None),
+    )
+    info = ServerErrorEngine().info()
+
+    assert not info.reachable
+    assert info.failure_category == "server_error"
+    assert info.desktop_evidence == DesktopEvidence(desktop_running=None, wsl_distro_running=None)
 
 
 def test_engine_execute_relays_stdout_and_stderr_while_running(capfd) -> None:

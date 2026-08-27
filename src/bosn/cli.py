@@ -12,6 +12,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import sqlite3
 import sys
 from collections.abc import Callable, Sequence
@@ -332,6 +333,9 @@ def cmd_doctor(opts: Options) -> int:
         deadline = None
         registry_id = None
         integrity = "not initialized"
+        local_resources = None
+        local_leases = None
+        local_sessions = None
     else:
         # A corrupt registry must still produce a diagnosis, never a traceback: doctor is
         # the tool the user reaches for precisely when the database is damaged, and the
@@ -342,10 +346,16 @@ def cmd_doctor(opts: Options) -> int:
                 deadline = registry.meta("maintenance.next_deadline")
                 registry_id = registry.registry_id
                 integrity = registry.integrity_check()
+                local_resources = len(registry.list_resources())
+                local_leases = len(registry.all_leases())
+                local_sessions = len(registry.execution_sessions())
         except sqlite3.DatabaseError as exc:
             deadline = None
             registry_id = None
             integrity = f"unreadable: {exc}"
+            local_resources = None
+            local_leases = None
+            local_sessions = None
     print(f"scheduler manifest installed: {autostart.manifest_installed()}")
     print(f"scheduler next deadline: {deadline or '-'}")
     print(f"registry integrity: {integrity}")
@@ -380,6 +390,44 @@ def cmd_doctor(opts: Options) -> int:
         )
     if not info.reachable:
         print(f"diagnosis:      {info.detail}", file=sys.stderr)
+        if info.failure_category == "docker_desktop_wedged":
+            from bosn.accounting import configured_desktop_vhdx_allocation
+
+            allocation = configured_desktop_vhdx_allocation()
+            print("engine resource inventory: unavailable")
+            if info.desktop_evidence is not None:
+                desktop = "running" if info.desktop_evidence.desktop_running else "unavailable"
+                wsl = "running" if info.desktop_evidence.wsl_distro_running else "unavailable"
+                print(f"Docker Desktop observation: {desktop}")
+                print(f"docker-desktop WSL observation: {wsl}")
+            print(
+                "local registered resources: "
+                f"{local_resources if local_resources is not None else 'unavailable'}"
+            )
+            print(f"local leases: {local_leases if local_leases is not None else 'unavailable'}")
+            print(
+                "local execution sessions: "
+                f"{local_sessions if local_sessions is not None else 'unavailable'}"
+            )
+            if allocation is not None:
+                print(
+                    "configured Docker Desktop VHDX: "
+                    f"{allocation.path} ({allocation.allocated_bytes / 1024**3:.1f} GiB "
+                    "allocated; allocation only)"
+                )
+                try:
+                    volume = shutil.disk_usage(allocation.path)
+                except OSError:
+                    print("configured VHDX volume free space: unavailable")
+                else:
+                    print(f"configured VHDX volume free space: {volume.free / 1024**3:.1f} GiB")
+            print(
+                "Docker Desktop engine appears wedged; restart Docker Desktop manually, "
+                "then rerun `bosn doctor`. "
+                "Bosn will not restart Docker or alter WSL, the VHDX, registry, "
+                "or engine resources.",
+                file=sys.stderr,
+            )
         return 1
     from bosn.resources import ResourceScanner
 

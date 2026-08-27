@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import json
 
-from bosn.accounting import StorageInventory, desktop_vhdx, engine_storage_path, resource_bytes
+from bosn.accounting import (
+    StorageInventory,
+    configured_desktop_vhdx_allocation,
+    desktop_vhdx,
+    engine_storage_path,
+    resource_bytes,
+)
 from bosn.engine import EngineResult
 from bosn.registry import Resource
 
@@ -192,3 +198,19 @@ def test_desktop_vhdx_finds_docker_data_disk_in_configured_directory(tmp_path) -
     docker_data.write_bytes(b"xx")
 
     assert desktop_vhdx(tmp_path) == docker_data
+
+
+def test_configured_vhdx_allocation_reports_a_file_not_reclaimable_slack(tmp_path) -> None:
+    settings = tmp_path / "settings-store.json"
+    disk = tmp_path / "wsl" / "disk"
+    disk.mkdir(parents=True)
+    vhdx = disk / "docker_data.vhdx"
+    vhdx.write_bytes(b"allocated")
+    settings.write_text(json.dumps({"CustomWslDistroDir": str(tmp_path / "wsl")}), encoding="utf-8")
+
+    allocation = configured_desktop_vhdx_allocation(settings)
+
+    assert allocation is not None
+    assert allocation.path == vhdx
+    assert allocation.allocated_bytes == len(b"allocated")
+    assert not hasattr(allocation, "reclaimable_bytes")
