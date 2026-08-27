@@ -376,9 +376,11 @@ def test_inflight_non_streaming_request_pins_daemon(tmp_path: Path) -> None:
         original_send = ipc.send_response
         ipc.read_request = lambda _conn: {"auth": daemon.secret, "verb": "gc"}  # type: ignore[assignment]
         daemon.dispatch = lambda *_args: {"ok": True}  # type: ignore[method-assign]
+
         def send(_conn: object, response: dict[str, object]) -> None:
             assert not daemon.should_retire(), "watchdog must not retire during response"
             sent.append(response)
+
         ipc.send_response = send  # type: ignore[assignment]
         handler.handle()
         ipc.read_request = original_read  # type: ignore[assignment]
