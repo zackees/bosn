@@ -365,6 +365,17 @@ def test_active_execution_session_pins_daemon_and_refuses_shutdown(tmp_path: Pat
         daemon.registry.close()
 
 
+def test_inflight_non_streaming_request_pins_daemon(tmp_path: Path) -> None:
+    daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=0)
+    try:
+        daemon.begin_request()
+        assert not daemon.should_retire()
+        daemon.finish_request()
+        assert daemon.should_retire()
+    finally:
+        daemon.registry.close()
+
+
 # -- Compose project leases (#48) -------------------------------------------
 
 

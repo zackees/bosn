@@ -298,7 +298,11 @@ class _Handler(socketserver.StreamRequestHandler):
             if verb in STREAMING_VERBS:
                 self._stream(daemon_ref, verb, request)
                 return
-            response = daemon_ref.dispatch(verb, request)
+            daemon_ref.begin_request()
+            try:
+                response = daemon_ref.dispatch(verb, request)
+            finally:
+                daemon_ref.finish_request()
         except KeyboardInterrupt:
             # Ctrl-C on the daemon means shut down, not "this one request failed".
             daemon_ref.request_stop()
@@ -403,6 +407,7 @@ class Daemon:
         self._execution_owners: dict[str, tuple[int, float | None]] = {}
         self._execution_engines: dict[str, str] = {}
         self._execution_lock = threading.RLock()
+        self._active_requests = 0
         self._stopping = False
         self.secret = secrets.token_urlsafe(32)
         self.registry = Registry(self.state_dir / "registry.sqlite3", clock=self.clock)
@@ -502,6 +507,14 @@ class Daemon:
         self.last_activity = self.clock.now()
         self.heartbeat_at = self.last_activity
 
+    def begin_request(self) -> None:
+        with self._execution_lock:
+            self._active_requests += 1
+
+    def finish_request(self) -> None:
+        with self._execution_lock:
+            self._active_requests -= 1
+
     def idle_seconds(self) -> float:
         return self.clock.now() - self.last_activity
 
@@ -516,7 +529,8 @@ class Daemon:
         """
         with self._execution_lock:
             sessions_active = bool(self._execution_sessions)
-        if self.jobs.active_count() > 0 or sessions_active:
+            requests_active = self._active_requests > 0
+        if self.jobs.active_count() > 0 or sessions_active or requests_active:
             return False
         return self.idle_seconds() >= self.idle_retire_seconds
 
