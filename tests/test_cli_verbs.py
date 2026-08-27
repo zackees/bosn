@@ -1047,9 +1047,12 @@ def test_doctor_reports_a_desktop_wedge_with_local_read_only_inventory(
     assert "Docker Desktop engine appears wedged" in captured.err
     assert "restart Docker Desktop" in captured.err
     assert "engine resource inventory: unavailable" in captured.out
+    assert "Docker Desktop observation: running" in captured.out
+    assert "docker-desktop WSL observation: running" in captured.out
     assert "local registered resources: 1" in captured.out
     assert "local leases: 1" in captured.out
     assert "382.0 GiB allocated" in captured.out
+    assert "configured VHDX volume free space:" in captured.out
     assert "prune" not in captured.err.lower()
     assert "adopt" not in captured.err.lower()
     assert "compact" not in captured.err.lower()

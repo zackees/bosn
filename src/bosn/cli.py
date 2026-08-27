@@ -12,6 +12,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import sqlite3
 import sys
 from collections.abc import Callable, Sequence
@@ -394,13 +395,19 @@ def cmd_doctor(opts: Options) -> int:
 
             allocation = configured_desktop_vhdx_allocation()
             print("engine resource inventory: unavailable")
+            if info.desktop_evidence is not None:
+                desktop = "running" if info.desktop_evidence.desktop_running else "unavailable"
+                wsl = "running" if info.desktop_evidence.wsl_distro_running else "unavailable"
+                print(f"Docker Desktop observation: {desktop}")
+                print(f"docker-desktop WSL observation: {wsl}")
             print(
                 "local registered resources: "
                 f"{local_resources if local_resources is not None else 'unavailable'}"
             )
             print(f"local leases: {local_leases if local_leases is not None else 'unavailable'}")
             print(
-                f"local execution sessions: {local_sessions if local_sessions is not None else 'unavailable'}"
+                "local execution sessions: "
+                f"{local_sessions if local_sessions is not None else 'unavailable'}"
             )
             if allocation is not None:
                 print(
@@ -408,10 +415,17 @@ def cmd_doctor(opts: Options) -> int:
                     f"{allocation.path} ({allocation.allocated_bytes / 1024**3:.1f} GiB "
                     "allocated; allocation only)"
                 )
+                try:
+                    volume = shutil.disk_usage(allocation.path)
+                except OSError:
+                    print("configured VHDX volume free space: unavailable")
+                else:
+                    print(f"configured VHDX volume free space: {volume.free / 1024**3:.1f} GiB")
             print(
                 "Docker Desktop engine appears wedged; restart Docker Desktop manually, "
                 "then rerun `bosn doctor`. "
-                "Bosn will not restart Docker or alter WSL, the VHDX, registry, or engine resources.",
+                "Bosn will not restart Docker or alter WSL, the VHDX, registry, "
+                "or engine resources.",
                 file=sys.stderr,
             )
         return 1

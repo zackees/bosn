@@ -206,9 +206,7 @@ def test_configured_vhdx_allocation_reports_a_file_not_reclaimable_slack(tmp_pat
     disk.mkdir(parents=True)
     vhdx = disk / "docker_data.vhdx"
     vhdx.write_bytes(b"allocated")
-    settings.write_text(
-        json.dumps({"CustomWslDistroDir": str(tmp_path / "wsl")}), encoding="utf-8"
-    )
+    settings.write_text(json.dumps({"CustomWslDistroDir": str(tmp_path / "wsl")}), encoding="utf-8")
 
     allocation = configured_desktop_vhdx_allocation(settings)
 

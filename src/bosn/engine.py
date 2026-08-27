@@ -84,7 +84,8 @@ def docker_desktop_evidence() -> DesktopEvidence:
 
 
 def _server_failure_category(detail: str, evidence: DesktopEvidence) -> str:
-    http_5xx = "http" in detail.lower() and "500" in detail
+    lowered = detail.lower()
+    http_5xx = ("http" in lowered and "500" in detail) or "500 internal server error" in lowered
     if http_5xx and evidence.desktop_running is True and evidence.wsl_distro_running is True:
         return "docker_desktop_wedged"
     return "server_error"
