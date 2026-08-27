@@ -294,7 +294,14 @@ class _Handler(socketserver.StreamRequestHandler):
             raise
         except Exception as exc:  # noqa: BLE001 - every failure is observable, none fatal
             response = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        ipc.send_response(self.connection, response)
+        try:
+            ipc.send_response(self.connection, response)
+        except (ipc.TransportError, OSError) as exc:
+            # A GC/status client can time out after the daemon has completed its work.
+            # Its disconnected socket is not authority to stop the shared daemon.
+            daemon_ref.registry.log_event(
+                "ipc.response_disconnected", f"{verb}: {type(exc).__name__}: {exc}"
+            )
 
     def _stream(self, daemon_ref: Daemon, verb: str, request: dict[str, Any]) -> None:
         """Hold the connection open and write events until the job reaches a terminal one.
