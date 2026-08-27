@@ -231,13 +231,17 @@ def test_status_names_unproven_resources_and_execution_sessions(
     ]
 
 
-def test_gc_dry_run_lists_each_unproven_resource_without_mutating(
-    registry: Registry, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("extra_key", "extra_value"),
+    [(labels.KIND, "volume"), (labels.CREATED, "2026-08-26T00:00:00Z")],
+)
+def test_gc_dry_run_does_not_offer_inspection_for_nonbinding_labels(
+    registry: Registry, monkeypatch: pytest.MonkeyPatch, extra_key: str, extra_value: str
 ) -> None:
     """#120: apply and preview both protect incomplete engine resources."""
     from bosn.resources import DiscoveredResource, ScanResult
 
-    partial = {labels.REGISTRY: registry.registry_id, labels.KIND: "volume"}
+    partial = {labels.REGISTRY: registry.registry_id, extra_key: extra_value}
     monkeypatch.setattr(
         gc_mod.ResourceScanner,
         "scan",
@@ -255,17 +259,43 @@ def test_gc_dry_run_lists_each_unproven_resource_without_mutating(
             "kind": "volume",
             "name": "partial",
             "registry_id": registry.registry_id,
-            "label_keys": [labels.KIND, labels.REGISTRY],
+            "label_keys": sorted([extra_key, labels.REGISTRY]),
             "decision": {
                 "action": "protected",
                 "eligible": False,
                 "reason": "incomplete ownership labels; protected from automatic recovery",
-                "recovery": "explicit-reconcile-available",
+                "recovery": "refused",
             },
             "attachment": {"state": "detached", "containers": []},
         }
     ]
     assert "partial" not in engine.removals()
+
+
+def test_gc_only_advertises_legacy_inspection_for_a_manifest_discriminator(
+    registry: Registry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from bosn.resources import DiscoveredResource, ScanResult
+
+    partial = {labels.REGISTRY: registry.registry_id, labels.STACK: "perf"}
+    monkeypatch.setattr(
+        gc_mod.ResourceScanner,
+        "scan",
+        lambda *_args, **_kwargs: ScanResult(
+            unlabeled=[DiscoveredResource("volume", "partial", partial)],
+            scanned_kinds={"volume"},
+        ),
+    )
+    result = Collector(
+        registry, FakeEngine({"partial": partial})
+    ).collect(dry_run=True)  # type: ignore[arg-type]
+
+    assert result.unproven_resources[0]["decision"] == {
+        "action": "protected",
+        "eligible": False,
+        "reason": "incomplete ownership labels; protected from automatic recovery",
+        "recovery": "explicit-reconcile-inspection-available",
+    }
 
 
 def test_gc_never_issues_a_system_prune(registry: Registry, clock: FakeClock) -> None:

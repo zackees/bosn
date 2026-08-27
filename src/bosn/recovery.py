@@ -16,6 +16,17 @@ from bosn.engine import Engine
 from bosn.resources import DiscoveredResource, TransferError, recreate_volume_with_labels
 
 
+# ``kind`` and ``created`` describe an object but do not bind it to the selected manifest
+# target.  Legacy reconciliation needs one surviving identity discriminator in addition to
+# the registry id; names are never evidence of ownership.
+_MANIFEST_DISCRIMINATORS = (
+    labels.STACK,
+    labels.GENERATION,
+    labels.SCOPE,
+    labels.WORKSPACE,
+)
+
+
 def _now_iso() -> str:
     return dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -36,6 +47,29 @@ def volume_attachments(engine: Engine, name: str) -> AttachmentReport:
         return AttachmentReport("unknown")
     containers = tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
     return AttachmentReport("attached" if containers else "detached", containers)
+
+
+def has_legacy_corroboration(
+    raw_labels: dict[str, str], registry_id: str, expected: labels.ResourceLabels | None = None
+) -> bool:
+    """Return whether surviving labels carry the minimum legacy recovery evidence.
+
+    With a manifest-derived expected contract this is the strict mutation predicate:
+    registry match, all surviving Bosn labels agree, and one surviving manifest-binding
+    discriminator agrees.  GC deliberately has no expected contract, so it can only
+    advertise that explicit inspection is available when a discriminator key survives.
+    """
+    if raw_labels.get(labels.REGISTRY) != registry_id:
+        return False
+    if expected is None:
+        return any(raw_labels.get(key) for key in _MANIFEST_DISCRIMINATORS)
+    expected_values = expected.to_dict()
+    surviving = {
+        key: value for key, value in raw_labels.items() if key.startswith(labels.NAMESPACE)
+    }
+    return bool(surviving) and all(
+        expected_values.get(key) == value for key, value in surviving.items()
+    ) and any(raw_labels.get(key) == expected_values[key] for key in _MANIFEST_DISCRIMINATORS)
 
 
 @dataclass(frozen=True)
@@ -104,14 +138,12 @@ def plan_unproven_resource(
         if include_attachment:
             attachment = volume_attachments(engine, resource.name)
             result["attachment"] = attachment.to_dict()
-        if raw.get(labels.REGISTRY) == registry_id and any(
-            key != labels.REGISTRY for key in namespaced
-        ):
+        if has_legacy_corroboration(raw, registry_id):
             result["decision"] = {
                 "action": "protected",
                 "eligible": False,
                 "reason": reason,
-                "recovery": "explicit-reconcile-available",
+                "recovery": "explicit-reconcile-inspection-available",
             }
     return result
 
@@ -126,7 +158,7 @@ def plan_legacy_volume_reconciliation(
 ) -> VolumeRecoveryPlan:
     """Plan one explicit legacy recovery, never inferring authority from a name alone."""
     if labels.is_owned_by(raw_labels, registry_id):
-        if any(expected.to_dict().get(key) != value for key, value in raw_labels.items()):
+        if not has_legacy_corroboration(raw_labels, registry_id, expected):
             return VolumeRecoveryPlan(
                 name,
                 raw_labels,
@@ -157,22 +189,12 @@ def plan_legacy_volume_reconciliation(
             "volume registry label is absent or belongs to another registry",
             "refused",
         )
-    if len(namespaced) < 2:
+    if not has_legacy_corroboration(raw_labels, registry_id, expected):
         return VolumeRecoveryPlan(
             name,
             raw_labels,
             "refused",
-            "volume has only a registry label; no independent Bosn identity survives",
-            "refused",
-        )
-
-    expected_values = expected.to_dict()
-    if any(expected_values.get(key) != value for key, value in namespaced.items()):
-        return VolumeRecoveryPlan(
-            name,
-            raw_labels,
-            "refused",
-            "surviving Bosn labels contradict the selected manifest identity",
+            "surviving Bosn labels lack a matching manifest-binding identity or contradict it",
             "refused",
         )
 

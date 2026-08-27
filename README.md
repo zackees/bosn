@@ -122,7 +122,9 @@ bosn reconcile-volume --stack perf --volume target --apply --yes
 
 `reconcile-volume` accepts the logical volume declared in `bosn.toml`, not an arbitrary
 engine volume name.  It derives the exact target from the current manifest, requires the
-current registry label plus a matching surviving Bosn identity label, and refuses an
+current registry label plus a matching surviving manifest-binding label (`stack`,
+`generation`, `scope`, or `workspace`); every other surviving Bosn label must also agree.
+It refuses an
 unlabeled, foreign, contradictory, attached, or attachment-unknown volume.  The final
 attachment check happens again immediately before staged recreation.  `gc --apply` remains
 non-destructive for all incomplete resources; there is no `--force`, and `adopt` is not a

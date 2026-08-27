@@ -105,6 +105,41 @@ def test_legacy_recovery_allows_no_registry_history_but_refuses_unlabeled_or_con
     assert conflicting.action == "refused"
 
 
+def test_legacy_recovery_requires_a_manifest_binding_discriminator() -> None:
+    registry_and_kind = {labels.REGISTRY: "ours", labels.KIND: "volume"}
+    kind_only = plan_legacy_volume_reconciliation(
+        name="target",
+        raw_labels=registry_and_kind,
+        expected=expected(registry_and_kind),
+        registry_id="ours",
+        engine=FakeEngine(registry_and_kind),  # type: ignore[arg-type]
+    )
+    assert kind_only.action == "refused"
+
+    registry_and_created = {
+        labels.REGISTRY: "ours",
+        labels.CREATED: "2026-08-26T00:00:00Z",
+    }
+    created_only = plan_legacy_volume_reconciliation(
+        name="target",
+        raw_labels=registry_and_created,
+        expected=expected(registry_and_created),
+        registry_id="ours",
+        engine=FakeEngine(registry_and_created),  # type: ignore[arg-type]
+    )
+    assert created_only.action == "refused"
+
+    registry_and_stack = {labels.REGISTRY: "ours", labels.STACK: "perf"}
+    stack_bound = plan_legacy_volume_reconciliation(
+        name="target",
+        raw_labels=registry_and_stack,
+        expected=expected(registry_and_stack),
+        registry_id="ours",
+        engine=FakeEngine(registry_and_stack),  # type: ignore[arg-type]
+    )
+    assert stack_bound.action == "would-recreate"
+
+
 def test_legacy_recovery_refuses_attached_or_unknown_volume() -> None:
     raw = partial()
     attached = plan_legacy_volume_reconciliation(
