@@ -104,7 +104,7 @@ Then:
 ```bash
 bosn ensure                    # converge and register without running anything (pre-warm)
 bosn unit                      # run the task
-bosn status                    # what exists, what holds it, bytes vs ceiling
+bosn status --json             # bounded daemon/registry state; use gc for engine/storage details
 ```
 
 Nothing needs starting — the first command lazily spawns the daemon.
@@ -192,8 +192,8 @@ images will not work.
 | `docker build` + `docker run` | `bosn run -- <cmd>` | rebuilds only if the *content digest* changed |
 | `docker compose up` | `bosn-docker compose up` | service **containers** get labeled and tracked; volumes do not (see below) |
 | `docker system prune` | *(nothing — automatic)* | never needed, and bosn never runs it |
-| `docker volume ls` + guesswork | `bosn status` | tiers, leases, managed bytes vs ceiling |
-| "is this cache still needed?" | `bosn gc` | dry-run by default; shows exactly what would be reclaimed |
+| `docker volume ls` + guesswork | `bosn gc --dry-run --json` | rich engine/storage inventory plus governed decisions |
+| "is this cache still needed?" | `bosn gc --dry-run --json` | dry-run by default; shows exactly what would be reclaimed |
 | deleting a worktree and hoping | `bosn done` | marks it finished; its caches become collectable |
 
 ### If you already have a compose.yaml
@@ -464,11 +464,11 @@ bosn shell                   # interactive session in the persistent container
 bosn ensure                  # converge and register without running anything
 
 bosn tasks --json            # tasks, stacks, content digests, registration state
-bosn status                  # tiers, leases, bytes vs ceiling, foreign registries
+bosn status --json           # bounded daemon/registry state; never scans the engine
 bosn jobs / bosn attach <j>  # daemon-owned builds that survive a killed CLI
 bosn cancel <j>              # stop a build you no longer want
 bosn done                    # this workspace is finished; its caches become collectable
-bosn gc                      # dry-run by default; --apply to reclaim (there is no --force)
+bosn gc --dry-run --json     # rich engine/storage inventory; --apply reclaims (no --force)
 bosn doctor                  # engine reachability, registry integrity, recovery commands
 bosn adopt --legacy <family> # import pre-bosn volumes; --yes to apply
 
@@ -476,9 +476,23 @@ bosn __daemon --autostart    # install the login launcher (also --no-autostart)
 bosn daemon-stop             # stop the daemon — needed after upgrading bosn
 ```
 
-`status`, `tasks`, and `doctor` read the sqlite registry directly, so they keep working when
-the daemon is wedged. `gc` and `jobs` are read-only but go through the daemon and fail closed
-if it is unreachable.
+`tasks` and `doctor` read the SQLite registry directly. `status --json` is always a short,
+control-plane/registry-only report: it returns stable `mode`, `registry_id`, `registered`,
+`execution_sessions`, and `daemon` fields without touching the container engine. A healthy
+daemon returns `mode: "online"`; an absent daemon returns `mode: "offline"`; and a lost control
+stream returns `mode: "degraded"` with persisted session diagnostics. For the rich engine,
+ownership, and storage inventory, use `bosn gc --dry-run --json` instead. `gc` and `jobs` are
+read-only but go through the daemon and fail closed if it is unreachable.
+
+When ordinary `status` can reach the daemon and says the client is dead, run `bosn daemon-stop`:
+Bosn first proves the owner is dead, then removes only that session's exact immutable container
+and releases its leases. A `last_orphan_reap_error` field means that safe cleanup could not be
+proved or completed; resolve the named engine/database error and retry `bosn daemon-stop`.
+
+Do **not** run `bosn daemon-stop` directly from `mode: "degraded"`: it uses the same unavailable
+daemon control channel. First restore or restart Bosn through its supported launcher/service and
+wait for `bosn status` to respond; then use `bosn daemon-stop` for the exact-container recovery.
+Do not delete registry rows or use a blind Docker force operation.
 
 **After you upgrade bosn, stop the daemon.** A running daemon refuses every mutating verb
 whose client reports a different version, so the next `bosn run` fails until you restart it.
@@ -528,8 +542,9 @@ precedence, and invalid values stop the command while naming the bad key. The `[
 accepts `container_idle_stop`, `container_remove`, `warm_volume_ttl`, `superseded_cap`,
 `shared_cache_ceiling` (really the total managed-bytes ceiling), `run_max_duration` (default
 8 h, the wall-clock cap on command execution), `idle_retire_seconds`, `build_ttl_seconds`, and
-`max_builds`; environment overrides are their uppercase `BOSN_` equivalents. `bosn status`
-reports each effective value and its origin.
+`max_builds`; environment overrides are their uppercase `BOSN_` equivalents. Policy provenance
+is not currently exposed as a public CLI report; `bosn gc --dry-run --json` shows the resulting
+governed storage decisions without requiring `status` to touch the engine.
 
 Enforcement is layered: the daemon is the authority but never the only mechanism. The
 persistent container's PID 1 watches the bind-mounted daemon heartbeat and exits once it has

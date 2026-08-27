@@ -91,7 +91,10 @@ def render() -> str:
 
     lines += _render_compose_flags(payload["compose"])
 
-    return "\n".join(lines) + "\n"
+    # `_render_compose_flags()` ends with an empty separator line. Normalize that internal
+    # layout detail to one POSIX terminal newline instead of emitting a trailing blank
+    # Markdown paragraph, so the committed generated document has a stable ending.
+    return "\n".join(lines).rstrip("\n") + "\n"
 
 
 def _render_flag_table(flags: list[dict]) -> list[str]:

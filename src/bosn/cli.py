@@ -69,6 +69,10 @@ DAEMON_STOP_TIMEOUT = 45.0
 # That bounded recovery legitimately exceeds the generic 10-second IPC control timeout on
 # Docker Desktop, while the preceding image build already has its own streamed job timeout.
 EXECUTION_ACQUIRE_TIMEOUT = 120.0
+# `status` is a diagnostic, not an engine inventory request.  When the daemon control plane
+# has lost a stream, wait only long enough to distinguish that failure, then read the durable
+# registry proof rather than starting the slow Docker scan that made #119 look like a hang.
+STATUS_DAEMON_TIMEOUT_SECONDS = 2.0
 
 
 def _policy_flags(opts: Options) -> dict[str, float | None]:
@@ -829,56 +833,153 @@ def cmd_cancel(opts: Options) -> int:
     return 0
 
 
+def _persisted_execution_sessions(registry, *, daemon_control_available: bool) -> list[dict]:
+    """Describe durable foreground ownership without contacting the engine or daemon.
+
+    The registry proves that a session is protected, but never authorizes removal.  In
+    particular, a dead owner remains blocking until the daemon's documented recovery path
+    has removed the exact immutable container and released its leases.
+    """
+    from bosn.resources import process_alive
+
+    sessions = []
+    for session in registry.execution_sessions():
+        alive = process_alive(session.client_pid, session.client_start)
+        last_reap_error = registry.latest_event(
+            "execution.orphan_reap.error", detail_prefix=f"session={session.id} "
+        )
+        sessions.append(
+            {
+                "id": session.id,
+                "container_id": session.container_id,
+                "engine": session.engine_binary,
+                "client_pid": session.client_pid,
+                "client_start": session.client_start,
+                "client_alive": alive,
+                "lease_ids": list(session.lease_ids),
+                "blocking_reason": (
+                    "client is live"
+                    if alive
+                    else "client is dead; awaiting safe exact-container reap"
+                ),
+                "last_orphan_reap_error": (
+                    {"at": last_reap_error["at"], "detail": last_reap_error["detail"]}
+                    if last_reap_error is not None
+                    else None
+                ),
+                "recovery": (
+                    "do not interrupt the live client"
+                    if alive
+                    else (
+                        "run `bosn daemon-stop`; it reaps only this exact container after "
+                        "confirming the client is dead"
+                        if daemon_control_available
+                        else "the daemon control channel is unavailable; restore or restart "
+                        "Bosn through its supported launcher/service first. Once `bosn "
+                        "status` responds, run `bosn daemon-stop` for exact-container reap"
+                    )
+                ),
+            }
+        )
+    return sessions
+
+
 def cmd_status(opts: Options) -> int:
     from bosn import daemon as daemon_mod
-    from bosn.config import ConfigError
-    from bosn.config import load as load_config
-    from bosn.gc import status
     from bosn.registry import Registry, default_db_path
 
     state_dir = opts.state_dir
     db_path = (state_dir / "registry.sqlite3") if state_dir else default_db_path()
     if not db_path.exists():
-        print(json.dumps({"registered": 0, "storage": "not initialized"}, indent=2))
-        return 0
-    # A foreground execution session is a small daemon-owned control-plane record.  Report
-    # it before the direct engine inventory below: on a loaded Docker Desktop host that
-    # inventory can be slow, while the session is the exact fact an operator needs to
-    # understand why an otherwise terminal-only `jobs` list still blocks the stack (#119).
-    # Do not autostart merely to optimize a read-only status command.
-    try:
-        daemon_status = daemon_mod.request("status", state_dir, autostart=False)
-    except (daemon_mod.DaemonError, ipc.TransportError):
-        daemon_status = None
-    if daemon_status and daemon_status.get("execution_sessions"):
         print(
             json.dumps(
                 {
-                    "registry_id": daemon_status.get("registry_id"),
-                    "execution_sessions": daemon_status["execution_sessions"],
+                    "mode": "offline",
+                    "registry_id": None,
+                    "registered": 0,
+                    "execution_sessions": [],
+                    "daemon": {"reachable": False, "error": "registry not initialized"},
                     "next": (
-                        "a live session remains protected; if its client is dead, retry "
-                        "after Bosn safely reaps its exact container"
+                        "no Bosn registry or daemon is available yet. Run the desired Bosn "
+                        "command to initialize its managed state; do not create resources with "
+                        "raw Docker."
                     ),
                 },
                 indent=2,
             )
         )
         return 0
+    # Status is deliberately a bounded control-plane and registry diagnostic, never an engine
+    # inventory.  That keeps it useful exactly when Docker Desktop or a foreground stream is
+    # stuck; `gc --dry-run --json` remains the explicit rich engine/storage report.
+    daemon_error: str | None = None
+    daemon_control_lost = False
     try:
-        with Registry(db_path, read_only=True) as registry:
-            print(
-                json.dumps(
-                    status(
-                        registry, Engine(opts.engine), config=load_config(flags=_policy_flags(opts))
+        daemon_status = daemon_mod.request(
+            "status",
+            state_dir,
+            autostart=False,
+            request_timeout=STATUS_DAEMON_TIMEOUT_SECONDS,
+            diagnostic=True,
+        )
+    except (daemon_mod.DaemonError, ipc.TransportError) as exc:
+        daemon_status = None
+        daemon_error = str(exc)
+        daemon_control_lost = isinstance(exc, ipc.TransportError)
+    if daemon_status and daemon_status.get("ok", True):
+        print(
+            json.dumps(
+                {
+                    "mode": "online",
+                    "registry_id": daemon_status.get("registry_id"),
+                    "registered": daemon_status.get("resources", 0),
+                    "execution_sessions": daemon_status.get("execution_sessions", []),
+                    "daemon": {
+                        "reachable": True,
+                        "pid": daemon_status.get("pid"),
+                        "version": daemon_status.get("version"),
+                    },
+                    "next": (
+                        "a live session remains protected; for a dead owner, `bosn daemon-stop` "
+                        "safely reaps only its exact container"
+                        if daemon_status.get("execution_sessions")
+                        else "no foreground execution session is blocking the daemon"
                     ),
-                    indent=2,
-                )
+                },
+                indent=2,
             )
+        )
         return 0
-    except ConfigError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
+    if daemon_status is not None:
+        daemon_error = str(daemon_status.get("error") or "daemon did not return status")
+    with Registry(db_path, read_only=True) as registry:
+        persisted_sessions = _persisted_execution_sessions(registry, daemon_control_available=False)
+        print(
+            json.dumps(
+                {
+                    "mode": "degraded" if daemon_control_lost else "offline",
+                    "registry_id": registry.registry_id,
+                    "registered": len(registry.list_resources()),
+                    "execution_sessions": persisted_sessions,
+                    "daemon": {
+                        "reachable": False,
+                        "error": daemon_error,
+                        "status_timeout_seconds": STATUS_DAEMON_TIMEOUT_SECONDS,
+                    },
+                    "next": (
+                        "the daemon control channel is unavailable, so do not run `bosn "
+                        "daemon-stop` yet: it uses that same channel. Restore or restart Bosn "
+                        "through its supported launcher/service first; once `bosn status` "
+                        "responds, `bosn daemon-stop` can attempt safe exact-container recovery."
+                        if persisted_sessions
+                        else "no execution session is persisted. Restore or restart Bosn through "
+                        "its supported launcher/service before retrying a mutating command."
+                    ),
+                },
+                indent=2,
+            )
+        )
+    return 0
 
 
 def cmd_gc(opts: Options) -> int:

@@ -188,12 +188,26 @@ class DaemonState:
             return None
 
 
-def is_serving(state_dir: Path | None = None, *, timeout: float = 2.0) -> bool:
-    """True when something answers the ping on this state dir's port."""
+def is_serving(
+    state_dir: Path | None = None,
+    *,
+    timeout: float = 2.0,
+    preserve_timeout: bool = False,
+) -> bool:
+    """True when something answers the ping on this state dir's port.
+
+    Normal callers want a Boolean for spawn/stop decisions. A bounded diagnostic is different:
+    a timeout proves that a listener was contacted but did not answer, which must not be
+    flattened into absence before the caller can report a degraded control plane.
+    """
     try:
         reply = ipc.send_request(
             port_for(state_dir), {"verb": "ping", "auth": _secret(state_dir)}, timeout=timeout
         )
+    except ipc.TransportTimeout:
+        if preserve_timeout:
+            raise
+        return False
     except ipc.TransportError:
         return False
     return bool(reply.get("ok"))
@@ -948,6 +962,9 @@ class Daemon:
             sessions = []
             for session, owner in self._execution_owners.items():
                 alive = process_alive(*owner)
+                last_reap_error = self.registry.latest_event(
+                    "execution.orphan_reap.error", detail_prefix=f"session={session} "
+                )
                 sessions.append(
                     {
                         "id": session,
@@ -961,6 +978,20 @@ class Daemon:
                             "client is live"
                             if alive
                             else "client is dead; awaiting safe exact-container reap"
+                        ),
+                        "last_orphan_reap_error": (
+                            {
+                                "at": last_reap_error["at"],
+                                "detail": last_reap_error["detail"],
+                            }
+                            if last_reap_error is not None
+                            else None
+                        ),
+                        "recovery": (
+                            "do not interrupt the live client"
+                            if alive
+                            else "run `bosn daemon-stop`; it reaps only this exact "
+                            "container after confirming the client is dead"
                         ),
                     }
                 )
@@ -1592,15 +1623,23 @@ def request(
     *,
     autostart: bool = True,
     request_timeout: float = ipc.DEFAULT_TIMEOUT,
+    diagnostic: bool = False,
     **payload: Any,
 ) -> dict[str, Any]:
     """Send a verb to the daemon, spawning it first when allowed.
 
     Fails closed when the daemon is unreachable and autostart is off -- a fallback to raw
     Docker would recreate exactly the unregistered resources bosn exists to eliminate.
+    ``diagnostic`` is intentionally opt-in for bounded read-only probes: it preserves a ping
+    timeout as ``TransportTimeout`` instead of flattening it into "not serving". Normal
+    autostart and every mutating call retain the historical Boolean liveness behavior.
     """
     state_dir = state_dir or default_state_dir()
-    if not is_serving(state_dir):
+    if not is_serving(
+        state_dir,
+        timeout=request_timeout if diagnostic else 2.0,
+        preserve_timeout=diagnostic,
+    ):
         if not autostart:
             raise DaemonError("no bosn daemon is running")
         spawn(state_dir)

@@ -42,11 +42,11 @@ Schema version: `1` (the shape of the `--supported --json` payload this doc refl
 | `push` | upload an image to a registry | not part of the managed subset; use the real `docker` binary directly if you accept the resources it creates will be unmanaged, or add it to bosn.toml so bosn can create it tracked |
 | `tag` | create a new tag pointing at an existing image | creates a new local image reference outside the registry; not part of the managed subset; use the real `docker` binary directly if you accept the resources it creates will be unmanaged, or add it to bosn.toml so bosn can create it tracked |
 | `cp` | copy files into or out of a container | targets a raw container name outside bosn's registry; use `bosn shell` to reach a managed container's filesystem |
-| `network` | manage networks (create/rm/connect/...) | networks are declared implicitly by a stack and labeled by bosn; use `bosn status` to inspect them, `bosn gc` to reclaim them |
-| `volume` | manage volumes (create/rm/prune/...) | volumes are declared in bosn.toml and labeled by bosn; use `bosn status` to inspect them, `bosn gc` to reclaim them |
-| `image` | manage images (build/rm/prune/...) | images are generation-keyed and managed by bosn; use `bosn status`/`bosn gc` instead of the raw image subcommands |
-| `container` | manage containers (create/rm/prune/...) | containers are declared in bosn.toml and labeled by bosn; use `bosn status`/`bosn gc` instead of the raw container subcommands |
-| `system` | manage or inspect the engine (df/prune/events/...) | `system prune` in particular deletes resources bosn did not choose to reclaim; use `bosn gc` for a governed equivalent |
+| `network` | manage networks (create/rm/connect/...) | networks are declared implicitly by a stack and labeled by bosn; use `bosn status --json` for bounded managed-state diagnostics, `bosn gc --dry-run --json` for a rich Bosn-owned engine/storage report, or `bosn gc` to reclaim collectable networks |
+| `volume` | manage volumes (create/rm/prune/...) | volumes are declared in bosn.toml and labeled by bosn; use `bosn status --json` for bounded managed-state diagnostics, `bosn gc --dry-run --json` for a rich Bosn-owned engine/storage report, or `bosn gc` to reclaim collectable volumes |
+| `image` | manage images (build/rm/prune/...) | images are generation-keyed and managed by bosn; use `bosn status --json` for bounded managed-state diagnostics, `bosn gc --dry-run --json` for a rich Bosn-owned engine/storage report, or `bosn gc` to reclaim collectable images |
+| `container` | manage containers (create/rm/prune/...) | containers are declared in bosn.toml and labeled by bosn; use `bosn status --json` for bounded managed-state diagnostics, `bosn gc --dry-run --json` for a rich Bosn-owned engine/storage report, or `bosn gc` to reclaim collectable containers |
+| `system` | manage or inspect the engine (df/prune/events/...) | `system prune` in particular deletes resources bosn did not choose to reclaim; use `bosn gc --dry-run --json` for a rich Bosn-owned engine/storage report, then `bosn gc` to reclaim collectable resources |
 | `save` | export an image to a tar archive | not part of the managed subset; use the real `docker` binary directly if you accept the resources it creates will be unmanaged, or add it to bosn.toml so bosn can create it tracked |
 | `load` | import an image from a tar archive | creates a local image outside the registry; not part of the managed subset; use the real `docker` binary directly if you accept the resources it creates will be unmanaged, or add it to bosn.toml so bosn can create it tracked |
 | `export` | export a container's filesystem to a tar archive | not part of the managed subset; use the real `docker` binary directly if you accept the resources it creates will be unmanaged, or add it to bosn.toml so bosn can create it tracked |
@@ -54,13 +54,13 @@ Schema version: `1` (the shape of the `--supported --json` payload this doc refl
 | `commit` | create a new image from a container's changes | creates a local image outside the registry; not part of the managed subset; use the real `docker` binary directly if you accept the resources it creates will be unmanaged, or add it to bosn.toml so bosn can create it tracked |
 | `rename` | rename a container | mutates a container's identity outside the registry's naming; not part of the managed subset; use the real `docker` binary directly if you accept the resources it creates will be unmanaged, or add it to bosn.toml so bosn can create it tracked |
 | `attach` | attach local streams to a running container | targets a raw container name outside bosn's registry; use `bosn attach` for a daemon-owned job |
-| `ps` | list containers | lists raw engine state instead of bosn's managed view; use `bosn status` or `bosn tasks` for governed introspection |
+| `ps` | list containers | lists raw engine state instead of Bosn's bounded managed-state diagnostics; use `bosn status --json` for those diagnostics, `bosn tasks` for manifest readiness, or `bosn gc --dry-run --json` for a rich Bosn-owned engine/storage report |
 | `logs` | fetch a container's logs | targets a raw container name outside bosn's registry; use `bosn-docker compose logs` for a managed stack, or `bosn attach` for a daemon-owned job |
-| `inspect` | show low-level details of an object | targets a raw object name outside bosn's registry; use `bosn status` for governed introspection |
+| `inspect` | show low-level details of an object | targets a raw object name outside bosn's registry; use `bosn status --json` for bounded managed-state diagnostics or `bosn gc --dry-run --json` for a rich Bosn-owned engine/storage report |
 | `top` | list processes running in a container | targets a raw container name outside bosn's registry; use `bosn jobs` for governed introspection |
-| `stats` | stream resource usage statistics | targets raw container names outside bosn's registry; use `bosn status` for governed introspection |
-| `events` | stream real-time engine events | surfaces raw engine activity outside bosn's registry; use `bosn status` for governed introspection |
-| `port` | list a container's published ports | targets a raw container name outside bosn's registry; use `bosn status` for governed introspection |
+| `stats` | stream resource usage statistics | targets raw container names outside bosn's registry; Bosn does not expose a streaming resource-usage view. Use `bosn status --json` for bounded managed-state diagnostics or `bosn gc --dry-run --json` for a rich Bosn-owned engine/storage report |
+| `events` | stream real-time engine events | surfaces raw engine activity outside bosn's registry; Bosn does not expose a raw engine event stream. Use `bosn status --json` for bounded managed-state diagnostics or `bosn gc --dry-run --json` for a rich Bosn-owned engine/storage report |
+| `port` | list a container's published ports | targets a raw container name outside bosn's registry; Bosn does not expose a published-port listing. Use `bosn status --json` only for bounded managed-state diagnostics or `bosn gc --dry-run --json` for a rich Bosn-owned engine/storage report |
 | `diff` | list changed files in a container's filesystem | targets a raw container name outside bosn's registry; use `bosn shell` to inspect a managed container directly |
 | `wait` | block until a container stops, then print its exit code | targets a raw container name outside bosn's registry; use `bosn jobs`/`bosn attach` to wait on a daemon-owned job |
 | `search` | search Docker Hub for images | not part of the managed subset; use the real `docker` binary directly if you accept the resources it creates will be unmanaged, or add it to bosn.toml so bosn can create it tracked |
@@ -122,4 +122,3 @@ No sub-verb-specific flags are declared; only the global flags above apply.
 ### `compose config`
 
 No sub-verb-specific flags are declared; only the global flags above apply.
-

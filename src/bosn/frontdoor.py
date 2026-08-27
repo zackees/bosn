@@ -250,35 +250,41 @@ _REFUSE: tuple[VerbSpec, ...] = (
         Category.REFUSE,
         "manage networks (create/rm/connect/...)",
         "networks are declared implicitly by a stack and labeled by bosn; use "
-        "`bosn status` to inspect them, `bosn gc` to reclaim them",
+        "`bosn status --json` for bounded managed-state diagnostics, "
+        "`bosn gc --dry-run --json` for a rich Bosn-owned engine/storage report, or "
+        "`bosn gc` to reclaim collectable networks",
     ),
     VerbSpec(
         "volume",
         Category.REFUSE,
         "manage volumes (create/rm/prune/...)",
-        "volumes are declared in bosn.toml and labeled by bosn; use `bosn status` to "
-        "inspect them, `bosn gc` to reclaim them",
+        "volumes are declared in bosn.toml and labeled by bosn; use `bosn status --json` "
+        "for bounded managed-state diagnostics, `bosn gc --dry-run --json` for a rich "
+        "Bosn-owned engine/storage report, or `bosn gc` to reclaim collectable volumes",
     ),
     VerbSpec(
         "image",
         Category.REFUSE,
         "manage images (build/rm/prune/...)",
-        "images are generation-keyed and managed by bosn; use `bosn status`/`bosn gc` "
-        "instead of the raw image subcommands",
+        "images are generation-keyed and managed by bosn; use `bosn status --json` for "
+        "bounded managed-state diagnostics, `bosn gc --dry-run --json` for a rich "
+        "Bosn-owned engine/storage report, or `bosn gc` to reclaim collectable images",
     ),
     VerbSpec(
         "container",
         Category.REFUSE,
         "manage containers (create/rm/prune/...)",
-        "containers are declared in bosn.toml and labeled by bosn; use "
-        "`bosn status`/`bosn gc` instead of the raw container subcommands",
+        "containers are declared in bosn.toml and labeled by bosn; use `bosn status --json` "
+        "for bounded managed-state diagnostics, `bosn gc --dry-run --json` for a rich "
+        "Bosn-owned engine/storage report, or `bosn gc` to reclaim collectable containers",
     ),
     VerbSpec(
         "system",
         Category.REFUSE,
         "manage or inspect the engine (df/prune/events/...)",
         "`system prune` in particular deletes resources bosn did not choose to reclaim; "
-        "use `bosn gc` for a governed equivalent",
+        "use `bosn gc --dry-run --json` for a rich Bosn-owned engine/storage report, then "
+        "`bosn gc` to reclaim collectable resources",
     ),
     VerbSpec(
         "save",
@@ -327,8 +333,9 @@ _REFUSE: tuple[VerbSpec, ...] = (
         "ps",
         Category.REFUSE,
         "list containers",
-        "lists raw engine state instead of bosn's managed view; use `bosn status` or "
-        "`bosn tasks` for governed introspection",
+        "lists raw engine state instead of Bosn's bounded managed-state diagnostics; use "
+        "`bosn status --json` for those diagnostics, `bosn tasks` for manifest readiness, or "
+        "`bosn gc --dry-run --json` for a rich Bosn-owned engine/storage report",
     ),
     VerbSpec(
         "logs",
@@ -341,8 +348,9 @@ _REFUSE: tuple[VerbSpec, ...] = (
         "inspect",
         Category.REFUSE,
         "show low-level details of an object",
-        "targets a raw object name outside bosn's registry; use `bosn status` for "
-        "governed introspection",
+        "targets a raw object name outside bosn's registry; use `bosn status --json` for "
+        "bounded managed-state diagnostics or `bosn gc --dry-run --json` for a rich "
+        "Bosn-owned engine/storage report",
     ),
     VerbSpec(
         "top",
@@ -355,22 +363,25 @@ _REFUSE: tuple[VerbSpec, ...] = (
         "stats",
         Category.REFUSE,
         "stream resource usage statistics",
-        "targets raw container names outside bosn's registry; use `bosn status` for "
-        "governed introspection",
+        "targets raw container names outside bosn's registry; Bosn does not expose a "
+        "streaming resource-usage view. Use `bosn status --json` for bounded managed-state "
+        "diagnostics or `bosn gc --dry-run --json` for a rich Bosn-owned engine/storage report",
     ),
     VerbSpec(
         "events",
         Category.REFUSE,
         "stream real-time engine events",
-        "surfaces raw engine activity outside bosn's registry; use `bosn status` for "
-        "governed introspection",
+        "surfaces raw engine activity outside bosn's registry; Bosn does not expose a raw "
+        "engine event stream. Use `bosn status --json` for bounded managed-state diagnostics "
+        "or `bosn gc --dry-run --json` for a rich Bosn-owned engine/storage report",
     ),
     VerbSpec(
         "port",
         Category.REFUSE,
         "list a container's published ports",
-        "targets a raw container name outside bosn's registry; use `bosn status` for "
-        "governed introspection",
+        "targets a raw container name outside bosn's registry; Bosn does not expose a "
+        "published-port listing. Use `bosn status --json` only for bounded managed-state "
+        "diagnostics or `bosn gc --dry-run --json` for a rich Bosn-owned engine/storage report",
     ),
     VerbSpec(
         "diff",

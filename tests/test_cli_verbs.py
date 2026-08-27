@@ -104,6 +104,7 @@ def test_status_surfaces_a_foreground_session_without_waiting_for_engine_scan(
         "request",
         lambda *_args, **_kwargs: {
             "registry_id": "registry",
+            "resources": 3,
             "execution_sessions": [
                 {"id": "session", "client_alive": False, "blocking_reason": "awaiting reap"}
             ],
@@ -113,7 +114,199 @@ def test_status_surfaces_a_foreground_session_without_waiting_for_engine_scan(
 
     assert cli.main(["--state-dir", str(state), "status", "--json"]) == 0
     report = json.loads(capsys.readouterr().out)
+    assert report["mode"] == "online"
+    assert report["registered"] == 3
     assert report["execution_sessions"][0]["id"] == "session"
+
+
+def test_status_returns_a_healthy_empty_session_report_without_engine_inventory(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """#119: an idle healthy daemon is a complete status answer, not a Docker scan."""
+    from bosn import daemon
+
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "registry.sqlite3").touch()
+    monkeypatch.setattr(
+        daemon,
+        "request",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "registry_id": "registry",
+            "resources": 0,
+            "execution_sessions": [],
+            "pid": 42,
+            "version": "test",
+        },
+    )
+    monkeypatch.setattr(cli, "Engine", lambda *_args: (_ for _ in ()).throw(AssertionError()))
+
+    assert cli.main(["--state-dir", str(state), "status", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "mode": "online",
+        "registry_id": "registry",
+        "registered": 0,
+        "execution_sessions": [],
+        "daemon": {"reachable": True, "pid": 42, "version": "test"},
+        "next": "no foreground execution session is blocking the daemon",
+    }
+
+
+def test_status_uses_persisted_session_proof_when_daemon_control_stream_is_lost(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """#119: terminal-only jobs must not hide a disconnected foreground client.
+
+    This deliberately uses the durable session record rather than a daemon fake response:
+    it is the path available when the control RPC itself has timed out.  Constructing an
+    Engine would prove a regression to slow inventory fallback.
+    """
+    from bosn import daemon, resources
+    from bosn.registry import ExecutionSession, Registry
+
+    state = tmp_path / "state"
+    with Registry(state / "registry.sqlite3") as registry:
+        registry.save_execution_session(
+            ExecutionSession("orphan", "immutable-id", "podman", 4242, 9.0, ("lease",))
+        )
+        registry.log_event(
+            "execution.orphan_reap.error",
+            "session=orphan container=immutable-id RuntimeError: busy",
+        )
+    calls = []
+
+    def lost_stream(*_args, **kwargs):
+        calls.append(kwargs)
+        raise ipc.TransportTimeout("timed out waiting for the daemon")
+
+    monkeypatch.setattr(daemon, "request", lost_stream)
+    monkeypatch.setattr(resources, "process_alive", lambda *_args: False)
+    monkeypatch.setattr(cli, "Engine", lambda *_args: (_ for _ in ()).throw(AssertionError()))
+
+    assert cli.main(["--state-dir", str(state), "status", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert calls == [
+        {
+            "autostart": False,
+            "request_timeout": cli.STATUS_DAEMON_TIMEOUT_SECONDS,
+            "diagnostic": True,
+        }
+    ]
+    assert report["mode"] == "degraded"
+    assert report["execution_sessions"][0]["id"] == "orphan"
+    assert report["execution_sessions"][0]["last_orphan_reap_error"]["detail"].endswith("busy")
+    assert "control channel is unavailable" in report["execution_sessions"][0]["recovery"]
+    assert "do not run `bosn daemon-stop` yet" in report["next"]
+
+
+def test_status_is_bounded_when_a_daemon_stream_is_lost_without_a_session(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """#119: a completed foreground command must not send status into engine inventory."""
+    from bosn import daemon
+    from bosn.registry import Registry
+
+    state = tmp_path / "state"
+    with Registry(state / "registry.sqlite3"):
+        pass
+
+    monkeypatch.setattr(
+        daemon,
+        "request",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ipc.TransportTimeout("timed out waiting for the daemon")
+        ),
+    )
+    monkeypatch.setattr(cli, "Engine", lambda *_args: (_ for _ in ()).throw(AssertionError()))
+
+    assert cli.main(["--state-dir", str(state), "status", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["mode"] == "degraded"
+    assert report["registered"] == 0
+    assert report["execution_sessions"] == []
+    assert "Restore or restart Bosn" in report["next"]
+
+
+@pytest.mark.parametrize("timeout_verb", ["ping", "status"])
+def test_status_preserves_a_real_diagnostic_request_timeout_as_degraded(
+    tmp_path, monkeypatch, capsys, timeout_verb
+) -> None:
+    """#119: request's liveness probe must not hide a contacted-but-stuck daemon.
+
+    This deliberately invokes the real ``daemon.request`` and real ``is_serving`` rather
+    than replacing either: the fake transport models the two wire positions where a timeout
+    can occur. A dead port still raises ordinary ``TransportError`` and is reported offline.
+    """
+    from bosn.registry import Registry
+
+    state = tmp_path / "state"
+    with Registry(state / "registry.sqlite3"):
+        pass
+    calls = []
+
+    def transport(_port, request, *, timeout, **_kwargs):
+        calls.append((request["verb"], timeout))
+        if request["verb"] == timeout_verb:
+            raise ipc.TransportTimeout("timed out waiting for the daemon")
+        return {"ok": True}
+
+    monkeypatch.setattr(ipc, "send_request", transport)
+    monkeypatch.setattr(cli, "Engine", lambda *_args: (_ for _ in ()).throw(AssertionError()))
+
+    assert cli.main(["--state-dir", str(state), "status", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["mode"] == "degraded"
+    assert calls == [("ping", cli.STATUS_DAEMON_TIMEOUT_SECONDS)] + (
+        [("status", cli.STATUS_DAEMON_TIMEOUT_SECONDS)] if timeout_verb == "status" else []
+    )
+
+
+def test_status_actual_diagnostic_request_reports_a_dead_port_offline(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """A refused ping is absence, unlike a ping that reaches its timeout budget."""
+    from bosn.registry import Registry
+
+    state = tmp_path / "state"
+    with Registry(state / "registry.sqlite3"):
+        pass
+    monkeypatch.setattr(
+        ipc,
+        "send_request",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ipc.TransportError("connection refused")),
+    )
+    monkeypatch.setattr(cli, "Engine", lambda *_args: (_ for _ in ()).throw(AssertionError()))
+
+    assert cli.main(["--state-dir", str(state), "status", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["mode"] == "offline"
+    assert report["daemon"]["reachable"] is False
+
+
+def test_status_returns_an_offline_empty_session_report_without_engine_inventory(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """#119: no daemon is still a bounded registry report, never an engine scan."""
+    from bosn import daemon
+    from bosn.registry import Registry
+
+    state = tmp_path / "state"
+    with Registry(state / "registry.sqlite3"):
+        pass
+    monkeypatch.setattr(
+        daemon,
+        "request",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(daemon.DaemonError("no daemon")),
+    )
+    monkeypatch.setattr(cli, "Engine", lambda *_args: (_ for _ in ()).throw(AssertionError()))
+
+    assert cli.main(["--state-dir", str(state), "status", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["mode"] == "offline"
+    assert report["registered"] == 0
+    assert report["execution_sessions"] == []
+    assert report["daemon"]["reachable"] is False
 
 
 def test_tasks_json_reports_unregistered_readiness(tmp_path, capsys) -> None:
