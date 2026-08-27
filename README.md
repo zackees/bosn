@@ -107,6 +107,33 @@ bosn unit                      # run the task
 bosn status --json             # bounded daemon/registry state; use gc for engine/storage details
 ```
 
+### Recovering an interrupted volume creation
+
+Bosn records a durable creation intent before creating new volumes.  A later `bosn ensure`
+repairs an interrupted intent-backed creation automatically, but it never guesses ownership
+from a name or from an unlabeled Docker volume.  For a legacy partial volume created before
+that intent record existed, inspect the protected decision first:
+
+```bash
+bosn gc --dry-run --json
+bosn reconcile-volume --stack perf --volume target --json
+bosn reconcile-volume --stack perf --volume target --apply --yes
+```
+
+`reconcile-volume` accepts the logical volume declared in `bosn.toml`, not an arbitrary
+engine volume name.  It derives the exact target from the current manifest, requires the
+current registry label plus a matching surviving manifest-binding label (`stack`,
+`generation`, `scope`, or `workspace`); every other surviving Bosn label must also agree.
+It refuses an
+unlabeled, foreign, contradictory, attached, or attachment-unknown volume.  The final
+attachment check happens again immediately before staged recreation.  `gc --apply` remains
+non-destructive for all incomplete resources; there is no `--force`, and `adopt` is not a
+remedy for incomplete ownership.
+
+When `gc` has a selected `bosn.toml`, its dry-run report also checks only the exact volume
+names derived from that manifest. This makes an otherwise label-free collision visible as a
+protected manifest blocker; the name remains a diagnostic selector, never ownership proof.
+
 Nothing needs starting — the first command lazily spawns the daemon.
 
 **For unattended cleanup, install the login launcher once:**
@@ -469,6 +496,8 @@ bosn jobs / bosn attach <j>  # daemon-owned builds that survive a killed CLI
 bosn cancel <j>              # stop a build you no longer want
 bosn done                    # this workspace is finished; its caches become collectable
 bosn gc --dry-run --json     # rich engine/storage inventory; --apply reclaims (no --force)
+bosn reconcile-volume --stack perf --volume target  # preview one legacy partial target
+bosn reconcile-volume --stack perf --volume target --apply --yes  # explicit repair
 bosn doctor                  # engine reachability, registry integrity, recovery commands
 bosn adopt --legacy <family> # import pre-bosn volumes; --yes to apply
 
@@ -483,6 +512,11 @@ daemon returns `mode: "online"`; an absent daemon returns `mode: "offline"`; and
 stream returns `mode: "degraded"` with persisted session diagnostics. For the rich engine,
 ownership, and storage inventory, use `bosn gc --dry-run --json` instead. `gc` and `jobs` are
 read-only but go through the daemon and fail closed if it is unreachable.
+
+`reconcile-volume` is for incomplete legacy labels only. It derives the engine name from the
+current manifest and refuses arbitrary names, unlabeled volumes, foreign/contradictory labels,
+and anything attached or with unknown attachment state. Ordinary `ensure` auto-recovers only a
+durable intent-backed interruption; it never uses this explicit legacy authority on its own.
 
 When ordinary `status` can reach the daemon and says the client is dead, run `bosn daemon-stop`:
 Bosn first proves the owner is dead, then removes only that session's exact immutable container

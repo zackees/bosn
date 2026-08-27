@@ -34,7 +34,9 @@ class Options:
     source_registry: str | None = None
     transfer: tuple[str, ...] = ()
     legacy: str | None = None
+    volume: str | None = None
     yes: bool = False
+    reconcile_apply: bool = False
     args: tuple[str, ...] = ()
     json: bool = False
 
@@ -136,7 +138,9 @@ def from_namespace(ns: argparse.Namespace) -> Options:
         source_registry=_as_str(get("source_registry")),
         transfer=get_list("transfer"),
         legacy=_as_str(get("legacy")),
+        volume=_as_str(get("volume")),
         yes=bool(get("yes", False)),
+        reconcile_apply=bool(get("reconcile_apply", False)),
         args=get_list("args"),
         json=bool(get("json", False)),
         compose=_as_str(get("compose")),

@@ -303,6 +303,26 @@ def test_interrupted_volume_recovery_refuses_an_unlabeled_collision(tmp_path: Pa
         assert registry.volume_creation_intent(name) is not None
 
 
+def test_no_intent_partial_volume_is_never_automatically_recovered(
+    project: Path, registry: Registry
+) -> None:
+    """#120: legacy recovery is an explicit CLI action, never an ensure side effect."""
+    engine = FakeEngine()
+    converger = Converger(load(project), registry, engine)  # type: ignore[arg-type]
+    stack = converger.manifest.stack("test")
+    workspace = workspace_of(converger.manifest)
+    name = volume_name_for(
+        stack, "spec", "target", digest="sha256:g", workspace=workspace, family=stack.family
+    )
+    partial = converger._resource_labels(stack, "volume", "sha256:g", "spec", workspace).to_dict()
+    del partial[labels.CREATED]
+    engine.existing.add(name)
+    engine.resource_labels[("volume", name)] = partial
+
+    with pytest.raises(EngineError, match="refusing to reuse"):
+        converger._ensure_volumes(stack, "sha256:g", workspace)
+
+
 def test_first_converge_registers_then_reuses(converger: Converger) -> None:
     """The same command is correct on the 1st and the 500th invocation."""
     first = converger.converge()

@@ -49,6 +49,13 @@ unless Docker access is intentionally configured.
 - Treat foreign registry warnings as protected state. Bosn intentionally cannot delete
   resources owned by a different registry identity; use explicit adoption only after
   confirming ownership.
+- For an incomplete legacy volume, inspect `bosn gc --dry-run --json` and use only
+  `bosn reconcile-volume --stack <stack> --volume <logical-name>` to preview it. Apply needs
+  `--apply --yes`; a registry label plus `kind`/`created` alone is insufficient. Never
+  substitute `adopt`, a raw engine name, or a force-delete.
+- Run `bosn gc` from the affected workspace or pass `--manifest`: it adds protected
+  diagnostics for exact manifest-derived volume-name collisions, including label-free ones,
+  but never uses the name itself as permission to modify a volume.
 - After changing bosn code during development, restart its daemon before dogfooding so the
   in-memory process runs the updated implementation.
 

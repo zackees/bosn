@@ -16,6 +16,7 @@ import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -98,6 +99,72 @@ def test_port_is_deterministic_not_random(tmp_path: Path) -> None:
     other = tmp_path / "elsewhere"
     other.mkdir()
     assert daemon_mod.port_for(other) != daemon_mod.port_for(tmp_path)
+
+
+def test_disconnected_non_streaming_response_does_not_escape_handler(
+    served: Daemon, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A client timing out on a large GC response cannot take down the daemon (#120)."""
+    handler = object.__new__(daemon_mod._Handler)
+    handler.connection = object()
+    handler.server = SimpleNamespace(daemon_ref=served)  # type: ignore[assignment]
+    monkeypatch.setattr(ipc, "read_request", lambda _conn: {"auth": served.secret, "verb": "gc"})
+    monkeypatch.setattr(served, "dispatch", lambda *_args: {"ok": True, "unproven_resources": [{}]})
+    real_send_response = ipc.send_response
+    monkeypatch.setattr(
+        ipc, "send_response", lambda *_args: (_ for _ in ()).throw(OSError("reset"))
+    )
+
+    handler.handle()
+
+    monkeypatch.setattr(ipc, "send_response", real_send_response)
+    assert _wait_until(lambda: daemon_mod.is_serving(served.state_dir)), "daemon stopped serving"
+    assert any(row["kind"] == "ipc.response_disconnected" for row in served.registry.events())
+
+
+def test_reconcile_volume_version_mismatch_is_rejected_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even a preview must match: the same verb may later perform an apply."""
+
+    class NoRegistryMutation:
+        def log_event(self, *_args: object) -> None:
+            raise AssertionError("the version gate must not mutate the registry")
+
+    class NoDispatch:
+        secret = "test-secret"
+        registry = NoRegistryMutation()
+
+        def note_activity(self) -> None:
+            return None
+
+        def dispatch(self, *_args: object) -> dict[str, object]:
+            raise AssertionError("the version gate must reject before dispatch or engine use")
+
+    handler = object.__new__(daemon_mod._Handler)
+    handler.connection = object()
+    handler.server = SimpleNamespace(daemon_ref=NoDispatch())  # type: ignore[assignment]
+    responses: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        ipc,
+        "read_request",
+        lambda _conn: {
+            "auth": "test-secret",
+            "verb": "reconcile-volume",
+            "version": "a-client-version-that-does-not-match",
+            # Intentionally omit apply: preview is gated with the mutating verb too.
+        },
+    )
+    monkeypatch.setattr(ipc, "send_response", lambda _conn, reply: responses.append(reply))
+
+    handler.handle()
+
+    assert responses == [
+        {
+            "ok": False,
+            "error": "daemon version differs; restart the daemon before destructive use",
+        }
+    ]
 
 
 def test_default_state_dir_uses_the_fixed_default_port(monkeypatch) -> None:
