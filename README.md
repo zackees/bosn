@@ -483,12 +483,15 @@ returns a bounded `mode: "degraded"` report from the registry instead of falling
 slow Docker inventory. `gc` and `jobs` are read-only but go through the daemon and fail closed
 if it is unreachable.
 
-If that degraded report says the client is still live, leave it alone. If it says the client is
-dead, run `bosn daemon-stop`: Bosn first proves the owner is dead, then removes only that
-session's exact immutable container and releases its leases. A `last_orphan_reap_error` field
-means that safe cleanup could not be proved or completed; resolve the named engine/database
-error and retry `bosn daemon-stop`. Do not delete registry rows or use a blind Docker force
-operation.
+When ordinary `status` can reach the daemon and says the client is dead, run `bosn daemon-stop`:
+Bosn first proves the owner is dead, then removes only that session's exact immutable container
+and releases its leases. A `last_orphan_reap_error` field means that safe cleanup could not be
+proved or completed; resolve the named engine/database error and retry `bosn daemon-stop`.
+
+Do **not** run `bosn daemon-stop` directly from `mode: "degraded"`: it uses the same unavailable
+daemon control channel. First restore or restart Bosn through its supported launcher/service and
+wait for `bosn status` to respond; then use `bosn daemon-stop` for the exact-container recovery.
+Do not delete registry rows or use a blind Docker force operation.
 
 **After you upgrade bosn, stop the daemon.** A running daemon refuses every mutating verb
 whose client reports a different version, so the next `bosn run` fails until you restart it.

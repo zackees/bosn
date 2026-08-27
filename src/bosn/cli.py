@@ -833,7 +833,7 @@ def cmd_cancel(opts: Options) -> int:
     return 0
 
 
-def _persisted_execution_sessions(registry) -> list[dict]:
+def _persisted_execution_sessions(registry, *, daemon_control_available: bool) -> list[dict]:
     """Describe durable foreground ownership without contacting the engine or daemon.
 
     The registry proves that a session is protected, but never authorizes removal.  In
@@ -870,8 +870,14 @@ def _persisted_execution_sessions(registry) -> list[dict]:
                 "recovery": (
                     "do not interrupt the live client"
                     if alive
-                    else "run `bosn daemon-stop`; it reaps only this exact container after "
-                    "confirming the client is dead"
+                    else (
+                        "run `bosn daemon-stop`; it reaps only this exact container after "
+                        "confirming the client is dead"
+                        if daemon_control_available
+                        else "the daemon control channel is unavailable; restore or restart "
+                        "Bosn through its supported launcher/service first. Once `bosn "
+                        "status` responds, run `bosn daemon-stop` for exact-container reap"
+                    )
                 ),
             }
         )
@@ -930,7 +936,9 @@ def cmd_status(opts: Options) -> int:
             # is intentionally *not* sufficient evidence to touch Docker.  Returning this
             # bounded report avoids turning a control-plane failure into an unbounded engine
             # inventory while retaining fail-closed ownership.
-            persisted_sessions = _persisted_execution_sessions(registry)
+            persisted_sessions = _persisted_execution_sessions(
+                registry, daemon_control_available=not daemon_control_lost
+            )
             if daemon_control_lost:
                 print(
                     json.dumps(
@@ -944,10 +952,12 @@ def cmd_status(opts: Options) -> int:
                             },
                             "execution_sessions": persisted_sessions,
                             "next": (
-                                "a live session remains protected. For a dead client, run "
-                                "`bosn daemon-stop`; it attempts safe exact-container recovery "
-                                "and reports any remaining error. Do not delete registry rows or "
-                                "use a blind Docker force operation."
+                                "the daemon control channel is unavailable, so do not run "
+                                "`bosn daemon-stop` yet: it uses that same channel. Restore or "
+                                "restart Bosn through its supported launcher/service first; once "
+                                "`bosn status` responds, `bosn daemon-stop` can attempt safe "
+                                "exact-container recovery. Do not delete registry rows or use a "
+                                "blind Docker force operation."
                                 if persisted_sessions
                                 else "no execution session is persisted. Restart the daemon "
                                 "before retrying a mutating command."

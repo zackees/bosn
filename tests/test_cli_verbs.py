@@ -153,7 +153,8 @@ def test_status_uses_persisted_session_proof_when_daemon_control_stream_is_lost(
     assert report["mode"] == "degraded"
     assert report["execution_sessions"][0]["id"] == "orphan"
     assert report["execution_sessions"][0]["last_orphan_reap_error"]["detail"].endswith("busy")
-    assert "daemon-stop" in report["execution_sessions"][0]["recovery"]
+    assert "control channel is unavailable" in report["execution_sessions"][0]["recovery"]
+    assert "do not run `bosn daemon-stop` yet" in report["next"]
 
 
 def test_status_is_bounded_when_a_daemon_stream_is_lost_without_a_session(
