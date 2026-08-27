@@ -599,6 +599,9 @@ def test_gc_asks_the_daemon_for_more_than_the_shared_default_budget(tmp_path, mo
         return {"ok": True, "result": {"collected": [], "kept": []}}
 
     monkeypatch.setattr(daemon, "request", capture)
+    # The repository checkout has its own bosn.toml. This case is specifically global GC
+    # with no discoverable manifest, so its client cwd must be the empty temporary root.
+    monkeypatch.chdir(tmp_path)
     cli.main(["--state-dir", str(tmp_path), "gc", "--dry-run", "--json"])
     assert seen["verb"] == "gc"
     assert seen["request_timeout"] == cli.GC_REQUEST_TIMEOUT_SECONDS
