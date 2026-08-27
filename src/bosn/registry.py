@@ -973,8 +973,7 @@ class Registry:
         """
         if detail_prefix:
             return self._exec(
-                "SELECT * FROM events WHERE kind = ? AND detail LIKE ? "
-                "ORDER BY id DESC LIMIT 1",
+                "SELECT * FROM events WHERE kind = ? AND detail LIKE ? ORDER BY id DESC LIMIT 1",
                 (kind, f"{detail_prefix}%"),
             ).fetchone()
         return self._exec(

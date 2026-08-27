@@ -149,9 +149,7 @@ def test_status_uses_persisted_session_proof_when_daemon_control_stream_is_lost(
 
     assert cli.main(["--state-dir", str(state), "status", "--json"]) == 0
     report = json.loads(capsys.readouterr().out)
-    assert calls == [
-        {"autostart": False, "request_timeout": cli.STATUS_DAEMON_TIMEOUT_SECONDS}
-    ]
+    assert calls == [{"autostart": False, "request_timeout": cli.STATUS_DAEMON_TIMEOUT_SECONDS}]
     assert report["mode"] == "degraded"
     assert report["execution_sessions"][0]["id"] == "orphan"
     assert report["execution_sessions"][0]["last_orphan_reap_error"]["detail"].endswith("busy")
