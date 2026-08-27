@@ -594,6 +594,14 @@ prior registry it prints a source-specific `bosn adopt --from-registry <uuid>` c
 lost-database recovery only: it restores an identity into an empty registry and never replaces
 the identity of a registry that already has rows.
 
+On native Windows, Docker's client can be present while Docker Desktop's server API is wedged.
+When a server-version HTTP 5xx is supported by bounded Desktop and `docker-desktop` WSL
+observations, `doctor` reports the raw failure, local read-only registry counts, and the
+configured VHDX **allocation** when it can find one. Engine resource inventory is explicitly
+unavailable in this state: foreign labels, ownership, and reclaimable storage cannot be
+inferred. Restart Docker Desktop manually and rerun `doctor`; Bosn never restarts Desktop,
+prunes or adopts resources, changes WSL, or alters or compacts the VHDX from this diagnostic.
+
 ## Integration
 
 clud ships a thin `clud bosn …` forwarder that passes argv verbatim to the executable, exactly

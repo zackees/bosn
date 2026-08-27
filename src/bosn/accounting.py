@@ -46,6 +46,14 @@ class StorageProbe:
     vhdx_slack_bytes: int | None = None
 
 
+@dataclass(frozen=True)
+class VhdxAllocation:
+    """Configured Docker Desktop data-disk allocation, never a reclaimability claim."""
+
+    path: Path
+    allocated_bytes: int
+
+
 def _bytes(value: object) -> int | None:
     """Parse Docker's JSON size field; absent/unrecognised remains explicitly unknown."""
     if isinstance(value, int):
@@ -179,6 +187,24 @@ def desktop_vhdx(directory: Path) -> Path | None:
     return max(
         candidates, key=lambda path: (path.name.lower() == "docker_data.vhdx", path.stat().st_size)
     )
+
+
+def configured_desktop_vhdx_allocation(
+    settings_path: Path | None = None,
+) -> VhdxAllocation | None:
+    """Read configured Desktop allocation without consulting the unavailable engine."""
+    settings_path = settings_path or (
+        Path(os.environ.get("APPDATA", "")) / "Docker" / "settings-store.json"
+    )
+    try:
+        raw = json.loads(settings_path.read_text(encoding="utf-8"))
+        for key in ("CustomWslDistroDir", "DataFolder"):
+            value = raw.get(key)
+            if value and (vhdx := desktop_vhdx(Path(str(value)))) is not None:
+                return VhdxAllocation(vhdx, vhdx.stat().st_size)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return None
 
 
 def probe(engine: Engine, fallback: Path) -> StorageProbe:
