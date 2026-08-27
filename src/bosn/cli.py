@@ -1011,21 +1011,23 @@ def cmd_gc(opts: Options) -> int:
     from bosn import daemon as daemon_mod
     from bosn.config import ConfigError
     from bosn.config import load as load_config
-    from bosn.manifest import find_manifest
+    from bosn.manifest import ManifestError, find_manifest, load
 
     try:
         flags = _policy_flags(opts)
         load_config(flags=flags)
-        # GC stays global when no manifest is present.  When one is available, the daemon
-        # can additionally inspect the exact volume names it derives from this contract.
+        # GC stays global when no manifest is present. When one is available, load it
+        # before IPC so a relative or custom filename becomes the stable source path the
+        # daemon must inspect, while its manifest root remains the collision context.
         manifest_path = opts.manifest or find_manifest()
+        manifest = load(manifest_path) if manifest_path is not None else None
         reply = daemon_mod.request(
             "gc",
             opts.state_dir,
             engine=opts.engine,
             dry_run=opts.dry_run,
             policy_flags=flags,
-            manifest=str(manifest_path) if manifest_path is not None else None,
+            manifest=str(manifest.path) if manifest is not None else None,
             request_timeout=GC_REQUEST_TIMEOUT_SECONDS,
         )
     except ConfigError as exc:
@@ -1033,6 +1035,13 @@ def cmd_gc(opts: Options) -> int:
             code="policy.invalid",
             message=str(exc),
             next_step="correct the named policy value and retry",
+            as_json=opts.json,
+        )
+    except ManifestError as exc:
+        return _error(
+            code="manifest.invalid",
+            message=str(exc),
+            next_step="create or select a valid bosn.toml with --manifest",
             as_json=opts.json,
         )
     except ipc.TransportTimeout as exc:

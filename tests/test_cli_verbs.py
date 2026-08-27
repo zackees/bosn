@@ -595,12 +595,14 @@ def test_gc_asks_the_daemon_for_more_than_the_shared_default_budget(tmp_path, mo
     def capture(verb, *_args, **kwargs):
         seen["verb"] = verb
         seen["request_timeout"] = kwargs.get("request_timeout")
+        seen["manifest"] = kwargs.get("manifest")
         return {"ok": True, "result": {"collected": [], "kept": []}}
 
     monkeypatch.setattr(daemon, "request", capture)
     cli.main(["--state-dir", str(tmp_path), "gc", "--dry-run", "--json"])
     assert seen["verb"] == "gc"
     assert seen["request_timeout"] == cli.GC_REQUEST_TIMEOUT_SECONDS
+    assert seen["manifest"] is None
     assert cli.GC_REQUEST_TIMEOUT_SECONDS > ipc.DEFAULT_TIMEOUT
 
 
@@ -621,7 +623,30 @@ def test_gc_passes_an_available_manifest_for_exact_collision_diagnostics(
     monkeypatch.setattr(daemon, "request", capture)
     assert cli.main(["--manifest", str(manifest), "gc", "--json"]) == 0
     assert seen["verb"] == "gc"
-    assert seen["manifest"] == str(manifest)
+    assert seen["manifest"] == str(manifest.resolve())
+
+
+def test_gc_canonicalizes_a_relative_custom_manifest_before_daemon_ipc(
+    tmp_path, monkeypatch
+) -> None:
+    from bosn import daemon
+
+    custom = tmp_path / "development.toml"
+    custom.write_text("[stack.perf]\nimage = 'alpine:3.20'\n", encoding="utf-8")
+    # The source path, not this default-named sibling, is the daemon's exact collision
+    # discriminator. Running from the client cwd makes the old relative-path handoff
+    # observably unsafe for a daemon with another cwd.
+    (tmp_path / "bosn.toml").write_text("[stack.decoy]\nimage = 'busybox'\n", encoding="utf-8")
+    seen: dict[str, object] = {}
+
+    def capture(_verb, *_args, **kwargs):
+        seen["manifest"] = kwargs["manifest"]
+        return {"ok": True, "result": {}, "errors": []}
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(daemon, "request", capture)
+    assert cli.main(["--manifest", "development.toml", "gc", "--json"]) == 0
+    assert seen["manifest"] == str(custom.resolve())
 
 
 def test_gc_json_reports_images_deferred_by_container_dependencies(
