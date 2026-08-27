@@ -365,9 +365,12 @@ def test_active_execution_session_pins_daemon_and_refuses_shutdown(tmp_path: Pat
         daemon.registry.close()
 
 
-def test_inflight_non_streaming_request_pins_daemon(tmp_path: Path) -> None:
+def test_inflight_non_streaming_request_pins_daemon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     entered = threading.Event()
     release = threading.Event()
+    watchdog_checked = threading.Event()
     reply: list[dict[str, object]] = []
     daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=0.1)
     daemon._set_next_maintenance(daemon.clock.now() + 3600)
@@ -381,6 +384,15 @@ def test_inflight_non_streaming_request_pins_daemon(tmp_path: Path) -> None:
         return {"ok": True}
 
     daemon.dispatch = blocking_dispatch  # type: ignore[method-assign]
+    original_should_retire = daemon.should_retire
+
+    def observed_should_retire() -> bool:
+        result = original_should_retire()
+        if entered.is_set() and not release.is_set():
+            watchdog_checked.set()
+        return result
+
+    monkeypatch.setattr(daemon, "should_retire", observed_should_retire)
     server = threading.Thread(target=daemon.serve_forever, daemon=True)
     server.start()
     try:
@@ -393,7 +405,7 @@ def test_inflight_non_streaming_request_pins_daemon(tmp_path: Path) -> None:
         )
         client.start()
         assert entered.wait(5), "GC handler never started"
-        time.sleep(0.4)
+        assert watchdog_checked.wait(5), "watchdog never checked retirement while GC was blocked"
         assert daemon_mod.is_serving(tmp_path), "watchdog retired an in-flight GC request"
         release.set()
         client.join(timeout=10)
