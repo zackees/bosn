@@ -896,6 +896,7 @@ def cmd_status(opts: Options) -> int:
     # understand why an otherwise terminal-only `jobs` list still blocks the stack (#119).
     # Do not autostart merely to optimize a read-only status command.
     daemon_error: str | None = None
+    daemon_control_lost = False
     try:
         daemon_status = daemon_mod.request(
             "status",
@@ -906,6 +907,7 @@ def cmd_status(opts: Options) -> int:
     except (daemon_mod.DaemonError, ipc.TransportError) as exc:
         daemon_status = None
         daemon_error = str(exc)
+        daemon_control_lost = isinstance(exc, ipc.TransportError)
     if daemon_status and daemon_status.get("execution_sessions"):
         print(
             json.dumps(
@@ -929,7 +931,7 @@ def cmd_status(opts: Options) -> int:
             # bounded report avoids turning a control-plane failure into an unbounded engine
             # inventory while retaining fail-closed ownership.
             persisted_sessions = _persisted_execution_sessions(registry)
-            if daemon_error is not None and persisted_sessions:
+            if daemon_control_lost:
                 print(
                     json.dumps(
                         {
@@ -946,6 +948,9 @@ def cmd_status(opts: Options) -> int:
                                 "`bosn daemon-stop`; it attempts safe exact-container recovery "
                                 "and reports any remaining error. Do not delete registry rows or "
                                 "use a blind Docker force operation."
+                                if persisted_sessions
+                                else "no execution session is persisted. Restart the daemon "
+                                "before retrying a mutating command."
                             ),
                         },
                         indent=2,

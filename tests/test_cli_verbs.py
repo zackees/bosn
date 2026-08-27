@@ -156,6 +156,33 @@ def test_status_uses_persisted_session_proof_when_daemon_control_stream_is_lost(
     assert "daemon-stop" in report["execution_sessions"][0]["recovery"]
 
 
+def test_status_is_bounded_when_a_daemon_stream_is_lost_without_a_session(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """#119: a completed foreground command must not send status into engine inventory."""
+    from bosn import daemon
+    from bosn.registry import Registry
+
+    state = tmp_path / "state"
+    with Registry(state / "registry.sqlite3"):
+        pass
+
+    monkeypatch.setattr(
+        daemon,
+        "request",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ipc.TransportTimeout("timed out waiting for the daemon")
+        ),
+    )
+    monkeypatch.setattr(cli, "Engine", lambda *_args: (_ for _ in ()).throw(AssertionError()))
+
+    assert cli.main(["--state-dir", str(state), "status", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["mode"] == "degraded"
+    assert report["execution_sessions"] == []
+    assert "Restart the daemon" in report["next"]
+
+
 def test_tasks_json_reports_unregistered_readiness(tmp_path, capsys) -> None:
     (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
     manifest = tmp_path / "bosn.toml"
