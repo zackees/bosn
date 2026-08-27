@@ -15,7 +15,6 @@ from bosn import labels
 from bosn.engine import Engine
 from bosn.resources import DiscoveredResource, TransferError, recreate_volume_with_labels
 
-
 # ``kind`` and ``created`` describe an object but do not bind it to the selected manifest
 # target.  Legacy reconciliation needs one surviving identity discriminator in addition to
 # the registry id; names are never evidence of ownership.
@@ -67,9 +66,11 @@ def has_legacy_corroboration(
     surviving = {
         key: value for key, value in raw_labels.items() if key.startswith(labels.NAMESPACE)
     }
-    return bool(surviving) and all(
-        expected_values.get(key) == value for key, value in surviving.items()
-    ) and any(raw_labels.get(key) == expected_values[key] for key in _MANIFEST_DISCRIMINATORS)
+    return (
+        bool(surviving)
+        and all(expected_values.get(key) == value for key, value in surviving.items())
+        and any(raw_labels.get(key) == expected_values[key] for key in _MANIFEST_DISCRIMINATORS)
+    )
 
 
 @dataclass(frozen=True)

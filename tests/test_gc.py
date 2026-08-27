@@ -286,9 +286,8 @@ def test_gc_only_advertises_legacy_inspection_for_a_manifest_discriminator(
             scanned_kinds={"volume"},
         ),
     )
-    result = Collector(
-        registry, FakeEngine({"partial": partial})
-    ).collect(dry_run=True)  # type: ignore[arg-type]
+    collector = Collector(registry, FakeEngine({"partial": partial}))  # type: ignore[arg-type]
+    result = collector.collect(dry_run=True)
 
     assert result.unproven_resources[0]["decision"] == {
         "action": "protected",
