@@ -366,28 +366,45 @@ def test_active_execution_session_pins_daemon_and_refuses_shutdown(tmp_path: Pat
 
 
 def test_inflight_non_streaming_request_pins_daemon(tmp_path: Path) -> None:
-    daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=0)
+    entered = threading.Event()
+    release = threading.Event()
+    reply: list[dict[str, object]] = []
+    daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=0.1)
+    daemon._set_next_maintenance(daemon.clock.now() + 3600)
+    original_dispatch = daemon.dispatch
+
+    def blocking_dispatch(verb: str, request: dict[str, object]) -> dict[str, object]:
+        if verb != "gc":
+            return original_dispatch(verb, request)
+        entered.set()
+        assert release.wait(10), "test did not release blocking GC request"
+        return {"ok": True}
+
+    daemon.dispatch = blocking_dispatch  # type: ignore[method-assign]
+    server = threading.Thread(target=daemon.serve_forever, daemon=True)
+    server.start()
     try:
-        handler = object.__new__(daemon_mod._Handler)
-        handler.connection = object()
-        handler.server = SimpleNamespace(daemon_ref=daemon)  # type: ignore[assignment]
-        sent: list[dict[str, object]] = []
-        original_read = ipc.read_request
-        original_send = ipc.send_response
-        ipc.read_request = lambda _conn: {"auth": daemon.secret, "verb": "gc"}  # type: ignore[assignment]
-        daemon.dispatch = lambda *_args: {"ok": True}  # type: ignore[method-assign]
-
-        def send(_conn: object, response: dict[str, object]) -> None:
-            assert not daemon.should_retire(), "watchdog must not retire during response"
-            sent.append(response)
-
-        ipc.send_response = send  # type: ignore[assignment]
-        handler.handle()
-        ipc.read_request = original_read  # type: ignore[assignment]
-        ipc.send_response = original_send  # type: ignore[assignment]
-        assert sent == [{"ok": True}]
-        assert daemon.should_retire()
+        assert _wait_until(lambda: daemon_mod.is_serving(tmp_path)), "daemon never came up"
+        client = threading.Thread(
+            target=lambda: reply.append(
+                ipc.send_request(daemon.port, {"auth": daemon.secret, "verb": "gc"}, timeout=10)
+            ),
+            daemon=True,
+        )
+        client.start()
+        assert entered.wait(5), "GC handler never started"
+        time.sleep(0.4)
+        assert daemon_mod.is_serving(tmp_path), "watchdog retired an in-flight GC request"
+        release.set()
+        client.join(timeout=10)
+        assert not client.is_alive(), "GC client never received a response"
+        assert reply == [{"ok": True}]
+        server.join(timeout=10)
+        assert not server.is_alive(), "daemon did not retire after request completion"
     finally:
+        release.set()
+        daemon.request_stop()
+        server.join(timeout=10)
         daemon.registry.close()
 
 
