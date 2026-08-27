@@ -16,6 +16,7 @@ import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -98,6 +99,25 @@ def test_port_is_deterministic_not_random(tmp_path: Path) -> None:
     other = tmp_path / "elsewhere"
     other.mkdir()
     assert daemon_mod.port_for(other) != daemon_mod.port_for(tmp_path)
+
+
+def test_disconnected_non_streaming_response_does_not_escape_handler(
+    served: Daemon, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A client timing out on a large GC response cannot take down the daemon (#120)."""
+    handler = object.__new__(daemon_mod._Handler)
+    handler.connection = object()
+    handler.server = SimpleNamespace(daemon_ref=served)
+    monkeypatch.setattr(ipc, "read_request", lambda _conn: {"auth": served.secret, "verb": "gc"})
+    monkeypatch.setattr(served, "dispatch", lambda *_args: {"ok": True, "unproven_resources": [{}]})
+    monkeypatch.setattr(
+        ipc, "send_response", lambda *_args: (_ for _ in ()).throw(OSError("reset"))
+    )
+
+    handler.handle()
+
+    assert daemon_mod.is_serving(served.state_dir)
+    assert any(row["kind"] == "ipc.response_disconnected" for row in served.registry.events())
 
 
 def test_default_state_dir_uses_the_fixed_default_port(monkeypatch) -> None:
