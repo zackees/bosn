@@ -993,6 +993,69 @@ def test_doctor_reports_unreachable_engine_and_scheduler_state_without_crashing(
     assert "not on PATH" in captured.err
 
 
+def test_doctor_reports_a_desktop_wedge_with_local_read_only_inventory(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """#136 preserves local evidence but never turns an engine failure into authority."""
+    import hashlib
+
+    from bosn import accounting
+    from bosn.engine import DesktopEvidence, EngineInfo
+    from bosn.registry import Registry
+
+    with Registry(tmp_path / "registry.sqlite3") as registry:
+        resource = registry.register_resource(
+            kind="volume",
+            name="warm-cache",
+            stack="dev",
+            generation="digest",
+            scope="stack",
+            workspace="workspace",
+        )
+        registry.acquire_lease(resource.id, pid=123, proc_start=1.0)
+    database = tmp_path / "registry.sqlite3"
+    before = hashlib.sha256(database.read_bytes()).hexdigest()
+
+    class WedgeEngine:
+        def __init__(self, binary: str = "docker") -> None:
+            self.binary = binary
+
+        def info(self):
+            return EngineInfo(
+                binary=self.binary,
+                reachable=False,
+                client_version="28.5.1",
+                detail="request returned 500 Internal Server Error",
+                failure_category="docker_desktop_wedged",
+                desktop_evidence=DesktopEvidence(True, True),
+            )
+
+    class ScannerMustNotRun:
+        def __init__(self, *_args) -> None:
+            raise AssertionError("doctor must not scan a wedged engine")
+
+    monkeypatch.setattr(cli, "Engine", WedgeEngine)
+    monkeypatch.setattr("bosn.resources.ResourceScanner", ScannerMustNotRun)
+    monkeypatch.setattr(
+        accounting,
+        "configured_desktop_vhdx_allocation",
+        lambda: accounting.VhdxAllocation(tmp_path / "docker_data.vhdx", 382 * 1024**3),
+    )
+
+    assert cli.main(["--state-dir", str(tmp_path), "doctor"]) == 1
+    captured = capsys.readouterr()
+    assert "Docker Desktop engine appears wedged" in captured.err
+    assert "restart Docker Desktop" in captured.err
+    assert "engine resource inventory: unavailable" in captured.out
+    assert "local registered resources: 1" in captured.out
+    assert "local leases: 1" in captured.out
+    assert "382.0 GiB allocated" in captured.out
+    assert "prune" not in captured.err.lower()
+    assert "adopt" not in captured.err.lower()
+    assert "compact" not in captured.err.lower()
+    assert hashlib.sha256(database.read_bytes()).hexdigest() == before
+
+
 def test_doctor_fails_with_actionable_warning_when_engine_clock_is_skewed(
     tmp_path, monkeypatch, capsys
 ) -> None:
