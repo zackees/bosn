@@ -952,9 +952,7 @@ def cmd_status(opts: Options) -> int:
     if daemon_status is not None:
         daemon_error = str(daemon_status.get("error") or "daemon did not return status")
     with Registry(db_path, read_only=True) as registry:
-        persisted_sessions = _persisted_execution_sessions(
-            registry, daemon_control_available=False
-        )
+        persisted_sessions = _persisted_execution_sessions(registry, daemon_control_available=False)
         print(
             json.dumps(
                 {
