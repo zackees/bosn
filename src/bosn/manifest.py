@@ -236,10 +236,16 @@ class Manifest:
     root: Path
     stacks: dict[str, StackSpec] = field(default_factory=dict)
     tasks: dict[str, TaskSpec] = field(default_factory=dict)
+    # `root` is deliberately the Docker context/workspace root.  The selected manifest
+    # need not be called bosn.toml, though, and daemon IPC must retain that exact source
+    # path rather than reconstructing a default-named sibling from the context root.
+    # Keeping this after the existing positional fields preserves Manifest(root, stacks,
+    # tasks) callers.
+    source_path: Path | None = None
 
     @property
     def path(self) -> Path:
-        return self.root / MANIFEST_NAME
+        return self.source_path or self.root / MANIFEST_NAME
 
     def default_stack(self) -> StackSpec:
         explicit = [s for s in self.stacks.values() if s.default]
@@ -295,13 +301,18 @@ def load(path: Path | str) -> Manifest:
     path = to_host_path(path)
     if path.is_dir():
         path = path / MANIFEST_NAME
+    # IPC crosses a daemon whose cwd is not the client's cwd.  Canonicalizing the
+    # selected source here makes a relative --manifest stable on both sides while keeping
+    # `root` (and therefore Docker context, digest inputs, and workspace identity) at the
+    # manifest's parent directory.
+    path = path.resolve()
     if not path.is_file():
         raise ManifestError(f"no manifest at {path}")
     try:
         raw = tomllib.loads(path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as exc:
         raise ManifestError(f"{path} is not valid TOML: {exc}") from exc
-    return parse(raw, root=path.parent)
+    return parse(raw, root=path.parent, source_path=path)
 
 
 def _refuse_duplicate_destinations(
@@ -339,8 +350,8 @@ def _refuse_duplicate_destinations(
         raise ManifestError(f"[stack.{stack}] mounts {duplicated} more than once")
 
 
-def parse(raw: dict, root: Path) -> Manifest:
-    manifest = Manifest(root=root)
+def parse(raw: dict, root: Path, *, source_path: Path | None = None) -> Manifest:
+    manifest = Manifest(root=root, source_path=source_path)
 
     for name, body in (raw.get("stack") or {}).items():
         if not isinstance(body, dict):

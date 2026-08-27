@@ -371,6 +371,168 @@ def test_tasks_json_reports_unregistered_readiness(tmp_path, capsys) -> None:
     assert payload["tasks"]["unit"]["readiness"]["jobs"]["state"] == "unavailable"
 
 
+def test_tasks_reports_the_selected_custom_manifest_path(tmp_path, capsys) -> None:
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    custom = tmp_path / "development.toml"
+    custom.write_text("[stack.dev]\ndockerfile = 'Dockerfile'\n", encoding="utf-8")
+    # A decoy makes this fail before #126: the loaded custom manifest was displayed as
+    # `<root>/bosn.toml`, despite that file neither selecting nor describing this stack.
+    (tmp_path / "bosn.toml").write_text("[stack.decoy]\nimage = 'busybox'\n", encoding="utf-8")
+
+    assert cli.main(["--manifest", str(custom), "tasks", "--json"]) == 0
+
+    assert json.loads(capsys.readouterr().out)["manifest"] == str(custom.resolve())
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        lambda custom: ["--manifest", str(custom), "ensure"],
+        lambda custom: ["ensure", "--manifest", str(custom)],
+    ],
+    ids=["global-manifest", "verb-local-manifest"],
+)
+def test_ensure_forwards_custom_manifest_source_for_global_and_local_flags(
+    tmp_path, monkeypatch, args
+) -> None:
+    from bosn.converge import ConvergeResult
+
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    custom = tmp_path / "development.toml"
+    custom.write_text("[stack.dev]\ndockerfile = 'Dockerfile'\n", encoding="utf-8")
+    (tmp_path / "bosn.toml").write_text("[stack.decoy]\nimage = 'busybox'\n", encoding="utf-8")
+    seen: dict[str, object] = {}
+
+    def converge(_opts, manifest, _stack):
+        seen["manifest"] = manifest.path
+        return ConvergeResult("dev", "sha256:custom", "reused", "image")
+
+    monkeypatch.setattr(cli, "_converge_via_daemon", converge)
+    assert cli.main(args(custom)) == 0
+    assert seen["manifest"] == custom.resolve()
+
+
+@pytest.mark.parametrize("verb", ["run", "shell"])
+def test_foreground_verbs_forward_the_selected_custom_source_to_execution_acquire(
+    verb, tmp_path, monkeypatch
+) -> None:
+    from bosn import daemon, resources
+    from bosn.converge import ConvergeResult
+
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    custom = tmp_path / "development.toml"
+    custom.write_text(
+        "[stack.dev]\ndockerfile = 'Dockerfile'\ndefault = true\n", encoding="utf-8"
+    )
+    (tmp_path / "bosn.toml").write_text("[stack.decoy]\nimage = 'busybox'\n", encoding="utf-8")
+    monkeypatch.setattr(
+        cli,
+        "_converge_via_daemon",
+        lambda *_args: ConvergeResult("dev", "sha256:custom", "reused", "image"),
+    )
+    monkeypatch.setattr(resources, "process_start_time", lambda _pid: 1.0)
+    seen: dict[str, object] = {}
+
+    def request(requested_verb, *_args, **kwargs):
+        if requested_verb == "execution-acquire":
+            seen["manifest"] = kwargs["manifest"]
+            return {"ok": True, "container": "container", "session": "session"}
+        assert requested_verb == "execution-release"
+        return {"ok": True}
+
+    class Engine:
+        def __init__(self, _binary="docker") -> None:
+            pass
+
+        def execute(self, _args) -> int:
+            return 0
+
+        def interactive(self, _args) -> int:
+            return 0
+
+    monkeypatch.setattr(daemon, "request", request)
+    monkeypatch.setattr(cli, "Engine", Engine)
+    command = ["--manifest", str(custom), verb]
+    if verb == "run":
+        command.extend(["--", "true"])
+    assert cli.main(command) == 0
+    assert seen["manifest"] == str(custom.resolve())
+
+
+def test_one_word_task_forwards_the_selected_custom_manifest_to_converge(
+    tmp_path, monkeypatch
+) -> None:
+    from bosn import daemon, resources
+    from bosn.converge import ConvergeResult
+
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    custom = tmp_path / "development.toml"
+    custom.write_text(
+        "[stack.dev]\ndockerfile = 'Dockerfile'\ndefault = true\n"
+        "[task.unit]\ncmd = 'true'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "bosn.toml").write_text("[stack.decoy]\nimage = 'busybox'\n", encoding="utf-8")
+    seen: dict[str, object] = {}
+
+    def converge(_opts, manifest, _stack):
+        seen["converge"] = manifest.path
+        return ConvergeResult("dev", "sha256:custom", "reused", "image")
+
+    def request(verb, *_args, **_kwargs):
+        if verb == "execution-acquire":
+            return {"ok": True, "container": "container", "session": "session"}
+        return {"ok": True}
+
+    class Engine:
+        def __init__(self, _binary="docker") -> None:
+            pass
+
+        def execute(self, _args) -> int:
+            return 0
+
+    monkeypatch.setattr(cli, "_converge_via_daemon", converge)
+    monkeypatch.setattr(resources, "process_start_time", lambda _pid: 1.0)
+    monkeypatch.setattr(daemon, "request", request)
+    monkeypatch.setattr(cli, "Engine", Engine)
+    assert cli.main(["--manifest", str(custom), "unit"]) == 0
+    assert seen["converge"] == custom.resolve()
+
+
+def test_reconcile_volume_forwards_selected_custom_manifest_source(tmp_path, monkeypatch) -> None:
+    from bosn import daemon
+
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    custom = tmp_path / "development.toml"
+    custom.write_text(
+        "[stack.dev]\ndockerfile = 'Dockerfile'\n[stack.dev.volumes]\ntarget = { scope = 'spec' }\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "bosn.toml").write_text("[stack.decoy]\nimage = 'busybox'\n", encoding="utf-8")
+    seen: dict[str, object] = {}
+
+    def request(_verb, *_args, **kwargs):
+        seen["manifest"] = kwargs["manifest"]
+        return {"ok": True, "plan": {}}
+
+    monkeypatch.setattr(daemon, "request", request)
+    assert (
+        cli.main(
+            [
+                "reconcile-volume",
+                "--manifest",
+                str(custom),
+                "--stack",
+                "dev",
+                "--volume",
+                "target",
+            ]
+        )
+        == 0
+    )
+    assert seen["manifest"] == str(custom.resolve())
+
+
 def test_tasks_json_manifest_error_has_stable_remedy(tmp_path, monkeypatch, capsys) -> None:
     monkeypatch.chdir(tmp_path)
     assert cli.main(["--state-dir", str(tmp_path), "tasks", "--json"]) == 1
