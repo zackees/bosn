@@ -107,7 +107,7 @@ def test_disconnected_non_streaming_response_does_not_escape_handler(
     """A client timing out on a large GC response cannot take down the daemon (#120)."""
     handler = object.__new__(daemon_mod._Handler)
     handler.connection = object()
-    handler.server = SimpleNamespace(daemon_ref=served)
+    handler.server = SimpleNamespace(daemon_ref=served)  # type: ignore[assignment]
     monkeypatch.setattr(ipc, "read_request", lambda _conn: {"auth": served.secret, "verb": "gc"})
     monkeypatch.setattr(served, "dispatch", lambda *_args: {"ok": True, "unproven_resources": [{}]})
     real_send_response = ipc.send_response
