@@ -826,7 +826,10 @@ def cmd_run(opts: Options) -> int:
                 # is intentionally limited to this machine-facing mode; ordinary runs use
                 # ``execute`` below and remain live on both native streams.
                 try:
-                    result = engine.run(exec_args, timeout=config.get("run_max_duration"))
+                    result = engine.execute_capture(
+                        exec_args,
+                        timeout=config.get("run_max_duration"),
+                    )
                 except KeyboardInterrupt:
                     engine._abort_container(str(acquired["container"]))
                     raise

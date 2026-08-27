@@ -3,11 +3,165 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
 
 import pytest
 
 from bosn import engine as engine_mod
 from bosn.engine import DesktopEvidence, Engine, EngineError, EngineResult
+
+
+class StalledProcess:
+    """Deterministic local Docker-CLI stand-in: pending until the monitor kills it."""
+
+    KEYBOARD_INTERRUPT_EXIT_CODES: set[int] = set()
+
+    def __init__(self, *_args, **_kwargs) -> None:
+        self.killed = False
+        self._killed = threading.Event()
+        self.output_bytes = 0
+
+    @property
+    def finished(self) -> bool:
+        return self.killed
+
+    def has_pending_output(self) -> bool:
+        return False
+
+    def get_next_line_non_blocking(self):
+        return engine_mod.rp.EndOfStream() if self.killed else None
+
+    def wait(self, *, timeout=None, echo=False):
+        del echo
+        if not self._killed.wait(timeout):
+            raise TimeoutError()
+        return -9
+
+    def kill(self) -> None:
+        self.killed = True
+        self._killed.set()
+
+    def captured_output_bytes(self) -> int:
+        return self.output_bytes
+
+    def poll(self) -> int | None:
+        return -9 if self.killed else None
+
+
+def _fast_health_monitor(monkeypatch) -> None:
+    monkeypatch.setattr(engine_mod, "ENGINE_HEALTH_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr(engine_mod, "ENGINE_HEALTH_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(engine_mod, "ENGINE_HEALTH_FAILURE_LIMIT", 2)
+
+
+def test_stream_fails_when_repeated_bounded_probes_cannot_reach_engine(monkeypatch) -> None:
+    _fast_health_monitor(monkeypatch)
+    process = StalledProcess()
+    monkeypatch.setattr(engine_mod.rp, "RunningProcess", lambda *_a, **_k: process)
+    engine = Engine("docker")
+    probes: list[float] = []
+
+    def down(timeout: float) -> tuple[bool, str]:
+        probes.append(timeout)
+        return False, "server-version probe exceeded its deadline"
+
+    monkeypatch.setattr(engine, "_probe_server", down)
+
+    with pytest.raises(EngineError, match="down or unresponsive.*bad state") as raised:
+        engine.stream(["build", "."])
+
+    assert "bosn doctor" in str(raised.value)
+    assert process.killed
+    assert len(probes) == 2
+
+
+def test_execute_fails_when_repeated_bounded_probes_cannot_reach_engine(monkeypatch) -> None:
+    _fast_health_monitor(monkeypatch)
+    process = StalledProcess()
+    monkeypatch.setattr(engine_mod.rp, "RunningProcess", lambda *_a, **_k: process)
+    engine = Engine("docker")
+    monkeypatch.setattr(engine, "_probe_server", lambda _timeout: (False, "named pipe stalled"))
+    aborted: list[str | None] = []
+    monkeypatch.setattr(engine, "_abort_container", lambda value: aborted.append(value))
+
+    with pytest.raises(EngineError, match="down or unresponsive.*bad state"):
+        engine.execute(["exec", "exact-id", "true"], timeout=60, abort_container="exact-id")
+
+    assert process.killed
+    assert aborted == ["exact-id"]
+
+
+def test_captured_execute_reports_the_same_engine_health_failure(monkeypatch) -> None:
+    _fast_health_monitor(monkeypatch)
+    process = StalledProcess()
+    monkeypatch.setattr(engine_mod.rp, "RunningProcess", lambda *_a, **_k: process)
+    engine = Engine("docker")
+    monkeypatch.setattr(engine, "_probe_server", lambda _timeout: (False, "API stalled"))
+
+    with pytest.raises(EngineError, match="down or unresponsive.*bosn doctor"):
+        engine.execute_capture(["exec", "exact-id", "true"], timeout=60)
+
+    assert process.killed
+
+
+def test_health_monitor_tolerates_a_transient_probe_failure(monkeypatch) -> None:
+    _fast_health_monitor(monkeypatch)
+    monkeypatch.setattr(engine_mod, "ENGINE_HEALTH_FAILURE_LIMIT", 2)
+    attempts = 0
+    process = StalledProcess()
+    engine = Engine("docker")
+
+    def recovers(_timeout: float) -> tuple[bool, str]:
+        nonlocal attempts
+        attempts += 1
+        return (False, "busy") if attempts == 1 else (True, "")
+
+    monkeypatch.setattr(engine, "_probe_server", recovers)
+    monitor = engine._monitor(process)
+    monitor.start()
+    time.sleep(0.05)
+    monitor.stop()
+
+    assert monitor.error is None
+    assert not process.killed
+
+
+def test_continuing_output_defers_health_failure_classification(monkeypatch) -> None:
+    _fast_health_monitor(monkeypatch)
+    process = StalledProcess()
+    engine = Engine("docker")
+    probes = 0
+
+    def down(_timeout: float) -> tuple[bool, str]:
+        nonlocal probes
+        probes += 1
+        return False, "busy"
+
+    monkeypatch.setattr(engine, "_probe_server", down)
+    monitor = engine._monitor(process)
+    monitor.start()
+    for _ in range(8):
+        process.output_bytes += 1
+        time.sleep(0.005)
+    monitor.stop()
+
+    assert monitor.error is None
+    assert not process.killed
+    assert probes <= 1
+
+
+def test_native_pending_process_is_bounded_by_engine_health_monitor(monkeypatch) -> None:
+    """A real local child cannot become immortal when the independent probe is wedged."""
+    _fast_health_monitor(monkeypatch)
+    engine = Engine(sys.executable)
+    monkeypatch.setattr(engine, "_probe_server", lambda _timeout: (False, "transport stalled"))
+    started = time.monotonic()
+
+    with pytest.raises(EngineError, match="down or unresponsive"):
+        engine.stream(["-c", "import time; time.sleep(60)"])
+
+    assert time.monotonic() - started < 2.0
 
 
 class FakeEngine(Engine):
@@ -175,12 +329,33 @@ def test_run_reports_an_actual_timeout_as_a_deadline(monkeypatch) -> None:
     # question is answered here rather than inherited from the runner.
     monkeypatch.setattr(engine_mod.Engine, "available", lambda _self: True)
     monkeypatch.setattr(engine_mod.rp, "subprocess_run", fake_subprocess_run)
+    monkeypatch.setattr(engine_mod.Engine, "_probe_server", lambda *_args: (True, ""))
 
     with pytest.raises(EngineError, match="7-second deadline") as raised:
         Engine("docker", timeout=7).run(["ps"])
 
     assert raised.value.__cause__ is wrapped
     assert wrapped.__cause__ is cause
+
+
+def test_run_timeout_reports_engine_unresponsive_when_probe_also_fails(monkeypatch) -> None:
+    cause = engine_mod.rp.TimeoutExpired(cmd=["docker", "ps"], timeout=7)
+    wrapped = RuntimeError("timed out")
+    wrapped.__cause__ = cause
+    monkeypatch.setattr(engine_mod.Engine, "available", lambda _self: True)
+    monkeypatch.setattr(
+        engine_mod.rp,
+        "subprocess_run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(wrapped),
+    )
+    monkeypatch.setattr(
+        engine_mod.Engine,
+        "_probe_server",
+        lambda *_args: (False, "server pipe did not respond"),
+    )
+
+    with pytest.raises(EngineError, match="down or unresponsive.*bad state.*bosn doctor"):
+        Engine("docker", timeout=7).run(["ps"])
 
 
 def test_run_distinguishes_a_spawn_failure_from_a_timeout(monkeypatch) -> None:

@@ -386,7 +386,7 @@ def parse(raw: dict, root: Path, *, source_path: Path | None = None) -> Manifest
         _refuse_duplicate_destinations(name, volumes, mounts, tmpfs)
         env: dict[str, str] = {}
         for env_key, env_value in (body.get("env") or {}).items():
-            if isinstance(env_value, (dict, list)):
+            if isinstance(env_value, dict | list):
                 raise ManifestError(
                     f"[stack.{name}.env] key {env_key!r} must be a scalar, not a table or array"
                 )

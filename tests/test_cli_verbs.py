@@ -825,7 +825,7 @@ def test_run_json_failure_reserves_stdout_for_one_envelope(tmp_path, monkeypatch
         def __init__(self, _binary="docker") -> None:
             pass
 
-        def run(self, *_args, **_kwargs):
+        def execute_capture(self, *_args, **_kwargs):
             return EngineResult(7, "partial stdout", "partial stderr")
 
         def execute(self, *_args, **_kwargs):
