@@ -19,6 +19,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import secrets
 import socket
 import socketserver
@@ -43,6 +44,21 @@ DEFAULT_PORT = 47764
 # Deterministic per-state-dir ports live in the IANA dynamic range, above the default.
 PORT_RANGE_START = 47765
 PORT_RANGE_SIZE = 1024
+MUTATING_VERBS = frozenset(
+    {
+        "converge",
+        "cancel",
+        "gc",
+        "done",
+        "adopt",
+        "compose-adopt",
+        "reconcile-volume",
+        "execution-acquire",
+        "execution-release",
+        "compose-acquire",
+        "compose-release",
+    }
+)
 
 DEFAULT_IDLE_RETIRE_SECONDS = 900.0
 DEFAULT_MAINTENANCE_INTERVAL_SECONDS = 300.0
@@ -257,30 +273,24 @@ class _Handler(socketserver.StreamRequestHandler):
                 self.connection, {"ok": False, "error": "unauthenticated IPC request"}
             )
             return
-        mutating_verbs = {
-            "converge",
-            "cancel",
-            "gc",
-            "done",
-            "adopt",
-            "compose-adopt",
-            "reconcile-volume",
-            "execution-acquire",
-            "execution-release",
-            "compose-acquire",
-            "compose-release",
-        }
         if (
             verb != "shutdown"
-            and verb in mutating_verbs
+            and verb in MUTATING_VERBS
             and "version" in request
             and str(request.get("version") or "") != __version__
         ):
+            client_version = str(request.get("version") or "unknown")
             ipc.send_response(
                 self.connection,
                 {
                     "ok": False,
-                    "error": "daemon version differs; restart the daemon before destructive use",
+                    "error": (
+                        "bosn client/daemon version mismatch: "
+                        f"client={client_version} daemon={__version__}; "
+                        "restart the daemon before destructive use"
+                    ),
+                    "client_version": client_version,
+                    "daemon_version": __version__,
                 },
             )
             return
@@ -1639,9 +1649,20 @@ class Daemon:
 
     def _verb_shutdown(self, _request: dict[str, Any]) -> dict[str, Any]:
         if not self.request_stop():
+            from bosn.resources import process_alive
+
+            blockers = []
+            with self._execution_lock:
+                for session, owner in self._execution_owners.items():
+                    state = (
+                        "live" if process_alive(*owner) else "dead awaiting exact-container reap"
+                    )
+                    blockers.append(f"{state} execution session {session} (pid {owner[0]})")
+                for session in self._execution_sessions.keys() - self._execution_owners.keys():
+                    blockers.append(f"active execution session {session} (owner details pending)")
             return {
                 "ok": False,
-                "error": "daemon has active execution session(s); wait for run or shell to exit",
+                "error": "daemon shutdown blocked by " + ", ".join(blockers),
             }
         return {"ok": True, "stopping": True}
 
@@ -1654,6 +1675,28 @@ def _clip(text: str, limit: int = 2000) -> str:
 
 
 # -- client side -----------------------------------------------------------
+
+
+def startup_log_file(state_dir: Path) -> Path:
+    return state_dir / "daemon-startup.log"
+
+
+def _startup_diagnostics(state_dir: Path, *, limit: int = 8192) -> str:
+    path = startup_log_file(state_dir)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")[-limit:]
+    except OSError:
+        return "no startup diagnostics were captured"
+    # Daemon exceptions should not normally contain credentials, but redact common
+    # key/value forms before surfacing child output in a terminal or bug report.
+    return (
+        re.sub(
+            r"(?i)(token|secret|password|passwd|api[_-]?key)(\s*[=:]\s*)([^\s]+)",
+            r"\1\2<redacted>",
+            text,
+        ).strip()
+        or "startup diagnostics were empty"
+    )
 
 
 def _detach(state_dir: Path) -> int:
@@ -1692,11 +1735,16 @@ def _detach(state_dir: Path) -> int:
         str(port_for(state_dir)),
     ]
 
+    state_dir.mkdir(parents=True, exist_ok=True)
+    # Each launch gets a fresh bounded diagnostic generation. This prevents repeated
+    # startup failures from growing the state file without limit; readers additionally
+    # cap the surfaced tail in `_startup_diagnostics`.
+    startup_log = startup_log_file(state_dir).open("wb", buffering=0)
     kwargs: dict[str, Any] = {
         "env": env,
         "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
+        "stdout": startup_log,
+        "stderr": subprocess.STDOUT,
         "close_fds": True,
     }
     if sys.platform.startswith("win"):
@@ -1710,7 +1758,10 @@ def _detach(state_dir: Path) -> int:
         # and never receives the terminal's Ctrl-C.
         kwargs["start_new_session"] = True
 
-    return subprocess.Popen(argv, **kwargs).pid
+    try:
+        return subprocess.Popen(argv, **kwargs).pid
+    finally:
+        startup_log.close()
 
 
 def spawn(state_dir: Path | None = None, *, timeout: float = SPAWN_TIMEOUT_SECONDS) -> DaemonState:
@@ -1725,7 +1776,7 @@ def spawn(state_dir: Path | None = None, *, timeout: float = SPAWN_TIMEOUT_SECON
         if state is not None and state.pid:
             return state
 
-    _detach(state_dir)
+    pid = _detach(state_dir)
 
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -1733,7 +1784,10 @@ def spawn(state_dir: Path | None = None, *, timeout: float = SPAWN_TIMEOUT_SECON
         if state is not None and state.pid:
             return state
         time.sleep(0.1)
-    raise DaemonError(f"daemon did not answer on port {port_for(state_dir)} within {timeout:.0f}s")
+    raise DaemonError(
+        f"daemon pid {pid} did not answer on port {port_for(state_dir)} "
+        f"within {timeout:.0f}s; startup diagnostics: {_startup_diagnostics(state_dir)}"
+    )
 
 
 def request(
@@ -1762,11 +1816,35 @@ def request(
         if not autostart:
             raise DaemonError("no bosn daemon is running")
         spawn(state_dir)
-    return ipc.send_request(
+    wire_request = {"verb": verb, "auth": _secret(state_dir), "version": __version__, **payload}
+    reply = ipc.send_request(
         port_for(state_dir),
-        {"verb": verb, "auth": _secret(state_dir), "version": __version__, **payload},
+        wire_request,
         timeout=request_timeout,
     )
+    if verb not in MUTATING_VERBS or not reply.get("daemon_version"):
+        return reply
+
+    # A stale daemon must never execute a mutation using a newer client's assumptions.
+    # It is safe to replace automatically only when durable foreground ownership is empty;
+    # otherwise return the explicit skew response and preserve the live session.
+    status = ipc.send_request(
+        port_for(state_dir),
+        {"verb": "status", "auth": _secret(state_dir), "version": __version__},
+        timeout=request_timeout,
+    )
+    sessions = status.get("execution_sessions") or []
+    if sessions:
+        details = ", ".join(
+            f"{item.get('id', 'unknown')} (pid {item.get('client_pid', 'unknown')})"
+            for item in sessions
+        )
+        reply["error"] = f"{reply.get('error')}; live execution sessions prevent restart: {details}"
+        return reply
+    if not stop(state_dir, timeout=request_timeout):
+        raise DaemonError("version-skewed daemon did not stop cleanly; mutation was not sent")
+    spawn(state_dir)
+    return ipc.send_request(port_for(state_dir), wire_request, timeout=request_timeout)
 
 
 def stream(

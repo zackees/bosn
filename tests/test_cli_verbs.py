@@ -162,6 +162,25 @@ def test_status_surfaces_a_foreground_session_without_waiting_for_engine_scan(
     assert report["execution_sessions"][0]["id"] == "session"
 
 
+def test_jobs_is_a_bounded_diagnostic_and_never_autostarts(tmp_path, monkeypatch, capsys) -> None:
+    from bosn import daemon
+
+    calls = []
+
+    def request(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise ipc.TransportTimeout("timed out waiting for the daemon")
+
+    monkeypatch.setattr(daemon, "request", request)
+    assert cli.main(["--state-dir", str(tmp_path), "jobs"]) == 1
+    assert calls[0][1] == {
+        "autostart": False,
+        "request_timeout": cli.JOBS_DAEMON_TIMEOUT_SECONDS,
+        "diagnostic": True,
+    }
+    assert "timed out" in capsys.readouterr().err
+
+
 def test_status_returns_a_healthy_empty_session_report_without_engine_inventory(
     tmp_path, monkeypatch, capsys
 ) -> None:
