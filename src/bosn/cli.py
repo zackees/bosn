@@ -50,6 +50,7 @@ GC_REQUEST_TIMEOUT_SECONDS = 120.0
 # transfer-sized copy legs for every selected volume. Keeping this operation-specific preserves
 # the shared 10-second control-plane budget used by ordinary verbs.
 ADOPT_SCAN_REQUEST_TIMEOUT_SECONDS = 15 * 60.0
+RECONCILE_VOLUME_REQUEST_TIMEOUT_SECONDS = ADOPT_SCAN_REQUEST_TIMEOUT_SECONDS + (2 * 30 * 60.0)
 
 
 def adopt_request_timeout_seconds(transfer_count: int) -> float:
@@ -146,6 +147,7 @@ VERBS: dict[str, tuple[str, str]] = {
     "done": ("mark this workspace finished; its caches become collectable", "implemented"),
     "ensure": ("pre-warm a stack without running a command", "implemented"),
     "adopt": ("recover labeled resources into this registry", "implemented"),
+    "reconcile-volume": ("explicitly repair one incomplete manifest volume", "implemented"),
     "doctor": ("engine health and reachability", "implemented"),
     "daemon-stop": ("stop the running daemon (needed after upgrades)", "implemented"),
     "init": ("translate a Compose file into bosn.toml (alias: bosn-docker init)", "implemented"),
@@ -188,7 +190,7 @@ def build_parser(*, json_errors: bool = False) -> argparse.ArgumentParser:
         sub = subparsers.add_parser(verb, help=help_text)
         _add_policy_flags(sub, default=argparse.SUPPRESS)
         sub.add_argument("args", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
-        if verb in {"run", "tasks", "shell", "done", "ensure", "adopt"}:
+        if verb in {"run", "tasks", "shell", "done", "ensure", "adopt", "reconcile-volume"}:
             sub.add_argument("--stack", default=None, help="stack to use (default: the default)")
             sub.add_argument("--task", default=None, help="run a manifest task by name")
             sub.add_argument("--manifest", default=None, dest="sub_manifest")
@@ -223,6 +225,21 @@ def build_parser(*, json_errors: bool = False) -> argparse.ArgumentParser:
                 action="store_true",
                 default=False,
                 help="apply the adoption; without it, only report what would be adopted",
+            )
+        if verb == "reconcile-volume":
+            sub.add_argument(
+                "--volume", default=None, metavar="LOGICAL_NAME",
+                help=(
+                    "declared volume name from the selected stack; engine names are never accepted"
+                ),
+            )
+            sub.add_argument(
+                "--apply", dest="reconcile_apply", action="store_true", default=False,
+                help="apply the exact recovery after preview and --yes confirmation",
+            )
+            sub.add_argument(
+                "--yes", dest="yes", action="store_true", default=False,
+                help="confirm the explicit legacy recovery when used with --apply",
             )
         if verb == "init":
             # Matches `bosn-docker init`'s flag surface (see docker_cli._parse_init_args)
@@ -1049,6 +1066,7 @@ def cmd_gc(opts: Options) -> int:
                     "removed": reply.get("removed", []),
                     "image_dependency_deferred": reply.get("image_dependency_deferred", []),
                     "image_decisions": reply.get("image_decisions", []),
+                    "unproven_resources": reply.get("unproven_resources", []),
                     "errors": reply.get("errors", []),
                     "advisories": reply.get("advisories", []),
                 },
@@ -1281,6 +1299,71 @@ def cmd_adopt(opts: Options) -> int:
     return 0
 
 
+def cmd_reconcile_volume(opts: Options) -> int:
+    """Preview or explicitly repair one incomplete volume derived from bosn.toml."""
+    from bosn import daemon as daemon_mod
+    from bosn.manifest import ManifestError, find_manifest, load
+
+    if not opts.stack or not opts.volume:
+        return _error(
+            code="reconcile-volume.stack_required",
+            message="reconcile-volume requires --stack and --volume for an unambiguous target",
+            next_step="pass the stack and logical volume declared by bosn.toml",
+            as_json=opts.json,
+        )
+    try:
+        manifest_path = opts.manifest or find_manifest()
+        if manifest_path is None:
+            raise ManifestError("no bosn.toml found; create one or pass --manifest")
+        manifest = load(manifest_path)
+        # Validate client-side too, so a typo never starts a daemon merely to be refused.
+        stack = manifest.stack(opts.stack)
+        if not any(volume.name == opts.volume for volume in stack.volumes):
+            raise ManifestError(f"volume {opts.volume!r} is not declared by stack {stack.name!r}")
+    except ManifestError as exc:
+        return _error(
+            code="reconcile-volume.invalid_manifest",
+            message=str(exc),
+            next_step="select a declared stack and logical volume",
+            as_json=opts.json,
+        )
+    try:
+        reply = daemon_mod.request(
+            "reconcile-volume",
+            opts.state_dir,
+            manifest=str(manifest.path),
+            stack=opts.stack,
+            volume=opts.volume,
+            apply=opts.reconcile_apply,
+            yes=opts.yes,
+            engine=opts.engine,
+            request_timeout=RECONCILE_VOLUME_REQUEST_TIMEOUT_SECONDS,
+        )
+    except ipc.TransportTimeout as exc:
+        return _error(
+            code="reconcile-volume.timeout",
+            message=f"the daemon did not finish volume reconciliation: {exc}",
+            next_step=(
+                "do not retry a transfer yet; inspect the preserved staging volume and status"
+            ),
+            as_json=opts.json,
+        )
+    except (daemon_mod.DaemonError, ipc.TransportError) as exc:
+        return _error(
+            code="daemon.unreachable",
+            message=f"cannot reach the bosn daemon: {exc}",
+            next_step="start or restart the daemon, then retry",
+            as_json=opts.json,
+        )
+    if opts.json:
+        print(json.dumps(reply, indent=2))
+    elif reply.get("plan"):
+        print(json.dumps(reply["plan"], indent=2))
+    elif not reply.get("ok"):
+        print(str(reply.get("error") or "reconcile-volume failed"), file=sys.stderr)
+    return 0 if reply.get("ok") else 1
+
+
 def cmd_shell(opts: Options) -> int:
     from bosn import daemon as daemon_mod
     from bosn.converge import workspace_of
@@ -1442,6 +1525,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "gc": cmd_gc,
         "done": cmd_done,
         "adopt": cmd_adopt,
+        "reconcile-volume": cmd_reconcile_volume,
         "init": cmd_init,
     }
     handler = handlers.get(opts.verb)

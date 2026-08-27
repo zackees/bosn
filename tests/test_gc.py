@@ -208,7 +208,13 @@ def test_status_names_unproven_resources_and_execution_sessions(
             "kind": "volume",
             "name": "partial",
             "registry_id": registry.registry_id,
-            "reason": "incomplete ownership labels; protected from automatic recovery",
+            "label_keys": [labels.REGISTRY],
+            "decision": {
+                "action": "protected",
+                "eligible": False,
+                "reason": "incomplete ownership labels; protected from automatic recovery",
+                "recovery": "refused",
+            },
         }
     ]
     assert report["execution_sessions"] == [
@@ -223,6 +229,43 @@ def test_status_names_unproven_resources_and_execution_sessions(
             "blocking_reason": "client is dead; awaiting safe exact-container reap",
         }
     ]
+
+
+def test_gc_dry_run_lists_each_unproven_resource_without_mutating(
+    registry: Registry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#120: apply and preview both protect incomplete engine resources."""
+    from bosn.resources import DiscoveredResource, ScanResult
+
+    partial = {labels.REGISTRY: registry.registry_id, labels.KIND: "volume"}
+    monkeypatch.setattr(
+        gc_mod.ResourceScanner,
+        "scan",
+        lambda *_args, **_kwargs: ScanResult(
+            unlabeled=[DiscoveredResource("volume", "partial", partial)],
+            scanned_kinds={"volume"},
+        ),
+    )
+    engine = FakeEngine({"partial": partial})
+    result = Collector(registry, engine).collect(dry_run=True)  # type: ignore[arg-type]
+
+    assert result.removed == []
+    assert result.unproven_resources == [
+        {
+            "kind": "volume",
+            "name": "partial",
+            "registry_id": registry.registry_id,
+            "label_keys": [labels.KIND, labels.REGISTRY],
+            "decision": {
+                "action": "protected",
+                "eligible": False,
+                "reason": "incomplete ownership labels; protected from automatic recovery",
+                "recovery": "explicit-reconcile-available",
+            },
+            "attachment": {"state": "detached", "containers": []},
+        }
+    ]
+    assert "partial" not in engine.removals()
 
 
 def test_gc_never_issues_a_system_prune(registry: Registry, clock: FakeClock) -> None:

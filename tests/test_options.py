@@ -152,3 +152,11 @@ def test_adopt_yes_defaults_to_false() -> None:
 
 def test_adopt_yes_flag_is_captured() -> None:
     assert opts(["adopt", "--legacy", "clud", "--yes"]).yes is True
+
+
+def test_reconcile_volume_accepts_only_a_logical_manifest_volume() -> None:
+    parsed = opts(["reconcile-volume", "--stack", "perf", "--volume", "target", "--apply", "--yes"])
+    assert parsed.stack == "perf"
+    assert parsed.volume == "target"
+    assert parsed.reconcile_apply is True
+    assert parsed.yes is True

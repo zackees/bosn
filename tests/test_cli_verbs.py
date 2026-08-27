@@ -91,6 +91,46 @@ def test_builtin_verb_name_is_reserved_from_task_dispatch(monkeypatch) -> None:
     assert seen == ["status"]
 
 
+def test_reconcile_volume_derives_a_manifest_target_before_requesting_daemon(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    from bosn import daemon
+
+    manifest = tmp_path / "bosn.toml"
+    (tmp_path / "Dockerfile").write_text("FROM alpine\n", encoding="utf-8")
+    manifest.write_text(
+        "[stack.perf]\ndockerfile = 'Dockerfile'\n\n[stack.perf.volumes]\n"
+        "target = { scope = 'stack' }\n",
+        encoding="utf-8",
+    )
+    requests = []
+    monkeypatch.setattr(
+        daemon,
+        "request",
+        lambda verb, *_args, **kwargs: requests.append((verb, kwargs)) or {
+            "ok": True,
+            "applied": kwargs["apply"],
+            "plan": {"name": "derived", "decision": {"action": "would-recreate"}},
+        },
+    )
+
+    preview = [
+        "--manifest",
+        str(manifest),
+        "--json",
+        "reconcile-volume",
+        "--stack",
+        "perf",
+        "--volume",
+        "target",
+    ]
+    assert cli.main(preview) == 0
+    assert cli.main([*preview, "--apply", "--yes"]) == 0
+    assert [entry[1]["apply"] for entry in requests] == [False, True]
+    assert all(entry[1]["volume"] == "target" for entry in requests)
+    assert '"applied": true' in capsys.readouterr().out.lower()
+
+
 def test_status_surfaces_a_foreground_session_without_waiting_for_engine_scan(
     tmp_path, monkeypatch, capsys
 ) -> None:

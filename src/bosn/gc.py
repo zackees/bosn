@@ -64,6 +64,7 @@ class GCResult:
     removed: list[str] = field(default_factory=list)
     kept: list[str] = field(default_factory=list)
     skipped_unproven: list[str] = field(default_factory=list)
+    unproven_resources: list[dict[str, object]] = field(default_factory=list)
     image_dependency_deferred: list[str] = field(default_factory=list)
     image_decisions: list[dict[str, object]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -76,6 +77,7 @@ class GCResult:
             "removed": len(self.removed),
             "kept": len(self.kept),
             "skipped_unproven": len(self.skipped_unproven),
+            "unproven_resources": len(self.unproven_resources),
             "image_dependency_deferred": len(self.image_dependency_deferred),
             "errors": len(self.errors),
             "advisories": len(self.advisories),
@@ -109,6 +111,12 @@ class Collector:
         from bosn.config import load as load_config
 
         config = self.config or load_config()
+        # Incomplete engine labels never become collection candidates.  They are scanned
+        # here solely to make a dry-run explain each protected object rather than hiding it
+        # behind an aggregate ``kept`` count (#120).
+        from bosn.recovery import plan_unproven_resource
+
+        scan = self.scanner.scan(self.registry.registry_id)
         inventory = StorageInventory.collect(self.engine)
         resource_rows = self.registry.list_resources()
         measured = {
@@ -175,6 +183,10 @@ class Collector:
             self.registry, pressure=pressure, config=config, running_containers=running_containers
         )
         result = GCResult(dry_run=dry_run)
+        result.unproven_resources = [
+            plan_unproven_resource(resource, self.registry.registry_id, self.engine)
+            for resource in scan.unlabeled
+        ]
         reclaimable = sum(
             measured.get(verdict.resource.id, 0) or 0 for verdict in collectable(verdicts)
         )
@@ -451,16 +463,15 @@ def status(
                 ),
             }
         )
-    # Incomplete labels are not ownership proof and therefore are never candidates for
-    # automatic collection.  They must nevertheless be named: a generic count leaves an
-    # operator unable to tell which resource is blocking convergence (#120).
+    # Status intentionally skips attachment probes for every unproven volume.  The scan
+    # is already bounded, while a probe per foreign/unlabeled object is not; `gc --dry-run
+    # --json` owns the full attachment-aware decision surface.
+    from bosn.recovery import plan_unproven_resource
+
     unproven_resources = [
-        {
-            "kind": resource.kind,
-            "name": resource.name,
-            "registry_id": resource.registry,
-            "reason": "incomplete ownership labels; protected from automatic recovery",
-        }
+        plan_unproven_resource(
+            resource, registry.registry_id, engine, include_attachment=False
+        )
         for resource in scan.unlabeled
     ]
     inventory = StorageInventory.collect(engine)

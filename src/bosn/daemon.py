@@ -932,6 +932,7 @@ class Daemon:
             "jobs": self._verb_jobs,
             "cancel": self._verb_cancel,
             "gc": self._verb_gc,
+            "reconcile-volume": self._verb_reconcile_volume,
             "done": self._verb_done,
             "adopt": self._verb_adopt,
             "compose-adopt": self._verb_compose_adopt,
@@ -1044,7 +1045,105 @@ class Daemon:
             "image_decisions": result.image_decisions,
             "errors": result.errors,
             "advisories": result.advisories,
+            "unproven_resources": result.unproven_resources,
         }
+
+    def _verb_reconcile_volume(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Explicitly repair one manifest-derived, legacy partial volume (#120).
+
+        This is deliberately not part of normal convergence.  Schema-v3 durable intents
+        remain the only automatic recovery authority; this verb consumes a human's exact
+        stack/volume selection and still refuses anything that lacks corroborating labels.
+        """
+        from pathlib import Path
+
+        from bosn.converge import volume_name_for, workspace_of
+        from bosn.engine import Engine
+        from bosn.manifest import ManifestError, generation_digest, load
+        from bosn.recovery import (
+            apply_legacy_volume_reconciliation,
+            legacy_expected_labels,
+            plan_legacy_volume_reconciliation,
+        )
+        from bosn.resources import ResourceScanner, TransferError
+
+        manifest_text = str(request.get("manifest") or "")
+        stack_name = str(request.get("stack") or "")
+        logical_name = str(request.get("volume") or "")
+        if not manifest_text or not stack_name or not logical_name:
+            return {"ok": False, "error": "reconcile-volume requires manifest, stack, and volume"}
+        try:
+            manifest = load(Path(manifest_text))
+            stack = manifest.stack(stack_name)
+            volume = next(item for item in stack.volumes if item.name == logical_name)
+        except (ManifestError, StopIteration) as exc:
+            detail = (
+                str(exc)
+                if isinstance(exc, ManifestError)
+                else "volume is not declared by the selected stack"
+            )
+            return {"ok": False, "error": detail}
+
+        workspace = workspace_of(manifest)
+        digest = generation_digest(manifest, stack)
+        name = volume_name_for(
+            stack,
+            volume.scope,
+            volume.name,
+            digest=digest,
+            workspace=workspace,
+            family=stack.family,
+        )
+        engine = Engine(str(request.get("engine") or self.engine_binary))
+
+        def current_plan():
+            raw = ResourceScanner(engine).inspect_labels("volume", name)
+            expected = legacy_expected_labels(
+                registry_id=self.registry.registry_id,
+                stack=stack.name,
+                generation=digest,
+                scope=volume.scope,
+                workspace=workspace,
+                raw_labels=raw,
+            )
+            return plan_legacy_volume_reconciliation(
+                name=name,
+                raw_labels=raw,
+                expected=expected,
+                registry_id=self.registry.registry_id,
+                engine=engine,
+            )
+
+        plan = current_plan()
+        if not bool(request.get("apply")):
+            return {"ok": True, "applied": False, "plan": plan.to_dict()}
+        if not bool(request.get("yes")):
+            return {
+                "ok": False,
+                "error": "reconcile-volume requires --yes together with --apply",
+                "plan": plan.to_dict(),
+            }
+        if plan.action == "already-owned":
+            return {"ok": True, "applied": False, "plan": plan.to_dict()}
+        if plan.action != "would-recreate":
+            return {"ok": False, "error": plan.reason, "plan": plan.to_dict()}
+        final_plan = plan
+        try:
+            # The preview's engine state is advisory.  The mutation boundary repeats both
+            # identity and attachment proof under the registry lifecycle lock.
+            with self.registry.lifecycle_guard():
+                final_plan = current_plan()
+                if final_plan.action != "would-recreate":
+                    return {"ok": False, "error": final_plan.reason, "plan": final_plan.to_dict()}
+                apply_legacy_volume_reconciliation(engine, final_plan)
+                self.registry.reconcile_resource(
+                    kind="volume", name=name, stack=stack.name, generation=digest,
+                    scope=volume.scope, workspace=workspace,
+                )
+                self.registry.log_event("volume.legacy_reconciled", name)
+        except TransferError as exc:
+            return {"ok": False, "error": str(exc), "plan": plan.to_dict()}
+        return {"ok": True, "applied": True, "plan": final_plan.to_dict()}
 
     def _verb_done(self, request: dict[str, Any]) -> dict[str, Any]:
         from bosn.gc import mark_done
