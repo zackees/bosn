@@ -180,6 +180,36 @@ def test_converge_streams_build_output_and_a_terminal_event(
     assert events[-1]["state"] == "succeeded"
 
 
+def test_custom_manifest_source_survives_daemon_queue_to_worker_payload(
+    served: Daemon, project: Path, builder: ControlledBuilder
+) -> None:
+    """A custom source filename is not rewritten to a decoy `bosn.toml` (#126)."""
+    custom = project / "development.toml"
+    custom.write_text(
+        "[stack.chosen]\ndockerfile = 'Dockerfile'\ndefault = true\n", encoding="utf-8"
+    )
+    # Before #126, `_verb_converge` loaded `development.toml` correctly, then stored
+    # `<root>/bosn.toml` in the queued job. The worker would consequently build this
+    # different declaration later.
+    (project / "bosn.toml").write_text(
+        "[stack.decoy]\ndockerfile = 'Dockerfile'\ndefault = true\n", encoding="utf-8"
+    )
+    stream = ipc.stream_request(
+        served.port,
+        {"verb": "converge", "manifest": str(custom), "auth": served.secret},
+        timeout=30,
+    )
+    submitted = next(stream)
+    job = served.jobs.get(submitted["job"])
+
+    assert job.stack == "chosen"
+    assert job.payload["manifest"] == str(custom.resolve())
+    # `_build` consumes this durable job payload, so pinning it is the client -> daemon
+    # queue -> worker source-path contract without needing a Docker build.
+    builder.release.set()
+    assert [event for event in stream if event.get("final")][-1]["state"] == "succeeded"
+
+
 def test_a_second_identical_converge_joins_rather_than_rebuilding(
     served: Daemon, project: Path, builder: ControlledBuilder
 ) -> None:

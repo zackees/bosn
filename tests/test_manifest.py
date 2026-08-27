@@ -67,6 +67,42 @@ def test_find_manifest_returns_none_when_absent(tmp_path: Path) -> None:
     assert manifest_mod.find_manifest(tmp_path) is None
 
 
+def test_load_retains_selected_custom_source_without_changing_context_root(tmp_path: Path) -> None:
+    context = tmp_path / "configs" / "dev"
+    context.mkdir(parents=True)
+    (context / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    custom = context / "development.toml"
+    custom.write_text("[stack.dev]\ndockerfile = 'Dockerfile'\ndefault = true\n", encoding="utf-8")
+
+    manifest = load(custom)
+
+    assert manifest.path == custom.resolve()
+    assert manifest.root == context.resolve()
+    # Dockerfile resolution/digests remain relative to the manifest parent, not its name.
+    assert manifest.digest("dev").startswith("sha256:")
+
+
+def test_load_default_and_directory_inputs_keep_default_source_path(project: Path) -> None:
+    selected = (project / "bosn.toml").resolve()
+
+    assert load(project).path == selected
+    assert load(project / "bosn.toml").path == selected
+
+
+def test_load_relative_custom_source_is_canonical_for_daemon_ipc(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    custom = tmp_path / "custom.toml"
+    custom.write_text("[stack.dev]\ndockerfile = 'Dockerfile'\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    manifest = load("custom.toml")
+
+    assert manifest.path == custom.resolve()
+    assert manifest.root == tmp_path.resolve()
+
+
 def test_unknown_stack_and_task_names_are_specific_errors(project: Path) -> None:
     manifest = load(project)
     with pytest.raises(ManifestError, match="no stack named 'nope'"):
