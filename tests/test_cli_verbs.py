@@ -186,7 +186,13 @@ def test_status_uses_persisted_session_proof_when_daemon_control_stream_is_lost(
 
     assert cli.main(["--state-dir", str(state), "status", "--json"]) == 0
     report = json.loads(capsys.readouterr().out)
-    assert calls == [{"autostart": False, "request_timeout": cli.STATUS_DAEMON_TIMEOUT_SECONDS}]
+    assert calls == [
+        {
+            "autostart": False,
+            "request_timeout": cli.STATUS_DAEMON_TIMEOUT_SECONDS,
+            "diagnostic": True,
+        }
+    ]
     assert report["mode"] == "degraded"
     assert report["execution_sessions"][0]["id"] == "orphan"
     assert report["execution_sessions"][0]["last_orphan_reap_error"]["detail"].endswith("busy")
@@ -232,7 +238,6 @@ def test_status_preserves_a_real_diagnostic_request_timeout_as_degraded(
     than replacing either: the fake transport models the two wire positions where a timeout
     can occur. A dead port still raises ordinary ``TransportError`` and is reported offline.
     """
-    from bosn import daemon
     from bosn.registry import Registry
 
     state = tmp_path / "state"
@@ -269,9 +274,7 @@ def test_status_actual_diagnostic_request_reports_a_dead_port_offline(
     monkeypatch.setattr(
         ipc,
         "send_request",
-        lambda *_args, **_kwargs: (
-            _ for _ in ()
-        ).throw(ipc.TransportError("connection refused")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ipc.TransportError("connection refused")),
     )
     monkeypatch.setattr(cli, "Engine", lambda *_args: (_ for _ in ()).throw(AssertionError()))
 
