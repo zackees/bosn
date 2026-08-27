@@ -72,9 +72,7 @@ def test_load_retains_selected_custom_source_without_changing_context_root(tmp_p
     context.mkdir(parents=True)
     (context / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
     custom = context / "development.toml"
-    custom.write_text(
-        "[stack.dev]\ndockerfile = 'Dockerfile'\ndefault = true\n", encoding="utf-8"
-    )
+    custom.write_text("[stack.dev]\ndockerfile = 'Dockerfile'\ndefault = true\n", encoding="utf-8")
 
     manifest = load(custom)
 
@@ -91,7 +89,9 @@ def test_load_default_and_directory_inputs_keep_default_source_path(project: Pat
     assert load(project / "bosn.toml").path == selected
 
 
-def test_load_relative_custom_source_is_canonical_for_daemon_ipc(tmp_path: Path, monkeypatch) -> None:
+def test_load_relative_custom_source_is_canonical_for_daemon_ipc(
+    tmp_path: Path, monkeypatch
+) -> None:
     (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
     custom = tmp_path / "custom.toml"
     custom.write_text("[stack.dev]\ndockerfile = 'Dockerfile'\n", encoding="utf-8")

@@ -421,9 +421,7 @@ def test_foreground_verbs_forward_the_selected_custom_source_to_execution_acquir
 
     (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
     custom = tmp_path / "development.toml"
-    custom.write_text(
-        "[stack.dev]\ndockerfile = 'Dockerfile'\ndefault = true\n", encoding="utf-8"
-    )
+    custom.write_text("[stack.dev]\ndockerfile = 'Dockerfile'\ndefault = true\n", encoding="utf-8")
     (tmp_path / "bosn.toml").write_text("[stack.decoy]\nimage = 'busybox'\n", encoding="utf-8")
     monkeypatch.setattr(
         cli,
@@ -444,7 +442,7 @@ def test_foreground_verbs_forward_the_selected_custom_source_to_execution_acquir
         def __init__(self, _binary="docker") -> None:
             pass
 
-        def execute(self, _args) -> int:
+        def execute(self, _args, **_kwargs) -> int:
             return 0
 
         def interactive(self, _args) -> int:
@@ -468,8 +466,7 @@ def test_one_word_task_forwards_the_selected_custom_manifest_to_converge(
     (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
     custom = tmp_path / "development.toml"
     custom.write_text(
-        "[stack.dev]\ndockerfile = 'Dockerfile'\ndefault = true\n"
-        "[task.unit]\ncmd = 'true'\n",
+        "[stack.dev]\ndockerfile = 'Dockerfile'\ndefault = true\n[task.unit]\ncmd = 'true'\n",
         encoding="utf-8",
     )
     (tmp_path / "bosn.toml").write_text("[stack.decoy]\nimage = 'busybox'\n", encoding="utf-8")
@@ -488,7 +485,7 @@ def test_one_word_task_forwards_the_selected_custom_manifest_to_converge(
         def __init__(self, _binary="docker") -> None:
             pass
 
-        def execute(self, _args) -> int:
+        def execute(self, _args, **_kwargs) -> int:
             return 0
 
     monkeypatch.setattr(cli, "_converge_via_daemon", converge)
@@ -505,7 +502,10 @@ def test_reconcile_volume_forwards_selected_custom_manifest_source(tmp_path, mon
     (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
     custom = tmp_path / "development.toml"
     custom.write_text(
-        "[stack.dev]\ndockerfile = 'Dockerfile'\n[stack.dev.volumes]\ntarget = { scope = 'spec' }\n",
+        (
+            "[stack.dev]\ndockerfile = 'Dockerfile'\n[stack.dev.volumes]\n"
+            "target = { scope = 'spec' }\n"
+        ),
         encoding="utf-8",
     )
     (tmp_path / "bosn.toml").write_text("[stack.decoy]\nimage = 'busybox'\n", encoding="utf-8")
