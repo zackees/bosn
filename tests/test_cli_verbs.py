@@ -222,6 +222,65 @@ def test_status_is_bounded_when_a_daemon_stream_is_lost_without_a_session(
     assert "Restore or restart Bosn" in report["next"]
 
 
+@pytest.mark.parametrize("timeout_verb", ["ping", "status"])
+def test_status_preserves_a_real_diagnostic_request_timeout_as_degraded(
+    tmp_path, monkeypatch, capsys, timeout_verb
+) -> None:
+    """#119: request's liveness probe must not hide a contacted-but-stuck daemon.
+
+    This deliberately invokes the real ``daemon.request`` and real ``is_serving`` rather
+    than replacing either: the fake transport models the two wire positions where a timeout
+    can occur. A dead port still raises ordinary ``TransportError`` and is reported offline.
+    """
+    from bosn import daemon
+    from bosn.registry import Registry
+
+    state = tmp_path / "state"
+    with Registry(state / "registry.sqlite3"):
+        pass
+    calls = []
+
+    def transport(_port, request, *, timeout, **_kwargs):
+        calls.append((request["verb"], timeout))
+        if request["verb"] == timeout_verb:
+            raise ipc.TransportTimeout("timed out waiting for the daemon")
+        return {"ok": True}
+
+    monkeypatch.setattr(ipc, "send_request", transport)
+    monkeypatch.setattr(cli, "Engine", lambda *_args: (_ for _ in ()).throw(AssertionError()))
+
+    assert cli.main(["--state-dir", str(state), "status", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["mode"] == "degraded"
+    assert calls == [("ping", cli.STATUS_DAEMON_TIMEOUT_SECONDS)] + (
+        [("status", cli.STATUS_DAEMON_TIMEOUT_SECONDS)] if timeout_verb == "status" else []
+    )
+
+
+def test_status_actual_diagnostic_request_reports_a_dead_port_offline(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """A refused ping is absence, unlike a ping that reaches its timeout budget."""
+    from bosn.registry import Registry
+
+    state = tmp_path / "state"
+    with Registry(state / "registry.sqlite3"):
+        pass
+    monkeypatch.setattr(
+        ipc,
+        "send_request",
+        lambda *_args, **_kwargs: (
+            _ for _ in ()
+        ).throw(ipc.TransportError("connection refused")),
+    )
+    monkeypatch.setattr(cli, "Engine", lambda *_args: (_ for _ in ()).throw(AssertionError()))
+
+    assert cli.main(["--state-dir", str(state), "status", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["mode"] == "offline"
+    assert report["daemon"]["reachable"] is False
+
+
 def test_status_returns_an_offline_empty_session_report_without_engine_inventory(
     tmp_path, monkeypatch, capsys
 ) -> None:

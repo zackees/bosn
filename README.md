@@ -104,7 +104,7 @@ Then:
 ```bash
 bosn ensure                    # converge and register without running anything (pre-warm)
 bosn unit                      # run the task
-bosn status                    # what exists, what holds it, bytes vs ceiling
+bosn status --json             # bounded daemon/registry state; use gc for engine/storage details
 ```
 
 Nothing needs starting — the first command lazily spawns the daemon.
@@ -192,8 +192,8 @@ images will not work.
 | `docker build` + `docker run` | `bosn run -- <cmd>` | rebuilds only if the *content digest* changed |
 | `docker compose up` | `bosn-docker compose up` | service **containers** get labeled and tracked; volumes do not (see below) |
 | `docker system prune` | *(nothing — automatic)* | never needed, and bosn never runs it |
-| `docker volume ls` + guesswork | `bosn status` | tiers, leases, managed bytes vs ceiling |
-| "is this cache still needed?" | `bosn gc` | dry-run by default; shows exactly what would be reclaimed |
+| `docker volume ls` + guesswork | `bosn gc --dry-run --json` | rich engine/storage inventory plus governed decisions |
+| "is this cache still needed?" | `bosn gc --dry-run --json` | dry-run by default; shows exactly what would be reclaimed |
 | deleting a worktree and hoping | `bosn done` | marks it finished; its caches become collectable |
 
 ### If you already have a compose.yaml
@@ -542,8 +542,9 @@ precedence, and invalid values stop the command while naming the bad key. The `[
 accepts `container_idle_stop`, `container_remove`, `warm_volume_ttl`, `superseded_cap`,
 `shared_cache_ceiling` (really the total managed-bytes ceiling), `run_max_duration` (default
 8 h, the wall-clock cap on command execution), `idle_retire_seconds`, `build_ttl_seconds`, and
-`max_builds`; environment overrides are their uppercase `BOSN_` equivalents. `bosn status`
-reports each effective value and its origin.
+`max_builds`; environment overrides are their uppercase `BOSN_` equivalents. Policy provenance
+is not currently exposed as a public CLI report; `bosn gc --dry-run --json` shows the resulting
+governed storage decisions without requiring `status` to touch the engine.
 
 Enforcement is layered: the daemon is the authority but never the only mechanism. The
 persistent container's PID 1 watches the bind-mounted daemon heartbeat and exits once it has

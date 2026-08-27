@@ -920,6 +920,7 @@ def cmd_status(opts: Options) -> int:
             state_dir,
             autostart=False,
             request_timeout=STATUS_DAEMON_TIMEOUT_SECONDS,
+            diagnostic=True,
         )
     except (daemon_mod.DaemonError, ipc.TransportError) as exc:
         daemon_status = None
