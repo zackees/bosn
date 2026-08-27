@@ -948,6 +948,9 @@ class Daemon:
             sessions = []
             for session, owner in self._execution_owners.items():
                 alive = process_alive(*owner)
+                last_reap_error = self.registry.latest_event(
+                    "execution.orphan_reap.error", detail_prefix=f"session={session} "
+                )
                 sessions.append(
                     {
                         "id": session,
@@ -961,6 +964,20 @@ class Daemon:
                             "client is live"
                             if alive
                             else "client is dead; awaiting safe exact-container reap"
+                        ),
+                        "last_orphan_reap_error": (
+                            {
+                                "at": last_reap_error["at"],
+                                "detail": last_reap_error["detail"],
+                            }
+                            if last_reap_error is not None
+                            else None
+                        ),
+                        "recovery": (
+                            "do not interrupt the live client"
+                            if alive
+                            else "run `bosn daemon-stop`; it reaps only this exact "
+                            "container after confirming the client is dead"
                         ),
                     }
                 )

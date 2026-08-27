@@ -69,6 +69,10 @@ DAEMON_STOP_TIMEOUT = 45.0
 # That bounded recovery legitimately exceeds the generic 10-second IPC control timeout on
 # Docker Desktop, while the preceding image build already has its own streamed job timeout.
 EXECUTION_ACQUIRE_TIMEOUT = 120.0
+# `status` is a diagnostic, not an engine inventory request.  When the daemon control plane
+# has lost a stream, wait only long enough to distinguish that failure, then read the durable
+# registry proof rather than starting the slow Docker scan that made #119 look like a hang.
+STATUS_DAEMON_TIMEOUT_SECONDS = 2.0
 
 
 def _policy_flags(opts: Options) -> dict[str, float | None]:
@@ -829,6 +833,51 @@ def cmd_cancel(opts: Options) -> int:
     return 0
 
 
+def _persisted_execution_sessions(registry) -> list[dict]:
+    """Describe durable foreground ownership without contacting the engine or daemon.
+
+    The registry proves that a session is protected, but never authorizes removal.  In
+    particular, a dead owner remains blocking until the daemon's documented recovery path
+    has removed the exact immutable container and released its leases.
+    """
+    from bosn.resources import process_alive
+
+    sessions = []
+    for session in registry.execution_sessions():
+        alive = process_alive(session.client_pid, session.client_start)
+        last_reap_error = registry.latest_event(
+            "execution.orphan_reap.error", detail_prefix=f"session={session.id} "
+        )
+        sessions.append(
+            {
+                "id": session.id,
+                "container_id": session.container_id,
+                "engine": session.engine_binary,
+                "client_pid": session.client_pid,
+                "client_start": session.client_start,
+                "client_alive": alive,
+                "lease_ids": list(session.lease_ids),
+                "blocking_reason": (
+                    "client is live"
+                    if alive
+                    else "client is dead; awaiting safe exact-container reap"
+                ),
+                "last_orphan_reap_error": (
+                    {"at": last_reap_error["at"], "detail": last_reap_error["detail"]}
+                    if last_reap_error is not None
+                    else None
+                ),
+                "recovery": (
+                    "do not interrupt the live client"
+                    if alive
+                    else "run `bosn daemon-stop`; it reaps only this exact container after "
+                    "confirming the client is dead"
+                ),
+            }
+        )
+    return sessions
+
+
 def cmd_status(opts: Options) -> int:
     from bosn import daemon as daemon_mod
     from bosn.config import ConfigError
@@ -846,10 +895,17 @@ def cmd_status(opts: Options) -> int:
     # inventory can be slow, while the session is the exact fact an operator needs to
     # understand why an otherwise terminal-only `jobs` list still blocks the stack (#119).
     # Do not autostart merely to optimize a read-only status command.
+    daemon_error: str | None = None
     try:
-        daemon_status = daemon_mod.request("status", state_dir, autostart=False)
-    except (daemon_mod.DaemonError, ipc.TransportError):
+        daemon_status = daemon_mod.request(
+            "status",
+            state_dir,
+            autostart=False,
+            request_timeout=STATUS_DAEMON_TIMEOUT_SECONDS,
+        )
+    except (daemon_mod.DaemonError, ipc.TransportError) as exc:
         daemon_status = None
+        daemon_error = str(exc)
     if daemon_status and daemon_status.get("execution_sessions"):
         print(
             json.dumps(
@@ -867,6 +923,35 @@ def cmd_status(opts: Options) -> int:
         return 0
     try:
         with Registry(db_path, read_only=True) as registry:
+            # The daemon may be alive enough to own a socket but unable to serve its control
+            # stream.  A persisted session is sufficient evidence to explain the block, and
+            # is intentionally *not* sufficient evidence to touch Docker.  Returning this
+            # bounded report avoids turning a control-plane failure into an unbounded engine
+            # inventory while retaining fail-closed ownership.
+            persisted_sessions = _persisted_execution_sessions(registry)
+            if daemon_error is not None and persisted_sessions:
+                print(
+                    json.dumps(
+                        {
+                            "mode": "degraded",
+                            "registry_id": registry.registry_id,
+                            "daemon": {
+                                "reachable": False,
+                                "error": daemon_error,
+                                "status_timeout_seconds": STATUS_DAEMON_TIMEOUT_SECONDS,
+                            },
+                            "execution_sessions": persisted_sessions,
+                            "next": (
+                                "a live session remains protected. For a dead client, run "
+                                "`bosn daemon-stop`; it attempts safe exact-container recovery "
+                                "and reports any remaining error. Do not delete registry rows or "
+                                "use a blind Docker force operation."
+                            ),
+                        },
+                        indent=2,
+                    )
+                )
+                return 0
             print(
                 json.dumps(
                     status(

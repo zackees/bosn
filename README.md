@@ -476,9 +476,19 @@ bosn __daemon --autostart    # install the login launcher (also --no-autostart)
 bosn daemon-stop             # stop the daemon — needed after upgrading bosn
 ```
 
-`status`, `tasks`, and `doctor` read the sqlite registry directly, so they keep working when
-the daemon is wedged. `gc` and `jobs` are read-only but go through the daemon and fail closed
+`tasks` and `doctor` read the SQLite registry directly. `status` first makes a short, read-only
+daemon query so it can show live foreground ownership without an engine scan. If that control
+stream is unavailable and the registry contains a persisted foreground session, `status --json`
+returns a bounded `mode: "degraded"` report from the registry instead of falling through to a
+slow Docker inventory. `gc` and `jobs` are read-only but go through the daemon and fail closed
 if it is unreachable.
+
+If that degraded report says the client is still live, leave it alone. If it says the client is
+dead, run `bosn daemon-stop`: Bosn first proves the owner is dead, then removes only that
+session's exact immutable container and releases its leases. A `last_orphan_reap_error` field
+means that safe cleanup could not be proved or completed; resolve the named engine/database
+error and retry `bosn daemon-stop`. Do not delete registry rows or use a blind Docker force
+operation.
 
 **After you upgrade bosn, stop the daemon.** A running daemon refuses every mutating verb
 whose client reports a different version, so the next `bosn run` fails until you restart it.

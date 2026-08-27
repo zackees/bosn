@@ -116,6 +116,48 @@ def test_status_surfaces_a_foreground_session_without_waiting_for_engine_scan(
     assert report["execution_sessions"][0]["id"] == "session"
 
 
+def test_status_uses_persisted_session_proof_when_daemon_control_stream_is_lost(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """#119: terminal-only jobs must not hide a disconnected foreground client.
+
+    This deliberately uses the durable session record rather than a daemon fake response:
+    it is the path available when the control RPC itself has timed out.  Constructing an
+    Engine would prove a regression to slow inventory fallback.
+    """
+    from bosn import daemon, resources
+    from bosn.registry import ExecutionSession, Registry
+
+    state = tmp_path / "state"
+    with Registry(state / "registry.sqlite3") as registry:
+        registry.save_execution_session(
+            ExecutionSession("orphan", "immutable-id", "podman", 4242, 9.0, ("lease",))
+        )
+        registry.log_event(
+            "execution.orphan_reap.error",
+            "session=orphan container=immutable-id RuntimeError: busy",
+        )
+    calls = []
+
+    def lost_stream(*_args, **kwargs):
+        calls.append(kwargs)
+        raise ipc.TransportTimeout("timed out waiting for the daemon")
+
+    monkeypatch.setattr(daemon, "request", lost_stream)
+    monkeypatch.setattr(resources, "process_alive", lambda *_args: False)
+    monkeypatch.setattr(cli, "Engine", lambda *_args: (_ for _ in ()).throw(AssertionError()))
+
+    assert cli.main(["--state-dir", str(state), "status", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert calls == [
+        {"autostart": False, "request_timeout": cli.STATUS_DAEMON_TIMEOUT_SECONDS}
+    ]
+    assert report["mode"] == "degraded"
+    assert report["execution_sessions"][0]["id"] == "orphan"
+    assert report["execution_sessions"][0]["last_orphan_reap_error"]["detail"].endswith("busy")
+    assert "daemon-stop" in report["execution_sessions"][0]["recovery"]
+
+
 def test_tasks_json_reports_unregistered_readiness(tmp_path, capsys) -> None:
     (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
     manifest = tmp_path / "bosn.toml"

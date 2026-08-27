@@ -665,6 +665,38 @@ def test_dead_execution_owner_is_stopped_and_reaped_before_next_acquire(
         daemon.registry.close()
 
 
+def test_status_reports_the_exact_dead_session_recovery_error(tmp_path: Path, monkeypatch) -> None:
+    """#119: status must name the failed safe-reap action, not just say "blocked"."""
+    from bosn import resources
+    from bosn.registry import ExecutionSession
+
+    daemon = Daemon(state_dir=tmp_path / "state")
+    try:
+        session = ExecutionSession("orphan", "immutable-id", "podman", 111, 10.0, ("lease",))
+        daemon.registry.save_execution_session(session)
+        daemon._execution_sessions[session.id] = session.lease_ids
+        daemon._execution_containers[session.id] = session.container_id
+        daemon._execution_owners[session.id] = (session.client_pid, session.client_start)
+        daemon._execution_engines[session.id] = session.engine_binary
+        daemon.registry.log_event(
+            "execution.orphan_reap.error",
+            "session=orphan container=immutable-id RuntimeError: busy",
+        )
+        monkeypatch.setattr(resources, "process_alive", lambda *_args: False)
+
+        report = daemon.dispatch("status", {})
+
+        [reported] = report["execution_sessions"]
+        assert reported["id"] == "orphan"
+        assert reported["container_id"] == "immutable-id"
+        assert reported["client_alive"] is False
+        assert reported["blocking_reason"] == "client is dead; awaiting safe exact-container reap"
+        assert reported["last_orphan_reap_error"]["detail"].endswith("busy")
+        assert "daemon-stop" in reported["recovery"]
+    finally:
+        daemon.registry.close()
+
+
 def test_execution_session_survives_daemon_restart_and_still_serializes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

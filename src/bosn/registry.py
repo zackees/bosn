@@ -963,6 +963,24 @@ class Registry:
     def events(self, limit: int = 100) -> list[sqlite3.Row]:
         return self._exec("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
+    def latest_event(self, kind: str, *, detail_prefix: str = "") -> sqlite3.Row | None:
+        """Return the newest event of ``kind``, optionally scoped to one durable identity.
+
+        Diagnostic callers use this to explain a protected state without treating an event
+        as authority to change it.  Prefix matching is deliberately parameterized: execution
+        recovery events begin with ``session=<uuid> `` and a report for one session must not
+        accidentally attribute another session's engine error to it.
+        """
+        if detail_prefix:
+            return self._exec(
+                "SELECT * FROM events WHERE kind = ? AND detail LIKE ? "
+                "ORDER BY id DESC LIMIT 1",
+                (kind, f"{detail_prefix}%"),
+            ).fetchone()
+        return self._exec(
+            "SELECT * FROM events WHERE kind = ? ORDER BY id DESC LIMIT 1", (kind,)
+        ).fetchone()
+
 
 def _resource_from_row(row: sqlite3.Row) -> Resource:
     return Resource(
