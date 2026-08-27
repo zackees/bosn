@@ -67,8 +67,16 @@ class Options:
 
     @property
     def command(self) -> list[str]:
-        """The ad-hoc command, with any argparse `--` separator stripped."""
-        return [arg for arg in self.args if arg != "--"]
+        """The ad-hoc command, without only argparse's leading separator.
+
+        A command can legitimately contain its own ``--`` argument.  In particular,
+        ``sh -c SCRIPT -- lint`` uses it to make ``lint`` the script's ``$1``.  Removing
+        every occurrence silently changes that argv and is not argparse's job.
+        """
+        args = list(self.args)
+        if args[:1] == ["--"]:
+            return args[1:]
+        return args
 
     def with_command(self, command: list[str]) -> Options:
         from dataclasses import replace

@@ -62,6 +62,21 @@ def test_command_strips_the_argparse_separator() -> None:
     assert "--" not in parsed.command
 
 
+def test_command_without_a_parser_separator_is_unchanged() -> None:
+    parsed = opts(["run", "echo", "before", "--", "after"])
+    assert parsed.command == ["echo", "before", "--", "after"]
+
+
+def test_command_preserves_a_separator_that_belongs_to_the_child_argv() -> None:
+    parsed = opts(["run", "--", "sh", "-c", "printf '%s\\n' \"$1\"", "--", "lint"])
+    assert parsed.command == ["sh", "-c", "printf '%s\\n' \"$1\"", "--", "lint"]
+
+
+def test_command_preserves_every_later_child_separator_in_order() -> None:
+    parsed = opts(["run", "--", "child", "--", "first", "--", "second"])
+    assert parsed.command == ["child", "--", "first", "--", "second"]
+
+
 def test_options_are_frozen() -> None:
     parsed = opts(["run"])
     with pytest.raises(dataclasses.FrozenInstanceError):
