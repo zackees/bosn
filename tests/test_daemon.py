@@ -684,14 +684,14 @@ def test_dead_execution_owner_is_stopped_and_reaped_before_next_acquire(
     )
     result = ConvergeResult("dev", "sha256:g", "reused", "image")
     alive = {111: True, 222: True}
-    removals: list[tuple[str, list[str]]] = []
+    removals: list[tuple[str, list[str], object]] = []
 
     class FakeEngine:
         def __init__(self, binary: str = "docker", **_kwargs: object) -> None:
             self.binary = binary
 
-        def run(self, args: list[str], **_kwargs: object) -> EngineResult:
-            removals.append((self.binary, args))
+        def run(self, args: list[str], **kwargs: object) -> EngineResult:
+            removals.append((self.binary, args, kwargs.get("timeout")))
             return EngineResult(0, "sha256:immutable-container", "")
 
     daemon = Daemon(state_dir=tmp_path / "state")
@@ -731,7 +731,11 @@ def test_dead_execution_owner_is_stopped_and_reaped_before_next_acquire(
 
         assert second["ok"] is True
         assert removals == [
-            ("podman", ["container", "rm", "--force", "sha256:immutable-container"])
+            (
+                "podman",
+                ["container", "rm", "--force", "sha256:immutable-container"],
+                daemon_mod.ORPHAN_REAP_TIMEOUT_SECONDS,
+            )
         ]
         assert daemon.registry.get_lease(first_lease.id) is None
         assert first["session"] not in daemon._execution_sessions

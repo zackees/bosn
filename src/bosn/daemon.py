@@ -81,6 +81,14 @@ SHUTDOWN_DRAIN_SECONDS = 60.0
 # int (not a float) because Engine.__init__'s `timeout` parameter is typed int.
 MAINTENANCE_ENGINE_PROBE_TIMEOUT_SECONDS = 5
 
+# A dead foreground client leaves a remote process in the exact persistent container it
+# acquired. Reaping it must remain a bounded control-plane operation, but Docker Desktop can
+# take longer than the old 10-second one-shot deadline to stop and remove an otherwise healthy
+# container. Keep the operation narrowly scoped to the immutable session container and give it
+# Engine's normal bounded control deadline instead of treating a slow successful reap as an
+# unrecoverable session leak. Any failure still leaves the session and leases intact.
+ORPHAN_REAP_TIMEOUT_SECONDS = 60.0
+
 # Upper bound on how long shutdown() waits for the watchdog thread to notice `_stop` and
 # exit, once the cooperative checks in `_run_maintenance` and the bounded probe above are
 # both in place. `EngineInfo.info()` can make the probe call up to twice before it decides
@@ -1424,7 +1432,10 @@ class Daemon:
                 engine_binary = self._execution_engines[session]
                 try:
                     engine = Engine(engine_binary)
-                    removed = engine.run(["container", "rm", "--force", container_id], timeout=10)
+                    removed = engine.run(
+                        ["container", "rm", "--force", container_id],
+                        timeout=ORPHAN_REAP_TIMEOUT_SECONDS,
+                    )
                     detail = removed.stderr or removed.stdout
                     if not removed.ok and "no such container" not in detail.lower():
                         raise RuntimeError(detail or "container removal failed")
