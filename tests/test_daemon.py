@@ -110,12 +110,14 @@ def test_disconnected_non_streaming_response_does_not_escape_handler(
     handler.server = SimpleNamespace(daemon_ref=served)
     monkeypatch.setattr(ipc, "read_request", lambda _conn: {"auth": served.secret, "verb": "gc"})
     monkeypatch.setattr(served, "dispatch", lambda *_args: {"ok": True, "unproven_resources": [{}]})
+    real_send_response = ipc.send_response
     monkeypatch.setattr(
         ipc, "send_response", lambda *_args: (_ for _ in ()).throw(OSError("reset"))
     )
 
     handler.handle()
 
+    monkeypatch.setattr(ipc, "send_response", real_send_response)
     assert daemon_mod.is_serving(served.state_dir)
     assert any(row["kind"] == "ipc.response_disconnected" for row in served.registry.events())
 
