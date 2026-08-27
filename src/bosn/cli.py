@@ -228,17 +228,25 @@ def build_parser(*, json_errors: bool = False) -> argparse.ArgumentParser:
             )
         if verb == "reconcile-volume":
             sub.add_argument(
-                "--volume", default=None, metavar="LOGICAL_NAME",
+                "--volume",
+                default=None,
+                metavar="LOGICAL_NAME",
                 help=(
                     "declared volume name from the selected stack; engine names are never accepted"
                 ),
             )
             sub.add_argument(
-                "--apply", dest="reconcile_apply", action="store_true", default=False,
+                "--apply",
+                dest="reconcile_apply",
+                action="store_true",
+                default=False,
                 help="apply the exact recovery after preview and --yes confirmation",
             )
             sub.add_argument(
-                "--yes", dest="yes", action="store_true", default=False,
+                "--yes",
+                dest="yes",
+                action="store_true",
+                default=False,
                 help="confirm the explicit legacy recovery when used with --apply",
             )
         if verb == "init":

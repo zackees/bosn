@@ -104,9 +104,8 @@ def plan_unproven_resource(
         if include_attachment:
             attachment = volume_attachments(engine, resource.name)
             result["attachment"] = attachment.to_dict()
-        if (
-            raw.get(labels.REGISTRY) == registry_id
-            and any(key != labels.REGISTRY for key in namespaced)
+        if raw.get(labels.REGISTRY) == registry_id and any(
+            key != labels.REGISTRY for key in namespaced
         ):
             result["decision"] = {
                 "action": "protected",

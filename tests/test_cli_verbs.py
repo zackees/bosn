@@ -107,11 +107,14 @@ def test_reconcile_volume_derives_a_manifest_target_before_requesting_daemon(
     monkeypatch.setattr(
         daemon,
         "request",
-        lambda verb, *_args, **kwargs: requests.append((verb, kwargs)) or {
-            "ok": True,
-            "applied": kwargs["apply"],
-            "plan": {"name": "derived", "decision": {"action": "would-recreate"}},
-        },
+        lambda verb, *_args, **kwargs: (
+            requests.append((verb, kwargs))
+            or {
+                "ok": True,
+                "applied": kwargs["apply"],
+                "plan": {"name": "derived", "decision": {"action": "would-recreate"}},
+            }
+        ),
     )
 
     preview = [

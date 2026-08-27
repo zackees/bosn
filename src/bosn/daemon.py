@@ -1137,8 +1137,12 @@ class Daemon:
                     return {"ok": False, "error": final_plan.reason, "plan": final_plan.to_dict()}
                 apply_legacy_volume_reconciliation(engine, final_plan)
                 self.registry.reconcile_resource(
-                    kind="volume", name=name, stack=stack.name, generation=digest,
-                    scope=volume.scope, workspace=workspace,
+                    kind="volume",
+                    name=name,
+                    stack=stack.name,
+                    generation=digest,
+                    scope=volume.scope,
+                    workspace=workspace,
                 )
                 self.registry.log_event("volume.legacy_reconciled", name)
         except TransferError as exc:

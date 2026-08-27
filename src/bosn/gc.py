@@ -469,9 +469,7 @@ def status(
     from bosn.recovery import plan_unproven_resource
 
     unproven_resources = [
-        plan_unproven_resource(
-            resource, registry.registry_id, engine, include_attachment=False
-        )
+        plan_unproven_resource(resource, registry.registry_id, engine, include_attachment=False)
         for resource in scan.unlabeled
     ]
     inventory = StorageInventory.collect(engine)
