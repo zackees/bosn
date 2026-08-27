@@ -85,7 +85,7 @@ class ConvergeResult:
     @classmethod
     def from_dict(cls, raw: dict[str, object]) -> ConvergeResult:
         volumes = raw.get("volumes") or []
-        if not isinstance(volumes, (list, tuple)):
+        if not isinstance(volumes, list | tuple):
             volumes = []
         return cls(
             stack=str(raw.get("stack", "")),

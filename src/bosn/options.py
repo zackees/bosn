@@ -120,7 +120,7 @@ def from_namespace(ns: argparse.Namespace) -> Options:
 
     def get_list(name: str) -> tuple[str, ...]:
         value = raw.get(name)
-        if not isinstance(value, (list, tuple)):
+        if not isinstance(value, list | tuple):
             return ()
         return tuple(str(item) for item in value)
 
