@@ -74,6 +74,9 @@ EXECUTION_ACQUIRE_TIMEOUT = 120.0
 # has lost a stream, wait only long enough to distinguish that failure, then read the durable
 # registry proof rather than starting the slow Docker scan that made #119 look like a hang.
 STATUS_DAEMON_TIMEOUT_SECONDS = 2.0
+# `jobs` is also a read-only control-plane diagnostic. It must not start a fresh daemon
+# (which cannot know about an old daemon's jobs) or inherit the generic 10-second wait.
+JOBS_DAEMON_TIMEOUT_SECONDS = 2.0
 
 
 def _policy_flags(opts: Options) -> dict[str, float | None]:
@@ -500,7 +503,13 @@ def cmd_jobs(opts: Options) -> int:
     from bosn import daemon as daemon_mod
 
     try:
-        reply = daemon_mod.request("jobs", opts.state_dir)
+        reply = daemon_mod.request(
+            "jobs",
+            opts.state_dir,
+            autostart=False,
+            request_timeout=JOBS_DAEMON_TIMEOUT_SECONDS,
+            diagnostic=True,
+        )
     except (daemon_mod.DaemonError, ipc.TransportError) as exc:  # fail closed, stay visible
         print(f"cannot reach the bosn daemon: {exc}", file=sys.stderr)
         return 1

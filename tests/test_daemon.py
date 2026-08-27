@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -162,7 +163,14 @@ def test_reconcile_volume_version_mismatch_is_rejected_before_dispatch(
     assert responses == [
         {
             "ok": False,
-            "error": "daemon version differs; restart the daemon before destructive use",
+            "error": (
+                "bosn client/daemon version mismatch: client="
+                "a-client-version-that-does-not-match daemon="
+                + daemon_mod.__version__
+                + "; restart the daemon before destructive use"
+            ),
+            "client_version": "a-client-version-that-does-not-match",
+            "daemon_version": daemon_mod.__version__,
         }
     ]
 
@@ -2032,6 +2040,48 @@ def test_mutating_request_fails_closed_without_a_daemon(tmp_path: Path) -> None:
         daemon_mod.request("status", tmp_path, autostart=False)
 
 
+def test_mutating_request_restarts_version_skew_only_without_live_sessions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(daemon_mod, "is_serving", lambda *_a, **_k: True)
+    replies = iter(
+        [
+            {"ok": False, "daemon_version": "old", "client_version": "new"},
+            {"ok": True, "execution_sessions": []},
+            {"ok": True, "result": "retried"},
+        ]
+    )
+    monkeypatch.setattr(ipc, "send_request", lambda *_a, **_k: next(replies))
+    stopped = []
+    spawned = []
+    monkeypatch.setattr(daemon_mod, "stop", lambda *_a, **_k: stopped.append(True) or True)
+    monkeypatch.setattr(daemon_mod, "spawn", lambda *_a, **_k: spawned.append(True))
+
+    assert daemon_mod.request("done", tmp_path)["result"] == "retried"
+    assert stopped == [True]
+    assert spawned == [True]
+
+
+def test_mutating_request_preserves_live_session_during_version_skew(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(daemon_mod, "is_serving", lambda *_a, **_k: True)
+    replies = iter(
+        [
+            {"ok": False, "error": "version mismatch", "daemon_version": "old"},
+            {"ok": True, "execution_sessions": [{"id": "session-1", "client_pid": 42}]},
+        ]
+    )
+    monkeypatch.setattr(ipc, "send_request", lambda *_a, **_k: next(replies))
+    monkeypatch.setattr(
+        daemon_mod, "stop", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError())
+    )
+
+    reply = daemon_mod.request("done", tmp_path)
+    assert not reply["ok"]
+    assert "session-1 (pid 42)" in reply["error"]
+
+
 def test_transport_error_on_a_dead_port() -> None:
     with pytest.raises(ipc.TransportError, match="unreachable"):
         ipc.send_request(daemon_mod.free_port(), {"verb": "ping"}, timeout=1.0)
@@ -2048,12 +2098,27 @@ def test_stop_raises_immediately_when_daemon_refuses_shutdown(tmp_path: Path, mo
         "send_request",
         lambda *a, **k: {
             "ok": False,
-            "error": "daemon has active execution session(s); wait for run or shell to exit",
+            "error": "daemon shutdown blocked by live execution session session-1 (pid 42)",
         },
     )
 
-    with pytest.raises(DaemonError, match="active execution session"):
+    with pytest.raises(DaemonError, match=r"live execution session session-1 \(pid 42\)"):
         daemon_mod.stop(tmp_path, timeout=0.0)
+
+
+def test_spawn_failure_includes_bounded_detached_diagnostics(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(daemon_mod, "is_serving", lambda *_a, **_k: False)
+    monkeypatch.setattr(daemon_mod, "running_state", lambda *_a, **_k: None)
+    monkeypatch.setattr(daemon_mod, "_detach", lambda *_a, **_k: 4321)
+    log = daemon_mod.startup_log_file(tmp_path)
+    log.write_text("fatal: token=top-secret\n", encoding="utf-8")
+
+    with pytest.raises(DaemonError) as caught:
+        daemon_mod.spawn(tmp_path, timeout=0)
+    message = str(caught.value)
+    assert "pid 4321" in message
+    assert "fatal:" in message
+    assert "top-secret" not in message
 
 
 def test_detach_does_not_depend_on_the_running_process_broker() -> None:
@@ -2068,6 +2133,18 @@ def test_detach_does_not_depend_on_the_running_process_broker() -> None:
     assert "launch_detached" not in code
     assert "rp_daemon" not in code
     assert "subprocess.Popen" in code
+
+
+def test_detach_truncates_diagnostics_for_each_launch(tmp_path: Path, monkeypatch) -> None:
+    log = daemon_mod.startup_log_file(tmp_path)
+    log.write_text("old failure that must not accumulate", encoding="utf-8")
+
+    class Child:
+        pid = 4321
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *_a, **_k: Child())
+    assert daemon_mod._detach(tmp_path) == 4321
+    assert log.read_bytes() == b""
 
 
 @pytest.mark.skipif(not sys.platform.startswith("win"), reason="Windows console flags")
