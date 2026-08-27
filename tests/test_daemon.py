@@ -122,6 +122,51 @@ def test_disconnected_non_streaming_response_does_not_escape_handler(
     assert any(row["kind"] == "ipc.response_disconnected" for row in served.registry.events())
 
 
+def test_reconcile_volume_version_mismatch_is_rejected_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even a preview must match: the same verb may later perform an apply."""
+
+    class NoRegistryMutation:
+        def log_event(self, *_args: object) -> None:
+            raise AssertionError("the version gate must not mutate the registry")
+
+    class NoDispatch:
+        secret = "test-secret"
+        registry = NoRegistryMutation()
+
+        def note_activity(self) -> None:
+            return None
+
+        def dispatch(self, *_args: object) -> dict[str, object]:
+            raise AssertionError("the version gate must reject before dispatch or engine use")
+
+    handler = object.__new__(daemon_mod._Handler)
+    handler.connection = object()
+    handler.server = SimpleNamespace(daemon_ref=NoDispatch())  # type: ignore[assignment]
+    responses: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        ipc,
+        "read_request",
+        lambda _conn: {
+            "auth": "test-secret",
+            "verb": "reconcile-volume",
+            "version": "a-client-version-that-does-not-match",
+            # Intentionally omit apply: preview is gated with the mutating verb too.
+        },
+    )
+    monkeypatch.setattr(ipc, "send_response", lambda _conn, reply: responses.append(reply))
+
+    handler.handle()
+
+    assert responses == [
+        {
+            "ok": False,
+            "error": "daemon version differs; restart the daemon before destructive use",
+        }
+    ]
+
+
 def test_default_state_dir_uses_the_fixed_default_port(monkeypatch) -> None:
     monkeypatch.delenv("BOSN_PORT", raising=False)
     from bosn.registry import default_state_dir

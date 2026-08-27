@@ -264,6 +264,7 @@ class _Handler(socketserver.StreamRequestHandler):
             "done",
             "adopt",
             "compose-adopt",
+            "reconcile-volume",
             "execution-acquire",
             "execution-release",
             "compose-acquire",
