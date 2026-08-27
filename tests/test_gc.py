@@ -7,6 +7,7 @@ import os
 import threading
 from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -15,7 +16,7 @@ from bosn import labels
 from bosn.accounting import StorageInventory, StorageProbe
 from bosn.clock import FakeClock
 from bosn.config import load as load_config
-from bosn.engine import EngineResult
+from bosn.engine import Engine, EngineResult
 from bosn.gc import Collector, done_workspaces, mark_done, status
 from bosn.registry import Registry
 from bosn.retention import (
@@ -360,9 +361,7 @@ def test_manifest_gc_reports_exact_unlabeled_collision_but_omits_safe_or_missing
         {target: {}, owned: label_dict(registry=registry.registry_id)}, {target, owned}
     )
 
-    result = Collector(registry, engine).collect(
-        dry_run=True, manifest=manifest
-    )  # type: ignore[arg-type]
+    result = Collector(registry, cast(Engine, engine)).collect(dry_run=True, manifest=manifest)
 
     assert calls == ["perf"]
     assert result.unproven_resources == [
@@ -382,9 +381,7 @@ def test_manifest_gc_reports_exact_unlabeled_collision_but_omits_safe_or_missing
     ]
     assert owned not in {entry["name"] for entry in result.unproven_resources}
 
-    Collector(registry, engine).collect(
-        dry_run=False, manifest=manifest
-    )  # type: ignore[arg-type]
+    Collector(registry, cast(Engine, engine)).collect(dry_run=False, manifest=manifest)
     assert calls == ["perf", "perf"]
     assert target not in engine.removals()
 
@@ -397,9 +394,7 @@ def test_manifest_gc_deduplicates_a_partial_volume_seen_by_generic_scan(
     from bosn.manifest import Manifest, StackSpec, VolumeSpec
     from bosn.resources import DiscoveredResource, ScanResult
 
-    stack = StackSpec(
-        name="perf", image="alpine", volumes=(VolumeSpec("target", "stack"),)
-    )
+    stack = StackSpec(name="perf", image="alpine", volumes=(VolumeSpec("target", "stack"),))
     manifest = Manifest(root=tmp_path, stacks={"perf": stack})
     monkeypatch.setattr(
         converge_mod, "resolved_generation", lambda *_args: ("sha256:resolved", None)
@@ -422,9 +417,7 @@ def test_manifest_gc_deduplicates_a_partial_volume_seen_by_generic_scan(
     )
     engine = ManifestCollisionEngine({name: partial}, {name})
 
-    result = Collector(registry, engine).collect(
-        dry_run=True, manifest=manifest
-    )  # type: ignore[arg-type]
+    result = Collector(registry, cast(Engine, engine)).collect(dry_run=True, manifest=manifest)
 
     assert len(result.unproven_resources) == 1
     assert result.unproven_resources[0]["name"] == name

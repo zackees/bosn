@@ -118,7 +118,7 @@ def test_disconnected_non_streaming_response_does_not_escape_handler(
     handler.handle()
 
     monkeypatch.setattr(ipc, "send_response", real_send_response)
-    assert daemon_mod.is_serving(served.state_dir)
+    assert _wait_until(lambda: daemon_mod.is_serving(served.state_dir)), "daemon stopped serving"
     assert any(row["kind"] == "ipc.response_disconnected" for row in served.registry.events())
 
 

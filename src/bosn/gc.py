@@ -247,9 +247,7 @@ class Collector:
             if manifest is not None
             else []
         )
-        result.unproven_resources = _dedupe_unproven_resources(
-            generic_unproven, manifest_selected
-        )
+        result.unproven_resources = _dedupe_unproven_resources(generic_unproven, manifest_selected)
         reclaimable = sum(
             measured.get(verdict.resource.id, 0) or 0 for verdict in collectable(verdicts)
         )
