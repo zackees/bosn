@@ -365,6 +365,61 @@ def test_active_execution_session_pins_daemon_and_refuses_shutdown(tmp_path: Pat
         daemon.registry.close()
 
 
+def test_inflight_non_streaming_request_pins_daemon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    watchdog_checked = threading.Event()
+    reply: list[dict[str, object]] = []
+    daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=0.1)
+    daemon._set_next_maintenance(daemon.clock.now() + 3600)
+    original_dispatch = daemon.dispatch
+
+    def blocking_dispatch(verb: str, request: dict[str, object]) -> dict[str, object]:
+        if verb != "gc":
+            return original_dispatch(verb, request)
+        entered.set()
+        assert release.wait(10), "test did not release blocking GC request"
+        return {"ok": True}
+
+    daemon.dispatch = blocking_dispatch  # type: ignore[method-assign]
+    original_should_retire = daemon.should_retire
+
+    def observed_should_retire() -> bool:
+        result = original_should_retire()
+        if entered.is_set() and not release.is_set():
+            watchdog_checked.set()
+        return result
+
+    monkeypatch.setattr(daemon, "should_retire", observed_should_retire)
+    server = threading.Thread(target=daemon.serve_forever, daemon=True)
+    server.start()
+    try:
+        assert _wait_until(lambda: daemon_mod.is_serving(tmp_path)), "daemon never came up"
+        client = threading.Thread(
+            target=lambda: reply.append(
+                ipc.send_request(daemon.port, {"auth": daemon.secret, "verb": "gc"}, timeout=10)
+            ),
+            daemon=True,
+        )
+        client.start()
+        assert entered.wait(5), "GC handler never started"
+        assert watchdog_checked.wait(5), "watchdog never checked retirement while GC was blocked"
+        assert daemon_mod.is_serving(tmp_path), "watchdog retired an in-flight GC request"
+        release.set()
+        client.join(timeout=10)
+        assert not client.is_alive(), "GC client never received a response"
+        assert reply == [{"ok": True}]
+        server.join(timeout=10)
+        assert not server.is_alive(), "daemon did not retire after request completion"
+    finally:
+        release.set()
+        daemon.request_stop()
+        server.join(timeout=10)
+        daemon.registry.close()
+
+
 # -- Compose project leases (#48) -------------------------------------------
 
 

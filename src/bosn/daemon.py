@@ -302,25 +302,26 @@ class _Handler(socketserver.StreamRequestHandler):
                 },
             )
             return
+        if verb in STREAMING_VERBS:
+            self._stream(daemon_ref, verb, request)
+            return
+        daemon_ref.begin_request()
         try:
-            if verb in STREAMING_VERBS:
-                self._stream(daemon_ref, verb, request)
-                return
-            response = daemon_ref.dispatch(verb, request)
-        except KeyboardInterrupt:
-            # Ctrl-C on the daemon means shut down, not "this one request failed".
-            daemon_ref.request_stop()
-            raise
-        except Exception as exc:  # noqa: BLE001 - every failure is observable, none fatal
-            response = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        try:
-            ipc.send_response(self.connection, response)
-        except (ipc.TransportError, OSError) as exc:
-            # A GC/status client can time out after the daemon has completed its work.
-            # Its disconnected socket is not authority to stop the shared daemon.
-            daemon_ref.registry.log_event(
-                "ipc.response_disconnected", f"{verb}: {type(exc).__name__}: {exc}"
-            )
+            try:
+                response = daemon_ref.dispatch(verb, request)
+            except KeyboardInterrupt:
+                daemon_ref.request_stop()
+                raise
+            except Exception as exc:  # noqa: BLE001
+                response = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            try:
+                ipc.send_response(self.connection, response)
+            except (ipc.TransportError, OSError) as exc:
+                daemon_ref.registry.log_event(
+                    "ipc.response_disconnected", f"{verb}: {type(exc).__name__}: {exc}"
+                )
+        finally:
+            daemon_ref.finish_request()
 
     def _stream(self, daemon_ref: Daemon, verb: str, request: dict[str, Any]) -> None:
         """Hold the connection open and write events until the job reaches a terminal one.
@@ -411,6 +412,7 @@ class Daemon:
         self._execution_owners: dict[str, tuple[int, float | None]] = {}
         self._execution_engines: dict[str, str] = {}
         self._execution_lock = threading.RLock()
+        self._active_requests = 0
         self._stopping = False
         self.secret = secrets.token_urlsafe(32)
         self.registry = Registry(self.state_dir / "registry.sqlite3", clock=self.clock)
@@ -510,6 +512,14 @@ class Daemon:
         self.last_activity = self.clock.now()
         self.heartbeat_at = self.last_activity
 
+    def begin_request(self) -> None:
+        with self._execution_lock:
+            self._active_requests += 1
+
+    def finish_request(self) -> None:
+        with self._execution_lock:
+            self._active_requests -= 1
+
     def idle_seconds(self) -> float:
         return self.clock.now() - self.last_activity
 
@@ -524,7 +534,8 @@ class Daemon:
         """
         with self._execution_lock:
             sessions_active = bool(self._execution_sessions)
-        if self.jobs.active_count() > 0 or sessions_active:
+            requests_active = self._active_requests > 0
+        if self.jobs.active_count() > 0 or sessions_active or requests_active:
             return False
         return self.idle_seconds() >= self.idle_retire_seconds
 
