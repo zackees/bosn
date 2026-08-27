@@ -442,6 +442,26 @@ def test_gc_asks_the_daemon_for_more_than_the_shared_default_budget(tmp_path, mo
     assert cli.GC_REQUEST_TIMEOUT_SECONDS > ipc.DEFAULT_TIMEOUT
 
 
+def test_gc_passes_an_available_manifest_for_exact_collision_diagnostics(
+    tmp_path, monkeypatch
+) -> None:
+    from bosn import daemon
+
+    manifest = tmp_path / "bosn.toml"
+    manifest.write_text("[stack.perf]\nimage = 'alpine:3.20'\n", encoding="utf-8")
+    seen: dict[str, object] = {}
+
+    def capture(verb, *_args, **kwargs):
+        seen["verb"] = verb
+        seen.update(kwargs)
+        return {"ok": True, "result": {}, "errors": []}
+
+    monkeypatch.setattr(daemon, "request", capture)
+    assert cli.main(["--manifest", str(manifest), "gc", "--json"]) == 0
+    assert seen["verb"] == "gc"
+    assert seen["manifest"] == str(manifest)
+
+
 def test_gc_json_reports_images_deferred_by_container_dependencies(
     tmp_path, capsys, monkeypatch
 ) -> None:

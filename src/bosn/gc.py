@@ -23,6 +23,7 @@ from bosn import labels, resources
 from bosn.accounting import StorageInventory, probe, resource_bytes
 from bosn.config import Config
 from bosn.engine import Engine
+from bosn.manifest import Manifest
 from bosn.registry import Registry
 from bosn.resources import ResourceScanner
 from bosn.retention import (
@@ -84,6 +85,59 @@ class GCResult:
         }
 
 
+def manifest_volume_collisions(
+    registry: Registry, engine: Engine, manifest: Manifest
+) -> list[dict[str, object]]:
+    """Report existing incomplete volumes selected by a manifest, never claim them.
+
+    Generic engine enumeration cannot establish that an unlabeled object blocks a stack.
+    This narrow supplement derives only names that the selected manifest itself declares,
+    using the same resolved generation and naming contract as convergence.  It is purely
+    diagnostic and is intentionally called only by ``gc``, not bounded ``status``.
+    """
+    from bosn.converge import resolved_generation, volume_name_for, workspace_of
+    from bosn.recovery import plan_manifest_volume_collision
+
+    scanner = ResourceScanner(engine)
+    workspace = workspace_of(manifest)
+    collisions: list[dict[str, object]] = []
+    for stack_name in sorted(manifest.stacks):
+        stack = manifest.stacks[stack_name]
+        digest, _ = resolved_generation(manifest, stack, engine)
+        for volume in stack.volumes:
+            name = volume_name_for(
+                stack,
+                volume.scope,
+                volume.name,
+                digest=digest,
+                workspace=workspace,
+                family=stack.family,
+            )
+            # Inspect existence separately from labels: an unlabeled existing volume and
+            # a nonexistent volume both render as ``{}`` through the label-only API.
+            if not engine.run(["volume", "inspect", name]).ok:
+                continue
+            raw_labels = scanner.inspect_labels("volume", name)
+            collision = plan_manifest_volume_collision(
+                name, raw_labels, registry.registry_id, engine
+            )
+            if collision is not None:
+                collisions.append(collision)
+    return collisions
+
+
+def _dedupe_unproven_resources(
+    generic: list[dict[str, object]], manifest_selected: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    """Merge generic and manifest views; the latter has the more specific diagnosis."""
+    merged: dict[tuple[str, str], dict[str, object]] = {}
+    for resource in [*generic, *manifest_selected]:
+        kind = str(resource.get("kind") or "")
+        name = str(resource.get("name") or "")
+        merged[(kind, name)] = resource
+    return [merged[key] for key in sorted(merged)]
+
+
 class Collector:
     def __init__(
         self, registry: Registry, engine: Engine | None = None, *, config: Config | None = None
@@ -107,6 +161,7 @@ class Collector:
         *,
         dry_run: bool = True,
         pressure: Pressure | None = None,
+        manifest: Manifest | None = None,
     ) -> GCResult:
         from bosn.config import load as load_config
 
@@ -183,10 +238,18 @@ class Collector:
             self.registry, pressure=pressure, config=config, running_containers=running_containers
         )
         result = GCResult(dry_run=dry_run)
-        result.unproven_resources = [
+        generic_unproven = [
             plan_unproven_resource(resource, self.registry.registry_id, self.engine)
             for resource in scan.unlabeled
         ]
+        manifest_selected = (
+            manifest_volume_collisions(self.registry, self.engine, manifest)
+            if manifest is not None
+            else []
+        )
+        result.unproven_resources = _dedupe_unproven_resources(
+            generic_unproven, manifest_selected
+        )
         reclaimable = sum(
             measured.get(verdict.resource.id, 0) or 0 for verdict in collectable(verdicts)
         )

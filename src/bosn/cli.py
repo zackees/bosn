@@ -1011,16 +1011,21 @@ def cmd_gc(opts: Options) -> int:
     from bosn import daemon as daemon_mod
     from bosn.config import ConfigError
     from bosn.config import load as load_config
+    from bosn.manifest import find_manifest
 
     try:
         flags = _policy_flags(opts)
         load_config(flags=flags)
+        # GC stays global when no manifest is present.  When one is available, the daemon
+        # can additionally inspect the exact volume names it derives from this contract.
+        manifest_path = opts.manifest or find_manifest()
         reply = daemon_mod.request(
             "gc",
             opts.state_dir,
             engine=opts.engine,
             dry_run=opts.dry_run,
             policy_flags=flags,
+            manifest=str(manifest_path) if manifest_path is not None else None,
             request_timeout=GC_REQUEST_TIMEOUT_SECONDS,
         )
     except ConfigError as exc:

@@ -109,6 +109,22 @@ class FakeEngine:
         return [c[-1] for c in self.commands if "rm" in c]
 
 
+class ManifestCollisionEngine(FakeEngine):
+    """Makes volume existence distinct from label inspection for manifest diagnostics."""
+
+    def __init__(self, label_map: dict[str, dict[str, str]], existing: set[str]) -> None:
+        super().__init__(label_map)
+        self.existing = existing
+
+    def run(self, args: list[str], *, check: bool = False) -> EngineResult:
+        if args[:2] == ["volume", "inspect"]:
+            self.commands.append(list(args))
+            if args[-1] not in self.existing:
+                return EngineResult(1, "", "no such volume")
+            return EngineResult(0, json.dumps(self.label_map.get(args[-1], {})), "")
+        return super().run(args, check=check)
+
+
 def label_dict(registry: str = OURS, kind: str = "volume", **overrides: str) -> dict[str, str]:
     base = labels.ResourceLabels(
         registry=registry,
@@ -295,6 +311,123 @@ def test_gc_only_advertises_legacy_inspection_for_a_manifest_discriminator(
         "reason": "incomplete ownership labels; protected from automatic recovery",
         "recovery": "explicit-reconcile-inspection-available",
     }
+
+
+def test_manifest_gc_reports_exact_unlabeled_collision_but_omits_safe_or_missing_volumes(
+    registry: Registry, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#120: a selected manifest names its collision without making that name ownership."""
+    from bosn import converge as converge_mod
+    from bosn.converge import volume_name_for, workspace_of
+    from bosn.manifest import Manifest, StackSpec, VolumeSpec
+
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    stack = StackSpec(
+        name="perf",
+        dockerfile="Dockerfile",
+        volumes=(
+            VolumeSpec("target", "spec"),
+            VolumeSpec("owned", "stack"),
+            VolumeSpec("missing", "stack"),
+        ),
+    )
+    manifest = Manifest(root=tmp_path, stacks={"perf": stack})
+    workspace = workspace_of(manifest)
+    calls: list[str] = []
+
+    def resolved(_manifest, selected, _engine):
+        calls.append(selected.name)
+        return "sha256:resolved", None
+
+    monkeypatch.setattr(converge_mod, "resolved_generation", resolved)
+    target = volume_name_for(
+        stack,
+        "spec",
+        "target",
+        digest="sha256:resolved",
+        workspace=workspace,
+        family=None,
+    )
+    owned = volume_name_for(
+        stack,
+        "stack",
+        "owned",
+        digest="sha256:resolved",
+        workspace=workspace,
+        family=None,
+    )
+    engine = ManifestCollisionEngine(
+        {target: {}, owned: label_dict(registry=registry.registry_id)}, {target, owned}
+    )
+
+    result = Collector(registry, engine).collect(
+        dry_run=True, manifest=manifest
+    )  # type: ignore[arg-type]
+
+    assert calls == ["perf"]
+    assert result.unproven_resources == [
+        {
+            "kind": "volume",
+            "name": target,
+            "registry_id": None,
+            "label_keys": [],
+            "decision": {
+                "action": "protected",
+                "eligible": False,
+                "reason": "manifest-derived name collision has no Bosn ownership labels",
+                "recovery": "refused",
+            },
+            "attachment": {"state": "detached", "containers": []},
+        }
+    ]
+    assert owned not in {entry["name"] for entry in result.unproven_resources}
+
+    Collector(registry, engine).collect(
+        dry_run=False, manifest=manifest
+    )  # type: ignore[arg-type]
+    assert calls == ["perf", "perf"]
+    assert target not in engine.removals()
+
+
+def test_manifest_gc_deduplicates_a_partial_volume_seen_by_generic_scan(
+    registry: Registry, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from bosn import converge as converge_mod
+    from bosn.converge import volume_name_for, workspace_of
+    from bosn.manifest import Manifest, StackSpec, VolumeSpec
+    from bosn.resources import DiscoveredResource, ScanResult
+
+    stack = StackSpec(
+        name="perf", image="alpine", volumes=(VolumeSpec("target", "stack"),)
+    )
+    manifest = Manifest(root=tmp_path, stacks={"perf": stack})
+    monkeypatch.setattr(
+        converge_mod, "resolved_generation", lambda *_args: ("sha256:resolved", None)
+    )
+    name = volume_name_for(
+        stack,
+        "stack",
+        "target",
+        digest="sha256:resolved",
+        workspace=workspace_of(manifest),
+        family=None,
+    )
+    partial = {labels.REGISTRY: registry.registry_id, labels.STACK: "perf"}
+    monkeypatch.setattr(
+        gc_mod.ResourceScanner,
+        "scan",
+        lambda *_args, **_kwargs: ScanResult(
+            unlabeled=[DiscoveredResource("volume", name, partial)], scanned_kinds={"volume"}
+        ),
+    )
+    engine = ManifestCollisionEngine({name: partial}, {name})
+
+    result = Collector(registry, engine).collect(
+        dry_run=True, manifest=manifest
+    )  # type: ignore[arg-type]
+
+    assert len(result.unproven_resources) == 1
+    assert result.unproven_resources[0]["name"] == name
 
 
 def test_gc_never_issues_a_system_prune(registry: Registry, clock: FakeClock) -> None:

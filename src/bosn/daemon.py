@@ -1036,12 +1036,20 @@ class Daemon:
         from bosn.config import load as load_config
         from bosn.engine import Engine
         from bosn.gc import Collector
+        from bosn.manifest import ManifestError, load
 
         flags = request.get("policy_flags")
         config = load_config(flags=flags if isinstance(flags, dict) else None)
+        manifest = None
+        manifest_text = str(request.get("manifest") or "")
+        if manifest_text:
+            try:
+                manifest = load(Path(manifest_text))
+            except ManifestError as exc:
+                return {"ok": False, "error": f"gc manifest diagnostics unavailable: {exc}"}
         result = Collector(
             self.registry, Engine(str(request.get("engine") or self.engine_binary)), config=config
-        ).collect(dry_run=bool(request.get("dry_run", True)))
+        ).collect(dry_run=bool(request.get("dry_run", True)), manifest=manifest)
         return {
             "ok": True,
             "result": result.summary(),

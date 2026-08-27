@@ -130,6 +130,10 @@ attachment check happens again immediately before staged recreation.  `gc --appl
 non-destructive for all incomplete resources; there is no `--force`, and `adopt` is not a
 remedy for incomplete ownership.
 
+When `gc` has a selected `bosn.toml`, its dry-run report also checks only the exact volume
+names derived from that manifest. This makes an otherwise label-free collision visible as a
+protected manifest blocker; the name remains a diagnostic selector, never ownership proof.
+
 Nothing needs starting — the first command lazily spawns the daemon.
 
 **For unattended cleanup, install the login launcher once:**

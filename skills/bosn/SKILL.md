@@ -53,6 +53,9 @@ unless Docker access is intentionally configured.
   `bosn reconcile-volume --stack <stack> --volume <logical-name>` to preview it. Apply needs
   `--apply --yes`; a registry label plus `kind`/`created` alone is insufficient. Never
   substitute `adopt`, a raw engine name, or a force-delete.
+- Run `bosn gc` from the affected workspace or pass `--manifest`: it adds protected
+  diagnostics for exact manifest-derived volume-name collisions, including label-free ones,
+  but never uses the name itself as permission to modify a volume.
 - After changing bosn code during development, restart its daemon before dogfooding so the
   in-memory process runs the updated implementation.
 

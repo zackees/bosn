@@ -149,6 +149,36 @@ def plan_unproven_resource(
     return result
 
 
+def plan_manifest_volume_collision(
+    name: str, raw_labels: dict[str, str], registry_id: str, engine: Engine
+) -> dict[str, object] | None:
+    """Describe an existing manifest-derived volume without treating its name as proof.
+
+    The caller has already proved that this exact name exists in the engine.  A complete
+    label contract belongs to normal ownership/foreign-registry reporting; only incomplete
+    and unlabeled collisions appear here, and they remain protected in both GC modes.
+    """
+    if labels.is_complete(raw_labels):
+        return None
+    if raw_labels:
+        return plan_unproven_resource(
+            DiscoveredResource("volume", name, raw_labels), registry_id, engine
+        )
+    return {
+        "kind": "volume",
+        "name": name,
+        "registry_id": None,
+        "label_keys": [],
+        "decision": {
+            "action": "protected",
+            "eligible": False,
+            "reason": "manifest-derived name collision has no Bosn ownership labels",
+            "recovery": "refused",
+        },
+        "attachment": volume_attachments(engine, name).to_dict(),
+    }
+
+
 def plan_legacy_volume_reconciliation(
     *,
     name: str,
