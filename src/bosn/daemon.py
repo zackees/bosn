@@ -1057,9 +1057,9 @@ class Daemon:
         """
         from pathlib import Path
 
-        from bosn.converge import volume_name_for, workspace_of
+        from bosn.converge import resolved_generation, volume_name_for, workspace_of
         from bosn.engine import Engine
-        from bosn.manifest import ManifestError, generation_digest, load
+        from bosn.manifest import ManifestError, load
         from bosn.recovery import (
             apply_legacy_volume_reconciliation,
             legacy_expected_labels,
@@ -1085,7 +1085,8 @@ class Daemon:
             return {"ok": False, "error": detail}
 
         workspace = workspace_of(manifest)
-        digest = generation_digest(manifest, stack)
+        engine = Engine(str(request.get("engine") or self.engine_binary))
+        digest, _ = resolved_generation(manifest, stack, engine)
         name = volume_name_for(
             stack,
             volume.scope,
@@ -1094,7 +1095,6 @@ class Daemon:
             workspace=workspace,
             family=stack.family,
         )
-        engine = Engine(str(request.get("engine") or self.engine_binary))
 
         def current_plan():
             raw = ResourceScanner(engine).inspect_labels("volume", name)
