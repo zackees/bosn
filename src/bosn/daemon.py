@@ -294,29 +294,26 @@ class _Handler(socketserver.StreamRequestHandler):
                 },
             )
             return
+        if verb in STREAMING_VERBS:
+            self._stream(daemon_ref, verb, request)
+            return
+        daemon_ref.begin_request()
         try:
-            if verb in STREAMING_VERBS:
-                self._stream(daemon_ref, verb, request)
-                return
-            daemon_ref.begin_request()
             try:
                 response = daemon_ref.dispatch(verb, request)
-            finally:
-                daemon_ref.finish_request()
-        except KeyboardInterrupt:
-            # Ctrl-C on the daemon means shut down, not "this one request failed".
-            daemon_ref.request_stop()
-            raise
-        except Exception as exc:  # noqa: BLE001 - every failure is observable, none fatal
-            response = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-        try:
-            ipc.send_response(self.connection, response)
-        except (ipc.TransportError, OSError) as exc:
-            # A GC/status client can time out after the daemon has completed its work.
-            # Its disconnected socket is not authority to stop the shared daemon.
-            daemon_ref.registry.log_event(
-                "ipc.response_disconnected", f"{verb}: {type(exc).__name__}: {exc}"
-            )
+            except KeyboardInterrupt:
+                daemon_ref.request_stop()
+                raise
+            except Exception as exc:  # noqa: BLE001
+                response = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            try:
+                ipc.send_response(self.connection, response)
+            except (ipc.TransportError, OSError) as exc:
+                daemon_ref.registry.log_event(
+                    "ipc.response_disconnected", f"{verb}: {type(exc).__name__}: {exc}"
+                )
+        finally:
+            daemon_ref.finish_request()
 
     def _stream(self, daemon_ref: Daemon, verb: str, request: dict[str, Any]) -> None:
         """Hold the connection open and write events until the job reaches a terminal one.

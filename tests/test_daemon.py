@@ -368,9 +368,22 @@ def test_active_execution_session_pins_daemon_and_refuses_shutdown(tmp_path: Pat
 def test_inflight_non_streaming_request_pins_daemon(tmp_path: Path) -> None:
     daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=0)
     try:
-        daemon.begin_request()
-        assert not daemon.should_retire()
-        daemon.finish_request()
+        handler = object.__new__(daemon_mod._Handler)
+        handler.connection = object()
+        handler.server = SimpleNamespace(daemon_ref=daemon)  # type: ignore[assignment]
+        sent: list[dict[str, object]] = []
+        original_read = ipc.read_request
+        original_send = ipc.send_response
+        ipc.read_request = lambda _conn: {"auth": daemon.secret, "verb": "gc"}  # type: ignore[assignment]
+        daemon.dispatch = lambda *_args: {"ok": True}  # type: ignore[method-assign]
+        def send(_conn: object, response: dict[str, object]) -> None:
+            assert not daemon.should_retire(), "watchdog must not retire during response"
+            sent.append(response)
+        ipc.send_response = send  # type: ignore[assignment]
+        handler.handle()
+        ipc.read_request = original_read  # type: ignore[assignment]
+        ipc.send_response = original_send  # type: ignore[assignment]
+        assert sent == [{"ok": True}]
         assert daemon.should_retire()
     finally:
         daemon.registry.close()
