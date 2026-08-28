@@ -1512,3 +1512,154 @@ def test_init_help_lists_the_compose_and_output_flags(capsys) -> None:
     out = capsys.readouterr().out
     assert "--compose" in out
     assert "--output" in out
+
+
+def test_run_explains_a_closed_stream_instead_of_only_asserting_it(tmp_path, monkeypatch, capsys):
+    """#134: `daemon closed the stream before the job ended` said nothing about why.
+
+    The reporter was left with a state directory holding a heartbeat, a registry, a secret
+    and an empty startup log, and no bounded diagnostic tying any of it to the failure.
+    """
+    from bosn import daemon as daemon_mod
+
+    manifest = tmp_path / "bosn.toml"
+    manifest.write_text("[stack.linux]\nimage = 'alpine:3.20'\n", encoding="utf-8")
+    daemon_mod.DaemonState(
+        pid=999_999, port=daemon_mod.port_for(tmp_path), started_at=1.0, version="0.0.1-old"
+    ).write(daemon_mod.state_file(tmp_path))
+
+    def closed_stream(*_args, **_kwargs):
+        raise ipc.TransportError("daemon closed the stream before the job ended")
+
+    monkeypatch.setattr(daemon_mod, "stream", closed_stream)
+    monkeypatch.setattr(daemon_mod, "request", closed_stream)
+
+    code = cli.main(
+        [
+            "--state-dir",
+            str(tmp_path),
+            "--manifest",
+            str(manifest),
+            "run",
+            "--stack",
+            "linux",
+            "true",
+        ]
+    )
+
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "daemon closed the stream before the job ended" in err
+    assert "control-plane diagnostics" in err
+    assert "version=0.0.1-old" in err, "the daemon version the client could not otherwise see"
+    assert "process absent" in err
+    assert "version skew" in err
+
+
+def test_degraded_status_reports_the_daemon_identity_it_could_not_reach(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """A skew refusal names a daemon version; `status` must be able to name it too (#134)."""
+    from bosn import daemon as daemon_mod
+    from bosn.registry import Registry
+
+    with Registry(tmp_path / "registry.sqlite3"):
+        pass
+    daemon_mod.DaemonState(
+        pid=999_999, port=daemon_mod.port_for(tmp_path), started_at=1.0, version="0.0.1-old"
+    ).write(daemon_mod.state_file(tmp_path))
+    monkeypatch.setattr(
+        daemon_mod,
+        "request",
+        lambda *a, **k: (_ for _ in ()).throw(ipc.TransportTimeout("no answer")),
+    )
+
+    assert cli.main(["--state-dir", str(tmp_path), "status"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    recorded = payload["daemon"]["recorded"]
+    assert payload["daemon"]["reachable"] is False
+    assert recorded["version"] == "0.0.1-old"
+    assert recorded["pid"] == 999_999
+    assert recorded["process_alive"] is False
+    assert recorded["version_skew"] is True
+    assert recorded["client_version"] == cli.__version__
+
+
+def test_status_reports_no_recorded_daemon_rather_than_inventing_one(tmp_path, monkeypatch, capsys):
+    """An empty state directory must read as "none", never as a daemon with unknown fields."""
+    from bosn import daemon as daemon_mod
+    from bosn.registry import Registry
+
+    with Registry(tmp_path / "registry.sqlite3"):
+        pass
+    monkeypatch.setattr(
+        daemon_mod,
+        "request",
+        lambda *a, **k: (_ for _ in ()).throw(daemon_mod.DaemonError("no bosn daemon is running")),
+    )
+
+    assert cli.main(["--state-dir", str(tmp_path), "status"]) == 0
+
+    assert json.loads(capsys.readouterr().out)["daemon"]["recorded"] is None
+
+
+def test_status_stays_bounded_against_a_listener_that_never_answers(tmp_path, capsys) -> None:
+    """#134's other half: after the restart attempt, control commands hung past 30 seconds.
+
+    A *closed* port fails instantly and proves nothing. The failure mode that hangs is a
+    socket that accepts the connection and then says nothing -- a wedged daemon, or a
+    half-started one -- so this test is the accepting-and-silent listener, and it asserts
+    on the wall clock rather than on a constant. Anything that reintroduces an unbounded
+    control-plane read fails here regardless of which timeout it forgot.
+    """
+    import socket
+    import threading
+    import time as _time
+
+    from bosn import daemon as daemon_mod
+    from bosn.registry import Registry
+
+    with Registry(tmp_path / "registry.sqlite3"):
+        pass
+    daemon_mod.DaemonState(
+        pid=999_999, port=daemon_mod.port_for(tmp_path), started_at=1.0, version="0.0.1-old"
+    ).write(daemon_mod.state_file(tmp_path))
+
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", daemon_mod.port_for(tmp_path)))
+    listener.listen(8)
+    held: list[socket.socket] = []
+    stop = threading.Event()
+
+    def accept_and_say_nothing() -> None:
+        listener.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                conn, _ = listener.accept()
+            except (TimeoutError, OSError):
+                continue
+            held.append(conn)  # deliberately never written to
+
+    accepter = threading.Thread(target=accept_and_say_nothing, daemon=True)
+    accepter.start()
+    try:
+        started = _time.monotonic()
+        code = cli.main(["--state-dir", str(tmp_path), "status"])
+        elapsed = _time.monotonic() - started
+    finally:
+        stop.set()
+        accepter.join(timeout=5)
+        for conn in held:
+            conn.close()
+        listener.close()
+
+    assert code == 0
+    assert elapsed < 15.0, f"status must stay bounded against a silent daemon; took {elapsed:.1f}s"
+    payload = json.loads(capsys.readouterr().out)
+    # A listener that accepts and never answers is a *degraded* control plane, not an
+    # absent one -- and the recorded identity is what makes it diagnosable.
+    assert payload["mode"] == "degraded"
+    assert payload["daemon"]["reachable"] is False
+    assert payload["daemon"]["recorded"]["version"] == "0.0.1-old"

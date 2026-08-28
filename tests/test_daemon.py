@@ -2476,3 +2476,83 @@ def test_real_detached_spawn_and_autostart(tmp_path: Path) -> None:
         assert daemon_mod.request("status", tmp_path)["pid"] == state.pid
     finally:
         assert daemon_mod.stop(tmp_path, timeout=30)
+
+
+# -- bounded control-plane diagnostics (#134) --------------------------------
+
+
+def test_control_diagnostics_explain_a_daemon_that_recorded_itself_and_stopped_answering(
+    tmp_path: Path,
+) -> None:
+    """The #134 shape: a state directory that proves a daemon existed and nothing else.
+
+    "daemon closed the stream before the job ended" is the whole message the reporter got.
+    Each fact asserted here is one the operator had no way to obtain: which version the
+    daemon was, whether its process still exists, and whether its port still answers.
+    """
+    daemon_mod.DaemonState(
+        pid=999_999, port=daemon_mod.port_for(tmp_path), started_at=1.0, version="0.1.3"
+    ).write(daemon_mod.state_file(tmp_path))
+
+    report = daemon_mod.control_diagnostics(tmp_path)
+
+    assert "version=0.1.3" in report
+    assert "pid=999999" in report
+    assert "process absent" in report, "a recorded pid that is gone must be reported as gone"
+    assert "not answering" in report
+    assert "heartbeat: never written" in report
+    assert daemon_mod.__version__ in report, "the client version belongs beside the daemon's"
+
+
+def test_control_diagnostics_name_version_skew_without_a_reachable_daemon(tmp_path: Path) -> None:
+    """A skew refusal names a daemon version; nothing else could tell the operator it."""
+    daemon_mod.DaemonState(
+        pid=os.getpid(), port=daemon_mod.port_for(tmp_path), started_at=1.0, version="0.0.1-old"
+    ).write(daemon_mod.state_file(tmp_path))
+
+    report = daemon_mod.control_diagnostics(tmp_path)
+
+    assert "version skew" in report
+    assert "0.0.1-old" in report
+    assert "process alive" in report, "this test's own pid is alive; the probe must say so"
+
+
+def test_control_diagnostics_never_leak_the_daemon_secret(tmp_path: Path) -> None:
+    """It runs on a failure path whose output lands in terminals and bug reports."""
+    secret = "s3cr3t-daemon-token-that-must-never-be-printed"
+    daemon_mod.secret_file(tmp_path).write_text(secret, encoding="utf-8")
+    log = daemon_mod.startup_log_file(tmp_path)
+    log.write_text(f"Traceback...\nsecret={secret}\napi_key={secret}\n", encoding="utf-8")
+
+    report = daemon_mod.control_diagnostics(tmp_path)
+
+    assert secret not in report
+    assert "<redacted>" in report
+    assert "Traceback" in report, "redaction must not cost the diagnostic its content"
+
+
+def test_control_diagnostics_are_bounded_and_never_raise(tmp_path: Path, monkeypatch) -> None:
+    """A diagnostic that can hang or fail replaces a bad message with no message at all."""
+    missing = tmp_path / "not-a-directory"
+
+    def exploding_state(_state_dir=None):
+        raise OSError("state file is on a disconnected volume")
+
+    monkeypatch.setattr(daemon_mod, "recorded_state", exploding_state)
+    started = time.monotonic()
+    report = daemon_mod.control_diagnostics(missing)
+    elapsed = time.monotonic() - started
+
+    assert "unreadable" in report
+    assert "control port:" in report, "one unreadable fact must not abandon the rest"
+    assert elapsed < 10.0, f"diagnostics must stay bounded; took {elapsed:.1f}s"
+
+
+def test_recorded_state_does_not_delete_what_it_reads(tmp_path: Path) -> None:
+    """`running_state` unlinks a stale file; a post-mortem must not destroy its evidence."""
+    path = daemon_mod.state_file(tmp_path)
+    daemon_mod.DaemonState(pid=999_999, port=1234, started_at=1.0, version="0.1.3").write(path)
+
+    assert daemon_mod.recorded_state(tmp_path) is not None
+    assert daemon_mod.recorded_state(tmp_path) is not None, "reading it twice must be possible"
+    assert path.exists()
