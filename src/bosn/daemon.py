@@ -2054,17 +2054,45 @@ def request(
         timeout=request_timeout,
     )
     sessions = status.get("execution_sessions") or []
-    if sessions:
+    # `client_alive` is the daemon's own verdict on each recorded owner, and it is the whole
+    # difference between "someone is running a command in there" and "a SIGKILLed client
+    # left a row behind". Treating every recorded session as live was #134: the reporter's
+    # owner pid was absent from the process table, `done` was refused to protect a live
+    # session that did not exist, and the documented restart could therefore never run --
+    # leaving no supported recovery at all.
+    #
+    # A session whose liveness the daemon did not report counts as live. That case is
+    # exactly a daemon too old to answer the question, which is the situation this branch
+    # exists for; inferring death from a missing field is how a live build gets interrupted.
+    blocking = [item for item in sessions if item.get("client_alive", True)]
+    if blocking:
         details = ", ".join(
             f"{item.get('id', 'unknown')} (pid {item.get('client_pid', 'unknown')})"
-            for item in sessions
+            for item in blocking
         )
         reply["error"] = f"{reply.get('error')}; live execution sessions prevent restart: {details}"
         return reply
+    # Every recorded session's owner is confirmed dead, so `stop()` -- the operator path
+    # this report documents -- is safe to run, and does the reaping itself.
+    #
+    # The client's read above is an optimization, never the authority: `Daemon.request_stop`
+    # re-confirms each owner's exact process identity under its own lock before releasing
+    # anything, refuses to stop while any session survives that check, and fails closed if
+    # cleanup is uncertain. So a session that came back to life between the status call and
+    # the stop still blocks, which is what keeps "recover a stale session" from ever
+    # becoming "interrupt a live one".
     if not stop(state_dir, timeout=request_timeout):
         raise DaemonError("version-skewed daemon did not stop cleanly; mutation was not sent")
     spawn(state_dir)
-    return ipc.send_request(port_for(state_dir), wire_request, timeout=request_timeout)
+    retried = ipc.send_request(port_for(state_dir), wire_request, timeout=request_timeout)
+    if sessions:
+        # The reap is durably recorded as `execution.orphan_reaped` in the event log; this
+        # says so in the reply too, so a caller need not infer that a restart quietly
+        # cleaned up after a dead client.
+        retried["recovered_execution_sessions"] = [
+            str(item.get("id", "unknown")) for item in sessions
+        ]
+    return retried
 
 
 def stream(
