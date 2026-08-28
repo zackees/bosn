@@ -886,7 +886,12 @@ def cmd_run(opts: Options) -> int:
         print(str(exc), file=sys.stderr)
         return exc.exit_code
     except (daemon_mod.DaemonError, ipc.TransportError) as exc:  # fail closed, stay visible
+        # A closed stream is the one failure the client genuinely cannot explain from the
+        # exception alone -- #134 reports exactly this message with nothing behind it. The
+        # diagnostics are bounded and secret-free, so printing them here cannot turn a
+        # failed command into a hung one.
         print(f"cannot reach the bosn daemon: {exc}", file=sys.stderr)
+        print(daemon_mod.control_diagnostics(opts.state_dir), file=sys.stderr)
         return 1
     except (ManifestError, EngineError, ConfigError) as exc:
         print(str(exc), file=sys.stderr)
@@ -915,6 +920,7 @@ def cmd_attach(opts: Options) -> int:
         return exc.exit_code
     except (daemon_mod.DaemonError, ipc.TransportError) as exc:
         print(f"cannot reach the bosn daemon: {exc}", file=sys.stderr)
+        print(daemon_mod.control_diagnostics(opts.state_dir), file=sys.stderr)
         return 1
     print(f"job {job_id} succeeded", file=sys.stderr)
     return 0
@@ -988,6 +994,24 @@ def _persisted_execution_sessions(registry, *, daemon_control_available: bool) -
             }
         )
     return sessions
+
+
+def _recorded_daemon(state_dir) -> dict[str, object] | None:
+    """The daemon's own last self-report, for the branch where it cannot be asked."""
+    from bosn import daemon as daemon_mod
+    from bosn.resources import process_alive
+
+    state = daemon_mod.recorded_state(state_dir)
+    if state is None:
+        return None
+    return {
+        "pid": state.pid,
+        "port": state.port,
+        "version": state.version,
+        "process_alive": process_alive(state.pid),
+        "client_version": __version__,
+        "version_skew": state.version != __version__,
+    }
 
 
 def cmd_status(opts: Options) -> int:
@@ -1071,6 +1095,13 @@ def cmd_status(opts: Options) -> int:
                         "reachable": False,
                         "error": daemon_error,
                         "status_timeout_seconds": STATUS_DAEMON_TIMEOUT_SECONDS,
+                        # An unreachable daemon is exactly when its identity matters most:
+                        # a version-skew refusal names a daemon version the client can
+                        # otherwise only learn from a daemon that answers (#134). This is
+                        # what the daemon last recorded about itself, marked as such --
+                        # `recorded` never claims the process is serving, only that it
+                        # wrote this and whether that pid still exists.
+                        "recorded": _recorded_daemon(opts.state_dir),
                     },
                     "next": (
                         "the daemon control channel is unavailable, so do not run `bosn "

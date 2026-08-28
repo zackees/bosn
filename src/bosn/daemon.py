@@ -1830,6 +1830,95 @@ def _startup_diagnostics(state_dir: Path, *, limit: int = 8192) -> str:
     )
 
 
+# The bounded diagnostic's own ceiling. Everything it reads is either instant (a small
+# file, a pid liveness test) or already deadlined, and its single network call reuses
+# `is_serving`'s ping with this budget. Named rather than inlined so "this must never
+# become another hang" is a checkable promise instead of an implied one (#134).
+CONTROL_DIAGNOSTIC_PING_TIMEOUT_SECONDS = 2.0
+
+
+def recorded_state(state_dir: Path | None = None) -> DaemonState | None:
+    """What the daemon last wrote about itself, believed or not.
+
+    `running_state` deliberately answers "is a daemon serving", and *deletes* the file when
+    the answer is no. That is right for spawn/stop decisions and useless for a post-mortem:
+    the moment worth diagnosing is exactly the one where a daemon recorded itself and then
+    stopped answering. This reads the same file and draws no conclusion from it.
+    """
+    return DaemonState.read(state_file(state_dir or default_state_dir()))
+
+
+def control_diagnostics(state_dir: Path | None = None, *, limit: int = 2048) -> str:
+    """A bounded, secret-free account of the control plane for a failure the client cannot explain.
+
+    "daemon closed the stream before the job ended" states what happened and nothing about
+    why. #134 reports precisely that: a state directory holding a heartbeat, a registry, a
+    secret, and an *empty* startup log, with no bounded diagnostic connecting any of it to
+    the closed stream -- and, one command later, a version-skew refusal naming a daemon
+    version the client had no other way to see.
+
+    So this reports what the daemon recorded about itself (including its version, beside
+    this client's), whether that process still exists, whether its port still answers, how
+    stale its heartbeat is, and the tail of its startup log.
+
+    Two properties this must keep, because it only ever runs on a failure path:
+
+    - It never raises. A diagnostic that can fail would replace a bad message with none.
+    - It never carries the daemon secret. The secret file is not read here, and the startup
+      tail goes through `_startup_diagnostics`' redaction.
+    """
+    state_dir = state_dir or default_state_dir()
+    lines = [f"control-plane diagnostics (client version {__version__}):"]
+
+    try:
+        recorded = recorded_state(state_dir)
+    except KeyboardInterrupt:
+        raise
+    except Exception:  # noqa: BLE001 - a diagnostic may not fail
+        lines.append("  recorded daemon: unreadable")
+    else:
+        if recorded is None:
+            lines.append("  recorded daemon: none (no daemon has recorded itself here)")
+        else:
+            try:
+                from bosn.resources import process_alive
+
+                alive = "alive" if process_alive(recorded.pid) else "absent"
+            except KeyboardInterrupt:
+                raise
+            except Exception:  # noqa: BLE001 - a diagnostic may not fail
+                alive = "unknown"
+            lines.append(
+                f"  recorded daemon: version={recorded.version} pid={recorded.pid} "
+                f"(process {alive}) port={recorded.port}"
+            )
+            if recorded.version != __version__:
+                lines.append(
+                    f"  version skew: this client is {__version__}; restart the daemon "
+                    "before destructive use"
+                )
+
+    try:
+        answered = is_serving(state_dir, timeout=CONTROL_DIAGNOSTIC_PING_TIMEOUT_SECONDS)
+        lines.append(
+            f"  control port: {'answering' if answered else 'not answering'} "
+            f"(probed for {CONTROL_DIAGNOSTIC_PING_TIMEOUT_SECONDS:g}s)"
+        )
+    except KeyboardInterrupt:
+        raise
+    except Exception:  # noqa: BLE001 - a diagnostic may not fail
+        lines.append("  control port: probe failed")
+
+    try:
+        beat = heartbeat_file(state_dir).stat().st_mtime
+        lines.append(f"  heartbeat: {max(0.0, time.time() - beat):.0f}s old")
+    except OSError:
+        lines.append("  heartbeat: never written")
+
+    lines.append(f"  startup log: {_startup_diagnostics(state_dir, limit=limit)}")
+    return "\n".join(lines)
+
+
 def _detach(state_dir: Path) -> int:
     """Start a detached `bosn __daemon`.
 
