@@ -105,11 +105,16 @@ def test_port_is_deterministic_not_random(tmp_path: Path) -> None:
 def test_disconnected_non_streaming_response_does_not_escape_handler(
     served: Daemon, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A client timing out on a large GC response cannot take down the daemon (#120)."""
+    """A client timing out on a large response cannot take down the daemon (#120).
+
+    `done` stands in for the non-streaming shape here. It was `gc` until #110 moved that
+    verb onto the streaming path -- the property is about the synchronous branch of
+    `_Handler.handle`, not about any particular verb.
+    """
     handler = object.__new__(daemon_mod._Handler)
     handler.connection = object()
     handler.server = SimpleNamespace(daemon_ref=served)  # type: ignore[assignment]
-    monkeypatch.setattr(ipc, "read_request", lambda _conn: {"auth": served.secret, "verb": "gc"})
+    monkeypatch.setattr(ipc, "read_request", lambda _conn: {"auth": served.secret, "verb": "done"})
     monkeypatch.setattr(served, "dispatch", lambda *_args: {"ok": True, "unproven_resources": [{}]})
     real_send_response = ipc.send_response
     monkeypatch.setattr(
@@ -365,6 +370,169 @@ def test_active_execution_session_pins_daemon_and_refuses_shutdown(tmp_path: Pat
         daemon.registry.close()
 
 
+def test_gc_streams_progress_then_one_final_event(tmp_path: Path, monkeypatch) -> None:
+    """#110: a collection reports while it runs, and ends with exactly one final payload.
+
+    The heartbeat interval is shortened rather than the collection lengthened, so this
+    proves the loop emits *while* the worker is still going without spending real seconds.
+    """
+    import bosn.engine
+    import bosn.gc
+    from bosn.engine import EngineInfo
+
+    release = threading.Event()
+    entered = threading.Event()
+
+    class ReachableEngine:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def info(self) -> EngineInfo:
+            return EngineInfo(binary="docker", reachable=True)
+
+    class BlockingCollector:
+        def __init__(self, _registry, _engine, *, config=None) -> None:
+            pass
+
+        def collect(self, *, progress=None, **_kwargs):
+            if progress is not None:
+                progress("scanning engine resources")
+            entered.set()
+            assert release.wait(10), "test never released the blocked collection"
+
+            class Result:
+                removed: list[str] = []
+                stopped: list[str] = []
+                would_stop: list[str] = []
+                image_dependency_deferred: list[str] = []
+                image_decisions: list[dict] = []
+                errors: list[str] = []
+                advisories: list[str] = []
+                unproven_resources: list[dict] = []
+
+                def summary(self):
+                    return {"removed": 0}
+
+            return Result()
+
+    monkeypatch.setattr(daemon_mod, "GC_HEARTBEAT_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setattr(bosn.engine, "Engine", ReachableEngine)
+    monkeypatch.setattr(bosn.gc, "Collector", BlockingCollector)
+    daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=3600)
+    try:
+        events: list[dict] = []
+        stream = daemon.dispatch_stream("gc", {"dry_run": True})
+        first = next(stream)
+        assert entered.is_set(), "the collection should already be running"
+        events.append(first)
+        release.set()
+        events.extend(stream)
+
+        progress = [event for event in events if not event.get("final")]
+        final = [event for event in events if event.get("final")]
+        assert progress, "a running collection must say so before it finishes"
+        assert progress[0]["phase"] == "scanning engine resources"
+        assert all("elapsed_seconds" in event for event in progress)
+        assert len(final) == 1, "exactly one final event ends the stream"
+        assert final[0]["ok"] is True
+        assert final[0]["result"] == {"removed": 0}
+    finally:
+        release.set()
+        daemon.registry.close()
+
+
+def test_a_failed_collection_still_ends_the_stream_with_a_reason(tmp_path: Path, monkeypatch):
+    """A crash inside the worker thread must not hang the client on a stream that never ends."""
+    import bosn.engine
+    import bosn.gc
+    from bosn.engine import EngineInfo
+
+    class ReachableEngine:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def info(self) -> EngineInfo:
+            return EngineInfo(binary="docker", reachable=True)
+
+    class ExplodingCollector:
+        def __init__(self, _registry, _engine, *, config=None) -> None:
+            pass
+
+        def collect(self, **_kwargs):
+            raise RuntimeError("engine went away mid-collection")
+
+    monkeypatch.setattr(bosn.engine, "Engine", ReachableEngine)
+    monkeypatch.setattr(bosn.gc, "Collector", ExplodingCollector)
+    daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=3600)
+    try:
+        events = list(daemon.dispatch_stream("gc", {"dry_run": True}))
+
+        assert events[-1]["final"] is True
+        assert events[-1]["ok"] is False
+        assert "engine went away mid-collection" in events[-1]["error"]
+    finally:
+        daemon.registry.close()
+
+
+def test_inflight_streaming_request_pins_daemon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#142 pinned the synchronous branch; a streamed `gc` is held by nothing else (#110).
+
+    A `converge` stream is protected from idle retirement by its job, which
+    `should_retire` counts. `gc` has no job, so if the pin did not cover the streaming
+    branch the watchdog could retire the daemon out from under a collection a client is
+    actively watching -- exactly the "client and daemon both exited" shape #110 reports.
+    """
+    entered = threading.Event()
+    release = threading.Event()
+    watchdog_checked = threading.Event()
+    daemon = Daemon(state_dir=tmp_path, idle_retire_seconds=0.1)
+    daemon._set_next_maintenance(daemon.clock.now() + 3600)
+
+    def blocking_stream(verb: str, _request: dict[str, object]):
+        assert verb == "gc"
+        entered.set()
+        assert release.wait(10), "test did not release the blocking stream"
+        yield {"ok": True, "final": True}
+
+    daemon.dispatch_stream = blocking_stream  # type: ignore[method-assign]
+    original_should_retire = daemon.should_retire
+
+    def observed_should_retire() -> bool:
+        result = original_should_retire()
+        if entered.is_set() and not release.is_set():
+            watchdog_checked.set()
+        return result
+
+    monkeypatch.setattr(daemon, "should_retire", observed_should_retire)
+    server = threading.Thread(target=daemon.serve_forever, daemon=True)
+    server.start()
+    try:
+        assert _wait_until(lambda: daemon_mod.is_serving(tmp_path)), "daemon never came up"
+        events: list[dict] = []
+        client = threading.Thread(
+            target=lambda: events.extend(
+                ipc.stream_request(daemon.port, {"auth": daemon.secret, "verb": "gc"})
+            ),
+            daemon=True,
+        )
+        client.start()
+        assert entered.wait(5), "gc stream never started"
+        assert watchdog_checked.wait(5), "watchdog never checked retirement mid-stream"
+        assert daemon_mod.is_serving(tmp_path), "watchdog retired an in-flight gc stream"
+        release.set()
+        client.join(timeout=10)
+        assert events == [{"ok": True, "final": True}]
+        server.join(timeout=10)
+        assert not server.is_alive(), "daemon did not retire after the stream completed"
+    finally:
+        release.set()
+        daemon.request_stop()
+        server.join(timeout=10)
+        daemon.registry.close()
+
+
 def test_inflight_non_streaming_request_pins_daemon(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -377,10 +545,10 @@ def test_inflight_non_streaming_request_pins_daemon(
     original_dispatch = daemon.dispatch
 
     def blocking_dispatch(verb: str, request: dict[str, object]) -> dict[str, object]:
-        if verb != "gc":
+        if verb != "done":
             return original_dispatch(verb, request)
         entered.set()
-        assert release.wait(10), "test did not release blocking GC request"
+        assert release.wait(10), "test did not release the blocking request"
         return {"ok": True}
 
     daemon.dispatch = blocking_dispatch  # type: ignore[method-assign]
@@ -399,17 +567,17 @@ def test_inflight_non_streaming_request_pins_daemon(
         assert _wait_until(lambda: daemon_mod.is_serving(tmp_path)), "daemon never came up"
         client = threading.Thread(
             target=lambda: reply.append(
-                ipc.send_request(daemon.port, {"auth": daemon.secret, "verb": "gc"}, timeout=10)
+                ipc.send_request(daemon.port, {"auth": daemon.secret, "verb": "done"}, timeout=10)
             ),
             daemon=True,
         )
         client.start()
-        assert entered.wait(5), "GC handler never started"
-        assert watchdog_checked.wait(5), "watchdog never checked retirement while GC was blocked"
-        assert daemon_mod.is_serving(tmp_path), "watchdog retired an in-flight GC request"
+        assert entered.wait(5), "handler never started"
+        assert watchdog_checked.wait(5), "watchdog never checked retirement while blocked"
+        assert daemon_mod.is_serving(tmp_path), "watchdog retired an in-flight request"
         release.set()
         client.join(timeout=10)
-        assert not client.is_alive(), "GC client never received a response"
+        assert not client.is_alive(), "client never received a response"
         assert reply == [{"ok": True}]
         server.join(timeout=10)
         assert not server.is_alive(), "daemon did not retire after request completion"

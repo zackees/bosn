@@ -16,7 +16,7 @@ import shutil
 import sqlite3
 import sys
 from collections.abc import Callable, Sequence
-from typing import NoReturn
+from typing import Any, NoReturn
 
 from bosn import __version__, ipc
 from bosn.engine import CLOCK_SKEW_BUDGET_SECONDS, Engine
@@ -24,27 +24,25 @@ from bosn.options import Options, from_namespace
 
 DAEMON_VERB = "__daemon"
 
-# `gc` waits on a daemon-side `Collector.collect`, whose cost is nothing like the shared
-# `ipc.DEFAULT_TIMEOUT` (10s) that every other verb inherits. Measured on a ~280-object
+# `gc` has no request budget, which is the second half of #110 and took two attempts.
+#
+# It waits on a daemon-side `Collector.collect`, whose cost is nothing like the shared
+# `ipc.DEFAULT_TIMEOUT` (10s) every other verb inherits. Measured on a ~280-object
 # development host: `docker system df -v` alone is 5.2s, the resource scan is 7-11s quiet
-# and ~24s under load (see #99), and removals come on top of both and scale with how much
-# there is to delete. 10s could not cover the *first* step, so `bosn gc` reported failure
-# for collections that were proceeding normally (#110).
+# and ~24s under load (see #99), and removals come on top of both. #111 replaced the 10s
+# with a measured 120s -- and a field host still ran past it with nothing wrong, leaving
+# the user no report of a collection that was proceeding normally.
 #
-# 120s is sized to cover inventory plus a loaded scan plus a substantial removal pass with
-# room to spare, rather than to the median case -- a `gc` that has real work to do is
-# exactly when this budget matters, and exactly when the host is slowest.
-#
-# It is deliberately a per-call override rather than a bump to `ipc.DEFAULT_TIMEOUT`, for
-# the same reason `compose-adopt` got its own in #99: that constant is shared by every
-# verb, and widening it to fit the slowest one would silently loosen budgets for verbs
-# that answer in milliseconds and should fail fast when they do not.
-#
-# Any fixed number here is ultimately a guess, because `gc`'s runtime scales with how much
-# it deletes. #110 records the alternative -- making `gc` job-backed the way builds already
-# are (`jobs.py`), so progress streams and no budget is needed at all -- as the real fix if
-# this one ever proves too small.
-GC_REQUEST_TIMEOUT_SECONDS = 120.0
+# That settled the question the constant's own comment posed: any fixed number is a guess
+# when the runtime is a function of how much there is to delete, so `gc` streams instead.
+# The client waits on the daemon still reporting progress (`ipc.STREAM_TIMEOUT` per event,
+# with the daemon heartbeating well inside it) rather than on a total deadline it invented.
+# Nothing here loosens the shared control-plane budget: ordinary verbs still fail fast.
+
+# How often a phase that is still running repeats itself on stderr. The daemon heartbeats
+# several times more often, because that rate is sized to keep the transport convinced the
+# collection is alive; this one is sized to be read by a person watching one scroll by.
+GC_PROGRESS_INTERVAL_SECONDS = 30.0
 
 # `adopt` always scans the engine, then processes each explicit transfer sequentially. Reserve a
 # loaded-host scan/reconciliation margin here; `adopt_request_timeout_seconds()` adds both
@@ -1104,15 +1102,37 @@ def cmd_gc(opts: Options) -> int:
         # daemon must inspect, while its manifest root remains the collision context.
         manifest_path = opts.manifest or find_manifest()
         manifest = load(manifest_path) if manifest_path is not None else None
-        reply = daemon_mod.request(
+        # Streamed, not a single request with a deadline: `gc`'s runtime is a function of
+        # how much there is to delete, so the client waits on the daemon still talking
+        # rather than on a total budget it had to guess (#110). Non-final events are
+        # progress; the final one carries exactly what the synchronous reply used to.
+        reply: dict[str, Any] = {}
+        shown_phase: str | None = None
+        shown_at = 0.0
+        for event in daemon_mod.stream(
             "gc",
             opts.state_dir,
             engine=opts.engine,
             dry_run=opts.dry_run,
             policy_flags=flags,
             manifest=str(manifest.path) if manifest is not None else None,
-            request_timeout=GC_REQUEST_TIMEOUT_SECONDS,
-        )
+        ):
+            if event.get("final"):
+                reply = event
+                break
+            if opts.json:
+                continue
+            phase = str(event.get("phase") or "working")
+            elapsed = float(event.get("elapsed_seconds") or 0)
+            # Every phase change, then only occasionally within one. The daemon heartbeats
+            # far more often than a reader needs -- that rate is sized to prove liveness to
+            # the transport, not to be read -- and a long phase would otherwise scroll the
+            # report it is introducing off the screen.
+            if phase == shown_phase and elapsed - shown_at < GC_PROGRESS_INTERVAL_SECONDS:
+                continue
+            shown_phase, shown_at = phase, elapsed
+            # stderr, so a piped `bosn gc` still yields only its JSON report on stdout.
+            print(f"collecting: {phase} ({elapsed:.0f}s)", file=sys.stderr)
     except ConfigError as exc:
         return _error(
             code="policy.invalid",
@@ -1129,19 +1149,20 @@ def cmd_gc(opts: Options) -> int:
         )
     except ipc.TransportTimeout as exc:
         # Ordered before the `TransportError` clause below, which it is a subclass of.
-        # A timeout here does not mean the daemon is absent -- it means it is still
-        # collecting -- so it must not inherit that clause's "start or restart the daemon"
-        # remedy. Restarting is the one action that would interrupt the very work being
-        # waited on, and the collection continues regardless of this client giving up.
+        # Now that the collection streams, this no longer fires on a long collection --
+        # it fires when the daemon stopped saying anything at all for a whole heartbeat
+        # window, which is a wedged or dead daemon rather than a busy one. It still must
+        # not inherit that clause's "restart the daemon" remedy: if a collection really is
+        # mid-flight, restarting is the one action that would interrupt it.
         return _error(
             code="gc.timeout",
             message=(
-                f"the daemon did not finish collecting within "
-                f"{GC_REQUEST_TIMEOUT_SECONDS:g}s: {exc}"
+                f"the daemon stopped reporting progress for {ipc.STREAM_TIMEOUT:g}s "
+                f"while collecting: {exc}"
             ),
             next_step=(
-                "the daemon is still collecting -- do not restart it; check `bosn status` "
-                "or the event log, and retry once it settles"
+                "check `bosn status` and the event log before restarting anything -- a "
+                "collection that is still running will finish on its own"
             ),
             as_json=opts.json,
         )
