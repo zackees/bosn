@@ -139,6 +139,13 @@ class ScanResult:
     foreign: list[DiscoveredResource] = field(default_factory=list)
     unlabeled: list[DiscoveredResource] = field(default_factory=list)
     scanned_kinds: set[str] = field(default_factory=set)
+    # kind -> why its listing did not complete. The complement of `scanned_kinds`, carrying
+    # the reason rather than only the absence, because an enumeration failure is the one
+    # case where an empty bucket means "unknown" and not "none exist" (#117). Every
+    # consumer that acts on absence already gates on `scanned_kinds`; this exists so the
+    # ones that *report* -- doctor, gc's dry run -- can say which kind failed and why
+    # instead of silently showing a short inventory.
+    failed_kinds: dict[str, str] = field(default_factory=dict)
 
     @property
     def foreign_registries(self) -> set[str]:
@@ -210,19 +217,33 @@ def _name_of(kind: str, row: dict[str, object]) -> str:
     return str(row.get("Names") or row.get("Name") or row.get("ID", ""))
 
 
+def _listing_failure(args: list[str], outcome: str, stderr: str) -> str:
+    """One line naming the command that failed and, when Docker said why, its first line."""
+    detail = next((line.strip() for line in (stderr or "").splitlines() if line.strip()), "")
+    rendered = f"docker {' '.join(args)} {outcome}"
+    return f"{rendered}: {detail}" if detail else rendered
+
+
 class ResourceScanner:
     """Enumerates engine resources and sorts them by ownership proof."""
 
     def __init__(self, engine: Engine | None = None) -> None:
         self.engine = engine or Engine()
 
-    def _discover(self, kind: str) -> tuple[list[DiscoveredResource], bool]:
+    def _discover(self, kind: str) -> tuple[list[DiscoveredResource], str | None]:
+        """List one kind. The second element is ``None`` on success, else why it failed.
+
+        Only a *non-zero exit* is reported that way. A listing that never produced a
+        result at all -- a blown deadline, a spawn failure -- raises `EngineError` out of
+        `Engine.run` and keeps doing so here, because `discover()` has nowhere to put a
+        reason; `scan()` is the caller that turns it into a failed kind (#117).
+        """
         args = _LIST_COMMANDS.get(kind)
         if args is None:
             raise ValueError(f"cannot enumerate unknown kind {kind!r}")
         result = self.engine.run(args)
         if not result.ok:
-            return [], False
+            return [], _listing_failure(args, f"exited {result.returncode}", result.stderr)
 
         # Two passes rather than one: the list format truncates labels for some kinds, and
         # confirming a truncated-looking row used to mean "call `inspect_labels` right here,
@@ -259,11 +280,11 @@ class ResourceScanner:
             if not labels.is_complete(raw):
                 raw = confirmed.get(name) or raw
             discovered.append(DiscoveredResource(kind=kind, name=name, raw_labels=raw))
-        return discovered, True
+        return discovered, None
 
     def discover(self, kind: str) -> list[DiscoveredResource]:
         """List one kind; callers needing safety metadata should use :meth:`scan`."""
-        discovered, _success = self._discover(kind)
+        discovered, _failure = self._discover(kind)
         return discovered
 
     def inspect_labels(self, kind: str, name: str) -> dict[str, str]:
@@ -340,11 +361,27 @@ class ResourceScanner:
         return recovered
 
     def scan(self, registry_id: str, kinds: list[str] | None = None) -> ScanResult:
+        """Enumerate every kind, bucketed by ownership proof, plus what could not be read.
+
+        One kind failing does not abandon the rest. A resource-heavy host is exactly where
+        `docker images` blows the 60-second engine deadline (#117) and also exactly where
+        the remaining diagnosis is worth the most, so the `EngineError` becomes a recorded
+        failed kind instead of an exception that discards three good listings. The kind is
+        deliberately kept out of `scanned_kinds`: every decision that reads absence as
+        removal gates on that set, so a failed kind stays invisible to it rather than
+        turning "could not list" into "no longer exists".
+        """
         scan = ScanResult()
         for kind in kinds or list(_LIST_COMMANDS):
-            discovered, success = self._discover(kind)
-            if success:
+            try:
+                discovered, failure = self._discover(kind)
+            except EngineError as exc:
+                scan.failed_kinds[kind] = str(exc)
+                continue
+            if failure is None:
                 scan.scanned_kinds.add(kind)
+            else:
+                scan.failed_kinds[kind] = failure
             for resource in discovered:
                 if not resource.complete:
                     scan.unlabeled.append(resource)

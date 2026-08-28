@@ -140,3 +140,34 @@ def test_a_successful_measurement_over_ceiling_still_evicts_exactly_as_before(
     assert result.removed == ["cache"]
     report = status(registry, engine, config=config)  # type: ignore[arg-type]
     assert report["pressure"]["bytes_unknown"] is False
+
+
+def test_an_incomplete_resource_scan_is_logged_as_an_event(registry: Registry, monkeypatch) -> None:
+    """#117: a listing that did not complete makes the unproven report short, not empty."""
+    from bosn.resources import ScanResult
+
+    add(registry)
+    engine = failing_df_engine()
+    monkeypatch.setattr(
+        "bosn.resources.ResourceScanner.scan",
+        lambda _self, _registry_id, **_kwargs: ScanResult(
+            scanned_kinds={"container", "network", "volume"},
+            failed_kinds={"image": "docker images --no-trunc exceeded its 60-second deadline"},
+        ),
+    )
+
+    Collector(registry, engine).collect(dry_run=True)  # type: ignore[arg-type]
+
+    events = [row for row in registry.events() if row["kind"] == "gc.scan_incomplete"]
+    assert events, "a short inventory must say why it is short"
+    assert "image" in str(events[0]["detail"])
+
+
+def test_a_complete_resource_scan_never_logs_the_incomplete_event(registry: Registry) -> None:
+    """Regression guard for the event itself: a healthy scan must stay silent."""
+    add(registry)
+
+    Collector(registry, failing_df_engine()).collect(dry_run=True)  # type: ignore[arg-type]
+
+    kinds = [row["kind"] for row in registry.events()]
+    assert "gc.scan_incomplete" not in kinds

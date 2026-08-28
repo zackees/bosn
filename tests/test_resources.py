@@ -17,7 +17,7 @@ import pytest
 
 from bosn import labels, resources
 from bosn.clock import FakeClock
-from bosn.engine import EngineResult
+from bosn.engine import EngineError, EngineResult
 from bosn.registry import Registry
 from bosn.resources import DiscoveredResource, ResourceScanner, ScanResult
 
@@ -1010,3 +1010,97 @@ def test_explicit_volume_transfer_refuses_an_attached_volume(registry: Registry)
     resource = DiscoveredResource("volume", "foreign-cache", label_dict(registry=THEIRS))
     with pytest.raises(resources.TransferError, match="attached"):
         resources.transfer_volume(registry, AttachedEngine(), resource)  # type: ignore[arg-type]
+
+
+# -- incomplete scans (#117) -------------------------------------------------
+
+
+class _KindFailingEngine(FakeEngine):
+    """A `FakeEngine` whose listing for one kind fails the way a loaded host fails.
+
+    Two shapes, because `_discover` sees them through different channels and #117 was
+    only ever reported for the second: a non-zero exit (`fail_exit`) comes back as an
+    `EngineResult`, while a deadline overrun or a spawn failure (`fail_timeout`) is
+    raised as `EngineError` out of `Engine.run` and never reaches the return value.
+    """
+
+    def __init__(
+        self,
+        listings: dict[str, list[dict]],
+        *,
+        fail_timeout: str | None = None,
+        fail_exit: str | None = None,
+    ) -> None:
+        super().__init__(listings)
+        self.fail_timeout = fail_timeout
+        self.fail_exit = fail_exit
+
+    def run(
+        self, args: list[str], *, check: bool = False, timeout: float | None = None
+    ) -> EngineResult:
+        kind = _LISTING_KINDS.get(args[0])
+        if kind is not None and kind == self.fail_timeout:
+            self.commands.append(list(args))
+            raise EngineError(
+                f"docker {' '.join(args)} exceeded its 60-second deadline",
+            )
+        if kind is not None and kind == self.fail_exit:
+            self.commands.append(list(args))
+            return EngineResult(1, "", "Cannot connect to the Docker daemon")
+        return super().run(args, check=check, timeout=timeout)
+
+
+_LISTING_KINDS = {"ps": "container", "volume": "volume", "images": "image", "network": "network"}
+
+
+def test_a_timed_out_listing_is_a_failed_kind_not_an_empty_one() -> None:
+    """#117: `docker images` blowing its deadline must not read as "no images exist"."""
+    engine = _KindFailingEngine(
+        {"volume": [{"Name": "ours", "Labels": json.dumps(label_dict())}]},
+        fail_timeout="image",
+    )
+
+    scan = ResourceScanner(engine).scan(OURS, kinds=["volume", "image"])  # type: ignore[arg-type]
+
+    assert [r.name for r in scan.owned] == ["ours"]
+    assert scan.scanned_kinds == {"volume"}
+    assert set(scan.failed_kinds) == {"image"}
+    assert "60-second deadline" in scan.failed_kinds["image"]
+
+
+def test_a_non_zero_listing_exit_is_reported_as_a_failed_kind() -> None:
+    """The pre-existing `([], False)` path gains the reason it never carried."""
+    engine = _KindFailingEngine({}, fail_exit="volume")
+
+    scan = ResourceScanner(engine).scan(OURS, kinds=["volume"])  # type: ignore[arg-type]
+
+    assert scan.scanned_kinds == set()
+    assert set(scan.failed_kinds) == {"volume"}
+    assert "Cannot connect to the Docker daemon" in scan.failed_kinds["volume"]
+
+
+def test_a_failed_kind_never_prunes_previously_registered_rows(tmp_path: Path) -> None:
+    """`reconcile_owned` deletes rows for kinds it *scanned*; a failed kind is not one."""
+    with Registry(tmp_path / "registry.sqlite3") as registry:
+        resource = registry.register_resource(
+            kind="image",
+            name="bosn-dev-image",
+            stack="dev",
+            generation="sha256:abc",
+            scope="stack",
+            workspace="/w",
+        )
+        engine = _KindFailingEngine({}, fail_timeout="image")
+        scan = ResourceScanner(engine).scan(registry.registry_id, kinds=["image"])  # type: ignore[arg-type]
+
+        resources.reconcile_owned(registry, scan, prior_resources=[resource])
+
+        assert [r.name for r in registry.list_resources()] == ["bosn-dev-image"]
+
+
+def test_discover_still_raises_so_callers_outside_scan_are_unchanged() -> None:
+    """`discover()` has no channel for partial truth; it must keep failing loudly."""
+    engine = _KindFailingEngine({}, fail_timeout="image")
+
+    with pytest.raises(EngineError):
+        ResourceScanner(engine).discover("image")  # type: ignore[arg-type]
