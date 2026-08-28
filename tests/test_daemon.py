@@ -889,6 +889,86 @@ def test_execution_acquire_serializes_commands_in_one_persistent_container(
         daemon.registry.close()
 
 
+def test_status_reports_no_execution_session_once_a_dead_owner_is_reaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#134's closing state: after recovery, nothing may still claim the workspace.
+
+    The test above proves the *container* is reaped before the next acquire. This is the
+    other half the report asks for -- that the session stops appearing in `status`, which
+    is the only thing an operator can check, and that the shutdown it was blocking now
+    succeeds.
+    """
+    import bosn.engine
+    from bosn import resources
+    from bosn.converge import Converger, ConvergeResult
+    from bosn.engine import EngineResult
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    manifest = project / "bosn.toml"
+    manifest.write_text(
+        "[stack.dev]\ndockerfile = 'Dockerfile'\ndefault = true\n", encoding="utf-8"
+    )
+    alive = {111: True}
+
+    class FakeEngine:
+        def __init__(self, binary: str = "docker", **_kwargs: object) -> None:
+            self.binary = binary
+
+        def run(self, _args: list[str], **_kwargs: object) -> EngineResult:
+            return EngineResult(0, "sha256:immutable-container", "")
+
+    daemon = Daemon(state_dir=tmp_path / "state")
+    resource = daemon.registry.register_resource(
+        kind="container",
+        name="dev",
+        stack="dev",
+        generation="g",
+        scope="stack",
+        workspace=str(project),
+    )
+
+    def acquire(*_args: object, **_kwargs: object):
+        lease = daemon.registry.acquire_lease(resource.id, pid=os.getpid(), proc_start=None)
+        return "sha256:immutable-container", (lease,)
+
+    monkeypatch.setattr(Converger, "_acquire_execution_container", acquire)
+    monkeypatch.setattr(resources, "process_alive", lambda pid, _start=None: alive.get(pid, False))
+    monkeypatch.setattr(bosn.engine, "Engine", FakeEngine)
+    try:
+        acquired = daemon.dispatch(
+            "execution-acquire",
+            {
+                "manifest": str(manifest),
+                "result": ConvergeResult("dev", "sha256:g", "reused", "image").to_dict(),
+                "workspace": str(project),
+                "proc_start": 10.0,
+                "pid": 111,
+                "engine": "docker",
+            },
+        )
+        assert acquired["ok"] is True
+
+        # While the owner lives, the session is visible and shutdown is refused.
+        live_sessions = daemon.dispatch("status", {})["execution_sessions"]
+        assert [item["id"] for item in live_sessions] == [acquired["session"]]
+        assert live_sessions[0]["client_alive"] is True
+        assert daemon.dispatch("shutdown", {})["ok"] is False
+
+        alive[111] = False
+
+        assert daemon.dispatch("shutdown", {})["ok"] is True
+        assert daemon.dispatch("status", {})["execution_sessions"] == []
+        assert daemon.registry.execution_sessions() == [], "the durable row must go too"
+        assert any(row["kind"] == "execution.orphan_reaped" for row in daemon.registry.events()), (
+            "a reap is a lifecycle event and must be recorded as one"
+        )
+    finally:
+        daemon.registry.close()
+
+
 def test_dead_execution_owner_is_stopped_and_reaped_before_next_acquire(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2385,6 +2465,127 @@ def test_mutating_request_preserves_live_session_during_version_skew(
     reply = daemon_mod.request("done", tmp_path)
     assert not reply["ok"]
     assert "session-1 (pid 42)" in reply["error"]
+
+
+def test_dead_owner_session_does_not_block_a_version_skew_restart(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """#134: a session whose owner is gone was protected as though someone were using it.
+
+    The reporter's recorded owner pid was absent from the process table, yet `done` was
+    refused with "live execution sessions prevent restart" -- so the documented recovery
+    (restart the skewed daemon, then retry) could never run, and there was no supported way
+    out. The daemon reports `client_alive` for exactly this question; the client ignored it.
+    """
+    monkeypatch.setattr(daemon_mod, "is_serving", lambda *_a, **_k: True)
+    replies = iter(
+        [
+            {"ok": False, "error": "version mismatch", "daemon_version": "0.1.3"},
+            {
+                "ok": True,
+                "execution_sessions": [
+                    {"id": "session-1", "client_pid": 86476, "client_alive": False}
+                ],
+            },
+            {"ok": True, "marked": 1},
+        ]
+    )
+    monkeypatch.setattr(ipc, "send_request", lambda *_a, **_k: next(replies))
+    stopped: list[bool] = []
+    spawned: list[bool] = []
+    monkeypatch.setattr(daemon_mod, "stop", lambda *_a, **_k: stopped.append(True) or True)
+    monkeypatch.setattr(daemon_mod, "spawn", lambda *_a, **_k: spawned.append(True))
+
+    reply = daemon_mod.request("done", tmp_path)
+
+    assert reply["ok"] is True and reply["marked"] == 1
+    assert stopped == [True], "the documented restart must actually run"
+    assert spawned == [True]
+    # `stop()` reaps the dead session on its way down; say so rather than leaving the
+    # caller to infer that a restart quietly cleaned up after a dead client.
+    assert reply["recovered_execution_sessions"] == ["session-1"]
+
+
+def test_one_live_session_still_blocks_a_restart_that_would_free_dead_ones(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Recovering a stale session must never become interrupting a live one."""
+    monkeypatch.setattr(daemon_mod, "is_serving", lambda *_a, **_k: True)
+    replies = iter(
+        [
+            {"ok": False, "error": "version mismatch", "daemon_version": "0.1.3"},
+            {
+                "ok": True,
+                "execution_sessions": [
+                    {"id": "dead-session", "client_pid": 111, "client_alive": False},
+                    {"id": "live-session", "client_pid": 222, "client_alive": True},
+                ],
+            },
+        ]
+    )
+    monkeypatch.setattr(ipc, "send_request", lambda *_a, **_k: next(replies))
+    monkeypatch.setattr(
+        daemon_mod, "stop", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("stopped"))
+    )
+
+    reply = daemon_mod.request("done", tmp_path)
+
+    assert not reply["ok"]
+    assert "live-session (pid 222)" in reply["error"]
+    assert "dead-session" not in reply["error"], "only the sessions actually blocking are named"
+
+
+def test_a_session_of_unreported_liveness_is_treated_as_live(tmp_path: Path, monkeypatch) -> None:
+    """The missing field means a daemon too old to answer -- which is this branch's whole case.
+
+    Inferring death from an absent `client_alive` is how a live build gets interrupted by
+    the very version skew that made the daemon unable to describe it.
+    """
+    monkeypatch.setattr(daemon_mod, "is_serving", lambda *_a, **_k: True)
+    replies = iter(
+        [
+            {"ok": False, "error": "version mismatch", "daemon_version": "0.0.9"},
+            {"ok": True, "execution_sessions": [{"id": "unknown-liveness", "client_pid": 42}]},
+        ]
+    )
+    monkeypatch.setattr(ipc, "send_request", lambda *_a, **_k: next(replies))
+    monkeypatch.setattr(
+        daemon_mod, "stop", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("stopped"))
+    )
+
+    reply = daemon_mod.request("done", tmp_path)
+
+    assert not reply["ok"]
+    assert "unknown-liveness (pid 42)" in reply["error"]
+
+
+def test_the_daemon_remains_the_authority_on_whether_a_session_may_be_reaped(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A client that decides "all dead" cannot free a session the daemon still holds.
+
+    `Daemon.request_stop` re-confirms each owner's exact process identity under its own
+    lock, so a session that came back into view between the status call and the stop still
+    refuses -- and the client must surface that refusal, never route around it.
+    """
+    monkeypatch.setattr(daemon_mod, "is_serving", lambda *_a, **_k: True)
+    replies = iter(
+        [
+            {"ok": False, "error": "version mismatch", "daemon_version": "0.1.3"},
+            {
+                "ok": True,
+                "execution_sessions": [{"id": "raced", "client_pid": 7, "client_alive": False}],
+            },
+        ]
+    )
+    monkeypatch.setattr(ipc, "send_request", lambda *_a, **_k: next(replies))
+    monkeypatch.setattr(daemon_mod, "stop", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        daemon_mod, "spawn", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("spawned"))
+    )
+
+    with pytest.raises(daemon_mod.DaemonError, match="did not stop cleanly"):
+        daemon_mod.request("done", tmp_path)
 
 
 def test_transport_error_on_a_dead_port() -> None:
