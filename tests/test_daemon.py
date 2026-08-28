@@ -2041,6 +2041,84 @@ def test_startup_reconciliation_repairs_remove_before_registry_crash(
         daemon.registry.close()
 
 
+def test_startup_reconciliation_declines_to_repair_from_an_incomplete_scan(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """#117 made `scan()` return partial truth; recovery must not mistake it for total truth.
+
+    The removal-repair test above proves a row whose object is gone gets dropped. That
+    inference is only valid when the listing actually ran: here the kind's listing timed
+    out, so the identical-looking empty scan must repair nothing and say why instead.
+    """
+    from bosn.resources import ScanResult
+
+    class Scanner:
+        def __init__(self, _engine) -> None:
+            pass
+
+        def scan(self, registry_id: str, **_kwargs):
+            return ScanResult(failed_kinds={"volume": "docker volume ls exceeded its deadline"})
+
+    import bosn.engine
+    import bosn.resources
+
+    monkeypatch.setattr(bosn.resources, "ResourceScanner", Scanner)
+    monkeypatch.setattr(bosn.engine, "Engine", lambda *a, **k: _StubEngine())
+    daemon = Daemon(state_dir=tmp_path)
+    try:
+        row = daemon.registry.register_resource(
+            kind="volume",
+            name="warm-cache",
+            stack="dev",
+            generation="digest",
+            scope="spec",
+            workspace="workspace",
+        )
+        daemon._reconcile_startup_resources()
+
+        assert daemon.registry.get_resource(row.id) is not None
+        events = [event for event in daemon.registry.events()]
+        unavailable = [e for e in events if e["kind"] == "recovery.scan.unavailable"]
+        assert unavailable, "an unrepairable pass must still record why"
+        assert "volume" in str(unavailable[0]["detail"])
+        assert not [e for e in events if e["kind"] == "recovery.startup"]
+    finally:
+        daemon.registry.close()
+
+
+def test_adopt_refuses_an_incomplete_scan_instead_of_reporting_nothing_to_adopt(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """An empty foreign set from a listing that never finished is not evidence (#117)."""
+    from bosn.resources import ScanResult
+
+    class Scanner:
+        def __init__(self, _engine) -> None:
+            pass
+
+        def scan(self, registry_id: str, **_kwargs):
+            return ScanResult(
+                scanned_kinds={"container", "volume"},
+                failed_kinds={"image": "docker images --no-trunc exceeded its deadline"},
+            )
+
+    import bosn.resources
+
+    monkeypatch.setattr(bosn.resources, "ResourceScanner", Scanner)
+    daemon = Daemon(state_dir=tmp_path)
+    try:
+        original = daemon.registry.registry_id
+        reply = daemon._verb_adopt({"engine": "docker"})
+
+        assert not reply["ok"]
+        assert "incomplete" in str(reply["error"])
+        assert "image" in str(reply["error"])
+        assert reply.get("adopted") is None, "a refusal must not also report an adoption"
+        assert daemon.registry.registry_id == original
+    finally:
+        daemon.registry.close()
+
+
 def test_startup_reconciliation_is_idempotent(monkeypatch, tmp_path: Path) -> None:
     """Mirrors the prune_dead_leases idempotency test: a second pass repairs nothing."""
     from bosn import labels

@@ -376,6 +376,19 @@ class _Server(socketserver.ThreadingTCPServer):
         super().__init__(addr, _Handler)
 
 
+def _incomplete_scan_detail(scan: Any) -> str:
+    """One line naming every kind whose listing did not complete, and why.
+
+    `ResourceScanner.scan` stopped raising when a single kind's listing blows the engine
+    deadline (#117) so `doctor` can still report the three that worked. Everything else in
+    here wanted the old all-or-nothing failure: recovery and adoption compare the engine
+    against the registry, and a comparison against a listing that never finished is not
+    one either should act on. Each such caller checks `scan.failed_kinds` explicitly and
+    uses this for the message, rather than the absent exception.
+    """
+    return "; ".join(f"{kind}: {reason}" for kind, reason in sorted(scan.failed_kinds.items()))
+
+
 class Daemon:
     """The serving side. Owns the registry connection and the idle clock."""
 
@@ -458,6 +471,13 @@ class Daemon:
                 return
             prior_resources = self.registry.list_resources()
             scan = ResourceScanner(engine).scan(self.registry.registry_id)
+            if scan.failed_kinds:
+                # Same outcome the escaping `EngineError` used to produce, now stated:
+                # log why, repair nothing, retry on the next pass. An unreachable engine
+                # reaches this line rather than the `except` below, so without this the
+                # most common recovery failure would stop being recorded at all.
+                self.registry.log_event("recovery.scan.unavailable", _incomplete_scan_detail(scan))
+                return
             if self._stop.is_set():
                 return
             repaired = reconcile_owned(self.registry, scan, prior_resources=prior_resources)
@@ -1257,6 +1277,17 @@ class Daemon:
                 "registry_id": self.registry.registry_id,
             }
         scan = ResourceScanner(engine).scan("", kinds=["container", "volume", "image"])
+        if scan.failed_kinds:
+            # Adoption reads an empty foreign set as "nothing to recover" and then rewrites
+            # this registry's identity from what it did find. Neither conclusion survives a
+            # partial listing, so an incomplete scan is refused rather than acted on (#117).
+            return {
+                "ok": False,
+                "error": (
+                    "engine resource listing did not complete, so adoption evidence is "
+                    f"incomplete: {_incomplete_scan_detail(scan)}"
+                ),
+            }
         registries = scan.foreign_registries
         if not registries:
             return {"ok": True, "adopted": [], "registry_id": None}
@@ -1282,6 +1313,15 @@ class Daemon:
             }
         self.registry.set_meta("registry_id", registry_id)
         recovered = ResourceScanner(engine).scan(registry_id)
+        if recovered.failed_kinds:
+            return {
+                "ok": False,
+                "registry_id": registry_id,
+                "error": (
+                    "engine resource listing did not complete while recovering "
+                    f"{registry_id}; rerun adopt: {_incomplete_scan_detail(recovered)}"
+                ),
+            }
         names = adopt(self.registry, recovered)
         recompute_manifest_generations(self.registry, recovered)
         return {"ok": True, "adopted": names, "registry_id": registry_id}

@@ -432,6 +432,29 @@ def cmd_doctor(opts: Options) -> int:
     from bosn.resources import ResourceScanner
 
     scan = ResourceScanner(Engine(opts.engine)).scan(registry_id or "")
+    if scan.failed_kinds:
+        # #117: the engine answered the reachability probe and then took longer than the
+        # 60-second command deadline to list a kind -- the signature of a host with enough
+        # objects on it that diagnosis matters most. Everything printed above stands; the
+        # inventory does not, and it is reported as unknown rather than as an empty
+        # inventory. The foreign-registry report below is skipped for the same reason:
+        # `adopt --from-registry <id>` advice derived from a listing that never finished
+        # would be guidance built on absence of evidence.
+        scanned = ", ".join(sorted(scan.scanned_kinds)) or "none"
+        print(f"engine resource inventory: incomplete (scanned: {scanned})")
+        for kind, reason in sorted(scan.failed_kinds.items()):
+            print(f"  {kind}: could not be listed -- {reason}")
+        failed = ", ".join(sorted(scan.failed_kinds))
+        print(
+            f"engine resource inventory is incomplete: the engine is reachable but "
+            f"listing these kinds did not complete: {failed}. bosn cannot say what "
+            "exists on the engine. "
+            "Rerun `bosn doctor` once the engine is less loaded. No ownership or "
+            "foreign-registry conclusion is drawn from a partial scan, and nothing "
+            "was changed.",
+            file=sys.stderr,
+        )
+        return 1
     if scan.foreign_registries:
         _report_foreign_registries(scan, opts)
     return 1 if clock_unsafe else 0

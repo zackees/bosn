@@ -1203,6 +1203,127 @@ def test_doctor_foreign_registry_wording_never_claims_dead_or_safe_to_delete(
         assert forbidden not in err, f"doctor must not claim foreign resources are {forbidden!r}"
 
 
+def _stub_engine_with_a_timing_out_listing(monkeypatch, *, foreign_volumes: int = 0):
+    """A reachable engine whose `docker images` blows its deadline, as #117 reported it.
+
+    Deliberately not a stubbed `ResourceScanner`: the whole bug is that the real scanner
+    lets `EngineError` escape `scan()`, so the test has to drive the real scanner and fail
+    at the engine boundary the way a loaded Docker Desktop host does. Returns the recorded
+    command list so a test can prove the failure path stayed read-only.
+    """
+    from bosn import labels
+    from bosn.engine import EngineError, EngineInfo, EngineResult
+
+    commands: list[list[str]] = []
+
+    def _foreign_row(index: int) -> str:
+        raw = labels.ResourceLabels(
+            registry="lost-registry",
+            kind="volume",
+            stack="dev",
+            generation="digest",
+            scope="spec",
+            workspace="workspace",
+            created="2026-01-01T00:00:00Z",
+        ).to_dict()
+        return json.dumps({"Name": f"warm-cache-{index}", "Labels": json.dumps(raw)})
+
+    class TimingOutEngine:
+        def __init__(self, binary: str = "docker") -> None:
+            self.binary = binary
+
+        def info(self):
+            return EngineInfo(
+                binary=self.binary,
+                reachable=True,
+                client_version="28.5.1",
+                server_version="28.5.1",
+                clock_skew_seconds=0.0,
+            )
+
+        def run(self, args, *, check: bool = False, timeout: float | None = None):
+            commands.append(list(args))
+            if args[0] == "images":
+                raise EngineError(
+                    "docker images --no-trunc --format {{json .}} exceeded its 60-second deadline"
+                )
+            if args[0] == "volume":
+                rows = [_foreign_row(i) for i in range(foreign_volumes)]
+                return EngineResult(0, "\n".join(rows), "")
+            return EngineResult(0, "", "")
+
+    monkeypatch.setattr(cli, "Engine", TimingOutEngine)
+    return commands
+
+
+def test_doctor_reports_an_incomplete_inventory_instead_of_a_traceback(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """#117: only the resource-inventory phase failed, so only that phase may be lost."""
+    import hashlib
+
+    from bosn.registry import Registry
+
+    with Registry(tmp_path / "registry.sqlite3") as registry:
+        registry.register_resource(
+            kind="volume",
+            name="warm-cache",
+            stack="dev",
+            generation="digest",
+            scope="stack",
+            workspace="workspace",
+        )
+    database = tmp_path / "registry.sqlite3"
+    before = hashlib.sha256(database.read_bytes()).hexdigest()
+    commands = _stub_engine_with_a_timing_out_listing(monkeypatch)
+
+    code = cli.main(["--state-dir", str(tmp_path), "doctor"])
+
+    assert code == 1, "a partial scan must never read as a healthy engine"
+    captured = capsys.readouterr()
+    # Everything doctor had already established stays on the report.
+    assert "client version: 28.5.1" in captured.out
+    assert "registry integrity: ok" in captured.out
+    assert "docker shims:" in captured.out
+    # ...and the phase that failed says so, naming the kind and the reason.
+    assert "engine resource inventory: incomplete" in captured.out
+    assert "image" in captured.out
+    assert "60-second deadline" in captured.out
+    assert "Traceback" not in captured.err
+    assert "EngineError" not in captured.err
+    # Read-only: no engine mutation, no registry mutation.
+    assert not [c for c in commands if {"rm", "prune", "rmi", "kill", "stop"} & set(c)]
+    assert hashlib.sha256(database.read_bytes()).hexdigest() == before
+
+
+def test_doctor_withholds_adoption_guidance_when_the_scan_is_incomplete(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """Absence of evidence is not evidence of absence: half a scan cannot advise adoption."""
+    _stub_engine_with_a_timing_out_listing(monkeypatch, foreign_volumes=3)
+
+    code = cli.main(["--state-dir", str(tmp_path), "doctor"])
+
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "adopt --from-registry" not in captured.err
+    assert "adopt --from-registry" not in captured.out
+    assert "incomplete" in captured.out
+
+
+def test_doctor_json_reports_an_incomplete_scan_as_one_envelope(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    _stub_engine_with_a_timing_out_listing(monkeypatch)
+
+    assert cli.main(["--json", "--state-dir", str(tmp_path), "doctor"]) == 1
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["code"] == "command.failed"
+    assert "engine resource inventory: incomplete" in payload["message"]
+
+
 def test_gc_reports_invalid_policy_without_a_traceback(monkeypatch, tmp_path, capsys) -> None:
     monkeypatch.setenv("BOSN_WARM_VOLUME_TTL", "not-a-number")
     assert cli.main(["--state-dir", str(tmp_path), "gc"]) == 1

@@ -172,6 +172,18 @@ class Collector:
         from bosn.recovery import plan_unproven_resource
 
         scan = self.scanner.scan(self.registry.registry_id)
+        if scan.failed_kinds:
+            # Same visibility rule as `gc.inventory_unmeasured` below, applied to the other
+            # half of the evidence: a kind whose listing did not complete contributes no
+            # `unlabeled` rows, so this pass's unproven-resource report is short for a
+            # reason that must be in the event log rather than inferred from its absence
+            # (#117). Collection itself is unaffected -- candidates come from registry rows,
+            # never from the scan -- so this records the gap instead of aborting the pass.
+            self.registry.log_event(
+                "gc.scan_incomplete",
+                "; ".join(f"{kind}: {reason}" for kind, reason in sorted(scan.failed_kinds.items()))
+                + "; unproven-resource reporting is incomplete this pass",
+            )
         inventory = StorageInventory.collect(self.engine)
         resource_rows = self.registry.list_resources()
         measured = {
@@ -602,6 +614,10 @@ def status(
         "by_reason": by_reason,
         "engine": scan.counts(),
         "scanned_kinds": sorted(scan.scanned_kinds),
+        # Non-empty means the engine did not finish listing that kind, so `engine` counts
+        # above are a floor, not a census (#117) -- the same fail-closed reporting #106
+        # established for an unmeasurable `docker system df -v`.
+        "failed_kinds": dict(sorted(scan.failed_kinds.items())),
         "unproven_resources": unproven_resources,
         "execution_sessions": execution_sessions,
         "foreign_registries": sorted(scan.foreign_registries),
