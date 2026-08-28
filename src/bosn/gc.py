@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -162,8 +163,20 @@ class Collector:
         dry_run: bool = True,
         pressure: Pressure | None = None,
         manifest: Manifest | None = None,
+        progress: Callable[[str], None] | None = None,
     ) -> GCResult:
+        """Evaluate every registered resource and, unless `dry_run`, collect what qualifies.
+
+        `progress` is called with a short phase name as each stage begins. A collection's
+        runtime scales with how much there is to delete, so the daemon streams these to the
+        client instead of making it wait out a fixed budget in silence (#110). It is a
+        callback, not a generator, so the phases stay annotations on this method's existing
+        control flow rather than becoming its shape -- nothing here may be suspended
+        mid-plan.
+        """
         from bosn.config import load as load_config
+
+        report = progress or (lambda _phase: None)
 
         config = self.config or load_config()
         # Incomplete engine labels never become collection candidates.  They are scanned
@@ -171,6 +184,7 @@ class Collector:
         # behind an aggregate ``kept`` count (#120).
         from bosn.recovery import plan_unproven_resource
 
+        report("scanning engine resources")
         scan = self.scanner.scan(self.registry.registry_id)
         if scan.failed_kinds:
             # Same visibility rule as `gc.inventory_unmeasured` below, applied to the other
@@ -184,8 +198,10 @@ class Collector:
                 "; ".join(f"{kind}: {reason}" for kind, reason in sorted(scan.failed_kinds.items()))
                 + "; unproven-resource reporting is incomplete this pass",
             )
+        report("measuring storage inventory")
         inventory = StorageInventory.collect(self.engine)
         resource_rows = self.registry.list_resources()
+        report(f"measuring {len(resource_rows)} registered resources")
         measured = {
             resource.id: resource_bytes(self.engine, resource, inventory)
             for resource in resource_rows
@@ -246,6 +262,7 @@ class Collector:
                 )
             return updated
 
+        report("planning collection")
         verdicts: list[Verdict] = plan(
             self.registry, pressure=pressure, config=config, running_containers=running_containers
         )
@@ -288,6 +305,12 @@ class Collector:
                 running_containers=running_containers,
             )
 
+        collectable_count = len(collectable(verdicts))
+        report(
+            f"evaluating {len(verdicts)} resources ({collectable_count} collectable)"
+            if dry_run
+            else f"collecting {collectable_count} of {len(verdicts)} resources"
+        )
         for verdict in verdicts:
             if not verdict.collect:
                 result.kept.append(verdict.name)

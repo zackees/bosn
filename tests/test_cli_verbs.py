@@ -564,13 +564,33 @@ def test_tasks_json_manifest_error_has_stable_remedy(tmp_path, monkeypatch, caps
     }
 
 
+def _stub_gc_stream(monkeypatch, final: dict, *, progress: list | None = None, capture=None):
+    """Stand in for the daemon's streamed `gc`: some progress, then one final event (#110)."""
+    from bosn import daemon
+
+    def stream(verb, *_args, **kwargs):
+        if capture is not None:
+            capture["verb"] = verb
+            capture.update(kwargs)
+        yield from (progress or [])
+        yield {**final, "final": True}
+
+    monkeypatch.setattr(daemon, "stream", stream)
+    # `gc` must not fall back to the budgeted single-request path it was moved off of.
+    monkeypatch.setattr(
+        daemon,
+        "request",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("gc must stream, not request")),
+    )
+
+
 def test_gc_json_daemon_error_has_stable_remedy(tmp_path, capsys, monkeypatch) -> None:
     from bosn import daemon
 
     def unavailable(*_args, **_kwargs):
         raise daemon.DaemonError("down")
 
-    monkeypatch.setattr(daemon, "request", unavailable)
+    monkeypatch.setattr(daemon, "stream", unavailable)
     assert cli.main(["--state-dir", str(tmp_path), "gc", "--json"]) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["code"] == "daemon.unreachable"
@@ -585,64 +605,106 @@ def test_gc_timeout_is_not_reported_as_an_unreachable_daemon(tmp_path, capsys, m
     user to "start or restart the daemon" -- the one action that would interrupt the
     collection being waited on, which continues regardless of this client giving up. I hit
     this for real running `bosn gc` on a host with ~280 Docker objects.
+
+    Now that the verb streams, a silent gap this long means the daemon stopped talking
+    rather than that the collection is slow -- but the remedy must still not be the one
+    that kills a collection which may yet be running.
     """
     from bosn import daemon
 
-    def slow(*_args, **_kwargs):
+    def silent(*_args, **_kwargs):
         raise ipc.TransportTimeout("timed out waiting for the daemon")
 
-    monkeypatch.setattr(daemon, "request", slow)
+    monkeypatch.setattr(daemon, "stream", silent)
     assert cli.main(["--state-dir", str(tmp_path), "gc", "--json"]) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["code"] == "gc.timeout"
-    assert "do not restart it" in payload["next"]
+    assert "before restarting anything" in payload["next"]
     assert "restart the daemon, then retry" not in payload["next"]
 
 
-def test_gc_asks_the_daemon_for_more_than_the_shared_default_budget(tmp_path, monkeypatch) -> None:
-    """`gc`'s daemon-side cost is unrelated to what every other verb needs (#110).
+def test_gc_streams_instead_of_asking_for_a_fixed_budget(tmp_path, monkeypatch, capsys) -> None:
+    """#110's second half: the budget was the bug, not its size.
 
-    Measured on a ~280-object host, `docker system df -v` alone is 5.2s and the scan adds
-    7-24s more, so the shared 10s default could not cover even the first step. Asserting on
-    the request rather than on the constant, so the wiring is what is pinned -- defining
-    the constant and forgetting to pass it would leave the bug in place.
+    #111 gave `gc` a measured 120-second request budget and a field host still ran past it
+    with nothing wrong, leaving no report of a collection that was proceeding normally.
+    A runtime that is a function of how much there is to delete cannot be covered by any
+    constant, so the client now waits on the daemon still reporting progress. Asserting on
+    the wiring rather than on a constant: `daemon.request` is stubbed to fail loudly, so a
+    regression back to the single-request path cannot pass this quietly.
     """
-    from bosn import daemon
-
     seen: dict[str, object] = {}
-
-    def capture(verb, *_args, **kwargs):
-        seen["verb"] = verb
-        seen["request_timeout"] = kwargs.get("request_timeout")
-        seen["manifest"] = kwargs.get("manifest")
-        return {"ok": True, "result": {"collected": [], "kept": []}}
-
-    monkeypatch.setattr(daemon, "request", capture)
+    _stub_gc_stream(
+        monkeypatch,
+        {"ok": True, "result": {"collected": [], "kept": []}},
+        progress=[{"ok": True, "phase": "scanning engine resources", "elapsed_seconds": 5.0}],
+        capture=seen,
+    )
     # The repository checkout has its own bosn.toml. This case is specifically global GC
     # with no discoverable manifest, so its client cwd must be the empty temporary root.
     monkeypatch.chdir(tmp_path)
-    cli.main(["--state-dir", str(tmp_path), "gc", "--dry-run", "--json"])
+
+    assert cli.main(["--state-dir", str(tmp_path), "gc", "--dry-run"]) == 0
+
     assert seen["verb"] == "gc"
-    assert seen["request_timeout"] == cli.GC_REQUEST_TIMEOUT_SECONDS
     assert seen["manifest"] is None
-    assert cli.GC_REQUEST_TIMEOUT_SECONDS > ipc.DEFAULT_TIMEOUT
+    assert "request_timeout" not in seen, "a streamed gc must not carry a total deadline"
+    assert not hasattr(cli, "GC_REQUEST_TIMEOUT_SECONDS"), "the guessed budget must be gone"
+    # Progress is visible while it works, and never on stdout, which carries only the report.
+    captured = capsys.readouterr()
+    assert "scanning engine resources" in captured.err
+    assert "scanning engine resources" not in captured.out
+
+
+def test_gc_progress_repeats_a_long_phase_only_occasionally(tmp_path, monkeypatch, capsys):
+    """The daemon heartbeats for the transport; a person reads what reaches the terminal.
+
+    A five-minute collection heartbeats roughly sixty times. Echoing each one would scroll
+    the report those lines are introducing off the screen, so an unchanged phase repeats on
+    its own slower interval while every phase *change* is always shown.
+    """
+    heartbeats = [
+        {"ok": True, "phase": "scanning engine resources", "elapsed_seconds": float(seconds)}
+        for seconds in range(5, 65, 5)
+    ] + [{"ok": True, "phase": "planning collection", "elapsed_seconds": 70.0}]
+    _stub_gc_stream(monkeypatch, {"ok": True, "result": {}, "errors": []}, progress=heartbeats)
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["--state-dir", str(tmp_path), "gc", "--dry-run"]) == 0
+
+    lines = [line for line in capsys.readouterr().err.splitlines() if line.startswith("collecting")]
+    assert len(lines) < len(heartbeats), "every heartbeat must not become a line"
+    assert lines[0] == "collecting: scanning engine resources (5s)"
+    # A phase change is never throttled away, however soon after the last line it lands.
+    assert lines[-1] == "collecting: planning collection (70s)"
+
+
+def test_gc_progress_stays_off_stdout_in_json_mode(tmp_path, monkeypatch, capsys) -> None:
+    """A `--json` consumer parses stdout; progress may not reach it in any form."""
+    _stub_gc_stream(
+        monkeypatch,
+        {"ok": True, "result": {}, "errors": []},
+        progress=[{"ok": True, "phase": "planning collection", "elapsed_seconds": 9.0}],
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["--state-dir", str(tmp_path), "gc", "--json"]) == 0
+
+    captured = capsys.readouterr()
+    json.loads(captured.out)  # exactly one parseable report, no progress interleaved
+    assert "planning collection" not in captured.out
+    assert "planning collection" not in captured.err
 
 
 def test_gc_passes_an_available_manifest_for_exact_collision_diagnostics(
     tmp_path, monkeypatch
 ) -> None:
-    from bosn import daemon
 
     manifest = tmp_path / "bosn.toml"
     manifest.write_text("[stack.perf]\nimage = 'alpine:3.20'\n", encoding="utf-8")
     seen: dict[str, object] = {}
 
-    def capture(verb, *_args, **kwargs):
-        seen["verb"] = verb
-        seen.update(kwargs)
-        return {"ok": True, "result": {}, "errors": []}
-
-    monkeypatch.setattr(daemon, "request", capture)
+    _stub_gc_stream(monkeypatch, {"ok": True, "result": {}, "errors": []}, capture=seen)
     assert cli.main(["--manifest", str(manifest), "gc", "--json"]) == 0
     assert seen["verb"] == "gc"
     assert seen["manifest"] == str(manifest.resolve())
@@ -651,7 +713,6 @@ def test_gc_passes_an_available_manifest_for_exact_collision_diagnostics(
 def test_gc_canonicalizes_a_relative_custom_manifest_before_daemon_ipc(
     tmp_path, monkeypatch
 ) -> None:
-    from bosn import daemon
 
     custom = tmp_path / "development.toml"
     custom.write_text("[stack.perf]\nimage = 'alpine:3.20'\n", encoding="utf-8")
@@ -661,12 +722,8 @@ def test_gc_canonicalizes_a_relative_custom_manifest_before_daemon_ipc(
     (tmp_path / "bosn.toml").write_text("[stack.decoy]\nimage = 'busybox'\n", encoding="utf-8")
     seen: dict[str, object] = {}
 
-    def capture(_verb, *_args, **kwargs):
-        seen["manifest"] = kwargs["manifest"]
-        return {"ok": True, "result": {}, "errors": []}
-
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(daemon, "request", capture)
+    _stub_gc_stream(monkeypatch, {"ok": True, "result": {}, "errors": []}, capture=seen)
     assert cli.main(["--manifest", "development.toml", "gc", "--json"]) == 0
     assert seen["manifest"] == str(custom.resolve())
 
@@ -674,7 +731,6 @@ def test_gc_canonicalizes_a_relative_custom_manifest_before_daemon_ipc(
 def test_gc_json_reports_images_deferred_by_container_dependencies(
     tmp_path, capsys, monkeypatch
 ) -> None:
-    from bosn import daemon
 
     def deferred(*_args, **_kwargs):
         image_decisions = [
@@ -713,7 +769,7 @@ def test_gc_json_reports_images_deferred_by_container_dependencies(
             "image_decisions": image_decisions,
         }
 
-    monkeypatch.setattr(daemon, "request", deferred)
+    _stub_gc_stream(monkeypatch, deferred())
 
     assert cli.main(["--state-dir", str(tmp_path), "gc", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)

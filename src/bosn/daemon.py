@@ -28,7 +28,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Generator, Iterator
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -67,7 +67,14 @@ MAINTENANCE_BACKOFF_MAX_SECONDS = 3600.0
 SPAWN_TIMEOUT_SECONDS = 30.0
 
 # Verbs that hold the connection open and write many messages instead of one.
-STREAMING_VERBS = frozenset({"converge", "attach"})
+STREAMING_VERBS = frozenset({"converge", "attach", "gc"})
+
+# How often a running collection tells its client it is still working. `gc` is the one verb
+# whose runtime scales with how much there is to delete, so #111's measured 120-second
+# client budget was always a guess -- and a field host exceeded it (#110). Streaming
+# replaces the guess with liveness: as long as a phase event lands well inside the client's
+# per-read `ipc.STREAM_TIMEOUT`, a collection may take as long as it honestly takes.
+GC_HEARTBEAT_INTERVAL_SECONDS = 5.0
 
 # How long shutdown waits for cancelled builds to finish tearing down and release the
 # registry. Must exceed a builder's worst case (Engine.stream waits 30s for the process,
@@ -302,11 +309,16 @@ class _Handler(socketserver.StreamRequestHandler):
                 },
             )
             return
-        if verb in STREAMING_VERBS:
-            self._stream(daemon_ref, verb, request)
-            return
+        # The pin covers both shapes. #142 wrapped only the synchronous branch, which was
+        # enough while every streaming verb was a `converge` already held by its job --
+        # `should_retire` counts jobs. A streaming `gc` is held by nothing, so without this
+        # the watchdog could retire the daemon out from under the collection a client is
+        # watching, which is the exact failure #110's field report describes.
         daemon_ref.begin_request()
         try:
+            if verb in STREAMING_VERBS:
+                self._stream(daemon_ref, verb, request)
+                return
             try:
                 response = daemon_ref.dispatch(verb, request)
             except KeyboardInterrupt:
@@ -1008,6 +1020,8 @@ class Daemon:
             return self._verb_converge(request)
         if verb == "attach":
             return self._verb_attach(request)
+        if verb == "gc":
+            return self._verb_gc_stream(request)
         raise DaemonError(f"unknown streaming verb {verb!r}")
 
     def _verb_ping(self, _request: dict[str, Any]) -> dict[str, Any]:
@@ -1082,7 +1096,62 @@ class Daemon:
         self.registry.log_event("job.cancelled", job.id)
         return {"ok": True, "job": job.id, "state": job.state}
 
-    def _verb_gc(self, request: dict[str, Any]) -> dict[str, Any]:
+    def _verb_gc_stream(self, request: dict[str, Any]) -> Iterator[dict[str, Any]]:
+        """Run one collection, saying so periodically, and end with exactly one final event.
+
+        `gc` is the only verb whose runtime is a function of how much there is to delete,
+        which is why no fixed client budget ever fit it: #111 measured one at 120 seconds
+        and a real host still ran past it, leaving the user with no report of a collection
+        that was proceeding perfectly well (#110). Streaming replaces the budget with
+        liveness -- the client waits on the next event, not on a total deadline.
+
+        The collection runs on its own thread rather than being rewritten as a generator.
+        `Collector.collect` holds registry lifecycle guards across its plan/remove phases;
+        turning it into something a consumer can suspend mid-plan would make how long a
+        client takes to read an event part of how long a lock is held. A thread plus a
+        phase callback keeps the collection exactly as it is and makes the events a view
+        of it.
+
+        The final event carries the identical payload the synchronous verb returned, so
+        every client-side field, error path, and JSON key is unchanged by the move.
+        """
+        outcome: dict[str, dict[str, Any]] = {}
+        phase = ["starting"]
+
+        def run() -> None:
+            try:
+                outcome["response"] = self._verb_gc(
+                    request, progress=lambda name: phase.append(name)
+                )
+            except KeyboardInterrupt:
+                # Cannot reach a worker thread in practice, but the two handlers must agree
+                # everywhere: Ctrl-C means shut down, never "this collection failed".
+                self.request_stop()
+                raise
+            except Exception as exc:  # noqa: BLE001 - a failed collection still owes a reason
+                outcome["response"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+        started = self.clock.now()
+        worker = threading.Thread(target=run, name="bosn-gc", daemon=True)
+        worker.start()
+        while True:
+            worker.join(GC_HEARTBEAT_INTERVAL_SECONDS)
+            if not worker.is_alive():
+                break
+            yield {
+                "ok": True,
+                "phase": phase[-1],
+                "elapsed_seconds": round(self.clock.now() - started, 1),
+            }
+        response = outcome.get("response") or {
+            "ok": False,
+            "error": "the collection thread ended without producing a result",
+        }
+        yield {**response, "final": True, "elapsed_seconds": round(self.clock.now() - started, 1)}
+
+    def _verb_gc(
+        self, request: dict[str, Any], *, progress: Callable[[str], None] | None = None
+    ) -> dict[str, Any]:
         from bosn.config import load as load_config
         from bosn.engine import Engine
         from bosn.gc import Collector
@@ -1099,7 +1168,7 @@ class Daemon:
                 return {"ok": False, "error": f"gc manifest diagnostics unavailable: {exc}"}
         result = Collector(
             self.registry, Engine(str(request.get("engine") or self.engine_binary)), config=config
-        ).collect(dry_run=bool(request.get("dry_run", True)), manifest=manifest)
+        ).collect(dry_run=bool(request.get("dry_run", True)), manifest=manifest, progress=progress)
         return {
             "ok": True,
             "result": result.summary(),
