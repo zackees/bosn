@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from bosn import labels, resources
-from bosn.accounting import StorageInventory, probe, resource_bytes
+from bosn.accounting import StorageInventory, bucket_totals, probe, resource_bytes
 from bosn.config import Config
 from bosn.engine import Engine
 from bosn.manifest import Manifest
@@ -644,15 +644,12 @@ def status(
         "unproven_resources": unproven_resources,
         "execution_sessions": execution_sessions,
         "foreign_registries": sorted(scan.foreign_registries),
-        "foreign_registry_totals": {
-            "count": len(scan.foreign),
-            "bytes": sum(
-                inventory.sizes.get((resource.kind, resource.name), 0) for resource in scan.foreign
-            ),
-            "unmeasured": sum(
-                (resource.kind, resource.name) not in inventory.sizes for resource in scan.foreign
-            ),
-        },
+        "foreign_registry_totals": bucket_totals(scan.foreign, inventory),
+        # The bucket that holds everything Docker made outside bosn. Reported with bytes
+        # rather than a bare count (#147 G1): a count cannot tell a user whether their
+        # unmanaged artifacts are worth acting on, which is exactly how a 16 GB pile grew
+        # unnoticed on a machine that had bosn installed the whole time.
+        "unlabeled_totals": bucket_totals(scan.unlabeled, inventory),
         "managed_bytes": managed_bytes,
         "managed_reclaimable_bytes": reclaimable,
         "pressure": {
