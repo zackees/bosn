@@ -1092,3 +1092,51 @@ def test_status_reports_running_as_the_kept_reason(registry: Registry) -> None:
 
     assert report["decisions"][0]["reason"] == KEPT_RUNNING
     assert report["by_reason"].get(KEPT_RUNNING) == 1
+
+
+class UnmanagedEngine(FakeEngine):
+    """Serves one unlabeled image plus a `system df -v` row that sizes it.
+
+    The point of #147's G1 is a host carrying artifacts bosn did not create, so the fake
+    has to produce a resource that lands in the `unlabeled` bucket *and* a size for it.
+    """
+
+    def run(self, args: list[str], *, check: bool = False) -> EngineResult:
+        if args == ["images", "--no-trunc", "--format", "{{json .}}"]:
+            self.commands.append(list(args))
+            return EngineResult(0, json.dumps({"ID": "sha256:loose", "Labels": ""}), "")
+        if args[:3] == ["system", "df", "-v"]:
+            self.commands.append(list(args))
+            return EngineResult(
+                0, json.dumps({"Images": [{"ID": "sha256:loose", "UniqueSize": "2GB"}]}), ""
+            )
+        return super().run(args, check=check)
+
+
+def test_status_sizes_the_unlabeled_bucket_not_just_its_count(registry: Registry) -> None:
+    # Before #147 G1 the unlabeled bucket surfaced as a bare integer, so a host could hold
+    # gigabytes of unmanaged artifacts and report only how many objects there were.
+    report = status(registry, UnmanagedEngine({}))  # type: ignore[arg-type]
+
+    totals = report["unlabeled_totals"]
+    assert totals["count"] == 1
+    assert totals["bytes"] == 2_000_000_000
+    assert totals["unmeasured"] == 0
+    assert totals["by_kind"]["image"] == {"count": 1, "bytes": 2_000_000_000, "unmeasured": 0}
+    assert report["engine"]["unlabeled"] == totals["count"], "count must not drift from bytes"
+
+
+def test_status_reports_both_ownership_buckets_with_the_same_shape(registry: Registry) -> None:
+    # Neither bucket may regain a field the other lacks; that asymmetry was the defect.
+    report = status(registry, FakeEngine({}))  # type: ignore[arg-type]
+
+    assert set(report["unlabeled_totals"]) == set(report["foreign_registry_totals"])
+
+
+def test_status_marks_unlabeled_bytes_a_floor_when_the_inventory_is_unmeasured(
+    registry: Registry,
+) -> None:
+    # A `system df -v` that could not be read must not report a confident zero.
+    report = status(registry, FakeEngine({}))  # type: ignore[arg-type]
+
+    assert report["unlabeled_totals"]["bytes_are_floor"] is True
