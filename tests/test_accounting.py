@@ -6,6 +6,7 @@ import json
 
 from bosn.accounting import (
     StorageInventory,
+    bucket_totals,
     configured_desktop_vhdx_allocation,
     desktop_vhdx,
     engine_storage_path,
@@ -214,3 +215,88 @@ def test_configured_vhdx_allocation_reports_a_file_not_reclaimable_slack(tmp_pat
     assert allocation.path == vhdx
     assert allocation.allocated_bytes == len(b"allocated")
     assert not hasattr(allocation, "reclaimable_bytes")
+
+
+class _Discovered:
+    """Stand-in for `resources.DiscoveredResource`, which `accounting` must not import."""
+
+    def __init__(self, kind: str, name: str) -> None:
+        self.kind = kind
+        self.name = name
+
+
+def test_bucket_totals_sizes_a_bucket_and_breaks_it_down_by_kind() -> None:
+    inventory = StorageInventory({("image", "sha256:a"): 10, ("volume", "work"): 5})
+    totals = bucket_totals(
+        [_Discovered("image", "sha256:a"), _Discovered("volume", "work")], inventory
+    )
+    assert totals["count"] == 2
+    assert totals["bytes"] == 15
+    assert totals["unmeasured"] == 0
+    assert totals["bytes_are_floor"] is False
+    assert totals["by_kind"] == {
+        "image": {"count": 1, "bytes": 10, "unmeasured": 0},
+        "volume": {"count": 1, "bytes": 5, "unmeasured": 0},
+    }
+
+
+def test_bucket_totals_counts_a_network_as_a_known_zero_not_as_unmeasured() -> None:
+    # `system df -v` has no row shape for networks, matching `resource_bytes`. Reporting
+    # them as unmeasured would make an honest total of a healthy host read as a floor.
+    totals = bucket_totals([_Discovered("network", "bridge")], StorageInventory({}))
+    assert totals["bytes"] == 0
+    assert totals["unmeasured"] == 0
+    assert totals["bytes_are_floor"] is False
+
+
+def test_bucket_totals_marks_bytes_a_floor_when_a_size_is_unattributable() -> None:
+    totals = bucket_totals([_Discovered("image", "sha256:missing")], StorageInventory({}))
+    assert totals["count"] == 1
+    assert totals["bytes"] == 0
+    assert totals["unmeasured"] == 1
+    assert totals["bytes_are_floor"] is True
+
+
+def test_bucket_totals_marks_bytes_a_floor_when_the_whole_inventory_is_unmeasured() -> None:
+    # An unmeasured inventory reads as sizes it happens to know nothing about; without
+    # `measured` the report would claim a confident zero for a host it never managed to read.
+    inventory = StorageInventory({}, measured=False)
+    totals = bucket_totals([_Discovered("network", "bridge")], inventory)
+    assert totals["unmeasured"] == 0
+    assert totals["bytes_are_floor"] is True
+
+
+def test_bucket_totals_of_an_empty_bucket_is_a_confident_zero() -> None:
+    totals = bucket_totals([], StorageInventory({}))
+    assert totals == {
+        "count": 0,
+        "bytes": 0,
+        "unmeasured": 0,
+        "by_kind": {},
+        "bytes_are_floor": False,
+    }
+
+
+def test_container_sizes_are_keyed_by_the_name_the_scanner_uses() -> None:
+    """`df -v` calls containers `Names`; reading only `Name` left every one unmeasured."""
+
+    class ContainerEngine:
+        def run(self, args: list[str]) -> EngineResult:
+            return EngineResult(
+                0, json.dumps({"Containers": [{"ID": "abc123", "Names": "web", "Size": "4kB"}]}), ""
+            )
+
+    inventory = StorageInventory.collect(ContainerEngine())  # type: ignore[arg-type]
+    assert inventory.sizes[("container", "web")] == 4000
+    resource = Resource(
+        id="r1",
+        kind="container",
+        name="web",
+        stack="s",
+        generation="g",
+        scope="spec",
+        workspace="/w",
+        created_at=0.0,
+        last_used=0.0,
+    )
+    assert resource_bytes(ContainerEngine(), resource, inventory) == 4000  # type: ignore[arg-type]

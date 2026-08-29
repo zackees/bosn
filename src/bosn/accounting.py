@@ -10,8 +10,10 @@ import json
 import os
 import re
 import shutil
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from bosn.engine import Engine
 from bosn.registry import Resource
@@ -126,7 +128,16 @@ class StorageInventory:
             ):
                 for item in row.get(key, []):
                     if isinstance(item, dict) and (size := _bytes(item.get(field))) is not None:
-                        sizes[(kind, str(item.get("Name") or item.get("ID") or ""))] = size
+                        # `df -v` names containers with `Names` (plural) and volumes with
+                        # `Name`. Reading only `Name` silently fell through to `ID` for every
+                        # container, while `resources._name_of` keys them by `Names` -- so the
+                        # two never met and every container read as unmeasured. That is not a
+                        # cosmetic gap: `gc` refuses to declare byte pressure resolved while
+                        # any managed resource is unmeasured, so one managed container was
+                        # enough to wedge pressure resolution permanently. Mirrors
+                        # `resources._name_of`; keep the two in step.
+                        name = item.get("Names") or item.get("Name") or item.get("ID") or ""
+                        sizes[(kind, str(name))] = size
             # UniqueSize is the only image attribution that cannot charge a shared layer twice.
             for item in row.get("Images", []):
                 if isinstance(item, dict) and (size := _bytes(item.get("UniqueSize"))) is not None:
@@ -149,6 +160,52 @@ def resource_bytes(
         return 0
     inventory = inventory or StorageInventory.collect(engine)
     return inventory.sizes.get((resource.kind, resource.name))
+
+
+class SizedResource(Protocol):
+    """The shape `bucket_totals` needs: anything the scanner reports with a kind and name."""
+
+    @property
+    def kind(self) -> str: ...
+
+    @property
+    def name(self) -> str: ...
+
+
+def bucket_totals(items: Iterable[SizedResource], inventory: StorageInventory) -> dict[str, object]:
+    """Size one ownership bucket from a scan, with a per-kind breakdown.
+
+    `gc.status` reported byte totals for the `foreign` bucket but only a bare count for
+    `unlabeled` (#147 G1), so a host could carry tens of gigabytes of artifacts bosn does
+    not manage and say only how *many* there were. Both buckets go through here now, so
+    neither can regain a size the other lacks.
+
+    Networks are counted as a known zero rather than unmeasured, for the same reason
+    `resource_bytes` does it: `docker system df -v` has no row shape for them because they
+    hold no data. Treating that absence as "unknown" would make an honest report of a
+    healthy host look permanently unmeasurable.
+    """
+    totals = {"count": 0, "bytes": 0, "unmeasured": 0}
+    by_kind: dict[str, dict[str, int]] = {}
+    for item in items:
+        kind_bucket = by_kind.setdefault(item.kind, {"count": 0, "bytes": 0, "unmeasured": 0})
+        totals["count"] += 1
+        kind_bucket["count"] += 1
+        size = 0 if item.kind == "network" else inventory.sizes.get((item.kind, item.name))
+        if size is None:
+            totals["unmeasured"] += 1
+            kind_bucket["unmeasured"] += 1
+            continue
+        totals["bytes"] += size
+        kind_bucket["bytes"] += size
+    return {
+        **totals,
+        # Sorted so a report, a test, and a diff of two passes all read in the same order.
+        "by_kind": dict(sorted(by_kind.items())),
+        # A size the engine could not attribute makes `bytes` a floor, not a total. Callers
+        # that print a number to a human need to know when to say "at least".
+        "bytes_are_floor": totals["unmeasured"] > 0 or not inventory.measured,
+    }
 
 
 def engine_storage_path(engine: Engine, fallback: Path) -> Path:
