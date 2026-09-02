@@ -19,6 +19,10 @@ GENERATION = f"{NAMESPACE}.generation"
 SCOPE = f"{NAMESPACE}.scope"
 WORKSPACE = f"{NAMESPACE}.workspace"
 CREATED = f"{NAMESPACE}.created"
+# Deliberately NOT in REQUIRED_LABELS. Every resource created before the pinned tier existed
+# lacks it, and adding it to the required set would make all of them read as "incompletely
+# labeled" -- which is to say, not ours, un-collectable, and un-adoptable. Absent means warm.
+RETENTION = f"{NAMESPACE}.retention"
 
 REQUIRED_LABELS: tuple[str, ...] = (REGISTRY, KIND, STACK, GENERATION, SCOPE, WORKSPACE, CREATED)
 
@@ -39,6 +43,15 @@ class ResourceLabels:
     scope: str
     workspace: str
     created: str
+    # Optional, and last, so every positional `ResourceLabels(...)` construction keeps
+    # working. `None` means the resource predates the tier, or simply is not pinned.
+    #
+    # This is on the *label*, not only the registry row, because the registry is explicitly
+    # disposable: "Losing the database is survivable. Ownership lives in the Docker labels."
+    # Without it, `bosn adopt` after a lost registry would rebuild every row as warm, and the
+    # next `bosn done` or pressure sweep would reclaim the one volume that costs an hour of
+    # someone's day to recreate (#151).
+    retention: str | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in KINDS:
@@ -49,7 +62,7 @@ class ResourceLabels:
             raise LabelError("registry id must not be empty")
 
     def to_dict(self) -> dict[str, str]:
-        return {
+        rendered = {
             REGISTRY: self.registry,
             KIND: self.kind,
             STACK: self.stack,
@@ -58,6 +71,12 @@ class ResourceLabels:
             WORKSPACE: self.workspace,
             CREATED: self.created,
         }
+        # Emitted only when set, so an unpinned resource's label set is byte-identical to
+        # the one bosn has always written. Anything comparing label dicts for equality --
+        # `_recover_interrupted_volume`'s saved creation intent, for one -- keeps matching.
+        if self.retention is not None:
+            rendered[RETENTION] = self.retention
+        return rendered
 
     def to_docker_args(self) -> list[str]:
         """Render as repeated `--label k=v` arguments for the engine CLI."""
@@ -79,6 +98,7 @@ class ResourceLabels:
             scope=raw[SCOPE],
             workspace=raw[WORKSPACE],
             created=raw[CREATED],
+            retention=raw.get(RETENTION) or None,
         )
 
 

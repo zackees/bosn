@@ -13,10 +13,12 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from bosn import guest as guest_mod
 from bosn import labels
 from bosn.engine import Engine, EngineError
 from bosn.manifest import (
@@ -314,11 +316,16 @@ class Converger:
         self.progress = progress
         self.cancelled = cancelled
         self.run_max_duration = run_max_duration
+        self._host_capability: guest_mod.HostCapability | None = None
 
     def converge(
         self, stack_name: str | None = None, *, workspace: str | None = None
     ) -> ConvergeResult:
         stack = self.manifest.stack(stack_name)
+        # Before anything is pulled, built, or registered: a guest stack on a host without
+        # KVM can never work, and finding that out after a multi-gigabyte image pull wastes
+        # both the pull and the user's attention.
+        self._require_supported_host(stack)
         digest, resolved_image = self._resolved_generation(stack)
         workspace = workspace or workspace_of(self.manifest)
 
@@ -395,7 +402,14 @@ class Converger:
         return self.registry.generation_recorded(digest, stack, workspace)
 
     def _resource_labels(
-        self, stack: StackSpec, kind: str, digest: str, scope: str, workspace: str
+        self,
+        stack: StackSpec,
+        kind: str,
+        digest: str,
+        scope: str,
+        workspace: str,
+        *,
+        retention: str = "warm",
     ) -> labels.ResourceLabels:
         return labels.ResourceLabels(
             registry=self.registry.registry_id,
@@ -405,6 +419,9 @@ class Converger:
             scope=scope,
             workspace=workspace,
             created=_now_iso(),
+            # Warm is the absence of the label, not a label saying "warm": that keeps an
+            # ordinary resource's label set exactly what it has always been.
+            retention=None if retention == "warm" else retention,
         )
 
     def _ensure_image(self, stack: StackSpec, digest: str, tag: str, workspace: str) -> None:
@@ -469,7 +486,7 @@ class Converger:
             )
             created.append(name)
             expected_labels = self._resource_labels(
-                stack, "volume", digest, volume.scope, workspace
+                stack, "volume", digest, volume.scope, workspace, retention=volume.retention
             )
             if self.engine.run(["volume", "inspect", name]).ok:
                 self._recover_interrupted_volume(name, expected_labels)
@@ -481,6 +498,7 @@ class Converger:
                     digest=digest,
                     scope=volume.scope,
                     workspace=workspace,
+                    retention=volume.retention,
                 )
                 continue
             # Record the exact intended identity before Docker creation.  If the process
@@ -497,7 +515,7 @@ class Converger:
             result = self.engine.run(["volume", "create", *label_args, name])
             if not result.ok:
                 raise EngineError(f"creating volume {name} failed: {result.stderr}")
-            self._register(stack, "volume", name, digest, volume.scope, workspace)
+            self._register(stack, "volume", name, digest, volume.scope, workspace, volume.retention)
             self.registry.delete_volume_creation_intent(name)
         return created
 
@@ -555,6 +573,7 @@ class Converger:
         digest: str,
         scope: str,
         workspace: str,
+        retention: str = "warm",
     ) -> None:
         """Prove ownership before reviving a reused engine object in the registry."""
         raw = ResourceScanner(self.engine).inspect_labels(kind, inspect_name)
@@ -573,6 +592,10 @@ class Converger:
             raise EngineError(f"existing {kind} {inspect_name!r} has a conflicting bosn kind label")
         if kind == "image":
             self.registry.canonicalize_image_identity(inspect_name, engine_name)
+        # The engine's label outranks the caller's default for a resource bosn did not
+        # create in this process: a volume adopted from labels alone has no manifest behind
+        # it here, and reading the row back as warm would silently un-pin it.
+        retention = parsed.retention or retention
         self.registry.reconcile_resource(
             kind=kind,
             name=engine_name,
@@ -580,10 +603,18 @@ class Converger:
             generation=digest,
             scope=scope,
             workspace=workspace,
+            retention=retention,
         )
 
     def _register(
-        self, stack: StackSpec, kind: str, name: str, digest: str, scope: str, workspace: str
+        self,
+        stack: StackSpec,
+        kind: str,
+        name: str,
+        digest: str,
+        scope: str,
+        workspace: str,
+        retention: str = "warm",
     ) -> None:
         self.registry.register_resource(
             kind=kind,
@@ -592,7 +623,25 @@ class Converger:
             generation=digest,
             scope=scope,
             workspace=workspace,
+            retention=retention,
         )
+
+    # -- guest stacks -------------------------------------------------------
+
+    def host_capability(self) -> guest_mod.HostCapability:
+        """This host's guest-stack capability, probed once per Converger.
+
+        Memoized because `create_args` and the preflight both want it and the probe reads
+        /proc and stats device nodes; the answer cannot change while a converge runs.
+        """
+        if self._host_capability is None:
+            self._host_capability = guest_mod.probe_host()
+        return self._host_capability
+
+    def _require_supported_host(self, stack: StackSpec) -> None:
+        if not stack.is_guest:
+            return
+        guest_mod.require_supported_host(stack.name, self.host_capability())
 
     # -- running -----------------------------------------------------------
 
@@ -635,6 +684,30 @@ class Converger:
             )
             if stale:
                 self._refuse_if_container_leased(name)
+                if stack.is_guest:
+                    # `rm --force` is an immediate SIGKILL: it does not honour the
+                    # `--stop-timeout 120` this kind sets at create time. For a Linux stack
+                    # that is fine -- PID 1 is a `sleep` loop with nothing to lose. Here it
+                    # is QEMU killed mid-write on a tens-of-GB pinned disk whose only
+                    # rebuild path is an hour with an installer, so bosn's own replacement
+                    # would defeat the guard bosn itself installed. Ask for a graceful stop
+                    # first and let the guest flush.
+                    #
+                    # The explicit timeout is load-bearing: `Engine.run` defaults to 60s and
+                    # `docker stop` legitimately takes the container's full 120s here, so
+                    # the default would abort the very shutdown being waited on. A failed
+                    # stop is not fatal -- the forced removal below still runs -- but it is
+                    # worth an event, because it is the one line that explains a guest disk
+                    # that comes back needing repair.
+                    stopped = self.engine.run(
+                        ["stop", container_id],
+                        timeout=guest_mod.STOP_TIMEOUT_SECONDS + 30,
+                    )
+                    if not stopped.ok:
+                        self.registry.log_event(
+                            "guest.stop_before_replace_failed",
+                            f"{name}: {stopped.stderr or stopped.stdout}",
+                        )
                 # Mutate the exact object whose ownership was proved. A name could be
                 # externally reused between inspect and remove; deleting by name would
                 # then destroy a foreign replacement we never validated.
@@ -653,7 +726,14 @@ class Converger:
                 stack, "container", converged.digest, "stack", workspace
             )
             # Docker removes an orphan automatically once PID 1's watchdog exits.
-            args = ["create", "--rm", "--name", name, *resource_labels.to_docker_args()]
+            # `--rm` only for stacks that carry the heartbeat watchdog: it is what lets
+            # Docker reap the container once PID 1 notices the daemon is gone. A guest stack
+            # has no watchdog (see `_expected_container_mounts`), so `--rm` would instead
+            # mean the container vanishes the moment the guest is stopped for any reason,
+            # taking an anonymous-volume-backed disk with it if the user forgot to declare
+            # storage. Keep it, and let the container tiers remove it on their own clock.
+            rm_args = [] if stack.is_guest else ["--rm"]
+            args = ["create", *rm_args, "--name", name, *resource_labels.to_docker_args()]
             for mount in expected_mounts.values():
                 if mount["type"] == "tmpfs":
                     entry = next(
@@ -669,16 +749,25 @@ class Converger:
             # fresh container through `_container_stale_reasons` before this code runs.
             for key, value in sorted(stack.env.items()):
                 args += ["--env", f"{key}={value}"]
-            # PID 1 exits only when the daemon heartbeat goes stale. Execution deadlines
-            # belong to the individual `docker exec`, not the container's creation time:
-            # a warm container may correctly serve many later sessions.
-            watchdog = (
-                "while :; do now=$(date +%s); "
-                "beat=$(stat -c %Y /bosn-daemon/heartbeat 2>/dev/null || echo 0); "
-                f"[ $((now-beat)) -gt {CONTAINER_HEARTBEAT_TIMEOUT_SECONDS} ] && exit 0; "
-                "sleep 30; done"
-            )
-            args += [converged.image_tag, "sh", "-c", watchdog]
+            if stack.is_guest:
+                # Device passthrough, published ports, and the guest's sizing env. No
+                # command argument follows the image, deliberately: dockur's ENTRYPOINT
+                # *is* the VM, so appending `sh -c ...` the way a Linux stack does would
+                # replace the guest with a shell and produce a container that starts, stays
+                # up, and never boots macOS.
+                args += guest_mod.create_args(stack.guest_spec(), self.host_capability())
+                args += [converged.image_tag]
+            else:
+                # PID 1 exits only when the daemon heartbeat goes stale. Execution deadlines
+                # belong to the individual `docker exec`, not the container's creation time:
+                # a warm container may correctly serve many later sessions.
+                watchdog = (
+                    "while :; do now=$(date +%s); "
+                    "beat=$(stat -c %Y /bosn-daemon/heartbeat 2>/dev/null || echo 0); "
+                    f"[ $((now-beat)) -gt {CONTAINER_HEARTBEAT_TIMEOUT_SECONDS} ] && exit 0; "
+                    "sleep 30; done"
+                )
+                args += [converged.image_tag, "sh", "-c", watchdog]
             created = self.engine.run(args)
             if not created.ok:
                 raise EngineError(f"creating persistent container {name} failed: {created.stderr}")
@@ -798,6 +887,15 @@ class Converger:
                 "destination": entry.destination,
                 "rw": entry.readwrite,
             }
+        if stack.is_guest:
+            # No heartbeat bind, because there is no watchdog to read it: a guest stack's
+            # PID 1 is dockur's own entrypoint (the VM), not the `sh -c` loop that watches
+            # this file and lets Docker reap an orphaned container. Mounting it anyway would
+            # add a host-path dependency that nothing in the container ever opens. A guest
+            # container is reclaimed by the ordinary container tiers in `retention.py`
+            # instead; unlike its storage volume, it is cheap to recreate -- a boot, not an
+            # hour with an installer.
+            return mounts
         heartbeat = (self.registry.path.parent / "daemon.heartbeat").resolve()
         heartbeat.touch(exist_ok=True)
         mounts["/bosn-daemon/heartbeat"] = {
@@ -1106,33 +1204,89 @@ class Converger:
         caller's terminal and exit status.
         """
         workspace = workspace or workspace_of(self.manifest)
+        stack = self.manifest.stack(converged.stack)
         name, leases = self._acquire_execution_container(
             converged, stack_name=stack_name, workspace=workspace
         )
-        # `workdir` is not baked into the container at create time (see
-        # `generation_digest`'s comment on why it is excluded from the digest) -- it is
-        # supplied here, fresh, on every `exec`, the same way `command` itself is.
-        workdir = self.manifest.stack(converged.stack).workdir
-        workdir_args = ["--workdir", workdir] if workdir else []
-        args = ["exec", *workdir_args, name, *command]
         try:
-            result = self.engine.run(args, timeout=self.run_max_duration)
+            if stack.is_guest:
+                returncode, output = self._run_in_guest(stack, name, command)
+            else:
+                # `workdir` is not baked into the container at create time (see
+                # `generation_digest`'s comment on why it is excluded from the digest) -- it
+                # is supplied here, fresh, on every `exec`, the same way `command` itself is.
+                workdir_args = ["--workdir", stack.workdir] if stack.workdir else []
+                result = self.engine.run(
+                    ["exec", *workdir_args, name, *command], timeout=self.run_max_duration
+                )
+                returncode, output = result.returncode, result.stdout or result.stderr
         finally:
             for lease in leases:
                 self.registry.release_lease(lease.id)
-        self.registry.log_event("run", f"{converged.stack} rc={result.returncode}")
-        return converged, result.returncode, result.stdout or result.stderr
+        self.registry.log_event("run", f"{converged.stack} rc={returncode}")
+        return converged, returncode, output
+
+    def _run_in_guest(
+        self, stack: StackSpec, container: str, command: list[str]
+    ) -> tuple[int, str]:
+        """Wait for the guest to be reachable, then run one task inside the VM over ssh.
+
+        `docker exec` is not an option here: it would land in the container, beside the VM
+        rather than inside it, and quietly run the task against a Linux userland the task
+        was never written for. The exit code that comes back is the task's own, which is
+        what lets CI gate on it -- see `guest.describe_exit` for the one ambiguity ssh
+        introduces.
+        """
+        guest = stack.guest_spec()
+        try:
+            waited = guest_mod.ensure_ready(
+                guest,
+                fetch_logs=guest_mod.container_log_reader(self.engine, container),
+                report=self.progress,
+            )
+        except guest_mod.GuestNotReadyError as exc:
+            self.registry.log_event("guest.not_ready", f"{stack.name}: {exc}")
+            raise EngineError(str(exc)) from exc
+        self.registry.log_event("guest.ready", f"{stack.name} in {waited:.0f}s")
+        shipped = guest_mod.ship_payload(guest, self.manifest.root, timeout=self.run_max_duration)
+        if shipped:
+            self.registry.log_event("guest.payload_shipped", f"{stack.name} -> {shipped}")
+
+        # A Linux stack receives `["sh", "-c", cmd]`; the guest's shell plays the role of
+        # `sh -c`, so the same task text means the same thing on both kinds.
+        payload = command[2] if command[:2] == ["sh", "-c"] and len(command) == 3 else None
+        remote = guest_mod.remote_command(
+            guest,
+            payload if payload is not None else shlex.join(command),
+            workdir=stack.workdir,
+        )
+        returncode, output = guest_mod.run_remote(
+            guest_mod.ssh_argv(guest, remote), timeout=self.run_max_duration
+        )
+        if returncode == guest_mod.SSH_TRANSPORT_FAILURE:
+            self.registry.log_event(
+                "guest.ambiguous_exit", f"{stack.name}: {guest_mod.describe_exit(returncode)}"
+            )
+        return returncode, output
 
     def shell_converged(
         self, converged: ConvergeResult, *, stack_name: str | None, workspace: str
     ) -> int:
         """Attach a real interactive shell to the persistent container."""
+        stack = self.manifest.stack(converged.stack)
         name, leases = self._acquire_execution_container(
             converged, stack_name=stack_name, workspace=workspace
         )
-        workdir = self.manifest.stack(converged.stack).workdir
-        workdir_args = ["--workdir", workdir] if workdir else []
+        workdir_args = ["--workdir", stack.workdir] if stack.workdir else []
         try:
+            if stack.is_guest:
+                # An interactive shell must land in the VM for the same reason a task does.
+                # Readiness is not polled here: the user is present, so a refused connection
+                # is immediate, legible feedback rather than a silent minutes-long wait.
+                guest = stack.guest_spec()
+                return guest_mod.interactive_remote(
+                    guest_mod.ssh_argv(guest, guest_mod.login_command(stack.workdir))
+                )
             return self.engine.interactive(["exec", "-it", *workdir_args, name, "sh"])
         finally:
             for lease in leases:

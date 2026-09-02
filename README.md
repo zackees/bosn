@@ -34,7 +34,11 @@ policy instead of a blunt instrument.
 >
 > **Partial:** the Docker front door — `bosn init` (alias: `bosn-docker init`) and `bosn-docker compose
 > {up,down,logs,ps}` only, over a small compose subset. See
-> [Coming from Docker](#coming-from-docker).
+> [Coming from Docker](#coming-from-docker). Also the **macOS x86-64 guest stack** — the
+> manifest surface, pinned retention, `release-volume`, host preflight, KVM/tun passthrough,
+> sshd readiness, and the ssh execution transport are implemented and unit-tested, but bosn's
+> own CI has no KVM and no baked guest image, so nothing here is exercised against a live
+> `dockurr/macos` guest. See [docs/macos-guest.md](docs/macos-guest.md).
 >
 > **Not built:** podman; `docker` / `docker-compose` shims; and **BuildKit's own layer
 > cache**, which is outside the label contract — bosn manages containers, volumes, and
@@ -498,6 +502,7 @@ bosn done                    # this workspace is finished; its caches become col
 bosn gc --dry-run --json     # rich engine/storage inventory; --apply reclaims (no --force)
 bosn reconcile-volume --stack perf --volume target  # preview one legacy partial target
 bosn reconcile-volume --stack perf --volume target --apply --yes  # explicit repair
+bosn release-volume --stack mac --volume storage --apply --yes  # release one pinned volume
 bosn doctor                  # engine reachability, registry integrity, recovery commands
 bosn adopt --legacy <family> # import pre-bosn volumes; --yes to apply
 
@@ -512,6 +517,13 @@ daemon returns `mode: "online"`; an absent daemon returns `mode: "offline"`; and
 stream returns `mode: "degraded"` with persisted session diagnostics. For the rich engine,
 ownership, and storage inventory, use `bosn gc --dry-run --json` instead. `gc` and `jobs` are
 read-only but go through the daemon and fail closed if it is unreachable.
+
+`release-volume` is the only way a `retention = "pinned"` volume is ever collected. Pinning
+exists for state that is not rebuildable on demand — the motivating case is a macOS guest disk
+whose only creation path is a human sitting through a 30–60 minute interactive installer — so a
+pinned volume is exempt from age, supersession, `bosn done`, and storage pressure alike. The
+release re-proves ownership from the engine's labels, refuses an active lease, and refuses a
+volume still attached to a container.
 
 `reconcile-volume` is for incomplete legacy labels only. It derives the engine name from the
 current manifest and refuses arbitrary names, unlabeled volumes, foreign/contradictory labels,

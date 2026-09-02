@@ -19,6 +19,7 @@ from bosn.retention import (
     KEPT_CURRENT_IMAGE,
     KEPT_LEASED,
     KEPT_MACHINE_SCOPE,
+    KEPT_PINNED,
     KEPT_QUIET_PERIOD,
     KEPT_RUNNING,
     KEPT_WARM,
@@ -567,3 +568,91 @@ def test_a_lease_outranks_running_in_the_reported_reason(
 
     assert not verdict.collect
     assert verdict.reason == KEPT_LEASED
+
+
+# -- the pinned tier (#151) ------------------------------------------------
+#
+# Pinning exists for state whose only creation path is a human sitting through a 30-60
+# minute interactive macOS install. Every test below is a signal that reclaims a *warm*
+# volume without anyone asking, and pinning has to beat all of them.
+
+
+def pinned(registry: Registry, scope="machine", workspace="/w"):
+    return registry.register_resource(
+        kind="volume",
+        name="guest-storage",
+        stack="mac",
+        generation="g",
+        scope=scope,
+        workspace=workspace,
+        retention="pinned",
+    )
+
+
+def test_a_pinned_volume_survives_its_warm_ttl(registry: Registry, clock: FakeClock) -> None:
+    resource = pinned(registry)
+    clock.advance(90 * DAY)
+
+    verdict = evaluate(registry, resource)
+    assert not verdict.collect
+    assert verdict.reason == KEPT_PINNED
+
+
+def test_a_pinned_volume_survives_storage_pressure(registry: Registry, clock: FakeClock) -> None:
+    resource = pinned(registry, scope="stack")
+    clock.advance(90 * DAY)
+
+    verdict = evaluate(registry, resource, pressure=Pressure(under_pressure=True))
+    assert not verdict.collect
+    assert verdict.reason == KEPT_PINNED
+
+
+def test_a_pinned_volume_survives_bosn_done(registry: Registry, clock: FakeClock) -> None:
+    resource = pinned(registry, scope="stack")
+    clock.advance(90 * DAY)
+
+    verdict = evaluate(registry, resource, workspace_done=True)
+    assert not verdict.collect, "`done` must not cost an hour of manual guest installation"
+
+
+def test_a_pinned_volume_survives_supersession(registry: Registry, clock: FakeClock) -> None:
+    resource = pinned(registry, scope="stack")
+    clock.advance(90 * DAY)
+
+    verdict = evaluate(registry, resource, superseded=True)
+    assert not verdict.collect
+    assert verdict.reason == KEPT_PINNED
+
+
+def test_a_warm_sibling_is_still_collected_under_the_same_signals(
+    registry: Registry, clock: FakeClock
+) -> None:
+    """The tier must be the thing doing the work, not a blanket softening of the rules."""
+    warm = make(registry, scope="stack")
+    clock.advance(90 * DAY)
+
+    assert evaluate(registry, warm, workspace_done=True).collect
+    assert evaluate(registry, warm, pressure=Pressure(under_pressure=True)).collect
+
+
+def test_pinning_does_not_outrank_an_active_lease(registry: Registry, clock: FakeClock) -> None:
+    """A lease is not a reclaim decision, so it is reported ahead of the pin."""
+    resource = pinned(registry)
+    registry.acquire_lease(resource.id, pid=1, proc_start=1.0, ttl_seconds=60)
+    clock.advance(10 * DAY)
+
+    verdict = evaluate(registry, resource, alive_probe=ALIVE)
+    assert not verdict.collect
+    assert verdict.reason == KEPT_LEASED
+
+
+def test_a_pinned_resource_is_never_in_the_collectable_plan(
+    registry: Registry, clock: FakeClock
+) -> None:
+    pinned(registry)
+    make(registry, scope="stack")
+    clock.advance(90 * DAY)
+
+    plan = retention.plan(registry, pressure=Pressure(under_pressure=True))
+    assert [v.name for v in retention.collectable(plan)] == ["volume-1"]
+    assert KEPT_PINNED in {v.reason for v in retention.kept(plan)}

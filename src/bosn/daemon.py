@@ -33,7 +33,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from bosn import __version__, ipc
+from bosn import __version__, ipc, labels
 from bosn.clock import Clock, SystemClock
 from bosn.config import Config
 from bosn.jobs import BuildOutcome, Job, JobError, JobManager
@@ -53,6 +53,7 @@ MUTATING_VERBS = frozenset(
         "adopt",
         "compose-adopt",
         "reconcile-volume",
+        "release-volume",
         "execution-acquire",
         "execution-release",
         "compose-acquire",
@@ -1002,6 +1003,7 @@ class Daemon:
             "cancel": self._verb_cancel,
             "gc": self._verb_gc,
             "reconcile-volume": self._verb_reconcile_volume,
+            "release-volume": self._verb_release_volume,
             "done": self._verb_done,
             "adopt": self._verb_adopt,
             "compose-adopt": self._verb_compose_adopt,
@@ -1277,11 +1279,142 @@ class Daemon:
                     generation=digest,
                     scope=volume.scope,
                     workspace=workspace,
+                    retention=volume.retention,
                 )
                 self.registry.log_event("volume.legacy_reconciled", name)
         except TransferError as exc:
             return {"ok": False, "error": str(exc), "plan": plan.to_dict()}
         return {"ok": True, "applied": True, "plan": final_plan.to_dict()}
+
+    def _verb_release_volume(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Release one pinned volume, the only way a pinned volume is ever collected (#151).
+
+        A pinned volume is exempt from every automatic rule in `retention.py`, which is the
+        whole point of the tier -- so it needs exactly one deliberate exit, and this is it.
+        The verb is narrow on purpose:
+
+        - it takes a *declared* stack and logical volume name, never an engine name, so a
+          mistyped name fails against the manifest rather than deleting something else;
+        - it refuses a volume that is not declared pinned, because a warm volume already has
+          a lifecycle and this must not become a general "delete my volume" tool;
+        - it re-proves ownership from the engine's labels, refuses an active lease, and
+          refuses a volume still attached to a container -- the same three proofs GC
+          requires, held under the lifecycle guard so nothing can lease it in between;
+        - and it previews unless given both `--apply` and `--yes`, since the state it
+          deletes is by definition the state that was expensive to create.
+        """
+        from pathlib import Path
+
+        from bosn.converge import generation_coalescing_key, volume_name_for, workspace_of
+        from bosn.engine import Engine
+        from bosn.manifest import DEFAULT_RETENTION, ManifestError, load
+        from bosn.resources import ResourceScanner, resource_is_leased, volume_is_attached
+
+        manifest_text = str(request.get("manifest") or "")
+        stack_name = str(request.get("stack") or "")
+        logical_name = str(request.get("volume") or "")
+        if not manifest_text or not stack_name or not logical_name:
+            return {"ok": False, "error": "release-volume requires manifest, stack, and volume"}
+        try:
+            manifest = load(Path(manifest_text))
+            stack = manifest.stack(stack_name)
+            volume = next(item for item in stack.volumes if item.name == logical_name)
+        except (ManifestError, StopIteration) as exc:
+            detail = (
+                str(exc)
+                if isinstance(exc, ManifestError)
+                else "volume is not declared by the selected stack"
+            )
+            return {"ok": False, "error": detail}
+        if volume.retention == DEFAULT_RETENTION:
+            return {
+                "ok": False,
+                "error": (
+                    f"volume {logical_name!r} of stack {stack.name!r} is not pinned; "
+                    "warm volumes are reclaimed by `bosn gc` on their own tier and do not "
+                    "need an explicit release"
+                ),
+            }
+
+        workspace = workspace_of(manifest)
+        engine = Engine(str(request.get("engine") or self.engine_binary))
+        # Only a `spec`-scoped volume's name contains the digest; `stack` and `machine`
+        # scopes are keyed on the workspace and family alone. Resolving a generation for
+        # those would pull the stack's image for a name that cannot depend on it -- and for
+        # the motivating case, a pinned guest disk, that image is tens of gigabytes fetched
+        # through a control-plane timeout, to delete something. Even where the digest is
+        # needed, `generation_coalescing_key` reads local image identity without pulling:
+        # this verb removes state, so it must never be the thing that fetches any.
+        digest = (
+            generation_coalescing_key(manifest, stack, engine) if volume.scope == "spec" else ""
+        )
+        name = volume_name_for(
+            stack,
+            volume.scope,
+            volume.name,
+            digest=digest,
+            workspace=workspace,
+            family=stack.family,
+        )
+        plan = {
+            "stack": stack.name,
+            "volume": volume.name,
+            "engine_name": name,
+            "scope": volume.scope,
+            "retention": volume.retention,
+            "action": "would-remove",
+        }
+        if not bool(request.get("apply")):
+            return {"ok": True, "applied": False, "plan": plan}
+        if not bool(request.get("yes")):
+            return {
+                "ok": False,
+                "error": "release-volume requires --yes together with --apply",
+                "plan": plan,
+            }
+
+        with self.registry.lifecycle_guard():
+            raw = ResourceScanner(engine).inspect_labels("volume", name)
+            if not labels.is_owned_by(raw, self.registry.registry_id):
+                ownership = "foreign" if labels.is_complete(raw) else "unlabeled or incomplete"
+                return {
+                    "ok": False,
+                    "error": (
+                        f"volume {name!r} is {ownership}; bosn removes only resources whose "
+                        "labels prove this registry created them"
+                    ),
+                    "plan": plan,
+                }
+            resource = self.registry.get_resource_by_engine_identity("volume", name)
+            if resource is not None and resource_is_leased(self.registry, resource.id):
+                return {
+                    "ok": False,
+                    "error": (
+                        f"volume {name!r} has an active execution lease; retry after that "
+                        "command exits"
+                    ),
+                    "plan": plan,
+                }
+            if volume_is_attached(engine, name):
+                return {
+                    "ok": False,
+                    "error": (
+                        f"volume {name!r} is still attached to a container; stop it first "
+                        "(`bosn done`, or stop the guest) and retry"
+                    ),
+                    "plan": plan,
+                }
+            removed = engine.run(["volume", "rm", name])
+            if not removed.ok:
+                return {
+                    "ok": False,
+                    "error": f"removing volume {name} failed: {removed.stderr or removed.stdout}",
+                    "plan": plan,
+                }
+            if resource is not None:
+                self.registry.remove_resource(resource.id)
+            self.registry.log_event("volume.released", f"{stack.name}/{volume.name} {name}")
+        return {"ok": True, "applied": True, "plan": {**plan, "action": "removed"}}
 
     def _verb_done(self, request: dict[str, Any]) -> dict[str, Any]:
         from bosn.gc import mark_done

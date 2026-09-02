@@ -750,6 +750,9 @@ def transfer_volume(registry: Registry, engine: Engine, resource: DiscoveredReso
         scope=parsed.scope,
         workspace=parsed.workspace,
         created=parsed.created,
+        # Preserved with everything else: a transfer changes who owns the volume, never how
+        # expensive it is to recreate.
+        retention=parsed.retention,
     )
     return recreate_volume_with_labels(engine, resource, new_labels)
 
@@ -863,6 +866,9 @@ def adopt(
             scope=parsed.scope,
             workspace=parsed.workspace,
             created_at=now,
+            # The label is the authority here -- rebuilding a lost registry is exactly the
+            # case the label exists for. Absent means warm, never an invented pin.
+            retention=parsed.retention or "warm",
         )
         registered = next(
             r
@@ -909,6 +915,7 @@ def reconcile_owned(
             generation=parsed.generation,
             scope=parsed.scope,
             workspace=parsed.workspace,
+            retention=parsed.retention or "warm",
         )
         registry.record_generation(parsed.generation, parsed.stack, parsed.workspace)
         registry.set_resource_state(registered.id, "adopted")

@@ -277,6 +277,11 @@ def legacy_expected_labels(
         scope=scope,
         workspace=workspace,
         created=raw_labels.get(labels.CREATED) or _now_iso(),
+        # A surviving retention label is preserved for the same reason `created` is: this
+        # repairs an incomplete label set, and must not quietly change the tier while it
+        # does. `retention` is not in REQUIRED_LABELS, so its absence is never the defect
+        # being repaired.
+        retention=raw_labels.get(labels.RETENTION) or None,
     )
 
 
