@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from bosn.clock import FakeClock
-from bosn.registry import Registry, RegistryError
+from bosn.registry import SCHEMA_VERSION, Registry, RegistryError
 
 
 @pytest.fixture
@@ -314,7 +314,7 @@ def test_v1_migration_deduplicates_engine_objects_and_preserves_leases(tmp_path:
         assert resources[0].id == "new"
         assert resources[0].created_at == 1
         assert migrated.leases_for("new")[0].id == "lease-old"
-        assert migrated.meta("schema_version") == "3"
+        assert migrated.meta("schema_version") == str(SCHEMA_VERSION)
         assert migrated.generation_superseded_at("sha256:g", stack="test", workspace="/w") is None
         index_columns = migrated.conn.execute(
             "PRAGMA index_info(idx_resources_engine_identity)"
@@ -452,3 +452,63 @@ def test_a_failed_proc_start_migration_raises_a_named_recoverable_error(
 
     with pytest.raises(RegistryError, match="relax_lease_proc_start_nullability"):
         Registry(path, clock=clock)
+
+
+def test_v3_migration_adds_retention_and_defaults_every_existing_row_to_warm(
+    tmp_path: Path,
+) -> None:
+    """Pinning is only ever asserted forward, by a manifest that asks for it (#151).
+
+    A row written before the tier existed was created under the tiered clocks and must keep
+    obeying them; inferring a pin for it would leak storage nobody can explain.
+    """
+    path = tmp_path / "v3.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta VALUES ('schema_version', '3'), ('registry_id', 'reg-1');
+        CREATE TABLE resources (
+            id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL, stack TEXT NOT NULL,
+            generation TEXT NOT NULL, scope TEXT NOT NULL, workspace TEXT NOT NULL,
+            created_at REAL NOT NULL, last_used REAL NOT NULL,
+            state TEXT NOT NULL DEFAULT 'active'
+        );
+        INSERT INTO resources VALUES
+            ('r1', 'volume', 'cache', 'test', 'sha256:g', 'stack', '/w', 1, 2, 'active');
+        """
+    )
+    connection.close()
+
+    with Registry(path) as migrated:
+        assert migrated.meta("schema_version") == str(SCHEMA_VERSION)
+        assert [r.retention for r in migrated.list_resources()] == ["warm"]
+        # And the column is usable for new rows, not merely present.
+        migrated.register_resource(
+            kind="volume",
+            name="guest-storage",
+            stack="mac",
+            generation="g",
+            scope="machine",
+            workspace="/w",
+            retention="pinned",
+        )
+        stored = migrated.get_resource_by_engine_identity("volume", "guest-storage")
+        assert stored is not None and stored.retention == "pinned"
+
+
+def test_re_registering_a_volume_can_move_it_off_the_pinned_tier(tmp_path: Path) -> None:
+    """Editing `retention` back to warm is how a user un-pins without deleting."""
+    with Registry(tmp_path / "r.sqlite3") as registry:
+        for retention in ("pinned", "warm"):
+            registry.register_resource(
+                kind="volume",
+                name="storage",
+                stack="mac",
+                generation="g",
+                scope="machine",
+                workspace="/w",
+                retention=retention,
+            )
+        stored = registry.get_resource_by_engine_identity("volume", "storage")
+        assert stored is not None and stored.retention == "warm"

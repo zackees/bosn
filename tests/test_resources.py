@@ -1104,3 +1104,45 @@ def test_discover_still_raises_so_callers_outside_scan_are_unchanged() -> None:
 
     with pytest.raises(EngineError):
         ResourceScanner(engine).discover("image")  # type: ignore[arg-type]
+
+
+def test_adoption_restores_the_pinned_tier_from_labels(tmp_path) -> None:
+    """A lost registry must not silently un-pin a volume that costs an hour to recreate.
+
+    `registry.py`'s own contract is that the database is disposable and ownership lives in
+    the Docker labels. The retention tier has to travel the same way, or `bosn adopt` would
+    rebuild the guest disk's row as warm and the next pressure sweep would reclaim it (#151).
+    """
+    from bosn import labels as labels_mod
+    from bosn.registry import Registry
+    from bosn.resources import DiscoveredResource, ScanResult, adopt
+
+    pinned = labels_mod.ResourceLabels(
+        registry="reg-1",
+        kind="volume",
+        stack="mac",
+        generation="sha256:g",
+        scope="machine",
+        workspace="/w",
+        created="2026-01-01T00:00:00Z",
+        retention="pinned",
+    )
+    warm = labels_mod.ResourceLabels(
+        registry="reg-1",
+        kind="volume",
+        stack="s",
+        generation="sha256:g",
+        scope="stack",
+        workspace="/w",
+        created="2026-01-01T00:00:00Z",
+    )
+    scan = ScanResult(
+        owned=[
+            DiscoveredResource("volume", "guest-storage", pinned.to_dict()),
+            DiscoveredResource("volume", "cache", warm.to_dict()),
+        ]
+    )
+    with Registry(tmp_path / "r.sqlite3") as registry:
+        adopt(registry, scan)
+        restored = {r.name: r.retention for r in registry.list_resources()}
+    assert restored == {"guest-storage": "pinned", "cache": "warm"}

@@ -12,6 +12,7 @@ from typing import cast
 
 import pytest
 
+from bosn import guest as guest_mod
 from bosn import labels
 from bosn.converge import (
     REGISTERED,
@@ -151,7 +152,9 @@ class FakeEngine:
                 # Docker does not report `--tmpfs` entries in `.Mounts`; it round-trips
                 # them through `.HostConfig.Tmpfs` as destination -> option string (#116).
                 tmpfs[destination] = options
-            image = args[-4]
+            # A Linux stack ends `... IMAGE sh -c <watchdog>`; a guest stack ends at the
+            # image, because dockur's ENTRYPOINT is the VM and must not be overridden.
+            image = args[-4] if args[-3:-1] == ["sh", "-c"] else args[-1]
             self.container_specs[name] = {
                 "Id": container_id,
                 "Config": {"Labels": raw_labels, "Image": image},
@@ -1635,3 +1638,217 @@ def test_execution_uses_configured_deadline_not_engine_control_timeout(
     converger.run(["true"])
     engine: FakeEngine = converger.engine  # type: ignore[assignment]
     assert engine.timeouts[-1] == 123.0
+
+
+# -- macOS guest stacks (#151) ---------------------------------------------
+
+GUEST_SAMPLE = """
+[stack.mac]
+kind = "macos-x64-guest"
+acknowledge_macos_license = true
+image = "ghcr.io/example/macos-x64-guest:ventura"
+family = "macos-x64"
+default = true
+workdir = "/Users/runner"
+
+[stack.mac.guest]
+ssh_port = 2299
+
+[stack.mac.volumes]
+storage = { scope = "machine", destination = "/storage", retention = "pinned" }
+"""
+
+CAPABLE_HOST = guest_mod.HostCapability(
+    platform="linux",
+    devices_present=guest_mod.REQUIRED_DEVICES,
+    cpu_vendor="GenuineIntel",
+)
+
+
+@pytest.fixture
+def guest_converger(tmp_path: Path, registry: Registry) -> Converger:
+    (tmp_path / "bosn.toml").write_text(GUEST_SAMPLE, encoding="utf-8")
+    converger = Converger(load(tmp_path), registry, FakeEngine())  # type: ignore[arg-type]
+    # The host probe reads /proc and stats device nodes; CI has neither, and the point of
+    # these tests is the argv bosn builds, not what this machine happens to expose.
+    converger._host_capability = CAPABLE_HOST
+    return converger
+
+
+def guest_create_args(converger: Converger) -> list[str]:
+    engine = cast(FakeEngine, converger.engine)
+    converged = converger.converge("mac")
+    converger.ensure_container(converged, stack_name="mac", workspace="/w")
+    return engine.ran("create")[0]
+
+
+def test_a_guest_container_gets_kvm_tun_and_net_admin(guest_converger: Converger) -> None:
+    args = guest_create_args(guest_converger)
+    assert args.count("--device") == 2
+    assert "/dev/kvm" in args
+    assert "/dev/net/tun" in args
+    assert "NET_ADMIN" in args
+
+
+def test_a_guest_container_publishes_its_ssh_port(guest_converger: Converger) -> None:
+    assert "2299:22" in guest_create_args(guest_converger)
+
+
+def test_a_guest_container_does_not_override_dockurs_entrypoint(
+    guest_converger: Converger,
+) -> None:
+    """Appending `sh -c <watchdog>` would replace the VM with a shell that never boots."""
+    engine = cast(FakeEngine, guest_converger.engine)
+    args = guest_create_args(guest_converger)
+    # The image is the last argument: nothing follows it to displace dockur's ENTRYPOINT.
+    assert args[-1] == engine.image_ids["ghcr.io/example/macos-x64-guest:ventura"]
+    assert "sh" not in args
+
+
+def test_a_guest_container_is_not_created_with_rm(guest_converger: Converger) -> None:
+    # `--rm` only makes sense alongside the heartbeat watchdog that triggers the reap.
+    assert "--rm" not in guest_create_args(guest_converger)
+
+
+def test_a_guest_container_carries_no_heartbeat_bind(guest_converger: Converger) -> None:
+    args = guest_create_args(guest_converger)
+    assert "/bosn-daemon/heartbeat" not in " ".join(args)
+
+
+def test_a_guest_container_still_mounts_its_declared_storage_volume(
+    guest_converger: Converger,
+) -> None:
+    args = guest_create_args(guest_converger)
+    assert any(value.endswith(":/storage") for value in args)
+
+
+def test_a_pinned_volume_is_registered_as_pinned(guest_converger: Converger) -> None:
+    """GC reads this row, not the manifest, so the tier has to survive into the registry."""
+    guest_converger.converge("mac")
+    volumes = [r for r in guest_converger.registry.list_resources() if r.kind == "volume"]
+    assert [v.retention for v in volumes] == ["pinned"]
+
+
+def test_a_guest_stack_is_refused_before_anything_is_pulled(
+    tmp_path: Path, registry: Registry
+) -> None:
+    (tmp_path / "bosn.toml").write_text(GUEST_SAMPLE, encoding="utf-8")
+    engine = FakeEngine()
+    converger = Converger(load(tmp_path), registry, engine)  # type: ignore[arg-type]
+    converger._host_capability = guest_mod.HostCapability(
+        platform="linux", devices_present=(), cpu_vendor=None
+    )
+    with pytest.raises(guest_mod.GuestUnsupportedError):
+        converger.converge("mac")
+    assert engine.ran("pull") == [], "the refusal must precede a multi-gigabyte pull"
+
+
+def test_a_guest_task_is_shipped_over_ssh_not_docker_exec(
+    guest_converger: Converger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sent: list[list[str]] = []
+    monkeypatch.setattr(guest_mod, "tcp_probe", lambda _h, _p: True)
+    monkeypatch.setattr(
+        guest_mod,
+        "run_remote",
+        lambda argv, timeout=None: (sent.append(argv), (0, "ok"))[1],
+    )
+    converged = guest_converger.converge("mac")
+    _result, code, output = guest_converger.run_converged(
+        converged, ["sh", "-c", "make test"], stack_name="mac", workspace="/w"
+    )
+
+    assert code == 0
+    assert output == "ok"
+    assert sent[0][0] == "ssh"
+    # The workdir is applied inside the guest, not as a `docker exec --workdir`.
+    assert sent[0][-1] == "cd /Users/runner && make test"
+    assert cast(FakeEngine, guest_converger.engine).ran("exec") == []
+
+
+def test_a_guest_task_propagates_its_real_exit_code(
+    guest_converger: Converger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CI gates on this number; a swallowed failure is the whole point of the feature."""
+    monkeypatch.setattr(guest_mod, "tcp_probe", lambda _h, _p: True)
+    monkeypatch.setattr(guest_mod, "run_remote", lambda _argv, timeout=None: (101, "boom"))
+    converged = guest_converger.converge("mac")
+    _result, code, _output = guest_converger.run_converged(
+        converged, ["sh", "-c", "false"], stack_name="mac", workspace="/w"
+    )
+    assert code == 101
+
+
+def test_an_unready_guest_fails_with_its_own_logs_attached(
+    guest_converger: Converger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(guest_mod, "tcp_probe", lambda _h, _p: False)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    converged = guest_converger.converge("mac")
+    # A short deadline so the bounded wait is exercised without a real 30-minute budget.
+    stack = guest_converger.manifest.stacks["mac"]
+    object.__setattr__(stack, "guest", replace(stack.guest_spec(), ready_timeout=1))
+
+    with pytest.raises(EngineError) as exc:
+        guest_converger.run_converged(
+            converged, ["sh", "-c", "true"], stack_name="mac", workspace="/w"
+        )
+    assert "did not answer" in str(exc.value)
+    assert "logs (last 60 lines)" in str(exc.value)
+    assert cast(FakeEngine, guest_converger.engine).ran("logs")
+
+
+def test_replacing_a_guest_container_stops_it_before_forcing_removal(
+    guest_converger: Converger,
+) -> None:
+    """`rm --force` is an immediate SIGKILL and ignores `--stop-timeout`.
+
+    Killing QEMU mid-write on the pinned guest disk is exactly what the long stop timeout
+    exists to prevent, so bosn's own replacement must not be the thing that does it.
+    """
+    engine = cast(FakeEngine, guest_converger.engine)
+    converged = guest_converger.converge("mac")
+    guest_converger.ensure_container(converged, stack_name="mac", workspace="/w")
+
+    # Roll the generation the way a `ram_size` edit would, forcing a replacement.
+    stack = guest_converger.manifest.stacks["mac"]
+    object.__setattr__(stack, "guest", replace(stack.guest_spec(), ram_size="16G"))
+    rolled = guest_converger.converge("mac")
+    assert rolled.digest != converged.digest
+    guest_converger.ensure_container(rolled, stack_name="mac", workspace="/w")
+
+    order = [c for c in engine.commands if c[:1] == ["stop"] or c[:2] == ["container", "rm"]]
+    assert order[0][0] == "stop"
+    assert order[1][:3] == ["container", "rm", "--force"]
+
+
+def test_the_guest_stop_waits_longer_than_the_engines_default_control_timeout(
+    guest_converger: Converger,
+) -> None:
+    """`Engine.run`'s 60s default would abort the very 120s shutdown being waited on."""
+    engine = cast(FakeEngine, guest_converger.engine)
+    converged = guest_converger.converge("mac")
+    guest_converger.ensure_container(converged, stack_name="mac", workspace="/w")
+    stack = guest_converger.manifest.stacks["mac"]
+    object.__setattr__(stack, "guest", replace(stack.guest_spec(), ram_size="16G"))
+    guest_converger.ensure_container(
+        guest_converger.converge("mac"), stack_name="mac", workspace="/w"
+    )
+
+    index = next(i for i, c in enumerate(engine.commands) if c[:1] == ["stop"])
+    deadline = engine.timeouts[index]
+    assert deadline is not None
+    assert deadline > guest_mod.STOP_TIMEOUT_SECONDS
+
+
+def test_replacing_an_ordinary_container_still_goes_straight_to_forced_removal(
+    project: Path, registry: Registry
+) -> None:
+    """A Linux stack's PID 1 is a sleep loop; a graceful stop would only add latency."""
+    engine = FakeEngine()
+    Converger(load(project), registry, engine).run(["true"])  # type: ignore[arg-type]
+    (project / "Dockerfile").write_text("FROM alpine\nRUN echo changed\n", encoding="utf-8")
+    Converger(load(project), registry, engine).run(["true"])  # type: ignore[arg-type]
+
+    assert engine.ran("container", "rm", "--force")
+    assert engine.ran("stop") == []

@@ -43,6 +43,7 @@ SUPERSEDED_CAP = 1 * DAY
 
 # Reasons a resource is kept. Ordered by how strongly they bind.
 KEPT_LEASED = "leased"
+KEPT_PINNED = "pinned"
 KEPT_RUNNING = "running"
 KEPT_QUIET_PERIOD = "quiet-period"
 KEPT_CURRENT_IMAGE = "current-image"
@@ -204,6 +205,20 @@ def evaluate(
         # Leased resources are untouchable, full stop -- this outranks every other signal,
         # including an explicit `done`.
         return Verdict(resource, False, KEPT_LEASED)
+
+    if resource.retention == "pinned":
+        # Deliberately above `superseded`, `workspace_done`, and pressure -- the three
+        # signals that are otherwise allowed to reclaim a warm volume without anyone asking.
+        # Every tier below this line is an inference that a resource is cheap to rebuild.
+        # Pinning is a first-party statement that it is not: the motivating case is a macOS
+        # guest disk whose only creation path is a human sitting through a 30-60 minute
+        # interactive installer, so a wrong reclaim costs an hour of someone's day and no
+        # amount of retrying gets it back (#151). The only thing that outranks it is an
+        # active lease, because that is not a reclaim decision at all.
+        #
+        # This is why the tier is a registry column rather than a manifest lookup: GC has no
+        # manifest, and the worktree that declared the volume may be long gone.
+        return Verdict(resource, False, KEPT_PINNED)
 
     running = resource.kind == "container" and (
         True if running_containers is None else resource.name in running_containers

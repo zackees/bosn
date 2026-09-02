@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -1663,3 +1664,157 @@ def test_status_stays_bounded_against_a_listener_that_never_answers(tmp_path, ca
     assert payload["mode"] == "degraded"
     assert payload["daemon"]["reachable"] is False
     assert payload["daemon"]["recorded"]["version"] == "0.0.1-old"
+
+
+# -- release-volume: the manual exit from the pinned tier (#151) ------------
+
+
+def _pinned_manifest(tmp_path) -> Path:
+    manifest = tmp_path / "bosn.toml"
+    manifest.write_text(
+        "[stack.mac]\nkind = 'macos-x64-guest'\nacknowledge_macos_license = true\n"
+        "image = 'ghcr.io/example/guest:ventura'\n\n[stack.mac.volumes]\n"
+        "storage = { scope = 'machine', destination = '/storage', retention = 'pinned' }\n"
+        "scratch = { scope = 'stack' }\n",
+        encoding="utf-8",
+    )
+    return manifest
+
+
+def test_release_volume_previews_before_it_removes_anything(tmp_path, monkeypatch) -> None:
+    from bosn import daemon
+
+    manifest = _pinned_manifest(tmp_path)
+    requests = []
+    monkeypatch.setattr(
+        daemon,
+        "request",
+        lambda verb, *_args, **kwargs: (
+            requests.append((verb, kwargs))
+            or {"ok": True, "applied": kwargs["apply"], "plan": {"engine_name": "bosn-m-x"}}
+        ),
+    )
+    argv = [
+        "--manifest",
+        str(manifest),
+        "--json",
+        "release-volume",
+        "--stack",
+        "mac",
+        "--volume",
+        "storage",
+    ]
+    assert cli.main(argv) == 0
+    assert cli.main([*argv, "--apply", "--yes"]) == 0
+    assert [entry[0] for entry in requests] == ["release-volume", "release-volume"]
+    assert [entry[1]["apply"] for entry in requests] == [False, True]
+
+
+def test_release_volume_refuses_a_warm_volume_without_reaching_the_daemon(
+    tmp_path, monkeypatch
+) -> None:
+    """It must not become a general "delete my volume" verb; warm volumes have `gc`."""
+    from bosn import daemon
+
+    manifest = _pinned_manifest(tmp_path)
+    monkeypatch.setattr(
+        daemon,
+        "request",
+        lambda *_args, **_kwargs: pytest.fail("a warm volume must be refused client-side"),
+    )
+    assert (
+        cli.main(
+            [
+                "--manifest",
+                str(manifest),
+                "--json",
+                "release-volume",
+                "--stack",
+                "mac",
+                "--volume",
+                "scratch",
+            ]
+        )
+        == 1
+    )
+
+
+def test_release_volume_requires_an_unambiguous_target(tmp_path, monkeypatch) -> None:
+    from bosn import daemon
+
+    monkeypatch.setattr(
+        daemon, "request", lambda *_args, **_kwargs: pytest.fail("no target was named")
+    )
+    assert cli.main(["--json", "release-volume", "--stack", "mac"]) == 1
+
+
+def test_bosn_run_ships_a_guest_task_over_ssh_not_docker_exec(tmp_path, monkeypatch) -> None:
+    """`cmd_run` execs in the CLI process, not through Converger, so it needs its own branch.
+
+    Without it a macOS task would land in the container beside the VM and run against a
+    Linux userland -- succeeding, silently, against the wrong machine.
+    """
+    from bosn import daemon
+    from bosn import guest as guest_mod
+    from bosn.converge import ConvergeResult
+
+    manifest = _pinned_manifest(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "_converge_via_daemon",
+        lambda *_args: ConvergeResult(
+            stack="mac", digest="sha256:g", action="reused", image_tag="img"
+        ),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "request",
+        lambda verb, *_args, **_kwargs: {"ok": True, "container": "c1", "session": "s1"},
+    )
+    monkeypatch.setattr(guest_mod, "tcp_probe", lambda _h, _p: True)
+    sent: list[list[str]] = []
+    monkeypatch.setattr(
+        guest_mod,
+        "interactive_remote",
+        lambda argv, timeout=None: (sent.append(argv), 0)[1],
+    )
+    monkeypatch.setattr(
+        cli.Engine,
+        "interactive",
+        lambda *_a, **_k: pytest.fail("a guest task must never go through docker exec"),
+    )
+
+    code = cli.main(["--manifest", str(manifest), "run", "--stack", "mac", "--", "sw_vers"])
+    assert code == 0
+    assert sent and sent[0][0] == "ssh"
+    assert sent[0][-1] == "sw_vers"
+
+
+def test_a_missing_ssh_client_is_reported_not_traced(tmp_path, monkeypatch, capsys) -> None:
+    """`GuestUnsupportedError` subclasses `EngineError` so cmd_run's handler catches it."""
+    from bosn import daemon
+    from bosn import guest as guest_mod
+    from bosn.converge import ConvergeResult
+
+    manifest = _pinned_manifest(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "_converge_via_daemon",
+        lambda *_args: ConvergeResult(
+            stack="mac", digest="sha256:g", action="reused", image_tag="img"
+        ),
+    )
+    monkeypatch.setattr(
+        daemon,
+        "request",
+        lambda verb, *_args, **_kwargs: {"ok": True, "container": "c1", "session": "s1"},
+    )
+    monkeypatch.setattr(guest_mod, "tcp_probe", lambda _h, _p: True)
+
+    def no_ssh(_argv, **_kwargs):
+        raise FileNotFoundError("ssh")
+
+    monkeypatch.setattr("subprocess.run", no_ssh)
+
+    assert cli.main(["--manifest", str(manifest), "run", "--stack", "mac", "--", "true"]) == 1
+    assert "on PATH" in capsys.readouterr().err

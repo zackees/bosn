@@ -22,7 +22,7 @@ from pathlib import Path
 
 from bosn.clock import Clock, SystemClock
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS resources (
     workspace   TEXT NOT NULL,
     created_at  REAL NOT NULL,
     last_used   REAL NOT NULL,
-    state       TEXT NOT NULL DEFAULT 'active'
+    state       TEXT NOT NULL DEFAULT 'active',
+    retention   TEXT NOT NULL DEFAULT 'warm'
 );
 
 CREATE INDEX IF NOT EXISTS idx_resources_stack ON resources(stack);
@@ -136,6 +137,11 @@ class Resource:
     created_at: float
     last_used: float
     state: str = "active"
+    # "warm" (the tiered clocks decide) or "pinned" (no automatic rule ever collects it).
+    # Persisted on the row rather than re-derived from the manifest because GC runs from the
+    # registry alone -- it has no manifest in hand, and the workspace that declared the
+    # volume may not even be checked out any more.
+    retention: str = "warm"
 
 
 @dataclass(frozen=True)
@@ -266,6 +272,10 @@ class Registry:
             (str(uuid.uuid4()),),
         )
 
+    def _resources_has_retention(self) -> bool:
+        rows = self.conn.execute("PRAGMA table_info(resources)").fetchall()
+        return any(row["name"] == "retention" for row in rows)
+
     def _migrate_schema(self) -> None:
         """Upgrade old registries without losing ownership, liveness, or leases."""
         raw_version = self.meta("schema_version")
@@ -329,6 +339,25 @@ class Registry:
                     "generation TEXT NOT NULL, scope TEXT NOT NULL, workspace TEXT NOT NULL)"
                 )
                 self.conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", ("3",))
+                self.conn.execute("COMMIT")
+            except KeyboardInterrupt:
+                self.conn.execute("ROLLBACK")
+                raise
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+
+        if version < 4:
+            # Additive, and deliberately defaulted to 'warm': every row that predates the
+            # pinned tier was created under the tiered clocks and must keep obeying them.
+            # Pinning is only ever asserted forward, by a manifest that asks for it.
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                if not self._resources_has_retention():
+                    self.conn.execute(
+                        "ALTER TABLE resources ADD COLUMN retention TEXT NOT NULL DEFAULT 'warm'"
+                    )
+                self.conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", ("4",))
                 self.conn.execute("COMMIT")
             except KeyboardInterrupt:
                 self.conn.execute("ROLLBACK")
@@ -493,6 +522,7 @@ class Registry:
         workspace: str,
         resource_id: str | None = None,
         created_at: float | None = None,
+        retention: str = "warm",
     ) -> Resource:
         return self._reconcile_resource(
             kind=kind,
@@ -503,6 +533,7 @@ class Registry:
             workspace=workspace,
             resource_id=resource_id,
             created_at=created_at,
+            retention=retention,
         )
 
     def reconcile_resource(
@@ -514,6 +545,7 @@ class Registry:
         generation: str,
         scope: str,
         workspace: str,
+        retention: str = "warm",
     ) -> Resource:
         """Make one engine object have one current, freshly-used registry identity."""
         return self._reconcile_resource(
@@ -523,6 +555,7 @@ class Registry:
             generation=generation,
             scope=scope,
             workspace=workspace,
+            retention=retention,
         )
 
     def _reconcile_resource(
@@ -536,6 +569,7 @@ class Registry:
         workspace: str,
         resource_id: str | None = None,
         created_at: float | None = None,
+        retention: str = "warm",
     ) -> Resource:
         with self._lock:
             previous = self.conn.execute(
@@ -548,10 +582,16 @@ class Registry:
             self.conn.execute(
                 "INSERT INTO resources"
                 "(id, kind, name, stack, generation, scope, workspace, created_at, "
-                "last_used, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active') "
+                "last_used, state, retention) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?) "
                 "ON CONFLICT(kind, name) DO UPDATE SET stack = excluded.stack, "
                 "generation = excluded.generation, scope = excluded.scope, "
-                "workspace = excluded.workspace, last_used = ?, state = 'active'",
+                # Retention follows the current declaration in both directions. Re-declaring
+                # a volume `warm` after it was pinned is how a user un-pins one without
+                # deleting it, and the digest rolled when they made that edit, so this
+                # statement is the first write of the new generation, not a stale one
+                # overwriting a fresh intent.
+                "workspace = excluded.workspace, retention = excluded.retention, "
+                "last_used = ?, state = 'active'",
                 (
                     rid,
                     kind,
@@ -562,6 +602,7 @@ class Registry:
                     workspace,
                     created,
                     created,
+                    retention,
                     now,
                 ),
             )
@@ -993,6 +1034,10 @@ def _resource_from_row(row: sqlite3.Row) -> Resource:
         created_at=row["created_at"],
         last_used=row["last_used"],
         state=row["state"],
+        # A registry restored from a backup taken before schema 4, or read through a
+        # connection opened read-only against an un-migrated file, has no such column.
+        # Absent means warm, which is the safe reading: it never invents a pin.
+        retention=(row["retention"] if "retention" in row.keys() else "warm") or "warm",
     )
 
 

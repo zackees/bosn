@@ -37,6 +37,7 @@ class Options:
     volume: str | None = None
     yes: bool = False
     reconcile_apply: bool = False
+    release_apply: bool = False
     args: tuple[str, ...] = ()
     json: bool = False
 
@@ -149,6 +150,7 @@ def from_namespace(ns: argparse.Namespace) -> Options:
         volume=_as_str(get("volume")),
         yes=bool(get("yes", False)),
         reconcile_apply=bool(get("reconcile_apply", False)),
+        release_apply=bool(get("release_apply", False)),
         args=get_list("args"),
         json=bool(get("json", False)),
         compose=_as_str(get("compose")),

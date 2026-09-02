@@ -23,6 +23,26 @@ from typing import Any
 MANIFEST_NAME = "bosn.toml"
 VALID_SCOPES = {"spec", "stack", "machine"}
 
+# Retention tiers a declared volume may ask for.
+#
+# `warm` is every volume bosn has ever managed: the tiered clocks in `retention.py` decide
+# when it goes, and losing one costs a rebuild. `pinned` is for state that is *not*
+# rebuildable on demand -- the motivating case is a macOS guest disk whose only creation
+# path is a human sitting through a 30-60 minute interactive installer (#151). A pinned
+# volume is never collected by any automatic rule: not by age, not by supersession, not by
+# `bosn done`, not under storage pressure. It leaves only when a human names it to
+# `bosn release-volume --apply --yes`.
+DEFAULT_RETENTION = "warm"
+VALID_RETENTIONS = {DEFAULT_RETENTION, "pinned"}
+
+# The one non-default stack kind. A bare stack (`kind` unset) is the Linux stack bosn has
+# always run: an image, `docker create`, `docker exec`. This kind is a QEMU/KVM macOS guest
+# inside a `dockurr/macos` container, where the workload runs in a VM *within* the
+# container -- so it needs device passthrough at create time and ssh, not `docker exec`, as
+# its execution transport.
+GUEST_MACOS_X64 = "macos-x64-guest"
+VALID_KINDS = {GUEST_MACOS_X64}
+
 # bosn mounts its own objects under this prefix and keeps the daemon heartbeat beside
 # it. User mounts may not land here: a collision would shadow a managed volume or the
 # liveness file the container's PID 1 watches.
@@ -78,12 +98,20 @@ class VolumeSpec:
     name: str
     scope: str
     destination: str | None = None
+    # Appended after the existing fields on purpose: `VolumeSpec(name, scope, destination)`
+    # is constructed positionally in several places and in the test suite.
+    retention: str = DEFAULT_RETENTION
 
     def __post_init__(self) -> None:
         if self.scope not in VALID_SCOPES:
             raise ManifestError(
                 f"volume {self.name!r} has unknown scope {self.scope!r}; "
                 f"expected one of {sorted(VALID_SCOPES)}"
+            )
+        if self.retention not in VALID_RETENTIONS:
+            raise ManifestError(
+                f"volume {self.name!r} has unknown retention {self.retention!r}; "
+                f"expected one of {sorted(VALID_RETENTIONS)}"
             )
         if self.destination is not None:
             object.__setattr__(
@@ -186,6 +214,79 @@ class TmpfsSpec:
         return readwrite
 
 
+def _positive_int(value: Any, *, stack: str, key: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ManifestError(f"[stack.{stack}.guest] {key} must be a positive integer")
+    if value <= 0:
+        raise ManifestError(f"[stack.{stack}.guest] {key} must be a positive integer")
+    return value
+
+
+@dataclass(frozen=True)
+class GuestSpec:
+    """How to reach and size the VM inside a guest stack's container.
+
+    Every default here is the value the working `zackees/kernal-api` scripts proved against
+    a real `dockurr/macos` guest, so an empty `[stack.X.guest]` table is a usable stack
+    rather than a stub. `dockurr/macos` publishes its web installer on 8006 and the guest's
+    sshd is reached by mapping a host port onto the container's 22.
+    """
+
+    ssh_port: int = 2222
+    ssh_user: str = "runner"
+    ssh_host: str = "127.0.0.1"
+    web_port: int = 8006
+    # macOS boots slowly, and on one core it is minutes rather than seconds. The deadline is
+    # bounded so a guest that never comes up fails with its logs attached instead of hanging
+    # a CI job to its own timeout.
+    ready_timeout: int = 1800
+    ready_poll_interval: int = 10
+    version: str = "ventura"
+    ram_size: str = "8G"
+    disk_size: str = "128G"
+    # `None` means "decide from the host CPU vendor at create time" -- see
+    # `guest.effective_cpu_cores`. An explicit value is honored as written.
+    cpu_cores: int | None = None
+    # One repo-relative file shipped into the guest before every task, and where it lands.
+    # A guest stack cannot bind-mount -- the VM does not see the container's filesystem -- so
+    # this is how the prebuilt artifact a task needs actually gets there. Unset means bosn
+    # ships nothing and the task is responsible for finding its own inputs.
+    payload: str | None = None
+    payload_destination: str = "~/bosn-payload"
+
+    def __post_init__(self) -> None:
+        for key in ("ssh_port", "web_port", "ready_timeout", "ready_poll_interval"):
+            value = getattr(self, key)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ManifestError(f"[stack.*.guest] {key} must be a positive integer")
+        if not self.ssh_user:
+            raise ManifestError("[stack.*.guest] ssh_user must not be empty")
+        if not self.ssh_host:
+            raise ManifestError("[stack.*.guest] ssh_host must not be empty")
+        if self.ssh_port == self.web_port:
+            raise ManifestError(
+                f"[stack.*.guest] ssh_port and web_port must differ; both are {self.ssh_port}"
+            )
+        if self.cpu_cores is not None and (
+            isinstance(self.cpu_cores, bool) or not isinstance(self.cpu_cores, int)
+        ):
+            raise ManifestError("[stack.*.guest] cpu_cores must be a positive integer")
+        if self.cpu_cores is not None and self.cpu_cores <= 0:
+            raise ManifestError("[stack.*.guest] cpu_cores must be a positive integer")
+
+    def digest_fields(self) -> list[tuple[str, str]]:
+        """A stable, sorted rendering for `generation_digest`.
+
+        Every field here lands in `docker create` -- published ports, `VERSION`, `RAM_SIZE`,
+        `DISK_SIZE` -- or decides how a task reaches the guest. Docker has no verb for
+        changing a created container's port map or env, so a change to any of them must roll
+        the generation for the same reason `env` does; see `generation_digest`.
+        """
+        return sorted(
+            (key, "" if value is None else str(value)) for key, value in self.__dict__.items()
+        )
+
+
 @dataclass(frozen=True)
 class StackSpec:
     name: str
@@ -210,12 +311,66 @@ class StackSpec:
     # `generation_digest`'s comment on why that puts it on the opposite side of the digest
     # boundary from `env`.
     workdir: str | None = None
+    # `None` is the ordinary Linux stack. See GUEST_MACOS_X64 for the one alternative.
+    kind: str | None = None
+    guest: GuestSpec | None = None
+    # Apple's EULA conditions macOS on the hardware it runs on, and running it under QEMU on
+    # a non-Apple host is the user's call to make, not something they should back into by
+    # copying somebody's bosn.toml. So a guest stack is inert until this is written out
+    # explicitly -- an opt-in keyword, not a default.
+    acknowledge_macos_license: bool = False
+
+    @property
+    def is_guest(self) -> bool:
+        return self.kind == GUEST_MACOS_X64
+
+    def guest_spec(self) -> GuestSpec:
+        """The guest configuration, for callers that already know this is a guest stack."""
+        if not self.is_guest or self.guest is None:
+            raise ManifestError(f"stack {self.name!r} is not a {GUEST_MACOS_X64} stack")
+        return self.guest
 
     def __post_init__(self) -> None:
         for key in self.env:
             _validate_env_key(key, stack=self.name)
         if self.workdir is not None:
             object.__setattr__(self, "workdir", _validate_workdir(self.workdir, stack=self.name))
+        if self.kind is not None and self.kind not in VALID_KINDS:
+            raise ManifestError(
+                f"[stack.{self.name}] has unknown kind {self.kind!r}; "
+                f"expected one of {sorted(VALID_KINDS)}"
+            )
+        if self.kind is None:
+            if self.guest is not None:
+                raise ManifestError(
+                    f'[stack.{self.name}.guest] is only meaningful with kind = "{GUEST_MACOS_X64}"'
+                )
+            if self.acknowledge_macos_license:
+                raise ManifestError(
+                    f"[stack.{self.name}] sets acknowledge_macos_license without "
+                    f'kind = "{GUEST_MACOS_X64}"'
+                )
+            return
+        if not self.acknowledge_macos_license:
+            raise ManifestError(
+                f"[stack.{self.name}] declares kind = {self.kind!r}, which boots macOS on "
+                "non-Apple hardware under QEMU. Apple's licence conditions macOS on the "
+                "hardware it runs on, so bosn will not start one unless you say so in the "
+                "manifest: add `acknowledge_macos_license = true` to this stack."
+            )
+        if self.mounts:
+            # Not a policy choice -- a bind lands in the *container's* filesystem, and the
+            # guest is a VM inside that container with no view of it. Accepting the
+            # declaration would produce a stack whose repo mount silently is not there.
+            names = sorted(mount.name for mount in self.mounts)
+            raise ManifestError(
+                f"[stack.{self.name}.mounts] declares {names}, but a {self.kind} guest "
+                "cannot see host bind mounts: the workload runs in a VM inside the "
+                "container. Ship what the task needs over the guest's ssh channel instead "
+                "(see docs/macos-guest.md)."
+            )
+        if self.guest is None:
+            object.__setattr__(self, "guest", GuestSpec())
 
     def referenced_files(self, root: Path) -> list[Path]:
         """Files whose byte content folds into this stack's digest."""
@@ -350,6 +505,50 @@ def _refuse_duplicate_destinations(
         raise ManifestError(f"[stack.{stack}] mounts {duplicated} more than once")
 
 
+_GUEST_INT_KEYS = ("ssh_port", "web_port", "ready_timeout", "ready_poll_interval", "cpu_cores")
+_GUEST_STR_KEYS = (
+    "ssh_user",
+    "ssh_host",
+    "version",
+    "ram_size",
+    "disk_size",
+    "payload",
+    "payload_destination",
+)
+
+
+def _parse_guest(stack: str, body: object) -> GuestSpec | None:
+    """Read `[stack.X.guest]`, refusing unknown keys rather than ignoring them.
+
+    A silently dropped `ssh_port` would send every task to the default 2222 and fail with a
+    connection error a long way from the typo that caused it.
+    """
+    if body is None:
+        return None
+    if not isinstance(body, dict):
+        raise ManifestError(f"[stack.{stack}.guest] must be a table")
+    known = set(_GUEST_INT_KEYS) | set(_GUEST_STR_KEYS)
+    unknown = sorted(set(body) - known)
+    if unknown:
+        raise ManifestError(
+            f"[stack.{stack}.guest] has unknown keys {unknown}; expected {sorted(known)}"
+        )
+    fields: dict[str, Any] = {}
+    for key in _GUEST_INT_KEYS:
+        if key in body:
+            fields[key] = _positive_int(body[key], stack=stack, key=key)
+    for key in _GUEST_STR_KEYS:
+        if key in body:
+            value = body[key]
+            if isinstance(value, dict | list | bool):
+                raise ManifestError(f"[stack.{stack}.guest] {key} must be a string")
+            fields[key] = str(value)
+    try:
+        return GuestSpec(**fields)
+    except ManifestError as exc:
+        raise ManifestError(str(exc).replace("[stack.*.guest]", f"[stack.{stack}.guest]")) from exc
+
+
 def parse(raw: dict, root: Path, *, source_path: Path | None = None) -> Manifest:
     manifest = Manifest(root=root, source_path=source_path)
 
@@ -365,6 +564,7 @@ def parse(raw: dict, root: Path, *, source_path: Path | None = None) -> Manifest
                     if (vol_body or {}).get("destination")
                     else None
                 ),
+                retention=str((vol_body or {}).get("retention", DEFAULT_RETENTION)),
             )
             for vol_name, vol_body in (body.get("volumes") or {}).items()
         )
@@ -392,6 +592,7 @@ def parse(raw: dict, root: Path, *, source_path: Path | None = None) -> Manifest
                 )
             env[str(env_key)] = str(env_value)
         workdir = body.get("workdir")
+        kind = body.get("kind")
         stack = StackSpec(
             name=name,
             dockerfile=body.get("dockerfile"),
@@ -403,6 +604,9 @@ def parse(raw: dict, root: Path, *, source_path: Path | None = None) -> Manifest
             tmpfs=tmpfs,
             env=env,
             workdir=str(workdir) if workdir else None,
+            kind=str(kind) if kind is not None else None,
+            guest=_parse_guest(name, body.get("guest")),
+            acknowledge_macos_license=bool(body.get("acknowledge_macos_license", False)),
         )
         if stack.dockerfile is None and stack.image is None:
             raise ManifestError(f"[stack.{name}] must set either `dockerfile` or `image`")
@@ -480,6 +684,25 @@ def generation_digest(manifest: Manifest, stack: StackSpec) -> str:
         # worse. For `workdir` the alternative is not worse, so it stays out.
         "env": sorted(stack.env.items()),
     }
+    # Everything below is added to `section` *only when it is set*, so a manifest that uses
+    # none of it hashes byte-identically to the way it hashed before these fields existed.
+    # An unconditional key would roll every existing user's generation on upgrade and
+    # rebuild every warm cache in the fleet, for a feature they are not using.
+    #
+    # When they *are* set, they belong in the digest for the same reason `env` does: `kind`
+    # and every `guest` field land in `docker create` (device passthrough, published ports,
+    # `VERSION`/`RAM_SIZE`/`DISK_SIZE`), and a created container serves its create-time
+    # configuration until it is replaced.
+    if stack.kind is not None:
+        section["kind"] = stack.kind
+    if stack.guest is not None:
+        section["guest"] = stack.guest.digest_fields()
+    # A retention change *must* roll: `pinned` is written into the volume's registry row at
+    # creation, and a volume that was registered warm keeps being collectable until a fresh
+    # generation re-registers it as pinned.
+    pinned = sorted(v.name for v in stack.volumes if v.retention != DEFAULT_RETENTION)
+    if pinned:
+        section["pinned_volumes"] = pinned
     _hash_field(
         hasher,
         json.dumps(section, sort_keys=True, separators=(",", ":")).encode("utf-8"),

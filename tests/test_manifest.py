@@ -13,6 +13,7 @@ from bosn.manifest import (
     dockerfile_external_images,
     generation_digest,
     load,
+    parse,
 )
 
 SAMPLE = """
@@ -721,3 +722,42 @@ def test_tmpfs_trailing_slash_alias_is_refused_as_a_duplicate(tmp_path: Path) ->
 
     with pytest.raises(ManifestError, match="mounts '/data' twice"):
         load(tmp_path)
+
+
+def test_volume_retention_defaults_to_warm_and_accepts_pinned(tmp_path: Path) -> None:
+    manifest = parse(
+        {
+            "stack": {
+                "s": {
+                    "image": "x",
+                    "volumes": {
+                        "cache": {"scope": "stack"},
+                        "storage": {"scope": "machine", "retention": "pinned"},
+                    },
+                }
+            }
+        },
+        tmp_path,
+    )
+    retentions = {v.name: v.retention for v in manifest.stack("s").volumes}
+    assert retentions == {"cache": "warm", "storage": "pinned"}
+
+
+def test_an_unknown_retention_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(ManifestError) as exc:
+        parse(
+            {"stack": {"s": {"image": "x", "volumes": {"v": {"retention": "forever"}}}}}, tmp_path
+        )
+    assert "unknown retention" in str(exc.value)
+
+
+def test_pinning_a_volume_rolls_the_generation(tmp_path: Path) -> None:
+    """The tier is written into the registry row at creation, so it must not reuse one."""
+
+    def digest(retention: str) -> str:
+        return parse(
+            {"stack": {"s": {"image": "x", "volumes": {"v": {"retention": retention}}}}},
+            tmp_path,
+        ).digest("s")
+
+    assert digest("warm") != digest("pinned")

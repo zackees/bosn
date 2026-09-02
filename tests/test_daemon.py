@@ -2757,3 +2757,174 @@ def test_recorded_state_does_not_delete_what_it_reads(tmp_path: Path) -> None:
     assert daemon_mod.recorded_state(tmp_path) is not None
     assert daemon_mod.recorded_state(tmp_path) is not None, "reading it twice must be possible"
     assert path.exists()
+
+
+# -- release-volume: the only exit from the pinned tier (#151) --------------
+
+
+PINNED_MANIFEST = """
+[stack.mac]
+kind = "macos-x64-guest"
+acknowledge_macos_license = true
+image = "ghcr.io/example/guest:ventura"
+family = "macos-x64"
+
+[stack.mac.volumes]
+storage = { scope = "machine", destination = "/storage", retention = "pinned" }
+scratch = { scope = "stack" }
+"""
+
+
+class ReleaseEngine:
+    """Just enough engine for the release path: labels, attachment, and removal."""
+
+    def __init__(self, registry_id: str) -> None:
+        self.registry_id = registry_id
+        self.removed: list[str] = []
+        self.attached = False
+        self.owned = True
+
+    def _labels(self) -> dict[str, str]:
+        from bosn import labels
+
+        if not self.owned:
+            return {}
+        return {
+            labels.REGISTRY: self.registry_id,
+            labels.KIND: "volume",
+            labels.STACK: "mac",
+            labels.GENERATION: "sha256:g",
+            labels.SCOPE: "machine",
+            labels.WORKSPACE: "/w",
+            labels.CREATED: "2026-01-01T00:00:00Z",
+        }
+
+    def run(self, args: list[str], *, check: bool = False, timeout: float | None = None):
+        import json as _json
+
+        from bosn.engine import EngineResult
+
+        if args[:2] == ["version", "--format"]:
+            return EngineResult(0, "linux/amd64", "")
+        if args[:2] == ["volume", "inspect"] and "{{json .Labels}}" in args:
+            return EngineResult(0, _json.dumps(self._labels()), "")
+        if args[:2] == ["image", "inspect"] and "{{.Id}}" in args:
+            return EngineResult(0, "sha256:guest-image", "")
+        if args[0] == "ps":
+            return EngineResult(0, "holder" if self.attached else "", "")
+        if args[:2] == ["volume", "rm"]:
+            self.removed.append(args[-1])
+            return EngineResult(0, "", "")
+        return EngineResult(0, "", "")
+
+
+@pytest.fixture
+def release_daemon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    manifest = tmp_path / "bosn.toml"
+    manifest.write_text(PINNED_MANIFEST, encoding="utf-8")
+    daemon = Daemon(state_dir=tmp_path / "state")
+    engine = ReleaseEngine(daemon.registry.registry_id)
+    monkeypatch.setattr("bosn.engine.Engine", lambda _binary: engine)
+    request = {"manifest": str(manifest), "stack": "mac", "volume": "storage"}
+    try:
+        yield daemon, engine, request
+    finally:
+        daemon.registry.close()
+
+
+def test_release_volume_previews_without_removing(release_daemon) -> None:
+    daemon, engine, request = release_daemon
+    reply = daemon._verb_release_volume(request)
+    assert reply["ok"] is True and reply["applied"] is False
+    assert reply["plan"]["action"] == "would-remove"
+    assert engine.removed == []
+
+
+def test_release_volume_refuses_apply_without_yes(release_daemon) -> None:
+    daemon, engine, request = release_daemon
+    reply = daemon._verb_release_volume({**request, "apply": True})
+    assert reply["ok"] is False
+    assert engine.removed == [], "the expensive state must survive a half-typed command"
+
+
+def test_release_volume_removes_and_forgets_a_pinned_volume(release_daemon) -> None:
+    daemon, engine, request = release_daemon
+    reply = daemon._verb_release_volume({**request, "apply": True, "yes": True})
+    assert reply["ok"] is True and reply["applied"] is True
+    name = reply["plan"]["engine_name"]
+    assert engine.removed == [name]
+    assert daemon.registry.get_resource_by_engine_identity("volume", name) is None
+    assert any(row["kind"] == "volume.released" for row in daemon.registry.events())
+
+
+def test_release_volume_refuses_a_warm_volume(release_daemon) -> None:
+    daemon, engine, request = release_daemon
+    reply = daemon._verb_release_volume(
+        {**request, "volume": "scratch", "apply": True, "yes": True}
+    )
+    assert reply["ok"] is False
+    assert "not pinned" in str(reply["error"])
+    assert engine.removed == []
+
+
+def test_release_volume_refuses_a_volume_it_cannot_prove_it_owns(release_daemon) -> None:
+    daemon, engine, request = release_daemon
+    engine.owned = False
+    reply = daemon._verb_release_volume({**request, "apply": True, "yes": True})
+    assert reply["ok"] is False
+    assert engine.removed == []
+
+
+def test_release_volume_refuses_a_volume_still_attached_to_a_container(release_daemon) -> None:
+    daemon, engine, request = release_daemon
+    engine.attached = True
+    reply = daemon._verb_release_volume({**request, "apply": True, "yes": True})
+    assert reply["ok"] is False
+    assert "attached" in str(reply["error"])
+    assert engine.removed == []
+
+
+def test_release_volume_refuses_a_leased_volume(release_daemon) -> None:
+    daemon, engine, request = release_daemon
+    preview = daemon._verb_release_volume(request)
+    name = preview["plan"]["engine_name"]
+    resource = daemon.registry.register_resource(
+        kind="volume",
+        name=name,
+        stack="mac",
+        generation="sha256:g",
+        scope="machine",
+        workspace="/w",
+        retention="pinned",
+    )
+    daemon.registry.acquire_lease(resource.id, pid=os.getpid(), proc_start=None, ttl_seconds=600)
+
+    reply = daemon._verb_release_volume({**request, "apply": True, "yes": True})
+    assert reply["ok"] is False
+    assert "lease" in str(reply["error"])
+    assert engine.removed == []
+
+
+def test_release_volume_is_gated_as_a_mutating_verb() -> None:
+    assert "release-volume" in daemon_mod.MUTATING_VERBS
+
+
+def test_release_volume_never_pulls_an_image_to_delete_a_volume(release_daemon) -> None:
+    """The guest image is tens of gigabytes; a delete must not be the thing that fetches it.
+
+    A `machine`-scoped volume's name is keyed on family and volume alone, so resolving a
+    generation for it would pull an image the name cannot even depend on.
+    """
+    daemon, engine, request = release_daemon
+    pulls: list[list[str]] = []
+    original = engine.run
+
+    def watched(args, **kwargs):
+        if args and args[0] == "pull":
+            pulls.append(list(args))
+        return original(args, **kwargs)
+
+    engine.run = watched  # type: ignore[method-assign]
+    reply = daemon._verb_release_volume({**request, "apply": True, "yes": True})
+    assert reply["ok"] is True
+    assert pulls == []

@@ -12,6 +12,7 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import shutil
 import sqlite3
 import sys
@@ -150,6 +151,7 @@ VERBS: dict[str, tuple[str, str]] = {
     "ensure": ("pre-warm a stack without running a command", "implemented"),
     "adopt": ("recover labeled resources into this registry", "implemented"),
     "reconcile-volume": ("explicitly repair one incomplete manifest volume", "implemented"),
+    "release-volume": ("manually release one pinned volume", "implemented"),
     "doctor": ("engine health and reachability", "implemented"),
     "daemon-stop": ("stop the running daemon (needed after upgrades)", "implemented"),
     "init": ("translate a Compose file into bosn.toml (alias: bosn-docker init)", "implemented"),
@@ -192,7 +194,16 @@ def build_parser(*, json_errors: bool = False) -> argparse.ArgumentParser:
         sub = subparsers.add_parser(verb, help=help_text)
         _add_policy_flags(sub, default=argparse.SUPPRESS)
         sub.add_argument("args", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
-        if verb in {"run", "tasks", "shell", "done", "ensure", "adopt", "reconcile-volume"}:
+        if verb in {
+            "run",
+            "tasks",
+            "shell",
+            "done",
+            "ensure",
+            "adopt",
+            "reconcile-volume",
+            "release-volume",
+        }:
             sub.add_argument("--stack", default=None, help="stack to use (default: the default)")
             sub.add_argument("--task", default=None, help="run a manifest task by name")
             sub.add_argument("--manifest", default=None, dest="sub_manifest")
@@ -250,6 +261,29 @@ def build_parser(*, json_errors: bool = False) -> argparse.ArgumentParser:
                 action="store_true",
                 default=False,
                 help="confirm the explicit legacy recovery when used with --apply",
+            )
+        if verb == "release-volume":
+            sub.add_argument(
+                "--volume",
+                default=None,
+                metavar="LOGICAL_NAME",
+                help=(
+                    "declared volume name from the selected stack; engine names are never accepted"
+                ),
+            )
+            sub.add_argument(
+                "--apply",
+                dest="release_apply",
+                action="store_true",
+                default=False,
+                help="actually remove the pinned volume, after preview and --yes",
+            )
+            sub.add_argument(
+                "--yes",
+                dest="yes",
+                action="store_true",
+                default=False,
+                help="confirm the release when used with --apply",
             )
         if verb == "init":
             # Matches `bosn-docker init`'s flag surface (see docker_cli._parse_init_args)
@@ -791,6 +825,53 @@ def _release_execution(daemon_mod, state_dir, session: object) -> str | None:
     return str(released.get("error") or f"could not release execution session {session}")
 
 
+def _run_in_guest(
+    stack,
+    engine,
+    container: str,
+    command: list[str],
+    *,
+    root,
+    capture: bool,
+    timeout: float | None,
+) -> int:
+    """Wait for the guest, then run one foreground task inside the VM over ssh.
+
+    `capture` follows the same rule the `docker exec` path uses: JSON mode reserves stdout
+    for exactly one parseable envelope, so output is captured and re-emitted; an ordinary
+    run inherits this process's stdio so a long test run streams live.
+    """
+    from bosn import guest as guest_mod
+    from bosn.engine import EngineError
+
+    guest = stack.guest_spec()
+    try:
+        guest_mod.ensure_ready(
+            guest,
+            fetch_logs=guest_mod.container_log_reader(engine, container),
+            report=None if capture else lambda message: print(message, file=sys.stderr),
+        )
+    except guest_mod.GuestNotReadyError as exc:
+        raise EngineError(str(exc)) from exc
+    guest_mod.ship_payload(guest, root, timeout=timeout)
+
+    # A Linux stack receives `["sh", "-c", cmd]`; the guest's own shell plays that role, so
+    # the same task text means the same thing on both kinds.
+    payload = command[2] if command[:2] == ["sh", "-c"] and len(command) == 3 else None
+    remote = guest_mod.remote_command(
+        guest,
+        payload if payload is not None else shlex.join(command),
+        workdir=stack.workdir,
+    )
+    argv = guest_mod.ssh_argv(guest, remote)
+    if not capture:
+        return guest_mod.interactive_remote(argv, timeout=timeout)
+    code, output = guest_mod.run_remote(argv, timeout=timeout)
+    if output:
+        print(output, file=sys.stderr if code else sys.stdout)
+    return code
+
+
 def cmd_run(opts: Options) -> int:
     from bosn import daemon as daemon_mod
     from bosn.config import ConfigError
@@ -841,6 +922,21 @@ def cmd_run(opts: Options) -> int:
         code: int | None = None
         try:
             engine = Engine(opts.engine)
+            stack = manifest.stack(stack_name)
+            if stack.is_guest:
+                # `docker exec` would land in the container, beside the VM rather than
+                # inside it, and quietly run a macOS task against a Linux userland. The
+                # guest's transport is ssh; see docs/macos-guest.md.
+                code = _run_in_guest(
+                    stack,
+                    engine,
+                    str(acquired["container"]),
+                    command,
+                    root=manifest.root,
+                    capture=opts.json,
+                    timeout=config.get("run_max_duration"),
+                )
+                return code
             exec_args = ["exec", str(acquired["container"]), *command]
             if opts.json:
                 # JSON errors reserve stdout for exactly one parseable envelope. Capturing
@@ -1521,6 +1617,77 @@ def cmd_reconcile_volume(opts: Options) -> int:
     return 0 if reply.get("ok") else 1
 
 
+def cmd_release_volume(opts: Options) -> int:
+    """Preview or explicitly release one pinned volume (#151).
+
+    Pinned volumes are exempt from every automatic reclamation rule, so this is their only
+    exit. It mirrors `reconcile-volume`'s shape deliberately: a declared stack plus logical
+    volume name, a preview by default, and a mutation only behind `--apply --yes`.
+    """
+    from bosn import daemon as daemon_mod
+    from bosn.manifest import DEFAULT_RETENTION, ManifestError, find_manifest, load
+
+    if not opts.stack or not opts.volume:
+        return _error(
+            code="release-volume.stack_required",
+            message="release-volume requires --stack and --volume for an unambiguous target",
+            next_step="pass the stack and logical volume declared by bosn.toml",
+            as_json=opts.json,
+        )
+    try:
+        manifest_path = opts.manifest or find_manifest()
+        if manifest_path is None:
+            raise ManifestError("no bosn.toml found; create one or pass --manifest")
+        manifest = load(manifest_path)
+        # Validated client-side too, so a typo never starts a daemon merely to be refused.
+        stack = manifest.stack(opts.stack)
+        declared = next((v for v in stack.volumes if v.name == opts.volume), None)
+        if declared is None:
+            raise ManifestError(f"volume {opts.volume!r} is not declared by stack {stack.name!r}")
+        if declared.retention == DEFAULT_RETENTION:
+            raise ManifestError(
+                f"volume {opts.volume!r} of stack {stack.name!r} is not pinned; warm volumes "
+                "are reclaimed by `bosn gc` and need no explicit release"
+            )
+    except ManifestError as exc:
+        return _error(
+            code="release-volume.invalid_manifest",
+            message=str(exc),
+            next_step="select a declared stack and a pinned logical volume",
+            as_json=opts.json,
+        )
+    try:
+        reply = daemon_mod.request(
+            "release-volume",
+            opts.state_dir,
+            manifest=str(manifest.path),
+            stack=opts.stack,
+            volume=opts.volume,
+            apply=opts.release_apply,
+            yes=opts.yes,
+            engine=opts.engine,
+            request_timeout=RECONCILE_VOLUME_REQUEST_TIMEOUT_SECONDS,
+        )
+    except (daemon_mod.DaemonError, ipc.TransportError) as exc:
+        return _error(
+            code="daemon.unreachable",
+            message=f"cannot reach the bosn daemon: {exc}",
+            next_step="start or restart the daemon, then retry",
+            as_json=opts.json,
+        )
+    if opts.json:
+        print(json.dumps(reply, indent=2))
+    elif reply.get("plan") and not reply.get("applied"):
+        print(json.dumps(reply["plan"], indent=2))
+        if reply.get("ok"):
+            print("nothing was removed; re-run with --apply --yes to release it", file=sys.stderr)
+    elif reply.get("ok"):
+        print(f"released {reply.get('plan', {}).get('engine_name', opts.volume)}")
+    if not reply.get("ok") and not opts.json:
+        print(str(reply.get("error") or "release-volume failed"), file=sys.stderr)
+    return 0 if reply.get("ok") else 1
+
+
 def cmd_shell(opts: Options) -> int:
     from bosn import daemon as daemon_mod
     from bosn.converge import workspace_of
@@ -1554,9 +1721,21 @@ def cmd_shell(opts: Options) -> int:
             raise EngineError(str(acquired.get("error") or "execution acquire failed"))
         code: int | None = None
         try:
-            code = Engine(opts.engine).interactive(
-                ["exec", "-it", str(acquired["container"]), "sh"]
-            )
+            from bosn import guest as guest_mod
+
+            stack = manifest.stack(opts.stack)
+            if stack.is_guest:
+                # The shell must land in the VM for the same reason a task does. Readiness
+                # is not polled: the user is present, so a refused connection is immediate,
+                # legible feedback rather than a silent minutes-long wait.
+                guest = stack.guest_spec()
+                code = guest_mod.interactive_remote(
+                    guest_mod.ssh_argv(guest, guest_mod.login_command(stack.workdir))
+                )
+            else:
+                code = Engine(opts.engine).interactive(
+                    ["exec", "-it", str(acquired["container"]), "sh"]
+                )
         finally:
             cleanup_error = _release_execution(daemon_mod, opts.state_dir, acquired["session"])
             if cleanup_error:
@@ -1683,6 +1862,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "done": cmd_done,
         "adopt": cmd_adopt,
         "reconcile-volume": cmd_reconcile_volume,
+        "release-volume": cmd_release_volume,
         "init": cmd_init,
     }
     handler = handlers.get(opts.verb)
