@@ -322,6 +322,137 @@ fn task_json_failure_is_stable_redacted_and_does_not_create_state() {
 }
 
 #[test]
+fn ensure_rejects_malformed_inputs_before_state_or_daemon_contact() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    for (name, state, config, extra) in [
+        (
+            "missing-state",
+            None,
+            "https://example.invalid/setup.toml",
+            vec!["--refresh", "--deadline-ms", "1", "--output-limit", "1"],
+        ),
+        (
+            "ambiguous-policy",
+            Some("ambiguous-policy"),
+            "https://example.invalid/setup.toml",
+            vec![
+                "--refresh",
+                "--offline",
+                "--deadline-ms",
+                "1",
+                "--output-limit",
+                "1",
+            ],
+        ),
+        (
+            "invalid-config",
+            Some("invalid-config"),
+            "docker://not-a-config",
+            vec!["--refresh", "--deadline-ms", "1", "--output-limit", "1"],
+        ),
+        (
+            "engine-control",
+            Some("engine-control"),
+            "https://example.invalid/setup.toml",
+            vec![
+                "--refresh",
+                "--deadline-ms",
+                "1",
+                "--output-limit",
+                "1",
+                "--image",
+                "evil",
+            ],
+        ),
+    ] {
+        let state_path = root.path().join(state.unwrap_or(name));
+        let mut args: Vec<&std::ffi::OsStr> = vec!["setup".as_ref(), "ensure".as_ref()];
+        if state.is_some() {
+            args.extend(["--state-dir".as_ref(), state_path.as_os_str()]);
+        }
+        args.extend([
+            "--workspace".as_ref(),
+            workspace.path().as_os_str(),
+            "--config".as_ref(),
+            config.as_ref(),
+        ]);
+        args.extend(extra.into_iter().map(std::ffi::OsStr::new));
+        let output = run(&args);
+        assert_eq!(output.status.code(), Some(2), "{name}");
+        assert!(output.stdout.is_empty(), "{name}");
+        assert!(!state_path.exists(), "{name}");
+    }
+
+    let output = run(&[
+        "setup".as_ref(),
+        "ensure".as_ref(),
+        "--state-dir".as_ref(),
+        "".as_ref(),
+        "--workspace".as_ref(),
+        workspace.path().as_os_str(),
+        "--config".as_ref(),
+        "https://example.invalid/setup.toml".as_ref(),
+        "--refresh".as_ref(),
+        "--deadline-ms".as_ref(),
+        "1".as_ref(),
+        "--output-limit".as_ref(),
+        "1".as_ref(),
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+
+    let output = run(&[
+        "setup".as_ref(),
+        "ensure".as_ref(),
+        "--state-dir".as_ref(),
+        root.path().join("empty-workspace").as_os_str(),
+        "--workspace".as_ref(),
+        "".as_ref(),
+        "--config".as_ref(),
+        "https://example.invalid/setup.toml".as_ref(),
+        "--refresh".as_ref(),
+        "--deadline-ms".as_ref(),
+        "1".as_ref(),
+        "--output-limit".as_ref(),
+        "1".as_ref(),
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(!root.path().join("empty-workspace").exists());
+}
+
+#[test]
+fn ensure_json_failure_is_stable_redacted_and_does_not_create_state() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("no-daemon-state");
+    let workspace = tempfile::tempdir().unwrap();
+    let output = run(&[
+        "setup".as_ref(),
+        "ensure".as_ref(),
+        "--state-dir".as_ref(),
+        state.as_os_str(),
+        "--workspace".as_ref(),
+        workspace.path().as_os_str(),
+        "--config".as_ref(),
+        "https://example.invalid/setup.toml".as_ref(),
+        "--refresh".as_ref(),
+        "--deadline-ms".as_ref(),
+        "1".as_ref(),
+        "--output-limit".as_ref(),
+        "1".as_ref(),
+        "--json".as_ref(),
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    assert!(!state.exists());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        serde_json::json!({"action": "setup_ensure", "error": "request failed"})
+    );
+}
+
+#[test]
 fn job_commands_reject_malformed_inputs_before_state_or_daemon_contact() {
     let root = tempfile::tempdir().unwrap();
     for (name, command, extra) in [

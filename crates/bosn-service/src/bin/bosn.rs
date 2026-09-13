@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use bosn_core::parse_setup_config_locator;
 use bosn_service::{
-    Client, JobLogPage, JobStatus, SetupPreparePolicy, SetupPrepareRequest, SetupTaskJobRequest,
+    Client, JobLogPage, JobStatus, SetupEnsureJobRequest, SetupPreparePolicy, SetupPrepareRequest,
+    SetupTaskJobRequest,
 };
 use bosn_setup::{
     SetupAcquirePolicy, SetupPlan, SetupPlanAppSource, SetupPlanRequest, SetupSourceKind,
@@ -222,6 +223,7 @@ fn run_setup(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
         Some(command) if command == "plan" => run_setup_plan(arguments),
         Some(command) if command == "prepare" => run_setup_prepare(arguments),
         Some(command) if command == "task" => run_setup_task(arguments),
+        Some(command) if command == "ensure" => run_setup_ensure(arguments),
         _ => usage(),
     }
 }
@@ -310,6 +312,38 @@ fn run_setup_task(arguments: impl Iterator<Item = std::ffi::OsString>) {
         );
     } else {
         println!("setup task submitted");
+        println!("job_id: {job_id}");
+    }
+}
+
+/// Submit one ownership-safe setup application ensure to an already-running
+/// daemon. This is deliberately only a semantic submission: it cannot start a
+/// daemon or invoke Docker itself, and the daemon derives every engine choice
+/// from the validated setup document and its prepared-image receipt.
+fn run_setup_ensure(arguments: impl Iterator<Item = std::ffi::OsString>) {
+    let invocation = match parse_ensure_arguments(arguments) {
+        Ok(invocation) => invocation,
+        Err(()) => usage(),
+    };
+    let client = match Client::for_state(&invocation.state_dir) {
+        Ok(client) => client,
+        Err(_) => setup_ensure_failure(invocation.json),
+    };
+    let runtime = match RuntimeBuilder::current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(_) => setup_ensure_failure(invocation.json),
+    };
+    let job_id = match runtime.run(client.submit_setup_ensure(invocation.request)) {
+        Ok(job_id) => job_id,
+        Err(_) => setup_ensure_failure(invocation.json),
+    };
+    if invocation.json {
+        println!(
+            "{}",
+            json!({"action": "setup_ensure", "submitted": true, "job_id": job_id})
+        );
+    } else {
+        println!("setup ensure submitted");
         println!("job_id: {job_id}");
     }
 }
@@ -591,6 +625,18 @@ fn setup_task_failure(json: bool) -> ! {
     std::process::exit(1)
 }
 
+fn setup_ensure_failure(json: bool) -> ! {
+    if json {
+        println!(
+            "{}",
+            json!({"action": "setup_ensure", "error": "request failed"})
+        );
+    } else {
+        eprintln!("bosn setup ensure: submission failed");
+    }
+    std::process::exit(1)
+}
+
 struct PlanInvocation {
     request: SetupPlanRequest,
     json: bool,
@@ -605,6 +651,12 @@ struct PrepareInvocation {
 struct TaskInvocation {
     state_dir: PathBuf,
     request: SetupTaskJobRequest,
+    json: bool,
+}
+
+struct EnsureInvocation {
+    state_dir: PathBuf,
+    request: SetupEnsureJobRequest,
     json: bool,
 }
 
@@ -760,6 +812,63 @@ fn parse_task_arguments(
     })
 }
 
+/// Parse every ensure-submission input before constructing a runtime or
+/// resolving the local IPC endpoint. The request intentionally has no app
+/// command, image, container, mount, environment, work-directory, network,
+/// privilege, label, state override, task, or raw Docker arguments.
+fn parse_ensure_arguments(
+    mut arguments: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<EnsureInvocation, ()> {
+    let mut state_dir = None;
+    let mut workspace = None;
+    let mut config = None;
+    let mut policy = None;
+    let mut deadline_ms = None;
+    let mut output_limit = None;
+    let mut json = false;
+    while let Some(argument) = arguments.next() {
+        match argument.to_string_lossy().as_ref() {
+            "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
+            "--workspace" => {
+                set_once_parsed(&mut workspace, arguments.next(), parse_setup_request_text)
+            }
+            "--config" => set_once_parsed(&mut config, arguments.next(), parse_setup_config),
+            "--refresh" => set_once(&mut policy, Some(SetupPreparePolicy::Refresh)),
+            "--offline" => set_once(&mut policy, Some(SetupPreparePolicy::Offline)),
+            "--deadline-ms" => set_once_parsed(&mut deadline_ms, arguments.next(), |value| {
+                let value = parse_u64(value)?;
+                (1..=SETUP_PREPARE_MAX_DEADLINE_MS)
+                    .contains(&value)
+                    .then_some(value)
+                    .ok_or(())
+            }),
+            "--output-limit" => set_once_parsed(&mut output_limit, arguments.next(), |value| {
+                let value = parse_usize(value)?;
+                (1..=SETUP_PREPARE_MAX_OUTPUT_LIMIT)
+                    .contains(&value)
+                    .then_some(value)
+                    .ok_or(())
+            }),
+            "--json" if !json => {
+                json = true;
+                Ok(())
+            }
+            _ => Err(()),
+        }?;
+    }
+    Ok(EnsureInvocation {
+        state_dir: state_dir.ok_or(())?,
+        request: SetupEnsureJobRequest {
+            workspace: PathBuf::from(workspace.ok_or(())?),
+            config: config.ok_or(())?,
+            policy: policy.ok_or(())?,
+            deadline: Duration::from_millis(deadline_ms.ok_or(())?),
+            output_limit: output_limit.ok_or(())?,
+        },
+        json,
+    })
+}
+
 fn set_once<T>(slot: &mut Option<T>, value: Option<T>) -> Result<(), ()> {
     if slot.is_some() {
         return Err(());
@@ -885,6 +994,9 @@ fn usage() -> ! {
     );
     eprintln!(
         "   or: bosn setup task --state-dir STATE_DIR --workspace WORKSPACE --config LOCATOR (--refresh | --offline) --task NAME --deadline-ms 1..=300000 --output-limit 1..=8388608 [--json]"
+    );
+    eprintln!(
+        "   or: bosn setup ensure --state-dir STATE_DIR --workspace WORKSPACE --config LOCATOR (--refresh | --offline) --deadline-ms 1..=300000 --output-limit 1..=8388608 [--json]"
     );
     eprintln!("   or: bosn job status --state-dir STATE_DIR --job-id ID [--json]");
     eprintln!(

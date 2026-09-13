@@ -170,6 +170,23 @@ It never starts a daemon or invokes Docker itself, and it accepts no task
 command, container, mount, environment, working-directory, per-request state
 override, or other engine controls.
 
+`bosn setup ensure` submits the complete daemon-owned plan, image-preparation,
+and ownership-safe application ensure pipeline. It returns promptly with
+`action: setup_ensure`, `submitted: true`, and a `job_id`:
+
+```text
+bosn setup ensure --state-dir STATE --workspace WORKSPACE --config LOCATOR \
+  (--refresh | --offline) --deadline-ms 1..=300000 \
+  --output-limit 1..=8388608 [--json]
+```
+
+The daemon may create an absent application or start a matching stopped one.
+It refuses foreign, incomplete, or mismatched candidates. It does not replace,
+delete, adopt, or garbage-collect an existing application. The native command
+never starts a daemon or invokes Docker directly, and exposes no container,
+image, command, mount, label, environment, work-directory, network,
+privilege, task, state-override, or raw engine arguments.
+
 Log replies include `retained_from`, `next`, and `gap`, so callers can retain
 their cursor and detect bounded-log eviction. The command surface is limited
 to typed IPC observation; it provides no daemon start, Docker, registry, or
