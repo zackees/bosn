@@ -2,7 +2,7 @@
 
 use bosn_core::{ResourceKind, ResourceState, Retention, Scope};
 use bosn_engine::{DockerDoctorReport, DockerDoctorState, DockerEngine, EngineEvent, RunOptions};
-use bosn_registry::{Event, Registry, RegistryStatus, Resource, ResourceUse};
+use bosn_registry::{Event, Registry, RegistryStatus, Resource, ResourceUse, SetupGcPreview};
 #[cfg(test)]
 use bosn_setup::PreparedImageKind;
 use bosn_setup::{
@@ -698,6 +698,54 @@ pub struct RegistryResourcePage {
     pub records: Vec<RegistryResourceDiagnostic>,
 }
 
+/// One safe, logical future-GC candidate. This is preview metadata only: it
+/// is never an engine identifier and cannot be used to request deletion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetupGcCandidateDiagnostic {
+    pub id: String,
+    pub name: String,
+    pub generation: String,
+    pub reason: String,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SetupGcPreviewCounts {
+    pub protected_not_retired: u64,
+    pub protected_ambiguous_use: u64,
+    pub protected_lease: u64,
+    pub protected_session: u64,
+    pub excluded_unmanaged: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetupGcPreviewPage {
+    pub next: Option<u64>,
+    pub candidates: Vec<SetupGcCandidateDiagnostic>,
+    pub counts: SetupGcPreviewCounts,
+}
+
+fn setup_gc_preview_diagnostic(value: SetupGcPreview) -> SetupGcPreviewPage {
+    SetupGcPreviewPage {
+        next: value.candidates.next_offset.map(|value| value as u64),
+        candidates: value
+            .candidates
+            .items
+            .into_iter()
+            .map(|candidate| SetupGcCandidateDiagnostic {
+                id: candidate.id,
+                name: candidate.name,
+                generation: candidate.generation,
+                reason: "retired_managed_setup_container".into(),
+            })
+            .collect(),
+        counts: SetupGcPreviewCounts {
+            protected_not_retired: value.counts.protected_not_retired,
+            protected_ambiguous_use: value.counts.protected_ambiguous_use,
+            protected_lease: value.counts.protected_lease,
+            protected_session: value.counts.protected_session,
+            excluded_unmanaged: value.counts.excluded_unmanaged,
+        },
+    }
+}
+
 /// One redacted setup-ensure registry event. Event details are authored by the
 /// daemon's allowlisted event formatter, not copied from config, engine, or
 /// workspace input.
@@ -805,6 +853,27 @@ fn validate_registry_diagnostics_request_wire(request: &Request) -> Result<(), E
         || !request.setup_task_name.is_empty()
     {
         return Err(Error::Protocol("nonsemantic registry diagnostic fields"));
+    }
+    Ok(())
+}
+
+fn validate_setup_gc_preview_request_wire(request: &Request) -> Result<(), Error> {
+    validate_registry_page(request.diagnostic_after, request.diagnostic_limit)?;
+    if request.workspace.is_empty()
+        || request.workspace.len() > 8 * 1024
+        || request.workspace.bytes().any(|byte| byte == 0)
+        || !request.stack.is_empty()
+        || !request.digest.is_empty()
+        || request.job_id != 0
+        || request.log_after != 0
+        || request.log_limit != 0
+        || !request.setup_config.is_empty()
+        || request.setup_policy != 0
+        || request.setup_deadline_ms != 0
+        || request.setup_output_limit != 0
+        || !request.setup_task_name.is_empty()
+    {
+        return Err(Error::Protocol("nonsemantic setup gc preview fields"));
     }
     Ok(())
 }
@@ -918,6 +987,36 @@ impl Client {
         {
             Reply::SetupEnsureEvents(v) => Ok(v),
             _ => Err(Error::Protocol("unexpected setup ensure events response")),
+        }
+    }
+    /// Return a read-only, conservative future-GC preview for one exact
+    /// workspace. No client-side registry open, Docker call, or mutation is
+    /// possible through this method.
+    pub async fn setup_gc_preview(
+        &self,
+        workspace: impl AsRef<Path>,
+        after: u64,
+        limit: u32,
+    ) -> Result<SetupGcPreviewPage, Error> {
+        validate_registry_page(after, limit)?;
+        let workspace = workspace.as_ref().to_string_lossy().into_owned();
+        if workspace.is_empty()
+            || workspace.len() > 8 * 1024
+            || workspace.bytes().any(|byte| byte == 0)
+        {
+            return Err(Error::Protocol("invalid setup gc preview workspace"));
+        }
+        match self
+            .call(Request {
+                workspace,
+                diagnostic_after: after,
+                diagnostic_limit: limit,
+                ..Request::operation(14)
+            })
+            .await?
+        {
+            Reply::SetupGcPreview(v) => Ok(v),
+            _ => Err(Error::Protocol("unexpected setup gc preview response")),
         }
     }
     pub async fn shutdown(&self) -> Result<(), Error> {
@@ -1156,6 +1255,12 @@ enum DbCommand {
         after: u64,
         limit: u32,
         reply: async_engine::OneshotSender<Result<SetupEnsureEventPage, Error>>,
+    },
+    SetupGcPreview {
+        workspace: String,
+        after: u64,
+        limit: u32,
+        reply: async_engine::OneshotSender<Result<SetupGcPreviewPage, Error>>,
     },
     AppendSetupEnsureEvents {
         events: Vec<SetupEnsureEvent>,
@@ -1929,6 +2034,25 @@ impl RegistryActor {
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
     }
+    async fn setup_gc_preview(
+        &self,
+        workspace: String,
+        after: u64,
+        limit: u32,
+    ) -> Result<SetupGcPreviewPage, Error> {
+        validate_registry_page(after, limit)?;
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::SetupGcPreview {
+                workspace,
+                after,
+                limit,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
     async fn append_setup_ensure_events(&self, events: Vec<SetupEnsureEvent>) -> Result<(), Error> {
         let (reply, wait) = async_engine::oneshot_channel();
         self.sender
@@ -2038,6 +2162,32 @@ async fn registry_actor(
                             next: page.next_offset.map(|value| value as u64),
                             records: page.items.into_iter().map(event_diagnostic).collect(),
                         });
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
+            DbCommand::SetupGcPreview {
+                workspace,
+                after,
+                limit,
+                reply,
+            } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = usize::try_from(after)
+                        .map_err(|_| bosn_registry::Error::BadRow("page offset"))
+                        .and_then(|after| {
+                            registry.setup_gc_preview(&workspace, after, limit as usize)
+                        })
+                        .map(setup_gc_preview_diagnostic);
                     (registry, result)
                 });
                 match worker.await {
@@ -2700,6 +2850,37 @@ async fn handle(
                         ..Default::default()
                     },
                 },
+                14 => match validate_setup_gc_preview_request_wire(&r) {
+                    Ok(()) => match actor
+                        .setup_gc_preview(r.workspace, r.diagnostic_after, r.diagnostic_limit)
+                        .await
+                    {
+                        Ok(page) => ReplyWire {
+                            code: 110,
+                            diagnostic_next: page.next.unwrap_or(0),
+                            diagnostic_has_next: page.next.is_some(),
+                            setup_gc_candidates: page
+                                .candidates
+                                .into_iter()
+                                .map(SetupGcCandidateWire::from)
+                                .collect(),
+                            gc_protected_not_retired: page.counts.protected_not_retired,
+                            gc_protected_ambiguous_use: page.counts.protected_ambiguous_use,
+                            gc_protected_lease: page.counts.protected_lease,
+                            gc_protected_session: page.counts.protected_session,
+                            gc_excluded_unmanaged: page.counts.excluded_unmanaged,
+                            ..Default::default()
+                        },
+                        Err(_) => ReplyWire {
+                            code: 3,
+                            ..Default::default()
+                        },
+                    },
+                    Err(_) => ReplyWire {
+                        code: 3,
+                        ..Default::default()
+                    },
+                },
                 _ => ReplyWire {
                     code: 2,
                     ..Default::default()
@@ -2948,6 +3129,18 @@ struct ReplyWire {
     doctor_client_version: String,
     #[prost(string, tag = "23")]
     doctor_server_version: String,
+    #[prost(message, repeated, tag = "24")]
+    setup_gc_candidates: Vec<SetupGcCandidateWire>,
+    #[prost(uint64, tag = "25")]
+    gc_protected_not_retired: u64,
+    #[prost(uint64, tag = "26")]
+    gc_protected_ambiguous_use: u64,
+    #[prost(uint64, tag = "27")]
+    gc_protected_lease: u64,
+    #[prost(uint64, tag = "28")]
+    gc_protected_session: u64,
+    #[prost(uint64, tag = "29")]
+    gc_excluded_unmanaged: u64,
 }
 #[derive(Message)]
 struct LogRecordWire {
@@ -3008,6 +3201,37 @@ impl From<ResourceDiagnosticWire> for RegistryResourceDiagnostic {
     }
 }
 #[derive(Message)]
+struct SetupGcCandidateWire {
+    #[prost(string, tag = "1")]
+    id: String,
+    #[prost(string, tag = "2")]
+    name: String,
+    #[prost(string, tag = "3")]
+    generation: String,
+    #[prost(string, tag = "4")]
+    reason: String,
+}
+impl From<SetupGcCandidateDiagnostic> for SetupGcCandidateWire {
+    fn from(value: SetupGcCandidateDiagnostic) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            generation: value.generation,
+            reason: value.reason,
+        }
+    }
+}
+impl From<SetupGcCandidateWire> for SetupGcCandidateDiagnostic {
+    fn from(value: SetupGcCandidateWire) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            generation: value.generation,
+            reason: value.reason,
+        }
+    }
+}
+#[derive(Message)]
 struct SetupEnsureEventWire {
     #[prost(uint64, tag = "1")]
     cursor: u64,
@@ -3048,6 +3272,7 @@ enum Reply {
     JobLogs(JobLogPage),
     RegistryResources(RegistryResourcePage),
     SetupEnsureEvents(SetupEnsureEventPage),
+    SetupGcPreview(SetupGcPreviewPage),
     Doctor(DoctorReport),
 }
 fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
@@ -3098,6 +3323,17 @@ fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
                 .then_some(v.doctor_client_version),
             server_version: (!v.doctor_server_version.is_empty())
                 .then_some(v.doctor_server_version),
+        })),
+        110 => Ok(Reply::SetupGcPreview(SetupGcPreviewPage {
+            next: v.diagnostic_has_next.then_some(v.diagnostic_next),
+            candidates: v.setup_gc_candidates.into_iter().map(Into::into).collect(),
+            counts: SetupGcPreviewCounts {
+                protected_not_retired: v.gc_protected_not_retired,
+                protected_ambiguous_use: v.gc_protected_ambiguous_use,
+                protected_lease: v.gc_protected_lease,
+                protected_session: v.gc_protected_session,
+                excluded_unmanaged: v.gc_excluded_unmanaged,
+            },
         })),
         1 => Err(Error::Protocol("unsupported protocol")),
         2 => Err(Error::Protocol("unknown operation")),

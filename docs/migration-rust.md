@@ -156,6 +156,18 @@ The equivalent read-only APIs are `bosn.Client.doctor()` in Python and the
 no-argument MCP tool `bosn_doctor`; both require the daemon selected when the
 client/server was created and accept no state path or diagnostic controls.
 
+### Setup GC preview only
+
+`bosn gc preview --state-dir STATE --workspace WORKSPACE --json`, Python
+`Client.setup_gc_preview(workspace)`, and read-only MCP
+`bosn_setup_gc_preview` expose only a bounded registry preview. They never
+call Docker, write SQLite, stop or remove a container, or expose a GC apply
+operation. A candidate must be a retired Bosn-owned setup container with an
+unambiguous retired use and no lease or execution session; foreign, active,
+adopted/done, incomplete, or otherwise ambiguous ownership is protected.
+Any future apply must obtain the candidate again and recheck every ownership
+fact immediately before an engine action.
+
 An opt-in live proof exercises the production daemon and kernal-api Docker
 transport end to end, including daemon restart and matching-container reuse:
 

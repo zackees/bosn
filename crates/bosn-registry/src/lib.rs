@@ -137,6 +137,34 @@ pub struct ExecutionSession {
     pub client_start: Option<f64>,
     pub lease_ids: Vec<String>,
 }
+/// A deliberately conservative, read-only candidate for a future setup GC
+/// apply operation.  This is registry accounting only; it has no engine
+/// effects and is intentionally narrower than a generic container listing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetupGcCandidate {
+    pub id: String,
+    pub name: String,
+    pub generation: String,
+}
+
+/// Stable summary of why setup containers in one workspace were protected or
+/// excluded from a GC preview. Counts can overlap: a doubtful record should
+/// remain protected for every reason observed rather than be made eligible by
+/// an arbitrary precedence rule.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SetupGcPreviewCounts {
+    pub protected_not_retired: u64,
+    pub protected_ambiguous_use: u64,
+    pub protected_lease: u64,
+    pub protected_session: u64,
+    pub excluded_unmanaged: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetupGcPreview {
+    pub candidates: Page<SetupGcCandidate>,
+    pub counts: SetupGcPreviewCounts,
+}
 #[derive(Clone, Debug, PartialEq)]
 pub struct VolumeCreationIntent {
     pub name: String,
@@ -1228,6 +1256,16 @@ impl Registry {
             resource,
         )
     }
+    /// Preview only retired, Bosn-managed setup containers for one exact
+    /// workspace. This makes no SQLite writes and never contacts an engine.
+    pub fn setup_gc_preview(
+        &self,
+        workspace: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<SetupGcPreview, Error> {
+        setup_gc_preview(&self.connection, workspace, offset, limit)
+    }
     pub fn resource_uses(&self, offset: usize, limit: usize) -> Result<Page<ResourceUse>, Error> {
         page(
             &self.connection,
@@ -1331,6 +1369,14 @@ impl ReadOnlyRegistry {
             limit,
             resource,
         )
+    }
+    pub fn setup_gc_preview(
+        &self,
+        workspace: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<SetupGcPreview, Error> {
+        setup_gc_preview(&self.connection, workspace, offset, limit)
     }
     pub fn resource_uses(&self, offset: usize, limit: usize) -> Result<Page<ResourceUse>, Error> {
         page(
@@ -1454,6 +1500,100 @@ fn page<T>(
         .map(|r| parse(&r))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Page { items, next_offset })
+}
+fn setup_gc_preview(
+    connection: &Connection,
+    workspace: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<SetupGcPreview, Error> {
+    // A managed setup container has both the product-owned logical namespace
+    // and the engine-name convention written by record_setup_ensure. Requiring
+    // the matching retired use row avoids acting on partially imported or
+    // otherwise incomplete ownership state. Any active/done/adopted use,
+    // foreign scope, lease, or session protects the record.
+    let candidate_sql = "SELECT r.id,r.name,r.generation FROM resources AS r \
+        WHERE r.kind='container' AND r.stack='setup' AND r.workspace=? \
+          AND r.state='retired' AND r.scope='machine' \
+          AND r.id GLOB 'setup-container:*' AND r.name GLOB 'bosn-setup-*' \
+          AND EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id \
+             AND u.workspace=? AND u.stack='setup' AND u.state='retired') \
+          AND NOT EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id \
+             AND (u.workspace<>? OR u.stack<>'setup' OR u.state<>'retired')) \
+          AND NOT EXISTS (SELECT 1 FROM leases AS l WHERE l.resource_id=r.id) \
+          AND NOT EXISTS (SELECT 1 FROM execution_sessions AS s \
+             WHERE s.container_id=r.id OR s.container_id=r.name) \
+        ORDER BY r.id LIMIT ? OFFSET ?";
+    let limit = limit.clamp(1, MAX_PAGE_SIZE);
+    let query_limit = limit.checked_add(1).ok_or(Error::BadRow("page limit"))?;
+    let rows = connection.query(
+        candidate_sql,
+        &[
+            Value::Text(workspace.into()),
+            Value::Text(workspace.into()),
+            Value::Text(workspace.into()),
+            Value::Integer(i64::try_from(query_limit).map_err(|_| Error::BadRow("page limit"))?),
+            Value::Integer(i64::try_from(offset).map_err(|_| Error::BadRow("page offset"))?),
+        ],
+        QueryLimits {
+            max_rows: query_limit,
+            max_bytes: 1_048_576,
+        },
+    )?;
+    let more = rows.len() > limit;
+    let candidates = Page {
+        items: rows
+            .into_iter()
+            .take(limit)
+            .map(|row| {
+                Ok(SetupGcCandidate {
+                    id: text(&row, 0)?,
+                    name: text(&row, 1)?,
+                    generation: text(&row, 2)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?,
+        next_offset: more
+            .then(|| {
+                offset
+                    .checked_add(limit)
+                    .ok_or(Error::BadRow("page offset"))
+            })
+            .transpose()?,
+    };
+    let count = |predicate: &str| -> Result<u64, Error> {
+        let sql = format!(
+            "SELECT COUNT(*) FROM resources AS r WHERE r.kind='container' AND r.stack='setup' AND r.workspace=? AND {predicate}"
+        );
+        let row = connection.query(
+            &sql,
+            &[Value::Text(workspace.into())],
+            QueryLimits {
+                max_rows: 1,
+                max_bytes: 1024,
+            },
+        )?;
+        match row.first().and_then(|row| row.get(0)) {
+            Some(Value::Integer(value)) if *value >= 0 => Ok(*value as u64),
+            _ => Err(Error::BadRow("setup gc count")),
+        }
+    };
+    let managed =
+        "r.scope='machine' AND r.id GLOB 'setup-container:*' AND r.name GLOB 'bosn-setup-*'";
+    let counts = SetupGcPreviewCounts {
+        protected_not_retired: count(&format!("{managed} AND r.state<>'retired'"))?,
+        protected_ambiguous_use: count(&format!(
+            "{managed} AND r.state='retired' AND (NOT EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id AND u.workspace=r.workspace AND u.stack='setup' AND u.state='retired') OR EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id AND (u.workspace<>r.workspace OR u.stack<>'setup' OR u.state<>'retired')) )"
+        ))?,
+        protected_lease: count(&format!(
+            "{managed} AND r.state='retired' AND EXISTS (SELECT 1 FROM leases AS l WHERE l.resource_id=r.id)"
+        ))?,
+        protected_session: count(&format!(
+            "{managed} AND r.state='retired' AND EXISTS (SELECT 1 FROM execution_sessions AS s WHERE s.container_id=r.id OR s.container_id=r.name)"
+        ))?,
+        excluded_unmanaged: count(&format!("NOT ({managed})"))?,
+    };
+    Ok(SetupGcPreview { candidates, counts })
 }
 fn text(r: &Row, i: usize) -> Result<String, Error> {
     match r.get(i) {
