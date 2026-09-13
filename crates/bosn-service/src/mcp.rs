@@ -15,8 +15,8 @@
 //! numeric arguments are bounded before they reach the native daemon.
 
 use crate::{
-    Client, Error, JobLogPage, JobStatus, SetupPreparePolicy, SetupPrepareRequest,
-    SetupTaskJobRequest, Status,
+    Client, Error, JobLogPage, JobStatus, SetupEnsureJobRequest, SetupPreparePolicy,
+    SetupPrepareRequest, SetupTaskJobRequest, Status,
 };
 use bosn_setup::{
     SetupAcquirePolicy, SetupPlan, SetupPlanAppSource, SetupPlanRequest, SetupSourceKind,
@@ -100,6 +100,10 @@ trait Backend {
     /// Submit a bounded, semantic setup image-preparation job. The daemon,
     /// rather than the MCP process, owns all Docker interaction.
     fn submit_setup_prepare(&mut self, request: SetupPrepareRequest) -> Result<u64, Error>;
+    /// Submit a bounded, semantic application ensure job. The daemon derives
+    /// every lifecycle detail from the validated setup document and refuses a
+    /// foreign or mismatched candidate rather than replacing it.
+    fn submit_setup_ensure(&mut self, request: SetupEnsureJobRequest) -> Result<u64, Error>;
     /// Submit one complete setup plan, image-preparation, and declared-task
     /// job.  The named task is the only executable selection exposed to MCP;
     /// the daemon derives all task details from the validated setup document.
@@ -135,6 +139,9 @@ impl Backend for DaemonBackend<'_> {
     }
     fn submit_setup_prepare(&mut self, request: SetupPrepareRequest) -> Result<u64, Error> {
         self.runtime.run(self.client.submit_setup_prepare(request))
+    }
+    fn submit_setup_ensure(&mut self, request: SetupEnsureJobRequest) -> Result<u64, Error> {
+        self.runtime.run(self.client.submit_setup_ensure(request))
     }
     fn submit_setup_task(&mut self, request: SetupTaskJobRequest) -> Result<u64, Error> {
         self.runtime.run(self.client.submit_setup_task(request))
@@ -321,6 +328,12 @@ fn tools_list() -> Value {
                 "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}
             },
             {
+                "name": "bosn_setup_ensure",
+                "description": "Submit one bounded daemon-owned setup application ensure job. Returns promptly with a durable job ID; poll the existing job tools for outcome and logs. The daemon may create an absent app or start a matching stopped app, but refuses foreign or mismatched candidates and never deletes or replaces an app.",
+                "inputSchema": setup_ensure_schema(),
+                "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}
+            },
+            {
                 "name": "bosn_setup_task",
                 "description": "Submit one bounded daemon-owned setup plan, image-preparation, and declared-task job. Returns promptly with a durable job ID; poll the existing job tools for outcome and logs. It accepts only a named task declared in the setup document, never task commands or engine controls.",
                 "inputSchema": setup_task_schema(),
@@ -344,6 +357,21 @@ fn setup_plan_schema() -> Value {
 }
 
 fn setup_prepare_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["workspace", "config", "policy", "deadline_ms", "output_limit"],
+        "properties": {
+            "workspace": {"type": "string", "minLength": 1, "maxLength": MAX_MCP_SETUP_STRING_BYTES},
+            "config": {"type": "string", "minLength": 1, "maxLength": MAX_MCP_SETUP_STRING_BYTES, "description": "An explicit local setup path or HTTPS setup URL."},
+            "policy": {"type": "string", "enum": ["refresh", "offline"]},
+            "deadline_ms": {"type": "integer", "minimum": 1, "maximum": 300000},
+            "output_limit": {"type": "integer", "minimum": 1, "maximum": 8388608}
+        }
+    })
+}
+
+fn setup_ensure_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -465,6 +493,18 @@ fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
                 })
                 .map_err(|_| ToolFailure::Daemon)
         }),
+        "bosn_setup_ensure" => setup_ensure_request(arguments).and_then(|request| {
+            backend
+                .submit_setup_ensure(request)
+                .map(|job_id| {
+                    json!({
+                        "action": "setup_ensure",
+                        "submitted": true,
+                        "job_id": job_id,
+                    })
+                })
+                .map_err(|_| ToolFailure::Daemon)
+        }),
         "bosn_setup_task" => setup_task_request(arguments).and_then(|request| {
             backend
                 .submit_setup_task(request)
@@ -568,6 +608,39 @@ fn setup_prepare_request(
         output_limit: required_bounded_u64(arguments, "output_limit", 8 * 1024 * 1024)? as usize,
     };
     Ok(SetupPrepareRequest {
+        workspace: input.workspace,
+        config: input.config,
+        policy: input.policy,
+        deadline: std::time::Duration::from_millis(input.deadline_ms),
+        output_limit: input.output_limit,
+    })
+}
+
+fn setup_ensure_request(
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<SetupEnsureJobRequest, ToolFailure> {
+    only_arguments(
+        arguments,
+        &[
+            "workspace",
+            "config",
+            "policy",
+            "deadline_ms",
+            "output_limit",
+        ],
+    )?;
+    let input = SetupPrepareInput {
+        workspace: PathBuf::from(required_setup_string(arguments, "workspace")?),
+        config: required_setup_string(arguments, "config")?,
+        policy: match required_setup_string(arguments, "policy")?.as_str() {
+            "refresh" => SetupPreparePolicy::Refresh,
+            "offline" => SetupPreparePolicy::Offline,
+            _ => return Err(ToolFailure::Invalid("policy must be refresh or offline")),
+        },
+        deadline_ms: required_bounded_u64(arguments, "deadline_ms", 300_000)?,
+        output_limit: required_bounded_u64(arguments, "output_limit", 8 * 1024 * 1024)? as usize,
+    };
+    Ok(SetupEnsureJobRequest {
         workspace: input.workspace,
         config: input.config,
         policy: input.policy,
@@ -796,9 +869,11 @@ mod tests {
         cancelled: Vec<u64>,
         setup_calls: Vec<(PathBuf, String, SetupAcquirePolicy)>,
         setup_prepare_calls: Vec<SetupPrepareRequest>,
+        setup_ensure_calls: Vec<SetupEnsureJobRequest>,
         setup_task_calls: Vec<SetupTaskJobRequest>,
         daemon_reads: u32,
         setup_prepare_error: bool,
+        setup_ensure_error: bool,
         setup_task_error: bool,
     }
     impl Backend for FakeBackend {
@@ -845,6 +920,15 @@ mod tests {
             }
             self.setup_prepare_calls.push(request);
             Ok(42)
+        }
+        fn submit_setup_ensure(&mut self, request: SetupEnsureJobRequest) -> Result<u64, Error> {
+            if self.setup_ensure_error {
+                return Err(Error::Protocol(
+                    "credential=https://user:secret@example.invalid",
+                ));
+            }
+            self.setup_ensure_calls.push(request);
+            Ok(44)
         }
         fn submit_setup_task(&mut self, request: SetupTaskJobRequest) -> Result<u64, Error> {
             if self.setup_task_error {
@@ -941,6 +1025,7 @@ mod tests {
                 "bosn_job_cancel",
                 "bosn_setup_plan",
                 "bosn_setup_prepare",
+                "bosn_setup_ensure",
                 "bosn_setup_task"
             ]
         );
@@ -960,6 +1045,34 @@ mod tests {
         );
         assert_eq!(
             prepare["inputSchema"]["properties"]["output_limit"]["maximum"],
+            8388608
+        );
+        let ensure = replies[1]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "bosn_setup_ensure")
+            .unwrap();
+        assert_eq!(ensure["annotations"]["readOnlyHint"], false);
+        assert_eq!(ensure["annotations"]["destructiveHint"], false);
+        assert_eq!(ensure["annotations"]["idempotentHint"], false);
+        assert_eq!(ensure["inputSchema"]["additionalProperties"], false);
+        assert_eq!(
+            ensure["inputSchema"]["required"],
+            json!([
+                "workspace",
+                "config",
+                "policy",
+                "deadline_ms",
+                "output_limit"
+            ])
+        );
+        assert_eq!(
+            ensure["inputSchema"]["properties"]["deadline_ms"]["maximum"],
+            300000
+        );
+        assert_eq!(
+            ensure["inputSchema"]["properties"]["output_limit"]["maximum"],
             8388608
         );
         let task = replies[1]["result"]["tools"]
@@ -1163,6 +1276,88 @@ mod tests {
                 r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
                 "\n",
                 r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"bosn_setup_prepare","arguments":{"workspace":"/workspace","config":"/setup.toml","policy":"refresh","deadline_ms":1,"output_limit":1}}}"#,
+                "\n",
+            ),
+            &mut backend,
+        );
+        let content = replies[1]["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(content, "native Bosn daemon request failed");
+        assert!(!content.contains("secret"));
+    }
+
+    #[test]
+    fn setup_ensure_submits_all_immutable_semantic_inputs() {
+        let mut backend = FakeBackend::default();
+        let replies = exchange(
+            concat!(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"bosn_setup_ensure","arguments":{"workspace":"/workspace","config":"https://configs.example/setup.toml","policy":"offline","deadline_ms":1234,"output_limit":7654321}}}"#,
+                "\n",
+            ),
+            &mut backend,
+        );
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[1]["result"]["isError"], false);
+        assert_eq!(
+            replies[1]["result"]["structuredContent"],
+            json!({
+                "action": "setup_ensure", "submitted": true, "job_id": 44,
+            })
+        );
+        assert_eq!(backend.setup_ensure_calls.len(), 1);
+        let request = &backend.setup_ensure_calls[0];
+        assert_eq!(request.workspace, PathBuf::from("/workspace"));
+        assert_eq!(request.config, "https://configs.example/setup.toml");
+        assert_eq!(request.policy, SetupPreparePolicy::Offline);
+        assert_eq!(request.deadline, std::time::Duration::from_millis(1234));
+        assert_eq!(request.output_limit, 7_654_321);
+    }
+
+    #[test]
+    fn setup_ensure_rejects_malformed_extra_or_out_of_range_arguments_without_submission() {
+        let mut backend = FakeBackend::default();
+        let replies = exchange(
+            concat!(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"bosn_setup_ensure","arguments":{"workspace":"/workspace","config":"/setup.toml","policy":"refresh","deadline_ms":1}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"bosn_setup_ensure","arguments":{"workspace":"","config":"/setup.toml","policy":"refresh","deadline_ms":1,"output_limit":1}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"bosn_setup_ensure","arguments":{"workspace":"/workspace","config":"/setup.toml","policy":"other","deadline_ms":1,"output_limit":1}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"bosn_setup_ensure","arguments":{"workspace":"/workspace","config":"/setup.toml","policy":"refresh","deadline_ms":0,"output_limit":1}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"bosn_setup_ensure","arguments":{"workspace":"/workspace","config":"/setup.toml","policy":"refresh","deadline_ms":300001,"output_limit":1}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"bosn_setup_ensure","arguments":{"workspace":"/workspace","config":"/setup.toml","policy":"refresh","deadline_ms":1,"output_limit":8388609}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"bosn_setup_ensure","arguments":{"workspace":"/workspace","config":"/setup.toml","policy":"refresh","deadline_ms":1,"output_limit":1,"container":"attacker-selected"}}}"#,
+                "\n",
+            ),
+            &mut backend,
+        );
+        assert_eq!(replies.len(), 8);
+        assert!(
+            replies[1..]
+                .iter()
+                .all(|reply| reply["result"]["isError"] == true)
+        );
+        assert!(backend.setup_ensure_calls.is_empty());
+    }
+
+    #[test]
+    fn setup_ensure_daemon_errors_are_redacted() {
+        let mut backend = FakeBackend {
+            setup_ensure_error: true,
+            ..Default::default()
+        };
+        let replies = exchange(
+            concat!(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"bosn_setup_ensure","arguments":{"workspace":"/workspace","config":"/setup.toml","policy":"refresh","deadline_ms":1,"output_limit":1}}}"#,
                 "\n",
             ),
             &mut backend,

@@ -154,18 +154,23 @@ mcp_servers:
 
 This initial surface offers `bosn_status`, `bosn_job_status`,
 `bosn_job_logs`, `bosn_job_cancel`, the read-only `bosn_setup_plan`, and
-`bosn_setup_prepare`, and `bosn_setup_task`. The preparation tool accepts only
+`bosn_setup_prepare`, `bosn_setup_ensure`, and `bosn_setup_task`. The
+preparation and ensure tools accept only
 `workspace`, a local-or-HTTPS `config`, `policy` (`refresh` or `offline`), a
 1..=300000 ms deadline, and a 1..=8388608-byte output limit. The task tool has
 the same closed inputs plus a bounded declared `task_name`; it submits the
 daemon-owned plan, image preparation, and that one document-defined task.
-Both promptly return a durable job ID; use the existing status/log/cancel tools
-to observe it. The server never starts a daemon and MCP cannot supply Docker
-arguments, mounts, output paths, state roots, task commands, environments,
-working directories, or arbitrary configuration fields. Job logs are
+All three promptly return a durable job ID; use the existing status/log/cancel
+tools to observe it. Setup ensure may create an absent application or start a
+matching stopped one, but refuses foreign, incomplete, or mismatched candidates.
+It never deletes, replaces, adopts, stops, or garbage-collects an application.
+The server never starts a daemon and MCP cannot supply Docker
+arguments, app commands, image or container names, labels, mounts,
+environments, working directories, task selection, networks, privileges,
+output paths, state roots, or arbitrary configuration fields. Job logs are
 cursor-paginated and limited to 64 records per MCP page. MCP client disconnect
-does not cancel jobs. Container lifecycle, setup-ensure, converge, and run
-remain intentionally absent.
+does not cancel jobs. Registry persistence, reconciliation, adoption,
+replacement, garbage collection, converge, and run remain intentionally absent.
 
 The official Rust MCP SDK currently owns a Tokio runtime and stdio transport.
 Bosn instead uses kernal-api's owned runtime, so the deliberately small adapter
