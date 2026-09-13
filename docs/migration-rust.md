@@ -101,8 +101,12 @@ The installed `bosn` package exposes a deliberately narrow native Python API:
 daemon-backed `Client(state_dir).submit_setup_prepare(workspace, config_locator,
 *, policy, deadline_ms, output_limit)` and
 `Client(state_dir).submit_setup_task(workspace, config_locator, *, policy,
-task_name, deadline_ms, output_limit)`. Both return a durable job ID promptly;
-the latter can select only a declared task by its bounded semantic name.
+task_name, deadline_ms, output_limit)` and
+`Client(state_dir).submit_setup_ensure(workspace, config_locator, *, policy,
+deadline_ms, output_limit)`. All return a durable job ID promptly; the task
+method can select only a declared task by its bounded semantic name, while the
+ensure method can only request the daemon-owned ownership-safe application
+ensure pipeline.
 `job_status(id)`, `job_logs(id, *, after=0, limit=64)`, and `cancel_job(id)`
 are typed IPC-only observation controls. The Python boundary has no Docker
 command, container, mount, environment, work-directory, or task-execution
@@ -186,6 +190,12 @@ delete, adopt, or garbage-collect an existing application. The native command
 never starts a daemon or invokes Docker directly, and exposes no container,
 image, command, mount, label, environment, work-directory, network,
 privilege, task, state-override, or raw engine arguments.
+
+The installed Python extension exposes the same semantic submission through
+`Client(state_dir).submit_setup_ensure(workspace, config_locator, *, policy,
+deadline_ms, output_limit)`. It validates all five inputs before IPC, returns
+only the durable job ID, and has no application, image, command, mount,
+environment, work-directory, label, network, task, or raw engine controls.
 
 Log replies include `retained_from`, `next`, and `gap`, so callers can retain
 their cursor and detect bounded-log eviction. The command surface is limited
