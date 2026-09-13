@@ -119,3 +119,36 @@ covers malformed JSON/FK/schema/marker/sequence failures, live ownership,
 held guard, no-overwrite destination, reconciliation writer refusal, and 1,001
 additional event rows. Native Windows coverage is intentionally deferred until
 a kernel-backed private-ACL fixture setup is available.
+
+## Native MCP stdio surface
+
+`bosn mcp` is the first Hermes-facing native surface. It uses newline-delimited
+JSON-RPC 2.0 on stdout and MCP's `2025-06-18` initialization/tools lifecycle;
+stdout has no launcher diagnostics. The Python console command invokes the
+same Rust function through the shipped PyO3 extension, while native development
+can use `cargo run -p bosn-service --bin bosn -- mcp`.
+
+Configure Hermes with the normal installed command and explicitly forward a
+state root when it differs from Bosn's default:
+
+```yaml
+mcp_servers:
+  bosn:
+    command: bosn
+    args: [mcp]
+    env:
+      BOSN_STATE_DIR: /absolute/path/to/bosn-state
+```
+
+This initial surface offers only `bosn_status`, `bosn_job_status`,
+`bosn_job_logs`, and `bosn_job_cancel`. Calls address the existing
+authenticated Rust daemon; the MCP server never spawns one and never invokes
+a shell. Job logs are cursor-paginated and limited to 64 records per MCP page.
+MCP client disconnect does not cancel jobs. Config setup, converge/run, and
+job submission are intentionally absent until they have genuine Rust daemon
+semantics.
+
+The official Rust MCP SDK currently owns a Tokio runtime and stdio transport.
+Bosn instead uses kernal-api's owned runtime, so the deliberately small adapter
+implements the required external JSON-RPC boundary without adding a second
+runtime. A future kernel-compatible MCP adapter may replace it.
