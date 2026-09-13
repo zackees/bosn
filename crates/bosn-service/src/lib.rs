@@ -1,6 +1,7 @@
 //! Small, authenticated Rust daemon foundation. Product protobuf remains private.
 
 use bosn_registry::{Registry, RegistryStatus};
+use jobs::{Jobs, Submission};
 use kernal_api::{
     async_engine::{self, CancellationSource},
     daemon_frame_v1::{
@@ -53,24 +54,44 @@ impl Client {
         })
     }
     pub async fn ping(&self) -> Result<(), Error> {
-        match self.call(1).await? {
+        match self.call(Request::operation(1)).await? {
             Reply::Pong => Ok(()),
             _ => Err(Error::Protocol("unexpected ping response")),
         }
     }
     pub async fn status(&self) -> Result<Status, Error> {
-        match self.call(2).await? {
+        match self.call(Request::operation(2)).await? {
             Reply::Status(v) => Ok(v),
             _ => Err(Error::Protocol("unexpected status response")),
         }
     }
     pub async fn shutdown(&self) -> Result<(), Error> {
-        match self.call(3).await? {
+        match self.call(Request::operation(3)).await? {
             Reply::Shutdown => Ok(()),
             _ => Err(Error::Protocol("unexpected shutdown response")),
         }
     }
-    async fn call(&self, operation: u32) -> Result<Reply, Error> {
+    pub async fn submit_job(
+        &self,
+        workspace: &str,
+        stack: &str,
+        digest: &str,
+    ) -> Result<u64, Error> {
+        match self
+            .call(Request {
+                protocol_version: PROTOCOL_VERSION,
+                operation: 4,
+                workspace: workspace.into(),
+                stack: stack.into(),
+                digest: digest.into(),
+            })
+            .await?
+        {
+            Reply::Job(id) => Ok(id),
+            _ => Err(Error::Protocol("unexpected submit response")),
+        }
+    }
+    async fn call(&self, request: Request) -> Result<Reply, Error> {
         // Resolve on every call: a Client may have been constructed while a
         // fresh daemon was still creating its registry, before an inode-based
         // alias-stable endpoint name existed.
@@ -81,10 +102,6 @@ impl Client {
         if !peer_is_authorized(&stream.peer_identity()?.user_id, &ipc::current_user_id()?) {
             return Err(Error::Unauthorized);
         }
-        let request = Request {
-            protocol_version: PROTOCOL_VERSION,
-            operation,
-        };
         let mut payload = Vec::new();
         request
             .encode(&mut payload)
@@ -110,6 +127,51 @@ struct RegistryActor {
 enum DbCommand {
     Status(async_engine::OneshotSender<Result<Status, Error>>),
     Stop(async_engine::OneshotSender<()>),
+}
+#[derive(Clone)]
+struct JobActor {
+    sender: async_engine::Sender<JobCommand>,
+}
+enum JobCommand {
+    Submit {
+        workspace: String,
+        stack: String,
+        digest: String,
+        reply: async_engine::OneshotSender<Result<u64, Error>>,
+    },
+}
+impl JobActor {
+    async fn submit(&self, workspace: String, stack: String, digest: String) -> Result<u64, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(JobCommand::Submit {
+                workspace,
+                stack,
+                digest,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
+}
+async fn job_actor(mut jobs: Jobs, mut receiver: async_engine::Receiver<JobCommand>) {
+    while let Some(JobCommand::Submit {
+        workspace,
+        stack,
+        digest,
+        reply,
+    }) = receiver.recv().await
+    {
+        let result = jobs
+            .submit(&workspace, &stack, &digest)
+            .map(|submission| match submission {
+                Submission::Started(id) | Submission::Queued(id) | Submission::Joined(id) => id,
+                Submission::Superseded { replacement, .. } => replacement,
+            })
+            .map_err(|_| Error::Protocol("job admission"));
+        let _ = reply.send(result);
+    }
 }
 impl RegistryActor {
     async fn status(&self) -> Result<Status, Error> {
@@ -188,6 +250,9 @@ impl Service {
         let listener = AsyncListener::bind_owner_only(&ep)?;
         let (sender, receiver) = async_engine::channel(16);
         let actor = RegistryActor { sender };
+        let (job_sender, job_receiver) = async_engine::channel(16);
+        let jobs = JobActor { sender: job_sender };
+        let job_worker = async_engine::launch(job_actor(Jobs::new(1), job_receiver));
         let worker = async_engine::launch(registry_actor(registry, receiver));
         let mut clients = async_engine::TaskGroup::new();
         while !self.stop.is_cancelled() {
@@ -217,12 +282,15 @@ impl Service {
                 continue;
             }
             let actor = actor.clone();
+            let jobs = jobs.clone();
             let stop = self.stop.clone();
-            clients.spawn(async move { handle(stream, actor, stop).await });
+            clients.spawn(async move { handle(stream, actor, jobs, stop).await });
         }
         while clients.join_next().await.is_some() {}
         actor.stop().await;
+        drop(jobs);
         let _ = worker.await;
+        let _ = job_worker.await;
         Ok(())
     }
 }
@@ -313,6 +381,7 @@ fn uuid(bytes: &[u8]) -> String {
 async fn handle(
     mut s: AsyncStream,
     actor: RegistryActor,
+    jobs: JobActor,
     stop: CancellationSource,
 ) -> Result<(), Error> {
     if !peer_is_authorized(&s.peer_identity()?.user_id, &ipc::current_user_id()?) {
@@ -335,6 +404,7 @@ async fn handle(
             leases: 0,
             sessions: 0,
             reconciliation_required: false,
+            job_id: 0,
         }
     } else {
         match r.operation {
@@ -352,6 +422,7 @@ async fn handle(
                     leases: status.leases,
                     sessions: status.sessions,
                     reconciliation_required: status.reconciliation_required,
+                    job_id: 0,
                 }
             }
             3 => {
@@ -361,6 +432,17 @@ async fn handle(
                     ..Default::default()
                 }
             }
+            4 => match jobs.submit(r.workspace, r.stack, r.digest).await {
+                Ok(job_id) => ReplyWire {
+                    code: 40,
+                    job_id,
+                    ..Default::default()
+                },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
             _ => ReplyWire {
                 code: 2,
                 ..Default::default()
@@ -428,6 +510,23 @@ struct Request {
     protocol_version: u32,
     #[prost(uint32, tag = "2")]
     operation: u32,
+    #[prost(string, tag = "3")]
+    workspace: String,
+    #[prost(string, tag = "4")]
+    stack: String,
+    #[prost(string, tag = "5")]
+    digest: String,
+}
+impl Request {
+    fn operation(operation: u32) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            operation,
+            workspace: String::new(),
+            stack: String::new(),
+            digest: String::new(),
+        }
+    }
 }
 #[derive(Message)]
 struct ReplyWire {
@@ -445,11 +544,14 @@ struct ReplyWire {
     sessions: u64,
     #[prost(bool, tag = "7")]
     reconciliation_required: bool,
+    #[prost(uint64, tag = "8")]
+    job_id: u64,
 }
 enum Reply {
     Pong,
     Status(Status),
     Shutdown,
+    Job(u64),
 }
 fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
     match v.code {
@@ -463,6 +565,7 @@ fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
             reconciliation_required: v.reconciliation_required,
         })),
         30 => Ok(Reply::Shutdown),
+        40 => Ok(Reply::Job(v.job_id)),
         1 => Err(Error::Protocol("unsupported protocol")),
         2 => Err(Error::Protocol("unknown operation")),
         _ => Err(Error::Protocol("daemon error")),
@@ -481,8 +584,7 @@ mod tests {
         let runtime = RuntimeBuilder::multi_thread().enable_all().build().unwrap();
         runtime.run(async {
             let first = async_engine::launch(Service::new(state.clone()).serve());
-            async_engine::sleep(Duration::from_millis(100)).await;
-            let client = Client::for_state(&state).unwrap();
+            let client = wait_for_client(&state).await;
             client.ping().await.unwrap();
             let before = client.status().await.unwrap();
             assert_eq!(before.schema_version, 5);
@@ -490,12 +592,36 @@ mod tests {
             client.shutdown().await.unwrap();
             stopped(first).await;
             let second = async_engine::launch(Service::new(state.clone()).serve());
-            async_engine::sleep(Duration::from_millis(100)).await;
-            let after = Client::for_state(&state).unwrap().status().await.unwrap();
+            let after = wait_for_client(&state).await.status().await.unwrap();
             assert_eq!(after.registry_id, before.registry_id);
-            Client::for_state(&state).unwrap().shutdown().await.unwrap();
+            wait_for_client(&state).await.shutdown().await.unwrap();
             stopped(second).await;
         });
+    }
+
+    #[test]
+    fn typed_job_submission_is_authenticated_and_coalesces() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        RuntimeBuilder::multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let server = async_engine::launch(Service::new(state.clone()).serve());
+                let client = wait_for_client(&state).await;
+                let one = client
+                    .submit_job("workspace", "stack", "sha256:abc")
+                    .await
+                    .unwrap();
+                let two = client
+                    .submit_job("workspace", "stack", "sha256:abc")
+                    .await
+                    .unwrap();
+                assert_eq!(one, two);
+                client.shutdown().await.unwrap();
+                stopped(server).await;
+            });
     }
 
     #[test]
@@ -587,6 +713,9 @@ mod tests {
             Request {
                 protocol_version: PROTOCOL_VERSION + 1,
                 operation: 1,
+                workspace: String::new(),
+                stack: String::new(),
+                digest: String::new(),
             }
             .encode(&mut payload)
             .unwrap();

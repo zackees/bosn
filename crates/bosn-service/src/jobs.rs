@@ -108,11 +108,7 @@ impl Jobs {
         }
         let id = self.next;
         self.next += 1;
-        let state = if active.is_some() {
-            JobState::Queued
-        } else {
-            JobState::Queued
-        };
+        let state = JobState::Queued;
         self.jobs.insert(
             id,
             Job {
