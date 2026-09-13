@@ -7,7 +7,7 @@ use bosn_core::{parse_and_plan_compose_yaml, parse_setup_config_locator};
 use bosn_service::{
     Client as ServiceClient, DoctorReport as ServiceDoctorReport, JobLogPage as ServiceJobLogPage,
     JobStatus as ServiceJobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE,
-    RegistryResourcePage as ServiceRegistryResourcePage, SetupAdoptRequest,
+    RegistryResourcePage as ServiceRegistryResourcePage, SetupAdoptRequest, SetupAppTaskJobRequest,
     SetupDoneResult as ServiceSetupDoneResult, SetupEnsureEventPage as ServiceSetupEnsureEventPage,
     SetupEnsureJobRequest, SetupGcApplyResult as ServiceSetupGcApplyResult,
     SetupGcPreviewPage as ServiceSetupGcPreviewPage, SetupPreparePolicy, SetupPrepareRequest,
@@ -345,6 +345,48 @@ impl Client {
             submit_setup_task(
                 &state_dir,
                 SetupTaskJobRequest {
+                    workspace,
+                    config: config_locator,
+                    policy,
+                    task_name,
+                    deadline: Duration::from_millis(deadline_ms),
+                    output_limit: output_limit as usize,
+                },
+            )
+            .map_err(service_error)
+        })
+    }
+
+    /// Submit one named task into the already ensured Bosn setup application.
+    /// The daemon derives and re-verifies the only container target and the
+    /// command from the document; this method exposes no Docker or shell
+    /// controls. Cancellation requests only stop the local exec client, so a
+    /// cancelled job never claims the in-container command was stopped.
+    #[pyo3(signature = (workspace, config_locator, *, policy, task_name, deadline_ms, output_limit))]
+    #[allow(clippy::too_many_arguments)]
+    fn submit_setup_app_task(
+        &self,
+        workspace: PathBuf,
+        config_locator: String,
+        policy: &str,
+        task_name: String,
+        deadline_ms: u64,
+        output_limit: u32,
+        py: Python<'_>,
+    ) -> PyResult<u64> {
+        let policy = parse_prepare_policy(policy)?;
+        validate_setup_task_input(
+            &workspace,
+            &config_locator,
+            &task_name,
+            deadline_ms,
+            output_limit,
+        )?;
+        let state_dir = self.state_dir.clone();
+        py.detach(move || {
+            submit_setup_app_task(
+                &state_dir,
+                SetupAppTaskJobRequest {
                     workspace,
                     config: config_locator,
                     policy,
@@ -1273,6 +1315,21 @@ fn submit_setup_task(
     runtime.run(async {
         ServiceClient::for_state(state_dir)?
             .submit_setup_task(request)
+            .await
+    })
+}
+
+fn submit_setup_app_task(
+    state_dir: &Path,
+    request: SetupAppTaskJobRequest,
+) -> Result<u64, bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async {
+        ServiceClient::for_state(state_dir)?
+            .submit_setup_app_task(request)
             .await
     })
 }

@@ -629,6 +629,7 @@ fn run_setup(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
         Some(command) if command == "plan" => run_setup_plan(arguments),
         Some(command) if command == "prepare" => run_setup_prepare(arguments),
         Some(command) if command == "task" => run_setup_task(arguments),
+        Some(command) if command == "app-task" => run_setup_app_task(arguments),
         Some(command) if command == "ensure" => run_setup_ensure(arguments),
         Some(command) if command == "reconcile" => run_setup_reconcile(arguments),
         Some(command) if command == "adopt" => run_setup_adopt(arguments),
@@ -947,6 +948,45 @@ fn run_setup_task(arguments: impl Iterator<Item = std::ffi::OsString>) {
         );
     } else {
         println!("setup task submitted");
+        println!("job_id: {job_id}");
+    }
+}
+
+/// Submit one declared task for the already ensured setup app. Parsing is
+/// intentionally identical to `setup task`: the extra semantic is selected
+/// only by this verb, never by a caller-controlled container or command flag.
+fn run_setup_app_task(arguments: impl Iterator<Item = std::ffi::OsString>) {
+    let invocation = match parse_task_arguments(arguments) {
+        Ok(invocation) => invocation,
+        Err(()) => usage(),
+    };
+    let request = bosn_service::SetupAppTaskJobRequest {
+        workspace: invocation.request.workspace,
+        config: invocation.request.config,
+        policy: invocation.request.policy,
+        task_name: invocation.request.task_name,
+        deadline: invocation.request.deadline,
+        output_limit: invocation.request.output_limit,
+    };
+    let client = match Client::for_state(&invocation.state_dir) {
+        Ok(client) => client,
+        Err(_) => setup_task_failure(invocation.json),
+    };
+    let runtime = match RuntimeBuilder::current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(_) => setup_task_failure(invocation.json),
+    };
+    let job_id = match runtime.run(client.submit_setup_app_task(request)) {
+        Ok(job_id) => job_id,
+        Err(_) => setup_task_failure(invocation.json),
+    };
+    if invocation.json {
+        println!(
+            "{}",
+            json!({"action": "setup_app_task", "submitted": true, "job_id": job_id})
+        );
+    } else {
+        println!("setup app task submitted");
         println!("job_id: {job_id}");
     }
 }
@@ -1685,6 +1725,9 @@ fn usage() -> ! {
     );
     eprintln!(
         "   or: bosn setup task --state-dir STATE_DIR --workspace WORKSPACE --config LOCATOR (--refresh | --offline) --task NAME --deadline-ms 1..=300000 --output-limit 1..=8388608 [--json]"
+    );
+    eprintln!(
+        "   or: bosn setup app-task --state-dir STATE_DIR --workspace WORKSPACE --config LOCATOR (--refresh | --offline) --task NAME --deadline-ms 1..=300000 --output-limit 1..=8388608 [--json]"
     );
     eprintln!(
         "   or: bosn setup ensure --state-dir STATE_DIR --workspace WORKSPACE --config LOCATOR (--refresh | --offline) --deadline-ms 1..=300000 --output-limit 1..=8388608 [--json]"

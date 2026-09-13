@@ -3,15 +3,16 @@
 use bosn_core::{ResourceKind, ResourceState, Retention, Scope};
 use bosn_engine::{DockerDoctorReport, DockerDoctorState, DockerEngine, EngineEvent, RunOptions};
 use bosn_registry::{
-    Event, Registry, RegistryStatus, Resource, ResourceUse, SetupDone, SetupGcPreview,
+    Event, ExecutionSession, Registry, RegistryStatus, Resource, ResourceUse, SetupDone,
+    SetupGcPreview,
 };
 #[cfg(test)]
 use bosn_setup::PreparedImageKind;
 use bosn_setup::{
-    PreparedImage, SetupAcquirePolicy, SetupEnsureEngine,
+    PreparedImage, SetupAcquirePolicy, SetupAppTaskRequest, SetupEnsureEngine,
     SetupEnsureRequest as CoreSetupEnsureRequest, SetupImageEngine, SetupPlan, SetupPlanRequest,
-    SetupTaskRequest, adopt_setup_app, ensure_setup_app, execute_setup_task, plan_setup,
-    prepare_setup_image,
+    SetupTaskRequest, adopt_setup_app, ensure_setup_app, execute_setup_app_task,
+    execute_setup_task, plan_setup, prepare_setup_image,
 };
 use jobs::{Jobs, Submission};
 use kernal_api::{
@@ -109,6 +110,20 @@ pub struct SetupTaskJobRequest {
     pub output_limit: usize,
 }
 
+/// Immutable inputs for running a named task in an already ensured setup app.
+/// This is intentionally distinct from [`SetupTaskJobRequest`]: it never
+/// creates an ephemeral `docker run` task container. The daemon re-plans and
+/// proves exact ownership of the content-addressed app before one fixed exec.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupAppTaskJobRequest {
+    pub workspace: PathBuf,
+    pub config: String,
+    pub policy: SetupPreparePolicy,
+    pub task_name: String,
+    pub deadline: Duration,
+    pub output_limit: usize,
+}
+
 /// All immutable caller inputs for one daemon-owned setup application ensure.
 /// The application name, image, command, mounts, labels, environment, and
 /// engine options are all derived from the validated setup document and its
@@ -161,6 +176,33 @@ pub trait SetupTaskExecutor: Send + Sync {
         cancellation: &'a async_engine::CancellationToken,
         logs: &'a async_engine::Sender<String>,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
+}
+
+/// Test seam for one declared task inside an already ensured setup app. It
+/// receives only semantic request fields; it has no container ID, command, or
+/// Docker argv control surface.
+pub trait SetupAppTaskExecutor: Send + Sync {
+    fn execute<'a>(
+        &'a self,
+        request: SetupAppTaskJobRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a async_engine::Sender<String>,
+        session: &'a dyn SetupAppTaskSessionRecorder,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
+}
+
+/// Daemon-owned durable ownership evidence for a live setup-app task. The
+/// executor cannot open SQLite itself; it must bracket the fixed exec through
+/// this actor-owned recorder. A recorder failure fails closed before exec.
+pub trait SetupAppTaskSessionRecorder: Send + Sync {
+    fn begin<'a>(
+        &'a self,
+        container_id: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+    fn finish<'a>(
+        &'a self,
+        outcome: &'static str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 }
 
 /// Testable daemon boundary for the complete plan, image-prepare, and
@@ -836,6 +878,211 @@ impl SetupTaskExecutor for DockerSetupTaskExecutor {
                 "completed declared task {} with image {}",
                 result.task_name, result.image_identity
             ))
+        })
+    }
+}
+
+/// Docker-backed implementation for one declared task in the persistent setup
+/// app. The app is never created, started, stopped, or replaced here: a fresh
+/// ownership inspection must prove the exact content-addressed app already
+/// exists before the fixed `docker container exec NAME sh -lc DECLARED` call.
+#[derive(Clone)]
+pub struct DockerSetupAppTaskExecutor {
+    state_dir: PathBuf,
+    engine: DockerEngine,
+}
+impl DockerSetupAppTaskExecutor {
+    fn new(state_dir: PathBuf) -> Self {
+        Self {
+            state_dir,
+            engine: DockerEngine::docker(),
+        }
+    }
+}
+impl SetupAppTaskExecutor for DockerSetupAppTaskExecutor {
+    fn execute<'a>(
+        &'a self,
+        request: SetupAppTaskJobRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a async_engine::Sender<String>,
+        session: &'a dyn SetupAppTaskSessionRecorder,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async move {
+            // Plan/prepare/ownership-inspect/exec share one caller budget.
+            // Four positive partitions make it impossible for a noisy early
+            // stage to leave the final exec with an unbounded output channel.
+            let quarter = request.output_limit / 4;
+            let exec_output = request.output_limit.saturating_sub(quarter * 3);
+            if quarter == 0 || exec_output == 0 {
+                return Err(
+                    "setup app task output budget cannot fund validation and execution".into(),
+                );
+            }
+            let deadline = async_engine::Deadline::after(request.deadline);
+            let plan = async_engine::cancellable(
+                cancellation,
+                async_engine::timeout_at(
+                    deadline,
+                    plan_setup(SetupPlanRequest {
+                        state_dir: self.state_dir.clone(),
+                        workspace: request.workspace.clone(),
+                        locator: request.config,
+                        policy: request.policy.acquire_policy(),
+                    }),
+                ),
+            )
+            .await
+            .map_err(|_| "setup app task cancelled before ownership inspection".to_owned())?
+            .map_err(|_| "setup app task planning exceeded its deadline".to_owned())?
+            .map_err(|error| error.to_string())?;
+            if cancellation.is_cancelled() {
+                return Err("setup app task cancelled before ownership inspection".into());
+            }
+            let remaining = deadline.remaining();
+            if remaining.is_zero() {
+                return Err("setup app task exceeded its deadline".into());
+            }
+            let (events, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
+            let forwarded_logs = logs.clone();
+            let forwarder = async_engine::launch(async move {
+                while let Some(event) = receiver.recv().await {
+                    forward_engine_event(&forwarded_logs, event).await?;
+                }
+                Ok::<(), String>(())
+            });
+            logs.send("[setup-app-task] verifying application image".into())
+                .await
+                .map_err(|_| "setup app task log consumer closed".to_owned())?;
+            let prepared = prepare_setup_image(
+                &self.engine,
+                &plan,
+                RunOptions::streaming(remaining, quarter),
+                cancellation,
+                &events,
+            )
+            .await;
+            let prepared = match prepared {
+                Ok(value) => value,
+                Err(error) => {
+                    drop(events);
+                    forwarder
+                        .await
+                        .map_err(|_| "setup app task log forwarder stopped".to_owned())??;
+                    return Err(error.to_string());
+                }
+            };
+            let remaining = deadline.remaining();
+            if cancellation.is_cancelled() || remaining.is_zero() {
+                drop(events);
+                forwarder
+                    .await
+                    .map_err(|_| "setup app task log forwarder stopped".to_owned())??;
+                return Err("setup app task ended before ownership inspection".into());
+            }
+            logs.send("[setup-app-task] proving exact managed application ownership".into())
+                .await
+                .map_err(|_| "setup app task log consumer closed".to_owned())?;
+            let observed = adopt_setup_app(
+                &self.engine,
+                CoreSetupEnsureRequest {
+                    plan: &plan,
+                    workspace_root: request.workspace.clone(),
+                    prepared_image: &prepared,
+                    options: RunOptions::streaming(remaining, quarter),
+                    cancellation,
+                    events: &events,
+                },
+            )
+            .await;
+            let observed = match observed {
+                Ok(value) => value,
+                Err(error) => {
+                    drop(events);
+                    forwarder
+                        .await
+                        .map_err(|_| "setup app task log forwarder stopped".to_owned())??;
+                    return Err(error.to_string());
+                }
+            };
+            if !observed.running {
+                drop(events);
+                forwarder
+                    .await
+                    .map_err(|_| "setup app task log forwarder stopped".to_owned())??;
+                return Err(
+                    "setup app task requires the exact managed application to be running".into(),
+                );
+            }
+            if cancellation.is_cancelled() {
+                drop(events);
+                forwarder
+                    .await
+                    .map_err(|_| "setup app task log forwarder stopped".to_owned())??;
+                return Err(
+                    "setup app task cancelled before exec; remote command was not started".into(),
+                );
+            }
+            let remaining = deadline.remaining();
+            if remaining.is_zero() {
+                drop(events);
+                forwarder
+                    .await
+                    .map_err(|_| "setup app task log forwarder stopped".to_owned())??;
+                return Err("setup app task exceeded its deadline before exec".into());
+            }
+            logs.send(format!(
+                "[setup-app-task] running declared task {}",
+                request.task_name
+            ))
+            .await
+            .map_err(|_| "setup app task log consumer closed".to_owned())?;
+            session
+                .begin(observed.container_id.clone())
+                .await
+                .map_err(|_| "setup app task ownership recording unavailable".to_owned())?;
+            let result = execute_setup_app_task(
+                &self.engine,
+                SetupAppTaskRequest {
+                    plan: &plan,
+                    workspace_root: request.workspace,
+                    task_name: request.task_name,
+                    prepared_image: &prepared,
+                    options: RunOptions::streaming(remaining, exec_output),
+                    cancellation,
+                    events: &events,
+                },
+            )
+            .await;
+            drop(events);
+            // A normal nonzero exit is a known terminal outcome. Conversely,
+            // a killed/timed-out direct Docker client cannot establish that
+            // its in-container process stopped, so that row must survive for
+            // restart recovery and conservative GC protection.
+            let outcome = match &result {
+                Ok(_) => "succeeded",
+                Err(bosn_setup::SetupTaskError::TaskFailed { .. }) => "failed",
+                Err(_) => "uncertain",
+            };
+            let finished = session.finish(outcome).await;
+            forwarder
+                .await
+                .map_err(|_| "setup app task log forwarder stopped".to_owned())??;
+            if finished.is_err() {
+                return Err("setup app task completion recording unavailable".into());
+            }
+            match result {
+                Ok(result) => Ok(format!(
+                    "completed declared app task {} in managed container {} with image {}",
+                    result.task_name, observed.container_name, result.image_identity
+                )),
+                // `docker exec` cancellation kills the local client only. Do
+                // not report that this stopped the command in the app.
+                Err(bosn_setup::SetupTaskError::Cancelled)
+                | Err(bosn_setup::SetupTaskError::Deadline) => Err(
+                    "setup app task exec client ended; remote command completion is unknown".into(),
+                ),
+                Err(error) => Err(error.to_string()),
+            }
         })
     }
 }
@@ -1901,6 +2148,45 @@ impl Client {
             _ => Err(Error::Protocol("unexpected setup task response")),
         }
     }
+    /// Submit one task declared by a setup document for execution inside its
+    /// already ensured, ownership-verified application container.
+    pub async fn submit_setup_app_task(
+        &self,
+        request: SetupAppTaskJobRequest,
+    ) -> Result<u64, Error> {
+        let workspace = request
+            .workspace
+            .to_str()
+            .ok_or(Error::Protocol("setup workspace is not UTF-8"))?
+            .to_owned();
+        let deadline_ms = u64::try_from(request.deadline.as_millis())
+            .map_err(|_| Error::Protocol("setup deadline too large"))?;
+        let output_limit = u32::try_from(request.output_limit)
+            .map_err(|_| Error::Protocol("setup output limit too large"))?;
+        validate_setup_task_wire(
+            &workspace,
+            &request.config,
+            request.policy,
+            &request.task_name,
+            deadline_ms,
+            output_limit,
+        )?;
+        match self
+            .call(Request {
+                workspace,
+                setup_config: request.config,
+                setup_policy: request.policy.wire(),
+                setup_task_name: request.task_name,
+                setup_deadline_ms: deadline_ms,
+                setup_output_limit: output_limit,
+                ..Request::operation(21)
+            })
+            .await?
+        {
+            Reply::Job(id) => Ok(id),
+            _ => Err(Error::Protocol("unexpected setup app task response")),
+        }
+    }
     /// Submit one daemon-owned plan, image-prepare, and ownership-safe
     /// application ensure job. The returned ID can only be observed with the
     /// existing bounded status/log/cancel APIs.
@@ -1966,6 +2252,7 @@ pub struct Service {
     stop: CancellationSource,
     setup_executor: Arc<dyn SetupPrepareExecutor>,
     setup_task_executor: Arc<dyn SetupTaskExecutor>,
+    setup_app_task_executor: Arc<dyn SetupAppTaskExecutor>,
     setup_ensure_executor: Arc<dyn SetupEnsureExecutor>,
     setup_adopt_executor: Arc<dyn SetupAdoptExecutor>,
     doctor_executor: Arc<dyn DoctorExecutor>,
@@ -2060,6 +2347,16 @@ enum DbCommand {
         execution: Box<SetupEnsureExecution>,
         reply: async_engine::OneshotSender<Result<(), Error>>,
     },
+    BeginSetupAppTaskSession {
+        job_id: u64,
+        container_id: String,
+        reply: async_engine::OneshotSender<Result<(), Error>>,
+    },
+    FinishSetupAppTaskSession {
+        job_id: u64,
+        outcome: &'static str,
+        reply: async_engine::OneshotSender<Result<(), Error>>,
+    },
     Stop(async_engine::OneshotSender<()>),
 }
 #[derive(Clone)]
@@ -2095,6 +2392,10 @@ enum JobCommand {
         request: SetupTaskJobRequest,
         reply: async_engine::OneshotSender<Result<u64, Error>>,
     },
+    SubmitSetupAppTask {
+        request: SetupAppTaskJobRequest,
+        reply: async_engine::OneshotSender<Result<u64, Error>>,
+    },
     SubmitSetupEnsure {
         request: SetupEnsureJobRequest,
         reply: async_engine::OneshotSender<Result<u64, Error>>,
@@ -2124,6 +2425,7 @@ enum JobCommand {
 enum SetupJobKind {
     Prepare,
     Task,
+    AppTask,
     Ensure,
 }
 
@@ -2188,6 +2490,7 @@ fn config_locator_kind(config: &str) -> &'static str {
 enum SetupJobRequest {
     Prepare(SetupPrepareRequest),
     Task(SetupTaskJobRequest),
+    AppTask(SetupAppTaskJobRequest),
     Ensure(SetupEnsureJobRequest),
 }
 
@@ -2195,6 +2498,7 @@ enum SetupJobRequest {
 struct SetupExecutors {
     prepare: Arc<dyn SetupPrepareExecutor>,
     task: Arc<dyn SetupTaskExecutor>,
+    app_task: Arc<dyn SetupAppTaskExecutor>,
     ensure: Arc<dyn SetupEnsureExecutor>,
 }
 impl JobActor {
@@ -2252,6 +2556,14 @@ impl JobActor {
         let (reply, wait) = async_engine::oneshot_channel();
         self.sender
             .send(JobCommand::SubmitSetupTask { request, reply })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
+    async fn submit_setup_app_task(&self, request: SetupAppTaskJobRequest) -> Result<u64, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(JobCommand::SubmitSetupAppTask { request, reply })
             .await
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
@@ -2367,6 +2679,7 @@ async fn job_actor(
                     &mut tasks,
                     &executors,
                     sender.clone(),
+                    registry.clone(),
                 );
             }
             JobCommand::SubmitSetupTask { request, reply } => {
@@ -2394,6 +2707,35 @@ async fn job_actor(
                     &mut tasks,
                     &executors,
                     sender.clone(),
+                    registry.clone(),
+                );
+            }
+            JobCommand::SubmitSetupAppTask { request, reply } => {
+                let digest = setup_app_task_digest(&request);
+                let workspace = request.workspace.to_string_lossy().into_owned();
+                let result = jobs
+                    .submit(&workspace, "setup-app-task", &digest)
+                    .map(|submission| match submission {
+                        Submission::Started(id) | Submission::Queued(id) => {
+                            requests.insert(id, SetupJobRequest::AppTask(request));
+                            id
+                        }
+                        Submission::Joined(id) => id,
+                        Submission::Superseded { replacement, .. } => {
+                            requests.insert(replacement, SetupJobRequest::AppTask(request));
+                            replacement
+                        }
+                    })
+                    .map_err(|_| Error::Protocol("setup app task job admission"));
+                let _ = reply.send(result);
+                launch_started_setup_jobs(
+                    &mut jobs,
+                    &mut requests,
+                    &mut cancellations,
+                    &mut tasks,
+                    &executors,
+                    sender.clone(),
+                    registry.clone(),
                 );
             }
             JobCommand::SubmitSetupEnsure { request, reply } => {
@@ -2464,6 +2806,7 @@ async fn job_actor(
                     &mut tasks,
                     &executors,
                     sender.clone(),
+                    registry.clone(),
                 );
             }
             JobCommand::PersistSetupEnsure {
@@ -2541,6 +2884,7 @@ async fn job_actor(
                         let operation = match kind {
                             SetupJobKind::Prepare => "setup prepare",
                             SetupJobKind::Task => "setup task",
+                            SetupJobKind::AppTask => "setup app task",
                             SetupJobKind::Ensure => "setup ensure",
                         };
                         let _ = jobs.log(id, format!("{operation} failed: {error}"));
@@ -2593,6 +2937,7 @@ async fn job_actor(
                 &mut tasks,
                 &executors,
                 sender.clone(),
+                registry.clone(),
             );
         }
         if stopping.is_some() && cancellations.is_empty() {
@@ -2612,6 +2957,7 @@ fn launch_started_setup_jobs(
     tasks: &mut async_engine::TaskGroup<()>,
     executors: &SetupExecutors,
     sender: async_engine::Sender<JobCommand>,
+    registry: RegistryActor,
 ) {
     for id in jobs.take_started() {
         // Legacy generic jobs have no daemon executor.  Only the new semantic
@@ -2624,8 +2970,13 @@ fn launch_started_setup_jobs(
         let token = cancellation.token();
         cancellations.insert(id, cancellation);
         let task_sender = sender.clone();
+        let session_recorder = ActorSetupAppTaskSessionRecorder {
+            actor: registry.clone(),
+            job_id: id,
+        };
         let prepare_executor = Arc::clone(&executors.prepare);
         let task_executor = Arc::clone(&executors.task);
+        let app_task_executor = Arc::clone(&executors.app_task);
         let ensure_executor = Arc::clone(&executors.ensure);
         tasks.spawn(async move {
             let (logs, mut log_receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
@@ -2645,6 +2996,12 @@ fn launch_started_setup_jobs(
                 SetupJobRequest::Task(request) => Some((
                     SetupJobKind::Task,
                     task_executor.execute(request, &token, &logs).await,
+                )),
+                SetupJobRequest::AppTask(request) => Some((
+                    SetupJobKind::AppTask,
+                    app_task_executor
+                        .execute(request, &token, &logs, &session_recorder)
+                        .await,
                 )),
                 SetupJobRequest::Ensure(request) => {
                     let result = ensure_executor.execute(request, &token, &logs).await;
@@ -2683,6 +3040,37 @@ fn launch_started_setup_jobs(
                     .await;
             }
         });
+    }
+}
+
+#[derive(Clone)]
+struct ActorSetupAppTaskSessionRecorder {
+    actor: RegistryActor,
+    job_id: u64,
+}
+
+impl SetupAppTaskSessionRecorder for ActorSetupAppTaskSessionRecorder {
+    fn begin<'a>(
+        &'a self,
+        container_id: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.actor
+                .begin_setup_app_task_session(self.job_id, container_id)
+                .await
+                .map_err(|_| "registry session start failed".into())
+        })
+    }
+    fn finish<'a>(
+        &'a self,
+        outcome: &'static str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.actor
+                .finish_setup_app_task_session(self.job_id, outcome)
+                .await
+                .map_err(|_| "registry session finish failed".into())
+        })
     }
 }
 
@@ -2746,6 +3134,30 @@ fn setup_task_digest(request: &SetupTaskJobRequest) -> String {
     )
 }
 
+fn setup_app_task_digest(request: &SetupAppTaskJobRequest) -> String {
+    let mut material = Vec::new();
+    let workspace = request.workspace.to_string_lossy();
+    let policy = request.policy.wire().to_le_bytes();
+    let deadline = request.deadline.as_millis().to_le_bytes();
+    let output_limit = (request.output_limit as u64).to_le_bytes();
+    for part in [
+        b"bosn.setup-app-task.v1".as_slice(),
+        workspace.as_bytes(),
+        request.config.as_bytes(),
+        &policy,
+        request.task_name.as_bytes(),
+        &deadline,
+        &output_limit,
+    ] {
+        material.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        material.extend_from_slice(part);
+    }
+    format!(
+        "setup:{}",
+        kernal_api::hash::blake3_bytes(&material).to_hex()
+    )
+}
+
 fn setup_ensure_digest(request: &SetupEnsureJobRequest) -> String {
     let mut material = Vec::new();
     let workspace = request.workspace.to_string_lossy();
@@ -2769,6 +3181,38 @@ fn setup_ensure_digest(request: &SetupEnsureJobRequest) -> String {
     )
 }
 impl RegistryActor {
+    async fn begin_setup_app_task_session(
+        &self,
+        job_id: u64,
+        container_id: String,
+    ) -> Result<(), Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::BeginSetupAppTaskSession {
+                job_id,
+                container_id,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
+    async fn finish_setup_app_task_session(
+        &self,
+        job_id: u64,
+        outcome: &'static str,
+    ) -> Result<(), Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::FinishSetupAppTaskSession {
+                job_id,
+                outcome,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
     async fn status(&self) -> Result<Status, Error> {
         let (reply, wait) = async_engine::oneshot_channel();
         self.sender
@@ -3451,12 +3895,100 @@ async fn registry_actor(
                     }
                 }
             }
+            DbCommand::BeginSetupAppTaskSession {
+                job_id,
+                container_id,
+                reply,
+            } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result =
+                        record_setup_app_task_session(&mut registry, job_id, &container_id);
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
+            DbCommand::FinishSetupAppTaskSession {
+                job_id,
+                outcome,
+                reply,
+            } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = finish_setup_app_task_session(&mut registry, job_id, outcome);
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
             DbCommand::Stop(reply) => {
                 let _ = reply.send(());
                 return;
             }
         }
     }
+}
+
+fn setup_app_task_session_id(job_id: u64) -> String {
+    format!("setup-app-task:{job_id}")
+}
+
+fn record_setup_app_task_session(
+    registry: &mut Registry,
+    job_id: u64,
+    container_id: &str,
+) -> Result<(), bosn_registry::Error> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
+        .as_secs_f64();
+    let mut transaction = registry.begin_immediate()?;
+    transaction.put_execution_session(&ExecutionSession {
+        id: setup_app_task_session_id(job_id),
+        container_id: container_id.into(),
+        engine_binary: "docker".into(),
+        client_pid: std::process::id(),
+        client_start: None,
+        lease_ids: Vec::new(),
+    })?;
+    transaction.append_event(now, "setup.app-task.started", "owned_declared_task")?;
+    transaction.commit()
+}
+
+fn finish_setup_app_task_session(
+    registry: &mut Registry,
+    job_id: u64,
+    outcome: &str,
+) -> Result<(), bosn_registry::Error> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
+        .as_secs_f64();
+    let mut transaction = registry.begin_immediate()?;
+    if outcome == "uncertain" {
+        // Do not remove the session: cancelling/timing out the local Docker
+        // client does not prove the remote `exec` process ended.
+        transaction.append_event(now, "setup.app-task.uncertain", "remote_completion_unknown")?;
+    } else {
+        transaction.delete_execution_session(&setup_app_task_session_id(job_id))?;
+        transaction.append_event(now, "setup.app-task.finished", outcome)?;
+    }
+    transaction.commit()
 }
 
 fn record_setup_ensure(
@@ -3646,6 +4178,7 @@ impl Service {
         Self {
             setup_executor: Arc::new(DockerSetupPrepareExecutor::new(state_dir.clone())),
             setup_task_executor: Arc::new(DockerSetupTaskExecutor::new(state_dir.clone())),
+            setup_app_task_executor: Arc::new(DockerSetupAppTaskExecutor::new(state_dir.clone())),
             setup_ensure_executor: Arc::new(DockerSetupEnsureExecutor::new(state_dir.clone())),
             setup_adopt_executor: Arc::new(DockerSetupAdoptExecutor::new(state_dir.clone())),
             doctor_executor: Arc::new(DockerDoctorExecutor::new()),
@@ -3664,6 +4197,13 @@ impl Service {
     /// integration-test seam; it cannot add arbitrary Docker controls.
     pub fn with_setup_task_executor(mut self, executor: Arc<dyn SetupTaskExecutor>) -> Self {
         self.setup_task_executor = executor;
+        self
+    }
+    /// Substitute only the complete semantic setup-app-task executor. This is
+    /// a test seam; it cannot add Docker argv, a container target, or a task
+    /// command to the caller-facing request.
+    pub fn with_setup_app_task_executor(mut self, executor: Arc<dyn SetupAppTaskExecutor>) -> Self {
+        self.setup_app_task_executor = executor;
         self
     }
     /// Substitute only the complete semantic setup-ensure executor. This is a
@@ -3727,6 +4267,7 @@ impl Service {
             SetupExecutors {
                 prepare: Arc::clone(&self.setup_executor),
                 task: Arc::clone(&self.setup_task_executor),
+                app_task: Arc::clone(&self.setup_app_task_executor),
                 ensure: Arc::clone(&self.setup_ensure_executor),
             },
             job_sender.clone(),
@@ -4337,6 +4878,45 @@ async fn handle(
                 });
                 match request {
                     Some(request) => match jobs.submit_setup_ensure(request).await {
+                        Ok(job_id) => ReplyWire {
+                            code: 40,
+                            job_id,
+                            ..Default::default()
+                        },
+                        Err(_) => ReplyWire {
+                            code: 3,
+                            ..Default::default()
+                        },
+                    },
+                    None => ReplyWire {
+                        code: 3,
+                        ..Default::default()
+                    },
+                }
+            }
+            21 => {
+                let policy = SetupPreparePolicy::from_wire(r.setup_policy);
+                let request = policy.and_then(|policy| {
+                    validate_setup_task_wire(
+                        &r.workspace,
+                        &r.setup_config,
+                        policy,
+                        &r.setup_task_name,
+                        r.setup_deadline_ms,
+                        r.setup_output_limit,
+                    )
+                    .ok()
+                    .map(|()| SetupAppTaskJobRequest {
+                        workspace: PathBuf::from(r.workspace),
+                        config: r.setup_config,
+                        policy,
+                        task_name: r.setup_task_name,
+                        deadline: Duration::from_millis(r.setup_deadline_ms),
+                        output_limit: r.setup_output_limit as usize,
+                    })
+                });
+                match request {
+                    Some(request) => match jobs.submit_setup_app_task(request).await {
                         Ok(job_id) => ReplyWire {
                             code: 40,
                             job_id,
@@ -5702,6 +6282,42 @@ mod tests {
         }
     }
 
+    struct FakeSetupAppTaskExecutor {
+        started: AtomicUsize,
+        observed: Mutex<Vec<String>>,
+    }
+    impl FakeSetupAppTaskExecutor {
+        fn new() -> Self {
+            Self {
+                started: AtomicUsize::new(0),
+                observed: Mutex::new(Vec::new()),
+            }
+        }
+    }
+    impl SetupAppTaskExecutor for FakeSetupAppTaskExecutor {
+        fn execute<'a>(
+            &'a self,
+            request: SetupAppTaskJobRequest,
+            _cancellation: &'a async_engine::CancellationToken,
+            logs: &'a async_engine::Sender<String>,
+            session: &'a dyn SetupAppTaskSessionRecorder,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.started.fetch_add(1, Ordering::SeqCst);
+                self.observed
+                    .lock()
+                    .unwrap()
+                    .push(request.task_name.clone());
+                session.begin("owned-container-id".into()).await?;
+                logs.send("[fake] declared app task executed".into())
+                    .await
+                    .map_err(|_| "fake log consumer closed".to_owned())?;
+                session.finish("succeeded").await?;
+                Ok("fake app task complete".into())
+            })
+        }
+    }
+
     struct FakeSetupEnsureExecutor {
         started: AtomicUsize,
         cancelled: AtomicUsize,
@@ -6094,6 +6710,107 @@ mod tests {
                 client.shutdown().await.unwrap();
                 stopped(server).await;
             });
+    }
+
+    #[test]
+    fn setup_app_task_is_prompt_typed_and_clears_its_durable_session() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let fake = Arc::new(FakeSetupAppTaskExecutor::new());
+        RuntimeBuilder::multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let server = async_engine::launch(
+                    Service::new(state.clone())
+                        .with_setup_app_task_executor(fake.clone())
+                        .serve(),
+                );
+                let client = wait_for_client(&state).await;
+                let request = SetupAppTaskJobRequest {
+                    workspace,
+                    config: "https://example.invalid/setup.toml".into(),
+                    policy: SetupPreparePolicy::Refresh,
+                    task_name: "check".into(),
+                    deadline: Duration::from_secs(2),
+                    output_limit: 4096,
+                };
+                let submitted = std::time::Instant::now();
+                let first = client.submit_setup_app_task(request.clone()).await.unwrap();
+                assert!(submitted.elapsed() < Duration::from_millis(250));
+                assert_eq!(
+                    first,
+                    client.submit_setup_app_task(request).await.unwrap(),
+                    "identical semantic app-task requests coalesce"
+                );
+                wait_for_job_state(&client, first, "Succeeded").await;
+                assert_eq!(fake.started.load(Ordering::SeqCst), 1);
+                assert_eq!(*fake.observed.lock().unwrap(), vec!["check"]);
+                assert_eq!(client.status().await.unwrap().sessions, 0);
+                let logs = client.job_logs(first, 0, 8).await.unwrap();
+                assert!(
+                    logs.records
+                        .iter()
+                        .any(|record| record.line.contains("declared app task"))
+                );
+                client.shutdown().await.unwrap();
+                stopped(server).await;
+            });
+    }
+
+    #[test]
+    fn uncertain_app_task_completion_keeps_session_and_protects_gc_until_known_terminal() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let database = state.join("registry.sqlite3");
+        let mut registry =
+            Registry::create_writer(&database, "11111111-2222-4333-8444-555555555555").unwrap();
+        let mut transaction = registry.begin_immediate().unwrap();
+        let resource_id = "setup-container:uncertain";
+        let container_name = "bosn-setup-uncertain";
+        transaction
+            .put_resource(&Resource {
+                id: resource_id.into(),
+                kind: ResourceKind::Container,
+                name: container_name.into(),
+                stack: "setup".into(),
+                generation: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                scope: Scope::Machine,
+                workspace: "/workspace".into(),
+                created_at: 1.0,
+                last_used: 1.0,
+                state: ResourceState::Retired,
+                retention: Retention::Pinned,
+            })
+            .unwrap();
+        transaction
+            .put_resource_use(&ResourceUse {
+                resource_id: resource_id.into(),
+                workspace: "/workspace".into(),
+                stack: "setup".into(),
+                generation: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                last_used: 1.0,
+                state: ResourceState::Retired,
+            })
+            .unwrap();
+        transaction.commit().unwrap();
+
+        record_setup_app_task_session(&mut registry, 7, container_name).unwrap();
+        finish_setup_app_task_session(&mut registry, 7, "uncertain").unwrap();
+        assert_eq!(registry.status().unwrap().sessions, 1);
+        let protected = registry.setup_gc_preview("/workspace", 0, 16).unwrap();
+        assert!(protected.candidates.items.is_empty());
+        assert_eq!(protected.counts.protected_session, 1);
+
+        finish_setup_app_task_session(&mut registry, 7, "failed").unwrap();
+        assert_eq!(registry.status().unwrap().sessions, 0);
+        let eligible = registry.setup_gc_preview("/workspace", 0, 16).unwrap();
+        assert_eq!(eligible.candidates.items.len(), 1);
+        assert_eq!(eligible.candidates.items[0].id, resource_id);
     }
 
     #[test]
@@ -7202,6 +7919,7 @@ mod tests {
                     SetupExecutors {
                         prepare: Arc::new(SlowFakeSetupExecutor::new()),
                         task: Arc::new(FakeSetupTaskExecutor::new()),
+                        app_task: Arc::new(FakeSetupAppTaskExecutor::new()),
                         ensure: fake,
                     },
                     job_sender.clone(),

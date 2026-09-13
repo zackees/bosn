@@ -64,6 +64,35 @@ pub enum SetupTaskCommand {
     },
 }
 
+/// The only engine command used for a declared task inside the already
+/// ensured setup application.  The target name is content-addressed from the
+/// validated plan; callers cannot choose a container ID or Docker arguments.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SetupAppTaskCommand {
+    Exec {
+        container_name: String,
+        command: String,
+    },
+}
+
+impl SetupAppTaskCommand {
+    fn docker_args(&self) -> Vec<String> {
+        match self {
+            Self::Exec {
+                container_name,
+                command,
+            } => vec![
+                "container".into(),
+                "exec".into(),
+                container_name.clone(),
+                "sh".into(),
+                "-lc".into(),
+                command.clone(),
+            ],
+        }
+    }
+}
+
 impl SetupTaskCommand {
     fn docker_args(&self) -> Vec<String> {
         match self {
@@ -125,6 +154,23 @@ pub trait SetupTaskEngine {
     ) -> Self::StreamFuture<'a>;
 }
 
+/// Testable engine boundary for one declared task in the setup app.  This
+/// operation intentionally has no inspection or lifecycle command: callers
+/// must prove exact app ownership with `adopt_setup_app` before reaching it.
+pub trait SetupAppTaskEngine {
+    type StreamFuture<'a>: Future<Output = Result<CommandResult, CommandError>> + Send + 'a
+    where
+        Self: 'a;
+
+    fn stream<'a>(
+        &'a self,
+        command: SetupAppTaskCommand,
+        options: RunOptions,
+        cancellation: &'a CancellationToken,
+        events: &'a Sender<EngineEvent>,
+    ) -> Self::StreamFuture<'a>;
+}
+
 impl SetupTaskEngine for DockerEngine {
     type StreamFuture<'a> =
         Pin<Box<dyn Future<Output = Result<CommandResult, CommandError>> + Send + 'a>>;
@@ -141,12 +187,42 @@ impl SetupTaskEngine for DockerEngine {
     }
 }
 
+impl SetupAppTaskEngine for DockerEngine {
+    type StreamFuture<'a> =
+        Pin<Box<dyn Future<Output = Result<CommandResult, CommandError>> + Send + 'a>>;
+
+    fn stream<'a>(
+        &'a self,
+        command: SetupAppTaskCommand,
+        options: RunOptions,
+        cancellation: &'a CancellationToken,
+        events: &'a Sender<EngineEvent>,
+    ) -> Self::StreamFuture<'a> {
+        let engine = self.with_args(command.docker_args());
+        Box::pin(async move { engine.stream(options, Some(cancellation), events).await })
+    }
+}
+
 /// The terminal receipt for a task command that exited successfully.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetupTaskResult {
     pub task_name: String,
     pub image_identity: String,
     pub exit_code: i32,
+}
+
+/// All typed inputs for executing one declared task inside the ensured setup
+/// application. Ownership is deliberately not inferred here: the daemon must
+/// perform a fresh `adopt_setup_app` inspection immediately before this call.
+#[derive(Debug)]
+pub struct SetupAppTaskRequest<'a> {
+    pub plan: &'a SetupPlan,
+    pub workspace_root: PathBuf,
+    pub task_name: String,
+    pub prepared_image: &'a PreparedImage,
+    pub options: RunOptions,
+    pub cancellation: &'a CancellationToken,
+    pub events: &'a Sender<EngineEvent>,
 }
 
 /// Why a single setup task was refused or did not complete successfully.
@@ -242,6 +318,77 @@ pub async fn execute_setup_task<E: SetupTaskEngine>(
     Ok(SetupTaskResult {
         task_name: request.task_name,
         image_identity: request.prepared_image.observed_identity.clone(),
+        exit_code: result.exit_code,
+    })
+}
+
+/// Execute exactly one named task in the deterministic setup application.
+///
+/// This function derives only `docker container exec NAME sh -lc COMMAND`.
+/// It never accepts a container identity, raw argv, mounts, environment, or
+/// working-directory override. A killed local `docker exec` client does not
+/// prove the remote command stopped; callers must retain that uncertainty in
+/// their lifecycle result.
+pub async fn execute_setup_app_task<E: SetupAppTaskEngine>(
+    engine: &E,
+    request: SetupAppTaskRequest<'_>,
+) -> Result<SetupTaskResult, SetupTaskError> {
+    let command = derive_command(&SetupTaskRequest {
+        plan: request.plan,
+        workspace_root: request.workspace_root.clone(),
+        task_name: request.task_name.clone(),
+        prepared_image: request.prepared_image,
+        options: request.options,
+        cancellation: request.cancellation,
+        events: request.events,
+    })?;
+    let SetupTaskCommand::Run {
+        image_identity,
+        command,
+        ..
+    } = command;
+    if request.cancellation.is_cancelled() {
+        return Err(SetupTaskError::Cancelled);
+    }
+    if request.options.deadline.is_zero() {
+        return Err(SetupTaskError::Deadline);
+    }
+    if request.options.output_limit == 0 {
+        return Err(SetupTaskError::InvalidRequest("output budget is zero"));
+    }
+    let deadline = Deadline::after(request.options.deadline);
+    let remaining = deadline.remaining();
+    if remaining.is_zero() {
+        return Err(SetupTaskError::Deadline);
+    }
+    let result = engine
+        .stream(
+            SetupAppTaskCommand::Exec {
+                container_name: format!("bosn-setup-{}", request.plan.content_sha256),
+                command,
+            },
+            RunOptions::streaming(remaining, request.options.output_limit),
+            request.cancellation,
+            request.events,
+        )
+        .await?;
+    let used = result.stdout.len().saturating_add(result.stderr.len());
+    if used > request.options.output_limit {
+        return Err(SetupTaskError::Transport(CommandError::OutputLimit {
+            limit: request.options.output_limit,
+            reaped_pid: None,
+            cleanup: None,
+        }));
+    }
+    if !result.ok() {
+        return Err(SetupTaskError::TaskFailed {
+            exit_code: result.exit_code,
+            detail: failure_detail(&result),
+        });
+    }
+    Ok(SetupTaskResult {
+        task_name: request.task_name,
+        image_identity,
         exit_code: result.exit_code,
     })
 }
@@ -647,6 +794,41 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FakeAppEngine {
+        calls: Mutex<Vec<SetupAppTaskCommand>>,
+        results: Mutex<VecDeque<Result<CommandResult, CommandError>>>,
+    }
+    impl FakeAppEngine {
+        fn with_results(
+            results: impl IntoIterator<Item = Result<CommandResult, CommandError>>,
+        ) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                results: Mutex::new(results.into_iter().collect()),
+            }
+        }
+    }
+    impl SetupAppTaskEngine for FakeAppEngine {
+        type StreamFuture<'a> = Ready<Result<CommandResult, CommandError>>;
+        fn stream<'a>(
+            &'a self,
+            command: SetupAppTaskCommand,
+            _options: RunOptions,
+            _cancellation: &'a CancellationToken,
+            _events: &'a Sender<EngineEvent>,
+        ) -> Self::StreamFuture<'a> {
+            self.calls.lock().unwrap().push(command);
+            ready(
+                self.results
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("configured app task result"),
+            )
+        }
+    }
+
     fn runtime() -> kernal_api::async_engine::Runtime {
         RuntimeBuilder::current_thread()
             .enable_all()
@@ -806,6 +988,56 @@ mod tests {
                 "--workdir",
                 "/workspace/src",
                 IDENTITY,
+                "sh",
+                "-lc",
+                "cargo test --locked",
+            ]
+        );
+    }
+
+    #[test]
+    fn declared_app_task_has_only_the_content_addressed_exec_shape() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(workspace.join("src")).unwrap();
+        let plan = plan(&workspace);
+        let image = prepared(&plan);
+        let engine = FakeAppEngine::with_results([command_result(0, b"ok", b"")]);
+        let cancellation = CancellationSource::new();
+        let (events, _receiver) = channel(8);
+        let result = runtime()
+            .run(execute_setup_app_task(
+                &engine,
+                SetupAppTaskRequest {
+                    plan: &plan,
+                    workspace_root: workspace,
+                    task_name: "check".into(),
+                    prepared_image: &image,
+                    options: RunOptions::streaming(Duration::from_secs(2), 4096),
+                    cancellation: &cancellation.token(),
+                    events: &events,
+                },
+            ))
+            .unwrap();
+        assert_eq!(result.task_name, "check");
+        assert_eq!(
+            *engine.calls.lock().unwrap(),
+            vec![SetupAppTaskCommand::Exec {
+                container_name: format!("bosn-setup-{HASH}"),
+                command: "cargo test --locked".into(),
+            }]
+        );
+        assert_eq!(
+            SetupAppTaskCommand::Exec {
+                container_name: format!("bosn-setup-{HASH}"),
+                command: "cargo test --locked".into(),
+            }
+            .docker_args(),
+            vec![
+                "container",
+                "exec",
+                &format!("bosn-setup-{HASH}"),
                 "sh",
                 "-lc",
                 "cargo test --locked",

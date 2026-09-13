@@ -16,9 +16,9 @@
 
 use crate::{
     Client, DoctorReport, Error, JobLogPage, JobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE,
-    RegistryResourcePage, SetupAdoptRequest, SetupAdoptResult, SetupDoneResult,
-    SetupEnsureEventPage, SetupEnsureJobRequest, SetupGcApplyResult, SetupGcPreviewPage,
-    SetupPreparePolicy, SetupPrepareRequest, SetupReconcileMissingRepairResult,
+    RegistryResourcePage, SetupAdoptRequest, SetupAdoptResult, SetupAppTaskJobRequest,
+    SetupDoneResult, SetupEnsureEventPage, SetupEnsureJobRequest, SetupGcApplyResult,
+    SetupGcPreviewPage, SetupPreparePolicy, SetupPrepareRequest, SetupReconcileMissingRepairResult,
     SetupReconcilePreviewPage, SetupRetiredStopResult, SetupTaskJobRequest, Status,
 };
 use bosn_core::parse_and_plan_compose_yaml;
@@ -153,6 +153,7 @@ trait Backend {
     /// job.  The named task is the only executable selection exposed to MCP;
     /// the daemon derives all task details from the validated setup document.
     fn submit_setup_task(&mut self, request: SetupTaskJobRequest) -> Result<u64, Error>;
+    fn submit_setup_app_task(&mut self, request: SetupAppTaskJobRequest) -> Result<u64, Error>;
     /// Generate an inert setup receipt under the state root selected when the
     /// MCP process was started.  Tool arguments intentionally cannot replace
     /// that root.
@@ -259,6 +260,9 @@ impl Backend for DaemonBackend<'_> {
     }
     fn submit_setup_task(&mut self, request: SetupTaskJobRequest) -> Result<u64, Error> {
         self.runtime.run(self.client.submit_setup_task(request))
+    }
+    fn submit_setup_app_task(&mut self, request: SetupAppTaskJobRequest) -> Result<u64, Error> {
+        self.runtime.run(self.client.submit_setup_app_task(request))
     }
     fn setup_plan(
         &mut self,
@@ -501,6 +505,12 @@ fn tools_list() -> Value {
             {
                 "name": "bosn_setup_task",
                 "description": "Submit one bounded daemon-owned setup plan, image-preparation, and declared-task job. Returns promptly with a durable job ID; poll the existing job tools for outcome and logs. It accepts only a named task declared in the setup document, never task commands or engine controls.",
+                "inputSchema": setup_task_schema(),
+                "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}
+            },
+            {
+                "name": "bosn_setup_app_task",
+                "description": "Submit one declared task for execution inside an already ensured Bosn setup application. The daemon re-plans and verifies the exact managed container before a fixed exec; it accepts no command, Docker, or container controls. Returns a durable job ID promptly. Cancelling the local exec client does not establish that the in-container command stopped.",
                 "inputSchema": setup_task_schema(),
                 "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}
             }
@@ -811,6 +821,16 @@ fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
                 })
                 .map_err(|_| ToolFailure::Daemon)
         }),
+        "bosn_setup_app_task" => setup_app_task_request(arguments).and_then(|request| {
+            backend
+                .submit_setup_app_task(request)
+                .map(|job_id| {
+                    json!({
+                        "action": "setup_app_task", "submitted": true, "job_id": job_id,
+                    })
+                })
+                .map_err(|_| ToolFailure::Daemon)
+        }),
         _ => return tool_error("unknown Bosn MCP tool"),
     };
     match result {
@@ -990,6 +1010,20 @@ fn setup_task_request(
         task_name: input.task_name,
         deadline: std::time::Duration::from_millis(input.deadline_ms),
         output_limit: input.output_limit,
+    })
+}
+
+fn setup_app_task_request(
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<SetupAppTaskJobRequest, ToolFailure> {
+    let task = setup_task_request(arguments)?;
+    Ok(SetupAppTaskJobRequest {
+        workspace: task.workspace,
+        config: task.config,
+        policy: task.policy,
+        task_name: task.task_name,
+        deadline: task.deadline,
+        output_limit: task.output_limit,
     })
 }
 
@@ -1379,6 +1413,7 @@ mod tests {
         setup_prepare_calls: Vec<SetupPrepareRequest>,
         setup_ensure_calls: Vec<SetupEnsureJobRequest>,
         setup_task_calls: Vec<SetupTaskJobRequest>,
+        setup_app_task_calls: Vec<SetupAppTaskJobRequest>,
         daemon_reads: u32,
         setup_prepare_error: bool,
         setup_ensure_error: bool,
@@ -1574,6 +1609,10 @@ mod tests {
             self.setup_task_calls.push(request);
             Ok(43)
         }
+        fn submit_setup_app_task(&mut self, request: SetupAppTaskJobRequest) -> Result<u64, Error> {
+            self.setup_app_task_calls.push(request);
+            Ok(45)
+        }
         fn setup_plan(
             &mut self,
             workspace: PathBuf,
@@ -1672,7 +1711,8 @@ mod tests {
                 "bosn_compose_plan",
                 "bosn_setup_prepare",
                 "bosn_setup_ensure",
-                "bosn_setup_task"
+                "bosn_setup_task",
+                "bosn_setup_app_task"
             ]
         );
         let resources = replies[1]["result"]["tools"]
@@ -2285,6 +2325,33 @@ mod tests {
         );
         assert_eq!(backend.setup_task_calls.len(), 1);
         let request = &backend.setup_task_calls[0];
+        assert_eq!(request.workspace, PathBuf::from("/workspace"));
+        assert_eq!(request.config, "https://configs.example/setup.toml");
+        assert_eq!(request.policy, SetupPreparePolicy::Offline);
+        assert_eq!(request.task_name, "check-build_2");
+        assert_eq!(request.deadline, std::time::Duration::from_millis(1234));
+        assert_eq!(request.output_limit, 7_654_321);
+    }
+
+    #[test]
+    fn setup_app_task_submits_only_declared_semantic_inputs() {
+        let mut backend = FakeBackend::default();
+        let replies = exchange(
+            concat!(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"bosn_setup_app_task","arguments":{"workspace":"/workspace","config":"https://configs.example/setup.toml","policy":"offline","task_name":"check-build_2","deadline_ms":1234,"output_limit":7654321}}}"#,
+                "\n",
+            ),
+            &mut backend,
+        );
+        assert_eq!(replies[1]["result"]["isError"], false);
+        assert_eq!(
+            replies[1]["result"]["structuredContent"],
+            json!({"action": "setup_app_task", "submitted": true, "job_id": 45})
+        );
+        assert_eq!(backend.setup_app_task_calls.len(), 1);
+        let request = &backend.setup_app_task_calls[0];
         assert_eq!(request.workspace, PathBuf::from("/workspace"));
         assert_eq!(request.config, "https://configs.example/setup.toml");
         assert_eq!(request.policy, SetupPreparePolicy::Offline);

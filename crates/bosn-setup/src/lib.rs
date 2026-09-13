@@ -51,8 +51,9 @@ pub use ensure::{
 
 mod task;
 pub use task::{
-    SetupTaskCommand, SetupTaskEngine, SetupTaskError, SetupTaskMount, SetupTaskRequest,
-    SetupTaskResult, execute_setup_task,
+    SetupAppTaskCommand, SetupAppTaskEngine, SetupAppTaskRequest, SetupTaskCommand,
+    SetupTaskEngine, SetupTaskError, SetupTaskMount, SetupTaskRequest, SetupTaskResult,
+    execute_setup_app_task, execute_setup_task,
 };
 
 /// The current durable cache-record wire version.  It is intentionally
