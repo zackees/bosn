@@ -7,7 +7,8 @@
 
 use std::path::{Path, PathBuf};
 
-use bosn_core::SetupSource;
+use bosn_core::{SetupApp, SetupSource, SetupTask};
+use std::collections::BTreeMap;
 
 use crate::{
     KernalHttpTransport, MaterializedSetupSource, SetupAcquireError, SetupAcquirePolicy,
@@ -58,6 +59,16 @@ pub struct SetupPlan {
     pub asset_root: Option<PathBuf>,
     /// Sorted task names from the validated document.
     pub task_names: Vec<String>,
+    /// The validated app declaration retained for a later typed operation.
+    ///
+    /// This is deliberately structured document data rather than raw source
+    /// bytes or Docker arguments.  Front ends that only need an inert receipt
+    /// should continue to expose [`Self::task_names`] rather than these values.
+    pub app: SetupApp,
+    /// Named task declarations retained from the same validated document as
+    /// the receipt.  A setup-task executor validates these again before any
+    /// engine call; they are never caller-provided command arguments.
+    pub tasks: BTreeMap<String, SetupTask>,
     /// The bounded app-source shape, without exposing Dockerfile contents.
     pub app_source: SetupPlanAppSource,
 }
@@ -141,6 +152,8 @@ pub async fn plan_setup_with_transport<T: SetupRemoteTransport>(
         workspace_root: materialized.workspace_root().to_path_buf(),
         asset_root: materialized.asset_root().map(Path::to_path_buf),
         task_names: materialized.tasks().keys().cloned().collect(),
+        app: materialized.app().clone(),
+        tasks: materialized.tasks().clone(),
         app_source,
     })
 }

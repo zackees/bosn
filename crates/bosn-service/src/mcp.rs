@@ -753,6 +753,24 @@ mod tests {
                 workspace_root: workspace,
                 asset_root: None,
                 task_names: vec!["check".into()],
+                app: bosn_core::SetupApp {
+                    source: bosn_core::SetupSource::PinnedImage(
+                        "registry.example/demo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                    ),
+                    environment: Default::default(),
+                    workdir: None,
+                    mounts: Vec::new(),
+                },
+                tasks: [(
+                    "check".into(),
+                    bosn_core::SetupTask {
+                        command: "true".into(),
+                        workdir: None,
+                        environment: Default::default(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
                 app_source: SetupPlanAppSource::PinnedImage {
                     image: "registry.example/demo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
                 },

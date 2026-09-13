@@ -51,6 +51,19 @@ native synthetic-child tests cover stream separation, ordinary exit 130, spawn v
 deadline classification, oversized output without a newline, pre-exit streaming,
 cancellation, and native post-cancellation identity observation proving client reaping.
 
+### Declared setup-task primitive
+
+`bosn-setup` can now execute exactly one named task retained in a validated
+`SetupPlan` after a matching `PreparedImage` receipt is supplied.  It verifies
+the canonical workspace, prepared image identity, task name, plan receipt,
+document-derived environment merge, workspace-relative workdir, and declared
+existing workspace mounts before reaching the engine.  Its testable command is
+the finite `SetupTaskCommand::Run` semantic shape; the `DockerEngine` adapter
+may emit only `docker run --rm` with document-derived bind mounts, environment,
+workdir, the observed image identity, and `sh -lc` with the declared task text.
+This primitive has no daemon IPC, CLI, MCP, registry persistence, container
+lifecycle, or setup-ensure wiring yet.
+
 ## Current surface and characterization references
 
 ### Main CLI (`bosn`)
