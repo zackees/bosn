@@ -105,8 +105,20 @@ bosn setup prepare --state-dir STATE --workspace WORKSPACE --config LOCATOR \
 ```
 
 The receipt is `action: setup_prepare`, `submitted: true`, and a `job_id`
-(the JSON form uses the same fields). Observe or cancel it through the typed
-Python/MCP client surfaces; a native job-observation CLI is not yet provided.
+(the JSON form uses the same fields). Existing daemon jobs, including setup
+preparation, can be observed or cancelled without launching a daemon or
+invoking Docker:
+
+```text
+bosn job status --state-dir STATE --job-id ID [--json]
+bosn job logs --state-dir STATE --job-id ID [--after CURSOR] [--limit 1..=256] [--json]
+bosn job cancel --state-dir STATE --job-id ID [--json]
+```
+
+Log replies include `retained_from`, `next`, and `gap`, so callers can retain
+their cursor and detect bounded-log eviction. The command surface is limited
+to typed IPC observation; it provides no daemon start, Docker, registry, or
+raw process controls.
 
 ### `bosn-docker` / `bosn-compose`
 
