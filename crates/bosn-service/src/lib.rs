@@ -1,7 +1,8 @@
 //! Small, authenticated Rust daemon foundation. Product protobuf remains private.
 
+use bosn_core::{ResourceKind, ResourceState, Retention, Scope};
 use bosn_engine::{DockerEngine, EngineEvent, RunOptions};
-use bosn_registry::{Registry, RegistryStatus};
+use bosn_registry::{Registry, RegistryStatus, Resource, ResourceUse};
 use bosn_setup::{
     SetupAcquirePolicy, SetupEnsureEngine, SetupEnsureRequest as CoreSetupEnsureRequest,
     SetupImageEngine, SetupPlan, SetupPlanRequest, SetupTaskRequest, ensure_setup_app,
@@ -22,7 +23,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 pub mod jobs;
 pub mod mcp;
@@ -140,7 +141,29 @@ pub trait SetupEnsureExecutor: Send + Sync {
         request: SetupEnsureJobRequest,
         cancellation: &'a async_engine::CancellationToken,
         logs: &'a async_engine::Sender<String>,
-    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>>;
+}
+
+/// A validated fact to be durably recorded after a successful setup-app
+/// ensure. Production constructs this only after plan, image preparation, and
+/// ownership-safe ensure all succeed. It is public solely because the
+/// executor trait is a cross-crate test seam; it is not an RPC request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupEnsureExecution {
+    pub receipt: String,
+    pub resource: SetupEnsureResource,
+}
+
+/// Logical identity facts for a daemon-owned setup container. The registry
+/// actor supplies timestamps, state, and retention rather than accepting them
+/// from the executor or an RPC caller.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupEnsureResource {
+    pub id: String,
+    pub name: String,
+    pub stack: String,
+    pub generation: String,
+    pub workspace: String,
 }
 
 #[derive(Clone)]
@@ -235,7 +258,7 @@ impl SetupEnsureExecutor for DockerSetupEnsureExecutor {
         request: SetupEnsureJobRequest,
         cancellation: &'a async_engine::CancellationToken,
         logs: &'a async_engine::Sender<String>,
-    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>> {
         Box::pin(async move {
             // The two engine stages receive disjoint portions of one caller
             // budget. This is intentionally stricter than letting both stages
@@ -286,10 +309,23 @@ impl SetupEnsureExecutor for DockerSetupEnsureExecutor {
                 .await
                 .map_err(|_| "setup log forwarder stopped".to_owned())??;
             let ensured = result?;
-            Ok(format!(
-                "ensured {} as {}",
-                ensured.container_name, ensured.container_id
-            ))
+            Ok(SetupEnsureExecution {
+                receipt: format!(
+                    "ensured {} as {}",
+                    ensured.container_name, ensured.container_id
+                ),
+                resource: SetupEnsureResource {
+                    // Docker can assign a different opaque ID if a managed
+                    // container was externally removed. The content-derived
+                    // name is the validated logical identity and keeps this
+                    // upsert idempotent across that recovery case.
+                    id: format!("setup-container:{}", plan.content_sha256),
+                    name: ensured.container_name,
+                    stack: "setup".into(),
+                    generation: format!("sha256:{}", plan.content_sha256),
+                    workspace: plan.workspace_root.to_string_lossy().into_owned(),
+                },
+            })
         })
     }
 }
@@ -790,12 +826,22 @@ pub struct Service {
     setup_task_executor: Arc<dyn SetupTaskExecutor>,
     setup_ensure_executor: Arc<dyn SetupEnsureExecutor>,
 }
+
+#[cfg(test)]
+struct SetupEnsureRecordGate {
+    entered: async_engine::Sender<()>,
+    release: async_engine::Receiver<()>,
+}
 #[derive(Clone)]
 struct RegistryActor {
     sender: async_engine::Sender<DbCommand>,
 }
 enum DbCommand {
     Status(async_engine::OneshotSender<Result<Status, Error>>),
+    RecordSetupEnsure {
+        resource: SetupEnsureResource,
+        reply: async_engine::OneshotSender<Result<(), Error>>,
+    },
     Stop(async_engine::OneshotSender<()>),
 }
 #[derive(Clone)]
@@ -834,6 +880,15 @@ enum JobCommand {
     SubmitSetupEnsure {
         request: SetupEnsureJobRequest,
         reply: async_engine::OneshotSender<Result<u64, Error>>,
+    },
+    /// The job actor, rather than an executor task, owns the transition from
+    /// a cancellable running job to a durably recorded successful ensure.
+    /// It deliberately awaits the registry transaction before it processes a
+    /// later Cancel command, then settles the job before replying.
+    PersistSetupEnsure {
+        id: u64,
+        execution: SetupEnsureExecution,
+        reply: async_engine::OneshotSender<Result<(), String>>,
     },
     Log {
         id: u64,
@@ -945,6 +1000,7 @@ async fn job_actor(
     mut receiver: async_engine::Receiver<JobCommand>,
     executors: SetupExecutors,
     sender: async_engine::Sender<JobCommand>,
+    registry: RegistryActor,
 ) {
     let mut requests: BTreeMap<u64, SetupJobRequest> = BTreeMap::new();
     let mut cancellations: BTreeMap<u64, CancellationSource> = BTreeMap::new();
@@ -1079,6 +1135,34 @@ async fn job_actor(
                     sender.clone(),
                 );
             }
+            JobCommand::PersistSetupEnsure {
+                id,
+                execution,
+                reply,
+            } => {
+                let result = if jobs
+                    .job(id)
+                    .is_ok_and(|job| job.state == jobs::JobState::Running)
+                {
+                    registry
+                        .record_setup_ensure(execution.resource)
+                        .await
+                        .map_err(|error| format!("setup ensure registry recording failed: {error}"))
+                        .map(|()| {
+                            // Settle before accepting another command. A
+                            // cancellation processed before this command has
+                            // already changed the state to Cancelling and is
+                            // rejected above; a later cancellation observes a
+                            // terminal success and cannot be accepted.
+                            cancellations.remove(&id);
+                            let _ = jobs.log(id, bounded_log_line(&execution.receipt));
+                            let _ = jobs.settle_with_error(id, true, None);
+                        })
+                } else {
+                    Err("setup ensure cancelled".into())
+                };
+                let _ = reply.send(result);
+            }
             JobCommand::Log { id, line } => {
                 // A full log record is never permitted to block daemon IPC;
                 // bounded engine output instead applies back-pressure upstream.
@@ -1168,25 +1252,51 @@ fn launch_started_setup_jobs(
                     }
                 }
             });
-            let (kind, result) = match request {
-                SetupJobRequest::Prepare(request) => (
+            let completion = match request {
+                SetupJobRequest::Prepare(request) => Some((
                     SetupJobKind::Prepare,
                     prepare_executor.execute(request, &token, &logs).await,
-                ),
-                SetupJobRequest::Task(request) => (
+                )),
+                SetupJobRequest::Task(request) => Some((
                     SetupJobKind::Task,
                     task_executor.execute(request, &token, &logs).await,
-                ),
-                SetupJobRequest::Ensure(request) => (
-                    SetupJobKind::Ensure,
-                    ensure_executor.execute(request, &token, &logs).await,
-                ),
+                )),
+                SetupJobRequest::Ensure(request) => {
+                    let result = ensure_executor.execute(request, &token, &logs).await;
+                    match result {
+                        Ok(execution) => {
+                            let (reply, wait) = async_engine::oneshot_channel();
+                            let persisted = if task_sender
+                                .send(JobCommand::PersistSetupEnsure {
+                                    id,
+                                    execution,
+                                    reply,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                Err("setup ensure registry actor stopped".to_owned())
+                            } else {
+                                match wait.await {
+                                    Ok(result) => result,
+                                    Err(_) => Err("setup ensure registry actor stopped".to_owned()),
+                                }
+                            };
+                            persisted
+                                .err()
+                                .map(|error| (SetupJobKind::Ensure, Err(error)))
+                        }
+                        Err(error) => Some((SetupJobKind::Ensure, Err(error))),
+                    }
+                }
             };
             drop(logs);
             let _ = forwarder.await;
-            let _ = task_sender
-                .send(JobCommand::Completed { id, kind, result })
-                .await;
+            if let Some((kind, result)) = completion {
+                let _ = task_sender
+                    .send(JobCommand::Completed { id, kind, result })
+                    .await;
+            }
         });
     }
 }
@@ -1282,6 +1392,14 @@ impl RegistryActor {
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
     }
+    async fn record_setup_ensure(&self, resource: SetupEnsureResource) -> Result<(), Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::RecordSetupEnsure { resource, reply })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
     async fn stop(&self) {
         let (reply, wait) = async_engine::oneshot_channel();
         if self.sender.send(DbCommand::Stop(reply)).await.is_ok() {
@@ -1289,12 +1407,39 @@ impl RegistryActor {
         }
     }
 }
-async fn registry_actor(mut registry: Registry, mut receiver: async_engine::Receiver<DbCommand>) {
+async fn registry_actor(
+    mut registry: Registry,
+    mut receiver: async_engine::Receiver<DbCommand>,
+    #[cfg(test)] mut setup_ensure_record_gate: Option<SetupEnsureRecordGate>,
+) {
     while let Some(command) = receiver.recv().await {
         match command {
             DbCommand::Status(reply) => {
                 let worker = async_engine::launch_blocking(move || {
                     let result = registry.status().map(Status::from);
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
+            DbCommand::RecordSetupEnsure { resource, reply } => {
+                #[cfg(test)]
+                if let Some(gate) = &mut setup_ensure_record_gate
+                    && (gate.entered.send(()).await.is_err() || gate.release.recv().await.is_none())
+                {
+                    let _ = reply.send(Err(Error::ActorClosed));
+                    continue;
+                }
+                let worker = async_engine::launch_blocking(move || {
+                    let result = record_setup_ensure(&mut registry, &resource);
                     (registry, result)
                 });
                 match worker.await {
@@ -1314,6 +1459,40 @@ async fn registry_actor(mut registry: Registry, mut receiver: async_engine::Rece
             }
         }
     }
+}
+
+fn record_setup_ensure(
+    registry: &mut Registry,
+    resource: &SetupEnsureResource,
+) -> Result<(), bosn_registry::Error> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
+        .as_secs_f64();
+    let mut transaction = registry.begin_immediate()?;
+    transaction.put_resource(&Resource {
+        id: resource.id.clone(),
+        kind: ResourceKind::Container,
+        name: resource.name.clone(),
+        stack: resource.stack.clone(),
+        generation: resource.generation.clone(),
+        // Setup app container names are machine-global and content-addressed.
+        scope: Scope::Machine,
+        workspace: resource.workspace.clone(),
+        created_at: now,
+        last_used: now,
+        state: ResourceState::Active,
+        retention: Retention::Pinned,
+    })?;
+    transaction.put_resource_use(&ResourceUse {
+        resource_id: resource.id.clone(),
+        workspace: resource.workspace.clone(),
+        stack: resource.stack.clone(),
+        generation: resource.generation.clone(),
+        last_used: now,
+        state: ResourceState::Active,
+    })?;
+    transaction.commit()
 }
 impl Service {
     pub fn new(state_dir: impl Into<PathBuf>) -> Self {
@@ -1385,8 +1564,14 @@ impl Service {
                 ensure: Arc::clone(&self.setup_ensure_executor),
             },
             job_sender.clone(),
+            actor.clone(),
         ));
-        let worker = async_engine::launch(registry_actor(registry, receiver));
+        let worker = async_engine::launch(registry_actor(
+            registry,
+            receiver,
+            #[cfg(test)]
+            None,
+        ));
         let mut clients = async_engine::TaskGroup::new();
         while !self.stop.is_cancelled() {
             // TaskGroup retains completed tasks until collected.  Reap only
@@ -2138,7 +2323,8 @@ mod tests {
             request: SetupEnsureJobRequest,
             cancellation: &'a async_engine::CancellationToken,
             logs: &'a async_engine::Sender<String>,
-        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>>
+        {
             Box::pin(async move {
                 self.started.fetch_add(1, Ordering::SeqCst);
                 self.stages.lock().unwrap().push("plan".into());
@@ -2173,7 +2359,16 @@ mod tests {
                 logs.send(format!("[fake] ensured {}", "x".repeat(4 * 1024)))
                     .await
                     .map_err(|_| "fake log consumer closed".to_owned())?;
-                Ok("fake ensured container".into())
+                Ok(SetupEnsureExecution {
+                    receipt: "fake ensured container".into(),
+                    resource: SetupEnsureResource {
+                        id: "setup-container:fake".into(),
+                        name: "bosn-setup-fake".into(),
+                        stack: "setup".into(),
+                        generation: "sha256:fake".into(),
+                        workspace: request.workspace.to_string_lossy().into_owned(),
+                    },
+                })
             })
         }
     }
@@ -2730,7 +2925,190 @@ mod tests {
                     client.shutdown().await.unwrap();
                     stopped(server).await;
                 });
+            let registry = Registry::open_read_only(state.join("registry.sqlite3")).unwrap();
+            assert!(registry.resources(0, 10).unwrap().items.is_empty());
+            assert!(registry.resource_uses(0, 10).unwrap().items.is_empty());
         }
+    }
+
+    #[test]
+    fn setup_ensure_persists_one_container_and_use_across_daemon_restart() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let request = SetupEnsureJobRequest {
+            workspace: workspace.clone(),
+            config: "https://example.invalid/setup.toml".into(),
+            policy: SetupPreparePolicy::Refresh,
+            deadline: Duration::from_secs(2),
+            output_limit: 4 * 1024,
+        };
+
+        for _ in 0..2 {
+            let fake = Arc::new(FakeSetupEnsureExecutor::new());
+            RuntimeBuilder::multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .run(async {
+                    let server = async_engine::launch(
+                        Service::new(state.clone())
+                            .with_setup_ensure_executor(fake.clone())
+                            .serve(),
+                    );
+                    let client = wait_for_client(&state).await;
+                    let job = client.submit_setup_ensure(request.clone()).await.unwrap();
+                    wait_for_job_state(&client, job, "Succeeded").await;
+                    client.shutdown().await.unwrap();
+                    stopped(server).await;
+                });
+        }
+
+        let registry = Registry::open_read_only(state.join("registry.sqlite3")).unwrap();
+        let resources = registry.resources(0, 10).unwrap().items;
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].id, "setup-container:fake");
+        assert_eq!(resources[0].kind, ResourceKind::Container);
+        assert_eq!(resources[0].name, "bosn-setup-fake");
+        assert_eq!(resources[0].stack, "setup");
+        assert_eq!(resources[0].generation, "sha256:fake");
+        assert_eq!(resources[0].scope, Scope::Machine);
+        assert_eq!(resources[0].workspace, workspace.to_string_lossy());
+        assert_eq!(resources[0].state, ResourceState::Active);
+        assert_eq!(resources[0].retention, Retention::Pinned);
+        let uses = registry.resource_uses(0, 10).unwrap().items;
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].resource_id, "setup-container:fake");
+        assert_eq!(uses[0].workspace, workspace.to_string_lossy());
+        assert_eq!(uses[0].stack, "setup");
+        assert_eq!(uses[0].generation, "sha256:fake");
+        assert_eq!(uses[0].state, ResourceState::Active);
+    }
+
+    #[test]
+    fn cancelled_setup_ensure_does_not_persist_a_resource() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let fake = Arc::new(FakeSetupEnsureExecutor::new());
+        RuntimeBuilder::multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let server = async_engine::launch(
+                    Service::new(state.clone())
+                        .with_setup_ensure_executor(fake.clone())
+                        .serve(),
+                );
+                let client = wait_for_client(&state).await;
+                let job = client
+                    .submit_setup_ensure(SetupEnsureJobRequest {
+                        workspace,
+                        config: "https://example.invalid/wait.toml".into(),
+                        policy: SetupPreparePolicy::Refresh,
+                        deadline: Duration::from_secs(2),
+                        output_limit: 4 * 1024,
+                    })
+                    .await
+                    .unwrap();
+                wait_for(|| fake.started.load(Ordering::SeqCst) == 1).await;
+                client.cancel_job(job).await.unwrap();
+                wait_for_job_state(&client, job, "Cancelled").await;
+                client.shutdown().await.unwrap();
+                stopped(server).await;
+            });
+        let registry = Registry::open_read_only(state.join("registry.sqlite3")).unwrap();
+        assert!(registry.resources(0, 10).unwrap().items.is_empty());
+        assert!(registry.resource_uses(0, 10).unwrap().items.is_empty());
+    }
+
+    #[test]
+    fn cancellation_queued_at_registry_handoff_is_rejected_after_persisted_success() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        RuntimeBuilder::multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let registry = Registry::create_writer(
+                    state.join("registry.sqlite3"),
+                    "11111111-2222-4333-8444-555555555555",
+                )
+                .unwrap();
+                let (entered, mut entered_wait) = async_engine::channel(1);
+                let (release, release_wait) = async_engine::channel(1);
+                let (registry_sender, registry_receiver) = async_engine::channel(4);
+                let registry_handle = RegistryActor {
+                    sender: registry_sender,
+                };
+                let registry_task = async_engine::launch(registry_actor(
+                    registry,
+                    registry_receiver,
+                    Some(SetupEnsureRecordGate {
+                        entered,
+                        release: release_wait,
+                    }),
+                ));
+                let (job_sender, job_receiver) = async_engine::channel(4);
+                let jobs = JobActor {
+                    sender: job_sender.clone(),
+                };
+                let fake = Arc::new(FakeSetupEnsureExecutor::new());
+                let job_task = async_engine::launch(job_actor(
+                    Jobs::new(1),
+                    job_receiver,
+                    SetupExecutors {
+                        prepare: Arc::new(SlowFakeSetupExecutor::new()),
+                        task: Arc::new(FakeSetupTaskExecutor::new()),
+                        ensure: fake,
+                    },
+                    job_sender.clone(),
+                    registry_handle.clone(),
+                ));
+                let id = jobs
+                    .submit_setup_ensure(SetupEnsureJobRequest {
+                        workspace: workspace.clone(),
+                        config: "https://example.invalid/setup.toml".into(),
+                        policy: SetupPreparePolicy::Refresh,
+                        deadline: Duration::from_secs(2),
+                        output_limit: 4 * 1024,
+                    })
+                    .await
+                    .unwrap();
+                assert!(entered_wait.recv().await.is_some());
+
+                // This command is now definitely queued behind an in-flight
+                // actor-owned registry transaction, not merely racing a token
+                // check in a worker task.
+                let (reply, wait) = async_engine::oneshot_channel();
+                assert!(
+                    job_sender
+                        .send(JobCommand::Cancel { id, reply })
+                        .await
+                        .is_ok()
+                );
+                release.send(()).await.unwrap();
+                assert!(wait.await.unwrap().is_err());
+                assert_eq!(
+                    jobs.status(id).await.unwrap().state,
+                    jobs::JobState::Succeeded
+                );
+
+                jobs.stop().await;
+                registry_handle.stop().await;
+                job_task.await.unwrap();
+                registry_task.await.unwrap();
+            });
+        let registry = Registry::open_read_only(state.join("registry.sqlite3")).unwrap();
+        assert_eq!(registry.resources(0, 10).unwrap().items.len(), 1);
+        assert_eq!(registry.resource_uses(0, 10).unwrap().items.len(), 1);
     }
 
     #[test]
