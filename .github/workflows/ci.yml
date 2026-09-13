@@ -41,9 +41,19 @@ jobs:
       - name: Build wheel
         run: uv build --wheel
 
-      - name: Assert py3-none-any wheel
+      - name: Assert native wheel contents
         run: |
           set -e
           ls dist/
-          test -n "$(ls dist/*-py3-none-any.whl)"
+          wheel="$(ls dist/*.whl)"
+          uv run python - "$wheel" <<'PY'
+          import sys
+          import zipfile
 
+          names = zipfile.ZipFile(sys.argv[1]).namelist()
+          assert any(
+              name.startswith("bosn/_native.")
+              and name.rsplit(".", 1)[-1] in {"so", "pyd", "dylib"}
+              for name in names
+          ), names
+          PY
