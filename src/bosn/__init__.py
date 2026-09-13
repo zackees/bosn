@@ -10,6 +10,7 @@ __all__ = ["__version__"]
 try:
     from ._native import (
         Client,
+        ComposePlan,
         DoctorReport,
         JobLogPage,
         JobLogRecord,
@@ -21,6 +22,7 @@ try:
         SetupPlan,
         Status,
         native_version,
+        plan_compose_yaml,
         protocol_version,
         run_mcp,
     )
@@ -30,6 +32,7 @@ except ModuleNotFoundError as error:
 else:
     __all__ += [
         "Client",
+        "ComposePlan",
         "DoctorReport",
         "JobLogPage",
         "JobLogRecord",
@@ -41,6 +44,7 @@ else:
         "SetupPlan",
         "Status",
         "native_version",
+        "plan_compose_yaml",
         "protocol_version",
         "run_mcp",
     ]

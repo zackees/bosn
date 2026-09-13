@@ -21,6 +21,7 @@ use crate::{
     SetupPreparePolicy, SetupPrepareRequest, SetupReconcileMissingRepairResult,
     SetupReconcilePreviewPage, SetupRetiredStopResult, SetupTaskJobRequest, Status,
 };
+use bosn_core::parse_and_plan_compose_yaml;
 use bosn_setup::{
     SetupAcquirePolicy, SetupPlan, SetupPlanAppSource, SetupPlanRequest, SetupSourceKind,
     plan_setup,
@@ -44,6 +45,9 @@ const MAX_MCP_REGISTRY_RECORDS: u32 = MAX_REGISTRY_DIAGNOSTIC_PAGE;
 /// Bound filesystem and URL strings independently from the JSON-RPC line
 /// bound.  `bosn-core` also validates the locator before it is observed.
 const MAX_MCP_SETUP_STRING_BYTES: usize = 8 * 1024;
+/// A caller-supplied YAML document only.  This is intentionally well below
+/// the JSON-RPC frame limit and never names a server-side path.
+const MAX_MCP_COMPOSE_DOCUMENT_BYTES: usize = 32 * 1024;
 
 /// Native default matching the current Python command's state-root contract.
 pub fn default_state_dir() -> PathBuf {
@@ -477,6 +481,12 @@ fn tools_list() -> Value {
                 "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
             },
             {
+                "name": "bosn_compose_plan",
+                "description": "Parse, validate, and digest caller-supplied Compose YAML using Bosn's documented subset. This is pure review data: it reads no file, contacts no daemon or Docker engine, writes no state, and never executes Compose.",
+                "inputSchema": compose_plan_schema(),
+                "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
+            },
+            {
                 "name": "bosn_setup_prepare",
                 "description": "Submit one bounded daemon-owned setup image-preparation job. Returns promptly with a durable job ID; poll the existing job tools for outcome and logs. It does not start a daemon, run setup tasks, or accept Docker, mount, or output-path controls.",
                 "inputSchema": setup_prepare_schema(),
@@ -495,6 +505,17 @@ fn tools_list() -> Value {
                 "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}
             }
         ]
+    })
+}
+
+fn compose_plan_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["document"],
+        "properties": {
+            "document": {"type": "string", "minLength": 1, "maxLength": MAX_MCP_COMPOSE_DOCUMENT_BYTES, "description": "Complete caller-supplied Compose YAML. Filesystem paths and URLs are not accepted by this tool."}
+        }
     })
 }
 
@@ -617,6 +638,13 @@ fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
         Some(_) => return tool_error("tool arguments must be an object"),
     };
     let result = match name {
+        "bosn_compose_plan" => compose_plan_request(arguments).and_then(|document| {
+            parse_and_plan_compose_yaml(&document)
+                .map(compose_plan_json)
+                .map_err(|_| {
+                    ToolFailure::Invalid("Bosn Compose document is invalid or unsupported")
+                })
+        }),
         "bosn_status" => {
             if !arguments.is_empty() {
                 return tool_error("bosn_status accepts no arguments");
@@ -791,6 +819,20 @@ fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
         Err(ToolFailure::Daemon) => tool_error("native Bosn daemon request failed"),
         Err(ToolFailure::Setup) => tool_error("Bosn setup plan failed"),
     }
+}
+
+fn compose_plan_request(arguments: &serde_json::Map<String, Value>) -> Result<String, ToolFailure> {
+    only_arguments(arguments, &["document"])?;
+    let document = arguments
+        .get("document")
+        .and_then(Value::as_str)
+        .ok_or(ToolFailure::Invalid("document must be a string"))?;
+    if document.is_empty() || document.len() > MAX_MCP_COMPOSE_DOCUMENT_BYTES {
+        return Err(ToolFailure::Invalid(
+            "document must be within 1..=32768 bytes",
+        ));
+    }
+    Ok(document.to_owned())
 }
 
 enum ToolFailure {
@@ -1278,6 +1320,17 @@ fn setup_plan_json(plan: SetupPlan) -> Value {
     })
 }
 
+fn compose_plan_json(plan: bosn_core::ComposePlan) -> Value {
+    json!({
+        "action": "compose_plan",
+        "applied": false,
+        "version": plan.version,
+        "digest": plan.digest,
+        "document": plan.document,
+        "normalized_json": plan.normalized_json,
+    })
+}
+
 fn tool_success(value: Value) -> Value {
     match serde_json::to_string(&value) {
         Ok(text) => json!({
@@ -1616,6 +1669,7 @@ mod tests {
                 "bosn_job_logs",
                 "bosn_job_cancel",
                 "bosn_setup_plan",
+                "bosn_compose_plan",
                 "bosn_setup_prepare",
                 "bosn_setup_ensure",
                 "bosn_setup_task"
@@ -1727,6 +1781,45 @@ mod tests {
         );
         assert_eq!(replies[2]["result"]["isError"], false);
         assert_eq!(replies[2]["result"]["structuredContent"]["resources"], 3);
+    }
+
+    #[test]
+    fn compose_plan_is_discoverable_pure_and_refuses_file_or_engine_inputs() {
+        let mut backend = FakeBackend::default();
+        let replies = exchange(
+            concat!(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"bosn_compose_plan","arguments":{"document":"services:\n  api:\n    image: alpine:3.21\n"}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"bosn_compose_plan","arguments":{"document":"services: {}","file":"/private/compose.yaml"}}}"#,
+                "\n",
+            ),
+            &mut backend,
+        );
+        let tool = replies[1]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "bosn_compose_plan")
+            .unwrap();
+        assert_eq!(tool["annotations"]["readOnlyHint"], true);
+        assert_eq!(tool["inputSchema"]["required"], json!(["document"]));
+        assert_eq!(
+            tool["inputSchema"]["properties"]["document"]["maxLength"],
+            32768
+        );
+        assert_eq!(replies[2]["result"]["isError"], false);
+        let plan = &replies[2]["result"]["structuredContent"];
+        assert_eq!(plan["action"], "compose_plan");
+        assert_eq!(plan["applied"], false);
+        assert_eq!(plan["document"]["services"]["api"]["image"], "alpine:3.21");
+        assert_eq!(replies[3]["result"]["isError"], true);
+        assert_eq!(backend.daemon_reads, 0);
+        assert!(backend.setup_calls.is_empty());
+        assert!(backend.cancelled.is_empty());
     }
 
     #[test]

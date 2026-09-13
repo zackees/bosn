@@ -3,7 +3,7 @@
 //! Product policy stays in Rust.  This extension only converts Python values
 //! into the typed Rust client and maps its result into immutable Python values.
 
-use bosn_core::parse_setup_config_locator;
+use bosn_core::{parse_and_plan_compose_yaml, parse_setup_config_locator};
 use bosn_service::{
     Client as ServiceClient, DoctorReport as ServiceDoctorReport, JobLogPage as ServiceJobLogPage,
     JobStatus as ServiceJobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE,
@@ -34,6 +34,9 @@ const MAX_SETUP_PREPARE_DEADLINE_MS: u64 = 5 * 60 * 1_000;
 const MAX_SETUP_PREPARE_OUTPUT_BYTES: u32 = 8 * 1024 * 1024;
 const MAX_JOB_LOG_RECORDS: u32 = 256;
 const MAX_REGISTRY_RECORDS: u32 = MAX_REGISTRY_DIAGNOSTIC_PAGE;
+/// Keep the pure native boundary finite even though the caller already owns
+/// the Python string.  MCP uses a smaller transport-specific limit.
+const MAX_COMPOSE_DOCUMENT_BYTES: usize = 1024 * 1024;
 
 #[pyclass(module = "bosn._native", frozen)]
 pub struct Client {
@@ -1039,6 +1042,25 @@ impl From<RustSetupPlan> for SetupPlan {
     }
 }
 
+/// Immutable, read-only result of [`plan_compose_yaml`].
+///
+/// `document_json` and `normalized_json` contain only caller-supplied Compose
+/// semantics.  They do not identify an engine, workspace, build context, or
+/// a resource that Bosn may execute.
+#[pyclass(module = "bosn._native", frozen)]
+pub struct ComposePlan {
+    #[pyo3(get)]
+    version: u32,
+    #[pyo3(get)]
+    digest: String,
+    #[pyo3(get)]
+    normalized_json: String,
+    #[pyo3(get)]
+    document_json: String,
+    #[pyo3(get)]
+    applied: bool,
+}
+
 /// Return the native extension version, which must match the Python package.
 #[pyfunction]
 fn native_version() -> &'static str {
@@ -1049,6 +1071,28 @@ fn native_version() -> &'static str {
 #[pyfunction]
 fn protocol_version() -> u32 {
     bosn_service::PROTOCOL_VERSION
+}
+
+/// Parse and validate a caller-supplied Compose YAML document without reading
+/// a path, contacting a daemon/engine, or writing state.
+#[pyfunction]
+fn plan_compose_yaml(source: &str) -> PyResult<ComposePlan> {
+    if source.len() > MAX_COMPOSE_DOCUMENT_BYTES {
+        return Err(PyValueError::new_err(format!(
+            "Compose YAML exceeds the {MAX_COMPOSE_DOCUMENT_BYTES}-byte limit"
+        )));
+    }
+    let plan = parse_and_plan_compose_yaml(source)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let document_json = serde_json::to_string(&plan.document)
+        .map_err(|_| PyRuntimeError::new_err("could not encode Compose plan"))?;
+    Ok(ComposePlan {
+        version: plan.version,
+        digest: plan.digest,
+        normalized_json: plan.normalized_json,
+        document_json,
+        applied: false,
+    })
 }
 
 fn status(state_dir: &Path) -> Result<ServiceStatus, bosn_service::Error> {
@@ -1504,8 +1548,10 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SetupEnsureEvent>()?;
     module.add_class::<SetupEnsureEventPage>()?;
     module.add_class::<SetupPlan>()?;
+    module.add_class::<ComposePlan>()?;
     module.add_function(wrap_pyfunction!(native_version, module)?)?;
     module.add_function(wrap_pyfunction!(protocol_version, module)?)?;
+    module.add_function(wrap_pyfunction!(plan_compose_yaml, module)?)?;
     module.add_function(wrap_pyfunction!(run_mcp, module)?)?;
     Ok(())
 }
@@ -1674,6 +1720,44 @@ mod tests {
     #[test]
     fn native_version_matches_python_distribution() {
         assert_eq!(native_version(), "0.1.3");
+    }
+
+    #[test]
+    fn compose_plan_is_pure_and_returns_an_immutable_receipt() {
+        let plan = plan_compose_yaml("services:\n  api:\n    image: alpine:3.21\n").unwrap();
+        assert_eq!(plan.version, 1);
+        assert!(plan.digest.starts_with("sha256:"));
+        assert!(plan.document_json.contains("alpine:3.21"));
+        assert!(plan.normalized_json.contains("alpine:3.21"));
+        assert!(!plan.applied);
+        assert!(plan_compose_yaml("services: {}\n").is_err());
+    }
+
+    #[cfg(feature = "embedded-python-tests")]
+    #[test]
+    fn python_module_exposes_compose_plan_without_a_client_or_daemon() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = PyModule::new(py, "bosn_native_test").unwrap();
+            _native(&module).unwrap();
+            let plan = module
+                .getattr("plan_compose_yaml")
+                .unwrap()
+                .call1(("services:\n  api:\n    image: alpine:3.21\n",))
+                .unwrap();
+            assert_eq!(
+                plan.getattr("version").unwrap().extract::<u32>().unwrap(),
+                1
+            );
+            assert!(!plan.getattr("applied").unwrap().extract::<bool>().unwrap());
+            assert!(
+                plan.getattr("document_json")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap()
+                    .contains("alpine:3.21")
+            );
+        });
     }
 
     #[cfg(feature = "embedded-python-tests")]

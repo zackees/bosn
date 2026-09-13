@@ -5,10 +5,14 @@
 //! -- mcp` an equivalent, package-ready route without a Python launcher.  Its
 //! setup route is a separate human/JSON CLI and never shares MCP stdio.
 
-use std::path::PathBuf;
 use std::time::Duration;
+use std::{
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
-use bosn_core::parse_setup_config_locator;
+use bosn_core::{parse_and_plan_compose_yaml, parse_setup_config_locator};
 use bosn_service::{
     Client, JobLogPage, JobStatus, SetupEnsureJobRequest, SetupPreparePolicy, SetupPrepareRequest,
     SetupTaskJobRequest,
@@ -24,6 +28,9 @@ const SETUP_PREPARE_MAX_DEADLINE_MS: u64 = 5 * 60 * 1_000;
 const SETUP_PREPARE_MAX_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 const DEFAULT_JOB_LOG_LIMIT: u32 = 64;
 const MAX_JOB_LOG_LIMIT: u32 = bosn_service::jobs::MAX_LOG_PAGE_RECORDS as u32;
+/// The CLI may explicitly read one local Compose file, but it never executes
+/// it and keeps the read bounded before parsing.
+const MAX_COMPOSE_FILE_BYTES: usize = 1024 * 1024;
 
 fn main() {
     let mut arguments = std::env::args_os();
@@ -39,12 +46,87 @@ fn main() {
         "mcp" => run_mcp(arguments),
         "daemon" => run_daemon(arguments),
         "doctor" => run_doctor(arguments),
+        "compose" => run_compose(arguments),
         "setup" => run_setup(arguments),
         "job" => run_job(arguments),
         "registry" => run_registry(arguments),
         "gc" => run_gc(arguments),
         _ => usage(),
     }
+}
+
+fn run_compose(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
+    match arguments.next().as_deref() {
+        Some(command) if command == "plan" => run_compose_plan(arguments),
+        _ => usage(),
+    }
+}
+
+/// Read and plan an explicitly selected Compose file.  This intentionally has
+/// no daemon, registry, Docker, or workspace dependency.
+fn run_compose_plan(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
+    let mut file = None;
+    let mut json_output = false;
+    while let Some(argument) = arguments.next() {
+        match argument.to_string_lossy().as_ref() {
+            "--file" => set_once(&mut file, arguments.next()),
+            "--json" if !json_output => {
+                json_output = true;
+                Ok(())
+            }
+            _ => Err(()),
+        }
+        .unwrap_or_else(|_| usage());
+    }
+    let file = PathBuf::from(file.unwrap_or_else(|| usage()));
+    let source = read_compose_file(&file).unwrap_or_else(|error| compose_failure(&error));
+    let plan = parse_and_plan_compose_yaml(&source)
+        .unwrap_or_else(|error| compose_failure(&error.to_string()));
+    if json_output {
+        println!(
+            "{}",
+            json!({
+                "action": "compose_plan",
+                "applied": false,
+                "version": plan.version,
+                "digest": plan.digest,
+                "document": plan.document,
+                "normalized_json": plan.normalized_json,
+            })
+        );
+    } else {
+        println!("compose plan (not applied)");
+        println!("version: {}", plan.version);
+        println!("digest: {}", plan.digest);
+        println!(
+            "services: {}",
+            plan.document
+                .services
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+}
+
+fn read_compose_file(path: &Path) -> Result<String, String> {
+    let file = File::open(path).map_err(|_| "could not open Compose file".to_owned())?;
+    let mut bytes = Vec::with_capacity(MAX_COMPOSE_FILE_BYTES.saturating_add(1));
+    file.take((MAX_COMPOSE_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "could not read Compose file".to_owned())?;
+    if bytes.len() > MAX_COMPOSE_FILE_BYTES {
+        return Err(format!(
+            "Compose file exceeds the {MAX_COMPOSE_FILE_BYTES}-byte limit"
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| "Compose file is not valid UTF-8".to_owned())
+}
+
+fn compose_failure(error: &str) -> ! {
+    eprintln!("bosn compose plan: {error}");
+    std::process::exit(1)
 }
 
 fn run_gc(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
@@ -1594,6 +1676,7 @@ fn usage() -> ! {
     eprintln!("   or: bosn daemon serve --state-dir STATE_DIR");
     eprintln!("   or: bosn daemon status --state-dir STATE_DIR [--json]");
     eprintln!("   or: bosn daemon stop --state-dir STATE_DIR [--json]");
+    eprintln!("   or: bosn compose plan --file COMPOSE_YAML [--json]");
     eprintln!(
         "   or: bosn setup plan --state-dir STATE_DIR --workspace WORKSPACE --config LOCATOR (--refresh | --offline) [--json]"
     );
