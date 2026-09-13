@@ -7,12 +7,19 @@ use std::collections::BTreeMap;
 
 pub mod config;
 pub mod manifest;
+pub mod setup;
 
 pub use config::{
     AppPolicy, MachinePolicy, PolicyDefaults, PolicyError, PolicyOrigin, parse_machine_policy_toml,
     resolve_app_policy, resolve_machine_policy,
 };
 pub use manifest::{Manifest, ManifestError, ManifestRoots, parse_manifest_toml};
+pub use setup::{
+    CompanionFile, MAX_COMPANION_FILE_BYTES, MAX_COMPANION_FILES, MAX_ENVIRONMENT_ENTRIES,
+    MAX_INLINE_DOCKERFILE_BYTES, MAX_MOUNTS, MAX_SETUP_DOCUMENT_BYTES, MAX_TASKS,
+    SETUP_DOCUMENT_VERSION, SetupApp, SetupConfigLocator, SetupDocument, SetupDocumentError,
+    SetupSource, SetupTask, WorkspaceMount, parse_setup_config_locator, parse_setup_document_toml,
+};
 
 pub const NAMESPACE: &str = "com.zackees.bosn";
 pub const LABEL_REGISTRY: &str = "com.zackees.bosn.registry";
