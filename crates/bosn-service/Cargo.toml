@@ -1,0 +1,14 @@
+[package]
+name = "bosn-service"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+
+[[bin]]
+name = "bosn-rs"
+path = "src/bin/bosn-rs.rs"
+
+[dependencies]
+bosn-registry = { path = "../bosn-registry" }
+prost = "=0.14.4"
+kernal-api = { git = "https://github.com/zackees/kernal-api", rev = "ed197c5c606d6fd984190721e309c30d7d0383ef", version = "=0.1.0", default-features = false, features = ["sqlite", "fs", "ipc", "ipc-async", "secure-random", "daemon-frame-v1"] }

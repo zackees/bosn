@@ -74,6 +74,41 @@ soldr cargo clippy --workspace --all-targets -- -D warnings
 uv run pytest tests/test_release_dependencies.py -q
 ```
 
+## Rust daemon foundation
+
+`bosn-service` supplies the intentionally small first native daemon surface,
+and `bosn-rs` is its development foreground binary. Python launchers are not
+changed. `serve STATE_DIR` hardens the state directory through kernal-api,
+creates a fresh private v5 registry with kernel OS entropy when absent, or
+opens its existing single writer before it attempts owner-only IPC binding.
+An occupied endpoint is refused conservatively; this slice does not retire an
+existing filesystem object.
+
+The client and daemon use kernal-api's authenticated async local IPC and its
+frozen daemon-frame-v1 envelope. Bosn's private Prost payload has protocol
+version 1 and a correlated frame request ID; its only operations are typed
+`ping`, `status`, and `shutdown`. Frames are capped at 1 MiB despite the
+larger kernel framing limit. Each frame read and write has a three-second
+deadline, so a partial client cannot retain admission indefinitely. The
+daemon checks the kernel peer user identity on both client and server sides.
+
+`status` is deliberately diagnostic only: it reports the actual stable
+registry UUID, schema version, resource/lease/session counts, and the
+reconciliation gate. It does not claim engine reconciliation, job execution,
+or Docker mutation. A bounded (16-command) actor owns the writer. Each status
+query moves the writer through kernal-api's blocking lane and returns it to
+the actor before the next command, so SQLite never occupies an async worker.
+Shutdown stops admission, drains client tasks, then asks that actor to drop
+the writer before the foreground service returns.
+
+The daemon foundation's native test matrix covers malformed and oversized
+frames, unsupported protocol versions, response correlation/protocol/kind/
+encoding rejection, same-user peer authorization, slow-drip absolute read
+deadlines, bounded shutdown, independent state directories, alias clients,
+and refusal of legacy-v4 or reconciliation-gated registries before IPC binds
+or registry bytes are changed. These checks do not claim engine or job
+coverage.
+
 Focused evidence includes all-eight-table typed transaction round trips, drop
 rollback, stable-ID reopen, concurrent writer exclusion with independent
 read-only diagnostics, missing read-only open followed by safe create, and a
