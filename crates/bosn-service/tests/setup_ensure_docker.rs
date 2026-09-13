@@ -414,10 +414,10 @@ fn live_docker_setup_ensure_creates_and_reuses_one_managed_app() {
 }
 
 /// Run with:
-/// `soldr cargo test -j1 -p bosn-service --test setup_ensure_docker --locked -- --ignored --exact live_docker_setup_reconcile_preview_detects_exact_missing_app`
+/// `soldr cargo test -j1 -p bosn-service --test setup_ensure_docker --locked -- --ignored --exact live_docker_setup_reconcile_repair_missing_retires_then_ensure_recreates_app`
 #[test]
 #[ignore = "requires a local Docker daemon and the pinned Alpine image"]
-fn live_docker_setup_reconcile_preview_detects_exact_missing_app() {
+fn live_docker_setup_reconcile_repair_missing_retires_then_ensure_recreates_app() {
     let engine = DockerEngine::docker();
     let root = tempfile::tempdir().expect("temporary test root");
     let state = root.path().join("state");
@@ -479,9 +479,68 @@ fn live_docker_setup_reconcile_preview_detects_exact_missing_app() {
         .expect("missing preview");
     assert_eq!(missing.records.len(), 1);
     assert_eq!(missing.records[0].drift, "missing");
+    let repair_token = missing.records[0]
+        .repair_token
+        .as_deref()
+        .expect("missing active app has opaque repair token");
+    let repaired = runtime
+        .run(client.setup_reconcile_repair_missing(&workspace, repair_token, true))
+        .expect("repair exact missing app");
+    assert!(repaired.repaired);
+    assert!(!repaired.already_repaired);
+    let repeated = runtime
+        .run(client.setup_reconcile_repair_missing(&workspace, repair_token, true))
+        .expect("repeat exact missing repair");
+    assert!(!repeated.repaired);
+    assert!(repeated.already_repaired);
+    assert!(
+        inspect_container(&engine, &container_name)
+            .expect("repair never mutates Docker")
+            .is_none(),
+        "repair recreated or otherwise changed missing app"
+    );
+    let second_job = runtime
+        .run(client.submit_setup_ensure(SetupEnsureJobRequest {
+            workspace: workspace.clone(),
+            config: config.to_string_lossy().into_owned(),
+            policy: SetupPreparePolicy::Offline,
+            deadline: JOB_DEADLINE,
+            output_limit: OUTPUT_LIMIT,
+        }))
+        .expect("submit recreation ensure");
+    wait_for_success(&runtime, &client, second_job);
+    let recreated = inspect_container(&engine, &container_name)
+        .expect("inspect recreated app")
+        .expect("ensure recreated managed app");
+    assert_ne!(
+        recreated.id, observed.id,
+        "ensure did not recreate missing app"
+    );
+    assert_eq!(
+        recreated.image, observed.image,
+        "current image was retained"
+    );
     runtime.run(client.shutdown()).expect("shutdown daemon");
     assert!(daemon.wait_for_exit().success());
+    let registry = Registry::open_read_only(state.join("registry.sqlite3")).expect("open registry");
+    assert!(
+        registry
+            .resources(0, 32)
+            .expect("resources")
+            .items
+            .iter()
+            .any(
+                |resource| resource.id == format!("setup-container:{}", plan.content_sha256)
+                    && resource.state == ResourceState::Active
+            )
+    );
     drop(cleanup);
+    assert!(
+        inspect_container(&engine, &container_name)
+            .expect("inspect exact cleanup")
+            .is_none(),
+        "exact cleanup retained recreated app"
+    );
 }
 
 /// Run with:

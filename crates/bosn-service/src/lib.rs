@@ -983,17 +983,30 @@ pub struct SetupReconcileRecord {
     /// Unknown is conservative and must never be treated as a
     /// repair/GC candidate.
     pub drift: String,
+    /// Present only for a previewed, currently repairable `missing` record.
+    /// This opaque binding is never a Docker identifier and is revalidated by
+    /// the daemon immediately before its registry-only transition.
+    pub repair_token: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SetupReconcilePreviewPage {
     pub next: Option<u64>,
     pub records: Vec<SetupReconcileRecord>,
 }
+/// Result of confirmation-gated repair of one previewed missing setup app.
+/// The repair changes durable registry lifecycle state only; it never mutates
+/// Docker. `already_repaired` makes a repeated exact token safely idempotent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetupReconcileMissingRepairResult {
+    pub repaired: bool,
+    pub already_repaired: bool,
+}
 
 #[derive(Clone, Debug)]
 struct SetupReconcileCandidate {
     resource: Resource,
     image_identities: Vec<String>,
+    missing_repairable: bool,
 }
 type SetupReconcileCandidates = (Option<u64>, Vec<SetupReconcileCandidate>);
 
@@ -1080,6 +1093,23 @@ fn setup_gc_token(candidate: &bosn_registry::SetupGcCandidate) -> String {
     token
 }
 
+fn setup_reconcile_missing_token(candidate: &SetupReconcileCandidate) -> String {
+    let mut bytes = Vec::new();
+    for value in [
+        &candidate.resource.id,
+        &candidate.resource.name,
+        &candidate.resource.generation,
+    ] {
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(0);
+    }
+    let mut token = String::from("srm1-");
+    for byte in bytes {
+        token.push_str(&format!("{byte:02x}"));
+    }
+    token
+}
+
 fn parse_setup_gc_token(token: &str) -> Result<(String, String, String), Error> {
     let encoded = token
         .strip_prefix("sgc1-")
@@ -1115,6 +1145,14 @@ fn parse_setup_gc_token(token: &str) -> Result<(String, String, String), Error> 
         return Err(Error::Protocol("invalid setup gc candidate"));
     }
     Ok(result)
+}
+
+fn parse_setup_reconcile_missing_token(token: &str) -> Result<(String, String, String), Error> {
+    let normalized = token
+        .strip_prefix("srm1-")
+        .ok_or(Error::Protocol("invalid setup reconcile repair candidate"))?;
+    parse_setup_gc_token(&format!("sgc1-{normalized}"))
+        .map_err(|_| Error::Protocol("invalid setup reconcile repair candidate"))
 }
 
 /// One redacted setup-ensure registry event. Event details are authored by the
@@ -1256,6 +1294,48 @@ fn validate_setup_gc_preview_request_wire(request: &Request) -> Result<(), Error
 fn validate_setup_reconcile_preview_request_wire(request: &Request) -> Result<(), Error> {
     validate_setup_gc_preview_request_wire(request)
         .map_err(|_| Error::Protocol("nonsemantic setup reconcile preview fields"))
+}
+
+fn validate_setup_reconcile_repair_missing_input(
+    workspace: &str,
+    token: &str,
+    confirm: bool,
+) -> Result<(), Error> {
+    if workspace.is_empty()
+        || workspace.len() > 8 * 1024
+        || workspace.bytes().any(|byte| byte == 0)
+        || !confirm
+    {
+        return Err(Error::Protocol("invalid setup reconcile repair request"));
+    }
+    let _ = parse_setup_reconcile_missing_token(token)?;
+    Ok(())
+}
+
+fn validate_setup_reconcile_repair_missing_request_wire(request: &Request) -> Result<(), Error> {
+    validate_setup_reconcile_repair_missing_input(
+        &request.workspace,
+        &request.gc_candidate_token,
+        request.gc_confirm,
+    )?;
+    if !request.stack.is_empty()
+        || !request.digest.is_empty()
+        || request.job_id != 0
+        || request.log_after != 0
+        || request.log_limit != 0
+        || !request.setup_config.is_empty()
+        || request.setup_policy != 0
+        || request.setup_deadline_ms != 0
+        || request.setup_output_limit != 0
+        || !request.setup_task_name.is_empty()
+        || request.diagnostic_after != 0
+        || request.diagnostic_limit != 0
+        || request.setup_done_confirm
+        || request.setup_adopt_confirm
+    {
+        return Err(Error::Protocol("nonsemantic setup reconcile repair fields"));
+    }
+    Ok(())
 }
 
 fn validate_setup_gc_apply_input(workspace: &str, token: &str, confirm: bool) -> Result<(), Error> {
@@ -1552,6 +1632,32 @@ impl Client {
             Reply::SetupReconcilePreview(v) => Ok(v),
             _ => Err(Error::Protocol(
                 "unexpected setup reconcile preview response",
+            )),
+        }
+    }
+    /// Retire exactly one previewed active setup app only after fixed Docker
+    /// inspection still proves it absent. This never accepts an engine name,
+    /// image, argv, mount, or lifecycle control.
+    pub async fn setup_reconcile_repair_missing(
+        &self,
+        workspace: impl AsRef<Path>,
+        candidate_token: &str,
+        confirm: bool,
+    ) -> Result<SetupReconcileMissingRepairResult, Error> {
+        let workspace = workspace.as_ref().to_string_lossy().into_owned();
+        validate_setup_reconcile_repair_missing_input(&workspace, candidate_token, confirm)?;
+        match self
+            .call(Request {
+                workspace,
+                gc_candidate_token: candidate_token.into(),
+                gc_confirm: true,
+                ..Request::operation(20)
+            })
+            .await?
+        {
+            Reply::SetupReconcileMissingRepair(value) => Ok(value),
+            _ => Err(Error::Protocol(
+                "unexpected setup reconcile repair response",
             )),
         }
     }
@@ -1899,6 +2005,21 @@ enum DbCommand {
         after: u64,
         limit: u32,
         reply: async_engine::OneshotSender<Result<SetupReconcileCandidates, Error>>,
+    },
+    SetupMissingRepairCandidate {
+        workspace: String,
+        id: String,
+        name: String,
+        generation: String,
+        reply: async_engine::OneshotSender<Result<bool, Error>>,
+    },
+    RepairMissingSetupContainer {
+        workspace: String,
+        id: String,
+        name: String,
+        generation: String,
+        reply:
+            async_engine::OneshotSender<Result<Option<bosn_registry::SetupMissingRepair>, Error>>,
     },
     SetupGcCandidate {
         workspace: String,
@@ -2740,6 +2861,46 @@ impl RegistryActor {
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
     }
+    async fn repair_missing_setup_container(
+        &self,
+        workspace: String,
+        id: String,
+        name: String,
+        generation: String,
+    ) -> Result<Option<bosn_registry::SetupMissingRepair>, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::RepairMissingSetupContainer {
+                workspace,
+                id,
+                name,
+                generation,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
+    async fn setup_missing_repair_candidate(
+        &self,
+        workspace: String,
+        id: String,
+        name: String,
+        generation: String,
+    ) -> Result<bool, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::SetupMissingRepairCandidate {
+                workspace,
+                id,
+                name,
+                generation,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
     async fn setup_gc_candidate(
         &self,
         workspace: String,
@@ -2997,13 +3158,89 @@ async fn registry_actor(
                             containers
                                 .items
                                 .into_iter()
-                                .map(|resource| SetupReconcileCandidate {
-                                    resource,
-                                    image_identities: images.clone(),
+                                .map(|resource| {
+                                    let missing_repairable = registry
+                                        .setup_missing_repair_candidate(
+                                            &workspace,
+                                            &resource.id,
+                                            &resource.name,
+                                            &resource.generation,
+                                        )?;
+                                    Ok(SetupReconcileCandidate {
+                                        resource,
+                                        image_identities: images.clone(),
+                                        missing_repairable,
+                                    })
                                 })
-                                .collect(),
+                                .collect::<Result<Vec<_>, bosn_registry::Error>>()?,
                         ))
                     })();
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
+            DbCommand::RepairMissingSetupContainer {
+                workspace,
+                id,
+                name,
+                generation,
+                reply,
+            } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = (|| {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
+                            .as_secs_f64();
+                        let mut transaction = registry.begin_immediate()?;
+                        let repaired = transaction.repair_missing_setup_container(
+                            &workspace,
+                            &id,
+                            &name,
+                            &generation,
+                            now,
+                        )?;
+                        if repaired == Some(bosn_registry::SetupMissingRepair::Repaired) {
+                            transaction.commit()?;
+                        }
+                        Ok(repaired)
+                    })();
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
+            DbCommand::SetupMissingRepairCandidate {
+                workspace,
+                id,
+                name,
+                generation,
+                reply,
+            } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = registry.setup_missing_repair_candidate(
+                        &workspace,
+                        &id,
+                        &name,
+                        &generation,
+                    );
                     (registry, result)
                 });
                 match worker.await {
@@ -3767,6 +4004,79 @@ async fn apply_setup_gc_candidate(
         ))
 }
 
+/// Repair only the durable lifecycle accounting for one previewed setup app
+/// that fixed Docker inspection proves absent. No Docker mutation occurs: the
+/// next semantic ensure is solely responsible for creating/re-recording an
+/// app. A forged/stale token is rejected before inspection because the actor
+/// first proves the exact active ownership shape.
+async fn repair_missing_setup_reconcile_candidate(
+    actor: &RegistryActor,
+    reconcile: &dyn SetupReconcileExecutor,
+    workspace: String,
+    token: String,
+) -> Result<SetupReconcileMissingRepairResult, Error> {
+    let (id, name, generation) = parse_setup_reconcile_missing_token(&token)?;
+    if !actor
+        .setup_missing_repair_candidate(
+            workspace.clone(),
+            id.clone(),
+            name.clone(),
+            generation.clone(),
+        )
+        .await?
+    {
+        // A repeat of a successful exact token is safe and silent. All other
+        // stale/protected shapes fail closed without Docker observation.
+        return match actor
+            .repair_missing_setup_container(workspace, id, name, generation)
+            .await?
+        {
+            Some(bosn_registry::SetupMissingRepair::AlreadyRepaired) => {
+                Ok(SetupReconcileMissingRepairResult {
+                    repaired: false,
+                    already_repaired: true,
+                })
+            }
+            _ => Err(Error::Protocol(
+                "setup reconcile repair preview is stale or protected",
+            )),
+        };
+    }
+    match reconcile.inspect(&name).await {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return Err(Error::Protocol(
+                "setup reconcile candidate is no longer missing",
+            ));
+        }
+        Err(_) => {
+            return Err(Error::Protocol(
+                "setup reconcile container inspection failed",
+            ));
+        }
+    }
+    match actor
+        .repair_missing_setup_container(workspace, id, name, generation)
+        .await?
+    {
+        Some(bosn_registry::SetupMissingRepair::Repaired) => {
+            Ok(SetupReconcileMissingRepairResult {
+                repaired: true,
+                already_repaired: false,
+            })
+        }
+        Some(bosn_registry::SetupMissingRepair::AlreadyRepaired) => {
+            Ok(SetupReconcileMissingRepairResult {
+                repaired: false,
+                already_repaired: true,
+            })
+        }
+        None => Err(Error::Protocol(
+            "setup reconcile repair preview became stale",
+        )),
+    }
+}
+
 /// Stop a live retired candidate with no caller-controlled Docker input. A
 /// subsequent fixed inspection proves it transitioned to stopped before the
 /// actor records the event. The registry record is intentionally retained.
@@ -4279,10 +4589,13 @@ async fn handle(
                         for candidate in candidates {
                             let inspected = reconcile.inspect(&candidate.resource.name).await;
                             let drift = classify_setup_reconcile(&candidate, inspected);
+                            let repair_token = (drift == "missing" && candidate.missing_repairable)
+                                .then(|| setup_reconcile_missing_token(&candidate));
                             records.push(SetupReconcileRecord {
                                 id: candidate.resource.id,
                                 name: candidate.resource.name,
                                 generation: candidate.resource.generation,
+                                repair_token,
                                 drift: drift.into(),
                             });
                         }
@@ -4297,6 +4610,31 @@ async fn handle(
                             ..Default::default()
                         }
                     }
+                    Err(_) => ReplyWire {
+                        code: 3,
+                        ..Default::default()
+                    },
+                },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
+            20 => match validate_setup_reconcile_repair_missing_request_wire(&r) {
+                Ok(()) => match repair_missing_setup_reconcile_candidate(
+                    &actor,
+                    reconcile.as_ref(),
+                    r.workspace,
+                    r.gc_candidate_token,
+                )
+                .await
+                {
+                    Ok(result) => ReplyWire {
+                        code: 170,
+                        setup_reconcile_repaired: result.repaired,
+                        setup_reconcile_already_repaired: result.already_repaired,
+                        ..Default::default()
+                    },
                     Err(_) => ReplyWire {
                         code: 3,
                         ..Default::default()
@@ -4639,6 +4977,10 @@ struct ReplyWire {
     setup_retired_already_stopped: bool,
     #[prost(message, repeated, tag = "37")]
     setup_reconcile_records: Vec<SetupReconcileRecordWire>,
+    #[prost(bool, tag = "38")]
+    setup_reconcile_repaired: bool,
+    #[prost(bool, tag = "39")]
+    setup_reconcile_already_repaired: bool,
 }
 #[derive(Message)]
 struct LogRecordWire {
@@ -4774,6 +5116,8 @@ struct SetupReconcileRecordWire {
     generation: String,
     #[prost(string, tag = "4")]
     drift: String,
+    #[prost(string, tag = "5")]
+    repair_token: String,
 }
 impl From<SetupReconcileRecord> for SetupReconcileRecordWire {
     fn from(value: SetupReconcileRecord) -> Self {
@@ -4782,6 +5126,7 @@ impl From<SetupReconcileRecord> for SetupReconcileRecordWire {
             name: value.name,
             generation: value.generation,
             drift: value.drift,
+            repair_token: value.repair_token.unwrap_or_default(),
         }
     }
 }
@@ -4792,6 +5137,7 @@ impl From<SetupReconcileRecordWire> for SetupReconcileRecord {
             name: value.name,
             generation: value.generation,
             drift: value.drift,
+            repair_token: (!value.repair_token.is_empty()).then_some(value.repair_token),
         }
     }
 }
@@ -4812,6 +5158,7 @@ enum Reply {
     SetupAdopt(SetupAdoptResult),
     Doctor(DoctorReport),
     SetupReconcilePreview(SetupReconcilePreviewPage),
+    SetupReconcileMissingRepair(SetupReconcileMissingRepairResult),
 }
 fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
     match v.code {
@@ -4896,6 +5243,12 @@ fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
                 .map(Into::into)
                 .collect(),
         })),
+        170 => Ok(Reply::SetupReconcileMissingRepair(
+            SetupReconcileMissingRepairResult {
+                repaired: v.setup_reconcile_repaired,
+                already_repaired: v.setup_reconcile_already_repaired,
+            },
+        )),
         1 => Err(Error::Protocol("unsupported protocol")),
         2 => Err(Error::Protocol("unknown operation")),
         _ => Err(Error::Protocol("daemon error")),
@@ -4956,6 +5309,38 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_missing_token_is_exact_and_rejects_gc_or_tampered_forms() {
+        let candidate = SetupReconcileCandidate {
+            resource: Resource {
+                id: "setup-container:abc".into(),
+                kind: ResourceKind::Container,
+                name: "bosn-setup-abc".into(),
+                stack: "setup".into(),
+                generation: "sha256:abc".into(),
+                scope: Scope::Machine,
+                workspace: "/work".into(),
+                created_at: 1.0,
+                last_used: 1.0,
+                state: ResourceState::Active,
+                retention: Retention::Pinned,
+            },
+            image_identities: vec![],
+            missing_repairable: true,
+        };
+        let token = setup_reconcile_missing_token(&candidate);
+        assert_eq!(
+            parse_setup_reconcile_missing_token(&token).unwrap(),
+            (
+                "setup-container:abc".into(),
+                "bosn-setup-abc".into(),
+                "sha256:abc".into()
+            )
+        );
+        assert!(parse_setup_reconcile_missing_token(&(token + "00")).is_err());
+        assert!(parse_setup_reconcile_missing_token("sgc1-7465737400").is_err());
+    }
+
+    #[test]
     fn reconcile_classifies_all_read_only_observations_conservatively() {
         let candidate = SetupReconcileCandidate {
             resource: Resource {
@@ -4972,6 +5357,7 @@ mod tests {
                 retention: Retention::Pinned,
             },
             image_identities: vec!["sha256:image".into()],
+            missing_repairable: true,
         };
         let observed = |running| SetupReconcileObserved {
             name: "/bosn-setup-abc".into(),
@@ -5035,6 +5421,34 @@ mod tests {
         malformed.setup_config.clear();
         malformed.diagnostic_limit = MAX_REGISTRY_DIAGNOSTIC_PAGE + 1;
         assert!(validate_setup_reconcile_preview_request_wire(&malformed).is_err());
+    }
+
+    #[test]
+    fn reconcile_missing_repair_wire_requires_confirmation_and_only_a_token() {
+        let valid = Request {
+            workspace: "/work".into(),
+            gc_candidate_token: "srm1-610062006300".into(),
+            gc_confirm: true,
+            ..Request::operation(20)
+        };
+        assert!(validate_setup_reconcile_repair_missing_request_wire(&valid).is_ok());
+        let missing_confirmation = Request {
+            workspace: "/work".into(),
+            gc_candidate_token: "srm1-610062006300".into(),
+            gc_confirm: false,
+            ..Request::operation(20)
+        };
+        assert!(
+            validate_setup_reconcile_repair_missing_request_wire(&missing_confirmation).is_err()
+        );
+        let nonsemantic = Request {
+            workspace: "/work".into(),
+            gc_candidate_token: "srm1-610062006300".into(),
+            gc_confirm: true,
+            setup_config: "https://attacker.invalid/setup.toml".into(),
+            ..Request::operation(20)
+        };
+        assert!(validate_setup_reconcile_repair_missing_request_wire(&nonsemantic).is_err());
     }
 
     #[test]

@@ -557,8 +557,13 @@ fn run_setup(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
 }
 
 fn run_setup_reconcile(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("preview")) {
-        usage();
+    match arguments.next().as_deref() {
+        Some(command) if command == "preview" => {}
+        Some(command) if command == "repair-missing" => {
+            run_setup_reconcile_repair_missing(arguments);
+            return;
+        }
+        _ => usage(),
     }
     let (state_dir, workspace, after, limit, json_output) =
         parse_gc_preview_arguments(arguments).unwrap_or_else(|_| usage());
@@ -586,6 +591,76 @@ fn run_setup_reconcile(mut arguments: impl Iterator<Item = std::ffi::OsString>) 
                 );
             } else {
                 eprintln!("bosn setup reconcile preview: daemon unavailable or request failed");
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Confirmation-gated registry repair for one opaque missing-drift preview
+/// token. The CLI never accepts a Docker identifier or lifecycle control.
+fn run_setup_reconcile_repair_missing(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
+    let mut state_dir = None;
+    let mut workspace = None;
+    let mut token = None;
+    let mut apply = false;
+    let mut yes = false;
+    let mut json_output = false;
+    while let Some(argument) = arguments.next() {
+        match argument.to_string_lossy().as_ref() {
+            "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
+            "--workspace" => set_once_parsed(&mut workspace, arguments.next(), parse_state_dir),
+            "--candidate" => set_once_parsed(&mut token, arguments.next(), |value| {
+                value.to_str().map(str::to_owned).ok_or(())
+            }),
+            "--apply" if !apply => {
+                apply = true;
+                Ok(())
+            }
+            "--yes" if !yes => {
+                yes = true;
+                Ok(())
+            }
+            "--json" if !json_output => {
+                json_output = true;
+                Ok(())
+            }
+            _ => Err(()),
+        }
+        .unwrap_or_else(|_| usage());
+    }
+    let (Some(state_dir), Some(workspace), Some(token)) = (state_dir, workspace, token) else {
+        usage();
+    };
+    if !apply || !yes {
+        usage();
+    }
+    let result = Client::for_state(&state_dir).ok().and_then(|client| {
+        RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .ok()
+            .and_then(|runtime| {
+                runtime
+                    .run(client.setup_reconcile_repair_missing(workspace, &token, true))
+                    .ok()
+            })
+    });
+    match result {
+        Some(result) => println!(
+            "{}",
+            json!({"action":"setup_reconcile_repair_missing","repaired":result.repaired,"already_repaired":result.already_repaired})
+        ),
+        None => {
+            if json_output {
+                println!(
+                    "{}",
+                    json!({"action":"setup_reconcile_repair_missing","error":"daemon unavailable or request failed"})
+                );
+            } else {
+                eprintln!(
+                    "bosn setup reconcile repair-missing: daemon unavailable or request failed"
+                );
             }
             std::process::exit(1);
         }
@@ -1532,7 +1607,7 @@ fn usage() -> ! {
         "   or: bosn setup ensure --state-dir STATE_DIR --workspace WORKSPACE --config LOCATOR (--refresh | --offline) --deadline-ms 1..=300000 --output-limit 1..=8388608 [--json]"
     );
     eprintln!(
-        "   or: bosn setup reconcile preview --state-dir STATE_DIR --workspace WORKSPACE [--after CURSOR] [--limit 1..=64] [--json]"
+        "   or: bosn setup reconcile preview --state-dir STATE_DIR --workspace WORKSPACE [--after CURSOR] [--limit 1..=64] [--json]\n   or: bosn setup reconcile repair-missing --state-dir STATE_DIR --workspace WORKSPACE --candidate TOKEN --apply --yes [--json]"
     );
     eprintln!("   or: bosn setup done --state-dir STATE_DIR --workspace WORKSPACE --yes [--json]");
     eprintln!(

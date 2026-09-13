@@ -147,6 +147,16 @@ pub struct SetupGcCandidate {
     pub generation: String,
 }
 
+/// Result of the narrowly-scoped repair for a setup container which Docker
+/// has proved absent.  This is intentionally distinct from GC: the durable
+/// record is retained, but its exact active use is retired so a later ensure
+/// can recreate and record a replacement generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetupMissingRepair {
+    Repaired,
+    AlreadyRepaired,
+}
+
 /// Stable summary of why setup containers in one workspace were protected or
 /// excluded from a GC preview. Counts can overlap: a doubtful record should
 /// remain protected for every reason observed rather than be made eligible by
@@ -842,6 +852,72 @@ impl<'a> Immediate<'a> {
         )?;
         Ok(true)
     }
+    /// Retire one exact, currently-active managed setup container/use after
+    /// the daemon has independently proved the exact Docker container absent.
+    ///
+    /// The predicate is deliberately stricter than a general resource update:
+    /// one active `setup` use at the supplied workspace/generation is required,
+    /// every other use is refused, and leases/sessions protect the record. The
+    /// state transition and compact event are one immediate transaction.
+    pub fn repair_missing_setup_container(
+        &mut self,
+        workspace: &str,
+        id: &str,
+        name: &str,
+        generation: &str,
+        at: f64,
+    ) -> Result<Option<SetupMissingRepair>, Error> {
+        if setup_missing_repair_candidate_exists(
+            &mut self.transaction,
+            workspace,
+            id,
+            name,
+            generation,
+            ResourceState::Active.as_str(),
+        )? {
+            let retired = ResourceState::Retired.as_str();
+            let active = ResourceState::Active.as_str();
+            let uses = self.transaction.execute(
+                "UPDATE resource_uses SET state=?,last_used=? WHERE resource_id=? AND workspace=? AND stack='setup' AND generation=? AND state=?",
+                &[
+                    Value::Text(retired.into()), Value::Real(at), Value::Text(id.into()),
+                    Value::Text(workspace.into()), Value::Text(generation.into()), Value::Text(active.into()),
+                ],
+            )?;
+            let resources = self.transaction.execute(
+                "UPDATE resources SET state=?,last_used=? WHERE id=? AND state=?",
+                &[
+                    Value::Text(retired.into()),
+                    Value::Real(at),
+                    Value::Text(id.into()),
+                    Value::Text(active.into()),
+                ],
+            )?;
+            if uses != 1 || resources != 1 {
+                return Err(Error::BadRow("missing setup repair transition"));
+            }
+            self.append_event(
+                at,
+                "setup.reconcile.missing_repaired",
+                "missing_managed_setup_container",
+            )?;
+            return Ok(Some(SetupMissingRepair::Repaired));
+        }
+        // A repeated token is harmless.  We only report this idempotent result
+        // when the same narrow ownership shape is already retired; all other
+        // mutations, including a new lease/session or foreign use, stay stale.
+        if setup_missing_repair_candidate_exists(
+            &mut self.transaction,
+            workspace,
+            id,
+            name,
+            generation,
+            ResourceState::Retired.as_str(),
+        )? {
+            return Ok(Some(SetupMissingRepair::AlreadyRepaired));
+        }
+        Ok(None)
+    }
     pub fn set_meta(&mut self, key: &str, value: &str) -> Result<(), Error> {
         if matches!(key, "schema_version" | "registry_id") || key == RECONCILIATION_REQUIRED {
             return Err(Error::ReservedMeta("schema_version or registry_id"));
@@ -1437,6 +1513,25 @@ impl Registry {
     ) -> Result<Option<SetupGcCandidate>, Error> {
         setup_gc_candidate(&mut self.connection, workspace, id, name, generation)
     }
+    /// Re-read one exact active managed setup container eligible for the
+    /// missing-container repair path.  This is a registry-only authorization
+    /// predicate; the daemon must still prove Docker reports it absent.
+    pub fn setup_missing_repair_candidate(
+        &mut self,
+        workspace: &str,
+        id: &str,
+        name: &str,
+        generation: &str,
+    ) -> Result<bool, Error> {
+        setup_missing_repair_candidate_exists(
+            &mut self.connection,
+            workspace,
+            id,
+            name,
+            generation,
+            ResourceState::Active.as_str(),
+        )
+    }
     pub fn resource_uses(&self, offset: usize, limit: usize) -> Result<Page<ResourceUse>, Error> {
         page(
             &self.connection,
@@ -1847,6 +1942,47 @@ fn setup_gc_candidate_exists(
             Value::Text(workspace.into()),
             Value::Text(workspace.into()),
             Value::Text(workspace.into()),
+        ],
+    )?;
+    Ok(!rows.is_empty())
+}
+
+/// Exact predicate shared by missing-drift preview revalidation and its
+/// transactional repair. Unlike GC, this covers only the live active
+/// generation which has exactly one local setup use. A resource with another
+/// use, lease, or execution session is ambiguous and therefore protected.
+fn setup_missing_repair_candidate_exists(
+    connection: &mut impl SetupGcQuery,
+    workspace: &str,
+    id: &str,
+    name: &str,
+    generation: &str,
+    state: &str,
+) -> Result<bool, Error> {
+    let rows = connection.setup_gc_query(
+        "SELECT 1 FROM resources AS r WHERE r.id=? AND r.name=? AND r.generation=? \
+         AND r.kind='container' AND r.stack='setup' AND r.workspace=? \
+         AND r.state=? AND r.scope='machine' \
+         AND r.id GLOB 'setup-container:*' AND r.name GLOB 'bosn-setup-*' \
+         AND EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id \
+            AND u.workspace=? AND u.stack='setup' AND u.generation=? AND u.state=?) \
+         AND NOT EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id \
+            AND (u.workspace<>? OR u.stack<>'setup' OR u.generation<>? OR u.state<>?)) \
+         AND NOT EXISTS (SELECT 1 FROM leases AS l WHERE l.resource_id=r.id) \
+         AND NOT EXISTS (SELECT 1 FROM execution_sessions AS s \
+            WHERE s.container_id=r.id OR s.container_id=r.name) LIMIT 1",
+        &[
+            Value::Text(id.into()),
+            Value::Text(name.into()),
+            Value::Text(generation.into()),
+            Value::Text(workspace.into()),
+            Value::Text(state.into()),
+            Value::Text(workspace.into()),
+            Value::Text(generation.into()),
+            Value::Text(state.into()),
+            Value::Text(workspace.into()),
+            Value::Text(generation.into()),
+            Value::Text(state.into()),
         ],
     )?;
     Ok(!rows.is_empty())

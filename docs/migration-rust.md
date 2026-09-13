@@ -167,7 +167,20 @@ are `matching_running`, `matching_stopped`, `missing`, `name_mismatch`,
 and never becomes a repair/GC candidate.
 The check requires exact deterministic name, all Bosn ownership labels, and a
 recorded Docker image identity. It returns neither workspace paths nor raw
-engine output, and has no apply, adoption, lifecycle, or SQLite-write path.
+engine output. A record that is `missing` and has exactly one active local
+`setup` use, with no foreign use, lease, or execution session, includes an
+opaque repair token. Only that token may be applied through `bosn setup
+reconcile repair-missing --state-dir STATE --workspace WORKSPACE --candidate
+TOKEN --apply --yes`, Python
+`Client.setup_reconcile_repair_missing(workspace, token, confirm=True)`, or
+MCP `bosn_setup_reconcile_repair_missing` with `confirm: true`. The daemon
+rereads every registry predicate, performs only fixed exact Docker inspection,
+and requires the container to remain absent before one immediate transaction
+retires exactly that resource/use and appends a redacted reconciliation event.
+It never creates, starts, stops, removes, or otherwise mutates Docker; a later
+semantic ensure is responsible for recreating an app. Repeating the exact
+already-repaired token is a no-write success; any mismatch, lease/session,
+foreign use, or changed observation refuses.
 
 ### Setup GC preview and narrowly confirmed apply
 

@@ -4,7 +4,7 @@ use std::io::Write as _;
 use bosn_core::{ResourceKind, ResourceState, Retention, Scope};
 use bosn_registry::{
     Error, ExecutionSession, Generation, Lease, Registry, Resource, ResourceUse,
-    VolumeCreationIntent, acquire_legacy_migration_guard, import_python_v4,
+    SetupMissingRepair, VolumeCreationIntent, acquire_legacy_migration_guard, import_python_v4,
 };
 
 #[test]
@@ -293,6 +293,219 @@ fn resource(id: &str, name: &str) -> Resource {
         state: ResourceState::Active,
         retention: Retention::Pinned,
     }
+}
+
+fn active_setup_container(id: &str, name: &str, workspace: &str, generation: &str) -> Resource {
+    Resource {
+        id: id.into(),
+        kind: ResourceKind::Container,
+        name: name.into(),
+        stack: "setup".into(),
+        generation: generation.into(),
+        scope: Scope::Machine,
+        workspace: workspace.into(),
+        created_at: 1.0,
+        last_used: 1.0,
+        state: ResourceState::Active,
+        retention: Retention::Pinned,
+    }
+}
+
+fn active_setup_use(id: &str, workspace: &str, generation: &str) -> ResourceUse {
+    ResourceUse {
+        resource_id: id.into(),
+        workspace: workspace.into(),
+        stack: "setup".into(),
+        generation: generation.into(),
+        last_used: 1.0,
+        state: ResourceState::Active,
+    }
+}
+
+#[test]
+fn missing_setup_repair_is_exact_atomic_idempotent_and_protects_ambiguous_state() {
+    let (_directory, path) = database_path();
+    let mut registry =
+        Registry::create_writer(&path, "11111111-2222-4333-8444-555555555555").unwrap();
+    let workspace = "/canonical/work";
+    let id = "setup-container:missing";
+    let name = "bosn-setup-missing";
+    let generation = "sha256:missing";
+    let mut tx = registry.begin_immediate().unwrap();
+    tx.put_resource(&active_setup_container(id, name, workspace, generation))
+        .unwrap();
+    tx.put_resource_use(&active_setup_use(id, workspace, generation))
+        .unwrap();
+    tx.commit().unwrap();
+
+    let mut tx = registry.begin_immediate().unwrap();
+    assert_eq!(
+        tx.repair_missing_setup_container(workspace, id, name, generation, 2.0)
+            .unwrap(),
+        Some(SetupMissingRepair::Repaired)
+    );
+    tx.commit().unwrap();
+    assert!(
+        registry
+            .resources(0, 10)
+            .unwrap()
+            .items
+            .iter()
+            .any(|r| r.id == id && r.state == ResourceState::Retired)
+    );
+    assert!(
+        registry
+            .resource_uses(0, 10)
+            .unwrap()
+            .items
+            .iter()
+            .any(|u| u.resource_id == id && u.state == ResourceState::Retired)
+    );
+    assert_eq!(
+        registry
+            .events(0, 10)
+            .unwrap()
+            .items
+            .iter()
+            .filter(|event| event.kind == "setup.reconcile.missing_repaired")
+            .count(),
+        1
+    );
+    let mut tx = registry.begin_immediate().unwrap();
+    assert_eq!(
+        tx.repair_missing_setup_container(workspace, id, name, generation, 3.0)
+            .unwrap(),
+        Some(SetupMissingRepair::AlreadyRepaired)
+    );
+    drop(tx);
+    assert_eq!(
+        registry.events(0, 10).unwrap().items.len(),
+        1,
+        "repeat does not write"
+    );
+
+    // Foreign uses, leases, sessions, and identity/generation mismatch all
+    // fail closed and dropping the transaction proves no partial state/event.
+    for (suffix, foreign_use, lease, session) in [
+        ("foreign", true, false, false),
+        ("lease", false, true, false),
+        ("session", false, false, true),
+    ] {
+        let candidate_id = format!("setup-container:{suffix}");
+        let candidate_name = format!("bosn-setup-{suffix}");
+        let mut tx = registry.begin_immediate().unwrap();
+        tx.put_resource(&active_setup_container(
+            &candidate_id,
+            &candidate_name,
+            workspace,
+            generation,
+        ))
+        .unwrap();
+        tx.put_resource_use(&active_setup_use(&candidate_id, workspace, generation))
+            .unwrap();
+        if foreign_use {
+            tx.put_resource_use(&active_setup_use(&candidate_id, "/other/work", generation))
+                .unwrap();
+        }
+        if lease {
+            tx.put_lease(&Lease {
+                id: format!("lease-{suffix}"),
+                resource_id: candidate_id.clone(),
+                pid: 1,
+                proc_start: None,
+                acquired_at: 1.0,
+                heartbeat_at: 1.0,
+                ttl_seconds: 1.0,
+            })
+            .unwrap();
+        }
+        if session {
+            tx.put_execution_session(&ExecutionSession {
+                id: format!("session-{suffix}"),
+                container_id: candidate_name.clone(),
+                engine_binary: "docker".into(),
+                client_pid: 1,
+                client_start: None,
+                lease_ids: vec![],
+            })
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        let mut tx = registry.begin_immediate().unwrap();
+        assert_eq!(
+            tx.repair_missing_setup_container(
+                workspace,
+                &candidate_id,
+                &candidate_name,
+                generation,
+                4.0
+            )
+            .unwrap(),
+            None
+        );
+        drop(tx);
+        assert!(
+            registry
+                .resources(0, 20)
+                .unwrap()
+                .items
+                .iter()
+                .any(|r| r.id == candidate_id && r.state == ResourceState::Active)
+        );
+    }
+    let mut tx = registry.begin_immediate().unwrap();
+    assert_eq!(
+        tx.repair_missing_setup_container(
+            workspace,
+            "setup-container:missing",
+            name,
+            "sha256:wrong",
+            5.0
+        )
+        .unwrap(),
+        None
+    );
+    drop(tx);
+
+    let rollback_id = "setup-container:rollback";
+    let rollback_name = "bosn-setup-rollback";
+    let mut tx = registry.begin_immediate().unwrap();
+    tx.put_resource(&active_setup_container(
+        rollback_id,
+        rollback_name,
+        workspace,
+        generation,
+    ))
+    .unwrap();
+    tx.put_resource_use(&active_setup_use(rollback_id, workspace, generation))
+        .unwrap();
+    tx.commit().unwrap();
+    let mut tx = registry.begin_immediate().unwrap();
+    assert_eq!(
+        tx.repair_missing_setup_container(workspace, rollback_id, rollback_name, generation, 6.0)
+            .unwrap(),
+        Some(SetupMissingRepair::Repaired)
+    );
+    drop(tx);
+    assert!(
+        registry
+            .resources(0, 32)
+            .unwrap()
+            .items
+            .iter()
+            .any(|r| r.id == rollback_id && r.state == ResourceState::Active)
+    );
+    assert_eq!(
+        registry
+            .events(0, 32)
+            .unwrap()
+            .items
+            .iter()
+            .filter(|event| event.kind == "setup.reconcile.missing_repaired")
+            .count(),
+        1,
+        "dropped repair rolls back state and event"
+    );
 }
 
 #[test]
