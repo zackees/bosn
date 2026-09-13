@@ -62,6 +62,7 @@ pub enum Error {
     UnsupportedSchema(u32),
     BadRow(&'static str),
     WriterAlreadyHeld(PathBuf),
+    MigrationGuardHeld(PathBuf),
     ReplacedPath(PathBuf),
     InvalidSchema,
     ResourceIdentityConflict,
@@ -159,6 +160,35 @@ pub struct Page<T> {
 pub struct Registry {
     connection: Connection,
     _writer: kernal_api::platform::fs::OwnedFileLock,
+}
+
+/// Exclusive proof that every bridge-capable Python writer has closed its
+/// registry connection. The guard names the state-directory lock file, not
+/// the SQLite source, and is held by the eventual importer for its complete
+/// backup/import interval.
+pub struct LegacyMigrationGuard {
+    _lock: kernal_api::platform::fs::OwnedFileLock,
+}
+
+/// Acquire the Rust half of the Python-v4 cooperative cutover protocol.
+///
+/// This intentionally does not claim that a pre-bridge Python release was
+/// fenced: callers must validate the durable bridge cutover proof before
+/// treating this guard as source quiescence. It does prove that all writers
+/// which implement the bridge's shared lock have closed.
+pub fn acquire_legacy_migration_guard(
+    state_dir: impl AsRef<Path>,
+) -> Result<LegacyMigrationGuard, Error> {
+    let path = state_dir.as_ref().join("registry.migration.lock");
+    let file = fs::open_lock_file(&path)?;
+    let lock = fs::try_lock_exclusive_owned(file).map_err(|error| {
+        if fs::is_lock_conflict(&error) {
+            Error::MigrationGuardHeld(path)
+        } else {
+            Error::Io(error)
+        }
+    })?;
+    Ok(LegacyMigrationGuard { _lock: lock })
 }
 pub struct Immediate<'a> {
     transaction: Transaction<'a>,

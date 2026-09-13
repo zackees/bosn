@@ -4,6 +4,15 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 
+[features]
+# Test harness only; excludes the cross-language lock helper from normal builds.
+migration-test-helper = []
+
+[[bin]]
+name = "migration-guard-test"
+path = "src/bin/migration-guard-test.rs"
+required-features = ["migration-test-helper"]
+
 [dependencies]
 bosn-core = { path = "../bosn-core" }
 serde_json = "=1.0.149"

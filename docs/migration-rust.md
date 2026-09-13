@@ -191,6 +191,52 @@ validation; those Phase 1/platform gates remain open.
 extracted registry package at that merge (47.55 seconds on this host). This checks
 the packaged SQLite feature graph, not every optional kernel feature or publication.
 
+### Python-v4 offline-import quiescence gate (2026-09-13)
+
+The v4 importer remains pending, but its cooperative Python bridge is implemented
+in this checkout. A safe importer must prove that the legacy Python daemon cannot
+write the source for the complete snapshot/import interval; a caller-supplied
+`quiesced: bool`, PID file, or one-time ping is not such proof.
+
+The Python daemon cannot be guarded by acquiring its SQLite file lock: it does not
+participate in `kernal-api`'s advisory file-lock protocol.  Its actual singleton is
+the deterministic loopback TCP endpoint calculated by `bosn.daemon.port_for` (with
+an explicit `BOSN_PORT` override).  However, `Daemon.__init__` opens
+`registry.sqlite3` before `serve_forever` binds that endpoint, while `shutdown()`
+closes the server endpoint before it has necessarily closed the registry (background
+work can defer registry close).  Consequently, either a free port or even a held
+port alone is insufficient evidence that no Python writer remains.
+
+The pinned public kernel API has SQLite backup/checkpoint and process-identity
+facades, plus local-IPC listeners, but no public loopback-TCP endpoint ownership.
+Bosn therefore uses a cooperative bridge rather than claiming to reserve the old
+TCP singleton: every writable bridge-capable Python `Registry` holds a shared lock
+on `registry.migration.lock` from before marker recheck through successful SQLite
+close (including deferred daemon close); Rust's public kernel filesystem facade
+takes the same lock exclusively. A real cross-language subprocess test proves the
+POSIX `flock` interaction. On Windows the Python bridge calls `LockFileEx` on the
+same single byte at offset `1 << 62` that kernal-api uses, rather than assuming a
+default third-party lock convention is compatible.
+
+The authenticated `migration-cutover` daemon verb closes mutation/stream admission,
+refuses active requests/jobs/execution ownership, requests daemon shutdown, and
+publishes the private create-new `rust-cutover-v1.json` marker with the source
+registry UUID. Existing bridge holders must close before Rust can obtain exclusive
+ownership; every later writable Python registry rechecks that marker under its
+shared lock and refuses to open. A malformed, unreadable, dangling, or conflicting
+marker fails closed and is never replaced. The marker is deliberate state-directory
+metadata, not a write to the source SQLite database.
+
+This only fences upgraded cooperative binaries. An older Python release cannot be
+inferred absent from a missing port or state file; activation must authenticate its
+shutdown and verify its exact process identity exited before starting the bridge
+release, otherwise import is refused. That old-release activation/proof consumer is
+not implemented yet, and neither is the importer; no current command represents a
+validated import authorization. The eventual importer must validate the marker/proof,
+retain exclusive ownership through SQLite's non-overwriting consistent backup and
+destination transaction, reject live or unclassifiable lease/session ownership, and
+leave the destination reconciliation-required.
+
 | Concern | Owner | Required migration rule |
 | --- | --- | --- |
 | SQLite connection/transactions/read-only/WAL/busy/integrity backup | kernal-api facade (new opt-in capability) | Bosn owns SQL/schema/migration/import policy; facade owns backend dependency and lifecycle primitives |

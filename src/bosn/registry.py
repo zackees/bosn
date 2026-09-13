@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from bosn.clock import Clock, SystemClock
+from bosn.migration_lock import CutoverError, SharedMigrationLock, acquire_shared
 
 SCHEMA_VERSION = 4
 
@@ -197,30 +198,53 @@ class Registry:
         self.read_only = read_only
         if not read_only:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._migration_lock: SharedMigrationLock | None = None
+        if not read_only:
+            try:
+                # This takes SH before checking the marker, so an exclusive Rust import
+                # cannot publish cutover between a legacy check and its SQLite open.
+                self._migration_lock = acquire_shared(self.path.parent)
+            except CutoverError as exc:
+                raise RegistryError(f"Rust migration cutover refuses legacy writer: {exc}") from exc
         # The daemon serves requests on a thread pool while owning one connection, so the
         # connection must outlive its creating thread; a lock keeps it single-writer.
         self._lock = threading.RLock()
-        if read_only:
-            # URI mode=ro refuses a missing database and prevents SQLite from creating WAL,
-            # schema, or migration state behind a supposedly read-only CLI command.
-            uri = f"file:{self.path.as_posix()}?mode=ro"
-            self.conn = sqlite3.connect(
-                uri, uri=True, isolation_level=None, check_same_thread=False
-            )
-        else:
-            self.conn = sqlite3.connect(
-                str(self.path), isolation_level=None, check_same_thread=False
-            )
-        self.conn.row_factory = sqlite3.Row
-        with self._lock:
-            if not read_only:
-                self.conn.execute("PRAGMA journal_mode=WAL")
-            self.conn.execute("PRAGMA foreign_keys=ON")
-            self.conn.execute("PRAGMA busy_timeout=5000")
-            if not read_only:
-                self.conn.executescript(SCHEMA)
-                self._ensure_meta()
-                self._migrate_schema()
+        try:
+            if read_only:
+                # URI mode=ro refuses a missing database and prevents SQLite from creating WAL,
+                # schema, or migration state behind a supposedly read-only CLI command.
+                uri = f"file:{self.path.as_posix()}?mode=ro"
+                self.conn = sqlite3.connect(
+                    uri, uri=True, isolation_level=None, check_same_thread=False
+                )
+            else:
+                self.conn = sqlite3.connect(
+                    str(self.path), isolation_level=None, check_same_thread=False
+                )
+            self.conn.row_factory = sqlite3.Row
+            with self._lock:
+                if not read_only:
+                    self.conn.execute("PRAGMA journal_mode=WAL")
+                self.conn.execute("PRAGMA foreign_keys=ON")
+                self.conn.execute("PRAGMA busy_timeout=5000")
+                if not read_only:
+                    self.conn.executescript(SCHEMA)
+                    self._ensure_meta()
+                    self._migrate_schema()
+        except KeyboardInterrupt:
+            if hasattr(self, "conn"):
+                self.conn.close()
+            if self._migration_lock is not None:
+                self._migration_lock.close()
+                self._migration_lock = None
+            raise
+        except Exception:
+            if hasattr(self, "conn"):
+                self.conn.close()
+            if self._migration_lock is not None:
+                self._migration_lock.close()
+                self._migration_lock = None
+            raise
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -233,6 +257,12 @@ class Registry:
     def close(self) -> None:
         with self._lock:
             self.conn.close()
+            # Never release before SQLite actually closes: the importer waits for EX
+            # to prove every cooperative writer, including deferred daemon shutdown,
+            # has stopped using the source. If close fails, leave the guard held.
+            if self._migration_lock is not None:
+                self._migration_lock.close()
+                self._migration_lock = None
 
     def _exec(self, sql: str, params: tuple[object, ...] = ()) -> sqlite3.Cursor:
         """Every statement goes through here so the daemon stays single-writer."""

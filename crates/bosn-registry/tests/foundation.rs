@@ -3,8 +3,20 @@ use std::collections::BTreeMap;
 use bosn_core::{ResourceKind, ResourceState, Retention, Scope};
 use bosn_registry::{
     Error, ExecutionSession, Generation, Lease, Registry, Resource, ResourceUse,
-    VolumeCreationIntent,
+    VolumeCreationIntent, acquire_legacy_migration_guard,
 };
+
+#[test]
+fn bridge_migration_guard_excludes_a_second_rust_importer() {
+    let (directory, _path) = database_path();
+    let guard = acquire_legacy_migration_guard(directory.path()).unwrap();
+    assert!(matches!(
+        acquire_legacy_migration_guard(directory.path()),
+        Err(Error::MigrationGuardHeld(_))
+    ));
+    drop(guard);
+    acquire_legacy_migration_guard(directory.path()).unwrap();
+}
 
 fn database_path() -> (
     kernal_api::platform::fs::TemporaryDirectory,
