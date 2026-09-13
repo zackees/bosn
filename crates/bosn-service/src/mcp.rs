@@ -15,6 +15,10 @@
 //! numeric arguments are bounded before they reach the native daemon.
 
 use crate::{Client, Error, JobLogPage, JobStatus, Status};
+use bosn_setup::{
+    SetupAcquirePolicy, SetupPlan, SetupPlanAppSource, SetupPlanRequest, SetupSourceKind,
+    plan_setup,
+};
 use kernal_api::async_engine::{Runtime, RuntimeBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -30,6 +34,9 @@ pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 /// Leave room below the product daemon's one-mebibyte IPC frame limit.
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_MCP_LOG_RECORDS: u32 = 64;
+/// Bound filesystem and URL strings independently from the JSON-RPC line
+/// bound.  `bosn-core` also validates the locator before it is observed.
+const MAX_MCP_SETUP_STRING_BYTES: usize = 8 * 1024;
 
 /// Native default matching the current Python command's state-root contract.
 pub fn default_state_dir() -> PathBuf {
@@ -70,10 +77,12 @@ pub fn serve_stdio(state_dir: impl Into<PathBuf>) -> Result<(), Error> {
         .enable_all()
         .build()
         .map_err(Error::Io)?;
-    let client = Client::for_state(state_dir.into())?;
+    let state_dir = state_dir.into();
+    let client = Client::for_state(&state_dir)?;
     let mut backend = DaemonBackend {
         runtime: &runtime,
         client,
+        state_dir,
     };
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -85,11 +94,21 @@ trait Backend {
     fn job_status(&mut self, id: u64) -> Result<JobStatus, Error>;
     fn job_logs(&mut self, id: u64, after: u64, limit: u32) -> Result<JobLogPage, Error>;
     fn cancel_job(&mut self, id: u64) -> Result<(), Error>;
+    /// Generate an inert setup receipt under the state root selected when the
+    /// MCP process was started.  Tool arguments intentionally cannot replace
+    /// that root.
+    fn setup_plan(
+        &mut self,
+        workspace: PathBuf,
+        locator: String,
+        policy: SetupAcquirePolicy,
+    ) -> Result<SetupPlan, Error>;
 }
 
 struct DaemonBackend<'a> {
     runtime: &'a Runtime,
     client: Client,
+    state_dir: PathBuf,
 }
 impl Backend for DaemonBackend<'_> {
     fn status(&mut self) -> Result<Status, Error> {
@@ -103,6 +122,22 @@ impl Backend for DaemonBackend<'_> {
     }
     fn cancel_job(&mut self, id: u64) -> Result<(), Error> {
         self.runtime.run(self.client.cancel_job(id))
+    }
+    fn setup_plan(
+        &mut self,
+        workspace: PathBuf,
+        locator: String,
+        policy: SetupAcquirePolicy,
+    ) -> Result<SetupPlan, Error> {
+        // Keep detailed filesystem/remote errors out of the MCP boundary.
+        self.runtime
+            .run(plan_setup(SetupPlanRequest {
+                state_dir: self.state_dir.clone(),
+                workspace,
+                locator,
+                policy,
+            }))
+            .map_err(|_| Error::Protocol("setup plan failed"))
     }
 }
 
@@ -256,8 +291,27 @@ fn tools_list() -> Value {
                 "description": "Request cancellation of one non-terminal native daemon job. This changes daemon job state but does not delete resources.",
                 "inputSchema": job_id_schema(),
                 "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
+            },
+            {
+                "name": "bosn_setup_plan",
+                "description": "Validate, cache, and materialize one Bosn setup document into the MCP server's preselected private state directory. Returns an inert receipt only: applied is always false; it does not start a daemon or invoke Docker.",
+                "inputSchema": setup_plan_schema(),
+                "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
             }
         ]
+    })
+}
+
+fn setup_plan_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["workspace", "config", "policy"],
+        "properties": {
+            "workspace": {"type": "string", "minLength": 1, "maxLength": MAX_MCP_SETUP_STRING_BYTES},
+            "config": {"type": "string", "minLength": 1, "maxLength": MAX_MCP_SETUP_STRING_BYTES, "description": "An explicit local setup path or HTTPS setup URL."},
+            "policy": {"type": "string", "enum": ["refresh", "offline"], "description": "refresh reads the selected source; offline reuses only its verified cached receipt."}
+        }
     })
 }
 
@@ -331,26 +385,77 @@ fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
                 .map(|()| json!({"job_id": id, "cancel_requested": true}))
                 .map_err(|_| ToolFailure::Daemon)
         }),
+        "bosn_setup_plan" => setup_plan_request(arguments).and_then(|request| {
+            // The client/server invocation, not an untrusted MCP tool call,
+            // owns state selection.  This prevents a model from directing the
+            // server to create or inspect arbitrary state roots.
+            backend
+                .setup_plan(request.workspace, request.locator, request.policy)
+                .map(setup_plan_json)
+                .map_err(|_| ToolFailure::Setup)
+        }),
         _ => return tool_error("unknown Bosn MCP tool"),
     };
     match result {
         Ok(value) => tool_success(value),
         Err(ToolFailure::Invalid(message)) => tool_error(message),
         Err(ToolFailure::Daemon) => tool_error("native Bosn daemon request failed"),
+        Err(ToolFailure::Setup) => tool_error("Bosn setup plan failed"),
     }
 }
 
 enum ToolFailure {
     Invalid(&'static str),
     Daemon,
+    Setup,
 }
 impl ToolFailure {
     fn message(&self) -> &'static str {
         match self {
             Self::Invalid(message) => message,
             Self::Daemon => "native Bosn daemon request failed",
+            Self::Setup => "Bosn setup plan failed",
         }
     }
+}
+
+struct SetupPlanInput {
+    workspace: PathBuf,
+    locator: String,
+    policy: SetupAcquirePolicy,
+}
+
+fn setup_plan_request(
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<SetupPlanInput, ToolFailure> {
+    only_arguments(arguments, &["workspace", "config", "policy"])?;
+    let workspace = required_setup_string(arguments, "workspace")?;
+    let locator = required_setup_string(arguments, "config")?;
+    let policy = match required_setup_string(arguments, "policy")?.as_str() {
+        "refresh" => SetupAcquirePolicy::OnlineRefresh,
+        "offline" => SetupAcquirePolicy::OfflineCacheOnly,
+        _ => return Err(ToolFailure::Invalid("policy must be refresh or offline")),
+    };
+    Ok(SetupPlanInput {
+        workspace: PathBuf::from(workspace),
+        locator,
+        policy,
+    })
+}
+
+fn required_setup_string(
+    arguments: &serde_json::Map<String, Value>,
+    key: &'static str,
+) -> Result<String, ToolFailure> {
+    let value = arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or(ToolFailure::Invalid("setup arguments must be strings"))?;
+    (!value.is_empty() && value.len() <= MAX_MCP_SETUP_STRING_BYTES)
+        .then_some(value.to_owned())
+        .ok_or(ToolFailure::Invalid(
+            "setup argument is empty or exceeds 8 KiB",
+        ))
 }
 
 fn only_arguments(
@@ -413,6 +518,31 @@ fn log_page_json(page: JobLogPage) -> Value {
     })
 }
 
+fn setup_plan_json(plan: SetupPlan) -> Value {
+    let app_source = match plan.app_source {
+        SetupPlanAppSource::PinnedImage { image } => {
+            json!({"kind": "pinned_image", "image": image})
+        }
+        SetupPlanAppSource::InlineDockerfile { dockerfile_path } => {
+            json!({"kind": "inline_dockerfile", "dockerfile_path": dockerfile_path})
+        }
+    };
+    json!({
+        "action": "plan",
+        "applied": false,
+        "source_kind": match plan.source_kind {
+            SetupSourceKind::LocalFile => "local_file",
+            SetupSourceKind::Https => "https",
+        },
+        "content_sha256": plan.content_sha256,
+        "schema_version": plan.schema_version,
+        "workspace": plan.workspace_root,
+        "asset_root": plan.asset_root,
+        "task_names": plan.task_names,
+        "app_source": app_source,
+    })
+}
+
 fn tool_success(value: Value) -> Value {
     match serde_json::to_string(&value) {
         Ok(text) => json!({
@@ -457,9 +587,12 @@ mod tests {
     #[derive(Default)]
     struct FakeBackend {
         cancelled: Vec<u64>,
+        setup_calls: Vec<(PathBuf, String, SetupAcquirePolicy)>,
+        daemon_reads: u32,
     }
     impl Backend for FakeBackend {
         fn status(&mut self) -> Result<Status, Error> {
+            self.daemon_reads += 1;
             Ok(Status {
                 registry_id: "123e4567-e89b-42d3-a456-426614174000".into(),
                 schema_version: 5,
@@ -470,6 +603,7 @@ mod tests {
             })
         }
         fn job_status(&mut self, id: u64) -> Result<JobStatus, Error> {
+            self.daemon_reads += 1;
             Ok(JobStatus {
                 id,
                 state: "Running".into(),
@@ -477,6 +611,7 @@ mod tests {
             })
         }
         fn job_logs(&mut self, id: u64, after: u64, limit: u32) -> Result<JobLogPage, Error> {
+            self.daemon_reads += 1;
             Ok(JobLogPage {
                 retained_from: 0,
                 next: after + 1,
@@ -491,9 +626,28 @@ mod tests {
             self.cancelled.push(id);
             Ok(())
         }
+        fn setup_plan(
+            &mut self,
+            workspace: PathBuf,
+            locator: String,
+            policy: SetupAcquirePolicy,
+        ) -> Result<SetupPlan, Error> {
+            self.setup_calls.push((workspace.clone(), locator, policy));
+            Ok(SetupPlan {
+                source_kind: SetupSourceKind::LocalFile,
+                content_sha256: "a".repeat(64),
+                schema_version: 1,
+                workspace_root: workspace,
+                asset_root: None,
+                task_names: vec!["check".into()],
+                app_source: SetupPlanAppSource::PinnedImage {
+                    image: "registry.example/demo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                },
+            })
+        }
     }
 
-    fn exchange(input: &str, backend: &mut FakeBackend) -> Vec<Value> {
+    fn exchange<B: Backend>(input: &str, backend: &mut B) -> Vec<Value> {
         let mut output = Vec::new();
         serve_transport(input.as_bytes(), &mut output, backend).unwrap();
         String::from_utf8(output)
@@ -536,7 +690,8 @@ mod tests {
                 "bosn_status",
                 "bosn_job_status",
                 "bosn_job_logs",
-                "bosn_job_cancel"
+                "bosn_job_cancel",
+                "bosn_setup_plan"
             ]
         );
         assert_eq!(replies[2]["result"]["isError"], false);
@@ -585,5 +740,153 @@ mod tests {
         );
         assert_eq!(replies.len(), 1);
         assert!(backend.cancelled.is_empty());
+    }
+
+    #[test]
+    fn setup_plan_tool_is_read_only_and_uses_only_server_selected_state() {
+        let mut backend = FakeBackend::default();
+        let replies = exchange(
+            concat!(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"bosn_setup_plan","arguments":{"workspace":"/workspace","config":"/configs/setup.toml","policy":"refresh"}}}"#,
+                "\n",
+            ),
+            &mut backend,
+        );
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[1]["result"]["isError"], false);
+        assert_eq!(replies[1]["result"]["structuredContent"]["applied"], false);
+        assert_eq!(
+            replies[1]["result"]["structuredContent"]["source_kind"],
+            "local_file"
+        );
+        assert_eq!(backend.daemon_reads, 0);
+        assert!(backend.cancelled.is_empty());
+        assert_eq!(backend.setup_calls.len(), 1);
+        assert_eq!(backend.setup_calls[0].0, PathBuf::from("/workspace"));
+        assert_eq!(backend.setup_calls[0].1, "/configs/setup.toml");
+        assert_eq!(backend.setup_calls[0].2, SetupAcquirePolicy::OnlineRefresh);
+    }
+
+    #[test]
+    fn setup_plan_rejects_malformed_or_ambiguous_arguments_before_execution() {
+        let mut backend = FakeBackend::default();
+        let replies = exchange(
+            concat!(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"bosn_setup_plan","arguments":{"workspace":"/workspace","config":"/configs/setup.toml"}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"bosn_setup_plan","arguments":{"workspace":"/workspace","config":"/configs/setup.toml","policy":"refresh","state_dir":"/attacker-selected"}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"bosn_setup_plan","arguments":{"workspace":"/workspace","config":"/configs/setup.toml","policy":"refresh,offline"}}}"#,
+                "\n",
+            ),
+            &mut backend,
+        );
+        assert_eq!(replies.len(), 4);
+        assert!(replies[1]["result"]["isError"].as_bool().unwrap());
+        assert!(replies[2]["result"]["isError"].as_bool().unwrap());
+        assert!(replies[3]["result"]["isError"].as_bool().unwrap());
+        assert!(backend.setup_calls.is_empty());
+        assert_eq!(backend.daemon_reads, 0);
+    }
+
+    fn pinned_document() -> String {
+        format!(
+            "version = 1\n[app]\nimage = 'registry.example/demo@sha256:{}'\n[task.check]\ncommand = 'echo check'\n",
+            "a".repeat(64)
+        )
+    }
+
+    fn inline_document() -> &'static str {
+        "version = 1\n[app]\ndockerfile = 'FROM scratch'\n[task.check]\ncommand = 'echo check'\n[[file]]\npath = 'check.sh'\ncontent = \"#!/bin/sh\\necho check\\n\"\n"
+    }
+
+    fn live_setup_plan(
+        state_dir: &std::path::Path,
+        workspace: &std::path::Path,
+        config: &std::path::Path,
+        policy: &str,
+    ) -> Value {
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = Client::for_state(state_dir).unwrap();
+        let mut backend = DaemonBackend {
+            runtime: &runtime,
+            client,
+            state_dir: state_dir.to_path_buf(),
+        };
+        let input = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "bosn_setup_plan", "arguments": {
+                "workspace": workspace,
+                "config": config,
+                "policy": policy,
+            }},
+        }))
+        .unwrap();
+        let replies = exchange(
+            &format!("{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}}\n{input}\n"),
+            &mut backend,
+        );
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[1]["result"]["isError"], false);
+        replies[1]["result"]["structuredContent"].clone()
+    }
+
+    #[test]
+    fn setup_plan_mcp_local_pinned_and_offline_reuse_never_start_daemon() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config_root = tempfile::tempdir().unwrap();
+        let config = config_root.path().join("setup.toml");
+        std::fs::write(&config, pinned_document()).unwrap();
+
+        let online = live_setup_plan(state.path(), workspace.path(), &config, "refresh");
+        assert_eq!(online["action"], "plan");
+        assert_eq!(online["applied"], false);
+        assert_eq!(online["source_kind"], "local_file");
+        assert_eq!(online["asset_root"], Value::Null);
+        assert_eq!(online["task_names"], json!(["check"]));
+        assert_eq!(online["app_source"]["kind"], "pinned_image");
+        assert!(!state.path().join("registry.sqlite3").exists());
+
+        std::fs::remove_file(&config).unwrap();
+        let offline = live_setup_plan(state.path(), workspace.path(), &config, "offline");
+        assert_eq!(offline, online);
+        assert!(!state.path().join("registry.sqlite3").exists());
+    }
+
+    #[test]
+    fn setup_plan_mcp_inline_materializes_only_under_server_state() {
+        let state = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config_root = tempfile::tempdir().unwrap();
+        let config = config_root.path().join("setup.toml");
+        std::fs::write(&config, inline_document()).unwrap();
+
+        let plan = live_setup_plan(state.path(), workspace.path(), &config, "refresh");
+        assert_eq!(plan["applied"], false);
+        assert_eq!(plan["app_source"]["kind"], "inline_dockerfile");
+        let asset_root = std::path::Path::new(plan["asset_root"].as_str().unwrap());
+        assert!(asset_root.starts_with(state.path()));
+        assert!(!asset_root.starts_with(workspace.path()));
+        assert_eq!(
+            std::fs::read_to_string(asset_root.join("Dockerfile")).unwrap(),
+            "FROM scratch"
+        );
+        assert!(
+            std::fs::read_dir(workspace.path())
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        assert!(!state.path().join("registry.sqlite3").exists());
     }
 }
