@@ -140,13 +140,17 @@ mcp_servers:
       BOSN_STATE_DIR: /absolute/path/to/bosn-state
 ```
 
-This initial surface offers only `bosn_status`, `bosn_job_status`,
-`bosn_job_logs`, and `bosn_job_cancel`. Calls address the existing
-authenticated Rust daemon; the MCP server never spawns one and never invokes
-a shell. Job logs are cursor-paginated and limited to 64 records per MCP page.
-MCP client disconnect does not cancel jobs. Config setup, converge/run, and
-job submission are intentionally absent until they have genuine Rust daemon
-semantics.
+This initial surface offers `bosn_status`, `bosn_job_status`,
+`bosn_job_logs`, `bosn_job_cancel`, the read-only `bosn_setup_plan`, and
+`bosn_setup_prepare`. The latter accepts only `workspace`, a local-or-HTTPS
+`config`, `policy` (`refresh` or `offline`), a 1..=300000 ms deadline, and a
+1..=8388608-byte output limit. It promptly returns a durable job ID; use the
+existing status/log/cancel tools to observe it. The server never starts a
+daemon and MCP cannot supply Docker arguments, mounts, output paths, state
+roots, task commands, or arbitrary configuration fields. Job logs are
+cursor-paginated and limited to 64 records per MCP page. MCP client disconnect
+does not cancel jobs. Container lifecycle, setup-task execution, and converge
+or run remain intentionally absent.
 
 The official Rust MCP SDK currently owns a Tokio runtime and stdio transport.
 Bosn instead uses kernal-api's owned runtime, so the deliberately small adapter
