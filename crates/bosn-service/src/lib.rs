@@ -30,6 +30,12 @@ pub struct Status {
     pub sessions: u64,
     pub reconciliation_required: bool,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobStatus {
+    pub id: u64,
+    pub state: String,
+    pub error: Option<String>,
+}
 impl From<RegistryStatus> for Status {
     fn from(v: RegistryStatus) -> Self {
         Self {
@@ -84,11 +90,36 @@ impl Client {
                 workspace: workspace.into(),
                 stack: stack.into(),
                 digest: digest.into(),
+                job_id: 0,
             })
             .await?
         {
             Reply::Job(id) => Ok(id),
             _ => Err(Error::Protocol("unexpected submit response")),
+        }
+    }
+    pub async fn job_status(&self, id: u64) -> Result<JobStatus, Error> {
+        match self
+            .call(Request {
+                job_id: id,
+                ..Request::operation(5)
+            })
+            .await?
+        {
+            Reply::JobStatus(v) => Ok(v),
+            _ => Err(Error::Protocol("unexpected job status response")),
+        }
+    }
+    pub async fn cancel_job(&self, id: u64) -> Result<(), Error> {
+        match self
+            .call(Request {
+                job_id: id,
+                ..Request::operation(6)
+            })
+            .await?
+        {
+            Reply::Cancelled => Ok(()),
+            _ => Err(Error::Protocol("unexpected job cancel response")),
         }
     }
     async fn call(&self, request: Request) -> Result<Reply, Error> {
@@ -139,6 +170,14 @@ enum JobCommand {
         digest: String,
         reply: async_engine::OneshotSender<Result<u64, Error>>,
     },
+    Status {
+        id: u64,
+        reply: async_engine::OneshotSender<Result<jobs::Job, Error>>,
+    },
+    Cancel {
+        id: u64,
+        reply: async_engine::OneshotSender<Result<(), Error>>,
+    },
 }
 impl JobActor {
     async fn submit(&self, workspace: String, stack: String, digest: String) -> Result<u64, Error> {
@@ -154,23 +193,50 @@ impl JobActor {
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
     }
+    async fn status(&self, id: u64) -> Result<jobs::Job, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(JobCommand::Status { id, reply })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
+    async fn cancel(&self, id: u64) -> Result<(), Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(JobCommand::Cancel { id, reply })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
 }
 async fn job_actor(mut jobs: Jobs, mut receiver: async_engine::Receiver<JobCommand>) {
-    while let Some(JobCommand::Submit {
-        workspace,
-        stack,
-        digest,
-        reply,
-    }) = receiver.recv().await
-    {
-        let result = jobs
-            .submit(&workspace, &stack, &digest)
-            .map(|submission| match submission {
-                Submission::Started(id) | Submission::Queued(id) | Submission::Joined(id) => id,
-                Submission::Superseded { replacement, .. } => replacement,
-            })
-            .map_err(|_| Error::Protocol("job admission"));
-        let _ = reply.send(result);
+    while let Some(command) = receiver.recv().await {
+        match command {
+            JobCommand::Submit {
+                workspace,
+                stack,
+                digest,
+                reply,
+            } => {
+                let result = jobs
+                    .submit(&workspace, &stack, &digest)
+                    .map(|s| match s {
+                        Submission::Started(id)
+                        | Submission::Queued(id)
+                        | Submission::Joined(id) => id,
+                        Submission::Superseded { replacement, .. } => replacement,
+                    })
+                    .map_err(|_| Error::Protocol("job admission"));
+                let _ = reply.send(result);
+            }
+            JobCommand::Status { id, reply } => {
+                let _ = reply.send(jobs.job(id).map_err(|_| Error::Protocol("unknown job")));
+            }
+            JobCommand::Cancel { id, reply } => {
+                let _ = reply.send(jobs.cancel(id).map_err(|_| Error::Protocol("job cancel")));
+            }
+        }
     }
 }
 impl RegistryActor {
@@ -405,6 +471,8 @@ async fn handle(
             sessions: 0,
             reconciliation_required: false,
             job_id: 0,
+            job_state: String::new(),
+            job_error: String::new(),
         }
     } else {
         match r.operation {
@@ -423,6 +491,8 @@ async fn handle(
                     sessions: status.sessions,
                     reconciliation_required: status.reconciliation_required,
                     job_id: 0,
+                    job_state: String::new(),
+                    job_error: String::new(),
                 }
             }
             3 => {
@@ -436,6 +506,29 @@ async fn handle(
                 Ok(job_id) => ReplyWire {
                     code: 40,
                     job_id,
+                    ..Default::default()
+                },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
+            5 => match jobs.status(r.job_id).await {
+                Ok(job) => ReplyWire {
+                    code: 50,
+                    job_id: job.id,
+                    job_state: format!("{:?}", job.state),
+                    job_error: job.error.unwrap_or_default(),
+                    ..Default::default()
+                },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
+            6 => match jobs.cancel(r.job_id).await {
+                Ok(()) => ReplyWire {
+                    code: 60,
                     ..Default::default()
                 },
                 Err(_) => ReplyWire {
@@ -516,6 +609,8 @@ struct Request {
     stack: String,
     #[prost(string, tag = "5")]
     digest: String,
+    #[prost(uint64, tag = "6")]
+    job_id: u64,
 }
 impl Request {
     fn operation(operation: u32) -> Self {
@@ -525,6 +620,7 @@ impl Request {
             workspace: String::new(),
             stack: String::new(),
             digest: String::new(),
+            job_id: 0,
         }
     }
 }
@@ -546,12 +642,18 @@ struct ReplyWire {
     reconciliation_required: bool,
     #[prost(uint64, tag = "8")]
     job_id: u64,
+    #[prost(string, tag = "9")]
+    job_state: String,
+    #[prost(string, tag = "10")]
+    job_error: String,
 }
 enum Reply {
     Pong,
     Status(Status),
     Shutdown,
     Job(u64),
+    JobStatus(JobStatus),
+    Cancelled,
 }
 fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
     match v.code {
@@ -566,6 +668,12 @@ fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
         })),
         30 => Ok(Reply::Shutdown),
         40 => Ok(Reply::Job(v.job_id)),
+        50 => Ok(Reply::JobStatus(JobStatus {
+            id: v.job_id,
+            state: v.job_state,
+            error: (!v.job_error.is_empty()).then_some(v.job_error),
+        })),
+        60 => Ok(Reply::Cancelled),
         1 => Err(Error::Protocol("unsupported protocol")),
         2 => Err(Error::Protocol("unknown operation")),
         _ => Err(Error::Protocol("daemon error")),
@@ -619,6 +727,11 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(one, two);
+                let status = client.job_status(one).await.unwrap();
+                assert_eq!(status.id, one);
+                assert_eq!(status.state, "Running");
+                client.cancel_job(one).await.unwrap();
+                assert_eq!(client.job_status(one).await.unwrap().state, "Cancelling");
                 client.shutdown().await.unwrap();
                 stopped(server).await;
             });
@@ -716,6 +829,7 @@ mod tests {
                 workspace: String::new(),
                 stack: String::new(),
                 digest: String::new(),
+                job_id: 0,
             }
             .encode(&mut payload)
             .unwrap();
