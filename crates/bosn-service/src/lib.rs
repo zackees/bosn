@@ -1,6 +1,8 @@
 //! Small, authenticated Rust daemon foundation. Product protobuf remains private.
 
+use bosn_engine::{DockerEngine, EngineEvent, RunOptions};
 use bosn_registry::{Registry, RegistryStatus};
+use bosn_setup::{SetupAcquirePolicy, SetupPlanRequest, plan_setup, prepare_setup_image};
 use jobs::{Jobs, Submission};
 use kernal_api::{
     async_engine::{self, CancellationSource},
@@ -11,7 +13,11 @@ use kernal_api::{
 };
 use prost::Message;
 use std::{
+    collections::BTreeMap,
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
+    sync::Arc,
     time::Duration,
 };
 pub mod jobs;
@@ -21,6 +27,157 @@ pub const PROTOCOL_VERSION: u32 = 1;
 const PAYLOAD_PROTOCOL: u32 = 0x4253_4e01;
 const MAX_FRAME: usize = 1024 * 1024;
 const IO_DEADLINE: Duration = Duration::from_secs(3);
+const SETUP_PREPARE_MAX_DEADLINE: Duration = Duration::from_secs(5 * 60);
+const SETUP_PREPARE_MAX_OUTPUT: usize = 8 * 1024 * 1024;
+const SETUP_PREPARE_COMMAND_QUEUE: usize = 64;
+const SETUP_PREPARE_EVENT_QUEUE: usize = 16;
+
+/// Explicit policy for one daemon-owned setup image preparation request.
+/// State is selected by [`Client::for_state`] and then owned by the daemon;
+/// callers cannot substitute a state root in the RPC itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetupPreparePolicy {
+    Refresh,
+    Offline,
+}
+impl SetupPreparePolicy {
+    fn wire(self) -> u32 {
+        match self {
+            Self::Refresh => 1,
+            Self::Offline => 2,
+        }
+    }
+    fn from_wire(value: u32) -> Option<Self> {
+        match value {
+            1 => Some(Self::Refresh),
+            2 => Some(Self::Offline),
+            _ => None,
+        }
+    }
+    fn acquire_policy(self) -> SetupAcquirePolicy {
+        match self {
+            Self::Refresh => SetupAcquirePolicy::OnlineRefresh,
+            Self::Offline => SetupAcquirePolicy::OfflineCacheOnly,
+        }
+    }
+}
+
+/// All immutable caller inputs for a semantic setup-image job.  This is not
+/// Docker argv and has no container, mount, or task-execution controls.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupPrepareRequest {
+    pub workspace: PathBuf,
+    pub config: String,
+    pub policy: SetupPreparePolicy,
+    pub deadline: Duration,
+    pub output_limit: usize,
+}
+
+/// Testable daemon execution boundary.  Production uses
+/// [`DockerSetupPrepareExecutor`]; tests can provide a deterministic runner
+/// without starting Docker.  Log records are bounded by the actor before they
+/// reach IPC.
+pub trait SetupPrepareExecutor: Send + Sync {
+    fn execute<'a>(
+        &'a self,
+        request: SetupPrepareRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a async_engine::Sender<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
+}
+
+#[derive(Clone)]
+pub struct DockerSetupPrepareExecutor {
+    state_dir: PathBuf,
+    engine: DockerEngine,
+}
+impl DockerSetupPrepareExecutor {
+    fn new(state_dir: PathBuf) -> Self {
+        Self {
+            state_dir,
+            engine: DockerEngine::docker(),
+        }
+    }
+}
+impl SetupPrepareExecutor for DockerSetupPrepareExecutor {
+    fn execute<'a>(
+        &'a self,
+        request: SetupPrepareRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a async_engine::Sender<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let deadline = async_engine::Deadline::after(request.deadline);
+            let plan = async_engine::cancellable(
+                cancellation,
+                async_engine::timeout_at(
+                    deadline,
+                    plan_setup(SetupPlanRequest {
+                        state_dir: self.state_dir.clone(),
+                        workspace: request.workspace,
+                        locator: request.config,
+                        policy: request.policy.acquire_policy(),
+                    }),
+                ),
+            )
+            .await
+            .map_err(|_| "setup preparation cancelled".to_owned())?
+            .map_err(|_| "setup planning exceeded its deadline".to_owned())?
+            .map_err(|error| error.to_string())?;
+            let remaining = deadline.remaining();
+            if remaining.is_zero() {
+                return Err("setup preparation exceeded its deadline".into());
+            }
+            let (events, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
+            let forwarded_logs = logs.clone();
+            let forwarder = async_engine::launch(async move {
+                while let Some(event) = receiver.recv().await {
+                    forward_engine_event(&forwarded_logs, event).await?;
+                }
+                Ok::<(), String>(())
+            });
+            let result = prepare_setup_image(
+                &self.engine,
+                &plan,
+                RunOptions::streaming(remaining, request.output_limit),
+                cancellation,
+                &events,
+            )
+            .await;
+            drop(events);
+            forwarder
+                .await
+                .map_err(|_| "setup log forwarder stopped".to_owned())??;
+            let prepared = result.map_err(|error| error.to_string())?;
+            Ok(format!(
+                "prepared {} as {}",
+                prepared.reference, prepared.observed_identity
+            ))
+        })
+    }
+}
+
+async fn forward_engine_event(
+    logs: &async_engine::Sender<String>,
+    event: EngineEvent,
+) -> Result<(), String> {
+    let (stream, bytes) = match event {
+        EngineEvent::Stdout(bytes) => ("stdout", bytes),
+        EngineEvent::Stderr(bytes) => ("stderr", bytes),
+    };
+    let prefix = format!("[{stream}] ");
+    // `bosn-engine` bounds source chunks at 8 KiB. Split after lossy text
+    // conversion so every daemon record is valid UTF-8 and frame-safe.
+    let text = String::from_utf8_lossy(&bytes);
+    let body = jobs::MAX_LOG_LINE_BYTES.saturating_sub(prefix.len()).max(1);
+    for chunk in text.as_bytes().chunks(body) {
+        let line = format!("{prefix}{}", String::from_utf8_lossy(chunk));
+        logs.send(line)
+            .await
+            .map_err(|_| "setup log consumer closed".to_owned())?;
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Status {
@@ -106,6 +263,10 @@ impl Client {
                 job_id: 0,
                 log_after: 0,
                 log_limit: 0,
+                setup_config: String::new(),
+                setup_policy: 0,
+                setup_deadline_ms: 0,
+                setup_output_limit: 0,
             })
             .await?
         {
@@ -151,6 +312,41 @@ impl Client {
             _ => Err(Error::Protocol("unexpected job logs response")),
         }
     }
+    /// Submit a daemon-owned plan-and-image-prepare operation. The response is
+    /// only the durable job ID; Docker work happens after the authenticated
+    /// reply and is observed through status/log polling.
+    pub async fn submit_setup_prepare(&self, request: SetupPrepareRequest) -> Result<u64, Error> {
+        let workspace = request
+            .workspace
+            .to_str()
+            .ok_or(Error::Protocol("setup workspace is not UTF-8"))?
+            .to_owned();
+        let deadline_ms = u64::try_from(request.deadline.as_millis())
+            .map_err(|_| Error::Protocol("setup deadline too large"))?;
+        let output_limit = u32::try_from(request.output_limit)
+            .map_err(|_| Error::Protocol("setup output limit too large"))?;
+        validate_setup_prepare_wire(
+            &workspace,
+            &request.config,
+            request.policy,
+            deadline_ms,
+            output_limit,
+        )?;
+        match self
+            .call(Request {
+                workspace,
+                setup_config: request.config,
+                setup_policy: request.policy.wire(),
+                setup_deadline_ms: deadline_ms,
+                setup_output_limit: output_limit,
+                ..Request::operation(8)
+            })
+            .await?
+        {
+            Reply::Job(id) => Ok(id),
+            _ => Err(Error::Protocol("unexpected setup prepare response")),
+        }
+    }
     async fn call(&self, request: Request) -> Result<Reply, Error> {
         // Resolve on every call: a Client may have been constructed while a
         // fresh daemon was still creating its registry, before an inode-based
@@ -179,6 +375,7 @@ impl Client {
 pub struct Service {
     state_dir: PathBuf,
     stop: CancellationSource,
+    setup_executor: Arc<dyn SetupPrepareExecutor>,
 }
 #[derive(Clone)]
 struct RegistryActor {
@@ -213,6 +410,19 @@ enum JobCommand {
         limit: usize,
         reply: async_engine::OneshotSender<Result<jobs::LogPage, Error>>,
     },
+    SubmitSetupPrepare {
+        request: SetupPrepareRequest,
+        reply: async_engine::OneshotSender<Result<u64, Error>>,
+    },
+    Log {
+        id: u64,
+        line: String,
+    },
+    Completed {
+        id: u64,
+        result: Result<String, String>,
+    },
+    Stop(async_engine::OneshotSender<()>),
 }
 impl JobActor {
     async fn submit(&self, workspace: String, stack: String, digest: String) -> Result<u64, Error> {
@@ -257,9 +467,36 @@ impl JobActor {
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
     }
+    async fn submit_setup_prepare(&self, request: SetupPrepareRequest) -> Result<u64, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(JobCommand::SubmitSetupPrepare { request, reply })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
+    async fn stop(&self) {
+        let (reply, wait) = async_engine::oneshot_channel();
+        if self.sender.send(JobCommand::Stop(reply)).await.is_ok() {
+            let _ = wait.await;
+        }
+    }
 }
-async fn job_actor(mut jobs: Jobs, mut receiver: async_engine::Receiver<JobCommand>) {
+async fn job_actor(
+    mut jobs: Jobs,
+    mut receiver: async_engine::Receiver<JobCommand>,
+    executor: Arc<dyn SetupPrepareExecutor>,
+    sender: async_engine::Sender<JobCommand>,
+) {
+    let mut requests: BTreeMap<u64, SetupPrepareRequest> = BTreeMap::new();
+    let mut cancellations: BTreeMap<u64, CancellationSource> = BTreeMap::new();
+    let mut tasks = async_engine::TaskGroup::new();
+    let mut stopping = None;
     while let Some(command) = receiver.recv().await {
+        while matches!(
+            async_engine::timeout(Duration::ZERO, tasks.join_next()).await,
+            Ok(Some(_))
+        ) {}
         match command {
             JobCommand::Submit {
                 workspace,
@@ -282,7 +519,15 @@ async fn job_actor(mut jobs: Jobs, mut receiver: async_engine::Receiver<JobComma
                 let _ = reply.send(jobs.job(id).map_err(|_| Error::Protocol("unknown job")));
             }
             JobCommand::Cancel { id, reply } => {
-                let _ = reply.send(jobs.cancel(id).map_err(|_| Error::Protocol("job cancel")));
+                let result = jobs.cancel(id).map_err(|_| Error::Protocol("job cancel"));
+                if result.is_ok() {
+                    if let Some(cancellation) = cancellations.get(&id) {
+                        cancellation.cancel();
+                    } else if jobs.job(id).is_ok_and(|job| job.state.terminal()) {
+                        requests.remove(&id);
+                    }
+                }
+                let _ = reply.send(result);
             }
             JobCommand::Logs {
                 id,
@@ -295,8 +540,157 @@ async fn job_actor(mut jobs: Jobs, mut receiver: async_engine::Receiver<JobComma
                         .map_err(|_| Error::Protocol("unknown job")),
                 );
             }
+            JobCommand::SubmitSetupPrepare { request, reply } => {
+                let digest = setup_prepare_digest(&request);
+                let workspace = request.workspace.to_string_lossy().into_owned();
+                let result = jobs
+                    .submit(&workspace, "setup-prepare", &digest)
+                    .map(|submission| match submission {
+                        Submission::Started(id) | Submission::Queued(id) => {
+                            requests.insert(id, request);
+                            id
+                        }
+                        Submission::Joined(id) => id,
+                        Submission::Superseded { replacement, .. } => {
+                            requests.insert(replacement, request);
+                            replacement
+                        }
+                    })
+                    .map_err(|_| Error::Protocol("setup job admission"));
+                let _ = reply.send(result);
+                launch_started_setup_jobs(
+                    &mut jobs,
+                    &mut requests,
+                    &mut cancellations,
+                    &mut tasks,
+                    Arc::clone(&executor),
+                    sender.clone(),
+                );
+            }
+            JobCommand::Log { id, line } => {
+                // A full log record is never permitted to block daemon IPC;
+                // bounded engine output instead applies back-pressure upstream.
+                let _ = jobs.log(id, bounded_log_line(&line));
+            }
+            JobCommand::Completed { id, result } => {
+                cancellations.remove(&id);
+                match result {
+                    Ok(receipt) => {
+                        let _ = jobs.log(id, bounded_log_line(&receipt));
+                        let _ = jobs.settle_with_error(id, true, None);
+                    }
+                    Err(error) => {
+                        let error = bounded_log_line(&error);
+                        let _ = jobs.log(id, format!("setup prepare failed: {error}"));
+                        let _ = jobs.settle_with_error(id, false, Some(error));
+                    }
+                }
+            }
+            JobCommand::Stop(reply) => {
+                jobs.close();
+                for (&id, cancellation) in &cancellations {
+                    // Preserve cancellation semantics in durable status while
+                    // the executor owns direct-child reaping.
+                    let _ = jobs.cancel(id);
+                    cancellation.cancel();
+                }
+                stopping = Some(reply);
+            }
+        }
+        // The completion path may have freed a slot. Launching only here
+        // makes task ownership explicit and preserves the scheduler cap.
+        if stopping.is_none() {
+            launch_started_setup_jobs(
+                &mut jobs,
+                &mut requests,
+                &mut cancellations,
+                &mut tasks,
+                Arc::clone(&executor),
+                sender.clone(),
+            );
+        }
+        if stopping.is_some() && cancellations.is_empty() {
+            while tasks.join_next().await.is_some() {}
+            if let Some(reply) = stopping.take() {
+                let _ = reply.send(());
+            }
+            return;
         }
     }
+}
+
+fn launch_started_setup_jobs(
+    jobs: &mut Jobs,
+    requests: &mut BTreeMap<u64, SetupPrepareRequest>,
+    cancellations: &mut BTreeMap<u64, CancellationSource>,
+    tasks: &mut async_engine::TaskGroup<()>,
+    executor: Arc<dyn SetupPrepareExecutor>,
+    sender: async_engine::Sender<JobCommand>,
+) {
+    for id in jobs.take_started() {
+        // Legacy generic jobs have no daemon executor.  Only the new semantic
+        // operation may enter this branch, so no arbitrary command can escape
+        // the typed setup boundary.
+        let Some(request) = requests.remove(&id) else {
+            continue;
+        };
+        let cancellation = CancellationSource::new();
+        let token = cancellation.token();
+        cancellations.insert(id, cancellation);
+        let task_sender = sender.clone();
+        let executor = Arc::clone(&executor);
+        tasks.spawn(async move {
+            let (logs, mut log_receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
+            let log_sender = task_sender.clone();
+            let forwarder = async_engine::launch(async move {
+                while let Some(line) = log_receiver.recv().await {
+                    if log_sender.send(JobCommand::Log { id, line }).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            let result = executor.execute(request, &token, &logs).await;
+            drop(logs);
+            let _ = forwarder.await;
+            let _ = task_sender.send(JobCommand::Completed { id, result }).await;
+        });
+    }
+}
+
+fn bounded_log_line(value: &str) -> String {
+    if value.len() <= jobs::MAX_LOG_LINE_BYTES {
+        return value.to_owned();
+    }
+    let mut end = jobs::MAX_LOG_LINE_BYTES.saturating_sub(3);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = value[..end].to_owned();
+    bounded.push_str("...");
+    bounded
+}
+
+fn setup_prepare_digest(request: &SetupPrepareRequest) -> String {
+    let mut material = Vec::new();
+    let workspace = request.workspace.to_string_lossy();
+    let policy = request.policy.wire().to_le_bytes();
+    let deadline = request.deadline.as_millis().to_le_bytes();
+    let output_limit = (request.output_limit as u64).to_le_bytes();
+    for part in [
+        b"bosn.setup-prepare.v1".as_slice(),
+        workspace.as_bytes(),
+        request.config.as_bytes(),
+        &policy,
+        &deadline,
+        &output_limit,
+    ] {
+        material.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        material.extend_from_slice(part);
+    }
+    format!(
+        "setup:{}",
+        kernal_api::hash::blake3_bytes(&material).to_hex()
+    )
 }
 impl RegistryActor {
     async fn status(&self) -> Result<Status, Error> {
@@ -342,10 +736,18 @@ async fn registry_actor(mut registry: Registry, mut receiver: async_engine::Rece
 }
 impl Service {
     pub fn new(state_dir: impl Into<PathBuf>) -> Self {
+        let state_dir = state_dir.into();
         Self {
-            state_dir: state_dir.into(),
+            setup_executor: Arc::new(DockerSetupPrepareExecutor::new(state_dir.clone())),
+            state_dir,
             stop: CancellationSource::new(),
         }
+    }
+    /// Substitute only the semantic setup executor. This is primarily an
+    /// integration-test seam; production callers retain the Docker adapter.
+    pub fn with_setup_prepare_executor(mut self, executor: Arc<dyn SetupPrepareExecutor>) -> Self {
+        self.setup_executor = executor;
+        self
     }
     /// Foreground lifecycle: acquires the sole registry writer before binding.
     pub async fn serve(self) -> Result<(), Error> {
@@ -375,9 +777,16 @@ impl Service {
         let listener = AsyncListener::bind_owner_only(&ep)?;
         let (sender, receiver) = async_engine::channel(16);
         let actor = RegistryActor { sender };
-        let (job_sender, job_receiver) = async_engine::channel(16);
-        let jobs = JobActor { sender: job_sender };
-        let job_worker = async_engine::launch(job_actor(Jobs::new(1), job_receiver));
+        let (job_sender, job_receiver) = async_engine::channel(SETUP_PREPARE_COMMAND_QUEUE);
+        let jobs = JobActor {
+            sender: job_sender.clone(),
+        };
+        let job_worker = async_engine::launch(job_actor(
+            Jobs::new(1),
+            job_receiver,
+            Arc::clone(&self.setup_executor),
+            job_sender.clone(),
+        ));
         let worker = async_engine::launch(registry_actor(registry, receiver));
         let mut clients = async_engine::TaskGroup::new();
         while !self.stop.is_cancelled() {
@@ -413,6 +822,7 @@ impl Service {
         }
         while clients.join_next().await.is_some() {}
         actor.stop().await;
+        jobs.stop().await;
         drop(jobs);
         let _ = worker.await;
         let _ = job_worker.await;
@@ -603,6 +1013,43 @@ async fn handle(
                     ..Default::default()
                 },
             },
+            8 => {
+                let policy = SetupPreparePolicy::from_wire(r.setup_policy);
+                let request = policy.and_then(|policy| {
+                    validate_setup_prepare_wire(
+                        &r.workspace,
+                        &r.setup_config,
+                        policy,
+                        r.setup_deadline_ms,
+                        r.setup_output_limit,
+                    )
+                    .ok()
+                    .map(|()| SetupPrepareRequest {
+                        workspace: PathBuf::from(r.workspace),
+                        config: r.setup_config,
+                        policy,
+                        deadline: Duration::from_millis(r.setup_deadline_ms),
+                        output_limit: r.setup_output_limit as usize,
+                    })
+                });
+                match request {
+                    Some(request) => match jobs.submit_setup_prepare(request).await {
+                        Ok(job_id) => ReplyWire {
+                            code: 40,
+                            job_id,
+                            ..Default::default()
+                        },
+                        Err(_) => ReplyWire {
+                            code: 3,
+                            ..Default::default()
+                        },
+                    },
+                    None => ReplyWire {
+                        code: 3,
+                        ..Default::default()
+                    },
+                }
+            }
             _ => ReplyWire {
                 code: 2,
                 ..Default::default()
@@ -682,6 +1129,14 @@ struct Request {
     log_after: u64,
     #[prost(uint32, tag = "8")]
     log_limit: u32,
+    #[prost(string, tag = "9")]
+    setup_config: String,
+    #[prost(uint32, tag = "10")]
+    setup_policy: u32,
+    #[prost(uint64, tag = "11")]
+    setup_deadline_ms: u64,
+    #[prost(uint32, tag = "12")]
+    setup_output_limit: u32,
 }
 impl Request {
     fn operation(operation: u32) -> Self {
@@ -694,8 +1149,40 @@ impl Request {
             job_id: 0,
             log_after: 0,
             log_limit: 0,
+            setup_config: String::new(),
+            setup_policy: 0,
+            setup_deadline_ms: 0,
+            setup_output_limit: 0,
         }
     }
+}
+
+fn validate_setup_prepare_wire(
+    workspace: &str,
+    config: &str,
+    _policy: SetupPreparePolicy,
+    deadline_ms: u64,
+    output_limit: u32,
+) -> Result<(), Error> {
+    const MAX_TEXT: usize = 8 * 1024;
+    if workspace.is_empty()
+        || workspace.len() > MAX_TEXT
+        || config.is_empty()
+        || config.len() > MAX_TEXT
+        || workspace.bytes().any(|byte| byte == 0)
+        || config.bytes().any(|byte| byte == 0)
+    {
+        return Err(Error::Protocol("invalid setup request text"));
+    }
+    let deadline = Duration::from_millis(deadline_ms);
+    if deadline.is_zero() || deadline > SETUP_PREPARE_MAX_DEADLINE {
+        return Err(Error::Protocol("invalid setup deadline"));
+    }
+    let output_limit = output_limit as usize;
+    if output_limit == 0 || output_limit > SETUP_PREPARE_MAX_OUTPUT {
+        return Err(Error::Protocol("invalid setup output limit"));
+    }
+    Ok(())
 }
 #[derive(Message)]
 struct ReplyWire {
@@ -786,6 +1273,46 @@ fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
 mod tests {
     use super::*;
     use kernal_api::async_engine::RuntimeBuilder;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct SlowFakeSetupExecutor {
+        started: AtomicUsize,
+        cancelled: AtomicUsize,
+    }
+    impl SlowFakeSetupExecutor {
+        fn new() -> Self {
+            Self {
+                started: AtomicUsize::new(0),
+                cancelled: AtomicUsize::new(0),
+            }
+        }
+    }
+    impl SetupPrepareExecutor for SlowFakeSetupExecutor {
+        fn execute<'a>(
+            &'a self,
+            _request: SetupPrepareRequest,
+            cancellation: &'a async_engine::CancellationToken,
+            logs: &'a async_engine::Sender<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.started.fetch_add(1, Ordering::SeqCst);
+                logs.send("[fake] preparation started".into())
+                    .await
+                    .map_err(|_| "fake log consumer closed".to_owned())?;
+                for _ in 0..100 {
+                    if cancellation.is_cancelled() {
+                        self.cancelled.fetch_add(1, Ordering::SeqCst);
+                        return Err("fake observed cancellation".into());
+                    }
+                    async_engine::sleep(Duration::from_millis(10)).await;
+                }
+                Ok("fake prepared sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
+            })
+        }
+    }
 
     #[test]
     fn fresh_daemon_serves_typed_client_and_releases_writer() {
@@ -846,6 +1373,97 @@ mod tests {
                 client.shutdown().await.unwrap();
                 stopped(server).await;
             });
+    }
+
+    #[test]
+    fn setup_prepare_job_is_prompt_coalesced_logged_and_cancellable_without_docker() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let fake = Arc::new(SlowFakeSetupExecutor::new());
+        RuntimeBuilder::multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let server = async_engine::launch(
+                    Service::new(state.clone())
+                        .with_setup_prepare_executor(fake.clone())
+                        .serve(),
+                );
+                let client = wait_for_client(&state).await;
+                let request = SetupPrepareRequest {
+                    workspace: workspace.clone(),
+                    config: "https://example.invalid/setup.toml".into(),
+                    policy: SetupPreparePolicy::Refresh,
+                    deadline: Duration::from_secs(2),
+                    output_limit: 4 * 1024,
+                };
+                let submitted = std::time::Instant::now();
+                let first = client.submit_setup_prepare(request.clone()).await.unwrap();
+                assert!(submitted.elapsed() < Duration::from_millis(250));
+                assert_eq!(
+                    first,
+                    client.submit_setup_prepare(request.clone()).await.unwrap()
+                );
+                wait_for(|| fake.started.load(Ordering::SeqCst) == 1).await;
+                // Slow execution does not occupy the daemon request actor.
+                client.ping().await.unwrap();
+                let logs = wait_for_logs(&client, first).await;
+                assert_eq!(logs.records[0].line, "[fake] preparation started");
+
+                let changed = SetupPrepareRequest {
+                    config: "https://example.invalid/other.toml".into(),
+                    ..request
+                };
+                let second = client.submit_setup_prepare(changed).await.unwrap();
+                assert_ne!(first, second);
+                client.cancel_job(first).await.unwrap();
+                wait_for_job_state(&client, first, "Cancelled").await;
+                wait_for(|| fake.started.load(Ordering::SeqCst) == 2).await;
+                client.cancel_job(second).await.unwrap();
+                wait_for_job_state(&client, second, "Cancelled").await;
+                assert_eq!(fake.cancelled.load(Ordering::SeqCst), 2);
+                client.shutdown().await.unwrap();
+                stopped(server).await;
+            });
+    }
+
+    #[test]
+    fn setup_prepare_coalescing_digest_covers_every_immutable_input() {
+        let base = SetupPrepareRequest {
+            workspace: PathBuf::from("/workspace"),
+            config: "https://example.invalid/setup.toml".into(),
+            policy: SetupPreparePolicy::Refresh,
+            deadline: Duration::from_secs(2),
+            output_limit: 4 * 1024,
+        };
+        let variants = [
+            SetupPrepareRequest {
+                workspace: PathBuf::from("/other"),
+                ..base.clone()
+            },
+            SetupPrepareRequest {
+                config: "https://example.invalid/other.toml".into(),
+                ..base.clone()
+            },
+            SetupPrepareRequest {
+                policy: SetupPreparePolicy::Offline,
+                ..base.clone()
+            },
+            SetupPrepareRequest {
+                deadline: Duration::from_secs(3),
+                ..base.clone()
+            },
+            SetupPrepareRequest {
+                output_limit: 8 * 1024,
+                ..base.clone()
+            },
+        ];
+        for variant in variants {
+            assert_ne!(setup_prepare_digest(&base), setup_prepare_digest(&variant));
+        }
     }
 
     #[test]
@@ -943,6 +1561,10 @@ mod tests {
                 job_id: 0,
                 log_after: 0,
                 log_limit: 0,
+                setup_config: String::new(),
+                setup_policy: 0,
+                setup_deadline_ms: 0,
+                setup_output_limit: 0,
             }
             .encode(&mut payload)
             .unwrap();
@@ -1187,5 +1809,36 @@ mod tests {
             async_engine::sleep(Duration::from_millis(20)).await;
         }
         panic!("daemon did not become ready")
+    }
+
+    async fn wait_for(predicate: impl Fn() -> bool) {
+        for _ in 0..100 {
+            if predicate() {
+                return;
+            }
+            async_engine::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("condition did not become true");
+    }
+
+    async fn wait_for_job_state(client: &Client, id: u64, wanted: &str) {
+        for _ in 0..100 {
+            if client.job_status(id).await.unwrap().state == wanted {
+                return;
+            }
+            async_engine::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("job {id} did not reach {wanted}");
+    }
+
+    async fn wait_for_logs(client: &Client, id: u64) -> JobLogPage {
+        for _ in 0..100 {
+            let page = client.job_logs(id, 0, 16).await.unwrap();
+            if !page.records.is_empty() {
+                return page;
+            }
+            async_engine::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("job {id} did not produce a log record");
     }
 }

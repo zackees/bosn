@@ -82,6 +82,10 @@ pub struct Jobs {
     jobs: BTreeMap<u64, Job>,
     slots: BTreeMap<(String, String), Slot>,
     queue: VecDeque<u64>,
+    /// IDs which have just transitioned from queued to running.  The daemon
+    /// actor drains this handoff and attaches the semantic executor; the
+    /// scheduler itself never knows about Docker or process ownership.
+    started: VecDeque<u64>,
 }
 
 impl Jobs {
@@ -162,7 +166,12 @@ impl Jobs {
             }
             self.jobs.get_mut(&id).unwrap().state = JobState::Running;
             self.running += 1;
+            self.started.push_back(id);
         }
+    }
+    /// Drain newly admitted running jobs exactly once.
+    pub fn take_started(&mut self) -> Vec<u64> {
+        self.started.drain(..).collect()
     }
     pub fn cancel(&mut self, id: u64) -> Result<(), JobError> {
         let state = self.jobs.get(&id).ok_or(JobError::Unknown)?.state;
@@ -180,6 +189,17 @@ impl Jobs {
         self.jobs.get(&id).cloned().ok_or(JobError::Unknown)
     }
     pub fn settle(&mut self, id: u64, ok: bool) -> Result<(), JobError> {
+        self.settle_with_error(id, ok, None)
+    }
+    /// Settle a running operation, retaining a bounded diagnostic only for a
+    /// failed terminal state.  A cancellation always wins a concurrently
+    /// arriving successful or failed executor result.
+    pub fn settle_with_error(
+        &mut self,
+        id: u64,
+        ok: bool,
+        error: Option<String>,
+    ) -> Result<(), JobError> {
         let state = self.jobs.get(&id).ok_or(JobError::Unknown)?.state;
         if state.terminal() {
             return Err(JobError::Finished);
@@ -191,8 +211,26 @@ impl Jobs {
         } else {
             JobState::Failed
         };
-        self.finish(id, terminal, None);
+        self.finish(
+            id,
+            terminal,
+            (terminal == JobState::Failed).then_some(error).flatten(),
+        );
         Ok(())
+    }
+    /// Stop admission and make every non-running queued job terminal.  The
+    /// daemon separately cancels direct child owners for running jobs before
+    /// awaiting their completion/reap notices.
+    pub fn close(&mut self) {
+        self.closing = true;
+        let queued: Vec<u64> = self
+            .jobs
+            .iter()
+            .filter_map(|(&id, job)| (job.state == JobState::Queued).then_some(id))
+            .collect();
+        for id in queued {
+            self.finish(id, JobState::Cancelled, Some("daemon stopping".into()));
+        }
     }
     fn finish(&mut self, id: u64, state: JobState, error: Option<String>) {
         let key = self.jobs[&id].key();
@@ -289,6 +327,7 @@ impl Default for Jobs {
             jobs: BTreeMap::new(),
             slots: BTreeMap::new(),
             queue: VecDeque::new(),
+            started: VecDeque::new(),
         }
     }
 }

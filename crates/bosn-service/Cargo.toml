@@ -15,6 +15,7 @@ path = "src/bin/bosn.rs"
 [dependencies]
 bosn-registry = { path = "../bosn-registry" }
 bosn-setup = { path = "../bosn-setup" }
+bosn-engine = { path = "../bosn-engine" }
 prost = "=0.14.4"
 kernal-api = { git = "https://github.com/zackees/kernal-api", rev = "fc634e507024d63ccaaf75fa564818b9dcfbff36", version = "=0.1.0", default-features = false, features = ["sqlite", "fs", "ipc", "ipc-async", "secure-random", "daemon-frame-v1"] }
 serde = { version = "=1.0.229", features = ["derive"] }
