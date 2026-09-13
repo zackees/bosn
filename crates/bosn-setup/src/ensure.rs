@@ -66,7 +66,7 @@ impl SetupEnsureCommand {
                 "inspect".into(),
                 "--format".into(),
                 format!(
-                    "{{{{.Id}}}}\\t{{{{.State.Running}}}}\\t{{{{.Image}}}}\\t{{{{index .Config.Labels \"{LABEL_MANAGED}\"}}}}\\t{{{{index .Config.Labels \"{LABEL_CONTENT_SHA256}\"}}}}\\t{{{{index .Config.Labels \"{LABEL_CONTAINER_NAME}\"}}}}"
+                    "{{{{.Id}}}}\t{{{{.State.Running}}}}\t{{{{.Image}}}}\t{{{{index .Config.Labels \"{LABEL_MANAGED}\"}}}}\t{{{{index .Config.Labels \"{LABEL_CONTENT_SHA256}\"}}}}\t{{{{index .Config.Labels \"{LABEL_CONTAINER_NAME}\"}}}}"
                 ),
                 container_name.clone(),
             ],
@@ -1066,6 +1066,50 @@ mod tests {
                 events: &events,
             },
         ))
+    }
+
+    #[test]
+    fn inspect_format_uses_actual_tabs_that_the_response_parser_accepts() {
+        let container_name = format!("bosn-setup-{HASH}");
+        let command = SetupEnsureCommand::Inspect {
+            container_name: container_name.clone(),
+        };
+        let args = command.docker_args();
+        assert_eq!(args[0], "container");
+        assert_eq!(args[1], "inspect");
+        assert_eq!(args[2], "--format");
+        assert!(args[3].contains('\t'));
+        assert!(!args[3].contains("\\\\t"));
+        assert_eq!(args[4], container_name);
+
+        let observed = parse_inspection(
+            format!(
+                "{CONTAINER_ID}\ttrue\t{IDENTITY}\t{MANAGED_VALUE}\t{HASH}\tbosn-setup-{HASH}\n"
+            )
+            .as_bytes(),
+        )
+        .expect("inspect output using the generated delimiter contract parses");
+        assert_eq!(observed.container_id, CONTAINER_ID);
+        assert!(observed.running);
+        assert_eq!(observed.image_identity, IDENTITY);
+        assert_eq!(
+            observed.labels.get(LABEL_MANAGED).map(String::as_str),
+            Some(MANAGED_VALUE)
+        );
+        assert_eq!(
+            observed
+                .labels
+                .get(LABEL_CONTENT_SHA256)
+                .map(String::as_str),
+            Some(HASH)
+        );
+        assert_eq!(
+            observed
+                .labels
+                .get(LABEL_CONTAINER_NAME)
+                .map(String::as_str),
+            Some(container_name.as_str())
+        );
     }
 
     #[test]

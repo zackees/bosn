@@ -1,0 +1,387 @@
+//! Opt-in, live-Docker proof for the daemon-owned setup-app ensure path.
+//!
+//! This test is intentionally ignored: it creates one short-lived container
+//! through the production daemon and therefore needs a Docker daemon and the
+//! pinned Alpine image documented below.  Its drop guard removes only the
+//! exact deterministic container after re-checking Bosn's ownership labels.
+
+use std::{
+    path::Path,
+    process::{Child, Command, ExitStatus, Stdio},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use bosn_engine::{CommandResult, DockerEngine, RunOptions};
+use bosn_service::{Client, SetupEnsureJobRequest, SetupPreparePolicy};
+use bosn_setup::{SetupAcquirePolicy, SetupPlanRequest, plan_setup};
+use kernal_api::async_engine::RuntimeBuilder;
+
+const PINNED_ALPINE: &str =
+    "alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b";
+const READY_DEADLINE: Duration = Duration::from_secs(10);
+const JOB_DEADLINE: Duration = Duration::from_secs(90);
+const DOCKER_DEADLINE: Duration = Duration::from_secs(10);
+const OUTPUT_LIMIT: usize = 1024 * 1024;
+const MANAGED_LABEL: &str = "com.zackees.bosn.setup-managed";
+const CONTENT_LABEL: &str = "com.zackees.bosn.setup-content-sha256";
+const NAME_LABEL: &str = "com.zackees.bosn.setup-container";
+
+/// A child daemon is reaped even if an assertion fails before the normal
+/// authenticated shutdown path runs.
+struct DaemonChild {
+    child: Child,
+}
+
+impl DaemonChild {
+    fn start(state: &Path) -> Self {
+        Self {
+            child: Command::new(env!("CARGO_BIN_EXE_bosn"))
+                .args(["daemon", "serve", "--state-dir"])
+                .arg(state)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("start production Bosn daemon"),
+        }
+    }
+
+    fn wait_for_exit(&mut self) -> ExitStatus {
+        let deadline = Instant::now() + READY_DEADLINE;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("observe daemon") {
+                return status;
+            }
+            assert!(Instant::now() < deadline, "daemon did not exit in time");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for DaemonChild {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ContainerInspection {
+    id: String,
+    running: bool,
+    image: String,
+    managed: String,
+    content_sha256: String,
+    container_name: String,
+}
+
+fn docker_capture(
+    engine: &DockerEngine,
+    args: impl IntoIterator<Item = impl Into<std::ffi::OsString>>,
+) -> CommandResult {
+    engine
+        .with_args(args)
+        .capture(RunOptions::bounded(DOCKER_DEADLINE, 64 * 1024))
+        .expect("run bounded kernal-api Docker command")
+}
+
+fn inspect_container(
+    engine: &DockerEngine,
+    container_name: &str,
+) -> Result<Option<ContainerInspection>, String> {
+    let inspect_format = format!(
+        "{{{{.Id}}}}\t{{{{.State.Running}}}}\t{{{{.Config.Image}}}}\t{{{{index .Config.Labels \"{MANAGED_LABEL}\"}}}}\t{{{{index .Config.Labels \"{CONTENT_LABEL}\"}}}}\t{{{{index .Config.Labels \"{NAME_LABEL}\"}}}}"
+    );
+    let result = docker_capture(
+        engine,
+        [
+            "container",
+            "inspect",
+            "--format",
+            inspect_format.as_str(),
+            container_name,
+        ],
+    );
+    if result.exit_code == 1 {
+        return Ok(None);
+    }
+    if !result.ok() {
+        return Err(format!(
+            "docker inspect exited {}: {}",
+            result.exit_code,
+            String::from_utf8_lossy(&result.stderr)
+        ));
+    }
+    let text = String::from_utf8(result.stdout)
+        .map_err(|_| "docker inspect returned non-UTF-8 output".to_owned())?;
+    let fields: Vec<_> = text.trim_end_matches(['\r', '\n']).split('\t').collect();
+    if fields.len() != 6 || fields.iter().any(|field| field.is_empty()) {
+        return Err("docker inspect returned an incomplete Bosn container record".into());
+    }
+    let running = match fields[1] {
+        "true" => true,
+        "false" => false,
+        _ => return Err("docker inspect returned an invalid running value".into()),
+    };
+    Ok(Some(ContainerInspection {
+        id: fields[0].into(),
+        running,
+        image: fields[2].into(),
+        managed: fields[3].into(),
+        content_sha256: fields[4].into(),
+        container_name: fields[5].into(),
+    }))
+}
+
+/// Removes only a container this test can still prove is its own.  It never
+/// uses a label selector, prune, or a name supplied by Docker output.
+struct ExactContainerCleanup {
+    engine: DockerEngine,
+    container_name: String,
+    content_sha256: String,
+}
+
+impl Drop for ExactContainerCleanup {
+    fn drop(&mut self) {
+        match inspect_container(&self.engine, &self.container_name) {
+            Ok(None) => {}
+            Ok(Some(observed))
+                if observed.managed == "v1"
+                    && observed.content_sha256 == self.content_sha256
+                    && observed.container_name == self.container_name =>
+            {
+                let result = docker_capture(
+                    &self.engine,
+                    ["container", "rm", "--force", self.container_name.as_str()],
+                );
+                if !result.ok() {
+                    eprintln!(
+                        "live setup ensure cleanup could not remove {}: {}",
+                        self.container_name,
+                        String::from_utf8_lossy(&result.stderr)
+                    );
+                }
+            }
+            Ok(Some(_)) => eprintln!(
+                "live setup ensure cleanup refused unexpected container {}",
+                self.container_name
+            ),
+            Err(error) => eprintln!(
+                "live setup ensure cleanup could not inspect {}: {error}",
+                self.container_name
+            ),
+        }
+    }
+}
+
+fn wait_for_client(
+    runtime: &kernal_api::async_engine::Runtime,
+    daemon: &mut DaemonChild,
+    state: &Path,
+) -> Client {
+    let client = Client::for_state(state).expect("construct daemon client");
+    let deadline = Instant::now() + READY_DEADLINE;
+    loop {
+        if runtime.run(client.ping()).is_ok() {
+            return client;
+        }
+        assert!(
+            daemon.child.try_wait().expect("observe daemon").is_none(),
+            "daemon exited before becoming ready"
+        );
+        assert!(Instant::now() < deadline, "daemon did not become ready");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_for_success(runtime: &kernal_api::async_engine::Runtime, client: &Client, job_id: u64) {
+    let deadline = Instant::now() + JOB_DEADLINE;
+    loop {
+        let status = runtime
+            .run(client.job_status(job_id))
+            .expect("read setup ensure job status");
+        match status.state.as_str() {
+            "Succeeded" => return,
+            "Failed" | "Cancelled" | "Superseded" => {
+                panic!(
+                    "setup ensure job {job_id} ended {}: {:?}",
+                    status.state, status.error
+                )
+            }
+            "Queued" | "Running" | "Cancelling" => {}
+            unexpected => panic!("unexpected setup ensure job state {unexpected}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "setup ensure job {job_id} timed out"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn image_identity(engine: &DockerEngine) -> String {
+    let result = docker_capture(
+        engine,
+        ["image", "inspect", "--format", "{{.Id}}", PINNED_ALPINE],
+    );
+    assert!(
+        result.ok(),
+        "pinned Alpine image is unavailable: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let identity = String::from_utf8(result.stdout).expect("image identity is UTF-8");
+    let identity = identity.trim().to_owned();
+    assert!(!identity.is_empty(), "pinned Alpine image has no identity");
+    identity
+}
+
+fn test_unique_suffix() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after Unix epoch")
+        .as_nanos();
+    format!("{}-{nanos}", std::process::id())
+}
+
+/// Run with:
+/// `cargo test -p bosn-service --test setup_ensure_docker -- --ignored --exact live_docker_setup_ensure_creates_and_reuses_one_managed_app`
+///
+/// It needs a usable local Docker daemon and the exact `PINNED_ALPINE` image.
+/// The test does not pull an unpinned image, and its cleanup refuses to remove
+/// any candidate whose three expected Bosn ownership labels do not match.
+#[test]
+#[ignore = "requires a local Docker daemon and the pinned Alpine image"]
+fn live_docker_setup_ensure_creates_and_reuses_one_managed_app() {
+    let engine = DockerEngine::docker();
+    let expected_image = image_identity(&engine);
+    let root = tempfile::tempdir().expect("temporary test root");
+    let state = root.path().join("state");
+    let workspace = root.path().join("workspace");
+    let config_root = root.path().join("config");
+    std::fs::create_dir_all(&workspace).expect("create empty workspace");
+    std::fs::create_dir_all(&config_root).expect("create config directory");
+    let config = config_root.join("setup.toml");
+    let unique = test_unique_suffix();
+    std::fs::write(
+        &config,
+        format!(
+            "version = 1\n[app]\nimage = '{PINNED_ALPINE}'\ncommand = 'exec sleep 120 # bosn-live-{unique}'\n"
+        ),
+    )
+    .expect("write setup document");
+
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("construct kernal-api runtime");
+    // Plan through the public setup API before the daemon starts so the test
+    // can derive its exact deterministic name for ownership-checked cleanup.
+    let plan = runtime
+        .run(plan_setup(SetupPlanRequest {
+            state_dir: state.clone(),
+            workspace: workspace.clone(),
+            locator: config.to_string_lossy().into_owned(),
+            policy: SetupAcquirePolicy::OnlineRefresh,
+        }))
+        .expect("plan pinned setup document without Docker");
+    let container_name = format!("bosn-setup-{}", plan.content_sha256);
+    assert!(
+        inspect_container(&engine, &container_name)
+            .expect("inspect deterministic test container")
+            .is_none(),
+        "unique test container name already exists; refusing to touch it"
+    );
+    let cleanup = ExactContainerCleanup {
+        engine: engine.clone(),
+        container_name: container_name.clone(),
+        content_sha256: plan.content_sha256.clone(),
+    };
+    let request = SetupEnsureJobRequest {
+        workspace: workspace.clone(),
+        config: config.to_string_lossy().into_owned(),
+        policy: SetupPreparePolicy::Refresh,
+        deadline: JOB_DEADLINE,
+        output_limit: OUTPUT_LIMIT,
+    };
+
+    let mut first_daemon = DaemonChild::start(&state);
+    let first_client = wait_for_client(&runtime, &mut first_daemon, &state);
+    let first_job = runtime
+        .run(first_client.submit_setup_ensure(request.clone()))
+        .expect("submit first production setup ensure job");
+    wait_for_success(&runtime, &first_client, first_job);
+    let first = inspect_container(&engine, &container_name)
+        .expect("inspect first setup app")
+        .expect("first setup app exists");
+    assert!(first.running, "first setup app is not running");
+    assert_eq!(first.image, expected_image, "managed app image identity");
+    assert_eq!(first.managed, "v1", "managed ownership label");
+    assert_eq!(
+        first.content_sha256, plan.content_sha256,
+        "content ownership label"
+    );
+    assert_eq!(
+        first.container_name, container_name,
+        "container-name ownership label"
+    );
+
+    runtime
+        .run(first_client.shutdown())
+        .expect("shut down first daemon");
+    assert!(
+        first_daemon.wait_for_exit().success(),
+        "first daemon failed"
+    );
+
+    // A new daemon has an empty in-memory scheduler.  The same request must
+    // still reuse the inspected, matching container rather than replacing it.
+    let mut second_daemon = DaemonChild::start(&state);
+    let second_client = wait_for_client(&runtime, &mut second_daemon, &state);
+    let second_job = runtime
+        .run(second_client.submit_setup_ensure(request))
+        .expect("submit second production setup ensure job");
+    wait_for_success(&runtime, &second_client, second_job);
+    let second = inspect_container(&engine, &container_name)
+        .expect("inspect reused setup app")
+        .expect("reused setup app exists");
+    assert!(second.running, "reused setup app is not running");
+    assert_eq!(
+        second.id, first.id,
+        "matching app was replaced instead of reused"
+    );
+    assert_eq!(second.image, expected_image, "reused app image identity");
+    assert_eq!(second.managed, "v1", "reused managed ownership label");
+    assert_eq!(
+        second.content_sha256, plan.content_sha256,
+        "reused content label"
+    );
+    assert_eq!(
+        second.container_name, container_name,
+        "reused container-name label"
+    );
+
+    runtime
+        .run(second_client.shutdown())
+        .expect("shut down second daemon");
+    assert!(
+        second_daemon.wait_for_exit().success(),
+        "second daemon failed"
+    );
+    assert!(
+        std::fs::read_dir(&workspace)
+            .expect("read workspace")
+            .next()
+            .is_none(),
+        "setup ensure wrote into the selected workspace"
+    );
+    drop(cleanup);
+    assert!(
+        inspect_container(&engine, &container_name)
+            .expect("inspect exact container after cleanup")
+            .is_none(),
+        "exact live-test container remained after cleanup"
+    );
+}
