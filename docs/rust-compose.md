@@ -45,6 +45,42 @@ cannot contain `..`; container targets must be normalized absolute paths without
 future daemon supplies the selected roots and revalidates them before any materialization or
 engine operation.
 
+## Pure Compose-to-setup translation
+
+`bosn_core::translate_compose_to_setup` is a second, still-inert planning boundary. It accepts a
+previously parsed `ComposeDocument` and returns `ComposeSetupPlan`, which contains Bosn's existing
+typed `SetupDocument`, canonical JSON, and a `sha256:` translation receipt. The receipt is over
+the translated setup semantics plus the selected service name; it is distinct from the broader
+Compose plan digest and is not a build-generation, container, or ownership receipt.
+
+This is deliberately a *lossless single-app adapter*, not a partial Compose runner. It accepts
+exactly one service with all of the following properties:
+
+| Compose shape | Typed setup result |
+| --- | --- |
+| `image: name@sha256:<64 lowercase hex>` | `SetupSource::PinnedImage` with the same immutable reference |
+| explicit `environment` mapping/list values that satisfy setup's identifier, size, and NUL rules | the same ordered-map environment |
+| bind mounts with safe relative sources and normalized absolute targets | the same `WorkspaceMount` values |
+| `working_dir` covered by a bind target | workspace-relative setup workdir which resolves back to that exact target |
+| no `command`, or `command: [sh, -lc, <nonempty bounded script>]` | no setup command, or the same script used by setup's fixed `sh -lc` command shape |
+
+The adapter neither chooses a workspace nor verifies that bind sources exist. It only derives a
+workspace-relative workdir lexically from an already-declared bind mount. This keeps path
+containment, filesystem observation, config acquisition, asset materialization, image
+preparation, registry writes, and Docker calls outside the boundary.
+
+Everything else is refused with a structured `ComposeError` and source path. In particular this
+includes more or fewer than one service; unpinned images; `build`; profiles; named volumes and
+tmpfs; top-level or service networks; ports; dependencies; healthchecks; labels; restart policy;
+container names; entrypoint overrides; arbitrary command vectors or strings; and workdirs not
+covered by a bind mount. Those features need a later daemon-owned multi-service/lifecycle model;
+they must never be smuggled through this adapter as raw Compose YAML or Docker arguments.
+
+There is intentionally no CLI, Python, or MCP translation front door in this increment. The
+existing `compose plan` interfaces remain read-only parser/planner review tools, not an apply
+path. Rust callers may use `parse_and_translate_compose_yaml(source)` only when they explicitly
+need this pure typed adapter.
+
 ## Read-only front doors
 
 The pure plan is available for review before any future execution work:
@@ -64,6 +100,6 @@ returns the same typed document, digest, and `applied: false` receipt.
 ## Next migration work
 
 The next Compose work package must add daemon-owned planning/apply semantics, context-closure
-digesting, lifecycle/lease/reconciliation behavior, and only then expose a typed client/CLI/
-Python/MCP operation. It must preserve the existing front-door refusal catalog and never turn
-this parser into a generic YAML or raw-Docker pass-through.
+digesting, multi-service/network/volume lifecycle, leases/reconciliation behavior, and only then
+expose a typed client/CLI/Python/MCP operation. It must preserve the existing front-door refusal
+catalog and never turn either pure planner into a generic YAML or raw-Docker pass-through.

@@ -11,9 +11,10 @@ pub mod manifest;
 pub mod setup;
 
 pub use compose::{
-    BuildSpec, COMPOSE_PLAN_VERSION, ComposeDocument, ComposeError, ComposeErrorCode, ComposePlan,
-    DependencySpec, HealthcheckSpec, MountSpec, RelativePath, ResourceSpec, ServiceSpec,
-    parse_and_plan_compose_yaml, parse_compose_yaml, plan_compose,
+    BuildSpec, COMPOSE_PLAN_VERSION, COMPOSE_SETUP_PLAN_VERSION, ComposeDocument, ComposeError,
+    ComposeErrorCode, ComposePlan, ComposeSetupPlan, DependencySpec, HealthcheckSpec, MountSpec,
+    RelativePath, ResourceSpec, ServiceSpec, parse_and_plan_compose_yaml,
+    parse_and_translate_compose_yaml, parse_compose_yaml, plan_compose, translate_compose_to_setup,
 };
 pub use config::{
     AppPolicy, MachinePolicy, PolicyDefaults, PolicyError, PolicyOrigin, parse_machine_policy_toml,
