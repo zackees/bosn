@@ -370,6 +370,7 @@ impl Client {
     /// Confirmed recovery of lost local registry ownership for an existing
     /// Bosn-managed app. The daemon derives every Docker identity itself.
     #[pyo3(signature = (workspace, config_locator, *, policy, deadline_ms, output_limit, confirm))]
+    #[allow(clippy::too_many_arguments)] // Required by the stable Python API signature.
     fn setup_adopt(
         &self,
         workspace: PathBuf,
