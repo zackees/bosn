@@ -256,3 +256,135 @@ def test_native_python_client_ensures_and_reuses_one_managed_app(tmp_path: Path)
         assert not any(workspace.iterdir()), "ensure wrote into the selected workspace"
     finally:
         _remove_exact_managed_container(container_name, plan.content_sha256)
+
+
+def test_native_python_client_ensures_supported_compose_yaml_source(tmp_path: Path) -> None:
+    """A lossless one-service Compose YAML source uses the normal setup lifecycle.
+
+    The test deliberately speaks only the typed Python setup API.  It neither
+    invokes nor requires a Compose executable, and the YAML carries no raw
+    Docker arguments: the fixed setup engine receives only the translated
+    pinned-image, environment, and fixed-shell command semantics.
+    """
+
+    image_id = _pinned_image_id()
+    assert bosn.Client.__module__ == "bosn._native"
+
+    state_dir = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    config_dir = tmp_path / "config"
+    workspace.mkdir()
+    config_dir.mkdir()
+    config = config_dir / "compose.yaml"
+    unique = f"python-compose-{os.getpid()}-{time.time_ns()}"
+    config.write_text(
+        "services:\n"
+        "  app:\n"
+        f"    image: {PINNED_ALPINE}\n"
+        "    environment:\n"
+        f"      BOSN_COMPOSE_PROOF: {unique}\n"
+        f"    command: [sh, -lc, 'exec sleep 120 # {unique}']\n",
+        encoding="utf-8",
+    )
+
+    client = bosn.Client(state_dir)
+    plan = client.plan_setup(workspace, str(config), policy="online_refresh")
+    assert plan.source_kind == "local_file"
+    assert plan.app_source_kind == "pinned_image"
+    assert plan.image == PINNED_ALPINE
+    assert plan.asset_root is None
+    assert plan.task_names == ()
+    assert not plan.applied
+    container_name = f"bosn-setup-{plan.content_sha256}"
+    assert _inspect_container(container_name) is None, "refusing an existing deterministic app"
+
+    try:
+        with _production_daemon(state_dir) as (_, daemon):
+            _wait_for_daemon(client, daemon)
+            first_job = client.submit_setup_ensure(
+                workspace,
+                str(config),
+                policy="online_refresh",
+                deadline_ms=90_000,
+                output_limit=1_048_576,
+            )
+            assert isinstance(_wait_for_success(client, first_job), tuple)
+
+            first = _inspect_container(container_name)
+            assert first is not None
+            first_id, first_running, first_image, first_labels = first
+            assert first_running
+            assert first_image == image_id
+            assert first_labels[MANAGED_LABEL] == "v1"
+            assert first_labels[CONTENT_LABEL] == plan.content_sha256
+            assert first_labels[NAME_LABEL] == container_name
+
+            # The daemon owns both durable resource records.  The image record
+            # is tied to Docker's inspected immutable identity rather than the
+            # Compose source reference, while the container record is tied to
+            # the verified YAML-content generation.
+            resources = client.registry_resources(limit=16).records
+            assert len(resources) == 2
+            container_resource = next(
+                record
+                for record in resources
+                if record.id == f"setup-container:{plan.content_sha256}"
+            )
+            assert (
+                container_resource.kind,
+                container_resource.name,
+                container_resource.stack,
+                container_resource.generation,
+                container_resource.state,
+                container_resource.retention,
+            ) == (
+                "container",
+                container_name,
+                "setup",
+                f"sha256:{plan.content_sha256}",
+                "active",
+                "pinned",
+            )
+            image_resource = next(record for record in resources if record.kind == "image")
+            assert (
+                image_resource.id,
+                image_resource.name,
+                image_resource.stack,
+                image_resource.generation,
+                image_resource.state,
+                image_resource.retention,
+            ) == (
+                f"setup-image:{image_id}",
+                f"setup-image:{image_id}",
+                "setup",
+                image_id,
+                "active",
+                "pinned",
+            )
+            assert [event.kind for event in client.setup_ensure_events(limit=8).records] == [
+                "setup.ensure.succeeded",
+                "setup.ensure.submitted",
+            ]
+
+            # Reuse goes through the same YAML source and typed API; it does
+            # not run a Compose command or replace the verified container.
+            second_job = client.submit_setup_ensure(
+                workspace,
+                str(config),
+                policy="offline_cache_only",
+                deadline_ms=90_000,
+                output_limit=1_048_576,
+            )
+            assert isinstance(_wait_for_success(client, second_job), tuple)
+            second = _inspect_container(container_name)
+            assert second is not None
+            second_id, second_running, second_image, second_labels = second
+            assert second_id == first_id, "Compose YAML ensure replaced the matching app"
+            assert second_running
+            assert second_image == first_image
+            assert second_labels == first_labels
+            assert client.status().resources == 2
+
+        assert not any(workspace.iterdir()), "ensure wrote into the selected workspace"
+    finally:
+        _remove_exact_managed_container(container_name, plan.content_sha256)
