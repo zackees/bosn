@@ -5,6 +5,15 @@
 
 use std::collections::BTreeMap;
 
+pub mod config;
+pub mod manifest;
+
+pub use config::{
+    AppPolicy, MachinePolicy, PolicyDefaults, PolicyError, PolicyOrigin, parse_machine_policy_toml,
+    resolve_app_policy, resolve_machine_policy,
+};
+pub use manifest::{Manifest, ManifestError, ManifestRoots, parse_manifest_toml};
+
 pub const NAMESPACE: &str = "com.zackees.bosn";
 pub const LABEL_REGISTRY: &str = "com.zackees.bosn.registry";
 pub const LABEL_KIND: &str = "com.zackees.bosn.kind";

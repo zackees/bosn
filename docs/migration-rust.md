@@ -15,6 +15,19 @@ are not performance promises or evidence that the Rust migration is implemented.
 - [x] Measure startup, idle RSS, status, ensure-reuse, and build/package cost.
 - [ ] Review the matrix and classify any behavior intentionally removed before Rust coding.
 
+## Landed implementation checkpoints
+
+- [Bosn #154](https://github.com/zackees/bosn/pull/154): Python state fixture and
+  runtime baseline. The broader Docker baseline failure is recorded below.
+- [kernal-api #192](https://github.com/zackees/kernal-api/pull/192): optional
+  SQLite facade. Exact registry publication and native platform proof remain open.
+- [Bosn #155](https://github.com/zackees/bosn/pull/155): pure Rust ownership,
+  per-holder lease observations, retention/idle-stop decisions and ordering.
+  Thirteen Rust tests pass; this does not implement persistent registry access,
+  daemon mutation, or the client front ends. See `docs/rust-domain.md`.
+
+No implementation phase is marked complete solely because one checkpoint landed.
+
 ## Current surface and characterization references
 
 ### Main CLI (`bosn`)
@@ -52,7 +65,7 @@ replacement catalog says otherwise.  It must not infer support from Docker's bro
 
 | Capability | Contract | Characterization references |
 | --- | --- | --- |
-| Manifest kind | `macos-x86-64`, explicit Apple-license acknowledgement, guest sizing/ports/readiness/payload fields; guest data volume can be pinned | `tests/test_guest.py`, `tests/test_manifest.py` |
+| Manifest kind | `macos-x64-guest`, explicit Apple-license acknowledgement, guest sizing/ports/readiness/payload fields; guest data volume can be pinned | `tests/test_guest.py`, `tests/test_manifest.py` |
 | Safe preflight | Linux only; require `/dev/kvm` and `/dev/net/tun`; conservative AMD one-core default | `tests/test_guest.py`, `tests/test_converge.py` |
 | Lifecycle | create with KVM/tun/NET_ADMIN and SSH port; no bind mounts; wait for SSH with guest logs on failure | `tests/test_guest.py`, `tests/test_converge.py` |
 | Execution | optional payload copied with `scp` each task, SSH command/shell, real exit propagation and ambiguous-255 event | `tests/test_guest.py`, `tests/test_cli_verbs.py`, `tests/test_converge.py` |
