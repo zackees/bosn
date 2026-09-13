@@ -244,23 +244,6 @@ fn wait_for_success(runtime: &kernal_api::async_engine::Runtime, client: &Client
     }
 }
 
-fn wait_for_stopped(engine: &DockerEngine, name: &str) -> ContainerInspection {
-    let deadline = Instant::now() + DOCKER_DEADLINE;
-    loop {
-        let observed = inspect_container(engine, name)
-            .expect("inspect exact managed app while waiting for stopped")
-            .expect("managed app disappeared before GC preview");
-        if !observed.running {
-            return observed;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "retired test app did not stop before GC"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
-}
-
 fn image_identity_for(engine: &DockerEngine, reference: &str) -> String {
     let result = docker_capture(
         engine,
@@ -606,7 +589,7 @@ fn live_docker_setup_gc_apply_removes_only_retired_generation() {
     let config = config_root.join("setup.toml");
     let unique = test_unique_suffix();
     let document = |generation: &str| {
-        let sleep = if generation == "a" { 1 } else { 120 };
+        let sleep = 120;
         format!(
             "version = 1\n[app]\nimage = '{PINNED_ALPINE}'\ncommand = 'exec sleep {sleep} # bosn-rollover-{unique}-{generation}'\n"
         )
@@ -688,13 +671,11 @@ fn live_docker_setup_gc_apply_removes_only_retired_generation() {
     let current = inspect_container(&engine, &name_b)
         .expect("inspect current generation")
         .expect("current managed app exists");
-    // The test document deliberately exits by itself. GC may only remove a
-    // stopped retired container; it must never stop an app as a side effect.
-    let old_after_rollover = wait_for_stopped(&engine, &name_a);
-    assert!(
-        !old_after_rollover.running,
-        "old app stops by its declared command"
-    );
+    // Rollover only retires registry ownership: it must not stop the old app.
+    let old_after_rollover = inspect_container(&engine, &name_a)
+        .expect("inspect retired generation")
+        .expect("retired app remains present");
+    assert!(old_after_rollover.running, "rollover must not stop old app");
     assert!(current.running, "current app must be running");
     assert_ne!(old_after_rollover.id, current.id);
     assert_eq!(current.image, expected_image);
@@ -719,6 +700,23 @@ fn live_docker_setup_gc_apply_removes_only_retired_generation() {
         !candidate.token.is_empty(),
         "preview returns opaque apply token"
     );
+    let stopped = runtime
+        .run(client.setup_stop_retired(&workspace, &candidate.token, true))
+        .expect("stop exact running retired candidate through daemon");
+    assert!(stopped.stopped);
+    assert!(!stopped.already_stopped);
+    assert!(
+        !inspect_container(&engine, &name_a)
+            .expect("inspect stopped retired candidate")
+            .expect("stopped retired candidate exists")
+            .running,
+        "stop-retired stops only the old generation"
+    );
+    let repeated = runtime
+        .run(client.setup_stop_retired(&workspace, &candidate.token, true))
+        .expect("repeat exact retired stop through daemon");
+    assert!(!repeated.stopped);
+    assert!(repeated.already_stopped);
     let applied = runtime
         .run(client.setup_gc_apply(&workspace, &candidate.token, true))
         .expect("apply exact preview candidate through daemon");
@@ -763,6 +761,16 @@ fn live_docker_setup_gc_apply_removes_only_retired_generation() {
             .expect("shared inspected image registry row")
             .state,
         ResourceState::Active
+    );
+    assert!(
+        registry
+            .events(0, 64)
+            .expect("read GC event")
+            .items
+            .iter()
+            .any(|event| event.kind == "setup.ensure.retired_stopped"
+                && event.detail == "retired_managed_setup_container"),
+        "successful stop records one redacted durable event"
     );
     assert!(
         registry

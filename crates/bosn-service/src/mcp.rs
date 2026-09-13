@@ -18,7 +18,7 @@ use crate::{
     Client, DoctorReport, Error, JobLogPage, JobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE,
     RegistryResourcePage, SetupAdoptRequest, SetupAdoptResult, SetupDoneResult,
     SetupEnsureEventPage, SetupEnsureJobRequest, SetupGcApplyResult, SetupGcPreviewPage,
-    SetupPreparePolicy, SetupPrepareRequest, SetupTaskJobRequest, Status,
+    SetupPreparePolicy, SetupPrepareRequest, SetupRetiredStopResult, SetupTaskJobRequest, Status,
 };
 use bosn_setup::{
     SetupAcquirePolicy, SetupPlan, SetupPlanAppSource, SetupPlanRequest, SetupSourceKind,
@@ -116,6 +116,11 @@ trait Backend {
         workspace: PathBuf,
         token: String,
     ) -> Result<SetupGcApplyResult, Error>;
+    fn setup_stop_retired(
+        &mut self,
+        workspace: PathBuf,
+        token: String,
+    ) -> Result<SetupRetiredStopResult, Error>;
     fn setup_done(&mut self, workspace: PathBuf) -> Result<SetupDoneResult, Error>;
     fn setup_adopt(&mut self, request: SetupAdoptRequest) -> Result<SetupAdoptResult, Error>;
     fn job_status(&mut self, id: u64) -> Result<JobStatus, Error>;
@@ -187,6 +192,14 @@ impl Backend for DaemonBackend<'_> {
     ) -> Result<SetupGcApplyResult, Error> {
         self.runtime
             .run(self.client.setup_gc_apply(workspace, &token, true))
+    }
+    fn setup_stop_retired(
+        &mut self,
+        workspace: PathBuf,
+        token: String,
+    ) -> Result<SetupRetiredStopResult, Error> {
+        self.runtime
+            .run(self.client.setup_stop_retired(workspace, &token, true))
     }
     fn setup_done(&mut self, workspace: PathBuf) -> Result<SetupDoneResult, Error> {
         self.runtime.run(self.client.setup_done(workspace, true))
@@ -383,6 +396,12 @@ fn tools_list() -> Value {
                 "description": "DESTRUCTIVE: remove exactly one retired Bosn-managed setup container using a preview candidate token and explicit confirmation. The daemon rechecks registry ownership and Docker labels before removal.",
                 "inputSchema": setup_gc_apply_schema(),
                 "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false}
+            },
+            {
+                "name": "bosn_setup_stop_retired",
+                "description": "DESTRUCTIVE: stop exactly one running retired Bosn-managed setup container using a preview candidate token and explicit confirmation. It retains the registry record for later GC apply and never removes images, volumes, or containers.",
+                "inputSchema": setup_gc_apply_schema(),
+                "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": true, "openWorldHint": false}
             },
             {
                 "name": "bosn_setup_done",
@@ -612,6 +631,14 @@ fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
                 backend
                     .setup_gc_apply(workspace, token)
                     .map(setup_gc_apply_json)
+                    .map_err(|_| ToolFailure::Daemon)
+            })
+        }
+        "bosn_setup_stop_retired" => {
+            setup_gc_apply_arguments(arguments).and_then(|(workspace, token)| {
+                backend
+                    .setup_stop_retired(workspace, token)
+                    .map(setup_stop_retired_json)
                     .map_err(|_| ToolFailure::Daemon)
             })
         }
@@ -1146,6 +1173,9 @@ fn setup_gc_preview_json(page: SetupGcPreviewPage) -> Value {
 fn setup_gc_apply_json(result: SetupGcApplyResult) -> Value {
     json!({"removed":result.removed,"reconciled_missing":result.reconciled_missing})
 }
+fn setup_stop_retired_json(result: SetupRetiredStopResult) -> Value {
+    json!({"stopped": result.stopped, "already_stopped": result.already_stopped})
+}
 fn setup_done_json(result: SetupDoneResult) -> Value {
     json!({"uses_completed":result.uses_completed,"resources_completed":result.resources_completed})
 }
@@ -1334,6 +1364,17 @@ mod tests {
                 reconciled_missing: false,
             })
         }
+        fn setup_stop_retired(
+            &mut self,
+            _workspace: PathBuf,
+            _token: String,
+        ) -> Result<SetupRetiredStopResult, Error> {
+            self.daemon_reads += 1;
+            Ok(SetupRetiredStopResult {
+                stopped: true,
+                already_stopped: false,
+            })
+        }
         fn setup_done(&mut self, _workspace: PathBuf) -> Result<SetupDoneResult, Error> {
             self.daemon_reads += 1;
             Ok(SetupDoneResult {
@@ -1482,6 +1523,7 @@ mod tests {
                 "bosn_setup_ensure_events",
                 "bosn_setup_gc_preview",
                 "bosn_setup_gc_apply",
+                "bosn_setup_stop_retired",
                 "bosn_setup_done",
                 "bosn_setup_adopt",
                 "bosn_job_status",
@@ -1643,6 +1685,29 @@ mod tests {
         );
         assert_eq!(rejected["isError"], true);
         assert_eq!(backend.daemon_reads, before);
+    }
+
+    #[test]
+    fn stop_retired_requires_token_confirmation_and_rejects_engine_controls() {
+        let mut backend = FakeBackend::default();
+        let rejected = call_tool(
+            json!({"name":"bosn_setup_stop_retired","arguments":{"workspace":"/private/work","candidate_token":"sgc1-00","confirm":false}}),
+            &mut backend,
+        );
+        assert_eq!(rejected["isError"], true);
+        assert_eq!(backend.daemon_reads, 0);
+        let rejected = call_tool(
+            json!({"name":"bosn_setup_stop_retired","arguments":{"workspace":"/private/work","candidate_token":"sgc1-00","confirm":true,"docker_args":["stop"]}}),
+            &mut backend,
+        );
+        assert_eq!(rejected["isError"], true);
+        assert_eq!(backend.daemon_reads, 0);
+        let stopped = call_tool(
+            json!({"name":"bosn_setup_stop_retired","arguments":{"workspace":"/private/work","candidate_token":"sgc1-00","confirm":true}}),
+            &mut backend,
+        );
+        assert_eq!(stopped["isError"], false);
+        assert_eq!(stopped["structuredContent"]["stopped"], true);
     }
 
     #[test]

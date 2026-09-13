@@ -549,8 +549,78 @@ fn run_setup(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
         Some(command) if command == "task" => run_setup_task(arguments),
         Some(command) if command == "ensure" => run_setup_ensure(arguments),
         Some(command) if command == "adopt" => run_setup_adopt(arguments),
+        Some(command) if command == "stop-retired" => run_setup_stop_retired(arguments),
         Some(command) if command == "done" => run_setup_done(arguments),
         _ => usage(),
+    }
+}
+
+/// Stop one preview-derived retired generation while retaining its registry
+/// record for the separate GC apply action. No Docker identifier or engine
+/// controls are accepted by this CLI.
+fn run_setup_stop_retired(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
+    let mut state_dir = None;
+    let mut workspace = None;
+    let mut token = None;
+    let mut apply = false;
+    let mut yes = false;
+    let mut json_output = false;
+    while let Some(argument) = arguments.next() {
+        match argument.to_string_lossy().as_ref() {
+            "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
+            "--workspace" => set_once_parsed(&mut workspace, arguments.next(), parse_state_dir),
+            "--candidate" => set_once_parsed(&mut token, arguments.next(), |value| {
+                value.to_str().map(str::to_owned).ok_or(())
+            }),
+            "--apply" if !apply => {
+                apply = true;
+                Ok(())
+            }
+            "--yes" if !yes => {
+                yes = true;
+                Ok(())
+            }
+            "--json" if !json_output => {
+                json_output = true;
+                Ok(())
+            }
+            _ => Err(()),
+        }
+        .unwrap_or_else(|_| usage());
+    }
+    let (Some(state_dir), Some(workspace), Some(token)) = (state_dir, workspace, token) else {
+        usage();
+    };
+    if !apply || !yes {
+        usage();
+    }
+    let result = Client::for_state(&state_dir).ok().and_then(|client| {
+        RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .ok()
+            .and_then(|runtime| {
+                runtime
+                    .run(client.setup_stop_retired(workspace, &token, true))
+                    .ok()
+            })
+    });
+    match result {
+        Some(result) => println!(
+            "{}",
+            json!({"action":"setup_stop_retired","stopped":result.stopped,"already_stopped":result.already_stopped})
+        ),
+        None => {
+            if json_output {
+                println!(
+                    "{}",
+                    json!({"action":"setup_stop_retired","error":"daemon unavailable or request failed"})
+                );
+            } else {
+                eprintln!("bosn setup stop-retired: daemon unavailable or request failed");
+            }
+            std::process::exit(1);
+        }
     }
 }
 
@@ -1425,6 +1495,9 @@ fn usage() -> ! {
         "   or: bosn setup ensure --state-dir STATE_DIR --workspace WORKSPACE --config LOCATOR (--refresh | --offline) --deadline-ms 1..=300000 --output-limit 1..=8388608 [--json]"
     );
     eprintln!("   or: bosn setup done --state-dir STATE_DIR --workspace WORKSPACE --yes [--json]");
+    eprintln!(
+        "   or: bosn setup stop-retired --state-dir STATE_DIR --workspace WORKSPACE --candidate TOKEN --apply --yes [--json]"
+    );
     eprintln!("   or: bosn job status --state-dir STATE_DIR --job-id ID [--json]");
     eprintln!(
         "   or: bosn job logs --state-dir STATE_DIR --job-id ID [--after CURSOR] [--limit 1..={MAX_JOB_LOG_LIMIT}] [--json]"
