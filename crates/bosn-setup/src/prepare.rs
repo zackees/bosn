@@ -38,6 +38,12 @@ impl SetupImageCommand {
             Self::Pull { image } => vec!["image".into(), "pull".into(), image.clone()],
             Self::Build { tag, .. } => vec![
                 "build".into(),
+                // A local setup app is single-platform. Without this,
+                // recent BuildKit releases export an OCI index whose `.Id`
+                // differs from the platform image ID Docker stores on the
+                // container. The ensure primitive must compare one stable
+                // image identity across create and later reuse.
+                "--provenance=false".into(),
                 "--tag".into(),
                 tag.clone(),
                 "--file".into(),
@@ -639,6 +645,7 @@ mod tests {
             .docker_args(),
             vec![
                 "build".into(),
+                "--provenance=false".into(),
                 "--tag".into(),
                 prepared.reference.clone(),
                 "--file".into(),

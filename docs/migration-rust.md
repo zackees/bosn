@@ -86,10 +86,21 @@ transport end to end, including daemon restart and matching-container reuse:
 cargo test -p bosn-service --test setup_ensure_docker -- --ignored --exact live_docker_setup_ensure_creates_and_reuses_one_managed_app
 ```
 
-It requires a usable Docker daemon and the exact pre-pulled Alpine digest
-named by the test. The test creates one uniquely content-addressed app and its
-drop guard removes only that exact app after re-checking all ownership labels;
-it never uses Docker prune or a selector-based cleanup.
+The companion one-file acceptance proof uses an inline Dockerfile carried only
+by the setup TOML. It verifies Bosn's content-addressed private build assets,
+the generated `bosn-setup:<content-sha256>` image, and ownership-safe reuse
+from a fresh daemon without writing the selected workspace:
+
+```text
+cargo test -p bosn-service --test setup_ensure_docker -- --ignored --exact live_docker_setup_ensure_builds_and_reuses_inline_app
+```
+
+Both require a usable Docker daemon and the exact pre-pulled Alpine digest
+named by the test. The inline proof does not need a separately authored
+Dockerfile, script, or build context. Each test creates one uniquely
+content-addressed app and its drop guard removes only that exact app after
+re-checking all ownership labels; neither uses Docker prune, a selector-based
+cleanup, or image deletion.
 
 ## Current surface and characterization references
 
