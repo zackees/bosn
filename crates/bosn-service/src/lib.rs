@@ -2,7 +2,10 @@
 
 use bosn_engine::{DockerEngine, EngineEvent, RunOptions};
 use bosn_registry::{Registry, RegistryStatus};
-use bosn_setup::{SetupAcquirePolicy, SetupPlanRequest, plan_setup, prepare_setup_image};
+use bosn_setup::{
+    SetupAcquirePolicy, SetupPlanRequest, SetupTaskRequest, execute_setup_task, plan_setup,
+    prepare_setup_image,
+};
 use jobs::{Jobs, Submission};
 use kernal_api::{
     async_engine::{self, CancellationSource},
@@ -73,6 +76,20 @@ pub struct SetupPrepareRequest {
     pub output_limit: usize,
 }
 
+/// All immutable caller inputs for one daemon-owned setup task.  The task's
+/// command, mounts, image, environment, and working directory remain solely
+/// in the validated setup document; this request can select only one declared
+/// task by name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupTaskJobRequest {
+    pub workspace: PathBuf,
+    pub config: String,
+    pub policy: SetupPreparePolicy,
+    pub task_name: String,
+    pub deadline: Duration,
+    pub output_limit: usize,
+}
+
 /// Testable daemon execution boundary.  Production uses
 /// [`DockerSetupPrepareExecutor`]; tests can provide a deterministic runner
 /// without starting Docker.  Log records are bounded by the actor before they
@@ -81,6 +98,18 @@ pub trait SetupPrepareExecutor: Send + Sync {
     fn execute<'a>(
         &'a self,
         request: SetupPrepareRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a async_engine::Sender<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
+}
+
+/// Testable daemon boundary for the complete plan, prepare, and declared-task
+/// pipeline. Production uses [`DockerSetupTaskExecutor`].  It deliberately
+/// receives no Docker controls: only the bounded semantic request above.
+pub trait SetupTaskExecutor: Send + Sync {
+    fn execute<'a>(
+        &'a self,
+        request: SetupTaskJobRequest,
         cancellation: &'a async_engine::CancellationToken,
         logs: &'a async_engine::Sender<String>,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
@@ -152,6 +181,143 @@ impl SetupPrepareExecutor for DockerSetupPrepareExecutor {
             Ok(format!(
                 "prepared {} as {}",
                 prepared.reference, prepared.observed_identity
+            ))
+        })
+    }
+}
+
+/// Docker-backed implementation for a single setup task.  The daemon plans,
+/// prepares, and then invokes the task primitive itself; no front end can
+/// insert an arbitrary container operation between those stages.
+#[derive(Clone)]
+pub struct DockerSetupTaskExecutor {
+    state_dir: PathBuf,
+    engine: DockerEngine,
+}
+impl DockerSetupTaskExecutor {
+    fn new(state_dir: PathBuf) -> Self {
+        Self {
+            state_dir,
+            engine: DockerEngine::docker(),
+        }
+    }
+}
+impl SetupTaskExecutor for DockerSetupTaskExecutor {
+    fn execute<'a>(
+        &'a self,
+        request: SetupTaskJobRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a async_engine::Sender<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async move {
+            // Both engine stages are sequential. Partitioning this one input
+            // budget prevents an image pull/build plus task from ever emitting
+            // more than the caller allowed, even if either stage is noisy.
+            // A one-byte request is syntactically valid but cannot safely fund
+            // both required bounded stages, so reject it before planning or
+            // Docker work starts.
+            let prepare_output = request.output_limit / 2;
+            let task_output = request.output_limit.saturating_sub(prepare_output);
+            if prepare_output == 0 || task_output == 0 {
+                return Err("setup task output budget cannot fund preparation and task".into());
+            }
+            let deadline = async_engine::Deadline::after(request.deadline);
+            let plan = async_engine::cancellable(
+                cancellation,
+                async_engine::timeout_at(
+                    deadline,
+                    plan_setup(SetupPlanRequest {
+                        state_dir: self.state_dir.clone(),
+                        workspace: request.workspace.clone(),
+                        locator: request.config,
+                        policy: request.policy.acquire_policy(),
+                    }),
+                ),
+            )
+            .await
+            .map_err(|_| "setup task cancelled".to_owned())?
+            .map_err(|_| "setup task planning exceeded its deadline".to_owned())?
+            .map_err(|error| error.to_string())?;
+            if cancellation.is_cancelled() {
+                return Err("setup task cancelled".into());
+            }
+            let remaining = deadline.remaining();
+            if remaining.is_zero() {
+                return Err("setup task exceeded its deadline".into());
+            }
+
+            let (events, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
+            let forwarded_logs = logs.clone();
+            let forwarder = async_engine::launch(async move {
+                while let Some(event) = receiver.recv().await {
+                    forward_engine_event(&forwarded_logs, event).await?;
+                }
+                Ok::<(), String>(())
+            });
+
+            logs.send("[setup] preparing application image".into())
+                .await
+                .map_err(|_| "setup log consumer closed".to_owned())?;
+            let prepared = prepare_setup_image(
+                &self.engine,
+                &plan,
+                RunOptions::streaming(remaining, prepare_output),
+                cancellation,
+                &events,
+            )
+            .await;
+            let prepared = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    drop(events);
+                    forwarder
+                        .await
+                        .map_err(|_| "setup log forwarder stopped".to_owned())??;
+                    return Err(error.to_string());
+                }
+            };
+            if cancellation.is_cancelled() {
+                drop(events);
+                forwarder
+                    .await
+                    .map_err(|_| "setup log forwarder stopped".to_owned())??;
+                return Err("setup task cancelled".into());
+            }
+            let remaining = deadline.remaining();
+            if remaining.is_zero() {
+                drop(events);
+                forwarder
+                    .await
+                    .map_err(|_| "setup log forwarder stopped".to_owned())??;
+                return Err("setup task exceeded its deadline".into());
+            }
+            logs.send(format!(
+                "[setup] running declared task {}",
+                request.task_name
+            ))
+            .await
+            .map_err(|_| "setup log consumer closed".to_owned())?;
+            let result = execute_setup_task(
+                &self.engine,
+                SetupTaskRequest {
+                    plan: &plan,
+                    workspace_root: request.workspace,
+                    task_name: request.task_name,
+                    prepared_image: &prepared,
+                    options: RunOptions::streaming(remaining, task_output),
+                    cancellation,
+                    events: &events,
+                },
+            )
+            .await;
+            drop(events);
+            forwarder
+                .await
+                .map_err(|_| "setup log forwarder stopped".to_owned())??;
+            let result = result.map_err(|error| error.to_string())?;
+            Ok(format!(
+                "completed declared task {} with image {}",
+                result.task_name, result.image_identity
             ))
         })
     }
@@ -267,6 +433,7 @@ impl Client {
                 setup_policy: 0,
                 setup_deadline_ms: 0,
                 setup_output_limit: 0,
+                setup_task_name: String::new(),
             })
             .await?
         {
@@ -347,6 +514,43 @@ impl Client {
             _ => Err(Error::Protocol("unexpected setup prepare response")),
         }
     }
+    /// Submit one daemon-owned plan, image-prepare, and declared-task job.
+    /// The response is the durable job ID; callers observe the bounded work
+    /// through the existing status/log/cancel methods.
+    pub async fn submit_setup_task(&self, request: SetupTaskJobRequest) -> Result<u64, Error> {
+        let workspace = request
+            .workspace
+            .to_str()
+            .ok_or(Error::Protocol("setup workspace is not UTF-8"))?
+            .to_owned();
+        let deadline_ms = u64::try_from(request.deadline.as_millis())
+            .map_err(|_| Error::Protocol("setup deadline too large"))?;
+        let output_limit = u32::try_from(request.output_limit)
+            .map_err(|_| Error::Protocol("setup output limit too large"))?;
+        validate_setup_task_wire(
+            &workspace,
+            &request.config,
+            request.policy,
+            &request.task_name,
+            deadline_ms,
+            output_limit,
+        )?;
+        match self
+            .call(Request {
+                workspace,
+                setup_config: request.config,
+                setup_policy: request.policy.wire(),
+                setup_task_name: request.task_name,
+                setup_deadline_ms: deadline_ms,
+                setup_output_limit: output_limit,
+                ..Request::operation(9)
+            })
+            .await?
+        {
+            Reply::Job(id) => Ok(id),
+            _ => Err(Error::Protocol("unexpected setup task response")),
+        }
+    }
     async fn call(&self, request: Request) -> Result<Reply, Error> {
         // Resolve on every call: a Client may have been constructed while a
         // fresh daemon was still creating its registry, before an inode-based
@@ -376,6 +580,7 @@ pub struct Service {
     state_dir: PathBuf,
     stop: CancellationSource,
     setup_executor: Arc<dyn SetupPrepareExecutor>,
+    setup_task_executor: Arc<dyn SetupTaskExecutor>,
 }
 #[derive(Clone)]
 struct RegistryActor {
@@ -414,15 +619,31 @@ enum JobCommand {
         request: SetupPrepareRequest,
         reply: async_engine::OneshotSender<Result<u64, Error>>,
     },
+    SubmitSetupTask {
+        request: SetupTaskJobRequest,
+        reply: async_engine::OneshotSender<Result<u64, Error>>,
+    },
     Log {
         id: u64,
         line: String,
     },
     Completed {
         id: u64,
+        kind: SetupJobKind,
         result: Result<String, String>,
     },
     Stop(async_engine::OneshotSender<()>),
+}
+
+#[derive(Clone, Copy)]
+enum SetupJobKind {
+    Prepare,
+    Task,
+}
+
+enum SetupJobRequest {
+    Prepare(SetupPrepareRequest),
+    Task(SetupTaskJobRequest),
 }
 impl JobActor {
     async fn submit(&self, workspace: String, stack: String, digest: String) -> Result<u64, Error> {
@@ -475,6 +696,14 @@ impl JobActor {
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
     }
+    async fn submit_setup_task(&self, request: SetupTaskJobRequest) -> Result<u64, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(JobCommand::SubmitSetupTask { request, reply })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
     async fn stop(&self) {
         let (reply, wait) = async_engine::oneshot_channel();
         if self.sender.send(JobCommand::Stop(reply)).await.is_ok() {
@@ -485,10 +714,11 @@ impl JobActor {
 async fn job_actor(
     mut jobs: Jobs,
     mut receiver: async_engine::Receiver<JobCommand>,
-    executor: Arc<dyn SetupPrepareExecutor>,
+    prepare_executor: Arc<dyn SetupPrepareExecutor>,
+    task_executor: Arc<dyn SetupTaskExecutor>,
     sender: async_engine::Sender<JobCommand>,
 ) {
-    let mut requests: BTreeMap<u64, SetupPrepareRequest> = BTreeMap::new();
+    let mut requests: BTreeMap<u64, SetupJobRequest> = BTreeMap::new();
     let mut cancellations: BTreeMap<u64, CancellationSource> = BTreeMap::new();
     let mut tasks = async_engine::TaskGroup::new();
     let mut stopping = None;
@@ -547,12 +777,12 @@ async fn job_actor(
                     .submit(&workspace, "setup-prepare", &digest)
                     .map(|submission| match submission {
                         Submission::Started(id) | Submission::Queued(id) => {
-                            requests.insert(id, request);
+                            requests.insert(id, SetupJobRequest::Prepare(request));
                             id
                         }
                         Submission::Joined(id) => id,
                         Submission::Superseded { replacement, .. } => {
-                            requests.insert(replacement, request);
+                            requests.insert(replacement, SetupJobRequest::Prepare(request));
                             replacement
                         }
                     })
@@ -563,7 +793,36 @@ async fn job_actor(
                     &mut requests,
                     &mut cancellations,
                     &mut tasks,
-                    Arc::clone(&executor),
+                    Arc::clone(&prepare_executor),
+                    Arc::clone(&task_executor),
+                    sender.clone(),
+                );
+            }
+            JobCommand::SubmitSetupTask { request, reply } => {
+                let digest = setup_task_digest(&request);
+                let workspace = request.workspace.to_string_lossy().into_owned();
+                let result = jobs
+                    .submit(&workspace, "setup-task", &digest)
+                    .map(|submission| match submission {
+                        Submission::Started(id) | Submission::Queued(id) => {
+                            requests.insert(id, SetupJobRequest::Task(request));
+                            id
+                        }
+                        Submission::Joined(id) => id,
+                        Submission::Superseded { replacement, .. } => {
+                            requests.insert(replacement, SetupJobRequest::Task(request));
+                            replacement
+                        }
+                    })
+                    .map_err(|_| Error::Protocol("setup task job admission"));
+                let _ = reply.send(result);
+                launch_started_setup_jobs(
+                    &mut jobs,
+                    &mut requests,
+                    &mut cancellations,
+                    &mut tasks,
+                    Arc::clone(&prepare_executor),
+                    Arc::clone(&task_executor),
                     sender.clone(),
                 );
             }
@@ -572,7 +831,7 @@ async fn job_actor(
                 // bounded engine output instead applies back-pressure upstream.
                 let _ = jobs.log(id, bounded_log_line(&line));
             }
-            JobCommand::Completed { id, result } => {
+            JobCommand::Completed { id, kind, result } => {
                 cancellations.remove(&id);
                 match result {
                     Ok(receipt) => {
@@ -581,7 +840,11 @@ async fn job_actor(
                     }
                     Err(error) => {
                         let error = bounded_log_line(&error);
-                        let _ = jobs.log(id, format!("setup prepare failed: {error}"));
+                        let operation = match kind {
+                            SetupJobKind::Prepare => "setup prepare",
+                            SetupJobKind::Task => "setup task",
+                        };
+                        let _ = jobs.log(id, format!("{operation} failed: {error}"));
                         let _ = jobs.settle_with_error(id, false, Some(error));
                     }
                 }
@@ -605,7 +868,8 @@ async fn job_actor(
                 &mut requests,
                 &mut cancellations,
                 &mut tasks,
-                Arc::clone(&executor),
+                Arc::clone(&prepare_executor),
+                Arc::clone(&task_executor),
                 sender.clone(),
             );
         }
@@ -621,10 +885,11 @@ async fn job_actor(
 
 fn launch_started_setup_jobs(
     jobs: &mut Jobs,
-    requests: &mut BTreeMap<u64, SetupPrepareRequest>,
+    requests: &mut BTreeMap<u64, SetupJobRequest>,
     cancellations: &mut BTreeMap<u64, CancellationSource>,
     tasks: &mut async_engine::TaskGroup<()>,
-    executor: Arc<dyn SetupPrepareExecutor>,
+    prepare_executor: Arc<dyn SetupPrepareExecutor>,
+    task_executor: Arc<dyn SetupTaskExecutor>,
     sender: async_engine::Sender<JobCommand>,
 ) {
     for id in jobs.take_started() {
@@ -638,7 +903,8 @@ fn launch_started_setup_jobs(
         let token = cancellation.token();
         cancellations.insert(id, cancellation);
         let task_sender = sender.clone();
-        let executor = Arc::clone(&executor);
+        let prepare_executor = Arc::clone(&prepare_executor);
+        let task_executor = Arc::clone(&task_executor);
         tasks.spawn(async move {
             let (logs, mut log_receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
             let log_sender = task_sender.clone();
@@ -649,10 +915,21 @@ fn launch_started_setup_jobs(
                     }
                 }
             });
-            let result = executor.execute(request, &token, &logs).await;
+            let (kind, result) = match request {
+                SetupJobRequest::Prepare(request) => (
+                    SetupJobKind::Prepare,
+                    prepare_executor.execute(request, &token, &logs).await,
+                ),
+                SetupJobRequest::Task(request) => (
+                    SetupJobKind::Task,
+                    task_executor.execute(request, &token, &logs).await,
+                ),
+            };
             drop(logs);
             let _ = forwarder.await;
-            let _ = task_sender.send(JobCommand::Completed { id, result }).await;
+            let _ = task_sender
+                .send(JobCommand::Completed { id, kind, result })
+                .await;
         });
     }
 }
@@ -681,6 +958,30 @@ fn setup_prepare_digest(request: &SetupPrepareRequest) -> String {
         workspace.as_bytes(),
         request.config.as_bytes(),
         &policy,
+        &deadline,
+        &output_limit,
+    ] {
+        material.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        material.extend_from_slice(part);
+    }
+    format!(
+        "setup:{}",
+        kernal_api::hash::blake3_bytes(&material).to_hex()
+    )
+}
+
+fn setup_task_digest(request: &SetupTaskJobRequest) -> String {
+    let mut material = Vec::new();
+    let workspace = request.workspace.to_string_lossy();
+    let policy = request.policy.wire().to_le_bytes();
+    let deadline = request.deadline.as_millis().to_le_bytes();
+    let output_limit = (request.output_limit as u64).to_le_bytes();
+    for part in [
+        b"bosn.setup-task.v1".as_slice(),
+        workspace.as_bytes(),
+        request.config.as_bytes(),
+        &policy,
+        request.task_name.as_bytes(),
         &deadline,
         &output_limit,
     ] {
@@ -739,6 +1040,7 @@ impl Service {
         let state_dir = state_dir.into();
         Self {
             setup_executor: Arc::new(DockerSetupPrepareExecutor::new(state_dir.clone())),
+            setup_task_executor: Arc::new(DockerSetupTaskExecutor::new(state_dir.clone())),
             state_dir,
             stop: CancellationSource::new(),
         }
@@ -747,6 +1049,12 @@ impl Service {
     /// integration-test seam; production callers retain the Docker adapter.
     pub fn with_setup_prepare_executor(mut self, executor: Arc<dyn SetupPrepareExecutor>) -> Self {
         self.setup_executor = executor;
+        self
+    }
+    /// Substitute only the complete semantic setup-task executor. This is an
+    /// integration-test seam; it cannot add arbitrary Docker controls.
+    pub fn with_setup_task_executor(mut self, executor: Arc<dyn SetupTaskExecutor>) -> Self {
+        self.setup_task_executor = executor;
         self
     }
     /// Foreground lifecycle: acquires the sole registry writer before binding.
@@ -785,6 +1093,7 @@ impl Service {
             Jobs::new(1),
             job_receiver,
             Arc::clone(&self.setup_executor),
+            Arc::clone(&self.setup_task_executor),
             job_sender.clone(),
         ));
         let worker = async_engine::launch(registry_actor(registry, receiver));
@@ -1050,6 +1359,45 @@ async fn handle(
                     },
                 }
             }
+            9 => {
+                let policy = SetupPreparePolicy::from_wire(r.setup_policy);
+                let request = policy.and_then(|policy| {
+                    validate_setup_task_wire(
+                        &r.workspace,
+                        &r.setup_config,
+                        policy,
+                        &r.setup_task_name,
+                        r.setup_deadline_ms,
+                        r.setup_output_limit,
+                    )
+                    .ok()
+                    .map(|()| SetupTaskJobRequest {
+                        workspace: PathBuf::from(r.workspace),
+                        config: r.setup_config,
+                        policy,
+                        task_name: r.setup_task_name,
+                        deadline: Duration::from_millis(r.setup_deadline_ms),
+                        output_limit: r.setup_output_limit as usize,
+                    })
+                });
+                match request {
+                    Some(request) => match jobs.submit_setup_task(request).await {
+                        Ok(job_id) => ReplyWire {
+                            code: 40,
+                            job_id,
+                            ..Default::default()
+                        },
+                        Err(_) => ReplyWire {
+                            code: 3,
+                            ..Default::default()
+                        },
+                    },
+                    None => ReplyWire {
+                        code: 3,
+                        ..Default::default()
+                    },
+                }
+            }
             _ => ReplyWire {
                 code: 2,
                 ..Default::default()
@@ -1137,6 +1485,8 @@ struct Request {
     setup_deadline_ms: u64,
     #[prost(uint32, tag = "12")]
     setup_output_limit: u32,
+    #[prost(string, tag = "13")]
+    setup_task_name: String,
 }
 impl Request {
     fn operation(operation: u32) -> Self {
@@ -1153,6 +1503,7 @@ impl Request {
             setup_policy: 0,
             setup_deadline_ms: 0,
             setup_output_limit: 0,
+            setup_task_name: String::new(),
         }
     }
 }
@@ -1181,6 +1532,27 @@ fn validate_setup_prepare_wire(
     let output_limit = output_limit as usize;
     if output_limit == 0 || output_limit > SETUP_PREPARE_MAX_OUTPUT {
         return Err(Error::Protocol("invalid setup output limit"));
+    }
+    Ok(())
+}
+
+fn validate_setup_task_wire(
+    workspace: &str,
+    config: &str,
+    policy: SetupPreparePolicy,
+    task_name: &str,
+    deadline_ms: u64,
+    output_limit: u32,
+) -> Result<(), Error> {
+    validate_setup_prepare_wire(workspace, config, policy, deadline_ms, output_limit)?;
+    if task_name.is_empty()
+        || task_name.len() > 64
+        || !task_name.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphanumeric() || byte == b'_' || (byte == b'-' && index > 0)
+        })
+        || !task_name.as_bytes()[0].is_ascii_alphanumeric()
+    {
+        return Err(Error::Protocol("invalid setup task name"));
     }
     Ok(())
 }
@@ -1274,7 +1646,7 @@ mod tests {
     use super::*;
     use kernal_api::async_engine::RuntimeBuilder;
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
 
@@ -1310,6 +1682,74 @@ mod tests {
                     async_engine::sleep(Duration::from_millis(10)).await;
                 }
                 Ok("fake prepared sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
+            })
+        }
+    }
+
+    struct FakeSetupTaskExecutor {
+        started: AtomicUsize,
+        cancelled: AtomicUsize,
+        stages: Mutex<Vec<String>>,
+    }
+    impl FakeSetupTaskExecutor {
+        fn new() -> Self {
+            Self {
+                started: AtomicUsize::new(0),
+                cancelled: AtomicUsize::new(0),
+                stages: Mutex::new(Vec::new()),
+            }
+        }
+        fn stages(&self) -> Vec<String> {
+            self.stages.lock().unwrap().clone()
+        }
+    }
+    impl SetupTaskExecutor for FakeSetupTaskExecutor {
+        fn execute<'a>(
+            &'a self,
+            request: SetupTaskJobRequest,
+            cancellation: &'a async_engine::CancellationToken,
+            logs: &'a async_engine::Sender<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.started.fetch_add(1, Ordering::SeqCst);
+                self.stages
+                    .lock()
+                    .unwrap()
+                    .push(format!("plan:{}", request.task_name));
+                logs.send("[fake] plan receipt accepted".into())
+                    .await
+                    .map_err(|_| "fake log consumer closed".to_owned())?;
+                self.stages
+                    .lock()
+                    .unwrap()
+                    .push(format!("prepare:{}", request.task_name));
+                logs.send("[fake] image prepared".into())
+                    .await
+                    .map_err(|_| "fake log consumer closed".to_owned())?;
+                if request.task_name == "prepare-fail" {
+                    return Err("fake preparation failed".into());
+                }
+                if request.task_name == "wait" {
+                    for _ in 0..100 {
+                        if cancellation.is_cancelled() {
+                            self.cancelled.fetch_add(1, Ordering::SeqCst);
+                            return Err("fake task observed cancellation".into());
+                        }
+                        async_engine::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+                if cancellation.is_cancelled() {
+                    self.cancelled.fetch_add(1, Ordering::SeqCst);
+                    return Err("fake task observed cancellation".into());
+                }
+                self.stages
+                    .lock()
+                    .unwrap()
+                    .push(format!("task:{}", request.task_name));
+                logs.send(format!("[fake] task output {}", "x".repeat(4 * 1024)))
+                    .await
+                    .map_err(|_| "fake log consumer closed".to_owned())?;
+                Ok(format!("fake task {} complete", request.task_name))
             })
         }
     }
@@ -1467,6 +1907,208 @@ mod tests {
     }
 
     #[test]
+    fn setup_task_job_is_prompt_coalesced_bounded_and_cancellable_without_docker() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let fake = Arc::new(FakeSetupTaskExecutor::new());
+        RuntimeBuilder::multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let server = async_engine::launch(
+                    Service::new(state.clone())
+                        .with_setup_task_executor(fake.clone())
+                        .serve(),
+                );
+                let client = wait_for_client(&state).await;
+                let request = SetupTaskJobRequest {
+                    workspace: workspace.clone(),
+                    config: "https://example.invalid/setup.toml".into(),
+                    policy: SetupPreparePolicy::Refresh,
+                    task_name: "wait".into(),
+                    deadline: Duration::from_secs(2),
+                    output_limit: 4 * 1024,
+                };
+                let submitted = std::time::Instant::now();
+                let first = client.submit_setup_task(request.clone()).await.unwrap();
+                assert!(submitted.elapsed() < Duration::from_millis(250));
+                assert_eq!(
+                    first,
+                    client.submit_setup_task(request.clone()).await.unwrap()
+                );
+                wait_for(|| fake.started.load(Ordering::SeqCst) == 1).await;
+                client.ping().await.unwrap();
+                let logs = wait_for_logs(&client, first).await;
+                assert!(
+                    logs.records
+                        .iter()
+                        .all(|record| record.line.len() <= jobs::MAX_LOG_LINE_BYTES)
+                );
+
+                let changed = SetupTaskJobRequest {
+                    task_name: "build".into(),
+                    ..request
+                };
+                let second = client.submit_setup_task(changed).await.unwrap();
+                assert_ne!(first, second);
+                client.cancel_job(first).await.unwrap();
+                wait_for_job_state(&client, first, "Cancelled").await;
+                wait_for(|| fake.started.load(Ordering::SeqCst) == 2).await;
+                wait_for_job_state(&client, second, "Succeeded").await;
+                let completed_logs = client.job_logs(second, 0, 16).await.unwrap();
+                assert!(
+                    completed_logs
+                        .records
+                        .iter()
+                        .any(|record| record.line.len() == jobs::MAX_LOG_LINE_BYTES)
+                );
+                assert_eq!(fake.cancelled.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    fake.stages(),
+                    vec![
+                        "plan:wait",
+                        "prepare:wait",
+                        "plan:build",
+                        "prepare:build",
+                        "task:build",
+                    ]
+                );
+                client.shutdown().await.unwrap();
+                stopped(server).await;
+            });
+    }
+
+    #[test]
+    fn setup_task_stops_after_prepare_failure_before_running_task() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let fake = Arc::new(FakeSetupTaskExecutor::new());
+        RuntimeBuilder::multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let server = async_engine::launch(
+                    Service::new(state.clone())
+                        .with_setup_task_executor(fake.clone())
+                        .serve(),
+                );
+                let client = wait_for_client(&state).await;
+                let job = client
+                    .submit_setup_task(SetupTaskJobRequest {
+                        workspace,
+                        config: "https://example.invalid/setup.toml".into(),
+                        policy: SetupPreparePolicy::Offline,
+                        task_name: "prepare-fail".into(),
+                        deadline: Duration::from_secs(2),
+                        output_limit: 4 * 1024,
+                    })
+                    .await
+                    .unwrap();
+                wait_for_job_state(&client, job, "Failed").await;
+                let logs = wait_for_logs(&client, job).await;
+                assert!(
+                    logs.records
+                        .iter()
+                        .any(|record| record.line.contains("setup task failed"))
+                );
+                assert_eq!(
+                    fake.stages(),
+                    vec!["plan:prepare-fail", "prepare:prepare-fail"]
+                );
+                client.shutdown().await.unwrap();
+                stopped(server).await;
+            });
+    }
+
+    #[test]
+    fn setup_task_coalescing_digest_covers_every_immutable_input() {
+        let base = SetupTaskJobRequest {
+            workspace: PathBuf::from("/workspace"),
+            config: "https://example.invalid/setup.toml".into(),
+            policy: SetupPreparePolicy::Refresh,
+            task_name: "build".into(),
+            deadline: Duration::from_secs(2),
+            output_limit: 4 * 1024,
+        };
+        let variants = [
+            SetupTaskJobRequest {
+                workspace: PathBuf::from("/other"),
+                ..base.clone()
+            },
+            SetupTaskJobRequest {
+                config: "https://example.invalid/other.toml".into(),
+                ..base.clone()
+            },
+            SetupTaskJobRequest {
+                policy: SetupPreparePolicy::Offline,
+                ..base.clone()
+            },
+            SetupTaskJobRequest {
+                task_name: "test".into(),
+                ..base.clone()
+            },
+            SetupTaskJobRequest {
+                deadline: Duration::from_secs(3),
+                ..base.clone()
+            },
+            SetupTaskJobRequest {
+                output_limit: 8 * 1024,
+                ..base.clone()
+            },
+        ];
+        for variant in variants {
+            assert_ne!(setup_task_digest(&base), setup_task_digest(&variant));
+        }
+    }
+
+    #[test]
+    fn setup_task_wire_validation_bounds_and_rejects_nonsemantic_names() {
+        let valid = || {
+            validate_setup_task_wire(
+                "/workspace",
+                "https://example.invalid/setup.toml",
+                SetupPreparePolicy::Refresh,
+                "build-1",
+                1,
+                1,
+            )
+        };
+        assert!(valid().is_ok());
+        for task_name in ["", "-build", "build/task", &"a".repeat(65)] {
+            assert!(
+                validate_setup_task_wire(
+                    "/workspace",
+                    "https://example.invalid/setup.toml",
+                    SetupPreparePolicy::Offline,
+                    task_name,
+                    1,
+                    1,
+                )
+                .is_err()
+            );
+        }
+        for (deadline, output) in [(0, 1), (300_001, 1), (1, 0), (1, 8_388_609)] {
+            assert!(
+                validate_setup_task_wire(
+                    "/workspace",
+                    "https://example.invalid/setup.toml",
+                    SetupPreparePolicy::Refresh,
+                    "build",
+                    deadline,
+                    output,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn second_daemon_is_refused_while_first_holds_writer() {
         let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
         let state = temporary.path().join("state");
@@ -1565,6 +2207,7 @@ mod tests {
                 setup_policy: 0,
                 setup_deadline_ms: 0,
                 setup_output_limit: 0,
+                setup_task_name: String::new(),
             }
             .encode(&mut payload)
             .unwrap();
