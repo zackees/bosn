@@ -4,6 +4,11 @@
 use std::collections::{BTreeMap, VecDeque};
 
 pub const DEFAULT_MAX_LOG_RECORDS: usize = 5_000;
+/// Keep a complete page well below the daemon frame cap, including protobuf
+/// overhead. Engine adapters must split output into records at this boundary.
+pub const MAX_LOG_LINE_BYTES: usize = 2_048;
+pub const MAX_LOG_PAGE_RECORDS: usize = 256;
+pub const MAX_LOG_PAGE_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JobState {
@@ -53,6 +58,14 @@ pub enum JobError {
     Unknown,
     Finished,
     Closing,
+    LogTooLarge,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LogPage {
+    pub retained_from: u64,
+    pub next: u64,
+    pub gap: bool,
+    pub records: Vec<(u64, String)>,
 }
 
 #[derive(Default)]
@@ -205,6 +218,9 @@ impl Jobs {
         self.pump();
     }
     pub fn log(&mut self, id: u64, line: String) -> Result<u64, JobError> {
+        if line.len() > MAX_LOG_LINE_BYTES {
+            return Err(JobError::LogTooLarge);
+        }
         let j = self.jobs.get_mut(&id).ok_or(JobError::Unknown)?;
         let cursor = j.log_start + j.logs.len() as u64;
         j.logs.push_back((cursor, line));
@@ -224,6 +240,31 @@ impl Jobs {
                 .cloned()
                 .collect(),
         ))
+    }
+    pub fn log_page(&self, id: u64, after: u64, limit: usize) -> Result<LogPage, JobError> {
+        let j = self.jobs.get(&id).ok_or(JobError::Unknown)?;
+        let begin = after.max(j.log_start);
+        let mut page_bytes = 0;
+        let mut records = Vec::new();
+        for (cursor, line) in j
+            .logs
+            .iter()
+            .filter(|(n, _)| *n >= begin)
+            .take(limit.min(MAX_LOG_PAGE_RECORDS))
+        {
+            if page_bytes + line.len() > MAX_LOG_PAGE_BYTES {
+                break;
+            }
+            page_bytes += line.len();
+            records.push((*cursor, line.clone()));
+        }
+        let next = records.last().map_or(begin, |(n, _)| n.saturating_add(1));
+        Ok(LogPage {
+            retained_from: j.log_start,
+            next,
+            gap: after < j.log_start,
+            records,
+        })
     }
     pub fn shutdown(&mut self) {
         self.closing = true;
@@ -292,5 +333,35 @@ mod tests {
         jobs.shutdown();
         assert_eq!(jobs.jobs[&second].state, JobState::Cancelled);
         assert!(matches!(jobs.submit("c", "s", "x"), Err(JobError::Closing)));
+    }
+    #[test]
+    fn log_page_reports_eviction_gap_and_bounded_next_cursor() {
+        let mut jobs = Jobs::new(1);
+        let id = match jobs.submit("w", "s", "d").unwrap() {
+            Submission::Started(id) => id,
+            _ => unreachable!(),
+        };
+        jobs.max_logs = 2;
+        for line in ["a", "b", "c"] {
+            jobs.log(id, line.into()).unwrap();
+        }
+        let page = jobs.log_page(id, 0, 1).unwrap();
+        assert!(page.gap);
+        assert_eq!(page.retained_from, 1);
+        assert_eq!(page.records, vec![(1, "b".into())]);
+        assert_eq!(page.next, 2);
+    }
+
+    #[test]
+    fn log_records_are_bounded_before_they_can_exceed_the_ipc_frame() {
+        let mut jobs = Jobs::new(1);
+        let id = match jobs.submit("w", "s", "d").unwrap() {
+            Submission::Started(id) => id,
+            _ => unreachable!(),
+        };
+        assert!(matches!(
+            jobs.log(id, "x".repeat(MAX_LOG_LINE_BYTES + 1)),
+            Err(JobError::LogTooLarge)
+        ));
     }
 }

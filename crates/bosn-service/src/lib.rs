@@ -36,6 +36,18 @@ pub struct JobStatus {
     pub state: String,
     pub error: Option<String>,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobLogRecord {
+    pub cursor: u64,
+    pub line: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobLogPage {
+    pub retained_from: u64,
+    pub next: u64,
+    pub gap: bool,
+    pub records: Vec<JobLogRecord>,
+}
 impl From<RegistryStatus> for Status {
     fn from(v: RegistryStatus) -> Self {
         Self {
@@ -91,6 +103,8 @@ impl Client {
                 stack: stack.into(),
                 digest: digest.into(),
                 job_id: 0,
+                log_after: 0,
+                log_limit: 0,
             })
             .await?
         {
@@ -120,6 +134,20 @@ impl Client {
         {
             Reply::Cancelled => Ok(()),
             _ => Err(Error::Protocol("unexpected job cancel response")),
+        }
+    }
+    pub async fn job_logs(&self, id: u64, after: u64, limit: u32) -> Result<JobLogPage, Error> {
+        match self
+            .call(Request {
+                job_id: id,
+                log_after: after,
+                log_limit: limit,
+                ..Request::operation(7)
+            })
+            .await?
+        {
+            Reply::JobLogs(v) => Ok(v),
+            _ => Err(Error::Protocol("unexpected job logs response")),
         }
     }
     async fn call(&self, request: Request) -> Result<Reply, Error> {
@@ -178,6 +206,12 @@ enum JobCommand {
         id: u64,
         reply: async_engine::OneshotSender<Result<(), Error>>,
     },
+    Logs {
+        id: u64,
+        after: u64,
+        limit: usize,
+        reply: async_engine::OneshotSender<Result<jobs::LogPage, Error>>,
+    },
 }
 impl JobActor {
     async fn submit(&self, workspace: String, stack: String, digest: String) -> Result<u64, Error> {
@@ -209,6 +243,19 @@ impl JobActor {
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
     }
+    async fn logs(&self, id: u64, after: u64, limit: usize) -> Result<jobs::LogPage, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(JobCommand::Logs {
+                id,
+                after,
+                limit,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
 }
 async fn job_actor(mut jobs: Jobs, mut receiver: async_engine::Receiver<JobCommand>) {
     while let Some(command) = receiver.recv().await {
@@ -235,6 +282,17 @@ async fn job_actor(mut jobs: Jobs, mut receiver: async_engine::Receiver<JobComma
             }
             JobCommand::Cancel { id, reply } => {
                 let _ = reply.send(jobs.cancel(id).map_err(|_| Error::Protocol("job cancel")));
+            }
+            JobCommand::Logs {
+                id,
+                after,
+                limit,
+                reply,
+            } => {
+                let _ = reply.send(
+                    jobs.log_page(id, after, limit)
+                        .map_err(|_| Error::Protocol("unknown job")),
+                );
             }
         }
     }
@@ -464,15 +522,7 @@ async fn handle(
     let reply = if r.protocol_version != PROTOCOL_VERSION {
         ReplyWire {
             code: 1,
-            registry_id: String::new(),
-            schema_version: 0,
-            resources: 0,
-            leases: 0,
-            sessions: 0,
-            reconciliation_required: false,
-            job_id: 0,
-            job_state: String::new(),
-            job_error: String::new(),
+            ..Default::default()
         }
     } else {
         match r.operation {
@@ -490,9 +540,7 @@ async fn handle(
                     leases: status.leases,
                     sessions: status.sessions,
                     reconciliation_required: status.reconciliation_required,
-                    job_id: 0,
-                    job_state: String::new(),
-                    job_error: String::new(),
+                    ..Default::default()
                 }
             }
             3 => {
@@ -529,6 +577,24 @@ async fn handle(
             6 => match jobs.cancel(r.job_id).await {
                 Ok(()) => ReplyWire {
                     code: 60,
+                    ..Default::default()
+                },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
+            7 => match jobs.logs(r.job_id, r.log_after, r.log_limit as usize).await {
+                Ok(page) => ReplyWire {
+                    code: 70,
+                    retained_from: page.retained_from,
+                    next_log_cursor: page.next,
+                    log_gap: page.gap,
+                    logs: page
+                        .records
+                        .into_iter()
+                        .map(|(cursor, line)| LogRecordWire { cursor, line })
+                        .collect(),
                     ..Default::default()
                 },
                 Err(_) => ReplyWire {
@@ -611,6 +677,10 @@ struct Request {
     digest: String,
     #[prost(uint64, tag = "6")]
     job_id: u64,
+    #[prost(uint64, tag = "7")]
+    log_after: u64,
+    #[prost(uint32, tag = "8")]
+    log_limit: u32,
 }
 impl Request {
     fn operation(operation: u32) -> Self {
@@ -621,6 +691,8 @@ impl Request {
             stack: String::new(),
             digest: String::new(),
             job_id: 0,
+            log_after: 0,
+            log_limit: 0,
         }
     }
 }
@@ -646,6 +718,21 @@ struct ReplyWire {
     job_state: String,
     #[prost(string, tag = "10")]
     job_error: String,
+    #[prost(message, repeated, tag = "11")]
+    logs: Vec<LogRecordWire>,
+    #[prost(uint64, tag = "12")]
+    retained_from: u64,
+    #[prost(uint64, tag = "13")]
+    next_log_cursor: u64,
+    #[prost(bool, tag = "14")]
+    log_gap: bool,
+}
+#[derive(Message)]
+struct LogRecordWire {
+    #[prost(uint64, tag = "1")]
+    cursor: u64,
+    #[prost(string, tag = "2")]
+    line: String,
 }
 enum Reply {
     Pong,
@@ -654,6 +741,7 @@ enum Reply {
     Job(u64),
     JobStatus(JobStatus),
     Cancelled,
+    JobLogs(JobLogPage),
 }
 fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
     match v.code {
@@ -674,6 +762,19 @@ fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
             error: (!v.job_error.is_empty()).then_some(v.job_error),
         })),
         60 => Ok(Reply::Cancelled),
+        70 => Ok(Reply::JobLogs(JobLogPage {
+            retained_from: v.retained_from,
+            next: v.next_log_cursor,
+            gap: v.log_gap,
+            records: v
+                .logs
+                .into_iter()
+                .map(|record| JobLogRecord {
+                    cursor: record.cursor,
+                    line: record.line,
+                })
+                .collect(),
+        })),
         1 => Err(Error::Protocol("unsupported protocol")),
         2 => Err(Error::Protocol("unknown operation")),
         _ => Err(Error::Protocol("daemon error")),
@@ -730,6 +831,15 @@ mod tests {
                 let status = client.job_status(one).await.unwrap();
                 assert_eq!(status.id, one);
                 assert_eq!(status.state, "Running");
+                assert_eq!(
+                    client.job_logs(one, 0, 16).await.unwrap(),
+                    JobLogPage {
+                        retained_from: 0,
+                        next: 0,
+                        gap: false,
+                        records: Vec::new(),
+                    }
+                );
                 client.cancel_job(one).await.unwrap();
                 assert_eq!(client.job_status(one).await.unwrap().state, "Cancelling");
                 client.shutdown().await.unwrap();
@@ -830,6 +940,8 @@ mod tests {
                 stack: String::new(),
                 digest: String::new(),
                 job_id: 0,
+                log_after: 0,
+                log_limit: 0,
             }
             .encode(&mut payload)
             .unwrap();
