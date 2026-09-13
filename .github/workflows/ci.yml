@@ -56,4 +56,9 @@ jobs:
               and name.rsplit(".", 1)[-1] in {"so", "pyd", "dylib"}
               for name in names
           ), names
+          assert any(
+              name.endswith(".data/platlib/bosn/_bin/bosn-native")
+              or name.endswith(".data/platlib/bosn/_bin/bosn-native.exe")
+              for name in names
+          ), names
           PY

@@ -31,6 +31,10 @@ fn main() {
     let Some(command) = arguments.next() else {
         usage();
     };
+    if command == "--version" || command == "-V" {
+        println!("bosn {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     match command.to_string_lossy().as_ref() {
         "mcp" => run_mcp(arguments),
         "daemon" => run_daemon(arguments),
