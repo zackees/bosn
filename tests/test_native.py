@@ -13,6 +13,8 @@ native = pytest.importorskip("bosn._native")
 def test_native_extension_is_reexported_by_python_package(tmp_path: Path) -> None:
     assert bosn.Client is native.Client
     assert bosn.Status is native.Status
+    assert bosn.RegistryResourcePage is native.RegistryResourcePage
+    assert bosn.SetupEnsureEventPage is native.SetupEnsureEventPage
     assert bosn.native_version() == bosn.__version__
     assert bosn.protocol_version() == 1
 
@@ -20,6 +22,21 @@ def test_native_extension_is_reexported_by_python_package(tmp_path: Path) -> Non
     assert client.state_dir == str(tmp_path / "state")
     with pytest.raises(RuntimeError, match="Io"):
         client.status()
+
+
+def test_native_registry_diagnostics_reject_bad_pages_without_initializing_state(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    client = bosn.Client(state)
+    with pytest.raises(ValueError, match="limit must"):
+        client.registry_resources(limit=0)
+    with pytest.raises(ValueError, match="limit must"):
+        client.setup_ensure_events(limit=65)
+    assert not state.exists()
+    with pytest.raises(RuntimeError, match="daemon"):
+        client.registry_resources(limit=1)
+    assert not state.exists()
 
 
 def test_native_setup_plan_is_structured_and_requires_an_explicit_policy(tmp_path: Path) -> None:

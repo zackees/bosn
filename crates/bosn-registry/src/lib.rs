@@ -1200,6 +1200,18 @@ impl Registry {
             event,
         )
     }
+    /// Return bounded setup-ensure diagnostics newest first.  This deliberate
+    /// allowlist prevents product front ends from treating the registry event
+    /// table as an unbounded raw audit export.
+    pub fn setup_ensure_events(&self, offset: usize, limit: usize) -> Result<Page<Event>, Error> {
+        page(
+            &self.connection,
+            "SELECT id,at,kind,detail FROM events WHERE kind LIKE 'setup.ensure.%' ORDER BY id DESC LIMIT ? OFFSET ?",
+            offset,
+            limit,
+            event,
+        )
+    }
 }
 fn is_uuid(value: &str) -> bool {
     value.len() == 36
@@ -1287,6 +1299,16 @@ impl ReadOnlyRegistry {
         page(
             &self.connection,
             "SELECT id,at,kind,detail FROM events ORDER BY id LIMIT ? OFFSET ?",
+            offset,
+            limit,
+            event,
+        )
+    }
+    /// Read-only counterpart to [`Registry::setup_ensure_events`].
+    pub fn setup_ensure_events(&self, offset: usize, limit: usize) -> Result<Page<Event>, Error> {
+        page(
+            &self.connection,
+            "SELECT id,at,kind,detail FROM events WHERE kind LIKE 'setup.ensure.%' ORDER BY id DESC LIMIT ? OFFSET ?",
             offset,
             limit,
             event,

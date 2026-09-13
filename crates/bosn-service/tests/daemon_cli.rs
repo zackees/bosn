@@ -148,6 +148,69 @@ fn daemon_cli_serves_status_stops_and_preserves_singleton() {
 }
 
 #[test]
+fn registry_cli_is_daemon_only_bounded_and_matches_native_client() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let missing = run(&[
+        "registry".as_ref(),
+        "resources".as_ref(),
+        "--state-dir".as_ref(),
+        state.as_os_str(),
+        "--json".as_ref(),
+    ]);
+    assert!(!missing.status.success());
+    assert!(
+        !state.exists(),
+        "read-only CLI unexpectedly initialized state"
+    );
+    let mut daemon = DaemonChild::start(&state);
+    let client = wait_for_client(&mut daemon, &state);
+    let output = run(&[
+        "registry".as_ref(),
+        "resources".as_ref(),
+        "--state-dir".as_ref(),
+        state.as_os_str(),
+        "--limit".as_ref(),
+        "1".as_ref(),
+        "--json".as_ref(),
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["action"], "registry_resources");
+    let expected = RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .run(client.registry_resources(0, 1))
+        .unwrap();
+    assert_eq!(
+        value["records"].as_array().unwrap().len(),
+        expected.records.len()
+    );
+    let malformed = run(&[
+        "registry".as_ref(),
+        "setup-ensure-events".as_ref(),
+        "--state-dir".as_ref(),
+        state.as_os_str(),
+        "--limit".as_ref(),
+        "65".as_ref(),
+        "--json".as_ref(),
+    ]);
+    assert!(!malformed.status.success());
+    RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .run(client.shutdown())
+        .unwrap();
+    assert!(daemon.wait_for_exit().success());
+}
+
+#[test]
 fn malformed_daemon_arguments_do_not_create_state() {
     let root = tempfile::tempdir().unwrap();
     for (name, command, extra) in [

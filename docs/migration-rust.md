@@ -113,6 +113,22 @@ both resource facts and use rows, so a failed transaction cannot claim a
 successful ensure. Job status/log retention remains deliberately in-memory;
 the event history is the durable summary across daemon restarts.
 
+### Read-only registry diagnostics
+
+The native daemon exposes bounded, authenticated read-only diagnostics without
+turning the SQLite file into a public API. `bosn registry resources` returns
+managed-resource summaries/details (ID, kind, name, stack, generation, state,
+retention, timestamps) and deliberately omits workspace and scope bindings.
+`bosn registry setup-ensure-events` returns newest-first, cursor-paginated
+`setup.ensure.*` events only. Both accept `--after` and `--limit 1..=64` and
+require an already-running daemon; they never create, migrate, or open a
+registry from the CLI process. Equivalent APIs are
+`bosn.Client.registry_resources()` and `bosn.Client.setup_ensure_events()` in
+Python, and the read-only MCP tools `bosn_registry_resources` and
+`bosn_setup_ensure_events`. MCP state selection remains fixed at server start;
+the tools accept no state/file path, Docker, workspace, or raw SQL controls.
+Malformed page arguments are rejected before daemon IPC.
+
 An opt-in live proof exercises the production daemon and kernal-api Docker
 transport end to end, including daemon restart and matching-container reuse:
 

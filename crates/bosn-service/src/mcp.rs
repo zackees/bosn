@@ -15,8 +15,9 @@
 //! numeric arguments are bounded before they reach the native daemon.
 
 use crate::{
-    Client, Error, JobLogPage, JobStatus, SetupEnsureJobRequest, SetupPreparePolicy,
-    SetupPrepareRequest, SetupTaskJobRequest, Status,
+    Client, Error, JobLogPage, JobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE, RegistryResourcePage,
+    SetupEnsureEventPage, SetupEnsureJobRequest, SetupPreparePolicy, SetupPrepareRequest,
+    SetupTaskJobRequest, Status,
 };
 use bosn_setup::{
     SetupAcquirePolicy, SetupPlan, SetupPlanAppSource, SetupPlanRequest, SetupSourceKind,
@@ -37,6 +38,7 @@ pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 /// Leave room below the product daemon's one-mebibyte IPC frame limit.
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_MCP_LOG_RECORDS: u32 = 64;
+const MAX_MCP_REGISTRY_RECORDS: u32 = MAX_REGISTRY_DIAGNOSTIC_PAGE;
 /// Bound filesystem and URL strings independently from the JSON-RPC line
 /// bound.  `bosn-core` also validates the locator before it is observed.
 const MAX_MCP_SETUP_STRING_BYTES: usize = 8 * 1024;
@@ -94,6 +96,13 @@ pub fn serve_stdio(state_dir: impl Into<PathBuf>) -> Result<(), Error> {
 
 trait Backend {
     fn status(&mut self) -> Result<Status, Error>;
+    fn registry_resources(&mut self, after: u64, limit: u32)
+    -> Result<RegistryResourcePage, Error>;
+    fn setup_ensure_events(
+        &mut self,
+        after: u64,
+        limit: u32,
+    ) -> Result<SetupEnsureEventPage, Error>;
     fn job_status(&mut self, id: u64) -> Result<JobStatus, Error>;
     fn job_logs(&mut self, id: u64, after: u64, limit: u32) -> Result<JobLogPage, Error>;
     fn cancel_job(&mut self, id: u64) -> Result<(), Error>;
@@ -127,6 +136,22 @@ struct DaemonBackend<'a> {
 impl Backend for DaemonBackend<'_> {
     fn status(&mut self) -> Result<Status, Error> {
         self.runtime.run(self.client.status())
+    }
+    fn registry_resources(
+        &mut self,
+        after: u64,
+        limit: u32,
+    ) -> Result<RegistryResourcePage, Error> {
+        self.runtime
+            .run(self.client.registry_resources(after, limit))
+    }
+    fn setup_ensure_events(
+        &mut self,
+        after: u64,
+        limit: u32,
+    ) -> Result<SetupEnsureEventPage, Error> {
+        self.runtime
+            .run(self.client.setup_ensure_events(after, limit))
     }
     fn job_status(&mut self, id: u64) -> Result<JobStatus, Error> {
         self.runtime.run(self.client.job_status(id))
@@ -289,6 +314,18 @@ fn tools_list() -> Value {
                 "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
             },
             {
+                "name": "bosn_registry_resources",
+                "description": "Read a bounded cursor page of path-safe managed-resource diagnostics from the already-running native Bosn daemon. Does not start a daemon, initialize a registry, or mutate state.",
+                "inputSchema": registry_page_schema(),
+                "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
+            },
+            {
+                "name": "bosn_setup_ensure_events",
+                "description": "Read a bounded newest-first cursor page of credential-safe setup ensure history from the already-running native Bosn daemon. Does not start a daemon, initialize a registry, or mutate state.",
+                "inputSchema": registry_page_schema(),
+                "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
+            },
+            {
                 "name": "bosn_job_status",
                 "description": "Read the state of one native daemon job.",
                 "inputSchema": job_id_schema(),
@@ -411,6 +448,17 @@ fn job_id_schema() -> Value {
     })
 }
 
+fn registry_page_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "after": {"type": "integer", "minimum": 0, "default": 0, "description": "Opaque offset cursor returned as next; start at 0."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": MAX_MCP_REGISTRY_RECORDS, "default": MAX_MCP_REGISTRY_RECORDS}
+        }
+    })
+}
+
 fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
     let Some(params) = params.as_object() else {
         return tool_error("tools/call params must be an object");
@@ -436,6 +484,22 @@ fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
                 .status()
                 .map(status_json)
                 .map_err(|_| ToolFailure::Daemon)
+        }
+        "bosn_registry_resources" => {
+            registry_page_arguments(arguments).and_then(|(after, limit)| {
+                backend
+                    .registry_resources(after, limit)
+                    .map(resource_page_json)
+                    .map_err(|_| ToolFailure::Daemon)
+            })
+        }
+        "bosn_setup_ensure_events" => {
+            registry_page_arguments(arguments).and_then(|(after, limit)| {
+                backend
+                    .setup_ensure_events(after, limit)
+                    .map(setup_ensure_event_page_json)
+                    .map_err(|_| ToolFailure::Daemon)
+            })
         }
         "bosn_job_status" => job_id(arguments).and_then(|id| {
             only_arguments(arguments, &["job_id"])?;
@@ -769,6 +833,17 @@ fn optional_u64(
     }
 }
 
+fn registry_page_arguments(
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<(u64, u32), ToolFailure> {
+    only_arguments(arguments, &["after", "limit"])?;
+    let after = optional_u64(arguments, "after", 0)?;
+    let limit = optional_u64(arguments, "limit", u64::from(MAX_MCP_REGISTRY_RECORDS))?;
+    (limit > 0 && limit <= u64::from(MAX_MCP_REGISTRY_RECORDS))
+        .then_some((after, limit as u32))
+        .ok_or(ToolFailure::Invalid("limit must be within 1..=64"))
+}
+
 fn status_json(status: Status) -> Value {
     json!({
         "registry_id": status.registry_id,
@@ -778,6 +853,29 @@ fn status_json(status: Status) -> Value {
         "sessions": status.sessions,
         "reconciliation_required": status.reconciliation_required,
     })
+}
+
+fn resource_page_json(page: RegistryResourcePage) -> Value {
+    let records: Vec<Value> = page
+        .records
+        .into_iter()
+        .map(|record| {
+            json!({
+                "id": record.id, "kind": record.kind, "name": record.name,
+                "stack": record.stack, "generation": record.generation,
+                "state": record.state, "retention": record.retention,
+                "created_at": record.created_at, "last_used": record.last_used,
+            })
+        })
+        .collect();
+    json!({"next": page.next, "records": records})
+}
+
+fn setup_ensure_event_page_json(page: SetupEnsureEventPage) -> Value {
+    let records: Vec<Value> = page.records.into_iter().map(|record| json!({
+        "cursor": record.cursor, "at": record.at, "kind": record.kind, "detail": record.detail,
+    })).collect();
+    json!({"next": page.next, "records": records})
 }
 
 fn job_json(job: JobStatus) -> Value {
@@ -886,6 +984,43 @@ mod tests {
                 leases: 2,
                 sessions: 1,
                 reconciliation_required: false,
+            })
+        }
+        fn registry_resources(
+            &mut self,
+            after: u64,
+            _limit: u32,
+        ) -> Result<RegistryResourcePage, Error> {
+            self.daemon_reads += 1;
+            Ok(RegistryResourcePage {
+                next: (after == 0).then_some(1),
+                records: vec![crate::RegistryResourceDiagnostic {
+                    id: "managed-image".into(),
+                    kind: "image".into(),
+                    name: "bosn-setup-image".into(),
+                    stack: "setup".into(),
+                    generation: "sha256:abc".into(),
+                    state: "active".into(),
+                    retention: "pinned".into(),
+                    created_at: 1.0,
+                    last_used: 2.0,
+                }],
+            })
+        }
+        fn setup_ensure_events(
+            &mut self,
+            after: u64,
+            _limit: u32,
+        ) -> Result<SetupEnsureEventPage, Error> {
+            self.daemon_reads += 1;
+            Ok(SetupEnsureEventPage {
+                next: (after == 0).then_some(1),
+                records: vec![crate::SetupEnsureEventDiagnostic {
+                    cursor: 7,
+                    at: 2.0,
+                    kind: "setup.ensure.succeeded".into(),
+                    detail: "job_id=7 outcome=succeeded".into(),
+                }],
             })
         }
         fn job_status(&mut self, id: u64) -> Result<JobStatus, Error> {
@@ -1020,6 +1155,8 @@ mod tests {
             names,
             [
                 "bosn_status",
+                "bosn_registry_resources",
+                "bosn_setup_ensure_events",
                 "bosn_job_status",
                 "bosn_job_logs",
                 "bosn_job_cancel",
@@ -1029,6 +1166,14 @@ mod tests {
                 "bosn_setup_task"
             ]
         );
+        let resources = replies[1]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "bosn_registry_resources")
+            .unwrap();
+        assert_eq!(resources["annotations"]["readOnlyHint"], true);
+        assert_eq!(resources["inputSchema"]["additionalProperties"], false);
         let prepare = replies[1]["result"]["tools"]
             .as_array()
             .unwrap()
@@ -1110,6 +1255,39 @@ mod tests {
         );
         assert_eq!(replies[2]["result"]["isError"], false);
         assert_eq!(replies[2]["result"]["structuredContent"]["resources"], 3);
+    }
+
+    #[test]
+    fn registry_diagnostics_are_bounded_read_only_and_path_safe() {
+        let mut backend = FakeBackend::default();
+        let replies = exchange(
+            concat!(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"bosn_registry_resources","arguments":{"after":0,"limit":1}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"bosn_setup_ensure_events","arguments":{"limit":65}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"bosn_registry_resources","arguments":{"workspace":"/attacker"}}}"#,
+                "\n",
+            ),
+            &mut backend,
+        );
+        assert_eq!(
+            replies[1]["result"]["structuredContent"]["records"][0]["id"],
+            "managed-image"
+        );
+        assert!(
+            replies[1]["result"]["structuredContent"]["records"][0]
+                .get("workspace")
+                .is_none()
+        );
+        assert_eq!(replies[2]["result"]["isError"], true);
+        assert_eq!(replies[3]["result"]["isError"], true);
+        // Only the well-formed resource read reached the backend.
+        assert_eq!(backend.daemon_reads, 1);
     }
 
     #[test]
