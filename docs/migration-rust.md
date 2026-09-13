@@ -128,6 +128,22 @@ bosn job logs --state-dir STATE --job-id ID [--after CURSOR] [--limit 1..=256] [
 bosn job cancel --state-dir STATE --job-id ID [--json]
 ```
 
+`bosn setup task` submits the complete daemon-owned plan, image-preparation,
+and one declared-task pipeline. It returns immediately with `action:
+setup_task`, `submitted: true`, and a `job_id`; use the same job observation
+commands for progress and cancellation:
+
+```text
+bosn setup task --state-dir STATE --workspace WORKSPACE --config LOCATOR \
+  (--refresh | --offline) --task NAME --deadline-ms 1..=300000 \
+  --output-limit 1..=8388608 [--json]
+```
+
+The command submits only a named task declared in the validated setup document.
+It never starts a daemon or invokes Docker itself, and it accepts no task
+command, container, mount, environment, working-directory, per-request state
+override, or other engine controls.
+
 Log replies include `retained_from`, `next`, and `gap`, so callers can retain
 their cursor and detect bounded-log eviction. The command surface is limited
 to typed IPC observation; it provides no daemon start, Docker, registry, or
