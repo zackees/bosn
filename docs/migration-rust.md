@@ -101,6 +101,15 @@ document references and tags are never used as registry identity. Failed or
 cancelled ensures persist neither fact, and repeat ensures are idempotent. It
 never deletes, replaces, stops, adopts, or garbage-collects a container.
 
+When a successful ensure records a different content generation for the same
+canonical workspace and `setup` stack, that same writer transaction marks the
+previous Bosn `setup-container:*` resource and its matching `ResourceUse` row
+`retired`. This is accounting only: the old Docker container is neither stopped
+nor removed. The transition is exact-workspace/exact-stack and container-only;
+it does not affect another workspace or stack, and it never retires an image
+because one inspected image identity may be shared. A failed, cancelled, or
+conflicted transaction leaves the prior generation active.
+
 The same writer keeps a compact, durable audit trail in the existing registry
 `events` table: `setup.ensure.submitted`, then exactly one terminal
 `succeeded`, `failed`, `cancelled`, or (for a pending replacement)

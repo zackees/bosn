@@ -287,7 +287,10 @@ fn live_docker_setup_task_runs_only_the_declared_one_file_task() {
     runtime
         .run(first_client.shutdown())
         .expect("shut down first daemon");
-    assert!(first_daemon.wait_for_exit().success(), "first daemon failed");
+    assert!(
+        first_daemon.wait_for_exit().success(),
+        "first daemon failed"
+    );
 
     // Tasks have no persistent container to reuse. A new daemon nevertheless
     // must be able to plan from the cached one-file receipt and run the same

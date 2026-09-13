@@ -13,7 +13,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use bosn_core::{ResourceKind, ResourceState};
 use bosn_engine::{CommandResult, DockerEngine, RunOptions};
+use bosn_registry::Registry;
 use bosn_service::{Client, SetupEnsureJobRequest, SetupPreparePolicy};
 use bosn_setup::{SetupAcquirePolicy, SetupPlanRequest, plan_setup};
 use kernal_api::{async_engine::RuntimeBuilder, hash::sha256_bytes};
@@ -409,6 +411,149 @@ fn live_docker_setup_ensure_creates_and_reuses_one_managed_app() {
             .is_none(),
         "exact live-test container remained after cleanup"
     );
+}
+
+/// Run with:
+/// `soldr cargo test -j1 -p bosn-service --test setup_ensure_docker --locked -- --ignored --exact live_docker_setup_ensure_rolls_registry_generation_without_deleting_old_app`
+///
+/// This opt-in observation uses two different one-file documents for one
+/// canonical workspace. Bosn may create the second managed app, but the old
+/// app must remain running in Docker while only its durable registry ownership
+/// is retired. Cleanup verifies ownership separately for each exact name.
+#[test]
+#[ignore = "requires a local Docker daemon and the pinned Alpine image"]
+fn live_docker_setup_ensure_rolls_registry_generation_without_deleting_old_app() {
+    let engine = DockerEngine::docker();
+    let expected_image = pinned_alpine_identity(&engine);
+    let root = tempfile::tempdir().expect("temporary test root");
+    let state = root.path().join("state");
+    let workspace = root.path().join("workspace");
+    let config_root = root.path().join("config");
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    std::fs::create_dir_all(&config_root).expect("create config directory");
+    let config = config_root.join("setup.toml");
+    let unique = test_unique_suffix();
+    let document = |generation: &str| {
+        format!(
+            "version = 1\n[app]\nimage = '{PINNED_ALPINE}'\ncommand = 'exec sleep 120 # bosn-rollover-{unique}-{generation}'\n"
+        )
+    };
+    std::fs::write(&config, document("a")).expect("write first setup document");
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("construct kernal-api runtime");
+    let plan_a = runtime
+        .run(plan_setup(SetupPlanRequest {
+            state_dir: state.clone(),
+            workspace: workspace.clone(),
+            locator: config.to_string_lossy().into_owned(),
+            policy: SetupAcquirePolicy::OnlineRefresh,
+        }))
+        .expect("plan first generation");
+    std::fs::write(&config, document("b")).expect("write second setup document");
+    let plan_b = runtime
+        .run(plan_setup(SetupPlanRequest {
+            state_dir: state.clone(),
+            workspace: workspace.clone(),
+            locator: config.to_string_lossy().into_owned(),
+            policy: SetupAcquirePolicy::OnlineRefresh,
+        }))
+        .expect("plan second generation");
+    assert_ne!(
+        plan_a.content_sha256, plan_b.content_sha256,
+        "the two one-file documents must form distinct generations"
+    );
+    let name_a = format!("bosn-setup-{}", plan_a.content_sha256);
+    let name_b = format!("bosn-setup-{}", plan_b.content_sha256);
+    for name in [&name_a, &name_b] {
+        assert!(
+            inspect_container(&engine, name)
+                .expect("inspect deterministic test container")
+                .is_none(),
+            "unique test container name already exists; refusing to touch it"
+        );
+    }
+    let cleanup_a = ExactContainerCleanup {
+        engine: engine.clone(),
+        container_name: name_a.clone(),
+        content_sha256: plan_a.content_sha256.clone(),
+    };
+    let cleanup_b = ExactContainerCleanup {
+        engine: engine.clone(),
+        container_name: name_b.clone(),
+        content_sha256: plan_b.content_sha256.clone(),
+    };
+
+    // Restore the first document before the production daemon observes it.
+    std::fs::write(&config, document("a")).expect("restore first setup document");
+    let request = SetupEnsureJobRequest {
+        workspace: workspace.clone(),
+        config: config.to_string_lossy().into_owned(),
+        policy: SetupPreparePolicy::Refresh,
+        deadline: JOB_DEADLINE,
+        output_limit: OUTPUT_LIMIT,
+    };
+    let mut daemon = DaemonChild::start(&state);
+    let client = wait_for_client(&runtime, &mut daemon, &state);
+    let first_job = runtime
+        .run(client.submit_setup_ensure(request.clone()))
+        .expect("submit first generation");
+    wait_for_success(&runtime, &client, first_job);
+    let first = inspect_container(&engine, &name_a)
+        .expect("inspect first generation")
+        .expect("first managed app exists");
+    assert!(first.running);
+    assert_eq!(first.image, expected_image);
+
+    std::fs::write(&config, document("b")).expect("restore second setup document");
+    let second_job = runtime
+        .run(client.submit_setup_ensure(request))
+        .expect("submit second generation");
+    wait_for_success(&runtime, &client, second_job);
+    let old_after_rollover = inspect_container(&engine, &name_a)
+        .expect("inspect old generation after rollover")
+        .expect("rollover must not delete the old managed app");
+    let current = inspect_container(&engine, &name_b)
+        .expect("inspect current generation")
+        .expect("current managed app exists");
+    assert!(old_after_rollover.running, "rollover must not stop old app");
+    assert!(current.running, "current app must be running");
+    assert_ne!(old_after_rollover.id, current.id);
+    assert_eq!(current.image, expected_image);
+
+    runtime.run(client.shutdown()).expect("shut down daemon");
+    assert!(daemon.wait_for_exit().success(), "daemon failed");
+    let registry = Registry::open_read_only(state.join("registry.sqlite3")).expect("open registry");
+    let resources = registry.resources(0, 16).expect("read resources").items;
+    let resource = |name: &str| {
+        resources
+            .iter()
+            .find(|value| value.kind == ResourceKind::Container && value.name == name)
+            .expect("managed container registry row")
+    };
+    assert_eq!(resource(&name_a).state, ResourceState::Retired);
+    assert_eq!(resource(&name_b).state, ResourceState::Active);
+    assert_eq!(
+        resources
+            .iter()
+            .find(|value| value.id == format!("setup-image:{expected_image}"))
+            .expect("shared inspected image registry row")
+            .state,
+        ResourceState::Active
+    );
+    drop(registry);
+    drop(cleanup_b);
+    drop(cleanup_a);
+    for name in [&name_a, &name_b] {
+        assert!(
+            inspect_container(&engine, name)
+                .expect("inspect exact container after cleanup")
+                .is_none(),
+            "exact live-test container remained after cleanup"
+        );
+    }
 }
 
 /// Run with:

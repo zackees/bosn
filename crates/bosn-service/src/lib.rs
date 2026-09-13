@@ -2158,8 +2158,21 @@ fn record_setup_ensure(
         last_used: now,
         state: ResourceState::Active,
     })?;
+    // A new successful setup document generation supersedes only prior Bosn
+    // setup *container* ownership in this exact canonical workspace/stack.
+    // It does not stop, delete, or otherwise mutate Docker; it also leaves
+    // image ownership active because inspected image identities can be shared
+    // across documents and workspaces. Keeping this after both current
+    // resource upserts means an image conflict rolls back without retiring a
+    // previously active generation.
+    transaction.retire_prior_setup_container_generations(
+        &container.workspace,
+        &container.stack,
+        &container.generation,
+    )?;
     // Success is never visible in the event log until both durable ownership
-    // facts have been accepted by this very transaction.
+    // facts and any generation retirement have been accepted by this very
+    // transaction.
     let event = SetupEnsureEvent::terminal(job_id, SetupEnsureEventOutcome::Succeeded);
     transaction.append_event(now, event.kind, &event.detail)?;
     transaction.commit()
@@ -3104,6 +3117,30 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
         },
     };
+
+    fn setup_ensure_execution(
+        workspace: &str,
+        generation: &str,
+        image_identity: &str,
+    ) -> SetupEnsureExecution {
+        SetupEnsureExecution {
+            receipt: format!("ensured {generation}"),
+            resource: SetupEnsureResource {
+                id: format!("setup-container:{generation}"),
+                name: format!("bosn-setup-{generation}"),
+                stack: "setup".into(),
+                generation: format!("sha256:{generation}"),
+                workspace: workspace.into(),
+            },
+            image: SetupEnsureImageResource {
+                id: format!("setup-image:{image_identity}"),
+                name: format!("setup-image:{image_identity}"),
+                stack: "setup".into(),
+                generation: image_identity.into(),
+                workspace: workspace.into(),
+            },
+        }
+    }
 
     struct SlowFakeSetupExecutor {
         started: AtomicUsize,
@@ -4116,11 +4153,377 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_setup_ensure_does_not_persist_a_resource() {
+    fn setup_ensure_generation_rollover_retires_only_prior_setup_containers() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let path = temporary.path().join("registry.sqlite3");
+        let workspace_a = "/canonical/workspace-a";
+        let workspace_b = "/canonical/workspace-b";
+        let shared_image = "sha256:shared-image";
+        let mut registry =
+            Registry::create_writer(&path, "11111111-2222-4333-8444-555555555555").unwrap();
+
+        record_setup_ensure(
+            &mut registry,
+            1,
+            &setup_ensure_execution(workspace_a, "generation-a", shared_image),
+        )
+        .unwrap();
+
+        // A container outside the `setup` stack is deliberately in the
+        // product namespace too. Rollover must still leave it untouched.
+        let mut transaction = registry.begin_immediate().unwrap();
+        transaction
+            .put_resource(&Resource {
+                id: "setup-container:other-stack".into(),
+                kind: ResourceKind::Container,
+                name: "other-stack-container".into(),
+                stack: "other".into(),
+                generation: "sha256:other".into(),
+                scope: Scope::Machine,
+                workspace: workspace_a.into(),
+                created_at: 1.0,
+                last_used: 1.0,
+                state: ResourceState::Active,
+                retention: Retention::Pinned,
+            })
+            .unwrap();
+        transaction
+            .put_resource_use(&ResourceUse {
+                resource_id: "setup-container:other-stack".into(),
+                workspace: workspace_a.into(),
+                stack: "other".into(),
+                generation: "sha256:other".into(),
+                last_used: 1.0,
+                state: ResourceState::Active,
+            })
+            .unwrap();
+        transaction.commit().unwrap();
+        // The registry primitive is deliberately hard-scoped to `setup`;
+        // even an internal caller cannot reuse it to retire another stack.
+        let mut transaction = registry.begin_immediate().unwrap();
+        transaction
+            .retire_prior_setup_container_generations(workspace_a, "other", "sha256:new")
+            .unwrap();
+        transaction.commit().unwrap();
+
+        // The exact same inspected image is shared across documents and
+        // workspaces. It must never be retired during a container rollover.
+        record_setup_ensure(
+            &mut registry,
+            2,
+            &setup_ensure_execution(workspace_b, "generation-c", shared_image),
+        )
+        .unwrap();
+        record_setup_ensure(
+            &mut registry,
+            3,
+            &setup_ensure_execution(workspace_a, "generation-b", shared_image),
+        )
+        .unwrap();
+        // Re-ensuring the current content is an active idempotent upsert, not
+        // another retirement transition.
+        record_setup_ensure(
+            &mut registry,
+            4,
+            &setup_ensure_execution(workspace_a, "generation-b", shared_image),
+        )
+        .unwrap();
+        drop(registry);
+
+        // Reopen to prove terminal ownership accounting survives a daemon
+        // restart rather than being an in-memory observation.
+        let registry = Registry::open_read_only(&path).unwrap();
+        let resources = registry.resources(0, 16).unwrap().items;
+        let resource = |id: &str| resources.iter().find(|value| value.id == id).unwrap();
+        assert_eq!(
+            resource("setup-container:generation-a").state,
+            ResourceState::Retired
+        );
+        assert_eq!(
+            resource("setup-container:generation-b").state,
+            ResourceState::Active
+        );
+        assert_eq!(
+            resource("setup-container:generation-c").state,
+            ResourceState::Active
+        );
+        assert_eq!(
+            resource("setup-container:other-stack").state,
+            ResourceState::Active
+        );
+        assert_eq!(
+            resource(&format!("setup-image:{shared_image}")).state,
+            ResourceState::Active
+        );
+
+        let uses = registry.resource_uses(0, 32).unwrap().items;
+        let use_state = |id: &str, workspace: &str, stack: &str, generation: &str| {
+            uses.iter()
+                .find(|value| {
+                    value.resource_id == id
+                        && value.workspace == workspace
+                        && value.stack == stack
+                        && value.generation == generation
+                })
+                .unwrap()
+                .state
+        };
+        assert_eq!(
+            use_state(
+                "setup-container:generation-a",
+                workspace_a,
+                "setup",
+                "sha256:generation-a"
+            ),
+            ResourceState::Retired
+        );
+        assert_eq!(
+            use_state(
+                "setup-container:generation-b",
+                workspace_a,
+                "setup",
+                "sha256:generation-b"
+            ),
+            ResourceState::Active
+        );
+        assert_eq!(
+            use_state(
+                "setup-container:generation-c",
+                workspace_b,
+                "setup",
+                "sha256:generation-c"
+            ),
+            ResourceState::Active
+        );
+        assert_eq!(
+            use_state(
+                "setup-container:other-stack",
+                workspace_a,
+                "other",
+                "sha256:other"
+            ),
+            ResourceState::Active
+        );
+        for image_use in uses
+            .iter()
+            .filter(|value| value.resource_id == format!("setup-image:{shared_image}"))
+        {
+            assert_eq!(image_use.state, ResourceState::Active);
+        }
+    }
+
+    #[test]
+    fn setup_ensure_rollover_conflict_rolls_back_without_retiring_current_generation() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let mut registry = Registry::create_writer(
+            temporary.path().join("registry.sqlite3"),
+            "11111111-2222-4333-8444-555555555555",
+        )
+        .unwrap();
+        let workspace = "/canonical/workspace";
+        record_setup_ensure(
+            &mut registry,
+            1,
+            &setup_ensure_execution(workspace, "generation-a", "sha256:image-a"),
+        )
+        .unwrap();
+
+        // Make the later image upsert fail after the next generation's
+        // container would otherwise have been accepted. The immediate
+        // transaction must preserve the active old generation and its use.
+        let mut transaction = registry.begin_immediate().unwrap();
+        transaction
+            .put_resource(&Resource {
+                id: "foreign-image".into(),
+                kind: ResourceKind::Image,
+                name: "setup-image:sha256:image-b".into(),
+                stack: "foreign".into(),
+                generation: "sha256:foreign".into(),
+                scope: Scope::Machine,
+                workspace: workspace.into(),
+                created_at: 1.0,
+                last_used: 1.0,
+                state: ResourceState::Active,
+                retention: Retention::Pinned,
+            })
+            .unwrap();
+        transaction.commit().unwrap();
+        assert!(matches!(
+            record_setup_ensure(
+                &mut registry,
+                2,
+                &setup_ensure_execution(workspace, "generation-b", "sha256:image-b"),
+            ),
+            Err(bosn_registry::Error::ResourceIdentityConflict)
+        ));
+        let old = registry
+            .resources(0, 16)
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|value| value.id == "setup-container:generation-a")
+            .unwrap();
+        assert_eq!(old.state, ResourceState::Active);
+        let old_use = registry
+            .resource_uses(0, 16)
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|value| value.resource_id == "setup-container:generation-a")
+            .unwrap();
+        assert_eq!(old_use.state, ResourceState::Active);
+        assert!(
+            registry
+                .resources(0, 16)
+                .unwrap()
+                .items
+                .iter()
+                .all(|value| value.id != "setup-container:generation-b")
+        );
+    }
+
+    #[test]
+    fn setup_ensure_rollover_never_retires_a_container_shared_by_another_workspace() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let mut registry = Registry::create_writer(
+            temporary.path().join("registry.sqlite3"),
+            "11111111-2222-4333-8444-555555555555",
+        )
+        .unwrap();
+        let workspace_a = "/canonical/workspace-a";
+        let workspace_b = "/canonical/workspace-b";
+        record_setup_ensure(
+            &mut registry,
+            1,
+            &setup_ensure_execution(workspace_a, "generation-a", "sha256:image-a"),
+        )
+        .unwrap();
+        // This is not normal setup-app ownership (the content-addressed
+        // container should not be shared across workspaces), but it proves
+        // that accounting fails closed rather than retiring a global resource
+        // observed by another workspace.
+        let mut transaction = registry.begin_immediate().unwrap();
+        transaction
+            .put_resource_use(&ResourceUse {
+                resource_id: "setup-container:generation-a".into(),
+                workspace: workspace_b.into(),
+                stack: "setup".into(),
+                generation: "sha256:generation-a".into(),
+                last_used: 1.0,
+                state: ResourceState::Active,
+            })
+            .unwrap();
+        transaction.commit().unwrap();
+        record_setup_ensure(
+            &mut registry,
+            2,
+            &setup_ensure_execution(workspace_a, "generation-b", "sha256:image-b"),
+        )
+        .unwrap();
+
+        let resources = registry.resources(0, 16).unwrap().items;
+        assert_eq!(
+            resources
+                .iter()
+                .find(|value| value.id == "setup-container:generation-a")
+                .unwrap()
+                .state,
+            ResourceState::Active
+        );
+        let uses = registry.resource_uses(0, 16).unwrap().items;
+        assert!(
+            uses.iter()
+                .filter(|value| value.resource_id == "setup-container:generation-a")
+                .all(|value| value.state == ResourceState::Active)
+        );
+        assert_eq!(
+            resources
+                .iter()
+                .find(|value| value.id == "setup-container:generation-b")
+                .unwrap()
+                .state,
+            ResourceState::Active
+        );
+    }
+
+    #[test]
+    fn setup_ensure_rollover_is_visible_through_daemon_registry_diagnostics() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let workspace = "/canonical/workspace";
+        let mut registry = Registry::create_writer(
+            state.join("registry.sqlite3"),
+            "11111111-2222-4333-8444-555555555555",
+        )
+        .unwrap();
+        record_setup_ensure(
+            &mut registry,
+            1,
+            &setup_ensure_execution(workspace, "generation-a", "sha256:image"),
+        )
+        .unwrap();
+        record_setup_ensure(
+            &mut registry,
+            2,
+            &setup_ensure_execution(workspace, "generation-b", "sha256:image"),
+        )
+        .unwrap();
+        drop(registry);
+
+        RuntimeBuilder::multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let server = async_engine::launch(Service::new(state.clone()).serve());
+                let client = wait_for_client(&state).await;
+                let page = client.registry_resources(0, 16).await.unwrap();
+                assert_eq!(
+                    page.records
+                        .iter()
+                        .find(|value| value.id == "setup-container:generation-a")
+                        .unwrap()
+                        .state,
+                    "retired"
+                );
+                assert_eq!(
+                    page.records
+                        .iter()
+                        .find(|value| value.id == "setup-container:generation-b")
+                        .unwrap()
+                        .state,
+                    "active"
+                );
+                client.shutdown().await.unwrap();
+                stopped(server).await;
+            });
+    }
+
+    #[test]
+    fn cancelled_setup_ensure_does_not_persist_or_retire_existing_resources() {
         let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
         let state = temporary.path().join("state");
         let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&state).unwrap();
         std::fs::create_dir(&workspace).unwrap();
+        let canonical_workspace = workspace.to_string_lossy().into_owned();
+        let mut initial_registry = Registry::create_writer(
+            state.join("registry.sqlite3"),
+            "11111111-2222-4333-8444-555555555555",
+        )
+        .unwrap();
+        record_setup_ensure(
+            &mut initial_registry,
+            1,
+            &setup_ensure_execution(
+                &canonical_workspace,
+                "existing-generation",
+                "sha256:existing-image",
+            ),
+        )
+        .unwrap();
+        drop(initial_registry);
         let fake = Arc::new(FakeSetupEnsureExecutor::new());
         RuntimeBuilder::multi_thread()
             .enable_all()
@@ -4150,8 +4553,19 @@ mod tests {
                 stopped(server).await;
             });
         let registry = Registry::open_read_only(state.join("registry.sqlite3")).unwrap();
-        assert!(registry.resources(0, 10).unwrap().items.is_empty());
-        assert!(registry.resource_uses(0, 10).unwrap().items.is_empty());
+        let resources = registry.resources(0, 10).unwrap().items;
+        assert_eq!(resources.len(), 2);
+        assert!(
+            resources
+                .iter()
+                .all(|resource| resource.state == ResourceState::Active)
+        );
+        let uses = registry.resource_uses(0, 10).unwrap().items;
+        assert_eq!(uses.len(), 2);
+        assert!(
+            uses.iter()
+                .all(|resource_use| resource_use.state == ResourceState::Active)
+        );
         assert_eq!(
             registry
                 .events(0, 10)
@@ -4161,6 +4575,7 @@ mod tests {
                 .map(|event| (event.kind.as_str(), event.detail.as_str()))
                 .collect::<Vec<_>>(),
             vec![
+                ("setup.ensure.succeeded", "job_id=1 outcome=succeeded"),
                 (
                     "setup.ensure.submitted",
                     "job_id=1 policy=refresh source=https",
