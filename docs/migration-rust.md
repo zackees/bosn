@@ -34,6 +34,23 @@ are not performance promises or evidence that the Rust migration is implemented.
 
 No implementation phase is marked complete solely because one checkpoint landed.
 
+### Rust Docker transport checkpoint (issue #153)
+
+`bosn-engine` provides a local Docker-CLI transport over the pinned public
+`kernal-api` process/session facade. It has bounded separated diagnostic capture,
+tagged streaming output, explicit deadline/cancellation and direct-client reaping.
+It accepts trusted, product-selected Docker argv/environment and is not an operation
+authorization boundary or sandbox; it is deliberately not exposed through daemon IPC.
+Killing a local `docker exec` client is not evidence that its remote command stopped;
+future job cancellation must validate Bosn ownership of the remote container before
+reporting it stopped. Health-monitor probing, interactive inherited-TTY execution,
+container lifecycle/build/pull/create/start/remove policy, and that remote cancellation
+protocol remain subsequent engine work, rather than silently claimed by this transport.
+The transport acceptance tests were added RED first (missing crate import), then GREEN:
+native synthetic-child tests cover stream separation, ordinary exit 130, spawn versus
+deadline classification, oversized output without a newline, pre-exit streaming,
+cancellation, and native post-cancellation identity observation proving client reaping.
+
 ## Current surface and characterization references
 
 ### Main CLI (`bosn`)

@@ -69,6 +69,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bosn-engine"
+version = "0.1.0"
+dependencies = [
+ "kernal-api",
+ "libc",
+]
+
+[[package]]
 name = "bosn-registry"
 version = "0.1.0"
 dependencies = [

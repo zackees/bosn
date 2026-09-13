@@ -1,0 +1,17 @@
+[package]
+name = "bosn-engine"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+
+[dependencies]
+kernal-api = { git = "https://github.com/zackees/kernal-api", rev = "ed197c5c606d6fd984190721e309c30d7d0383ef", version = "=0.1.0", default-features = false }
+libc = { version = "=0.2.189", optional = true }
+
+[features]
+native-test-helper = ["dep:libc"]
+
+[[bin]]
+name = "bosn-engine-native-helper"
+path = "src/bin/bosn-engine-native-helper.rs"
+required-features = ["native-test-helper"]
