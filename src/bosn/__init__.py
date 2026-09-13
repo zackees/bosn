@@ -10,6 +10,7 @@ __all__ = ["__version__"]
 try:
     from ._native import (
         Client,
+        DoctorReport,
         JobLogPage,
         JobLogRecord,
         JobStatus,
@@ -29,6 +30,7 @@ except ModuleNotFoundError as error:
 else:
     __all__ += [
         "Client",
+        "DoctorReport",
         "JobLogPage",
         "JobLogRecord",
         "JobStatus",
