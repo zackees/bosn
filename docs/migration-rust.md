@@ -68,8 +68,16 @@ cancellation, and native post-cancellation identity observation proving client r
 | `init` | Compose-to-`bosn.toml`, refuse overwrite | `tests/test_docker_cli.py`, `tests/test_cli_verbs.py` |
 | global options | engine/state/manifest selection, JSON envelopes, unified policy precedence | `tests/test_options.py`, `tests/test_config.py`, `tests/test_cli_smoke.py` |
 
-`bosn` currently has no supported Python product API beyond package version export
-(`src/bosn/__init__.py`).  Internal modules are not a compatibility contract.
+The installed `bosn` package exposes a deliberately narrow native Python API:
+`Client(state_dir).status()` and
+`Client(state_dir).plan_setup(workspace, config_locator, *, policy)`.  The
+setup planner requires either `"online_refresh"` or `"offline_cache_only"`;
+it releases the GIL while calling the Rust `bosn-setup` pipeline and returns a
+frozen receipt (`SetupPlan`) with source kind, content hash, schema, canonical
+workspace, optional private asset root, ordered task names, source shape, and
+`applied == false`.  It does not write the selected workspace, contact Docker
+or the Bosn daemon, or apply the document.  Other Python internal modules are
+not a compatibility contract.
 
 ### `bosn-docker` / `bosn-compose`
 

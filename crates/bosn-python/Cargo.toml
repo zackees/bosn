@@ -10,5 +10,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 bosn-service = { path = "../bosn-service" }
+bosn-setup = { path = "../bosn-setup" }
 kernal-api = { git = "https://github.com/zackees/kernal-api", rev = "fc634e507024d63ccaaf75fa564818b9dcfbff36", version = "=0.1.0", default-features = false, features = ["ipc-async"] }
 pyo3 = { version = "=0.29.2", features = ["extension-module"] }

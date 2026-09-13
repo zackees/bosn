@@ -1,5 +1,6 @@
 """The native surface is exercised after ``maturin develop`` in release checks."""
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -19,3 +20,79 @@ def test_native_extension_is_reexported_by_python_package(tmp_path: Path) -> Non
     assert client.state_dir == str(tmp_path / "state")
     with pytest.raises(RuntimeError, match="Io"):
         client.status()
+
+
+def test_native_setup_plan_is_structured_and_requires_an_explicit_policy(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = tmp_path / "setup.toml"
+    document = (
+        "version = 1\n"
+        "[app]\n"
+        "image = 'registry.example/demo@sha256:"
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n"
+        "[task.check]\n"
+        "command = 'echo check'\n"
+        "[task.lint]\n"
+        "command = 'echo lint'\n"
+    )
+    config.write_text(document)
+
+    client = bosn.Client(state_dir)
+    plan = client.plan_setup(workspace, str(config), policy="online_refresh")
+
+    assert plan.source_kind == "local_file"
+    assert plan.content_sha256 == hashlib.sha256(document.encode()).hexdigest()
+    assert plan.schema_version == 1
+    assert plan.workspace == str(workspace.resolve())
+    assert plan.asset_root is None
+    assert plan.task_names == ("check", "lint")
+    assert plan.app_source_kind == "pinned_image"
+    assert plan.image == "registry.example/demo@sha256:" + "a" * 64
+    assert plan.dockerfile_path is None
+    assert plan.applied is False
+    with pytest.raises(AttributeError):
+        plan.applied = True
+    with pytest.raises(ValueError, match="policy must"):
+        client.plan_setup(workspace, str(config), policy="refresh")
+    secret_locator = "https://user:top-secret@example.test/setup.toml"
+    with pytest.raises(RuntimeError, match="setup config locator is invalid") as error:
+        client.plan_setup(workspace, secret_locator, policy="online_refresh")
+    assert "top-secret" not in str(error.value)
+
+
+def test_native_setup_plan_reuses_local_inline_document_offline_without_docker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = tmp_path / "setup.toml"
+    config.write_text(
+        "version = 1\n"
+        "[app]\n"
+        "dockerfile = 'FROM scratch'\n"
+        "[task.check]\n"
+        "command = 'echo check'\n"
+        "[[file]]\n"
+        "path = 'scripts/check.sh'\n"
+        "content = '#!/bin/sh\\necho check\\n'\n"
+    )
+    monkeypatch.setenv("DOCKER_HOST", "tcp://127.0.0.1:1")
+
+    client = bosn.Client(state_dir)
+    first = client.plan_setup(workspace, str(config), policy="online_refresh")
+    config.unlink()
+    offline = client.plan_setup(workspace, str(config), policy="offline_cache_only")
+
+    assert offline.content_sha256 == first.content_sha256
+    assert offline.app_source_kind == "inline_dockerfile"
+    assert offline.image is None
+    assert offline.asset_root == first.asset_root
+    assert offline.dockerfile_path == first.dockerfile_path
+    assert offline.asset_root is not None
+    assert Path(offline.asset_root).is_relative_to(state_dir)
+    assert Path(offline.dockerfile_path).read_text() == "FROM scratch"
+    assert list(workspace.iterdir()) == []
+    assert offline.applied is False

@@ -87,6 +87,7 @@ name = "bosn"
 version = "0.1.3"
 dependencies = [
  "bosn-service",
+ "bosn-setup",
  "kernal-api",
  "pyo3",
 ]
