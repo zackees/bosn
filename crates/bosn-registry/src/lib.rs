@@ -820,6 +820,28 @@ impl<'a> Immediate<'a> {
         self.append_event(at, event_kind, "retired_managed_setup_container")?;
         Ok(true)
     }
+    /// Recheck one exact retired setup-container candidate and append the
+    /// deliberately small stopped event without changing resource lifecycle
+    /// state.  The container remains retired and is therefore still eligible
+    /// for the separate, confirmation-gated GC apply operation.
+    pub fn confirm_setup_retired_container_stopped(
+        &mut self,
+        workspace: &str,
+        id: &str,
+        name: &str,
+        generation: &str,
+        at: f64,
+    ) -> Result<bool, Error> {
+        if !setup_gc_candidate_exists(&mut self.transaction, workspace, id, name, generation)? {
+            return Ok(false);
+        }
+        self.append_event(
+            at,
+            "setup.ensure.retired_stopped",
+            "retired_managed_setup_container",
+        )?;
+        Ok(true)
+    }
     pub fn set_meta(&mut self, key: &str, value: &str) -> Result<(), Error> {
         if matches!(key, "schema_version" | "registry_id") || key == RECONCILIATION_REQUIRED {
             return Err(Error::ReservedMeta("schema_version or registry_id"));

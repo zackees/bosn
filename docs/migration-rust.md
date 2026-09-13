@@ -178,6 +178,16 @@ container is already absent, apply conservatively removes only its still-valid
 retired registry record and records `setup.gc.reconciled_missing`; this is
 idempotent reconciliation, not an engine deletion claim.
 
+When a retired generation is still running, it can first be stopped without
+removal using `bosn setup stop-retired --state-dir STATE --workspace WORKSPACE
+--candidate TOKEN --apply --yes`, Python
+`Client.setup_stop_retired(workspace, token, confirm=True)`, or MCP
+`bosn_setup_stop_retired` with `confirm: true`. It accepts the same opaque
+preview token only, rechecks all registry protections and exact ownership
+labels, performs only fixed `docker container stop NAME`, reinspects the
+stopped state, and records a compact event. An already stopped exact candidate
+is idempotent and remains eligible for the separate GC apply operation.
+
 The opt-in live acceptance proof creates two setup generations, applies only
 the preview token for the stopped retired generation, verifies that the current
 container and image remain, checks the durable GC event, and cleans exact

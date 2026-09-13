@@ -11,7 +11,8 @@ use bosn_service::{
     SetupDoneResult as ServiceSetupDoneResult, SetupEnsureEventPage as ServiceSetupEnsureEventPage,
     SetupEnsureJobRequest, SetupGcApplyResult as ServiceSetupGcApplyResult,
     SetupGcPreviewPage as ServiceSetupGcPreviewPage, SetupPreparePolicy, SetupPrepareRequest,
-    SetupTaskJobRequest, Status as ServiceStatus,
+    SetupRetiredStopResult as ServiceSetupRetiredStopResult, SetupTaskJobRequest,
+    Status as ServiceStatus,
 };
 use bosn_setup::{
     SetupAcquirePolicy, SetupPlan as RustSetupPlan, SetupPlanAppSource, SetupPlanRequest,
@@ -149,6 +150,29 @@ impl Client {
         py.detach(move || {
             setup_gc_apply(&state_dir, workspace, candidate_token)
                 .map(SetupGcApplyResult::from)
+                .map_err(service_error)
+        })
+    }
+
+    /// Stop one preview-derived retired setup app. ``confirm=True`` is
+    /// required; Docker names, images, argv, and timeouts are not accepted.
+    #[pyo3(signature = (workspace, candidate_token, *, confirm))]
+    fn setup_stop_retired(
+        &self,
+        workspace: PathBuf,
+        candidate_token: String,
+        confirm: bool,
+        py: Python<'_>,
+    ) -> PyResult<SetupRetiredStopResult> {
+        if !confirm {
+            return Err(PyValueError::new_err(
+                "setup_stop_retired requires confirm=True",
+            ));
+        }
+        let state_dir = self.state_dir.clone();
+        py.detach(move || {
+            setup_stop_retired(&state_dir, workspace, candidate_token)
+                .map(SetupRetiredStopResult::from)
                 .map_err(service_error)
         })
     }
@@ -694,6 +718,23 @@ impl From<ServiceSetupGcApplyResult> for SetupGcApplyResult {
 
 #[derive(Debug)]
 #[pyclass(module = "bosn._native", frozen)]
+pub struct SetupRetiredStopResult {
+    #[pyo3(get)]
+    stopped: bool,
+    #[pyo3(get)]
+    already_stopped: bool,
+}
+impl From<ServiceSetupRetiredStopResult> for SetupRetiredStopResult {
+    fn from(value: ServiceSetupRetiredStopResult) -> Self {
+        Self {
+            stopped: value.stopped,
+            already_stopped: value.already_stopped,
+        }
+    }
+}
+
+#[derive(Debug)]
+#[pyclass(module = "bosn._native", frozen)]
 pub struct SetupDoneResult {
     #[pyo3(get)]
     uses_completed: u64,
@@ -959,6 +1000,21 @@ fn setup_gc_apply(
     runtime.run(async {
         ServiceClient::for_state(state_dir)?
             .setup_gc_apply(workspace, &candidate_token, true)
+            .await
+    })
+}
+fn setup_stop_retired(
+    state_dir: &Path,
+    workspace: PathBuf,
+    candidate_token: String,
+) -> Result<ServiceSetupRetiredStopResult, bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async {
+        ServiceClient::for_state(state_dir)?
+            .setup_stop_retired(workspace, &candidate_token, true)
             .await
     })
 }
@@ -1283,6 +1339,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SetupGcPreviewCounts>()?;
     module.add_class::<SetupGcPreviewPage>()?;
     module.add_class::<SetupGcApplyResult>()?;
+    module.add_class::<SetupRetiredStopResult>()?;
     module.add_class::<SetupDoneResult>()?;
     module.add_class::<SetupEnsureEvent>()?;
     module.add_class::<SetupEnsureEventPage>()?;

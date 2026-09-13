@@ -864,6 +864,14 @@ pub struct SetupGcApplyResult {
     pub removed: bool,
     pub reconciled_missing: bool,
 }
+/// Result of stopping one exact retired setup generation.  An already-stopped
+/// exact candidate is intentionally idempotent: no Docker mutation or event
+/// write occurs, and its retired registry record remains for GC apply.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetupRetiredStopResult {
+    pub stopped: bool,
+    pub already_stopped: bool,
+}
 /// Result of an explicit, registry-only setup workspace completion.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SetupDoneResult {
@@ -1120,6 +1128,15 @@ fn validate_setup_gc_apply_input(workspace: &str, token: &str, confirm: bool) ->
     Ok(())
 }
 
+fn validate_setup_retired_stop_input(
+    workspace: &str,
+    token: &str,
+    confirm: bool,
+) -> Result<(), Error> {
+    validate_setup_gc_apply_input(workspace, token, confirm)
+        .map_err(|_| Error::Protocol("invalid setup retired stop request"))
+}
+
 fn validate_setup_gc_apply_request_wire(request: &Request) -> Result<(), Error> {
     validate_setup_gc_apply_input(
         &request.workspace,
@@ -1142,6 +1159,32 @@ fn validate_setup_gc_apply_request_wire(request: &Request) -> Result<(), Error> 
         || request.setup_adopt_confirm
     {
         return Err(Error::Protocol("nonsemantic setup gc apply fields"));
+    }
+    Ok(())
+}
+
+fn validate_setup_retired_stop_request_wire(request: &Request) -> Result<(), Error> {
+    validate_setup_retired_stop_input(
+        &request.workspace,
+        &request.gc_candidate_token,
+        request.gc_confirm,
+    )?;
+    if !request.stack.is_empty()
+        || !request.digest.is_empty()
+        || request.job_id != 0
+        || request.log_after != 0
+        || request.log_limit != 0
+        || !request.setup_config.is_empty()
+        || request.setup_policy != 0
+        || request.setup_deadline_ms != 0
+        || request.setup_output_limit != 0
+        || !request.setup_task_name.is_empty()
+        || request.diagnostic_after != 0
+        || request.diagnostic_limit != 0
+        || request.setup_done_confirm
+        || request.setup_adopt_confirm
+    {
+        return Err(Error::Protocol("nonsemantic setup retired stop fields"));
     }
     Ok(())
 }
@@ -1360,6 +1403,30 @@ impl Client {
         {
             Reply::SetupGcApply(value) => Ok(value),
             _ => Err(Error::Protocol("unexpected setup gc apply response")),
+        }
+    }
+    /// Stop exactly one opaque retired candidate returned by GC preview. The
+    /// daemon revalidates durable ownership and fixed Docker labels; the
+    /// caller cannot select a Docker name, image, argv, or timeout.
+    pub async fn setup_stop_retired(
+        &self,
+        workspace: impl AsRef<Path>,
+        candidate_token: &str,
+        confirm: bool,
+    ) -> Result<SetupRetiredStopResult, Error> {
+        let workspace = workspace.as_ref().to_string_lossy().into_owned();
+        validate_setup_retired_stop_input(&workspace, candidate_token, confirm)?;
+        match self
+            .call(Request {
+                workspace,
+                gc_candidate_token: candidate_token.into(),
+                gc_confirm: true,
+                ..Request::operation(18)
+            })
+            .await?
+        {
+            Reply::SetupRetiredStop(value) => Ok(value),
+            _ => Err(Error::Protocol("unexpected setup retired stop response")),
         }
     }
     /// Explicitly mark this setup workspace's active registry ownership done.
@@ -1665,6 +1732,13 @@ enum DbCommand {
         name: String,
         generation: String,
         missing: bool,
+        reply: async_engine::OneshotSender<Result<bool, Error>>,
+    },
+    ConfirmSetupRetiredStopped {
+        workspace: String,
+        id: String,
+        name: String,
+        generation: String,
         reply: async_engine::OneshotSender<Result<bool, Error>>,
     },
     CompleteSetupWorkspace {
@@ -2508,6 +2582,26 @@ impl RegistryActor {
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
     }
+    async fn confirm_setup_retired_stopped(
+        &self,
+        workspace: String,
+        id: String,
+        name: String,
+        generation: String,
+    ) -> Result<bool, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::ConfirmSetupRetiredStopped {
+                workspace,
+                id,
+                name,
+                generation,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
     async fn complete_setup_workspace(&self, workspace: String) -> Result<SetupDoneResult, Error> {
         let (reply, wait) = async_engine::oneshot_channel();
         self.sender
@@ -2731,6 +2825,45 @@ async fn registry_actor(
                             transaction.commit()?;
                         }
                         Ok(removed)
+                    })();
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
+            DbCommand::ConfirmSetupRetiredStopped {
+                workspace,
+                id,
+                name,
+                generation,
+                reply,
+            } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = (|| {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
+                            .as_secs_f64();
+                        let mut transaction = registry.begin_immediate()?;
+                        let recorded = transaction.confirm_setup_retired_container_stopped(
+                            &workspace,
+                            &id,
+                            &name,
+                            &generation,
+                            now,
+                        )?;
+                        if recorded {
+                            transaction.commit()?;
+                        }
+                        Ok(recorded)
                     })();
                     (registry, result)
                 });
@@ -3251,7 +3384,7 @@ const SETUP_GC_ENGINE_OUTPUT: usize = 16 * 1024;
 async fn inspect_setup_gc_container(
     engine: &DockerEngine,
     candidate: &bosn_registry::SetupGcCandidate,
-) -> Result<Option<()>, Error> {
+) -> Result<Option<bool>, Error> {
     let format = "{{.Name}}\t{{.State.Running}}\t{{index .Config.Labels \"com.zackees.bosn.setup-managed\"}}\t{{index .Config.Labels \"com.zackees.bosn.setup-content-sha256\"}}\t{{index .Config.Labels \"com.zackees.bosn.setup-container\"}}";
     let result = engine
         .with_args(["container", "inspect", "--format", format, &candidate.name])
@@ -3276,14 +3409,18 @@ async fn inspect_setup_gc_container(
         .ok_or(Error::Protocol("setup gc candidate identity invalid"))?;
     if fields.len() != 5
         || fields[0] != format!("/{}", candidate.name)
-        || fields[1] != "false"
         || fields[2] != "v1"
         || fields[3] != content
         || fields[4] != candidate.name
     {
         return Err(Error::Protocol("setup gc container ownership mismatch"));
     }
-    Ok(Some(()))
+    let running = match fields[1] {
+        "true" => true,
+        "false" => false,
+        _ => return Err(Error::Protocol("setup gc container inspection invalid")),
+    };
+    Ok(Some(running))
 }
 
 async fn apply_setup_gc_candidate(
@@ -3297,10 +3434,8 @@ async fn apply_setup_gc_candidate(
         .await?
         .ok_or(Error::Protocol("setup gc preview is stale or protected"))?;
     let engine = DockerEngine::docker();
-    if inspect_setup_gc_container(&engine, &candidate)
-        .await?
-        .is_none()
-    {
+    let first = inspect_setup_gc_container(&engine, &candidate).await?;
+    if first.is_none() {
         let reconciled = actor
             .finalize_setup_gc(
                 workspace,
@@ -3317,12 +3452,13 @@ async fn apply_setup_gc_candidate(
             })
             .ok_or(Error::Protocol("setup gc preview became stale"));
     }
+    if first != Some(false) {
+        return Err(Error::Protocol("setup gc candidate is still running"));
+    }
     // A second ownership inspection closes the only practical inspect/remove
     // interval without ever using a name glob or Docker selector.
-    if inspect_setup_gc_container(&engine, &candidate)
-        .await?
-        .is_none()
-    {
+    let second = inspect_setup_gc_container(&engine, &candidate).await?;
+    if second.is_none() {
         let reconciled = actor
             .finalize_setup_gc(
                 workspace,
@@ -3338,6 +3474,9 @@ async fn apply_setup_gc_candidate(
                 reconciled_missing: true,
             })
             .ok_or(Error::Protocol("setup gc preview became stale"));
+    }
+    if second != Some(false) {
+        return Err(Error::Protocol("setup gc candidate is still running"));
     }
     let removed = engine
         .with_args(["container", "rm", &candidate.name])
@@ -3367,6 +3506,72 @@ async fn apply_setup_gc_candidate(
         .ok_or(Error::Protocol(
             "setup gc registry finalization failed after container removal",
         ))
+}
+
+/// Stop a live retired candidate with no caller-controlled Docker input. A
+/// subsequent fixed inspection proves it transitioned to stopped before the
+/// actor records the event. The registry record is intentionally retained.
+async fn stop_setup_retired_candidate(
+    actor: &RegistryActor,
+    workspace: String,
+    token: String,
+) -> Result<SetupRetiredStopResult, Error> {
+    let (id, name, generation) = parse_setup_gc_token(&token)?;
+    let candidate = actor
+        .setup_gc_candidate(workspace.clone(), id, name, generation)
+        .await?
+        .ok_or(Error::Protocol(
+            "setup retired stop preview is stale or protected",
+        ))?;
+    let engine = DockerEngine::docker();
+    match inspect_setup_gc_container(&engine, &candidate).await? {
+        None => return Err(Error::Protocol("setup retired stop candidate is absent")),
+        Some(false) => {
+            // Already stopped is idempotent. Do not add duplicate events and
+            // keep the exact retired candidate eligible for explicit GC.
+            return Ok(SetupRetiredStopResult {
+                stopped: false,
+                already_stopped: true,
+            });
+        }
+        Some(true) => {}
+    }
+    // Recheck the exact identity after registry selection, then make the one
+    // permitted engine mutation. The short grace is product-fixed and stays
+    // inside the absolute engine deadline; no caller-controlled argv or
+    // timeout reaches this boundary.
+    if inspect_setup_gc_container(&engine, &candidate).await? != Some(true) {
+        return Err(Error::Protocol("setup retired stop candidate changed"));
+    }
+    let stopped = engine
+        .with_args(["container", "stop", "--time", "1", &candidate.name])
+        .capture_async(RunOptions::bounded(
+            SETUP_GC_ENGINE_DEADLINE,
+            SETUP_GC_ENGINE_OUTPUT,
+        ))
+        .await
+        .map_err(|_| Error::Protocol("setup retired stop failed"))?;
+    if !stopped.ok() {
+        return Err(Error::Protocol("setup retired stop failed"));
+    }
+    if inspect_setup_gc_container(&engine, &candidate).await? != Some(false) {
+        return Err(Error::Protocol("setup retired stop did not stop candidate"));
+    }
+    let recorded = actor
+        .confirm_setup_retired_stopped(
+            workspace,
+            candidate.id,
+            candidate.name,
+            candidate.generation,
+        )
+        .await?;
+    if !recorded {
+        return Err(Error::Protocol("setup retired stop registry became stale"));
+    }
+    Ok(SetupRetiredStopResult {
+        stopped: true,
+        already_stopped: false,
+    })
 }
 
 async fn handle(
@@ -3782,6 +3987,28 @@ async fn handle(
                     ..Default::default()
                 },
             },
+            18 => match validate_setup_retired_stop_request_wire(&r) {
+                Ok(()) => {
+                    match stop_setup_retired_candidate(&actor, r.workspace, r.gc_candidate_token)
+                        .await
+                    {
+                        Ok(result) => ReplyWire {
+                            code: 150,
+                            setup_retired_stopped: result.stopped,
+                            setup_retired_already_stopped: result.already_stopped,
+                            ..Default::default()
+                        },
+                        Err(_) => ReplyWire {
+                            code: 3,
+                            ..Default::default()
+                        },
+                    }
+                }
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
             _ => ReplyWire {
                 code: 2,
                 ..Default::default()
@@ -4108,6 +4335,10 @@ struct ReplyWire {
     setup_done_resources: u64,
     #[prost(bool, tag = "34")]
     setup_adopted: bool,
+    #[prost(bool, tag = "35")]
+    setup_retired_stopped: bool,
+    #[prost(bool, tag = "36")]
+    setup_retired_already_stopped: bool,
 }
 #[derive(Message)]
 struct LogRecordWire {
@@ -4245,6 +4476,7 @@ enum Reply {
     SetupEnsureEvents(SetupEnsureEventPage),
     SetupGcPreview(SetupGcPreviewPage),
     SetupGcApply(SetupGcApplyResult),
+    SetupRetiredStop(SetupRetiredStopResult),
     SetupDone(SetupDoneResult),
     SetupAdopt(SetupAdoptResult),
     Doctor(DoctorReport),
@@ -4320,6 +4552,10 @@ fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
         140 => Ok(Reply::SetupAdopt(SetupAdoptResult {
             adopted: v.setup_adopted,
         })),
+        150 => Ok(Reply::SetupRetiredStop(SetupRetiredStopResult {
+            stopped: v.setup_retired_stopped,
+            already_stopped: v.setup_retired_already_stopped,
+        })),
         1 => Err(Error::Protocol("unsupported protocol")),
         2 => Err(Error::Protocol("unknown operation")),
         _ => Err(Error::Protocol("daemon error")),
@@ -4377,6 +4613,39 @@ mod tests {
         );
         assert!(parse_setup_gc_token(&(token + "00")).is_err());
         assert!(validate_setup_gc_apply_input("/work", "sgc1-00", false).is_err());
+    }
+
+    #[test]
+    fn retired_stop_wire_requires_only_preview_identity_and_confirmation() {
+        let request = || {
+            Request {
+            workspace: "/workspace".into(),
+            gc_candidate_token: "sgc1-73657475702d636f6e7461696e65723a6100626f736e2d73657475702d61007368613235363a6100".into(),
+            gc_confirm: true,
+            ..Request::operation(18)
+        }
+        };
+        assert!(validate_setup_retired_stop_request_wire(&request()).is_ok());
+        for invalid in [
+            Request {
+                gc_confirm: false,
+                ..request()
+            },
+            Request {
+                setup_deadline_ms: 1,
+                ..request()
+            },
+            Request {
+                setup_config: "docker://bad".into(),
+                ..request()
+            },
+            Request {
+                diagnostic_limit: 1,
+                ..request()
+            },
+        ] {
+            assert!(validate_setup_retired_stop_request_wire(&invalid).is_err());
+        }
     }
 
     #[test]
@@ -5657,6 +5926,77 @@ mod tests {
         {
             assert_eq!(image_use.state, ResourceState::Active);
         }
+    }
+
+    #[test]
+    fn retired_stop_registry_confirmation_preserves_candidate_and_rejects_stale_state() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let mut registry = Registry::create_writer(
+            temporary.path().join("registry.sqlite3"),
+            "11111111-2222-4333-8444-555555555555",
+        )
+        .unwrap();
+        let workspace = "/canonical/retired-stop";
+        record_setup_ensure(
+            &mut registry,
+            1,
+            &setup_ensure_execution(workspace, "old", "sha256:image"),
+        )
+        .unwrap();
+        record_setup_ensure(
+            &mut registry,
+            2,
+            &setup_ensure_execution(workspace, "new", "sha256:image"),
+        )
+        .unwrap();
+        let candidate = registry
+            .setup_gc_candidate(
+                workspace,
+                "setup-container:old",
+                "bosn-setup-old",
+                "sha256:old",
+            )
+            .unwrap()
+            .expect("retired candidate");
+        let mut tx = registry.begin_immediate().unwrap();
+        assert!(
+            tx.confirm_setup_retired_container_stopped(
+                workspace,
+                &candidate.id,
+                &candidate.name,
+                &candidate.generation,
+                3.0,
+            )
+            .unwrap()
+        );
+        tx.commit().unwrap();
+        assert!(
+            registry
+                .setup_gc_candidate(
+                    workspace,
+                    &candidate.id,
+                    &candidate.name,
+                    &candidate.generation,
+                )
+                .unwrap()
+                .is_some()
+        );
+        // A stale identity is a no-write failure, not permission to append an
+        // event after a resource/use/lease/session protection race.
+        let events_before = registry.events(0, 16).unwrap().items.len();
+        let mut tx = registry.begin_immediate().unwrap();
+        assert!(
+            !tx.confirm_setup_retired_container_stopped(
+                workspace,
+                "setup-container:other",
+                &candidate.name,
+                &candidate.generation,
+                4.0,
+            )
+            .unwrap()
+        );
+        drop(tx);
+        assert_eq!(registry.events(0, 16).unwrap().items.len(), events_before);
     }
 
     #[test]
