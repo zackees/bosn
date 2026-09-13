@@ -65,6 +65,19 @@ The primitive is submitted through typed daemon IPC and the bounded native,
 Python, and MCP job-submission surfaces. It deliberately still has no registry
 persistence, container lifecycle, or setup-ensure wiring.
 
+### Setup-app ensure core primitive
+
+`bosn-setup::ensure_setup_app` is the next deliberately narrow core primitive
+for one-file Docker Linux apps. It derives a deterministic managed container
+name and ownership labels solely from the validated setup-plan content hash,
+then performs only inspect, create-if-absent, and start-if-stopped through the
+finite `SetupEnsureCommand` protocol. Create receives only the validated
+document's image receipt, mounts, environment, workdir, and optional declared
+`app.command` (as `sh -lc`). An existing candidate must exactly prove the
+expected image and Bosn labels or is refused before mutation. This is not yet
+daemon/CLI/Python/MCP exposed or registry-backed, and it never deletes,
+replaces, stops, adopts, or garbage-collects a container.
+
 ## Current surface and characterization references
 
 ### Main CLI (`bosn`)

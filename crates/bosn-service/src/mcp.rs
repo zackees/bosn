@@ -875,6 +875,7 @@ mod tests {
                     ),
                     environment: Default::default(),
                     workdir: None,
+                    command: None,
                     mounts: Vec::new(),
                 },
                 tasks: [(

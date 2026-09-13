@@ -472,6 +472,7 @@ mod tests {
                 source: bosn_core::SetupSource::PinnedImage(image.into()),
                 environment: Default::default(),
                 workdir: None,
+                command: None,
                 mounts: Vec::new(),
             },
             tasks: Default::default(),

@@ -42,6 +42,13 @@ pub use prepare::{
     prepare_setup_image,
 };
 
+mod ensure;
+pub use ensure::{
+    SetupEnsureCommand, SetupEnsureEngine, SetupEnsureError, SetupEnsureMount,
+    SetupEnsureObservedContainer, SetupEnsureRequest, SetupEnsureResponse, SetupEnsureResult,
+    ensure_setup_app,
+};
+
 mod task;
 pub use task::{
     SetupTaskCommand, SetupTaskEngine, SetupTaskError, SetupTaskMount, SetupTaskRequest,
