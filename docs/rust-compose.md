@@ -76,10 +76,24 @@ container names; entrypoint overrides; arbitrary command vectors or strings; and
 covered by a bind mount. Those features need a later daemon-owned multi-service/lifecycle model;
 they must never be smuggled through this adapter as raw Compose YAML or Docker arguments.
 
-There is intentionally no CLI, Python, or MCP translation front door in this increment. The
-existing `compose plan` interfaces remain read-only parser/planner review tools, not an apply
-path. Rust callers may use `parse_and_translate_compose_yaml(source)` only when they explicitly
-need this pure typed adapter.
+## Setup-source acquisition
+
+The existing typed setup lifecycle can acquire this lossless subset without introducing a raw
+Compose execution path. A selected local path or HTTPS URL ending in `.yaml` or `.yml` (case
+insensitive, before an HTTPS query string) is parsed exactly once through
+`parse_and_translate_compose_yaml`, and only the resulting `SetupDocument` reaches the existing
+setup cache, plan, image-preparation, ensure, or task flows. The original YAML bytes remain the
+content-hash/cache receipt; the translated typed document remains the only downstream input.
+
+All other locator names, including extensionless legacy paths, remain TOML-only. Bosn does not
+probe YAML and then TOML, or vice versa. Consequently a TOML body at a `.yaml` URL and a Compose
+body at a `.toml` URL both fail closed. Offline mode revalidates the same source syntax from the
+locator bound into its cache key, and never contacts the source or falls back to another cached
+format. The existing one MiB document limit applies before either parser runs.
+
+This makes `bosn setup plan`, the matching Python `Client.plan_setup`, and MCP setup tools accurate
+for the narrow supported one-service YAML shape. It does not make `bosn compose plan` an apply
+path, and it does not permit a multi-service Compose file to enter setup/engine execution.
 
 ## Read-only front doors
 

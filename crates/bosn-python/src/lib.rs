@@ -247,7 +247,8 @@ impl Client {
     /// Create an inert, validated setup plan using an explicit acquisition policy.
     ///
     /// `policy` must be either ``"online_refresh"`` (read and validate the
-    /// local file or HTTPS document, then update Bosn's private cache) or
+    /// local TOML file, supported Compose YAML file (`.yaml`/`.yml`), or HTTPS
+    /// document, then update Bosn's private cache) or
     /// ``"offline_cache_only"`` (reuse only an existing verified cache
     /// record).  Planning may create private cache/generated-asset state under
     /// this client's ``state_dir``, but it never writes ``workspace``, invokes
