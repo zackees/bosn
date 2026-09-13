@@ -155,6 +155,7 @@ VERBS: dict[str, tuple[str, str]] = {
     "doctor": ("engine health and reachability", "implemented"),
     "daemon-stop": ("stop the running daemon (needed after upgrades)", "implemented"),
     "init": ("translate a Compose file into bosn.toml (alias: bosn-docker init)", "implemented"),
+    "mcp": ("serve the native Bosn MCP server over stdio", "implemented"),
 }
 
 
@@ -542,6 +543,30 @@ def _report_foreign_registries(scan, opts: Options) -> None:
         f"bosn{state} adopt --from-registry <id>",
         file=sys.stderr,
     )
+
+
+def cmd_mcp(opts: Options) -> int:
+    """Run the packaged Rust MCP server without putting launcher output on stdout."""
+    if opts.json:
+        print("`bosn mcp` already speaks JSON-RPC on stdout; do not pass --json", file=sys.stderr)
+        return 2
+    try:
+        from bosn._native import run_mcp
+    except (ImportError, ModuleNotFoundError):
+        print(
+            "the installed bosn native extension does not provide MCP support; "
+            "install a current Bosn wheel",
+            file=sys.stderr,
+        )
+        return 1
+    from bosn.registry import default_state_dir
+
+    try:
+        run_mcp(str(opts.state_dir or default_state_dir()))
+    except RuntimeError as exc:
+        print(f"bosn mcp: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def cmd_daemon(opts: Options) -> int:
@@ -1864,10 +1889,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "reconcile-volume": cmd_reconcile_volume,
         "release-volume": cmd_release_volume,
         "init": cmd_init,
+        "mcp": cmd_mcp,
     }
     handler = handlers.get(opts.verb)
     if handler is not None:
-        if opts.json and opts.verb not in {"tasks", "gc", "adopt", "init"}:
+        if opts.json and opts.verb not in {"tasks", "gc", "adopt", "init", "mcp"}:
             # Older human-oriented verbs already return useful exit codes and write
             # diagnostics to stderr.  Adapt that boundary once so JSON callers never
             # need to parse prose while those commands are migrated individually.

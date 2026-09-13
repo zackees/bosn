@@ -89,12 +89,23 @@ fn status(state_dir: &Path) -> Result<ServiceStatus, bosn_service::Error> {
     runtime.run(async { ServiceClient::for_state(state_dir)?.status().await })
 }
 
+/// Run the native JSON-RPC MCP server on the caller's stdio streams.
+///
+/// The Python CLI uses this only as a packaged launcher. The protocol loop,
+/// daemon client, and all lifecycle authority remain in Rust.
+#[pyfunction]
+fn run_mcp(state_dir: PathBuf, py: Python<'_>) -> PyResult<()> {
+    py.detach(move || bosn_service::mcp::serve_stdio(state_dir).map_err(|error| error.to_string()))
+        .map_err(PyRuntimeError::new_err)
+}
+
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Client>()?;
     module.add_class::<Status>()?;
     module.add_function(wrap_pyfunction!(native_version, module)?)?;
     module.add_function(wrap_pyfunction!(protocol_version, module)?)?;
+    module.add_function(wrap_pyfunction!(run_mcp, module)?)?;
     Ok(())
 }
 

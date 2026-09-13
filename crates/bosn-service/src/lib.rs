@@ -15,6 +15,7 @@ use std::{
     time::Duration,
 };
 pub mod jobs;
+pub mod mcp;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 const PAYLOAD_PROTOCOL: u32 = 0x4253_4e01;
