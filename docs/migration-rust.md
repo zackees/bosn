@@ -70,6 +70,24 @@ replacement catalog says otherwise.  It must not infer support from Docker's bro
 | Git completion | derive finished workspaces from Git state conservatively | `src/bosn/gitstate.py`, `tests/test_gitstate.py` |
 | Integration consumer | Soldr manifest/workflow guidance | `docs/soldr-integration.md`, `examples/soldr.toml`, `tests/test_shims.py` |
 
+## Downstream migration inventory (read-only discovery, 2026-09-13)
+
+These are identified consumers, not completed consumer migrations. Sibling
+checkouts were inspected without modification; implementation stays in this
+repository until a reviewed downstream change is ready.
+
+| Consumer | Verified integration | Required release proof |
+| --- | --- | --- |
+| Soldr (`942f4acf`) | `bosn.toml` declares cook/seed/warm stacks, shared cache volumes, workspace mounts and tasks; `ci/bosn_workspace_test.py` handles bootstrap-to-source handoff | Load/migrate the real manifest, preserve cache scopes and readonly mounts, execute the workspace task; retain `tests/test_perf_local.py` handoff/cleanup tests |
+| clud (`bce6aee2`) | `bosn.toml`, `bosn/Dockerfile`, bundled `clud-bosn` and `clud-preloop` skills, `crates/clud-bin/src/skills_tests.rs` | Update install/command examples and support/refusal claims, preserve manifest tasks and volume scopes, run bundled-skill tests and a representative task |
+| kernal-api (`fcfc2ed`) | `bosn.toml` and `docker/bosn.Dockerfile` | Migrate manifest and prove its declared task through the installed Rust CLI |
+| Hermes | New consumer, not an existing Bosn integration found in the inspected checkout | Pin client version; prove MCP initialization, tool discovery, setup, run, logs and cancellation |
+
+The clud skill currently describes an older Compose subset and rejects `up -d`,
+unlike the current Bosn implementation; migrate from the source-tested catalog
+above rather than preserving those stale claims. This targeted inventory is not
+a claim to have found every external user or to have validated downstream tasks.
+
 ## Python v4 registry contract
 
 The registry is file-backed system/resource state, not a crawler index.  It opens WAL,
@@ -147,6 +165,19 @@ tags listing was empty; `soldr cargo info kernal-api` also found no crates.io pa
 exact published kernal-api dependency remains a Phase 1 release gate, not an assumed version.
 Bosn must not directly depend on kernel private backend crates.
 
+The SQLite prerequisite subsequently landed in
+[kernal-api PR #192](https://github.com/zackees/kernal-api/pull/192), merge
+`10e558a9f2eb51c2989c89d05b13cf7636bd374e`. Its opt-in facade supplies
+WAL/read-only connections, bounded prepared-query results, immediate transactions,
+integrity/checkpoint and non-overwriting consistent backup through private bundled
+SQLite. Thirteen SQLite tests, the facade-policy test, targeted Clippy and two
+dependency-boundary unit tests passed locally after integration with upstream.
+This is source readiness, not evidence of a published crate or native Windows/macOS
+validation; those Phase 1/platform gates remain open.
+`soldr cargo package --locked --features sqlite` also passed verification of the
+extracted registry package at that merge (47.55 seconds on this host). This checks
+the packaged SQLite feature graph, not every optional kernel feature or publication.
+
 | Concern | Owner | Required migration rule |
 | --- | --- | --- |
 | SQLite connection/transactions/read-only/WAL/busy/integrity backup | kernal-api facade (new opt-in capability) | Bosn owns SQL/schema/migration/import policy; facade owns backend dependency and lifecycle primitives |
@@ -171,6 +202,16 @@ tests as authoritative until README is corrected in a separately reviewed docume
 `uv run pytest -q -m 'not docker'` at the Python baseline completed with **1219
 passed, 9 skipped, 37 deselected** in 125.30 seconds. The new portable-fixture test
 passes separately. No Python production behavior changes in this milestone.
+
+The broader baseline `uv run pytest -q -m docker` completed with **36 passed,
+1 failed** in 1135.75 seconds on this host. The failing test is
+`tests/test_compose_e2e_docker.py::test_compose_lifecycle_through_the_real_front_door`:
+the Compose `run web echo ...` step returned 1 after reporting that the existing
+volume did not match the configuration and attempting to recreate a network with
+active endpoints. The current overlay stamps `created` with the current time on
+every invocation (`src/bosn/docker_cli.py`); label stability across repeated Compose
+verbs needs explicit characterization during the Rust port. This is an observed
+Python-baseline failure, not a passed migration gate or a proven root-cause claim.
 
 Run `uv run python ci/migration_baseline.py --docker --samples 7` to repeat the
 measurements. The runner creates an isolated state directory, starts/stops its own
