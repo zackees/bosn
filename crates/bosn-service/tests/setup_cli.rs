@@ -208,3 +208,70 @@ fn prepare_rejects_malformed_or_ambiguous_inputs_before_state_or_daemon_contact(
         assert!(!state.exists(), "{name}");
     }
 }
+
+#[test]
+fn job_commands_reject_malformed_inputs_before_state_or_daemon_contact() {
+    let root = tempfile::tempdir().unwrap();
+    for (name, command, extra) in [
+        ("zero-id", "status", vec!["--job-id", "0"]),
+        ("missing-id", "cancel", vec![]),
+        ("zero-limit", "logs", vec!["--job-id", "1", "--limit", "0"]),
+        (
+            "oversize-limit",
+            "logs",
+            vec!["--job-id", "1", "--limit", "257"],
+        ),
+        (
+            "duplicate-after",
+            "logs",
+            vec!["--job-id", "1", "--after", "0", "--after", "1"],
+        ),
+    ] {
+        let state = root.path().join(name);
+        let mut args: Vec<&std::ffi::OsStr> = vec![
+            "job".as_ref(),
+            command.as_ref(),
+            "--state-dir".as_ref(),
+            state.as_os_str(),
+        ];
+        args.extend(extra.into_iter().map(std::ffi::OsStr::new));
+        let output = run(&args);
+        assert_eq!(output.status.code(), Some(2), "{name}");
+        assert!(output.stdout.is_empty(), "{name}");
+        assert!(!state.exists(), "{name}");
+    }
+
+    let output = run(&[
+        "job".as_ref(),
+        "status".as_ref(),
+        "--state-dir".as_ref(),
+        "".as_ref(),
+        "--job-id".as_ref(),
+        "1".as_ref(),
+    ]);
+    assert_eq!(output.status.code(), Some(2), "empty-state");
+    assert!(output.stdout.is_empty(), "empty-state");
+}
+
+#[test]
+fn job_json_failures_have_a_stable_redacted_shape() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("no-daemon-state");
+    let output = run(&[
+        "job".as_ref(),
+        "status".as_ref(),
+        "--state-dir".as_ref(),
+        state.as_os_str(),
+        "--job-id".as_ref(),
+        "1".as_ref(),
+        "--json".as_ref(),
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    assert!(!state.exists());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({"action": "job_status", "error": "request failed"})
+    );
+}
