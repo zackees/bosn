@@ -468,6 +468,13 @@ mod tests {
             workspace_root: PathBuf::from("/unused"),
             asset_root: None,
             task_names: Vec::new(),
+            app: bosn_core::SetupApp {
+                source: bosn_core::SetupSource::PinnedImage(image.into()),
+                environment: Default::default(),
+                workdir: None,
+                mounts: Vec::new(),
+            },
+            tasks: Default::default(),
             app_source: SetupPlanAppSource::PinnedImage {
                 image: image.into(),
             },
@@ -506,6 +513,8 @@ mod tests {
                 workspace_root: materialized.workspace_root().to_path_buf(),
                 asset_root: Some(root.clone()),
                 task_names: Vec::new(),
+                app: materialized.app().clone(),
+                tasks: materialized.tasks().clone(),
                 app_source: SetupPlanAppSource::InlineDockerfile {
                     dockerfile_path: root.join("Dockerfile"),
                 },

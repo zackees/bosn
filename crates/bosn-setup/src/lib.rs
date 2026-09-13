@@ -42,6 +42,12 @@ pub use prepare::{
     prepare_setup_image,
 };
 
+mod task;
+pub use task::{
+    SetupTaskCommand, SetupTaskEngine, SetupTaskError, SetupTaskMount, SetupTaskRequest,
+    SetupTaskResult, execute_setup_task,
+};
+
 /// The current durable cache-record wire version.  It is intentionally
 /// independent of the setup-document schema version.
 pub const CACHE_RECORD_VERSION: u16 = 1;
