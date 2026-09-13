@@ -16,7 +16,7 @@ use std::{
 use bosn_core::{ResourceKind, ResourceState};
 use bosn_engine::{CommandResult, DockerEngine, RunOptions};
 use bosn_registry::Registry;
-use bosn_service::{Client, SetupEnsureJobRequest, SetupPreparePolicy};
+use bosn_service::{Client, SetupAdoptRequest, SetupEnsureJobRequest, SetupPreparePolicy};
 use bosn_setup::{SetupAcquirePolicy, SetupPlanRequest, plan_setup};
 use kernal_api::{async_engine::RuntimeBuilder, hash::sha256_bytes};
 use support::tls_setup_server::{TlsSetupServer, certificate_path};
@@ -427,6 +427,160 @@ fn live_docker_setup_ensure_creates_and_reuses_one_managed_app() {
             .expect("inspect exact container after cleanup")
             .is_none(),
         "exact live-test container remained after cleanup"
+    );
+}
+
+/// Run with:
+/// `soldr cargo test -j1 -p bosn-service --test setup_ensure_docker --locked -- --ignored --exact live_docker_setup_adopt_restores_lost_registry_without_touching_app`
+///
+/// This intentionally deletes only the disposable test registry after its
+/// daemon is cleanly stopped. It preserves the private setup cache and proves
+/// adoption is a registry restoration, not Docker lifecycle control.
+#[test]
+#[ignore = "requires a local Docker daemon and the pinned Alpine image"]
+fn live_docker_setup_adopt_restores_lost_registry_without_touching_app() {
+    let engine = DockerEngine::docker();
+    let expected_image = pinned_alpine_identity(&engine);
+    let root = tempfile::tempdir().expect("temporary test root");
+    let state = root.path().join("state");
+    let workspace = root.path().join("workspace");
+    let config_root = root.path().join("config");
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    std::fs::create_dir_all(&config_root).expect("create config directory");
+    let config = config_root.join("setup.toml");
+    let unique = test_unique_suffix();
+    std::fs::write(
+        &config,
+        format!(
+            "version = 1\n[app]\nimage = '{PINNED_ALPINE}'\ncommand = 'exec sleep 120 # bosn-adopt-{unique}'\n"
+        ),
+    )
+    .expect("write setup document");
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let plan = runtime
+        .run(plan_setup(SetupPlanRequest {
+            state_dir: state.clone(),
+            workspace: workspace.clone(),
+            locator: config.to_string_lossy().into_owned(),
+            policy: SetupAcquirePolicy::OnlineRefresh,
+        }))
+        .expect("plan setup");
+    let container_name = format!("bosn-setup-{}", plan.content_sha256);
+    assert!(
+        inspect_container(&engine, &container_name)
+            .unwrap()
+            .is_none(),
+        "refuse colliding test name"
+    );
+    let cleanup = ExactContainerCleanup {
+        engine: engine.clone(),
+        container_name: container_name.clone(),
+        content_sha256: plan.content_sha256.clone(),
+    };
+    let ensure = SetupEnsureJobRequest {
+        workspace: workspace.clone(),
+        config: config.to_string_lossy().into_owned(),
+        policy: SetupPreparePolicy::Refresh,
+        deadline: JOB_DEADLINE,
+        output_limit: OUTPUT_LIMIT,
+    };
+    let mut first_daemon = DaemonChild::start(&state);
+    let first_client = wait_for_client(&runtime, &mut first_daemon, &state);
+    let job = runtime
+        .run(first_client.submit_setup_ensure(ensure))
+        .expect("submit ensure");
+    wait_for_success(&runtime, &first_client, job);
+    let before = inspect_container(&engine, &container_name)
+        .unwrap()
+        .expect("managed app exists");
+    assert!(before.running);
+    assert_eq!(before.image, expected_image);
+    assert_eq!(before.managed, "v1");
+    assert_eq!(before.content_sha256, plan.content_sha256);
+    assert_eq!(before.container_name, container_name);
+    runtime
+        .run(first_client.shutdown())
+        .expect("shutdown first daemon");
+    assert!(first_daemon.wait_for_exit().success());
+    // Only this temporary registry is removed. No Docker command runs in this
+    // transition and the private cache remains for the subsequent refresh.
+    let registry_path = state.join("registry.sqlite3");
+    assert!(
+        registry_path.is_file(),
+        "first daemon did not create test registry"
+    );
+    std::fs::remove_file(&registry_path).expect("remove only temporary registry");
+    for suffix in ["-wal", "-shm"] {
+        let path = state.join(format!("registry.sqlite3{suffix}"));
+        if path.exists() {
+            std::fs::remove_file(path).expect("remove only temporary sqlite sidecar");
+        }
+    }
+    assert!(
+        inspect_container(&engine, &container_name)
+            .unwrap()
+            .is_some(),
+        "registry loss touched Docker container"
+    );
+    let mut second_daemon = DaemonChild::start(&state);
+    let second_client = wait_for_client(&runtime, &mut second_daemon, &state);
+    let adopted = runtime
+        .run(second_client.setup_adopt(SetupAdoptRequest {
+            workspace: workspace.clone(),
+            config: config.to_string_lossy().into_owned(),
+            policy: SetupPreparePolicy::Refresh,
+            deadline: JOB_DEADLINE,
+            output_limit: OUTPUT_LIMIT,
+            confirm: true,
+        }))
+        .expect("public client adoption");
+    assert!(adopted.adopted);
+    let after = inspect_container(&engine, &container_name)
+        .unwrap()
+        .expect("adopted app exists");
+    assert!(after.running);
+    assert_eq!(after.id, before.id, "adoption replaced the container");
+    assert_eq!(after.image, before.image);
+    runtime
+        .run(second_client.shutdown())
+        .expect("shutdown second daemon");
+    assert!(second_daemon.wait_for_exit().success());
+    let registry = Registry::open_read_only(&registry_path).expect("open restored registry");
+    let resources = registry
+        .resources(0, 16)
+        .expect("read restored resources")
+        .items;
+    assert!(resources.iter().any(|r| r.kind == ResourceKind::Container
+        && r.name == container_name
+        && r.state == ResourceState::Active));
+    assert!(
+        resources
+            .iter()
+            .any(|r| r.kind == ResourceKind::Image && r.generation == expected_image)
+    );
+    let uses = registry
+        .resource_uses(0, 16)
+        .expect("read restored uses")
+        .items;
+    assert_eq!(uses.len(), 2, "container and image uses restored");
+    assert!(
+        registry
+            .setup_ensure_events(0, 16)
+            .expect("read events")
+            .items
+            .iter()
+            .any(|event| event.kind == "setup.ensure.adopted")
+    );
+    drop(cleanup);
+    assert!(
+        inspect_container(&engine, &container_name)
+            .unwrap()
+            .is_none(),
+        "exact test container remained after cleanup"
     );
 }
 

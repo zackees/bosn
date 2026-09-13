@@ -1345,6 +1345,25 @@ impl Registry {
             resource,
         )
     }
+    /// Return one exact logical resource identity. This deliberately does not
+    /// accept a selector or wildcard and is used by daemon-owned adoption to
+    /// refuse incompatible pre-existing ownership before any write.
+    pub fn resource_by_kind_name(
+        &self,
+        kind: ResourceKind,
+        name: &str,
+    ) -> Result<Option<Resource>, Error> {
+        let rows = self.connection.query(
+            "SELECT id,kind,name,stack,generation,scope,workspace,created_at,last_used,state,retention FROM resources WHERE kind=? AND name=?",
+            &[Value::Text(kind.as_str().into()), Value::Text(name.into())],
+            QueryLimits { max_rows: 2, max_bytes: 8192 },
+        )?;
+        match rows.as_slice() {
+            [] => Ok(None),
+            [row] => Ok(Some(resource(row)?)),
+            _ => Err(Error::BadRow("duplicate resource identity")),
+        }
+    }
     /// Preview only retired, Bosn-managed setup containers for one exact
     /// workspace. This makes no SQLite writes and never contacts an engine.
     pub fn setup_gc_preview(

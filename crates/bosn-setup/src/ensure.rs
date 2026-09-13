@@ -390,6 +390,68 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
     })
 }
 
+/// Inspect and prove ownership of the deterministic setup app without changing
+/// Docker. This is the sole primitive used to restore a lost local registry:
+/// it derives the candidate name, labels, and image identity from the validated
+/// plan and prepared image, then refuses any uncertainty. In particular it
+/// never creates, starts, stops, removes, pulls, or replaces a container.
+pub async fn adopt_setup_app<E: SetupEnsureEngine>(
+    engine: &E,
+    request: SetupEnsureRequest<'_>,
+) -> Result<SetupEnsureResult, SetupEnsureError> {
+    let derived = derive_command(&request)?;
+    if request.cancellation.is_cancelled() {
+        return Err(SetupEnsureError::Cancelled);
+    }
+    if request.options.deadline.is_zero() {
+        return Err(SetupEnsureError::Deadline);
+    }
+    if request.options.output_limit == 0 {
+        return Err(SetupEnsureError::InvalidRequest("output budget is zero"));
+    }
+    let deadline = Deadline::after(request.options.deadline);
+    let mut remaining_output = request.options.output_limit;
+    let inspection = invoke(
+        engine,
+        SetupEnsureCommand::Inspect {
+            container_name: derived.container_name.clone(),
+        },
+        &deadline,
+        &mut remaining_output,
+        &request,
+    )
+    .await?;
+    let SetupEnsureResponse::Inspection(observed, result) = inspection else {
+        return Err(SetupEnsureError::EngineProtocol(
+            "inspection returned a mutation response",
+        ));
+    };
+    consume_output(&result, &mut remaining_output, request.options.output_limit)?;
+    let observed = match observed {
+        Some(observed) if result.ok() => observed,
+        Some(_) => {
+            return Err(SetupEnsureError::EngineProtocol(
+                "present inspection has a nonzero result",
+            ));
+        }
+        None if result.exit_code == 1 => return Err(SetupEnsureError::OwnershipMismatch),
+        None if result.ok() => {
+            return Err(SetupEnsureError::EngineProtocol(
+                "absent inspection has a successful result",
+            ));
+        }
+        None => return Err(action_failed("container inspect", &result)),
+    };
+    validate_observed(&observed, &derived)?;
+    Ok(SetupEnsureResult {
+        container_name: derived.container_name,
+        container_id: observed.container_id,
+        image_identity: derived.image_identity,
+        created: false,
+        started: false,
+    })
+}
+
 async fn invoke<E: SetupEnsureEngine>(
     engine: &E,
     command: SetupEnsureCommand,
@@ -1066,6 +1128,106 @@ mod tests {
                 events: &events,
             },
         ))
+    }
+    fn run_adopt(
+        engine: &FakeEngine,
+        plan: &SetupPlan,
+        workspace: &Path,
+        image: &PreparedImage,
+        cancellation: &CancellationToken,
+        options: RunOptions,
+    ) -> Result<SetupEnsureResult, SetupEnsureError> {
+        let (events, _receiver) = channel(8);
+        runtime().run(adopt_setup_app(
+            engine,
+            SetupEnsureRequest {
+                plan,
+                workspace_root: workspace.into(),
+                prepared_image: image,
+                options,
+                cancellation,
+                events: &events,
+            },
+        ))
+    }
+
+    #[test]
+    fn adoption_proves_exact_running_or_stopped_candidate_without_mutation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(workspace.join("src")).unwrap();
+        let plan = plan(&workspace);
+        let image = prepared(&plan);
+        for running in [true, false] {
+            let engine = FakeEngine::with_results([inspection(&plan, running)]);
+            let source = CancellationSource::new();
+            let result = run_adopt(
+                &engine,
+                &plan,
+                &workspace,
+                &image,
+                &source.token(),
+                RunOptions::streaming(Duration::from_secs(2), 4096),
+            )
+            .unwrap();
+            assert!(!result.created && !result.started);
+            assert!(matches!(
+                engine.calls.lock().unwrap().as_slice(),
+                [SetupEnsureCommand::Inspect { .. }]
+            ));
+        }
+        let mut bad = observed(&plan, true);
+        bad.labels.insert(LABEL_MANAGED.into(), "foreign".into());
+        let engine = FakeEngine::with_results([Ok(SetupEnsureResponse::Inspection(
+            Some(bad),
+            result(0, [], []),
+        ))]);
+        let source = CancellationSource::new();
+        assert!(matches!(
+            run_adopt(
+                &engine,
+                &plan,
+                &workspace,
+                &image,
+                &source.token(),
+                RunOptions::streaming(Duration::from_secs(2), 4096)
+            ),
+            Err(SetupEnsureError::OwnershipMismatch)
+        ));
+        assert!(matches!(
+            engine.calls.lock().unwrap().as_slice(),
+            [SetupEnsureCommand::Inspect { .. }]
+        ));
+        let cancelled = FakeEngine::default();
+        let source = CancellationSource::new();
+        source.cancel();
+        assert!(matches!(
+            run_adopt(
+                &cancelled,
+                &plan,
+                &workspace,
+                &image,
+                &source.token(),
+                RunOptions::streaming(Duration::from_secs(2), 4096)
+            ),
+            Err(SetupEnsureError::Cancelled)
+        ));
+        assert!(cancelled.calls.lock().unwrap().is_empty());
+        let deadline = FakeEngine::default();
+        let source = CancellationSource::new();
+        assert!(matches!(
+            run_adopt(
+                &deadline,
+                &plan,
+                &workspace,
+                &image,
+                &source.token(),
+                RunOptions::streaming(Duration::ZERO, 4096)
+            ),
+            Err(SetupEnsureError::Deadline)
+        ));
+        assert!(deadline.calls.lock().unwrap().is_empty());
     }
 
     #[test]

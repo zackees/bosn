@@ -7,9 +7,9 @@ use bosn_core::parse_setup_config_locator;
 use bosn_service::{
     Client as ServiceClient, DoctorReport as ServiceDoctorReport, JobLogPage as ServiceJobLogPage,
     JobStatus as ServiceJobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE,
-    RegistryResourcePage as ServiceRegistryResourcePage, SetupDoneResult as ServiceSetupDoneResult,
-    SetupEnsureEventPage as ServiceSetupEnsureEventPage, SetupEnsureJobRequest,
-    SetupGcApplyResult as ServiceSetupGcApplyResult,
+    RegistryResourcePage as ServiceRegistryResourcePage, SetupAdoptRequest,
+    SetupDoneResult as ServiceSetupDoneResult, SetupEnsureEventPage as ServiceSetupEnsureEventPage,
+    SetupEnsureJobRequest, SetupGcApplyResult as ServiceSetupGcApplyResult,
     SetupGcPreviewPage as ServiceSetupGcPreviewPage, SetupPreparePolicy, SetupPrepareRequest,
     SetupTaskJobRequest, Status as ServiceStatus,
 };
@@ -321,6 +321,41 @@ impl Client {
                     output_limit: output_limit as usize,
                 },
             )
+            .map_err(service_error)
+        })
+    }
+    /// Confirmed recovery of lost local registry ownership for an existing
+    /// Bosn-managed app. The daemon derives every Docker identity itself.
+    #[pyo3(signature = (workspace, config_locator, *, policy, deadline_ms, output_limit, confirm))]
+    fn setup_adopt(
+        &self,
+        workspace: PathBuf,
+        config_locator: String,
+        policy: &str,
+        deadline_ms: u64,
+        output_limit: u32,
+        confirm: bool,
+        py: Python<'_>,
+    ) -> PyResult<bool> {
+        if !confirm {
+            return Err(PyValueError::new_err("setup_adopt requires confirm=True"));
+        }
+        let policy = parse_prepare_policy(policy)?;
+        validate_setup_prepare_input(&workspace, &config_locator, deadline_ms, output_limit)?;
+        let state = self.state_dir.clone();
+        py.detach(move || {
+            setup_adopt(
+                &state,
+                SetupAdoptRequest {
+                    workspace,
+                    config: config_locator,
+                    policy,
+                    deadline: Duration::from_millis(deadline_ms),
+                    output_limit: output_limit as usize,
+                    confirm: true,
+                },
+            )
+            .map(|v| v.adopted)
             .map_err(service_error)
         })
     }
@@ -938,6 +973,20 @@ fn setup_done(
         .build()
         .map_err(bosn_service::Error::Io)?;
     runtime.run(client.setup_done(workspace, true))
+}
+fn setup_adopt(
+    state_dir: &Path,
+    request: SetupAdoptRequest,
+) -> Result<bosn_service::SetupAdoptResult, bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async {
+        ServiceClient::for_state(state_dir)?
+            .setup_adopt(request)
+            .await
+    })
 }
 
 fn submit_setup_prepare(

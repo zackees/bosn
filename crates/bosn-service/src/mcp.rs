@@ -16,9 +16,9 @@
 
 use crate::{
     Client, DoctorReport, Error, JobLogPage, JobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE,
-    RegistryResourcePage, SetupDoneResult, SetupEnsureEventPage, SetupEnsureJobRequest,
-    SetupGcApplyResult, SetupGcPreviewPage, SetupPreparePolicy, SetupPrepareRequest,
-    SetupTaskJobRequest, Status,
+    RegistryResourcePage, SetupAdoptRequest, SetupAdoptResult, SetupDoneResult,
+    SetupEnsureEventPage, SetupEnsureJobRequest, SetupGcApplyResult, SetupGcPreviewPage,
+    SetupPreparePolicy, SetupPrepareRequest, SetupTaskJobRequest, Status,
 };
 use bosn_setup::{
     SetupAcquirePolicy, SetupPlan, SetupPlanAppSource, SetupPlanRequest, SetupSourceKind,
@@ -117,6 +117,7 @@ trait Backend {
         token: String,
     ) -> Result<SetupGcApplyResult, Error>;
     fn setup_done(&mut self, workspace: PathBuf) -> Result<SetupDoneResult, Error>;
+    fn setup_adopt(&mut self, request: SetupAdoptRequest) -> Result<SetupAdoptResult, Error>;
     fn job_status(&mut self, id: u64) -> Result<JobStatus, Error>;
     fn job_logs(&mut self, id: u64, after: u64, limit: u32) -> Result<JobLogPage, Error>;
     fn cancel_job(&mut self, id: u64) -> Result<(), Error>;
@@ -189,6 +190,9 @@ impl Backend for DaemonBackend<'_> {
     }
     fn setup_done(&mut self, workspace: PathBuf) -> Result<SetupDoneResult, Error> {
         self.runtime.run(self.client.setup_done(workspace, true))
+    }
+    fn setup_adopt(&mut self, request: SetupAdoptRequest) -> Result<SetupAdoptResult, Error> {
+        self.runtime.run(self.client.setup_adopt(request))
     }
     fn job_status(&mut self, id: u64) -> Result<JobStatus, Error> {
         self.runtime.run(self.client.job_status(id))
@@ -386,6 +390,7 @@ fn tools_list() -> Value {
                 "inputSchema": setup_done_schema(),
                 "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
             },
+            {"name":"bosn_setup_adopt","description":"STATE CHANGE: restore registry ownership only after the daemon proves an existing app has exact Bosn labels, deterministic name, and prepared image identity. Confirmation required; no Docker controls.","inputSchema":setup_adopt_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
             {
                 "name": "bosn_job_status",
                 "description": "Read the state of one native daemon job.",
@@ -539,6 +544,9 @@ fn setup_done_schema() -> Value {
         "confirm":{"const":true,"description":"Explicit state-change confirmation."}
     }})
 }
+fn setup_adopt_schema() -> Value {
+    json!({"type":"object","additionalProperties":false,"required":["workspace","config","policy","deadline_ms","output_limit","confirm"],"properties":{"workspace":{"type":"string","minLength":1,"maxLength":MAX_MCP_SETUP_STRING_BYTES},"config":{"type":"string","minLength":1,"maxLength":MAX_MCP_SETUP_STRING_BYTES},"policy":{"type":"string","enum":["refresh","offline"]},"deadline_ms":{"type":"integer","minimum":1,"maximum":300000},"output_limit":{"type":"integer","minimum":1,"maximum":8388608},"confirm":{"const":true}}})
+}
 
 fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
     let Some(params) = params.as_object() else {
@@ -611,6 +619,12 @@ fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
             backend
                 .setup_done(workspace)
                 .map(setup_done_json)
+                .map_err(|_| ToolFailure::Daemon)
+        }),
+        "bosn_setup_adopt" => setup_adopt_arguments(arguments).and_then(|request| {
+            backend
+                .setup_adopt(request)
+                .map(|value| json!({"action":"setup_adopt","adopted":value.adopted}))
                 .map_err(|_| ToolFailure::Daemon)
         }),
         "bosn_job_status" => job_id(arguments).and_then(|id| {
@@ -1028,6 +1042,59 @@ fn setup_done_arguments(
             "workspace must be a non-empty bounded string",
         ))
 }
+fn setup_adopt_arguments(
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<SetupAdoptRequest, ToolFailure> {
+    only_arguments(
+        arguments,
+        &[
+            "workspace",
+            "config",
+            "policy",
+            "deadline_ms",
+            "output_limit",
+            "confirm",
+        ],
+    )?;
+    if arguments.get("confirm") != Some(&Value::Bool(true)) {
+        return Err(ToolFailure::Invalid("confirm must be true"));
+    }
+    let workspace = arguments
+        .get("workspace")
+        .and_then(Value::as_str)
+        .filter(|v| {
+            !v.is_empty() && v.len() <= MAX_MCP_SETUP_STRING_BYTES && !v.bytes().any(|b| b == 0)
+        })
+        .map(PathBuf::from)
+        .ok_or(ToolFailure::Invalid(
+            "workspace must be a non-empty bounded string",
+        ))?;
+    let config = arguments
+        .get("config")
+        .and_then(Value::as_str)
+        .filter(|v| {
+            !v.is_empty() && v.len() <= MAX_MCP_SETUP_STRING_BYTES && !v.bytes().any(|b| b == 0)
+        })
+        .map(str::to_owned)
+        .ok_or(ToolFailure::Invalid(
+            "config must be a non-empty bounded string",
+        ))?;
+    let policy = match arguments.get("policy").and_then(Value::as_str) {
+        Some("refresh") => SetupPreparePolicy::Refresh,
+        Some("offline") => SetupPreparePolicy::Offline,
+        _ => return Err(ToolFailure::Invalid("policy must be refresh or offline")),
+    };
+    let deadline = required_bounded_u64(arguments, "deadline_ms", 300000)?;
+    let output = required_bounded_u64(arguments, "output_limit", 8388608)?;
+    Ok(SetupAdoptRequest {
+        workspace,
+        config,
+        policy,
+        deadline: std::time::Duration::from_millis(deadline),
+        output_limit: output as usize,
+        confirm: true,
+    })
+}
 
 fn status_json(status: Status) -> Value {
     json!({
@@ -1274,6 +1341,10 @@ mod tests {
                 resources_completed: 1,
             })
         }
+        fn setup_adopt(&mut self, _request: SetupAdoptRequest) -> Result<SetupAdoptResult, Error> {
+            self.daemon_reads += 1;
+            Ok(SetupAdoptResult { adopted: true })
+        }
         fn job_status(&mut self, id: u64) -> Result<JobStatus, Error> {
             self.daemon_reads += 1;
             Ok(JobStatus {
@@ -1412,6 +1483,7 @@ mod tests {
                 "bosn_setup_gc_preview",
                 "bosn_setup_gc_apply",
                 "bosn_setup_done",
+                "bosn_setup_adopt",
                 "bosn_job_status",
                 "bosn_job_logs",
                 "bosn_job_cancel",
