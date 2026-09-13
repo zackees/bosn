@@ -85,11 +85,15 @@ The installed `bosn` package exposes a deliberately narrow native Python API:
 `Client(state_dir).status()` and
 `Client(state_dir).plan_setup(workspace, config_locator, *, policy)` and the
 daemon-backed `Client(state_dir).submit_setup_prepare(workspace, config_locator,
-*, policy, deadline_ms, output_limit)`. The latter returns a durable job ID
-promptly; `job_status(id)`, `job_logs(id, *, after=0, limit=64)`, and
-`cancel_job(id)` are typed IPC-only observation controls. The Python boundary
-has no Docker command, container, mount, or task-execution parameters. The
-setup planner requires either `"online_refresh"` or `"offline_cache_only"`;
+*, policy, deadline_ms, output_limit)` and
+`Client(state_dir).submit_setup_task(workspace, config_locator, *, policy,
+task_name, deadline_ms, output_limit)`. Both return a durable job ID promptly;
+the latter can select only a declared task by its bounded semantic name.
+`job_status(id)`, `job_logs(id, *, after=0, limit=64)`, and `cancel_job(id)`
+are typed IPC-only observation controls. The Python boundary has no Docker
+command, container, mount, environment, work-directory, or task-execution
+parameters. The setup planner requires either `"online_refresh"` or
+`"offline_cache_only"`;
 it releases the GIL while calling the Rust `bosn-setup` pipeline and returns a
 frozen receipt (`SetupPlan`) with source kind, content hash, schema, canonical
 workspace, optional private asset root, ordered task names, source shape, and
@@ -100,8 +104,16 @@ not a compatibility contract.
 The production extension is deliberately built with PyO3's
 `extension-module` feature, so ordinary `soldr cargo test -p bosn --lib --locked`
 does not embed or link CPython. The fake-daemon Python boundary integration is
-available explicitly for development with
-`PYO3_PYTHON=.venv/bin/python soldr cargo test -p bosn --lib --locked --no-default-features --features embedded-python-tests`.
+available explicitly for development with an absolute interpreter and its
+library directory on the loader path:
+
+```bash
+PYTHON_BIN="$PWD/.venv/bin/python"
+PYTHON_LIB="$("$PYTHON_BIN" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+PYO3_PYTHON="$PYTHON_BIN" LD_LIBRARY_PATH="$PYTHON_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  soldr cargo test -p bosn --lib --locked --no-default-features --features embedded-python-tests
+```
+
 Installed-extension behavior is covered separately through
 `uv run maturin develop --locked && uv run pytest tests/test_native.py`.
 

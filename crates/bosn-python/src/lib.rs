@@ -6,7 +6,7 @@
 use bosn_core::parse_setup_config_locator;
 use bosn_service::{
     Client as ServiceClient, JobLogPage as ServiceJobLogPage, JobStatus as ServiceJobStatus,
-    SetupPreparePolicy, SetupPrepareRequest, Status as ServiceStatus,
+    SetupPreparePolicy, SetupPrepareRequest, SetupTaskJobRequest, Status as ServiceStatus,
 };
 use bosn_setup::{
     SetupAcquirePolicy, SetupPlan as RustSetupPlan, SetupPlanAppSource, SetupPlanRequest,
@@ -111,6 +111,54 @@ impl Client {
                     workspace,
                     config: config_locator,
                     policy,
+                    deadline: Duration::from_millis(deadline_ms),
+                    output_limit: output_limit as usize,
+                },
+            )
+            .map_err(service_error)
+        })
+    }
+
+    /// Submit one declared setup task to the local Bosn daemon and return its
+    /// durable job ID without waiting for planning, image preparation, or task
+    /// execution.
+    ///
+    /// The selected `task_name` must be a valid declared-task identifier; its
+    /// command, image, mounts, environment, and working directory come only
+    /// from the validated setup document. This method exposes no Docker,
+    /// container, command, mount, or process controls. `policy`,
+    /// `deadline_ms`, and `output_limit` have the same bounded semantic
+    /// contract as [`Self::submit_setup_prepare`]. The GIL is released for the
+    /// authenticated IPC roundtrip.
+    #[pyo3(signature = (workspace, config_locator, *, policy, task_name, deadline_ms, output_limit))]
+    #[allow(clippy::too_many_arguments)] // Required by the stable Python API signature.
+    fn submit_setup_task(
+        &self,
+        workspace: PathBuf,
+        config_locator: String,
+        policy: &str,
+        task_name: String,
+        deadline_ms: u64,
+        output_limit: u32,
+        py: Python<'_>,
+    ) -> PyResult<u64> {
+        let policy = parse_prepare_policy(policy)?;
+        validate_setup_task_input(
+            &workspace,
+            &config_locator,
+            &task_name,
+            deadline_ms,
+            output_limit,
+        )?;
+        let state_dir = self.state_dir.clone();
+        py.detach(move || {
+            submit_setup_task(
+                &state_dir,
+                SetupTaskJobRequest {
+                    workspace,
+                    config: config_locator,
+                    policy,
+                    task_name,
                     deadline: Duration::from_millis(deadline_ms),
                     output_limit: output_limit as usize,
                 },
@@ -375,6 +423,21 @@ fn submit_setup_prepare(
     })
 }
 
+fn submit_setup_task(
+    state_dir: &Path,
+    request: SetupTaskJobRequest,
+) -> Result<u64, bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async {
+        ServiceClient::for_state(state_dir)?
+            .submit_setup_task(request)
+            .await
+    })
+}
+
 fn job_status(state_dir: &Path, job_id: u64) -> Result<ServiceJobStatus, bosn_service::Error> {
     let runtime = RuntimeBuilder::multi_thread()
         .worker_threads(1)
@@ -463,6 +526,29 @@ fn validate_setup_prepare_input(
         return Err(PyValueError::new_err(
             "output_limit must be between 1 and 8388608",
         ));
+    }
+    Ok(())
+}
+
+/// Keep this syntactic check identical to the daemon wire validator and the
+/// setup-document schema. Existence in the document remains a daemon-owned
+/// execution concern, so the Python boundary never parses or runs task data.
+fn validate_setup_task_input(
+    workspace: &Path,
+    config_locator: &str,
+    task_name: &str,
+    deadline_ms: u64,
+    output_limit: u32,
+) -> PyResult<()> {
+    validate_setup_prepare_input(workspace, config_locator, deadline_ms, output_limit)?;
+    if task_name.is_empty()
+        || task_name.len() > 64
+        || !task_name.as_bytes()[0].is_ascii_alphanumeric()
+        || !task_name.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphanumeric() || byte == b'_' || (byte == b'-' && index > 0)
+        })
+    {
+        return Err(PyValueError::new_err("task_name is invalid"));
     }
     Ok(())
 }
@@ -598,7 +684,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
     #[cfg(feature = "embedded-python-tests")]
-    use bosn_service::{Service, SetupPrepareExecutor};
+    use bosn_service::{Service, SetupPrepareExecutor, SetupTaskExecutor};
     #[cfg(feature = "embedded-python-tests")]
     use kernal_api::async_engine::{self, CancellationToken, RuntimeBuilder, Sender};
     #[cfg(feature = "embedded-python-tests")]
@@ -649,6 +735,47 @@ mod tests {
                     async_engine::sleep(Duration::from_millis(10)).await;
                 }
                 Ok("fake prepared sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
+            })
+        }
+    }
+
+    #[cfg(feature = "embedded-python-tests")]
+    struct FakeSetupTaskExecutor {
+        started: AtomicUsize,
+        cancelled: AtomicUsize,
+    }
+
+    #[cfg(feature = "embedded-python-tests")]
+    impl FakeSetupTaskExecutor {
+        fn new() -> Self {
+            Self {
+                started: AtomicUsize::new(0),
+                cancelled: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[cfg(feature = "embedded-python-tests")]
+    impl SetupTaskExecutor for FakeSetupTaskExecutor {
+        fn execute<'a>(
+            &'a self,
+            _request: SetupTaskJobRequest,
+            cancellation: &'a CancellationToken,
+            logs: &'a Sender<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.started.fetch_add(1, Ordering::SeqCst);
+                logs.send("[fake] setup task started".into())
+                    .await
+                    .map_err(|_| "fake log consumer closed".to_owned())?;
+                for _ in 0..100 {
+                    if cancellation.is_cancelled() {
+                        self.cancelled.fetch_add(1, Ordering::SeqCst);
+                        return Err("fake task cancellation observed".into());
+                    }
+                    async_engine::sleep(Duration::from_millis(10)).await;
+                }
+                Ok("fake task completed".into())
             })
         }
     }
@@ -735,6 +862,103 @@ mod tests {
                 .unwrap();
                 assert_eq!(running.id, first);
                 assert!(matches!(running.state.as_str(), "Running" | "Cancelling"));
+                let python_state = state.clone();
+                std::thread::spawn(move || {
+                    Python::attach(|py| {
+                        Client {
+                            state_dir: python_state,
+                        }
+                        .cancel_job(first, py)
+                    })
+                })
+                .join()
+                .expect("Python cancellation thread panicked")
+                .unwrap();
+                wait_for_job_state(&wire_client, first, "Cancelled").await;
+                assert_eq!(executor.cancelled.load(Ordering::SeqCst), 1);
+
+                wire_client.shutdown().await.unwrap();
+                async_engine::timeout(Duration::from_secs(5), server)
+                    .await
+                    .expect("service did not stop")
+                    .expect("service task failed")
+                    .expect("service returned error");
+            });
+    }
+
+    #[cfg(feature = "embedded-python-tests")]
+    #[test]
+    fn python_client_submits_and_cancels_coalesced_fake_setup_task_without_docker() {
+        Python::initialize();
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let executor = Arc::new(FakeSetupTaskExecutor::new());
+        RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let server = async_engine::launch(
+                    Service::new(state.clone())
+                        .with_setup_task_executor(executor.clone())
+                        .serve(),
+                );
+                let wire_client = wait_for_client(&state).await;
+                let submitted = Instant::now();
+                let python_state = state.clone();
+                let python_workspace = workspace.clone();
+                let (first, second) = std::thread::spawn(move || {
+                    Python::initialize();
+                    Python::attach(|py| {
+                        let python_client = Client {
+                            state_dir: python_state,
+                        };
+                        let first = python_client.submit_setup_task(
+                            python_workspace.clone(),
+                            "https://example.invalid/setup.toml".into(),
+                            "online_refresh",
+                            "wait".into(),
+                            2_000,
+                            4 * 1024,
+                            py,
+                        )?;
+                        let second = python_client.submit_setup_task(
+                            python_workspace,
+                            "https://example.invalid/setup.toml".into(),
+                            "online_refresh",
+                            "wait".into(),
+                            2_000,
+                            4 * 1024,
+                            py,
+                        )?;
+                        Ok::<_, PyErr>((first, second))
+                    })
+                })
+                .join()
+                .expect("Python submit thread panicked")
+                .unwrap();
+                assert!(submitted.elapsed() < Duration::from_millis(250));
+                assert_eq!(first, second);
+
+                wait_for(|| executor.started.load(Ordering::SeqCst) == 1).await;
+                let python_state = state.clone();
+                let running = std::thread::spawn(move || {
+                    Python::attach(|py| {
+                        Client {
+                            state_dir: python_state,
+                        }
+                        .job_status(first, py)
+                    })
+                })
+                .join()
+                .expect("Python status thread panicked")
+                .unwrap();
+                assert_eq!(running.id, first);
+                assert!(matches!(running.state.as_str(), "Running" | "Cancelling"));
+
                 let python_state = state.clone();
                 std::thread::spawn(move || {
                     Python::attach(|py| {
