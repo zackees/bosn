@@ -3,8 +3,9 @@
 use bosn_engine::{DockerEngine, EngineEvent, RunOptions};
 use bosn_registry::{Registry, RegistryStatus};
 use bosn_setup::{
-    SetupAcquirePolicy, SetupPlanRequest, SetupTaskRequest, execute_setup_task, plan_setup,
-    prepare_setup_image,
+    SetupAcquirePolicy, SetupEnsureEngine, SetupEnsureRequest as CoreSetupEnsureRequest,
+    SetupImageEngine, SetupPlan, SetupPlanRequest, SetupTaskRequest, ensure_setup_app,
+    execute_setup_task, plan_setup, prepare_setup_image,
 };
 use jobs::{Jobs, Submission};
 use kernal_api::{
@@ -90,6 +91,19 @@ pub struct SetupTaskJobRequest {
     pub output_limit: usize,
 }
 
+/// All immutable caller inputs for one daemon-owned setup application ensure.
+/// The application name, image, command, mounts, labels, environment, and
+/// engine options are all derived from the validated setup document and its
+/// prepared-image receipt. Callers cannot select any of them here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupEnsureJobRequest {
+    pub workspace: PathBuf,
+    pub config: String,
+    pub policy: SetupPreparePolicy,
+    pub deadline: Duration,
+    pub output_limit: usize,
+}
+
 /// Testable daemon execution boundary.  Production uses
 /// [`DockerSetupPrepareExecutor`]; tests can provide a deterministic runner
 /// without starting Docker.  Log records are bounded by the actor before they
@@ -110,6 +124,20 @@ pub trait SetupTaskExecutor: Send + Sync {
     fn execute<'a>(
         &'a self,
         request: SetupTaskJobRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a async_engine::Sender<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
+}
+
+/// Testable daemon boundary for the complete plan, image-prepare, and
+/// ownership-safe application ensure pipeline. Production uses
+/// [`DockerSetupEnsureExecutor`]. It exposes no container lifecycle controls:
+/// the core primitive may only create an absent container or start a matching
+/// stopped one, and refuses every other existing candidate.
+pub trait SetupEnsureExecutor: Send + Sync {
+    fn execute<'a>(
+        &'a self,
+        request: SetupEnsureJobRequest,
         cancellation: &'a async_engine::CancellationToken,
         logs: &'a async_engine::Sender<String>,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
@@ -184,6 +212,150 @@ impl SetupPrepareExecutor for DockerSetupPrepareExecutor {
             ))
         })
     }
+}
+
+/// Docker-backed implementation for the bounded plan, prepare, and
+/// create-if-absent/start-if-stopped application ensure pipeline.
+#[derive(Clone)]
+pub struct DockerSetupEnsureExecutor {
+    state_dir: PathBuf,
+    engine: DockerEngine,
+}
+impl DockerSetupEnsureExecutor {
+    fn new(state_dir: PathBuf) -> Self {
+        Self {
+            state_dir,
+            engine: DockerEngine::docker(),
+        }
+    }
+}
+impl SetupEnsureExecutor for DockerSetupEnsureExecutor {
+    fn execute<'a>(
+        &'a self,
+        request: SetupEnsureJobRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a async_engine::Sender<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async move {
+            // The two engine stages receive disjoint portions of one caller
+            // budget. This is intentionally stricter than letting both stages
+            // each consume the full limit; a tiny budget is syntactically
+            // valid on the wire but cannot safely fund both stages.
+            let prepare_output = request.output_limit / 2;
+            let ensure_output = request.output_limit.saturating_sub(prepare_output);
+            if prepare_output == 0 || ensure_output == 0 {
+                return Err("setup ensure output budget cannot fund preparation and ensure".into());
+            }
+            let deadline = async_engine::Deadline::after(request.deadline);
+            let plan = async_engine::cancellable(
+                cancellation,
+                async_engine::timeout_at(
+                    deadline,
+                    plan_setup(SetupPlanRequest {
+                        state_dir: self.state_dir.clone(),
+                        workspace: request.workspace.clone(),
+                        locator: request.config,
+                        policy: request.policy.acquire_policy(),
+                    }),
+                ),
+            )
+            .await
+            .map_err(|_| "setup ensure cancelled".to_owned())?
+            .map_err(|_| "setup ensure planning exceeded its deadline".to_owned())?
+            .map_err(|error| error.to_string())?;
+            let (events, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
+            let forwarded_logs = logs.clone();
+            let forwarder = async_engine::launch(async move {
+                while let Some(event) = receiver.recv().await {
+                    forward_engine_event(&forwarded_logs, event).await?;
+                }
+                Ok::<(), String>(())
+            });
+            let pipeline = SetupEnsurePipeline {
+                plan: &plan,
+                workspace: request.workspace,
+                deadline: &deadline,
+                prepare_output,
+                ensure_output,
+            };
+            let result =
+                execute_setup_ensure_pipeline(&self.engine, &pipeline, cancellation, &events, logs)
+                    .await;
+            drop(events);
+            forwarder
+                .await
+                .map_err(|_| "setup log forwarder stopped".to_owned())??;
+            let ensured = result?;
+            Ok(format!(
+                "ensured {} as {}",
+                ensured.container_name, ensured.container_id
+            ))
+        })
+    }
+}
+
+/// Execute already-planned app preparation and ensure under one absolute
+/// deadline and one aggregate output budget. This generic helper preserves
+/// the finite core engine commands for deterministic no-Docker tests.
+struct SetupEnsurePipeline<'a> {
+    plan: &'a SetupPlan,
+    workspace: PathBuf,
+    deadline: &'a async_engine::Deadline,
+    prepare_output: usize,
+    ensure_output: usize,
+}
+
+async fn execute_setup_ensure_pipeline<E: SetupImageEngine + SetupEnsureEngine>(
+    engine: &E,
+    pipeline: &SetupEnsurePipeline<'_>,
+    cancellation: &async_engine::CancellationToken,
+    events: &async_engine::Sender<EngineEvent>,
+    logs: &async_engine::Sender<String>,
+) -> Result<bosn_setup::SetupEnsureResult, String> {
+    if cancellation.is_cancelled() {
+        return Err("setup ensure cancelled".into());
+    }
+    let remaining = pipeline.deadline.remaining();
+    if remaining.is_zero() {
+        return Err("setup ensure exceeded its deadline".into());
+    }
+    logs.send("[setup] preparing application image".into())
+        .await
+        .map_err(|_| "setup log consumer closed".to_owned())?;
+    let prepared = prepare_setup_image(
+        engine,
+        pipeline.plan,
+        RunOptions::streaming(remaining, pipeline.prepare_output),
+        cancellation,
+        events,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if cancellation.is_cancelled() {
+        return Err("setup ensure cancelled".into());
+    }
+    let remaining = pipeline.deadline.remaining();
+    if remaining.is_zero() {
+        return Err("setup ensure exceeded its deadline".into());
+    }
+    logs.send("[setup] ensuring application container".into())
+        .await
+        .map_err(|_| "setup log consumer closed".to_owned())?;
+    // `ensure_setup_app` validates the image receipt against the plan before
+    // inspection. Any mismatch fails closed before create/start can occur.
+    ensure_setup_app(
+        engine,
+        CoreSetupEnsureRequest {
+            plan: pipeline.plan,
+            workspace_root: pipeline.workspace.clone(),
+            prepared_image: &prepared,
+            options: RunOptions::streaming(remaining, pipeline.ensure_output),
+            cancellation,
+            events,
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// Docker-backed implementation for a single setup task.  The daemon plans,
@@ -551,6 +723,41 @@ impl Client {
             _ => Err(Error::Protocol("unexpected setup task response")),
         }
     }
+    /// Submit one daemon-owned plan, image-prepare, and ownership-safe
+    /// application ensure job. The returned ID can only be observed with the
+    /// existing bounded status/log/cancel APIs.
+    pub async fn submit_setup_ensure(&self, request: SetupEnsureJobRequest) -> Result<u64, Error> {
+        let workspace = request
+            .workspace
+            .to_str()
+            .ok_or(Error::Protocol("setup workspace is not UTF-8"))?
+            .to_owned();
+        let deadline_ms = u64::try_from(request.deadline.as_millis())
+            .map_err(|_| Error::Protocol("setup deadline too large"))?;
+        let output_limit = u32::try_from(request.output_limit)
+            .map_err(|_| Error::Protocol("setup output limit too large"))?;
+        validate_setup_ensure_wire(
+            &workspace,
+            &request.config,
+            request.policy,
+            deadline_ms,
+            output_limit,
+        )?;
+        match self
+            .call(Request {
+                workspace,
+                setup_config: request.config,
+                setup_policy: request.policy.wire(),
+                setup_deadline_ms: deadline_ms,
+                setup_output_limit: output_limit,
+                ..Request::operation(10)
+            })
+            .await?
+        {
+            Reply::Job(id) => Ok(id),
+            _ => Err(Error::Protocol("unexpected setup ensure response")),
+        }
+    }
     async fn call(&self, request: Request) -> Result<Reply, Error> {
         // Resolve on every call: a Client may have been constructed while a
         // fresh daemon was still creating its registry, before an inode-based
@@ -581,6 +788,7 @@ pub struct Service {
     stop: CancellationSource,
     setup_executor: Arc<dyn SetupPrepareExecutor>,
     setup_task_executor: Arc<dyn SetupTaskExecutor>,
+    setup_ensure_executor: Arc<dyn SetupEnsureExecutor>,
 }
 #[derive(Clone)]
 struct RegistryActor {
@@ -623,6 +831,10 @@ enum JobCommand {
         request: SetupTaskJobRequest,
         reply: async_engine::OneshotSender<Result<u64, Error>>,
     },
+    SubmitSetupEnsure {
+        request: SetupEnsureJobRequest,
+        reply: async_engine::OneshotSender<Result<u64, Error>>,
+    },
     Log {
         id: u64,
         line: String,
@@ -639,11 +851,20 @@ enum JobCommand {
 enum SetupJobKind {
     Prepare,
     Task,
+    Ensure,
 }
 
 enum SetupJobRequest {
     Prepare(SetupPrepareRequest),
     Task(SetupTaskJobRequest),
+    Ensure(SetupEnsureJobRequest),
+}
+
+#[derive(Clone)]
+struct SetupExecutors {
+    prepare: Arc<dyn SetupPrepareExecutor>,
+    task: Arc<dyn SetupTaskExecutor>,
+    ensure: Arc<dyn SetupEnsureExecutor>,
 }
 impl JobActor {
     async fn submit(&self, workspace: String, stack: String, digest: String) -> Result<u64, Error> {
@@ -704,6 +925,14 @@ impl JobActor {
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
     }
+    async fn submit_setup_ensure(&self, request: SetupEnsureJobRequest) -> Result<u64, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(JobCommand::SubmitSetupEnsure { request, reply })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
     async fn stop(&self) {
         let (reply, wait) = async_engine::oneshot_channel();
         if self.sender.send(JobCommand::Stop(reply)).await.is_ok() {
@@ -714,8 +943,7 @@ impl JobActor {
 async fn job_actor(
     mut jobs: Jobs,
     mut receiver: async_engine::Receiver<JobCommand>,
-    prepare_executor: Arc<dyn SetupPrepareExecutor>,
-    task_executor: Arc<dyn SetupTaskExecutor>,
+    executors: SetupExecutors,
     sender: async_engine::Sender<JobCommand>,
 ) {
     let mut requests: BTreeMap<u64, SetupJobRequest> = BTreeMap::new();
@@ -793,8 +1021,7 @@ async fn job_actor(
                     &mut requests,
                     &mut cancellations,
                     &mut tasks,
-                    Arc::clone(&prepare_executor),
-                    Arc::clone(&task_executor),
+                    &executors,
                     sender.clone(),
                 );
             }
@@ -821,8 +1048,34 @@ async fn job_actor(
                     &mut requests,
                     &mut cancellations,
                     &mut tasks,
-                    Arc::clone(&prepare_executor),
-                    Arc::clone(&task_executor),
+                    &executors,
+                    sender.clone(),
+                );
+            }
+            JobCommand::SubmitSetupEnsure { request, reply } => {
+                let digest = setup_ensure_digest(&request);
+                let workspace = request.workspace.to_string_lossy().into_owned();
+                let result = jobs
+                    .submit(&workspace, "setup-ensure", &digest)
+                    .map(|submission| match submission {
+                        Submission::Started(id) | Submission::Queued(id) => {
+                            requests.insert(id, SetupJobRequest::Ensure(request));
+                            id
+                        }
+                        Submission::Joined(id) => id,
+                        Submission::Superseded { replacement, .. } => {
+                            requests.insert(replacement, SetupJobRequest::Ensure(request));
+                            replacement
+                        }
+                    })
+                    .map_err(|_| Error::Protocol("setup ensure job admission"));
+                let _ = reply.send(result);
+                launch_started_setup_jobs(
+                    &mut jobs,
+                    &mut requests,
+                    &mut cancellations,
+                    &mut tasks,
+                    &executors,
                     sender.clone(),
                 );
             }
@@ -843,6 +1096,7 @@ async fn job_actor(
                         let operation = match kind {
                             SetupJobKind::Prepare => "setup prepare",
                             SetupJobKind::Task => "setup task",
+                            SetupJobKind::Ensure => "setup ensure",
                         };
                         let _ = jobs.log(id, format!("{operation} failed: {error}"));
                         let _ = jobs.settle_with_error(id, false, Some(error));
@@ -868,8 +1122,7 @@ async fn job_actor(
                 &mut requests,
                 &mut cancellations,
                 &mut tasks,
-                Arc::clone(&prepare_executor),
-                Arc::clone(&task_executor),
+                &executors,
                 sender.clone(),
             );
         }
@@ -888,8 +1141,7 @@ fn launch_started_setup_jobs(
     requests: &mut BTreeMap<u64, SetupJobRequest>,
     cancellations: &mut BTreeMap<u64, CancellationSource>,
     tasks: &mut async_engine::TaskGroup<()>,
-    prepare_executor: Arc<dyn SetupPrepareExecutor>,
-    task_executor: Arc<dyn SetupTaskExecutor>,
+    executors: &SetupExecutors,
     sender: async_engine::Sender<JobCommand>,
 ) {
     for id in jobs.take_started() {
@@ -903,8 +1155,9 @@ fn launch_started_setup_jobs(
         let token = cancellation.token();
         cancellations.insert(id, cancellation);
         let task_sender = sender.clone();
-        let prepare_executor = Arc::clone(&prepare_executor);
-        let task_executor = Arc::clone(&task_executor);
+        let prepare_executor = Arc::clone(&executors.prepare);
+        let task_executor = Arc::clone(&executors.task);
+        let ensure_executor = Arc::clone(&executors.ensure);
         tasks.spawn(async move {
             let (logs, mut log_receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
             let log_sender = task_sender.clone();
@@ -923,6 +1176,10 @@ fn launch_started_setup_jobs(
                 SetupJobRequest::Task(request) => (
                     SetupJobKind::Task,
                     task_executor.execute(request, &token, &logs).await,
+                ),
+                SetupJobRequest::Ensure(request) => (
+                    SetupJobKind::Ensure,
+                    ensure_executor.execute(request, &token, &logs).await,
                 ),
             };
             drop(logs);
@@ -993,6 +1250,29 @@ fn setup_task_digest(request: &SetupTaskJobRequest) -> String {
         kernal_api::hash::blake3_bytes(&material).to_hex()
     )
 }
+
+fn setup_ensure_digest(request: &SetupEnsureJobRequest) -> String {
+    let mut material = Vec::new();
+    let workspace = request.workspace.to_string_lossy();
+    let policy = request.policy.wire().to_le_bytes();
+    let deadline = request.deadline.as_millis().to_le_bytes();
+    let output_limit = (request.output_limit as u64).to_le_bytes();
+    for part in [
+        b"bosn.setup-ensure.v1".as_slice(),
+        workspace.as_bytes(),
+        request.config.as_bytes(),
+        &policy,
+        &deadline,
+        &output_limit,
+    ] {
+        material.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        material.extend_from_slice(part);
+    }
+    format!(
+        "setup:{}",
+        kernal_api::hash::blake3_bytes(&material).to_hex()
+    )
+}
 impl RegistryActor {
     async fn status(&self) -> Result<Status, Error> {
         let (reply, wait) = async_engine::oneshot_channel();
@@ -1041,6 +1321,7 @@ impl Service {
         Self {
             setup_executor: Arc::new(DockerSetupPrepareExecutor::new(state_dir.clone())),
             setup_task_executor: Arc::new(DockerSetupTaskExecutor::new(state_dir.clone())),
+            setup_ensure_executor: Arc::new(DockerSetupEnsureExecutor::new(state_dir.clone())),
             state_dir,
             stop: CancellationSource::new(),
         }
@@ -1055,6 +1336,12 @@ impl Service {
     /// integration-test seam; it cannot add arbitrary Docker controls.
     pub fn with_setup_task_executor(mut self, executor: Arc<dyn SetupTaskExecutor>) -> Self {
         self.setup_task_executor = executor;
+        self
+    }
+    /// Substitute only the complete semantic setup-ensure executor. This is a
+    /// test seam; it does not add a caller-controlled container operation.
+    pub fn with_setup_ensure_executor(mut self, executor: Arc<dyn SetupEnsureExecutor>) -> Self {
+        self.setup_ensure_executor = executor;
         self
     }
     /// Foreground lifecycle: acquires the sole registry writer before binding.
@@ -1092,8 +1379,11 @@ impl Service {
         let job_worker = async_engine::launch(job_actor(
             Jobs::new(1),
             job_receiver,
-            Arc::clone(&self.setup_executor),
-            Arc::clone(&self.setup_task_executor),
+            SetupExecutors {
+                prepare: Arc::clone(&self.setup_executor),
+                task: Arc::clone(&self.setup_task_executor),
+                ensure: Arc::clone(&self.setup_ensure_executor),
+            },
             job_sender.clone(),
         ));
         let worker = async_engine::launch(registry_actor(registry, receiver));
@@ -1398,6 +1688,37 @@ async fn handle(
                     },
                 }
             }
+            10 => {
+                let policy = SetupPreparePolicy::from_wire(r.setup_policy);
+                let request = policy.and_then(|policy| {
+                    validate_setup_ensure_request_wire(&r, policy)
+                        .ok()
+                        .map(|()| SetupEnsureJobRequest {
+                            workspace: PathBuf::from(r.workspace),
+                            config: r.setup_config,
+                            policy,
+                            deadline: Duration::from_millis(r.setup_deadline_ms),
+                            output_limit: r.setup_output_limit as usize,
+                        })
+                });
+                match request {
+                    Some(request) => match jobs.submit_setup_ensure(request).await {
+                        Ok(job_id) => ReplyWire {
+                            code: 40,
+                            job_id,
+                            ..Default::default()
+                        },
+                        Err(_) => ReplyWire {
+                            code: 3,
+                            ..Default::default()
+                        },
+                    },
+                    None => ReplyWire {
+                        code: 3,
+                        ..Default::default()
+                    },
+                }
+            }
             _ => ReplyWire {
                 code: 2,
                 ..Default::default()
@@ -1556,6 +1877,42 @@ fn validate_setup_task_wire(
     }
     Ok(())
 }
+
+fn validate_setup_ensure_wire(
+    workspace: &str,
+    config: &str,
+    policy: SetupPreparePolicy,
+    deadline_ms: u64,
+    output_limit: u32,
+) -> Result<(), Error> {
+    validate_setup_prepare_wire(workspace, config, policy, deadline_ms, output_limit)
+}
+
+/// The operation reuses the compact private protobuf envelope, but accepts no
+/// legacy job or task fields. Rejecting rather than ignoring these values
+/// makes the semantic surface exactly the five documented immutable inputs.
+fn validate_setup_ensure_request_wire(
+    request: &Request,
+    policy: SetupPreparePolicy,
+) -> Result<(), Error> {
+    validate_setup_ensure_wire(
+        &request.workspace,
+        &request.setup_config,
+        policy,
+        request.setup_deadline_ms,
+        request.setup_output_limit,
+    )?;
+    if !request.stack.is_empty()
+        || !request.digest.is_empty()
+        || request.job_id != 0
+        || request.log_after != 0
+        || request.log_limit != 0
+        || !request.setup_task_name.is_empty()
+    {
+        return Err(Error::Protocol("nonsemantic setup ensure fields"));
+    }
+    Ok(())
+}
 #[derive(Message)]
 struct ReplyWire {
     #[prost(uint32, tag = "1")]
@@ -1645,9 +2002,13 @@ fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
 mod tests {
     use super::*;
     use kernal_api::async_engine::RuntimeBuilder;
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        collections::{BTreeMap, VecDeque},
+        future::{Ready, ready},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     struct SlowFakeSetupExecutor {
@@ -1751,6 +2112,156 @@ mod tests {
                     .map_err(|_| "fake log consumer closed".to_owned())?;
                 Ok(format!("fake task {} complete", request.task_name))
             })
+        }
+    }
+
+    struct FakeSetupEnsureExecutor {
+        started: AtomicUsize,
+        cancelled: AtomicUsize,
+        stages: Mutex<Vec<String>>,
+    }
+    impl FakeSetupEnsureExecutor {
+        fn new() -> Self {
+            Self {
+                started: AtomicUsize::new(0),
+                cancelled: AtomicUsize::new(0),
+                stages: Mutex::new(Vec::new()),
+            }
+        }
+        fn stages(&self) -> Vec<String> {
+            self.stages.lock().unwrap().clone()
+        }
+    }
+    impl SetupEnsureExecutor for FakeSetupEnsureExecutor {
+        fn execute<'a>(
+            &'a self,
+            request: SetupEnsureJobRequest,
+            cancellation: &'a async_engine::CancellationToken,
+            logs: &'a async_engine::Sender<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.started.fetch_add(1, Ordering::SeqCst);
+                self.stages.lock().unwrap().push("plan".into());
+                logs.send("[fake] plan receipt accepted".into())
+                    .await
+                    .map_err(|_| "fake log consumer closed".to_owned())?;
+                self.stages.lock().unwrap().push("prepare".into());
+                logs.send("[fake] image prepared".into())
+                    .await
+                    .map_err(|_| "fake log consumer closed".to_owned())?;
+                if request.config.contains("prepare-fail") {
+                    return Err("fake preparation failed".into());
+                }
+                self.stages.lock().unwrap().push("ensure".into());
+                if request.config.contains("ensure-mismatch") {
+                    return Err("fake ownership mismatch".into());
+                }
+                if request.config.contains("wait") {
+                    for _ in 0..100 {
+                        if cancellation.is_cancelled() {
+                            self.cancelled.fetch_add(1, Ordering::SeqCst);
+                            return Err("fake ensure observed cancellation".into());
+                        }
+                        async_engine::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+                if cancellation.is_cancelled() {
+                    self.cancelled.fetch_add(1, Ordering::SeqCst);
+                    return Err("fake ensure observed cancellation".into());
+                }
+                self.stages.lock().unwrap().push("mutate".into());
+                logs.send(format!("[fake] ensured {}", "x".repeat(4 * 1024)))
+                    .await
+                    .map_err(|_| "fake log consumer closed".to_owned())?;
+                Ok("fake ensured container".into())
+            })
+        }
+    }
+
+    struct PipelineFakeEngine {
+        image_calls: Mutex<Vec<(bosn_setup::SetupImageCommand, RunOptions)>>,
+        ensure_calls: Mutex<Vec<(bosn_setup::SetupEnsureCommand, RunOptions)>>,
+        image_results:
+            Mutex<VecDeque<Result<bosn_engine::CommandResult, bosn_engine::CommandError>>>,
+        ensure_results:
+            Mutex<VecDeque<Result<bosn_setup::SetupEnsureResponse, bosn_engine::CommandError>>>,
+    }
+    impl PipelineFakeEngine {
+        fn new(
+            image_results: impl IntoIterator<
+                Item = Result<bosn_engine::CommandResult, bosn_engine::CommandError>,
+            >,
+            ensure_results: impl IntoIterator<
+                Item = Result<bosn_setup::SetupEnsureResponse, bosn_engine::CommandError>,
+            >,
+        ) -> Self {
+            Self {
+                image_calls: Mutex::new(Vec::new()),
+                ensure_calls: Mutex::new(Vec::new()),
+                image_results: Mutex::new(image_results.into_iter().collect()),
+                ensure_results: Mutex::new(ensure_results.into_iter().collect()),
+            }
+        }
+    }
+    impl SetupImageEngine for PipelineFakeEngine {
+        type StreamFuture<'a> =
+            Ready<Result<bosn_engine::CommandResult, bosn_engine::CommandError>>;
+        fn stream<'a>(
+            &'a self,
+            command: bosn_setup::SetupImageCommand,
+            options: RunOptions,
+            _cancellation: &'a async_engine::CancellationToken,
+            _events: &'a async_engine::Sender<EngineEvent>,
+        ) -> Self::StreamFuture<'a> {
+            self.image_calls.lock().unwrap().push((command, options));
+            ready(self.image_results.lock().unwrap().pop_front().unwrap())
+        }
+    }
+    impl SetupEnsureEngine for PipelineFakeEngine {
+        type StreamFuture<'a> =
+            Ready<Result<bosn_setup::SetupEnsureResponse, bosn_engine::CommandError>>;
+        fn stream<'a>(
+            &'a self,
+            command: bosn_setup::SetupEnsureCommand,
+            options: RunOptions,
+            _cancellation: &'a async_engine::CancellationToken,
+            _events: &'a async_engine::Sender<EngineEvent>,
+        ) -> Self::StreamFuture<'a> {
+            self.ensure_calls.lock().unwrap().push((command, options));
+            ready(self.ensure_results.lock().unwrap().pop_front().unwrap())
+        }
+    }
+
+    const TEST_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const TEST_IDENTITY: &str =
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const TEST_CONTAINER_ID: &str =
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    fn pipeline_plan(workspace: &Path) -> SetupPlan {
+        let image = format!("registry.example/team/app@sha256:{TEST_HASH}");
+        SetupPlan {
+            source_kind: bosn_setup::SetupSourceKind::LocalFile,
+            content_sha256: TEST_HASH.into(),
+            schema_version: 1,
+            workspace_root: kernal_api::platform::fs::canonical_context_path(workspace).unwrap(),
+            asset_root: None,
+            task_names: Vec::new(),
+            app: bosn_core::SetupApp {
+                source: bosn_core::SetupSource::PinnedImage(image.clone()),
+                environment: BTreeMap::new(),
+                workdir: None,
+                command: None,
+                mounts: Vec::new(),
+            },
+            tasks: BTreeMap::new(),
+            app_source: bosn_setup::SetupPlanAppSource::PinnedImage { image },
+        }
+    }
+    fn command_result(exit_code: i32, stdout: impl Into<Vec<u8>>) -> bosn_engine::CommandResult {
+        bosn_engine::CommandResult {
+            exit_code,
+            stdout: stdout.into(),
+            stderr: Vec::new(),
         }
     }
 
@@ -2106,6 +2617,364 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn setup_ensure_job_is_prompt_coalesced_bounded_and_cancellable_without_docker() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let fake = Arc::new(FakeSetupEnsureExecutor::new());
+        RuntimeBuilder::multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let server = async_engine::launch(
+                    Service::new(state.clone())
+                        .with_setup_ensure_executor(fake.clone())
+                        .serve(),
+                );
+                let client = wait_for_client(&state).await;
+                let request = SetupEnsureJobRequest {
+                    workspace: workspace.clone(),
+                    config: "https://example.invalid/wait.toml".into(),
+                    policy: SetupPreparePolicy::Refresh,
+                    deadline: Duration::from_secs(2),
+                    output_limit: 4 * 1024,
+                };
+                let submitted = std::time::Instant::now();
+                let first = client.submit_setup_ensure(request.clone()).await.unwrap();
+                assert!(submitted.elapsed() < Duration::from_millis(250));
+                assert_eq!(
+                    first,
+                    client.submit_setup_ensure(request.clone()).await.unwrap()
+                );
+                wait_for(|| fake.started.load(Ordering::SeqCst) == 1).await;
+                client.ping().await.unwrap();
+                let logs = wait_for_logs(&client, first).await;
+                assert!(
+                    logs.records
+                        .iter()
+                        .all(|record| record.line.len() <= jobs::MAX_LOG_LINE_BYTES)
+                );
+
+                let changed = SetupEnsureJobRequest {
+                    config: "https://example.invalid/other.toml".into(),
+                    ..request
+                };
+                let second = client.submit_setup_ensure(changed).await.unwrap();
+                assert_ne!(first, second);
+                client.cancel_job(first).await.unwrap();
+                wait_for_job_state(&client, first, "Cancelled").await;
+                wait_for(|| fake.started.load(Ordering::SeqCst) == 2).await;
+                wait_for_job_state(&client, second, "Succeeded").await;
+                assert_eq!(fake.cancelled.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    fake.stages(),
+                    vec![
+                        "plan", "prepare", "ensure", "plan", "prepare", "ensure", "mutate"
+                    ]
+                );
+                client.shutdown().await.unwrap();
+                stopped(server).await;
+            });
+    }
+
+    #[test]
+    fn setup_ensure_stops_after_prepare_failure_or_ownership_mismatch_without_mutation() {
+        for config in [
+            "https://example.invalid/prepare-fail.toml",
+            "https://example.invalid/ensure-mismatch.toml",
+        ] {
+            let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+            let state = temporary.path().join("state");
+            let workspace = temporary.path().join("workspace");
+            std::fs::create_dir(&workspace).unwrap();
+            let fake = Arc::new(FakeSetupEnsureExecutor::new());
+            RuntimeBuilder::multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .run(async {
+                    let server = async_engine::launch(
+                        Service::new(state.clone())
+                            .with_setup_ensure_executor(fake.clone())
+                            .serve(),
+                    );
+                    let client = wait_for_client(&state).await;
+                    let job = client
+                        .submit_setup_ensure(SetupEnsureJobRequest {
+                            workspace,
+                            config: config.into(),
+                            policy: SetupPreparePolicy::Offline,
+                            deadline: Duration::from_secs(2),
+                            output_limit: 4 * 1024,
+                        })
+                        .await
+                        .unwrap();
+                    wait_for_job_state(&client, job, "Failed").await;
+                    let logs = wait_for_logs(&client, job).await;
+                    assert!(
+                        logs.records
+                            .iter()
+                            .any(|record| record.line.contains("setup ensure failed"))
+                    );
+                    assert!(!fake.stages().contains(&"mutate".into()));
+                    if config.contains("prepare-fail") {
+                        assert_eq!(fake.stages(), vec!["plan", "prepare"]);
+                    } else {
+                        assert_eq!(fake.stages(), vec!["plan", "prepare", "ensure"]);
+                    }
+                    client.shutdown().await.unwrap();
+                    stopped(server).await;
+                });
+        }
+    }
+
+    #[test]
+    fn setup_ensure_coalescing_digest_covers_every_immutable_input() {
+        let base = SetupEnsureJobRequest {
+            workspace: PathBuf::from("/workspace"),
+            config: "https://example.invalid/setup.toml".into(),
+            policy: SetupPreparePolicy::Refresh,
+            deadline: Duration::from_secs(2),
+            output_limit: 4 * 1024,
+        };
+        let variants = [
+            SetupEnsureJobRequest {
+                workspace: PathBuf::from("/other"),
+                ..base.clone()
+            },
+            SetupEnsureJobRequest {
+                config: "https://example.invalid/other.toml".into(),
+                ..base.clone()
+            },
+            SetupEnsureJobRequest {
+                policy: SetupPreparePolicy::Offline,
+                ..base.clone()
+            },
+            SetupEnsureJobRequest {
+                deadline: Duration::from_secs(3),
+                ..base.clone()
+            },
+            SetupEnsureJobRequest {
+                output_limit: 8 * 1024,
+                ..base.clone()
+            },
+        ];
+        for variant in variants {
+            assert_ne!(setup_ensure_digest(&base), setup_ensure_digest(&variant));
+        }
+    }
+
+    #[test]
+    fn setup_ensure_wire_validation_preserves_prepare_bounds() {
+        assert!(
+            validate_setup_ensure_wire(
+                "/workspace",
+                "https://example.invalid/setup.toml",
+                SetupPreparePolicy::Refresh,
+                1,
+                1,
+            )
+            .is_ok()
+        );
+        for (deadline, output) in [(0, 1), (300_001, 1), (1, 0), (1, 8_388_609)] {
+            assert!(
+                validate_setup_ensure_wire(
+                    "/workspace",
+                    "https://example.invalid/setup.toml",
+                    SetupPreparePolicy::Offline,
+                    deadline,
+                    output,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn setup_ensure_rejects_all_legacy_job_and_task_wire_fields() {
+        let request = || Request {
+            workspace: "/workspace".into(),
+            setup_config: "https://example.invalid/setup.toml".into(),
+            setup_policy: SetupPreparePolicy::Refresh.wire(),
+            setup_deadline_ms: 1,
+            setup_output_limit: 1,
+            ..Request::operation(10)
+        };
+        assert!(
+            validate_setup_ensure_request_wire(&request(), SetupPreparePolicy::Refresh).is_ok()
+        );
+        for invalid in [
+            Request {
+                stack: "stack".into(),
+                ..request()
+            },
+            Request {
+                digest: "digest".into(),
+                ..request()
+            },
+            Request {
+                job_id: 1,
+                ..request()
+            },
+            Request {
+                log_after: 1,
+                ..request()
+            },
+            Request {
+                log_limit: 1,
+                ..request()
+            },
+            Request {
+                setup_task_name: "task".into(),
+                ..request()
+            },
+        ] {
+            assert!(
+                validate_setup_ensure_request_wire(&invalid, SetupPreparePolicy::Refresh).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_pipeline_does_not_reset_budget_and_never_mutates_after_prepare_or_ownership_failure()
+    {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let plan = pipeline_plan(&workspace);
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // A failed image action prevents all ensure inspection/create/start
+        // operations, so no container mutation can follow preparation failure.
+        let prepare_failure =
+            PipelineFakeEngine::new([Ok(command_result(1, b"pull failed".to_vec()))], []);
+        runtime.run(async {
+            let deadline = async_engine::Deadline::after(Duration::from_secs(1));
+            let cancellation = CancellationSource::new();
+            let (events, _event_receiver) = async_engine::channel(8);
+            let (logs, _log_receiver) = async_engine::channel(8);
+            let pipeline = SetupEnsurePipeline {
+                plan: &plan,
+                workspace: workspace.clone(),
+                deadline: &deadline,
+                prepare_output: 512,
+                ensure_output: 512,
+            };
+            assert!(
+                execute_setup_ensure_pipeline(
+                    &prepare_failure,
+                    &pipeline,
+                    &cancellation.token(),
+                    &events,
+                    &logs,
+                )
+                .await
+                .is_err()
+            );
+        });
+        assert!(prepare_failure.ensure_calls.lock().unwrap().is_empty());
+
+        // A mismatching observed candidate fails in ensure_setup_app before
+        // any create/start command. The fake has no later mutation response
+        // configured, making an accidental mutation an immediate test failure.
+        let mismatch = PipelineFakeEngine::new(
+            [
+                Ok(command_result(0, Vec::new())),
+                Ok(command_result(0, format!("{TEST_IDENTITY}\n"))),
+            ],
+            [Ok(bosn_setup::SetupEnsureResponse::Inspection(
+                Some(bosn_setup::SetupEnsureObservedContainer {
+                    container_id: TEST_CONTAINER_ID.into(),
+                    running: false,
+                    image_identity:
+                        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                            .into(),
+                    labels: BTreeMap::new(),
+                }),
+                command_result(0, Vec::new()),
+            ))],
+        );
+        runtime.run(async {
+            let deadline = async_engine::Deadline::after(Duration::from_secs(1));
+            let cancellation = CancellationSource::new();
+            let (events, _event_receiver) = async_engine::channel(8);
+            let (logs, _log_receiver) = async_engine::channel(8);
+            let pipeline = SetupEnsurePipeline {
+                plan: &plan,
+                workspace: workspace.clone(),
+                deadline: &deadline,
+                prepare_output: 512,
+                ensure_output: 512,
+            };
+            assert!(
+                execute_setup_ensure_pipeline(
+                    &mismatch,
+                    &pipeline,
+                    &cancellation.token(),
+                    &events,
+                    &logs,
+                )
+                .await
+                .is_err()
+            );
+        });
+        assert_eq!(mismatch.ensure_calls.lock().unwrap().len(), 1);
+
+        let success = PipelineFakeEngine::new(
+            [
+                Ok(command_result(0, Vec::new())),
+                Ok(command_result(0, format!("{TEST_IDENTITY}\n"))),
+            ],
+            [
+                Ok(bosn_setup::SetupEnsureResponse::Inspection(
+                    None,
+                    command_result(1, Vec::new()),
+                )),
+                Ok(bosn_setup::SetupEnsureResponse::Command(command_result(
+                    0,
+                    format!("{TEST_CONTAINER_ID}\n"),
+                ))),
+                Ok(bosn_setup::SetupEnsureResponse::Command(command_result(
+                    0,
+                    Vec::new(),
+                ))),
+            ],
+        );
+        runtime.run(async {
+            let deadline = async_engine::Deadline::after(Duration::from_secs(1));
+            let cancellation = CancellationSource::new();
+            let (events, _event_receiver) = async_engine::channel(8);
+            let (logs, _log_receiver) = async_engine::channel(8);
+            let pipeline = SetupEnsurePipeline {
+                plan: &plan,
+                workspace,
+                deadline: &deadline,
+                prepare_output: 1024,
+                ensure_output: 1025,
+            };
+            execute_setup_ensure_pipeline(
+                &success,
+                &pipeline,
+                &cancellation.token(),
+                &events,
+                &logs,
+            )
+            .await
+            .unwrap();
+        });
+        // The prepare helper uses its one 1024-byte allocation for pull and
+        // inspect; ensure receives the disjoint 1025-byte remainder, never
+        // the caller's full 2049-byte cap again.
+        assert_eq!(success.image_calls.lock().unwrap()[0].1.output_limit, 1024);
+        assert_eq!(success.ensure_calls.lock().unwrap()[0].1.output_limit, 1025);
     }
 
     #[test]
