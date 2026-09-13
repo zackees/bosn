@@ -101,6 +101,18 @@ document references and tags are never used as registry identity. Failed or
 cancelled ensures persist neither fact, and repeat ensures are idempotent. It
 never deletes, replaces, stops, adopts, or garbage-collects a container.
 
+The same writer keeps a compact, durable audit trail in the existing registry
+`events` table: `setup.ensure.submitted`, then exactly one terminal
+`succeeded`, `failed`, `cancelled`, or (for a pending replacement)
+`superseded` event. Submission details contain only the numeric in-memory job
+ID, policy, and locator *kind* (`https`, `http`, `file`, or `path`); terminal details
+contain only that ID and outcome. They never store a setup URL, query string,
+workspace path, engine output, Docker receipt, or container/image identifier.
+The successful terminal event is appended in the same SQLite transaction as
+both resource facts and use rows, so a failed transaction cannot claim a
+successful ensure. Job status/log retention remains deliberately in-memory;
+the event history is the durable summary across daemon restarts.
+
 An opt-in live proof exercises the production daemon and kernal-api Docker
 transport end to end, including daemon restart and matching-container reuse:
 
