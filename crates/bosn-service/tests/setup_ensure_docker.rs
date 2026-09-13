@@ -205,9 +205,18 @@ fn wait_for_success(runtime: &kernal_api::async_engine::Runtime, client: &Client
         match status.state.as_str() {
             "Succeeded" => return,
             "Failed" | "Cancelled" | "Superseded" => {
+                let logs = runtime
+                    .run(client.job_logs(job_id, 0, 64))
+                    .map(|page| {
+                        page.records
+                            .into_iter()
+                            .map(|record| record.line)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 panic!(
-                    "setup ensure job {job_id} ended {}: {:?}",
-                    status.state, status.error
+                    "setup ensure job {job_id} ended {}: {:?}; logs: {logs:?}",
+                    status.state, status.error,
                 )
             }
             "Queued" | "Running" | "Cancelling" => {}
@@ -221,20 +230,24 @@ fn wait_for_success(runtime: &kernal_api::async_engine::Runtime, client: &Client
     }
 }
 
-fn image_identity(engine: &DockerEngine) -> String {
+fn image_identity_for(engine: &DockerEngine, reference: &str) -> String {
     let result = docker_capture(
         engine,
-        ["image", "inspect", "--format", "{{.Id}}", PINNED_ALPINE],
+        ["image", "inspect", "--format", "{{.Id}}", reference],
     );
     assert!(
         result.ok(),
-        "pinned Alpine image is unavailable: {}",
+        "Docker image {reference:?} is unavailable: {}",
         String::from_utf8_lossy(&result.stderr)
     );
     let identity = String::from_utf8(result.stdout).expect("image identity is UTF-8");
     let identity = identity.trim().to_owned();
     assert!(!identity.is_empty(), "pinned Alpine image has no identity");
     identity
+}
+
+fn pinned_alpine_identity(engine: &DockerEngine) -> String {
+    image_identity_for(engine, PINNED_ALPINE)
 }
 
 fn test_unique_suffix() -> String {
@@ -255,7 +268,7 @@ fn test_unique_suffix() -> String {
 #[ignore = "requires a local Docker daemon and the pinned Alpine image"]
 fn live_docker_setup_ensure_creates_and_reuses_one_managed_app() {
     let engine = DockerEngine::docker();
-    let expected_image = image_identity(&engine);
+    let expected_image = pinned_alpine_identity(&engine);
     let root = tempfile::tempdir().expect("temporary test root");
     let state = root.path().join("state");
     let workspace = root.path().join("workspace");
@@ -383,5 +396,181 @@ fn live_docker_setup_ensure_creates_and_reuses_one_managed_app() {
             .expect("inspect exact container after cleanup")
             .is_none(),
         "exact live-test container remained after cleanup"
+    );
+}
+
+/// Run with:
+/// `cargo test -p bosn-service --test setup_ensure_docker -- --ignored --exact live_docker_setup_ensure_builds_and_reuses_inline_app`
+///
+/// This is the one-file setup acceptance path: the TOML carries its whole
+/// Dockerfile and no separately-authored Dockerfile, script, or workspace
+/// asset participates in the build. It requires a usable local Docker daemon
+/// and the exact `PINNED_ALPINE` base image to have been pre-pulled.
+#[test]
+#[ignore = "requires a local Docker daemon and the pinned Alpine image"]
+fn live_docker_setup_ensure_builds_and_reuses_inline_app() {
+    let engine = DockerEngine::docker();
+    // Check the base before creating any Bosn state. The inline build is then
+    // offline with respect to its only base-image requirement.
+    let _base_image = pinned_alpine_identity(&engine);
+    let root = tempfile::tempdir().expect("temporary test root");
+    let state = root.path().join("state");
+    let workspace = root.path().join("workspace");
+    let config_root = root.path().join("config");
+    std::fs::create_dir_all(&workspace).expect("create empty workspace");
+    std::fs::create_dir_all(&config_root).expect("create config directory");
+    let config = config_root.join("setup.toml");
+    let unique = test_unique_suffix();
+    let dockerfile = format!(
+        "FROM {PINNED_ALPINE}\nRUN printf '%s\\n' bosn-inline-{unique} > /bosn-inline-proof\nCMD [\"sh\", \"-c\", \"exec sleep 120\"]\n"
+    );
+    std::fs::write(
+        &config,
+        format!(
+            "version = 1\n[app]\ndockerfile = '''{dockerfile}'''\ncommand = 'exec sleep 120 # bosn-inline-live-{unique}'\n"
+        ),
+    )
+    .expect("write self-contained inline setup document");
+
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("construct kernal-api runtime");
+    // Planning materializes the Dockerfile into Bosn-owned state only. The
+    // test records the exact root before the production daemon is involved.
+    let plan = runtime
+        .run(plan_setup(SetupPlanRequest {
+            state_dir: state.clone(),
+            workspace: workspace.clone(),
+            locator: config.to_string_lossy().into_owned(),
+            policy: SetupAcquirePolicy::OnlineRefresh,
+        }))
+        .expect("plan self-contained inline setup document");
+    let asset_root = plan
+        .asset_root
+        .as_ref()
+        .expect("inline setup plan has generated assets");
+    assert_eq!(
+        asset_root,
+        &state.join("setup-assets").join(&plan.content_sha256),
+        "inline assets are content-addressed under Bosn state"
+    );
+    assert_eq!(
+        std::fs::read_to_string(asset_root.join("Dockerfile")).expect("read generated Dockerfile"),
+        dockerfile,
+        "generated Dockerfile comes entirely from the setup document"
+    );
+    assert!(
+        std::fs::read_dir(&workspace)
+            .expect("read untouched workspace before ensure")
+            .next()
+            .is_none(),
+        "inline planning wrote into the selected workspace"
+    );
+    let image_tag = format!("bosn-setup:{}", plan.content_sha256);
+    let container_name = format!("bosn-setup-{}", plan.content_sha256);
+    assert!(
+        inspect_container(&engine, &container_name)
+            .expect("inspect deterministic inline test container")
+            .is_none(),
+        "unique test container name already exists; refusing to touch it"
+    );
+    let cleanup = ExactContainerCleanup {
+        engine: engine.clone(),
+        container_name: container_name.clone(),
+        content_sha256: plan.content_sha256.clone(),
+    };
+    let request = SetupEnsureJobRequest {
+        workspace: workspace.clone(),
+        config: config.to_string_lossy().into_owned(),
+        policy: SetupPreparePolicy::Refresh,
+        deadline: JOB_DEADLINE,
+        output_limit: OUTPUT_LIMIT,
+    };
+
+    let mut first_daemon = DaemonChild::start(&state);
+    let first_client = wait_for_client(&runtime, &mut first_daemon, &state);
+    let first_job = runtime
+        .run(first_client.submit_setup_ensure(request.clone()))
+        .expect("submit first production inline setup ensure job");
+    wait_for_success(&runtime, &first_client, first_job);
+    let expected_image = image_identity_for(&engine, &image_tag);
+    let first = inspect_container(&engine, &container_name)
+        .expect("inspect first inline setup app")
+        .expect("first inline setup app exists");
+    assert!(first.running, "first inline setup app is not running");
+    assert_eq!(
+        first.image, expected_image,
+        "managed inline app image identity"
+    );
+    assert_eq!(first.managed, "v1", "managed ownership label");
+    assert_eq!(
+        first.content_sha256, plan.content_sha256,
+        "inline content ownership label"
+    );
+    assert_eq!(
+        first.container_name, container_name,
+        "inline container-name ownership label"
+    );
+
+    runtime
+        .run(first_client.shutdown())
+        .expect("shut down first inline daemon");
+    assert!(
+        first_daemon.wait_for_exit().success(),
+        "first inline daemon failed"
+    );
+
+    // A fresh daemon must inspect and reuse the already-built, matching
+    // container. It must not replace it or author anything in the workspace.
+    let mut second_daemon = DaemonChild::start(&state);
+    let second_client = wait_for_client(&runtime, &mut second_daemon, &state);
+    let second_job = runtime
+        .run(second_client.submit_setup_ensure(request))
+        .expect("submit second production inline setup ensure job");
+    wait_for_success(&runtime, &second_client, second_job);
+    let second = inspect_container(&engine, &container_name)
+        .expect("inspect reused inline setup app")
+        .expect("reused inline setup app exists");
+    assert!(second.running, "reused inline setup app is not running");
+    assert_eq!(
+        second.id, first.id,
+        "matching inline app was replaced instead of reused"
+    );
+    assert_eq!(
+        second.image, expected_image,
+        "reused inline app image identity"
+    );
+    assert_eq!(second.managed, "v1", "reused managed ownership label");
+    assert_eq!(
+        second.content_sha256, plan.content_sha256,
+        "reused inline content label"
+    );
+    assert_eq!(
+        second.container_name, container_name,
+        "reused inline container-name ownership label"
+    );
+
+    runtime
+        .run(second_client.shutdown())
+        .expect("shut down second inline daemon");
+    assert!(
+        second_daemon.wait_for_exit().success(),
+        "second inline daemon failed"
+    );
+    assert!(
+        std::fs::read_dir(&workspace)
+            .expect("read workspace after inline ensure")
+            .next()
+            .is_none(),
+        "inline setup ensure wrote into the selected workspace"
+    );
+    drop(cleanup);
+    assert!(
+        inspect_container(&engine, &container_name)
+            .expect("inspect exact inline container after cleanup")
+            .is_none(),
+        "exact inline live-test container remained after cleanup"
     );
 }
