@@ -1,0 +1,15 @@
+[package]
+name = "bosn-setup"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+bosn-core = { path = "../bosn-core" }
+kernal-api = { git = "https://github.com/zackees/kernal-api", rev = "fc634e507024d63ccaaf75fa564818b9dcfbff36", version = "=0.1.0", default-features = false, features = ["fs", "hash-sha256", "http-client", "ipc"] }
+
+[dev-dependencies]
+tempfile = "=3.27.0"
