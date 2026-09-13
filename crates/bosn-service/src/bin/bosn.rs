@@ -1,4 +1,4 @@
-//! Native Bosn command development entry point.
+//! Native Bosn command entry point.
 //!
 //! Python packaging invokes the same `bosn-service::mcp::serve_stdio` function
 //! through PyO3 today. This binary makes `cargo run -p bosn-service --bin bosn
@@ -30,9 +30,173 @@ fn main() {
     };
     match command.to_string_lossy().as_ref() {
         "mcp" => run_mcp(arguments),
+        "daemon" => run_daemon(arguments),
         "setup" => run_setup(arguments),
         "job" => run_job(arguments),
         _ => usage(),
+    }
+}
+
+/// Run the deliberately small, package-ready foreground daemon surface. It
+/// does not fork, register an autostart entry, or make Docker calls. The
+/// service itself owns state-directory hardening, registry-writer exclusion,
+/// and authenticated local IPC.
+fn run_daemon(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
+    let Some(command) = arguments.next() else {
+        usage();
+    };
+    let invocation = match command.to_string_lossy().as_ref() {
+        "serve" => parse_daemon_serve_arguments(arguments)
+            .map(|state_dir| DaemonInvocation::Serve { state_dir }),
+        "status" => parse_daemon_client_arguments(arguments)
+            .map(|(state_dir, json)| DaemonInvocation::Status { state_dir, json }),
+        "stop" => parse_daemon_client_arguments(arguments)
+            .map(|(state_dir, json)| DaemonInvocation::Stop { state_dir, json }),
+        _ => Err(()),
+    };
+    let invocation = match invocation {
+        Ok(invocation) => invocation,
+        Err(()) => usage(),
+    };
+
+    let runtime = match RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => daemon_failure(invocation.action(), invocation.json()),
+    };
+    match invocation {
+        DaemonInvocation::Serve { state_dir } => {
+            if runtime
+                .run(bosn_service::Service::new(state_dir).serve())
+                .is_err()
+            {
+                daemon_failure("serve", false);
+            }
+            println!("daemon stopped");
+        }
+        DaemonInvocation::Status { state_dir, json } => {
+            let status = match Client::for_state(&state_dir)
+                .and_then(|client| runtime.run(client.status()))
+            {
+                Ok(status) => status,
+                Err(_) => daemon_failure("status", json),
+            };
+            print_daemon_status(&status, json);
+        }
+        DaemonInvocation::Stop { state_dir, json } => {
+            if Client::for_state(&state_dir)
+                .and_then(|client| runtime.run(client.shutdown()))
+                .is_err()
+            {
+                daemon_failure("stop", json);
+            }
+            if json {
+                println!("{}", json!({"action": "daemon_stop", "stopped": true}));
+            } else {
+                println!("daemon stopped");
+            }
+        }
+    }
+}
+
+enum DaemonInvocation {
+    Serve { state_dir: PathBuf },
+    Status { state_dir: PathBuf, json: bool },
+    Stop { state_dir: PathBuf, json: bool },
+}
+
+impl DaemonInvocation {
+    fn action(&self) -> &'static str {
+        match self {
+            Self::Serve { .. } => "serve",
+            Self::Status { .. } => "status",
+            Self::Stop { .. } => "stop",
+        }
+    }
+
+    fn json(&self) -> bool {
+        match self {
+            Self::Serve { .. } => false,
+            Self::Status { json, .. } | Self::Stop { json, .. } => *json,
+        }
+    }
+}
+
+/// Parse every daemon argument before constructing a runtime, asking the
+/// client to resolve an endpoint, or allowing `serve` to create state.
+fn parse_daemon_serve_arguments(
+    mut arguments: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<PathBuf, ()> {
+    let mut state_dir = None;
+    while let Some(argument) = arguments.next() {
+        match argument.to_string_lossy().as_ref() {
+            "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
+            _ => Err(()),
+        }?;
+    }
+    state_dir.ok_or(())
+}
+
+fn parse_daemon_client_arguments(
+    mut arguments: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(PathBuf, bool), ()> {
+    let mut state_dir = None;
+    let mut json = false;
+    while let Some(argument) = arguments.next() {
+        match argument.to_string_lossy().as_ref() {
+            "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
+            "--json" if !json => {
+                json = true;
+                Ok(())
+            }
+            _ => Err(()),
+        }?;
+    }
+    Ok((state_dir.ok_or(())?, json))
+}
+
+fn daemon_failure(action: &str, json: bool) -> ! {
+    if json {
+        println!(
+            "{}",
+            json!({"action": format!("daemon_{action}"), "error": "request failed"})
+        );
+    } else {
+        eprintln!("bosn daemon {action}: request failed");
+    }
+    std::process::exit(1)
+}
+
+fn print_daemon_status(status: &bosn_service::Status, json: bool) {
+    if json {
+        println!(
+            "{}",
+            json!({
+                "action": "daemon_status",
+                "daemon": "online",
+                "registry_id": status.registry_id,
+                "schema_version": status.schema_version,
+                "resources": status.resources,
+                "leases": status.leases,
+                "sessions": status.sessions,
+                "reconciliation_required": status.reconciliation_required,
+            })
+        );
+    } else {
+        println!("daemon status");
+        println!("daemon: online");
+        println!("registry_id: {}", status.registry_id);
+        println!("schema_version: {}", status.schema_version);
+        println!("resources: {}", status.resources);
+        println!("leases: {}", status.leases);
+        println!("sessions: {}", status.sessions);
+        println!(
+            "reconciliation_required: {}",
+            status.reconciliation_required
+        );
     }
 }
 
@@ -585,6 +749,9 @@ fn print_json(plan: &SetupPlan) {
 
 fn usage() -> ! {
     eprintln!("usage: bosn mcp [--state-dir STATE_DIR]");
+    eprintln!("   or: bosn daemon serve --state-dir STATE_DIR");
+    eprintln!("   or: bosn daemon status --state-dir STATE_DIR [--json]");
+    eprintln!("   or: bosn daemon stop --state-dir STATE_DIR [--json]");
     eprintln!(
         "   or: bosn setup plan --state-dir STATE_DIR --workspace WORKSPACE --config LOCATOR (--refresh | --offline) [--json]"
     );
