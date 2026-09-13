@@ -65,6 +65,23 @@ The primitive is submitted through typed daemon IPC and the bounded native,
 Python, and MCP job-submission surfaces. It deliberately still has no registry
 persistence or broader container lifecycle wiring.
 
+An opt-in live-Docker acceptance test proves the production daemon's complete
+plan, image-prepare, and named-task pipeline from one self-contained TOML:
+
+```text
+soldr cargo test -j1 -p bosn-service --test setup_task_docker --locked -- --ignored --exact live_docker_setup_task_runs_only_the_declared_one_file_task
+```
+
+It uses the exact pre-pulled Alpine digest named in the test, checks bounded
+stdout/stderr job logs and the document-derived mount/workdir/environment
+artifact, then verifies the ephemeral task container is already gone (`--rm`).
+It restarts the daemon, removes the source TOML, and repeats the named task
+from the verified offline receipt. The request surface deliberately contains
+only workspace, config, policy, task name, deadline, and output budget; it
+cannot carry a command, image, mount, environment, workdir, container name, or
+raw Docker argument. The test performs no Docker cleanup: each short-lived
+task container removes itself, and it never deletes images or persistent apps.
+
 ### Setup-app ensure core primitive
 
 `bosn-setup::ensure_setup_app` is the next deliberately narrow core primitive
