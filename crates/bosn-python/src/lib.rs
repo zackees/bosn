@@ -6,7 +6,8 @@
 use bosn_core::parse_setup_config_locator;
 use bosn_service::{
     Client as ServiceClient, JobLogPage as ServiceJobLogPage, JobStatus as ServiceJobStatus,
-    SetupPreparePolicy, SetupPrepareRequest, SetupTaskJobRequest, Status as ServiceStatus,
+    SetupEnsureJobRequest, SetupPreparePolicy, SetupPrepareRequest, SetupTaskJobRequest,
+    Status as ServiceStatus,
 };
 use bosn_setup::{
     SetupAcquirePolicy, SetupPlan as RustSetupPlan, SetupPlanAppSource, SetupPlanRequest,
@@ -159,6 +160,45 @@ impl Client {
                     config: config_locator,
                     policy,
                     task_name,
+                    deadline: Duration::from_millis(deadline_ms),
+                    output_limit: output_limit as usize,
+                },
+            )
+            .map_err(service_error)
+        })
+    }
+
+    /// Submit one complete, daemon-owned setup application ensure and return
+    /// its durable job ID without waiting for planning, image preparation, or
+    /// application mutation.
+    ///
+    /// The application name, image, command, mounts, environment, labels,
+    /// working directory, and engine choices are derived solely from the
+    /// validated setup document. This method exposes no Docker, container,
+    /// command, mount, process, or task controls. `policy`, `deadline_ms`,
+    /// and `output_limit` use the same bounded semantic contract as
+    /// [`Self::submit_setup_prepare`]. The GIL is released only for the
+    /// authenticated IPC roundtrip.
+    #[pyo3(signature = (workspace, config_locator, *, policy, deadline_ms, output_limit))]
+    fn submit_setup_ensure(
+        &self,
+        workspace: PathBuf,
+        config_locator: String,
+        policy: &str,
+        deadline_ms: u64,
+        output_limit: u32,
+        py: Python<'_>,
+    ) -> PyResult<u64> {
+        let policy = parse_prepare_policy(policy)?;
+        validate_setup_prepare_input(&workspace, &config_locator, deadline_ms, output_limit)?;
+        let state_dir = self.state_dir.clone();
+        py.detach(move || {
+            submit_setup_ensure(
+                &state_dir,
+                SetupEnsureJobRequest {
+                    workspace,
+                    config: config_locator,
+                    policy,
                     deadline: Duration::from_millis(deadline_ms),
                     output_limit: output_limit as usize,
                 },
@@ -438,6 +478,21 @@ fn submit_setup_task(
     })
 }
 
+fn submit_setup_ensure(
+    state_dir: &Path,
+    request: SetupEnsureJobRequest,
+) -> Result<u64, bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async {
+        ServiceClient::for_state(state_dir)?
+            .submit_setup_ensure(request)
+            .await
+    })
+}
+
 fn job_status(state_dir: &Path, job_id: u64) -> Result<ServiceJobStatus, bosn_service::Error> {
     let runtime = RuntimeBuilder::multi_thread()
         .worker_threads(1)
@@ -684,7 +739,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
     #[cfg(feature = "embedded-python-tests")]
-    use bosn_service::{Service, SetupPrepareExecutor, SetupTaskExecutor};
+    use bosn_service::{Service, SetupEnsureExecutor, SetupPrepareExecutor, SetupTaskExecutor};
     #[cfg(feature = "embedded-python-tests")]
     use kernal_api::async_engine::{self, CancellationToken, RuntimeBuilder, Sender};
     #[cfg(feature = "embedded-python-tests")]
@@ -776,6 +831,47 @@ mod tests {
                     async_engine::sleep(Duration::from_millis(10)).await;
                 }
                 Ok("fake task completed".into())
+            })
+        }
+    }
+
+    #[cfg(feature = "embedded-python-tests")]
+    struct FakeSetupEnsureExecutor {
+        started: AtomicUsize,
+        cancelled: AtomicUsize,
+    }
+
+    #[cfg(feature = "embedded-python-tests")]
+    impl FakeSetupEnsureExecutor {
+        fn new() -> Self {
+            Self {
+                started: AtomicUsize::new(0),
+                cancelled: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[cfg(feature = "embedded-python-tests")]
+    impl SetupEnsureExecutor for FakeSetupEnsureExecutor {
+        fn execute<'a>(
+            &'a self,
+            _request: SetupEnsureJobRequest,
+            cancellation: &'a CancellationToken,
+            logs: &'a Sender<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.started.fetch_add(1, Ordering::SeqCst);
+                logs.send("[fake] setup ensure started".into())
+                    .await
+                    .map_err(|_| "fake log consumer closed".to_owned())?;
+                for _ in 0..100 {
+                    if cancellation.is_cancelled() {
+                        self.cancelled.fetch_add(1, Ordering::SeqCst);
+                        return Err("fake ensure cancellation observed".into());
+                    }
+                    async_engine::sleep(Duration::from_millis(10)).await;
+                }
+                Ok("fake setup ensured".into())
             })
         }
     }
@@ -985,6 +1081,89 @@ mod tests {
 
     #[cfg(feature = "embedded-python-tests")]
     #[test]
+    fn python_client_submits_and_cancels_coalesced_fake_setup_ensure_without_docker() {
+        Python::initialize();
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let executor = Arc::new(FakeSetupEnsureExecutor::new());
+        RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let server = async_engine::launch(
+                    Service::new(state.clone())
+                        .with_setup_ensure_executor(executor.clone())
+                        .serve(),
+                );
+                let wire_client = wait_for_client(&state).await;
+                let submitted = Instant::now();
+                let python_state = state.clone();
+                let python_workspace = workspace.clone();
+                let (first, second) = std::thread::spawn(move || {
+                    Python::initialize();
+                    Python::attach(|py| {
+                        let python_client = Client {
+                            state_dir: python_state,
+                        };
+                        let first = python_client.submit_setup_ensure(
+                            python_workspace.clone(),
+                            "https://example.invalid/setup.toml".into(),
+                            "online_refresh",
+                            2_000,
+                            4 * 1024,
+                            py,
+                        )?;
+                        let second = python_client.submit_setup_ensure(
+                            python_workspace,
+                            "https://example.invalid/setup.toml".into(),
+                            "online_refresh",
+                            2_000,
+                            4 * 1024,
+                            py,
+                        )?;
+                        Ok::<_, PyErr>((first, second))
+                    })
+                })
+                .join()
+                .expect("Python submit thread panicked")
+                .unwrap();
+                assert!(submitted.elapsed() < Duration::from_millis(250));
+                assert_eq!(first, second);
+
+                wait_for(|| executor.started.load(Ordering::SeqCst) == 1).await;
+                let page = wait_for_python_logs(&state, first).await;
+                assert_eq!(page.records[0].line, "[fake] setup ensure started");
+
+                let python_state = state.clone();
+                std::thread::spawn(move || {
+                    Python::attach(|py| {
+                        Client {
+                            state_dir: python_state,
+                        }
+                        .cancel_job(first, py)
+                    })
+                })
+                .join()
+                .expect("Python cancellation thread panicked")
+                .unwrap();
+                wait_for_job_state(&wire_client, first, "Cancelled").await;
+                assert_eq!(executor.cancelled.load(Ordering::SeqCst), 1);
+
+                wire_client.shutdown().await.unwrap();
+                async_engine::timeout(Duration::from_secs(5), server)
+                    .await
+                    .expect("service did not stop")
+                    .expect("service task failed")
+                    .expect("service returned error");
+            });
+    }
+
+    #[cfg(feature = "embedded-python-tests")]
+    #[test]
     fn python_prepare_input_and_diagnostics_do_not_expose_credentials() {
         Python::initialize();
         let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
@@ -998,6 +1177,31 @@ mod tests {
                     "https://user:top-secret@example.invalid/setup.toml".into(),
                     "online_refresh",
                     1_000,
+                    4 * 1024,
+                    py,
+                )
+                .unwrap_err();
+            assert!(error.is_instance_of::<PyValueError>(py));
+
+            let error = client
+                .submit_setup_ensure(
+                    temporary.path().join("workspace"),
+                    "https://user:ensure-secret@example.invalid/setup.toml".into(),
+                    "online_refresh",
+                    1_000,
+                    4 * 1024,
+                    py,
+                )
+                .unwrap_err();
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert!(!error.to_string().contains("ensure-secret"));
+
+            let error = client
+                .submit_setup_ensure(
+                    temporary.path().join("workspace"),
+                    "https://example.invalid/setup.toml".into(),
+                    "online_refresh",
+                    0,
                     4 * 1024,
                     py,
                 )

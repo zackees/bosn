@@ -198,3 +198,55 @@ def test_native_setup_task_rejects_bad_input_and_missing_daemon_without_docker(
             output_limit=4 * 1024,
         )
     assert "example.invalid" not in str(error.value)
+
+
+def test_native_setup_ensure_rejects_bad_input_and_missing_daemon_without_docker(
+    tmp_path: Path,
+) -> None:
+    client = bosn.Client(tmp_path / "state")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with pytest.raises(ValueError, match="policy must"):
+        client.submit_setup_ensure(
+            workspace,
+            "https://example.invalid/setup.toml",
+            policy="refresh",
+            deadline_ms=1_000,
+            output_limit=4 * 1024,
+        )
+    secret_locator = "https://user:top-secret@example.invalid/setup.toml"
+    with pytest.raises(ValueError, match="setup config locator is invalid") as error:
+        client.submit_setup_ensure(
+            workspace,
+            secret_locator,
+            policy="online_refresh",
+            deadline_ms=1_000,
+            output_limit=4 * 1024,
+        )
+    assert "top-secret" not in str(error.value)
+    with pytest.raises(ValueError, match="deadline_ms must"):
+        client.submit_setup_ensure(
+            workspace,
+            "https://example.invalid/setup.toml",
+            policy="online_refresh",
+            deadline_ms=0,
+            output_limit=4 * 1024,
+        )
+    with pytest.raises(ValueError, match="output_limit must"):
+        client.submit_setup_ensure(
+            workspace,
+            "https://example.invalid/setup.toml",
+            policy="online_refresh",
+            deadline_ms=1_000,
+            output_limit=0,
+        )
+    with pytest.raises(RuntimeError, match="daemon") as error:
+        client.submit_setup_ensure(
+            workspace,
+            "https://example.invalid/setup.toml",
+            policy="online_refresh",
+            deadline_ms=1_000,
+            output_limit=4 * 1024,
+        )
+    assert "example.invalid" not in str(error.value)
