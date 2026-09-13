@@ -391,6 +391,23 @@ impl DockerEngine {
             info,
         })
     }
+    /// Run Bosn's fixed, read-only Docker health probe.  Unlike [`Self::capture`]
+    /// and [`Self::diagnostics`], this is safe to expose through a product
+    /// diagnostic boundary: callers cannot select argv and no engine output is
+    /// returned.  The single `docker version` invocation is bounded by the
+    /// supplied deadline/output limit and does not pull, inspect, or mutate
+    /// engine state.
+    pub async fn doctor_async(&self, options: RunOptions) -> DockerDoctorReport {
+        let result = self
+            .with_args([
+                "version",
+                "--format",
+                "{{.Client.Version}}|{{.Server.Version}}",
+            ])
+            .capture_async(options)
+            .await;
+        doctor_report(result)
+    }
     /// Append trusted, product-selected Docker CLI arguments. This local
     /// transport is not a sandbox or authorization boundary and is not RPC.
     #[must_use]
@@ -418,6 +435,82 @@ pub struct DockerDiagnostics {
     pub client: CommandResult,
     pub server: CommandResult,
     pub info: CommandResult,
+}
+
+/// Stable, redacted outcome of the fixed Docker health probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerDoctorReport {
+    pub state: DockerDoctorState,
+    pub client_version: Option<String>,
+    pub server_version: Option<String>,
+}
+
+/// No raw Docker stderr, endpoint, environment, or process error crosses this
+/// type.  `Unavailable` includes absent binaries and unreachable daemons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockerDoctorState {
+    Ready,
+    Unavailable,
+    Deadline,
+    OutputLimit,
+    InvalidResponse,
+}
+
+fn doctor_report(result: Result<CommandResult, CommandError>) -> DockerDoctorReport {
+    let unavailable = || DockerDoctorReport {
+        state: DockerDoctorState::Unavailable,
+        client_version: None,
+        server_version: None,
+    };
+    let result = match result {
+        Ok(result) if result.ok() => result,
+        Ok(_) | Err(CommandError::Spawn(_)) | Err(CommandError::Io(_)) => return unavailable(),
+        Err(CommandError::Deadline { .. }) => {
+            return DockerDoctorReport {
+                state: DockerDoctorState::Deadline,
+                client_version: None,
+                server_version: None,
+            };
+        }
+        Err(CommandError::OutputLimit { .. }) => {
+            return DockerDoctorReport {
+                state: DockerDoctorState::OutputLimit,
+                client_version: None,
+                server_version: None,
+            };
+        }
+        Err(_) => return unavailable(),
+    };
+    let Ok(text) = std::str::from_utf8(&result.stdout) else {
+        return invalid_doctor_response();
+    };
+    let Some((client, server)) = text.trim_end_matches(['\r', '\n']).split_once('|') else {
+        return invalid_doctor_response();
+    };
+    if !valid_version(client) || !valid_version(server) || server.contains('|') {
+        return invalid_doctor_response();
+    }
+    DockerDoctorReport {
+        state: DockerDoctorState::Ready,
+        client_version: Some(client.into()),
+        server_version: Some(server.into()),
+    }
+}
+
+fn invalid_doctor_response() -> DockerDoctorReport {
+    DockerDoctorReport {
+        state: DockerDoctorState::InvalidResponse,
+        client_version: None,
+        server_version: None,
+    }
+}
+
+fn valid_version(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'_'))
 }
 
 fn event_bytes(event: &EngineEvent) -> &[u8] {
@@ -506,7 +599,7 @@ fn map_bounded(error: BoundedProcessError) -> CommandError {
 
 #[cfg(test)]
 mod tests {
-    use super::CommandError;
+    use super::{CommandError, CommandResult, DockerDoctorState, doctor_report};
 
     #[test]
     fn error_display_claims_reaping_only_after_confirmed_cleanup() {
@@ -572,5 +665,33 @@ mod tests {
             .to_string(),
             "Docker CLI output consumer closed and was reaped"
         );
+    }
+
+    #[test]
+    fn doctor_result_is_structured_and_never_retains_raw_output() {
+        let ready = doctor_report(Ok(CommandResult {
+            exit_code: 0,
+            stdout: b"29.0.1|29.0.1\n".to_vec(),
+            stderr: b"secret engine warning".to_vec(),
+        }));
+        assert_eq!(ready.state, DockerDoctorState::Ready);
+        assert_eq!(ready.client_version.as_deref(), Some("29.0.1"));
+        assert_eq!(ready.server_version.as_deref(), Some("29.0.1"));
+
+        let invalid = doctor_report(Ok(CommandResult {
+            exit_code: 0,
+            stdout: b"version|value|extra".to_vec(),
+            stderr: Vec::new(),
+        }));
+        assert_eq!(invalid.state, DockerDoctorState::InvalidResponse);
+        assert_eq!(invalid.client_version, None);
+
+        let limited = doctor_report(Err(CommandError::OutputLimit {
+            limit: 1,
+            reaped_pid: None,
+            cleanup: None,
+        }));
+        assert_eq!(limited.state, DockerDoctorState::OutputLimit);
+        assert_eq!(limited.server_version, None);
     }
 }

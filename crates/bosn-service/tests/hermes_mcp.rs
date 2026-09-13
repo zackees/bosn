@@ -312,18 +312,18 @@ fn hermes_agent_stdio_contract_survives_daemon_restart() {
         OsString::from("--env"),
         OsString::from(format!("BOSN_STATE_DIR={}", state.display())),
     ];
-    if let Some(value) = env::var_os("LD_LIBRARY_PATH") {
-        if !value.is_empty() {
-            add_args.push(OsString::from(format!(
-                "LD_LIBRARY_PATH={}",
-                value.to_string_lossy()
-            )));
-        }
+    if let Some(value) = env::var_os("LD_LIBRARY_PATH")
+        && !value.is_empty()
+    {
+        add_args.push(OsString::from(format!(
+            "LD_LIBRARY_PATH={}",
+            value.to_string_lossy()
+        )));
     }
     add_args.extend([OsString::from("--args"), OsString::from("mcp")]);
     let registered = hermes(&add_args, &hermes_home, Some(b"y\n"));
     let registered_stdout = hermes_stdout(&registered);
-    assert!(registered_stdout.contains("Connected! Found 8 tool(s)"));
+    assert!(registered_stdout.contains("Connected! Found 11 tool(s)"));
     assert!(registered_stdout.contains("Saved 'bosn-contract'"));
 
     let discovery = hermes(
@@ -338,6 +338,7 @@ fn hermes_agent_stdio_contract_survives_daemon_restart() {
     let discovery_stdout = hermes_stdout(&discovery);
     for tool in [
         "bosn_status",
+        "bosn_doctor",
         "bosn_job_status",
         "bosn_job_logs",
         "bosn_job_cancel",

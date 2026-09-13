@@ -15,9 +15,9 @@
 //! numeric arguments are bounded before they reach the native daemon.
 
 use crate::{
-    Client, Error, JobLogPage, JobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE, RegistryResourcePage,
-    SetupEnsureEventPage, SetupEnsureJobRequest, SetupPreparePolicy, SetupPrepareRequest,
-    SetupTaskJobRequest, Status,
+    Client, DoctorReport, Error, JobLogPage, JobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE,
+    RegistryResourcePage, SetupEnsureEventPage, SetupEnsureJobRequest, SetupPreparePolicy,
+    SetupPrepareRequest, SetupTaskJobRequest, Status,
 };
 use bosn_setup::{
     SetupAcquirePolicy, SetupPlan, SetupPlanAppSource, SetupPlanRequest, SetupSourceKind,
@@ -96,6 +96,7 @@ pub fn serve_stdio(state_dir: impl Into<PathBuf>) -> Result<(), Error> {
 
 trait Backend {
     fn status(&mut self) -> Result<Status, Error>;
+    fn doctor(&mut self) -> Result<DoctorReport, Error>;
     fn registry_resources(&mut self, after: u64, limit: u32)
     -> Result<RegistryResourcePage, Error>;
     fn setup_ensure_events(
@@ -136,6 +137,9 @@ struct DaemonBackend<'a> {
 impl Backend for DaemonBackend<'_> {
     fn status(&mut self) -> Result<Status, Error> {
         self.runtime.run(self.client.status())
+    }
+    fn doctor(&mut self) -> Result<DoctorReport, Error> {
+        self.runtime.run(self.client.doctor())
     }
     fn registry_resources(
         &mut self,
@@ -314,6 +318,12 @@ fn tools_list() -> Value {
                 "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
             },
             {
+                "name": "bosn_doctor",
+                "description": "Run fixed daemon-owned, read-only registry integrity and Docker version checks. It accepts no arguments, never starts a daemon, initializes or migrates a registry, mutates Docker, or returns raw engine output.",
+                "inputSchema": {"type": "object", "additionalProperties": false},
+                "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
+            },
+            {
                 "name": "bosn_registry_resources",
                 "description": "Read a bounded cursor page of path-safe managed-resource diagnostics from the already-running native Bosn daemon. Does not start a daemon, initialize a registry, or mutate state.",
                 "inputSchema": registry_page_schema(),
@@ -483,6 +493,15 @@ fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
             backend
                 .status()
                 .map(status_json)
+                .map_err(|_| ToolFailure::Daemon)
+        }
+        "bosn_doctor" => {
+            if !arguments.is_empty() {
+                return tool_error("bosn_doctor accepts no arguments");
+            }
+            backend
+                .doctor()
+                .map(doctor_json)
                 .map_err(|_| ToolFailure::Daemon)
         }
         "bosn_registry_resources" => {
@@ -855,6 +874,16 @@ fn status_json(status: Status) -> Value {
     })
 }
 
+fn doctor_json(report: DoctorReport) -> Value {
+    json!({
+        "daemon": report.daemon,
+        "registry": report.registry,
+        "engine": report.engine,
+        "client_version": report.client_version,
+        "server_version": report.server_version,
+    })
+}
+
 fn resource_page_json(page: RegistryResourcePage) -> Value {
     let records: Vec<Value> = page
         .records
@@ -984,6 +1013,15 @@ mod tests {
                 leases: 2,
                 sessions: 1,
                 reconciliation_required: false,
+            })
+        }
+        fn doctor(&mut self) -> Result<DoctorReport, Error> {
+            Ok(DoctorReport {
+                daemon: "ready".into(),
+                registry: "ready".into(),
+                engine: "unavailable".into(),
+                client_version: None,
+                server_version: None,
             })
         }
         fn registry_resources(
@@ -1155,6 +1193,7 @@ mod tests {
             names,
             [
                 "bosn_status",
+                "bosn_doctor",
                 "bosn_registry_resources",
                 "bosn_setup_ensure_events",
                 "bosn_job_status",
@@ -1173,6 +1212,14 @@ mod tests {
             .find(|tool| tool["name"] == "bosn_registry_resources")
             .unwrap();
         assert_eq!(resources["annotations"]["readOnlyHint"], true);
+        let doctor = replies[1]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "bosn_doctor")
+            .unwrap();
+        assert_eq!(doctor["annotations"]["readOnlyHint"], true);
+        assert_eq!(doctor["inputSchema"]["additionalProperties"], false);
         assert_eq!(resources["inputSchema"]["additionalProperties"], false);
         let prepare = replies[1]["result"]["tools"]
             .as_array()
@@ -1255,6 +1302,27 @@ mod tests {
         );
         assert_eq!(replies[2]["result"]["isError"], false);
         assert_eq!(replies[2]["result"]["structuredContent"]["resources"], 3);
+    }
+
+    #[test]
+    fn doctor_tool_is_no_argument_and_returns_only_stable_fields() {
+        let mut backend = FakeBackend::default();
+        let success = call_tool(
+            json!({"name": "bosn_doctor", "arguments": {}}),
+            &mut backend,
+        );
+        assert_eq!(success["isError"], false);
+        let report = &success["structuredContent"];
+        assert_eq!(report["daemon"], "ready");
+        assert_eq!(report["registry"], "ready");
+        assert_eq!(report["engine"], "unavailable");
+        assert!(report.get("docker_args").is_none());
+
+        let rejected = call_tool(
+            json!({"name": "bosn_doctor", "arguments": {"deadline_ms": 1}}),
+            &mut backend,
+        );
+        assert_eq!(rejected["isError"], true);
     }
 
     #[test]

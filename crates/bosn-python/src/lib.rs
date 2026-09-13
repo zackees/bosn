@@ -5,8 +5,9 @@
 
 use bosn_core::parse_setup_config_locator;
 use bosn_service::{
-    Client as ServiceClient, JobLogPage as ServiceJobLogPage, JobStatus as ServiceJobStatus,
-    MAX_REGISTRY_DIAGNOSTIC_PAGE, RegistryResourcePage as ServiceRegistryResourcePage,
+    Client as ServiceClient, DoctorReport as ServiceDoctorReport, JobLogPage as ServiceJobLogPage,
+    JobStatus as ServiceJobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE,
+    RegistryResourcePage as ServiceRegistryResourcePage,
     SetupEnsureEventPage as ServiceSetupEnsureEventPage, SetupEnsureJobRequest, SetupPreparePolicy,
     SetupPrepareRequest, SetupTaskJobRequest, Status as ServiceStatus,
 };
@@ -56,6 +57,19 @@ impl Client {
             .detach(move || status(&state_dir).map_err(|error| error.to_string()))
             .map_err(PyRuntimeError::new_err)?;
         Ok(Status::from(status))
+    }
+
+    /// Run fixed, daemon-owned read-only health checks. This accepts no
+    /// Docker, command, path, deadline, or output controls. An absent daemon
+    /// is returned as the typed ``"unavailable"`` state rather than causing
+    /// this extension to open or initialize a registry.
+    fn doctor(&self, py: Python<'_>) -> PyResult<DoctorReport> {
+        let state_dir = self.state_dir.clone();
+        py.detach(move || {
+            doctor(&state_dir)
+                .map(DoctorReport::from)
+                .map_err(service_error)
+        })
     }
 
     /// Read a bounded page of path-safe managed-resource diagnostics from the
@@ -314,6 +328,33 @@ impl From<ServiceStatus> for Status {
             leases: value.leases,
             sessions: value.sessions,
             reconciliation_required: value.reconciliation_required,
+        }
+    }
+}
+
+/// Stable bounded health result returned by [`Client::doctor`]. Versions are
+/// present only when the daemon's fixed Docker version probe succeeded.
+#[pyclass(module = "bosn._native", frozen)]
+pub struct DoctorReport {
+    #[pyo3(get)]
+    daemon: String,
+    #[pyo3(get)]
+    registry: String,
+    #[pyo3(get)]
+    engine: String,
+    #[pyo3(get)]
+    client_version: Option<String>,
+    #[pyo3(get)]
+    server_version: Option<String>,
+}
+impl From<ServiceDoctorReport> for DoctorReport {
+    fn from(value: ServiceDoctorReport) -> Self {
+        Self {
+            daemon: value.daemon,
+            registry: value.registry,
+            engine: value.engine,
+            client_version: value.client_version,
+            server_version: value.server_version,
         }
     }
 }
@@ -625,6 +666,14 @@ fn status(state_dir: &Path) -> Result<ServiceStatus, bosn_service::Error> {
         .enable_all()
         .build()?;
     runtime.run(async { ServiceClient::for_state(state_dir)?.status().await })
+}
+
+fn doctor(state_dir: &Path) -> Result<ServiceDoctorReport, bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async { ServiceClient::for_state(state_dir)?.doctor().await })
 }
 
 fn registry_resources(
@@ -943,6 +992,7 @@ fn run_mcp(state_dir: PathBuf, py: Python<'_>) -> PyResult<()> {
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Client>()?;
     module.add_class::<Status>()?;
+    module.add_class::<DoctorReport>()?;
     module.add_class::<JobStatus>()?;
     module.add_class::<JobLogRecord>()?;
     module.add_class::<JobLogPage>()?;
@@ -1489,12 +1539,13 @@ mod tests {
                 let server = async_engine::launch(Service::new(state.clone()).serve());
                 let wire = wait_for_client(&state).await;
                 let python_state = state.clone();
-                let (resources, events) = std::thread::spawn(move || {
+                let (doctor, resources, events) = std::thread::spawn(move || {
                     Python::attach(|py| {
                         let client = Client {
                             state_dir: python_state,
                         };
                         Ok::<_, PyErr>((
+                            client.doctor(py)?,
                             client.registry_resources(0, 1, py)?,
                             client.setup_ensure_events(0, 1, py)?,
                         ))
@@ -1503,6 +1554,8 @@ mod tests {
                 .join()
                 .unwrap()
                 .unwrap();
+                assert_eq!(doctor.daemon, "ready");
+                assert_eq!(doctor.registry, "ready");
                 assert!(resources.records.is_empty());
                 assert!(events.records.is_empty());
                 let direct = wire.registry_resources(0, 1).await.unwrap();
