@@ -24,6 +24,12 @@ fn remote_document(task: &str) -> String {
     )
 }
 
+fn remote_compose_document() -> String {
+    format!(
+        "services:\n  app:\n    image: registry.example/remote@sha256:{DIGEST}\n    environment:\n      LOG_LEVEL: info\n"
+    )
+}
+
 fn run_bosn(certificate: &Path, args: &[&OsStr]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_bosn"))
         // Trust is passed only to this child. Bosn constructs its ordinary
@@ -197,5 +203,62 @@ fn production_https_plan_records_redacted_provenance_and_reuses_cache_offline() 
     assert!(
         !text(&rejected).contains(TEST_SECRET),
         "credential leaked through rejected setup diagnostics"
+    );
+}
+
+#[test]
+fn production_https_compose_yaml_plan_uses_only_the_lossless_typed_adapter() {
+    let root = tempfile::tempdir().expect("temporary test root");
+    let state = root.path().join("state");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("create selected workspace");
+    let document = remote_compose_document();
+    let mut server = TlsSetupServer::start(document.as_bytes());
+    let locator = server.url("/compose.yaml?revision=1");
+    let certificate = certificate_path();
+
+    let online = run_bosn(
+        &certificate,
+        &plan_args(&state, &workspace, &locator, "--refresh"),
+    );
+    assert!(
+        online.status.success(),
+        "online Compose plan failed: {}",
+        text(&online)
+    );
+    let online_json: Value = serde_json::from_slice(&online.stdout).expect("online plan JSON");
+    assert_eq!(online_json["action"], "plan");
+    assert_eq!(online_json["applied"], false);
+    assert_eq!(online_json["source_kind"], "https");
+    assert_eq!(
+        online_json["content_sha256"],
+        sha256_bytes(document.as_bytes()).to_hex()
+    );
+    assert_eq!(online_json["task_names"], serde_json::json!([]));
+    assert_eq!(online_json["app_source"]["kind"], "pinned_image");
+    assert_eq!(
+        online_json["app_source"]["image"],
+        format!("registry.example/remote@sha256:{DIGEST}")
+    );
+    assert_eq!(server.request_count(), 1);
+
+    server.stop();
+    let offline = run_bosn(
+        &certificate,
+        &plan_args(&state, &workspace, &locator, "--offline"),
+    );
+    assert!(
+        offline.status.success(),
+        "offline cached Compose plan failed: {}",
+        text(&offline)
+    );
+    let offline_json: Value = serde_json::from_slice(&offline.stdout).expect("offline plan JSON");
+    assert_eq!(offline_json, online_json);
+    assert!(
+        std::fs::read_dir(&workspace)
+            .expect("read selected workspace")
+            .next()
+            .is_none(),
+        "Compose setup planning wrote into selected workspace"
     );
 }

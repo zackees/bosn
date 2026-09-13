@@ -16,7 +16,7 @@ use std::{
 
 use bosn_core::{
     MAX_SETUP_DOCUMENT_BYTES, SETUP_DOCUMENT_VERSION, SetupConfigLocator, SetupDocument,
-    parse_setup_config_locator, parse_setup_document_toml,
+    parse_and_translate_compose_yaml, parse_setup_config_locator, parse_setup_document_toml,
 };
 use kernal_api::{
     hash::sha256_bytes,
@@ -285,7 +285,7 @@ impl SetupCache {
             .join(format!("{CACHE_FILE_PREFIX}{key}{CACHE_FILE_SUFFIX}"))
     }
 
-    fn read(&self, raw_locator: &str) -> Result<CachedRecord, SetupAcquireError> {
+    fn read(&self, raw_locator: &str) -> Result<ResolvedSetupDocument, SetupAcquireError> {
         let path = self.record_path(raw_locator);
         let bytes = match fs::read_private_regular_file_bounded(&path, MAX_CACHE_RECORD_BYTES) {
             Ok(bytes) => bytes,
@@ -294,7 +294,7 @@ impl SetupCache {
             }
             Err(error) => return Err(SetupAcquireError::Filesystem(error)),
         };
-        CachedRecord::decode(&bytes, raw_locator)
+        CachedRecord::decode(&bytes, raw_locator)?.validated(raw_locator)
     }
 
     fn write(&self, raw_locator: &str, record: &CachedRecord) -> Result<(), SetupAcquireError> {
@@ -348,7 +348,6 @@ pub async fn acquire_setup_document<T: SetupRemoteTransport>(
             kernal_api::async_engine::launch_blocking(move || cache.read(&locator))
                 .await
                 .map_err(|_| SetupAcquireError::BlockingTask)?
-                .and_then(CachedRecord::validated)
         }
         SetupAcquirePolicy::OnlineRefresh => {
             let (bytes, source_kind, resolved_locator) = match parsed_locator {
@@ -377,7 +376,7 @@ pub async fn acquire_setup_document<T: SetupRemoteTransport>(
                 }
             };
             let record = CachedRecord::from_fresh(locator, bytes, source_kind, resolved_locator)?;
-            let validated = record.clone().validated()?;
+            let validated = record.clone().validated(locator)?;
             let cache = cache.clone();
             let locator = locator.to_owned();
             let record_for_cache = record.clone();
@@ -445,6 +444,45 @@ fn redact_locator(locator: &str) -> String {
     format!("{prefix}?{redacted}")
 }
 
+/// Source syntax is selected once from the validated locator, never by trying
+/// one parser after another.  This preserves legacy TOML behavior for every
+/// locator other than the explicitly documented YAML suffixes, including
+/// extensionless local paths and HTTPS URLs.
+fn parse_setup_document(raw_locator: &str, text: &str) -> Result<SetupDocument, SetupAcquireError> {
+    match setup_document_syntax(raw_locator)? {
+        SetupDocumentSyntax::Toml => {
+            parse_setup_document_toml(text).map_err(|_| SetupAcquireError::DocumentInvalid)
+        }
+        SetupDocumentSyntax::ComposeYaml => parse_and_translate_compose_yaml(text)
+            .map(|plan| plan.setup)
+            .map_err(|_| SetupAcquireError::DocumentInvalid),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SetupDocumentSyntax {
+    Toml,
+    ComposeYaml,
+}
+
+fn setup_document_syntax(raw_locator: &str) -> Result<SetupDocumentSyntax, SetupAcquireError> {
+    let path = match parse_setup_config_locator(raw_locator)
+        .map_err(|_| SetupAcquireError::InvalidLocator)?
+    {
+        SetupConfigLocator::LocalPath(path) => path,
+        SetupConfigLocator::HttpsUrl(url) => url
+            .split_once('?')
+            .map_or(url.as_str(), |(path, _)| path)
+            .into(),
+    };
+    let lower = path.to_ascii_lowercase();
+    Ok(if lower.ends_with(".yaml") || lower.ends_with(".yml") {
+        SetupDocumentSyntax::ComposeYaml
+    } else {
+        SetupDocumentSyntax::Toml
+    })
+}
+
 #[derive(Clone, Debug)]
 struct CachedRecord {
     locator_key: [u8; 32],
@@ -468,8 +506,7 @@ impl CachedRecord {
             return Err(SetupAcquireError::InputTooLarge);
         }
         let text = std::str::from_utf8(&bytes).map_err(|_| SetupAcquireError::InputNotUtf8)?;
-        let document =
-            parse_setup_document_toml(text).map_err(|_| SetupAcquireError::DocumentInvalid)?;
+        let document = parse_setup_document(raw_locator, text)?;
         let locator_key = *sha256_bytes(raw_locator.as_bytes()).as_bytes();
         Ok(Self {
             locator_key,
@@ -483,7 +520,7 @@ impl CachedRecord {
         })
     }
 
-    fn validated(self) -> Result<ResolvedSetupDocument, SetupAcquireError> {
+    fn validated(self, raw_locator: &str) -> Result<ResolvedSetupDocument, SetupAcquireError> {
         if self.bytes.len() > MAX_SETUP_DOCUMENT_BYTES
             || self.schema_version != SETUP_DOCUMENT_VERSION
         {
@@ -494,7 +531,7 @@ impl CachedRecord {
         }
         let text = std::str::from_utf8(&self.bytes).map_err(|_| SetupAcquireError::CacheCorrupt)?;
         let document =
-            parse_setup_document_toml(text).map_err(|_| SetupAcquireError::CacheCorrupt)?;
+            parse_setup_document(raw_locator, text).map_err(|_| SetupAcquireError::CacheCorrupt)?;
         if document.version != self.schema_version {
             return Err(SetupAcquireError::CacheCorrupt);
         }

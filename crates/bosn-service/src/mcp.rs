@@ -476,7 +476,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "bosn_setup_plan",
-                "description": "Validate, cache, and materialize one Bosn setup document into the MCP server's preselected private state directory. Returns an inert receipt only: applied is always false; it does not start a daemon or invoke Docker.",
+                "description": "Validate, cache, and materialize one Bosn setup document into the MCP server's preselected private state directory. A `.yaml`/`.yml` locator is accepted only for the supported lossless single-service Compose-to-setup subset; all other locators remain TOML-only. Returns an inert receipt only: applied is always false; it does not start a daemon or invoke Docker.",
                 "inputSchema": setup_plan_schema(),
                 "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
             },
@@ -526,7 +526,7 @@ fn setup_plan_schema() -> Value {
         "required": ["workspace", "config", "policy"],
         "properties": {
             "workspace": {"type": "string", "minLength": 1, "maxLength": MAX_MCP_SETUP_STRING_BYTES},
-            "config": {"type": "string", "minLength": 1, "maxLength": MAX_MCP_SETUP_STRING_BYTES, "description": "An explicit local setup path or HTTPS setup URL."},
+            "config": {"type": "string", "minLength": 1, "maxLength": MAX_MCP_SETUP_STRING_BYTES, "description": "An explicit local setup path or HTTPS setup URL. `.yaml`/`.yml` selects only Bosn's supported lossless single-service Compose-to-setup subset; other locators are TOML-only."},
             "policy": {"type": "string", "enum": ["refresh", "offline"], "description": "refresh reads the selected source; offline reuses only its verified cached receipt."}
         }
     })
@@ -539,7 +539,7 @@ fn setup_prepare_schema() -> Value {
         "required": ["workspace", "config", "policy", "deadline_ms", "output_limit"],
         "properties": {
             "workspace": {"type": "string", "minLength": 1, "maxLength": MAX_MCP_SETUP_STRING_BYTES},
-            "config": {"type": "string", "minLength": 1, "maxLength": MAX_MCP_SETUP_STRING_BYTES, "description": "An explicit local setup path or HTTPS setup URL."},
+            "config": {"type": "string", "minLength": 1, "maxLength": MAX_MCP_SETUP_STRING_BYTES, "description": "An explicit local setup path or HTTPS setup URL. `.yaml`/`.yml` selects only Bosn's supported lossless single-service Compose-to-setup subset; other locators are TOML-only."},
             "policy": {"type": "string", "enum": ["refresh", "offline"]},
             "deadline_ms": {"type": "integer", "minimum": 1, "maximum": 300000},
             "output_limit": {"type": "integer", "minimum": 1, "maximum": 8388608}
@@ -554,7 +554,7 @@ fn setup_ensure_schema() -> Value {
         "required": ["workspace", "config", "policy", "deadline_ms", "output_limit"],
         "properties": {
             "workspace": {"type": "string", "minLength": 1, "maxLength": MAX_MCP_SETUP_STRING_BYTES},
-            "config": {"type": "string", "minLength": 1, "maxLength": MAX_MCP_SETUP_STRING_BYTES, "description": "An explicit local setup path or HTTPS setup URL."},
+            "config": {"type": "string", "minLength": 1, "maxLength": MAX_MCP_SETUP_STRING_BYTES, "description": "An explicit local setup path or HTTPS setup URL. `.yaml`/`.yml` selects only Bosn's supported lossless single-service Compose-to-setup subset; other locators are TOML-only."},
             "policy": {"type": "string", "enum": ["refresh", "offline"]},
             "deadline_ms": {"type": "integer", "minimum": 1, "maximum": 300000},
             "output_limit": {"type": "integer", "minimum": 1, "maximum": 8388608}
@@ -569,7 +569,7 @@ fn setup_task_schema() -> Value {
         "required": ["workspace", "config", "policy", "task_name", "deadline_ms", "output_limit"],
         "properties": {
             "workspace": {"type": "string", "minLength": 1, "maxLength": MAX_MCP_SETUP_STRING_BYTES},
-            "config": {"type": "string", "minLength": 1, "maxLength": MAX_MCP_SETUP_STRING_BYTES, "description": "An explicit local setup path or HTTPS setup URL."},
+            "config": {"type": "string", "minLength": 1, "maxLength": MAX_MCP_SETUP_STRING_BYTES, "description": "An explicit local setup path or HTTPS setup URL. `.yaml`/`.yml` selects only Bosn's supported lossless single-service Compose-to-setup subset; other locators are TOML-only."},
             "policy": {"type": "string", "enum": ["refresh", "offline"]},
             "task_name": {"type": "string", "minLength": 1, "maxLength": 64, "description": "A declared setup task name: starts alphanumeric and then uses alphanumerics, underscores, or hyphens."},
             "deadline_ms": {"type": "integer", "minimum": 1, "maximum": 300000},
@@ -618,7 +618,7 @@ fn setup_done_schema() -> Value {
     }})
 }
 fn setup_adopt_schema() -> Value {
-    json!({"type":"object","additionalProperties":false,"required":["workspace","config","policy","deadline_ms","output_limit","confirm"],"properties":{"workspace":{"type":"string","minLength":1,"maxLength":MAX_MCP_SETUP_STRING_BYTES},"config":{"type":"string","minLength":1,"maxLength":MAX_MCP_SETUP_STRING_BYTES},"policy":{"type":"string","enum":["refresh","offline"]},"deadline_ms":{"type":"integer","minimum":1,"maximum":300000},"output_limit":{"type":"integer","minimum":1,"maximum":8388608},"confirm":{"const":true}}})
+    json!({"type":"object","additionalProperties":false,"required":["workspace","config","policy","deadline_ms","output_limit","confirm"],"properties":{"workspace":{"type":"string","minLength":1,"maxLength":MAX_MCP_SETUP_STRING_BYTES},"config":{"type":"string","minLength":1,"maxLength":MAX_MCP_SETUP_STRING_BYTES,"description":"An explicit local setup path or HTTPS setup URL. `.yaml`/`.yml` selects only Bosn's supported lossless single-service Compose-to-setup subset; other locators are TOML-only."},"policy":{"type":"string","enum":["refresh","offline"]},"deadline_ms":{"type":"integer","minimum":1,"maximum":300000},"output_limit":{"type":"integer","minimum":1,"maximum":8388608},"confirm":{"const":true}}})
 }
 
 fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
