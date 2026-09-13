@@ -76,13 +76,25 @@ uv run pytest tests/test_release_dependencies.py -q
 
 ## Rust daemon foundation
 
-`bosn-service` supplies the intentionally small first native daemon surface,
-and `bosn-rs` is its development foreground binary. Python launchers are not
-changed. `serve STATE_DIR` hardens the state directory through kernal-api,
+`bosn-service` supplies the intentionally small first native daemon surface.
+The package-ready foreground control surface is explicit and authenticated:
+
+```text
+bosn daemon serve --state-dir STATE_DIR
+bosn daemon status --state-dir STATE_DIR [--json]
+bosn daemon stop --state-dir STATE_DIR [--json]
+```
+
+`serve` hardens the state directory through kernal-api,
 creates a fresh private v5 registry with kernel OS entropy when absent, or
 opens its existing single writer before it attempts owner-only IPC binding.
 An occupied endpoint is refused conservatively; this slice does not retire an
 existing filesystem object.
+
+It is intentionally foreground-only: it does not spawn a background process,
+install login autostart, retire idle daemons, manage arbitrary processes, or
+invoke Docker. `status` and `stop` use the authenticated client protocol and
+fail with a bounded redacted receipt if no compatible daemon is reachable.
 
 The client and daemon use kernal-api's authenticated async local IPC and its
 frozen daemon-frame-v1 envelope. Bosn's private Prost payload has protocol
