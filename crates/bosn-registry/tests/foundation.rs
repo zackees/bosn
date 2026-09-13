@@ -398,6 +398,39 @@ fn pagination_has_an_explicit_next_offset_after_more_than_maximum() {
 }
 
 #[test]
+fn read_only_setup_ensure_events_are_filtered_newest_first_and_do_not_write() {
+    let (_directory, path) = database_path();
+    let mut writer =
+        Registry::create_writer(&path, "11111111-2222-4333-8444-555555555555").unwrap();
+    let mut tx = writer.begin_immediate().unwrap();
+    tx.append_event(
+        1.0,
+        "setup.ensure.submitted",
+        "job_id=1 policy=refresh source=https",
+    )
+    .unwrap();
+    tx.append_event(2.0, "unrelated", "must not appear")
+        .unwrap();
+    tx.append_event(3.0, "setup.ensure.succeeded", "job_id=1 outcome=succeeded")
+        .unwrap();
+    tx.commit().unwrap();
+    let before = std::fs::metadata(&path).unwrap().len();
+    let readonly = Registry::open_read_only(&path).unwrap();
+    let page = readonly.setup_ensure_events(0, 1).unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].kind, "setup.ensure.succeeded");
+    assert_eq!(page.next_offset, Some(1));
+    let next = readonly
+        .setup_ensure_events(page.next_offset.unwrap(), 64)
+        .unwrap();
+    assert_eq!(next.items.len(), 1);
+    assert_eq!(next.items[0].kind, "setup.ensure.submitted");
+    assert!(next.next_offset.is_none());
+    drop(readonly);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
+}
+
+#[test]
 fn read_only_missing_does_not_create_and_legacy_or_newer_schemas_are_refused() {
     let (_directory, path) = database_path();
     assert!(Registry::open_read_only(&path).is_err());

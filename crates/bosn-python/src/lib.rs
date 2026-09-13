@@ -6,8 +6,9 @@
 use bosn_core::parse_setup_config_locator;
 use bosn_service::{
     Client as ServiceClient, JobLogPage as ServiceJobLogPage, JobStatus as ServiceJobStatus,
-    SetupEnsureJobRequest, SetupPreparePolicy, SetupPrepareRequest, SetupTaskJobRequest,
-    Status as ServiceStatus,
+    MAX_REGISTRY_DIAGNOSTIC_PAGE, RegistryResourcePage as ServiceRegistryResourcePage,
+    SetupEnsureEventPage as ServiceSetupEnsureEventPage, SetupEnsureJobRequest, SetupPreparePolicy,
+    SetupPrepareRequest, SetupTaskJobRequest, Status as ServiceStatus,
 };
 use bosn_setup::{
     SetupAcquirePolicy, SetupPlan as RustSetupPlan, SetupPlanAppSource, SetupPlanRequest,
@@ -26,6 +27,7 @@ const PYTHON_PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_SETUP_PREPARE_DEADLINE_MS: u64 = 5 * 60 * 1_000;
 const MAX_SETUP_PREPARE_OUTPUT_BYTES: u32 = 8 * 1024 * 1024;
 const MAX_JOB_LOG_RECORDS: u32 = 256;
+const MAX_REGISTRY_RECORDS: u32 = MAX_REGISTRY_DIAGNOSTIC_PAGE;
 
 #[pyclass(module = "bosn._native", frozen)]
 pub struct Client {
@@ -54,6 +56,43 @@ impl Client {
             .detach(move || status(&state_dir).map_err(|error| error.to_string()))
             .map_err(PyRuntimeError::new_err)?;
         Ok(Status::from(status))
+    }
+
+    /// Read a bounded page of path-safe managed-resource diagnostics from the
+    /// already-running daemon. This method never opens, creates, or migrates
+    /// the registry itself; an unavailable daemon raises a runtime error.
+    #[pyo3(signature = (*, after = 0, limit = 64))]
+    fn registry_resources(
+        &self,
+        after: u64,
+        limit: u32,
+        py: Python<'_>,
+    ) -> PyResult<RegistryResourcePage> {
+        validate_registry_page(after, limit)?;
+        let state_dir = self.state_dir.clone();
+        py.detach(move || {
+            registry_resources(&state_dir, after, limit)
+                .map(RegistryResourcePage::from)
+                .map_err(service_error)
+        })
+    }
+
+    /// Read a bounded newest-first page of credential-safe setup ensure event
+    /// history from the already-running daemon. It never initializes state.
+    #[pyo3(signature = (*, after = 0, limit = 64))]
+    fn setup_ensure_events(
+        &self,
+        after: u64,
+        limit: u32,
+        py: Python<'_>,
+    ) -> PyResult<SetupEnsureEventPage> {
+        validate_registry_page(after, limit)?;
+        let state_dir = self.state_dir.clone();
+        py.detach(move || {
+            setup_ensure_events(&state_dir, after, limit)
+                .map(SetupEnsureEventPage::from)
+                .map_err(service_error)
+        })
     }
 
     /// Create an inert, validated setup plan using an explicit acquisition policy.
@@ -324,6 +363,146 @@ pub struct JobLogPage {
     records: Vec<JobLogRecord>,
 }
 
+/// A path-safe managed resource diagnostic. Workspace/scope bindings are not
+/// exposed by this Python API.
+#[derive(Debug)]
+#[pyclass(module = "bosn._native", frozen)]
+pub struct RegistryResource {
+    #[pyo3(get)]
+    id: String,
+    #[pyo3(get)]
+    kind: String,
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    stack: String,
+    #[pyo3(get)]
+    generation: String,
+    #[pyo3(get)]
+    state: String,
+    #[pyo3(get)]
+    retention: String,
+    #[pyo3(get)]
+    created_at: f64,
+    #[pyo3(get)]
+    last_used: f64,
+}
+#[derive(Debug)]
+#[pyclass(module = "bosn._native", frozen)]
+pub struct RegistryResourcePage {
+    #[pyo3(get)]
+    next: Option<u64>,
+    records: Vec<RegistryResource>,
+}
+#[pymethods]
+impl RegistryResourcePage {
+    #[getter]
+    fn records(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        let values = self
+            .records
+            .iter()
+            .map(|record| {
+                Py::new(
+                    py,
+                    RegistryResource {
+                        id: record.id.clone(),
+                        kind: record.kind.clone(),
+                        name: record.name.clone(),
+                        stack: record.stack.clone(),
+                        generation: record.generation.clone(),
+                        state: record.state.clone(),
+                        retention: record.retention.clone(),
+                        created_at: record.created_at,
+                        last_used: record.last_used,
+                    },
+                )
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(PyTuple::new(py, values)?.unbind())
+    }
+}
+impl From<ServiceRegistryResourcePage> for RegistryResourcePage {
+    fn from(value: ServiceRegistryResourcePage) -> Self {
+        Self {
+            next: value.next,
+            records: value
+                .records
+                .into_iter()
+                .map(|record| RegistryResource {
+                    id: record.id,
+                    kind: record.kind,
+                    name: record.name,
+                    stack: record.stack,
+                    generation: record.generation,
+                    state: record.state,
+                    retention: record.retention,
+                    created_at: record.created_at,
+                    last_used: record.last_used,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug)]
+#[pyclass(module = "bosn._native", frozen)]
+pub struct SetupEnsureEvent {
+    #[pyo3(get)]
+    cursor: u64,
+    #[pyo3(get)]
+    at: f64,
+    #[pyo3(get)]
+    kind: String,
+    #[pyo3(get)]
+    detail: String,
+}
+#[derive(Debug)]
+#[pyclass(module = "bosn._native", frozen)]
+pub struct SetupEnsureEventPage {
+    #[pyo3(get)]
+    next: Option<u64>,
+    records: Vec<SetupEnsureEvent>,
+}
+#[pymethods]
+impl SetupEnsureEventPage {
+    #[getter]
+    fn records(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        let values = self
+            .records
+            .iter()
+            .map(|record| {
+                Py::new(
+                    py,
+                    SetupEnsureEvent {
+                        cursor: record.cursor,
+                        at: record.at,
+                        kind: record.kind.clone(),
+                        detail: record.detail.clone(),
+                    },
+                )
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(PyTuple::new(py, values)?.unbind())
+    }
+}
+impl From<ServiceSetupEnsureEventPage> for SetupEnsureEventPage {
+    fn from(value: ServiceSetupEnsureEventPage) -> Self {
+        Self {
+            next: value.next,
+            records: value
+                .records
+                .into_iter()
+                .map(|record| SetupEnsureEvent {
+                    cursor: record.cursor,
+                    at: record.at,
+                    kind: record.kind,
+                    detail: redact_diagnostic(&record.detail),
+                })
+                .collect(),
+        }
+    }
+}
+
 #[pymethods]
 impl JobLogPage {
     /// Records as an immutable tuple, in cursor order.
@@ -446,6 +625,38 @@ fn status(state_dir: &Path) -> Result<ServiceStatus, bosn_service::Error> {
         .enable_all()
         .build()?;
     runtime.run(async { ServiceClient::for_state(state_dir)?.status().await })
+}
+
+fn registry_resources(
+    state_dir: &Path,
+    after: u64,
+    limit: u32,
+) -> Result<ServiceRegistryResourcePage, bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async {
+        ServiceClient::for_state(state_dir)?
+            .registry_resources(after, limit)
+            .await
+    })
+}
+
+fn setup_ensure_events(
+    state_dir: &Path,
+    after: u64,
+    limit: u32,
+) -> Result<ServiceSetupEnsureEventPage, bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async {
+        ServiceClient::for_state(state_dir)?
+            .setup_ensure_events(after, limit)
+            .await
+    })
 }
 
 fn submit_setup_prepare(
@@ -615,6 +826,13 @@ fn validate_job_id(job_id: u64) -> PyResult<()> {
     Ok(())
 }
 
+fn validate_registry_page(_after: u64, limit: u32) -> PyResult<()> {
+    if limit == 0 || limit > MAX_REGISTRY_RECORDS {
+        return Err(PyValueError::new_err("limit must be between 1 and 64"));
+    }
+    Ok(())
+}
+
 /// Remove common URL credentials and credential-bearing query values before a
 /// daemon diagnostic crosses the Python boundary. Service protocol failures do
 /// not include request text, but job logs originate with external tools and
@@ -728,6 +946,10 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<JobStatus>()?;
     module.add_class::<JobLogRecord>()?;
     module.add_class::<JobLogPage>()?;
+    module.add_class::<RegistryResource>()?;
+    module.add_class::<RegistryResourcePage>()?;
+    module.add_class::<SetupEnsureEvent>()?;
+    module.add_class::<SetupEnsureEventPage>()?;
     module.add_class::<SetupPlan>()?;
     module.add_function(wrap_pyfunction!(native_version, module)?)?;
     module.add_function(wrap_pyfunction!(protocol_version, module)?)?;
@@ -1249,6 +1471,49 @@ mod tests {
             redact_diagnostic("https://user:secret@example.test/a?token=also-secret&safe=value"),
             "https://[redacted]@example.test/a?token=[redacted]&safe=value"
         );
+    }
+
+    #[cfg(feature = "embedded-python-tests")]
+    #[test]
+    fn python_registry_diagnostics_match_the_authenticated_daemon_surface() {
+        Python::initialize();
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+
+        RuntimeBuilder::multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let server = async_engine::launch(Service::new(state.clone()).serve());
+                let wire = wait_for_client(&state).await;
+                let python_state = state.clone();
+                let (resources, events) = std::thread::spawn(move || {
+                    Python::attach(|py| {
+                        let client = Client {
+                            state_dir: python_state,
+                        };
+                        Ok::<_, PyErr>((
+                            client.registry_resources(0, 1, py)?,
+                            client.setup_ensure_events(0, 1, py)?,
+                        ))
+                    })
+                })
+                .join()
+                .unwrap()
+                .unwrap();
+                assert!(resources.records.is_empty());
+                assert!(events.records.is_empty());
+                let direct = wire.registry_resources(0, 1).await.unwrap();
+                assert_eq!(direct.records.len(), resources.records.len());
+                wire.shutdown().await.unwrap();
+                async_engine::timeout(Duration::from_secs(5), server)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            });
     }
 
     #[cfg(feature = "embedded-python-tests")]

@@ -2,7 +2,7 @@
 
 use bosn_core::{ResourceKind, ResourceState, Retention, Scope};
 use bosn_engine::{DockerEngine, EngineEvent, RunOptions};
-use bosn_registry::{Registry, RegistryStatus, Resource, ResourceUse};
+use bosn_registry::{Event, Registry, RegistryStatus, Resource, ResourceUse};
 #[cfg(test)]
 use bosn_setup::PreparedImageKind;
 use bosn_setup::{
@@ -38,6 +38,9 @@ const SETUP_PREPARE_MAX_DEADLINE: Duration = Duration::from_secs(5 * 60);
 const SETUP_PREPARE_MAX_OUTPUT: usize = 8 * 1024 * 1024;
 const SETUP_PREPARE_COMMAND_QUEUE: usize = 64;
 const SETUP_PREPARE_EVENT_QUEUE: usize = 16;
+/// A diagnostic page is deliberately small enough to fit comfortably in the
+/// authenticated IPC frame and every public front end.
+pub const MAX_REGISTRY_DIAGNOSTIC_PAGE: u32 = 64;
 
 /// Explicit policy for one daemon-owned setup image preparation request.
 /// State is selected by [`Client::for_state`] and then owned by the daemon;
@@ -634,6 +637,100 @@ pub struct JobLogPage {
     pub gap: bool,
     pub records: Vec<JobLogRecord>,
 }
+
+/// One credential- and path-safe registry resource diagnostic.  This is not a
+/// raw registry row: workspace and scope bindings remain local registry
+/// implementation details, while these stable facts identify managed state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegistryResourceDiagnostic {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub stack: String,
+    pub generation: String,
+    pub state: String,
+    pub retention: String,
+    pub created_at: f64,
+    pub last_used: f64,
+}
+
+/// Bounded offset-cursor page of safe managed-resource diagnostics.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegistryResourcePage {
+    pub next: Option<u64>,
+    pub records: Vec<RegistryResourceDiagnostic>,
+}
+
+/// One redacted setup-ensure registry event. Event details are authored by the
+/// daemon's allowlisted event formatter, not copied from config, engine, or
+/// workspace input.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetupEnsureEventDiagnostic {
+    pub cursor: u64,
+    pub at: f64,
+    pub kind: String,
+    pub detail: String,
+}
+
+/// Bounded offset-cursor page of recent setup-ensure history, newest first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetupEnsureEventPage {
+    pub next: Option<u64>,
+    pub records: Vec<SetupEnsureEventDiagnostic>,
+}
+
+fn resource_diagnostic(value: Resource) -> RegistryResourceDiagnostic {
+    RegistryResourceDiagnostic {
+        id: value.id,
+        kind: value.kind.as_str().into(),
+        name: value.name,
+        stack: value.stack,
+        generation: value.generation,
+        state: value.state.as_str().into(),
+        retention: value.retention.as_str().into(),
+        created_at: value.created_at,
+        last_used: value.last_used,
+    }
+}
+
+fn event_diagnostic(value: Event) -> SetupEnsureEventDiagnostic {
+    SetupEnsureEventDiagnostic {
+        cursor: u64::try_from(value.id).unwrap_or(0),
+        at: value.at,
+        kind: value.kind,
+        detail: value.detail,
+    }
+}
+
+fn validate_registry_page(after: u64, limit: u32) -> Result<(), Error> {
+    let _ = usize::try_from(after).map_err(|_| Error::Protocol("invalid registry cursor"))?;
+    if limit == 0 || limit > MAX_REGISTRY_DIAGNOSTIC_PAGE {
+        return Err(Error::Protocol("invalid registry page limit"));
+    }
+    Ok(())
+}
+
+/// Diagnostic operations have no caller-selected files, jobs, setup values, or
+/// engine controls. Rejecting stray fields makes the private wire contract as
+/// narrow as every public front end rather than silently accepting ambiguity.
+fn validate_registry_diagnostics_request_wire(request: &Request) -> Result<(), Error> {
+    validate_registry_page(request.diagnostic_after, request.diagnostic_limit)?;
+    if !request.workspace.is_empty()
+        || !request.stack.is_empty()
+        || !request.digest.is_empty()
+        || request.job_id != 0
+        || request.log_after != 0
+        || request.log_limit != 0
+        || !request.setup_config.is_empty()
+        || request.setup_policy != 0
+        || request.setup_deadline_ms != 0
+        || request.setup_output_limit != 0
+        || !request.setup_task_name.is_empty()
+    {
+        return Err(Error::Protocol("nonsemantic registry diagnostic fields"));
+    }
+    Ok(())
+}
 impl From<RegistryStatus> for Status {
     fn from(v: RegistryStatus) -> Self {
         Self {
@@ -669,6 +766,48 @@ impl Client {
             _ => Err(Error::Protocol("unexpected status response")),
         }
     }
+    /// Read a bounded, path-safe page of managed resource diagnostics from the
+    /// already-running daemon. This never opens, creates, or migrates a
+    /// registry in the client process.
+    pub async fn registry_resources(
+        &self,
+        after: u64,
+        limit: u32,
+    ) -> Result<RegistryResourcePage, Error> {
+        validate_registry_page(after, limit)?;
+        match self
+            .call(Request {
+                diagnostic_after: after,
+                diagnostic_limit: limit,
+                ..Request::operation(11)
+            })
+            .await?
+        {
+            Reply::RegistryResources(v) => Ok(v),
+            _ => Err(Error::Protocol("unexpected registry resources response")),
+        }
+    }
+    /// Read a bounded, newest-first page of credential-safe setup ensure
+    /// history from the already-running daemon. This has no registry write
+    /// path and never initializes state in the client process.
+    pub async fn setup_ensure_events(
+        &self,
+        after: u64,
+        limit: u32,
+    ) -> Result<SetupEnsureEventPage, Error> {
+        validate_registry_page(after, limit)?;
+        match self
+            .call(Request {
+                diagnostic_after: after,
+                diagnostic_limit: limit,
+                ..Request::operation(12)
+            })
+            .await?
+        {
+            Reply::SetupEnsureEvents(v) => Ok(v),
+            _ => Err(Error::Protocol("unexpected setup ensure events response")),
+        }
+    }
     pub async fn shutdown(&self) -> Result<(), Error> {
         match self.call(Request::operation(3)).await? {
             Reply::Shutdown => Ok(()),
@@ -696,6 +835,8 @@ impl Client {
                 setup_deadline_ms: 0,
                 setup_output_limit: 0,
                 setup_task_name: String::new(),
+                diagnostic_after: 0,
+                diagnostic_limit: 0,
             })
             .await?
         {
@@ -892,6 +1033,16 @@ struct RegistryActor {
 }
 enum DbCommand {
     Status(async_engine::OneshotSender<Result<Status, Error>>),
+    Resources {
+        after: u64,
+        limit: u32,
+        reply: async_engine::OneshotSender<Result<RegistryResourcePage, Error>>,
+    },
+    SetupEnsureEvents {
+        after: u64,
+        limit: u32,
+        reply: async_engine::OneshotSender<Result<SetupEnsureEventPage, Error>>,
+    },
     AppendSetupEnsureEvents {
         events: Vec<SetupEnsureEvent>,
         reply: async_engine::OneshotSender<Result<(), Error>>,
@@ -1618,6 +1769,36 @@ impl RegistryActor {
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
     }
+    async fn resources(&self, after: u64, limit: u32) -> Result<RegistryResourcePage, Error> {
+        validate_registry_page(after, limit)?;
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::Resources {
+                after,
+                limit,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
+    async fn setup_ensure_events(
+        &self,
+        after: u64,
+        limit: u32,
+    ) -> Result<SetupEnsureEventPage, Error> {
+        validate_registry_page(after, limit)?;
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::SetupEnsureEvents {
+                after,
+                limit,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
     async fn append_setup_ensure_events(&self, events: Vec<SetupEnsureEvent>) -> Result<(), Error> {
         let (reply, wait) = async_engine::oneshot_channel();
         self.sender
@@ -1659,6 +1840,58 @@ async fn registry_actor(
             DbCommand::Status(reply) => {
                 let worker = async_engine::launch_blocking(move || {
                     let result = registry.status().map(Status::from);
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
+            DbCommand::Resources {
+                after,
+                limit,
+                reply,
+            } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = usize::try_from(after)
+                        .map_err(|_| bosn_registry::Error::BadRow("page offset"))
+                        .and_then(|after| registry.resources(after, limit as usize))
+                        .map(|page| RegistryResourcePage {
+                            next: page.next_offset.map(|value| value as u64),
+                            records: page.items.into_iter().map(resource_diagnostic).collect(),
+                        });
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
+            DbCommand::SetupEnsureEvents {
+                after,
+                limit,
+                reply,
+            } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = usize::try_from(after)
+                        .map_err(|_| bosn_registry::Error::BadRow("page offset"))
+                        .and_then(|after| registry.setup_ensure_events(after, limit as usize))
+                        .map(|page| SetupEnsureEventPage {
+                            next: page.next_offset.map(|value| value as u64),
+                            records: page.items.into_iter().map(event_diagnostic).collect(),
+                        });
                     (registry, result)
                 });
                 match worker.await {
@@ -2216,6 +2449,58 @@ async fn handle(
                     },
                 }
             }
+            11 => match validate_registry_diagnostics_request_wire(&r) {
+                Ok(()) => match actor
+                    .resources(r.diagnostic_after, r.diagnostic_limit)
+                    .await
+                {
+                    Ok(page) => ReplyWire {
+                        code: 80,
+                        diagnostic_next: page.next.unwrap_or(0),
+                        diagnostic_has_next: page.next.is_some(),
+                        resources_diagnostic: page
+                            .records
+                            .into_iter()
+                            .map(ResourceDiagnosticWire::from)
+                            .collect(),
+                        ..Default::default()
+                    },
+                    Err(_) => ReplyWire {
+                        code: 3,
+                        ..Default::default()
+                    },
+                },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
+            12 => match validate_registry_diagnostics_request_wire(&r) {
+                Ok(()) => match actor
+                    .setup_ensure_events(r.diagnostic_after, r.diagnostic_limit)
+                    .await
+                {
+                    Ok(page) => ReplyWire {
+                        code: 90,
+                        diagnostic_next: page.next.unwrap_or(0),
+                        diagnostic_has_next: page.next.is_some(),
+                        setup_ensure_events: page
+                            .records
+                            .into_iter()
+                            .map(SetupEnsureEventWire::from)
+                            .collect(),
+                        ..Default::default()
+                    },
+                    Err(_) => ReplyWire {
+                        code: 3,
+                        ..Default::default()
+                    },
+                },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
             _ => ReplyWire {
                 code: 2,
                 ..Default::default()
@@ -2305,6 +2590,10 @@ struct Request {
     setup_output_limit: u32,
     #[prost(string, tag = "13")]
     setup_task_name: String,
+    #[prost(uint64, tag = "14")]
+    diagnostic_after: u64,
+    #[prost(uint32, tag = "15")]
+    diagnostic_limit: u32,
 }
 impl Request {
     fn operation(operation: u32) -> Self {
@@ -2322,6 +2611,8 @@ impl Request {
             setup_deadline_ms: 0,
             setup_output_limit: 0,
             setup_task_name: String::new(),
+            diagnostic_after: 0,
+            diagnostic_limit: 0,
         }
     }
 }
@@ -2440,6 +2731,14 @@ struct ReplyWire {
     next_log_cursor: u64,
     #[prost(bool, tag = "14")]
     log_gap: bool,
+    #[prost(uint64, tag = "15")]
+    diagnostic_next: u64,
+    #[prost(bool, tag = "16")]
+    diagnostic_has_next: bool,
+    #[prost(message, repeated, tag = "17")]
+    resources_diagnostic: Vec<ResourceDiagnosticWire>,
+    #[prost(message, repeated, tag = "18")]
+    setup_ensure_events: Vec<SetupEnsureEventWire>,
 }
 #[derive(Message)]
 struct LogRecordWire {
@@ -2447,6 +2746,88 @@ struct LogRecordWire {
     cursor: u64,
     #[prost(string, tag = "2")]
     line: String,
+}
+#[derive(Message)]
+struct ResourceDiagnosticWire {
+    #[prost(string, tag = "1")]
+    id: String,
+    #[prost(string, tag = "2")]
+    kind: String,
+    #[prost(string, tag = "3")]
+    name: String,
+    #[prost(string, tag = "4")]
+    stack: String,
+    #[prost(string, tag = "5")]
+    generation: String,
+    #[prost(string, tag = "6")]
+    state: String,
+    #[prost(string, tag = "7")]
+    retention: String,
+    #[prost(double, tag = "8")]
+    created_at: f64,
+    #[prost(double, tag = "9")]
+    last_used: f64,
+}
+impl From<RegistryResourceDiagnostic> for ResourceDiagnosticWire {
+    fn from(value: RegistryResourceDiagnostic) -> Self {
+        Self {
+            id: value.id,
+            kind: value.kind,
+            name: value.name,
+            stack: value.stack,
+            generation: value.generation,
+            state: value.state,
+            retention: value.retention,
+            created_at: value.created_at,
+            last_used: value.last_used,
+        }
+    }
+}
+impl From<ResourceDiagnosticWire> for RegistryResourceDiagnostic {
+    fn from(value: ResourceDiagnosticWire) -> Self {
+        Self {
+            id: value.id,
+            kind: value.kind,
+            name: value.name,
+            stack: value.stack,
+            generation: value.generation,
+            state: value.state,
+            retention: value.retention,
+            created_at: value.created_at,
+            last_used: value.last_used,
+        }
+    }
+}
+#[derive(Message)]
+struct SetupEnsureEventWire {
+    #[prost(uint64, tag = "1")]
+    cursor: u64,
+    #[prost(double, tag = "2")]
+    at: f64,
+    #[prost(string, tag = "3")]
+    kind: String,
+    #[prost(string, tag = "4")]
+    detail: String,
+}
+impl From<SetupEnsureEventDiagnostic> for SetupEnsureEventWire {
+    fn from(value: SetupEnsureEventDiagnostic) -> Self {
+        Self {
+            cursor: value.cursor,
+            at: value.at,
+            kind: value.kind,
+            detail: value.detail,
+        }
+    }
+}
+impl From<SetupEnsureEventWire> for SetupEnsureEventDiagnostic {
+    fn from(value: SetupEnsureEventWire) -> Self {
+        Self {
+            cursor: value.cursor,
+            at: value.at,
+            kind: value.kind,
+            detail: value.detail,
+        }
+    }
 }
 enum Reply {
     Pong,
@@ -2456,6 +2837,8 @@ enum Reply {
     JobStatus(JobStatus),
     Cancelled,
     JobLogs(JobLogPage),
+    RegistryResources(RegistryResourcePage),
+    SetupEnsureEvents(SetupEnsureEventPage),
 }
 fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
     match v.code {
@@ -2488,6 +2871,14 @@ fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
                     line: record.line,
                 })
                 .collect(),
+        })),
+        80 => Ok(Reply::RegistryResources(RegistryResourcePage {
+            next: v.diagnostic_has_next.then_some(v.diagnostic_next),
+            records: v.resources_diagnostic.into_iter().map(Into::into).collect(),
+        })),
+        90 => Ok(Reply::SetupEnsureEvents(SetupEnsureEventPage {
+            next: v.diagnostic_has_next.then_some(v.diagnostic_next),
+            records: v.setup_ensure_events.into_iter().map(Into::into).collect(),
         })),
         1 => Err(Error::Protocol("unsupported protocol")),
         2 => Err(Error::Protocol("unknown operation")),
@@ -3782,6 +4173,36 @@ mod tests {
     }
 
     #[test]
+    fn registry_diagnostics_wire_rejects_nonsemantic_or_unbounded_fields() {
+        let request = || Request {
+            diagnostic_after: 0,
+            diagnostic_limit: 1,
+            ..Request::operation(11)
+        };
+        assert!(validate_registry_diagnostics_request_wire(&request()).is_ok());
+        for invalid in [
+            Request {
+                workspace: "/attacker".into(),
+                ..request()
+            },
+            Request {
+                setup_config: "https://user:secret@example.invalid/setup.toml".into(),
+                ..request()
+            },
+            Request {
+                job_id: 1,
+                ..request()
+            },
+            Request {
+                diagnostic_limit: MAX_REGISTRY_DIAGNOSTIC_PAGE + 1,
+                ..request()
+            },
+        ] {
+            assert!(validate_registry_diagnostics_request_wire(&invalid).is_err());
+        }
+    }
+
+    #[test]
     fn ensure_pipeline_does_not_reset_budget_and_never_mutates_after_prepare_or_ownership_failure()
     {
         let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
@@ -3959,6 +4380,57 @@ mod tests {
     }
 
     #[test]
+    fn daemon_registry_diagnostics_are_bounded_safe_and_read_only() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let db = state.join("registry.sqlite3");
+        let mut registry =
+            Registry::create_writer(&db, "00000000-0000-4000-8000-000000000123").unwrap();
+        let mut tx = registry.begin_immediate().unwrap();
+        tx.put_resource(&Resource {
+            id: "managed".into(),
+            kind: ResourceKind::Container,
+            name: "managed-app".into(),
+            stack: "setup".into(),
+            generation: "sha256:managed".into(),
+            scope: Scope::Machine,
+            workspace: "/private/workspace".into(),
+            created_at: 1.0,
+            last_used: 2.0,
+            state: ResourceState::Active,
+            retention: Retention::Pinned,
+        })
+        .unwrap();
+        tx.append_event(1.0, "unrelated", "not exposed").unwrap();
+        tx.append_event(2.0, "setup.ensure.succeeded", "job_id=1 outcome=succeeded")
+            .unwrap();
+        tx.commit().unwrap();
+        drop(registry);
+        let before = std::fs::metadata(&db).unwrap().len();
+        let runtime = RuntimeBuilder::multi_thread().enable_all().build().unwrap();
+        runtime.run(async {
+            let server = async_engine::launch(Service::new(state.clone()).serve());
+            let client = wait_for_client(&state).await;
+            let resources = client.registry_resources(0, 1).await.unwrap();
+            assert_eq!(resources.records.len(), 1);
+            assert_eq!(resources.records[0].id, "managed");
+            assert_eq!(resources.records[0].name, "managed-app");
+            assert!(!format!("{:?}", resources.records[0]).contains("/private/workspace"));
+            let events = client.setup_ensure_events(0, 1).await.unwrap();
+            assert_eq!(events.records[0].kind, "setup.ensure.succeeded");
+            assert!(!events.records.iter().any(|event| event.kind == "unrelated"));
+            assert!(matches!(
+                client.registry_resources(0, 0).await,
+                Err(Error::Protocol("invalid registry page limit"))
+            ));
+            client.shutdown().await.unwrap();
+            stopped(server).await;
+        });
+        assert_eq!(std::fs::metadata(&db).unwrap().len(), before);
+    }
+
+    #[test]
     fn response_envelope_rejects_wrong_correlation_protocol_kind_and_encoding() {
         let mut payload = Vec::new();
         ReplyWire {
@@ -4018,6 +4490,8 @@ mod tests {
                 setup_deadline_ms: 0,
                 setup_output_limit: 0,
                 setup_task_name: String::new(),
+                diagnostic_after: 0,
+                diagnostic_limit: 0,
             }
             .encode(&mut payload)
             .unwrap();

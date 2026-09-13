@@ -40,8 +40,157 @@ fn main() {
         "daemon" => run_daemon(arguments),
         "setup" => run_setup(arguments),
         "job" => run_job(arguments),
+        "registry" => run_registry(arguments),
         _ => usage(),
     }
+}
+
+/// Bounded, read-only daemon diagnostics. These commands deliberately require
+/// the already-running daemon: the CLI does not open, create, or migrate a
+/// SQLite registry and therefore preserves the daemon's single-writer model.
+fn run_registry(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
+    let Some(command) = arguments.next() else {
+        usage();
+    };
+    let invocation = match command.to_string_lossy().as_ref() {
+        "resources" => {
+            parse_registry_arguments(arguments).map(|(state_dir, after, limit, json)| {
+                RegistryInvocation::Resources {
+                    state_dir,
+                    after,
+                    limit,
+                    json,
+                }
+            })
+        }
+        "setup-ensure-events" => {
+            parse_registry_arguments(arguments).map(|(state_dir, after, limit, json)| {
+                RegistryInvocation::SetupEnsureEvents {
+                    state_dir,
+                    after,
+                    limit,
+                    json,
+                }
+            })
+        }
+        _ => Err(()),
+    }
+    .unwrap_or_else(|_| usage());
+    let state_dir = invocation.state_dir();
+    let json_output = invocation.json();
+    let client = Client::for_state(state_dir)
+        .unwrap_or_else(|_| registry_failure(invocation.action(), json_output));
+    let runtime = RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|_| registry_failure(invocation.action(), json_output));
+    match invocation {
+        RegistryInvocation::Resources { after, limit, .. } => {
+            match runtime.run(client.registry_resources(after, limit)) {
+                Ok(page) => print_registry_resources(page, json_output),
+                Err(_) => registry_failure("resources", json_output),
+            }
+        }
+        RegistryInvocation::SetupEnsureEvents { after, limit, .. } => {
+            match runtime.run(client.setup_ensure_events(after, limit)) {
+                Ok(page) => print_setup_ensure_events(page, json_output),
+                Err(_) => registry_failure("setup-ensure-events", json_output),
+            }
+        }
+    }
+}
+
+enum RegistryInvocation {
+    Resources {
+        state_dir: PathBuf,
+        after: u64,
+        limit: u32,
+        json: bool,
+    },
+    SetupEnsureEvents {
+        state_dir: PathBuf,
+        after: u64,
+        limit: u32,
+        json: bool,
+    },
+}
+impl RegistryInvocation {
+    fn state_dir(&self) -> &std::path::Path {
+        match self {
+            Self::Resources { state_dir, .. } | Self::SetupEnsureEvents { state_dir, .. } => {
+                state_dir
+            }
+        }
+    }
+    fn json(&self) -> bool {
+        match self {
+            Self::Resources { json, .. } | Self::SetupEnsureEvents { json, .. } => *json,
+        }
+    }
+    fn action(&self) -> &'static str {
+        match self {
+            Self::Resources { .. } => "resources",
+            Self::SetupEnsureEvents { .. } => "setup-ensure-events",
+        }
+    }
+}
+
+fn parse_registry_arguments(
+    mut arguments: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(PathBuf, u64, u32, bool), ()> {
+    let mut state_dir = None;
+    let mut after = None;
+    let mut limit = None;
+    let mut json = false;
+    while let Some(argument) = arguments.next() {
+        match argument.to_string_lossy().as_ref() {
+            "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
+            "--after" => set_once_parsed(&mut after, arguments.next(), parse_u64),
+            "--limit" => set_once_parsed(&mut limit, arguments.next(), parse_registry_limit),
+            "--json" if !json => {
+                json = true;
+                Ok(())
+            }
+            _ => Err(()),
+        }?;
+    }
+    Ok((
+        state_dir.ok_or(())?,
+        after.unwrap_or(0),
+        limit.unwrap_or(64),
+        json,
+    ))
+}
+
+fn parse_registry_limit(value: std::ffi::OsString) -> Result<u32, ()> {
+    let value = parse_u64(value)?;
+    (1..=u64::from(bosn_service::MAX_REGISTRY_DIAGNOSTIC_PAGE))
+        .contains(&value)
+        .then_some(value as u32)
+        .ok_or(())
+}
+
+fn registry_failure(action: &str, json: bool) -> ! {
+    if json {
+        println!(
+            "{}",
+            json!({"action": format!("registry_{action}"), "error": "daemon unavailable or request failed"})
+        );
+    } else {
+        eprintln!("bosn registry {action}: daemon unavailable or request failed");
+    }
+    std::process::exit(1)
+}
+
+fn print_registry_resources(page: bosn_service::RegistryResourcePage, _json_output: bool) {
+    let records: Vec<_> = page.records.into_iter().map(|record| json!({"id": record.id, "kind": record.kind, "name": record.name, "stack": record.stack, "generation": record.generation, "state": record.state, "retention": record.retention, "created_at": record.created_at, "last_used": record.last_used})).collect();
+    let value = json!({"action": "registry_resources", "next": page.next, "records": records});
+    println!("{value}");
+}
+fn print_setup_ensure_events(page: bosn_service::SetupEnsureEventPage, _json_output: bool) {
+    let records: Vec<_> = page.records.into_iter().map(|record| json!({"cursor": record.cursor, "at": record.at, "kind": record.kind, "detail": record.detail})).collect();
+    let value = json!({"action": "setup_ensure_events", "next": page.next, "records": records});
+    println!("{value}");
 }
 
 /// Run the deliberately small, package-ready foreground daemon surface. It
