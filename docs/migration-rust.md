@@ -25,6 +25,12 @@ are not performance promises or evidence that the Rust migration is implemented.
   per-holder lease observations, retention/idle-stop decisions and ordering.
   Thirteen Rust tests pass; this does not implement persistent registry access,
   daemon mutation, or the client front ends. See `docs/rust-domain.md`.
+- [Bosn #159](https://github.com/zackees/bosn/pull/159), merge `39e9253`:
+  guarded Python-v4 import preparation. Import activation and engine
+  reconciliation remain pending.
+- [kernal-api #207](https://github.com/zackees/kernal-api/pull/207), merge
+  `ed197c5`: owner-private bounded file reads used by the guarded import path.
+  This does not complete cutover or activation.
 
 No implementation phase is marked complete solely because one checkpoint landed.
 

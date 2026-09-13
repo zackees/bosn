@@ -167,6 +167,17 @@ pub struct Page<T> {
     pub next_offset: Option<usize>,
 }
 
+/// Bounded, exact registry facts suitable for a daemon diagnostic response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegistryStatus {
+    pub registry_id: String,
+    pub schema_version: u32,
+    pub resources: u64,
+    pub leases: u64,
+    pub sessions: u64,
+    pub reconciliation_required: bool,
+}
+
 pub struct Registry {
     connection: Connection,
     _writer: kernal_api::platform::fs::OwnedFileLock,
@@ -1085,6 +1096,30 @@ impl Registry {
     }
     pub fn registry_id(&self) -> Result<String, Error> {
         meta(&self.connection, "registry_id")?.ok_or(Error::BadRow("registry_id"))
+    }
+    pub fn status(&self) -> Result<RegistryStatus, Error> {
+        let count = |table: &str| -> Result<u64, Error> {
+            let rows = self.connection.query(
+                &format!("SELECT COUNT(*) FROM {table}"),
+                &[],
+                QueryLimits {
+                    max_rows: 1,
+                    max_bytes: 64,
+                },
+            )?;
+            match rows.first().and_then(|row| row.get(0)) {
+                Some(Value::Integer(value)) if *value >= 0 => Ok(*value as u64),
+                _ => Err(Error::BadRow("status count")),
+            }
+        };
+        Ok(RegistryStatus {
+            registry_id: self.registry_id()?,
+            schema_version: SCHEMA_VERSION,
+            resources: count("resources")?,
+            leases: count("leases")?,
+            sessions: count("execution_sessions")?,
+            reconciliation_required: self.meta(RECONCILIATION_REQUIRED)?.as_deref() == Some("true"),
+        })
     }
     pub fn meta(&self, key: &str) -> Result<Option<String>, Error> {
         meta(&self.connection, key)
