@@ -3,7 +3,11 @@
 //! Product policy stays in Rust.  This extension only converts Python values
 //! into the typed Rust client and maps its result into immutable Python values.
 
-use bosn_service::{Client as ServiceClient, Status as ServiceStatus};
+use bosn_core::parse_setup_config_locator;
+use bosn_service::{
+    Client as ServiceClient, JobLogPage as ServiceJobLogPage, JobStatus as ServiceJobStatus,
+    SetupPreparePolicy, SetupPrepareRequest, Status as ServiceStatus,
+};
 use bosn_setup::{
     SetupAcquirePolicy, SetupPlan as RustSetupPlan, SetupPlanAppSource, SetupPlanRequest,
     SetupSourceKind, plan_setup,
@@ -15,8 +19,12 @@ use pyo3::{
     types::PyTuple,
 };
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const PYTHON_PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
+const MAX_SETUP_PREPARE_DEADLINE_MS: u64 = 5 * 60 * 1_000;
+const MAX_SETUP_PREPARE_OUTPUT_BYTES: u32 = 8 * 1024 * 1024;
+const MAX_JOB_LOG_RECORDS: u32 = 256;
 
 #[pyclass(module = "bosn._native", frozen)]
 pub struct Client {
@@ -73,6 +81,85 @@ impl Client {
             .map_err(PyRuntimeError::new_err)?;
         Ok(SetupPlan::from(plan))
     }
+
+    /// Submit a bounded semantic setup-image preparation job to the local
+    /// Bosn daemon and return its durable ID without waiting for Docker work.
+    ///
+    /// This accepts only a workspace and validated setup-document locator;
+    /// it has no command, Docker argv, container, mount, or task-execution
+    /// inputs. `policy` uses the same explicit values as [`Self::plan_setup`]:
+    /// ``"online_refresh"`` or ``"offline_cache_only"``. `deadline_ms` is
+    /// bounded to five minutes and `output_limit` to eight MiB before any IPC
+    /// is attempted. The GIL is released for the authenticated IPC roundtrip.
+    #[pyo3(signature = (workspace, config_locator, *, policy, deadline_ms, output_limit))]
+    fn submit_setup_prepare(
+        &self,
+        workspace: PathBuf,
+        config_locator: String,
+        policy: &str,
+        deadline_ms: u64,
+        output_limit: u32,
+        py: Python<'_>,
+    ) -> PyResult<u64> {
+        let policy = parse_prepare_policy(policy)?;
+        validate_setup_prepare_input(&workspace, &config_locator, deadline_ms, output_limit)?;
+        let state_dir = self.state_dir.clone();
+        py.detach(move || {
+            submit_setup_prepare(
+                &state_dir,
+                SetupPrepareRequest {
+                    workspace,
+                    config: config_locator,
+                    policy,
+                    deadline: Duration::from_millis(deadline_ms),
+                    output_limit: output_limit as usize,
+                },
+            )
+            .map_err(service_error)
+        })
+    }
+
+    /// Return typed status for a daemon job. The GIL is released while the
+    /// bounded authenticated IPC roundtrip is in flight.
+    fn job_status(&self, job_id: u64, py: Python<'_>) -> PyResult<JobStatus> {
+        validate_job_id(job_id)?;
+        let state_dir = self.state_dir.clone();
+        py.detach(move || {
+            job_status(&state_dir, job_id)
+                .map(JobStatus::from)
+                .map_err(service_error)
+        })
+    }
+
+    /// Return at most 256 cursor-addressed daemon log records. `next` can be
+    /// passed as `after` on the next poll; `gap` reports evicted history.
+    #[pyo3(signature = (job_id, *, after = 0, limit = 64))]
+    fn job_logs(
+        &self,
+        job_id: u64,
+        after: u64,
+        limit: u32,
+        py: Python<'_>,
+    ) -> PyResult<JobLogPage> {
+        validate_job_id(job_id)?;
+        if limit == 0 || limit > MAX_JOB_LOG_RECORDS {
+            return Err(PyValueError::new_err("limit must be between 1 and 256"));
+        }
+        let state_dir = self.state_dir.clone();
+        py.detach(move || {
+            job_logs(&state_dir, job_id, after, limit)
+                .map(JobLogPage::from)
+                .map_err(service_error)
+        })
+    }
+
+    /// Request cooperative cancellation of a daemon job. The eventual terminal
+    /// state remains observable through [`Self::job_status`].
+    fn cancel_job(&self, job_id: u64, py: Python<'_>) -> PyResult<()> {
+        validate_job_id(job_id)?;
+        let state_dir = self.state_dir.clone();
+        py.detach(move || cancel_job(&state_dir, job_id).map_err(service_error))
+    }
 }
 
 #[pyclass(module = "bosn._native", frozen)]
@@ -100,6 +187,91 @@ impl From<ServiceStatus> for Status {
             leases: value.leases,
             sessions: value.sessions,
             reconciliation_required: value.reconciliation_required,
+        }
+    }
+}
+
+/// Immutable typed status for a daemon job.
+#[derive(Debug)]
+#[pyclass(module = "bosn._native", frozen)]
+pub struct JobStatus {
+    #[pyo3(get)]
+    id: u64,
+    #[pyo3(get)]
+    state: String,
+    #[pyo3(get)]
+    error: Option<String>,
+}
+
+impl From<ServiceJobStatus> for JobStatus {
+    fn from(value: ServiceJobStatus) -> Self {
+        Self {
+            id: value.id,
+            state: value.state,
+            error: value.error.map(|message| redact_diagnostic(&message)),
+        }
+    }
+}
+
+/// One bounded daemon job-log record.
+#[derive(Debug)]
+#[pyclass(module = "bosn._native", frozen)]
+pub struct JobLogRecord {
+    #[pyo3(get)]
+    cursor: u64,
+    #[pyo3(get)]
+    line: String,
+}
+
+/// Immutable cursor page returned by [`Client::job_logs`].
+#[derive(Debug)]
+#[pyclass(module = "bosn._native", frozen)]
+pub struct JobLogPage {
+    #[pyo3(get)]
+    retained_from: u64,
+    #[pyo3(get)]
+    next: u64,
+    #[pyo3(get)]
+    gap: bool,
+    records: Vec<JobLogRecord>,
+}
+
+#[pymethods]
+impl JobLogPage {
+    /// Records as an immutable tuple, in cursor order.
+    #[getter]
+    fn records(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        let values = self
+            .records
+            .iter()
+            .map(|record| {
+                Py::new(
+                    py,
+                    JobLogRecord {
+                        cursor: record.cursor,
+                        line: record.line.clone(),
+                    },
+                )
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(PyTuple::new(py, values)?.unbind())
+    }
+}
+
+impl From<ServiceJobLogPage> for JobLogPage {
+    fn from(value: ServiceJobLogPage) -> Self {
+        Self {
+            retained_from: value.retained_from,
+            next: value.next,
+            gap: value.gap,
+            records: value
+                .records
+                .into_iter()
+                .map(|record| JobLogRecord {
+                    cursor: record.cursor,
+                    line: redact_diagnostic(&record.line),
+                })
+                .collect(),
         }
     }
 }
@@ -188,6 +360,62 @@ fn status(state_dir: &Path) -> Result<ServiceStatus, bosn_service::Error> {
     runtime.run(async { ServiceClient::for_state(state_dir)?.status().await })
 }
 
+fn submit_setup_prepare(
+    state_dir: &Path,
+    request: SetupPrepareRequest,
+) -> Result<u64, bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async {
+        ServiceClient::for_state(state_dir)?
+            .submit_setup_prepare(request)
+            .await
+    })
+}
+
+fn job_status(state_dir: &Path, job_id: u64) -> Result<ServiceJobStatus, bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async {
+        ServiceClient::for_state(state_dir)?
+            .job_status(job_id)
+            .await
+    })
+}
+
+fn job_logs(
+    state_dir: &Path,
+    job_id: u64,
+    after: u64,
+    limit: u32,
+) -> Result<ServiceJobLogPage, bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async {
+        ServiceClient::for_state(state_dir)?
+            .job_logs(job_id, after, limit)
+            .await
+    })
+}
+
+fn cancel_job(state_dir: &Path, job_id: u64) -> Result<(), bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async {
+        ServiceClient::for_state(state_dir)?
+            .cancel_job(job_id)
+            .await
+    })
+}
+
 fn parse_setup_policy(policy: &str) -> PyResult<SetupAcquirePolicy> {
     match policy {
         "online_refresh" => Ok(SetupAcquirePolicy::OnlineRefresh),
@@ -196,6 +424,123 @@ fn parse_setup_policy(policy: &str) -> PyResult<SetupAcquirePolicy> {
             "policy must be 'online_refresh' or 'offline_cache_only'",
         )),
     }
+}
+
+fn parse_prepare_policy(policy: &str) -> PyResult<SetupPreparePolicy> {
+    match policy {
+        "online_refresh" => Ok(SetupPreparePolicy::Refresh),
+        "offline_cache_only" => Ok(SetupPreparePolicy::Offline),
+        _ => Err(PyValueError::new_err(
+            "policy must be 'online_refresh' or 'offline_cache_only'",
+        )),
+    }
+}
+
+fn validate_setup_prepare_input(
+    workspace: &Path,
+    config_locator: &str,
+    deadline_ms: u64,
+    output_limit: u32,
+) -> PyResult<()> {
+    let workspace = workspace
+        .to_str()
+        .ok_or_else(|| PyValueError::new_err("workspace must be valid UTF-8"))?;
+    if workspace.is_empty() || workspace.len() > 8 * 1024 || workspace.bytes().any(|byte| byte == 0)
+    {
+        return Err(PyValueError::new_err("workspace is empty or invalid"));
+    }
+    // This is pure core parsing only: it rejects non-HTTPS remote locators,
+    // userinfo, fragments, whitespace, and oversized values before IPC.
+    // Do not echo the caller's locator, which may contain credentials.
+    parse_setup_config_locator(config_locator)
+        .map_err(|_| PyValueError::new_err("setup config locator is invalid"))?;
+    if deadline_ms == 0 || deadline_ms > MAX_SETUP_PREPARE_DEADLINE_MS {
+        return Err(PyValueError::new_err(
+            "deadline_ms must be between 1 and 300000",
+        ));
+    }
+    if output_limit == 0 || output_limit > MAX_SETUP_PREPARE_OUTPUT_BYTES {
+        return Err(PyValueError::new_err(
+            "output_limit must be between 1 and 8388608",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_job_id(job_id: u64) -> PyResult<()> {
+    if job_id == 0 {
+        return Err(PyValueError::new_err("job_id must be positive"));
+    }
+    Ok(())
+}
+
+/// Remove common URL credentials and credential-bearing query values before a
+/// daemon diagnostic crosses the Python boundary. Service protocol failures do
+/// not include request text, but job logs originate with external tools and
+/// are therefore handled defensively here as well.
+fn redact_diagnostic(value: &str) -> String {
+    let mut redacted = value.to_owned();
+    for scheme in ["https://", "http://"] {
+        let mut search_from = 0;
+        while let Some(relative) = redacted[search_from..].find(scheme) {
+            let start = search_from + relative + scheme.len();
+            let end = redacted[start..]
+                .find(|character: char| {
+                    character.is_whitespace() || character == '/' || character == '?'
+                })
+                .map(|offset| start + offset)
+                .unwrap_or(redacted.len());
+            if let Some(at) = redacted[start..end].find('@') {
+                let at = start + at;
+                redacted.replace_range(start..=at, "[redacted]@");
+                search_from = start + "[redacted]@".len();
+            } else {
+                search_from = end;
+            }
+        }
+    }
+    for key in [
+        "token",
+        "access_token",
+        "password",
+        "secret",
+        "api_key",
+        "apikey",
+        "authorization",
+    ] {
+        let needle = format!("{key}=");
+        let mut search_from = 0;
+        while let Some(relative) = redacted[search_from..].to_ascii_lowercase().find(&needle) {
+            let start = search_from + relative + needle.len();
+            let end = redacted[start..]
+                .find(|character: char| {
+                    character == '&'
+                        || character.is_whitespace()
+                        || character == '"'
+                        || character == '\''
+                })
+                .map(|offset| start + offset)
+                .unwrap_or(redacted.len());
+            redacted.replace_range(start..end, "[redacted]");
+            search_from = start + "[redacted]".len();
+        }
+    }
+    redacted
+}
+
+fn service_error(error: bosn_service::Error) -> PyErr {
+    let message = match error {
+        bosn_service::Error::Io(_) | bosn_service::Error::Deadline => {
+            "Bosn daemon is unavailable or did not respond in time"
+        }
+        bosn_service::Error::Unauthorized => "Bosn daemon authentication failed",
+        bosn_service::Error::EndpointOccupied(_) => "Bosn daemon endpoint is unavailable",
+        bosn_service::Error::Protocol(_) => "Bosn daemon rejected the request",
+        bosn_service::Error::Registry(_)
+        | bosn_service::Error::Random
+        | bosn_service::Error::ActorClosed => "Bosn daemon request failed",
+    };
+    PyRuntimeError::new_err(message)
 }
 
 fn source_kind_name(source_kind: SetupSourceKind) -> &'static str {
@@ -239,6 +584,9 @@ fn run_mcp(state_dir: PathBuf, py: Python<'_>) -> PyResult<()> {
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Client>()?;
     module.add_class::<Status>()?;
+    module.add_class::<JobStatus>()?;
+    module.add_class::<JobLogRecord>()?;
+    module.add_class::<JobLogPage>()?;
     module.add_class::<SetupPlan>()?;
     module.add_function(wrap_pyfunction!(native_version, module)?)?;
     module.add_function(wrap_pyfunction!(protocol_version, module)?)?;
@@ -249,9 +597,261 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "embedded-python-tests")]
+    use bosn_service::{Service, SetupPrepareExecutor};
+    #[cfg(feature = "embedded-python-tests")]
+    use kernal_api::async_engine::{self, CancellationToken, RuntimeBuilder, Sender};
+    #[cfg(feature = "embedded-python-tests")]
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Instant,
+    };
+
+    #[cfg(feature = "embedded-python-tests")]
+    struct FakeSetupExecutor {
+        started: AtomicUsize,
+        cancelled: AtomicUsize,
+    }
+
+    #[cfg(feature = "embedded-python-tests")]
+    impl FakeSetupExecutor {
+        fn new() -> Self {
+            Self {
+                started: AtomicUsize::new(0),
+                cancelled: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[cfg(feature = "embedded-python-tests")]
+    impl SetupPrepareExecutor for FakeSetupExecutor {
+        fn execute<'a>(
+            &'a self,
+            _request: SetupPrepareRequest,
+            cancellation: &'a CancellationToken,
+            logs: &'a Sender<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.started.fetch_add(1, Ordering::SeqCst);
+                logs.send("[fake] setup preparation started".into())
+                    .await
+                    .map_err(|_| "fake log consumer closed".to_owned())?;
+                for _ in 0..100 {
+                    if cancellation.is_cancelled() {
+                        self.cancelled.fetch_add(1, Ordering::SeqCst);
+                        return Err("fake cancellation observed".into());
+                    }
+                    async_engine::sleep(Duration::from_millis(10)).await;
+                }
+                Ok("fake prepared sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
+            })
+        }
+    }
 
     #[test]
     fn native_version_matches_python_distribution() {
         assert_eq!(native_version(), "0.1.3");
+    }
+
+    #[cfg(feature = "embedded-python-tests")]
+    #[test]
+    fn python_client_submits_and_observes_fake_setup_job_without_docker() {
+        Python::initialize();
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let executor = Arc::new(FakeSetupExecutor::new());
+        RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let server = async_engine::launch(
+                    Service::new(state.clone())
+                        .with_setup_prepare_executor(executor.clone())
+                        .serve(),
+                );
+                let wire_client = wait_for_client(&state).await;
+                let submitted = Instant::now();
+                let python_state = state.clone();
+                let python_workspace = workspace.clone();
+                let (first, second) = std::thread::spawn(move || {
+                    Python::initialize();
+                    Python::attach(|py| {
+                        let python_client = Client {
+                            state_dir: python_state,
+                        };
+                        let first = python_client.submit_setup_prepare(
+                            python_workspace.clone(),
+                            "https://example.invalid/setup.toml".into(),
+                            "online_refresh",
+                            2_000,
+                            4 * 1024,
+                            py,
+                        )?;
+                        let second = python_client.submit_setup_prepare(
+                            python_workspace,
+                            "https://example.invalid/setup.toml".into(),
+                            "online_refresh",
+                            2_000,
+                            4 * 1024,
+                            py,
+                        )?;
+                        Ok::<_, PyErr>((first, second))
+                    })
+                })
+                .join()
+                .expect("Python submit thread panicked")
+                .unwrap();
+                assert!(submitted.elapsed() < Duration::from_millis(250));
+                assert_eq!(first, second);
+
+                wait_for(|| executor.started.load(Ordering::SeqCst) == 1).await;
+                let page = wait_for_python_logs(&state, first).await;
+                assert_eq!(page.records.len(), 1);
+                assert_eq!(page.records[0].cursor, 0);
+                assert_eq!(page.records[0].line, "[fake] setup preparation started");
+                assert_eq!(page.next, 1);
+                assert!(!page.gap);
+
+                let python_state = state.clone();
+                let running = std::thread::spawn(move || {
+                    Python::attach(|py| {
+                        Client {
+                            state_dir: python_state,
+                        }
+                        .job_status(first, py)
+                    })
+                })
+                .join()
+                .expect("Python status thread panicked")
+                .unwrap();
+                assert_eq!(running.id, first);
+                assert!(matches!(running.state.as_str(), "Running" | "Cancelling"));
+                let python_state = state.clone();
+                std::thread::spawn(move || {
+                    Python::attach(|py| {
+                        Client {
+                            state_dir: python_state,
+                        }
+                        .cancel_job(first, py)
+                    })
+                })
+                .join()
+                .expect("Python cancellation thread panicked")
+                .unwrap();
+                wait_for_job_state(&wire_client, first, "Cancelled").await;
+                assert_eq!(executor.cancelled.load(Ordering::SeqCst), 1);
+
+                wire_client.shutdown().await.unwrap();
+                async_engine::timeout(Duration::from_secs(5), server)
+                    .await
+                    .expect("service did not stop")
+                    .expect("service task failed")
+                    .expect("service returned error");
+            });
+    }
+
+    #[cfg(feature = "embedded-python-tests")]
+    #[test]
+    fn python_prepare_input_and_diagnostics_do_not_expose_credentials() {
+        Python::initialize();
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let client = Client {
+            state_dir: temporary.path().join("no-daemon"),
+        };
+        Python::attach(|py| {
+            let error = client
+                .submit_setup_prepare(
+                    temporary.path().join("workspace"),
+                    "https://user:top-secret@example.invalid/setup.toml".into(),
+                    "online_refresh",
+                    1_000,
+                    4 * 1024,
+                    py,
+                )
+                .unwrap_err();
+            assert!(error.is_instance_of::<PyValueError>(py));
+            assert!(!error.to_string().contains("top-secret"));
+
+            let error = client
+                .submit_setup_prepare(
+                    temporary.path().join("workspace"),
+                    "https://example.invalid/setup.toml".into(),
+                    "online_refresh",
+                    0,
+                    4 * 1024,
+                    py,
+                )
+                .unwrap_err();
+            assert!(error.is_instance_of::<PyValueError>(py));
+
+            let error = client.job_status(1, py).unwrap_err();
+            assert!(error.is_instance_of::<PyRuntimeError>(py));
+            assert!(!error.to_string().contains("no-daemon"));
+        });
+        assert_eq!(
+            redact_diagnostic("https://user:secret@example.test/a?token=also-secret&safe=value"),
+            "https://[redacted]@example.test/a?token=[redacted]&safe=value"
+        );
+    }
+
+    #[cfg(feature = "embedded-python-tests")]
+    async fn wait_for_client(state: &Path) -> ServiceClient {
+        let client = ServiceClient::for_state(state).unwrap();
+        for _ in 0..50 {
+            if client.ping().await.is_ok() {
+                return client;
+            }
+            async_engine::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("fake daemon did not become ready");
+    }
+
+    #[cfg(feature = "embedded-python-tests")]
+    async fn wait_for(predicate: impl Fn() -> bool) {
+        for _ in 0..100 {
+            if predicate() {
+                return;
+            }
+            async_engine::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("condition did not become true");
+    }
+
+    #[cfg(feature = "embedded-python-tests")]
+    async fn wait_for_job_state(client: &ServiceClient, id: u64, wanted: &str) {
+        for _ in 0..100 {
+            if client.job_status(id).await.unwrap().state == wanted {
+                return;
+            }
+            async_engine::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("job {id} did not reach {wanted}");
+    }
+
+    #[cfg(feature = "embedded-python-tests")]
+    async fn wait_for_python_logs(state: &Path, id: u64) -> JobLogPage {
+        for _ in 0..100 {
+            let state = state.to_path_buf();
+            let page = std::thread::spawn(move || {
+                Python::attach(|py| Client { state_dir: state }.job_logs(id, 0, 16, py))
+            })
+            .join()
+            .expect("Python logs thread panicked")
+            .unwrap();
+            if !page.records.is_empty() {
+                return page;
+            }
+            async_engine::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("job {id} did not emit logs");
     }
 }
