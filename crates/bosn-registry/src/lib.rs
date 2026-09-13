@@ -734,6 +734,90 @@ impl<'a> Immediate<'a> {
         self.transaction.execute("INSERT INTO resource_uses(resource_id,workspace,stack,generation,last_used,state) VALUES(?,?,?,?,?,?) ON CONFLICT(resource_id,workspace,stack,generation) DO UPDATE SET last_used=excluded.last_used,state=excluded.state", &[Value::Text(v.resource_id.clone()),Value::Text(v.workspace.clone()),Value::Text(v.stack.clone()),Value::Text(v.generation.clone()),Value::Real(v.last_used),Value::Text(v.state.as_str().into())])?;
         Ok(())
     }
+    /// Retire superseded Bosn setup application-container ownership for one
+    /// exact workspace/stack generation boundary.
+    ///
+    /// This deliberately has no engine effects.  It is only durable registry
+    /// accounting and is intended to run in the same immediate transaction
+    /// that records the succeeding generation.  Images are intentionally
+    /// excluded: an inspected Docker image can be shared by unrelated setup
+    /// documents and workspaces.  The `setup-container:` identity namespace
+    /// prevents this product-specific rollover from changing arbitrary
+    /// container records which happen to use the same stack name.
+    pub fn retire_prior_setup_container_generations(
+        &mut self,
+        workspace: &str,
+        stack: &str,
+        generation: &str,
+    ) -> Result<(), Error> {
+        // This is a product-specific transition, not a generic container
+        // lifecycle API. An executor seam or future caller cannot extend it
+        // to another stack merely by supplying a different string.
+        if stack != "setup" {
+            return Ok(());
+        }
+        let retired = ResourceState::Retired.as_str();
+        let active = ResourceState::Active.as_str();
+        let container = ResourceKind::Container.as_str();
+
+        // Retire the use records first while the candidate set is still the
+        // active, exact-scope set. A container with an active use outside
+        // this exact workspace/stack is deliberately excluded altogether:
+        // `resources.state` is machine-scoped, so changing it would leak this
+        // local rollover into another workspace. Both writes remain invisible
+        // unless the caller commits the enclosing immediate transaction.
+        self.transaction.execute(
+            "UPDATE resource_uses SET state=? \
+             WHERE workspace=? AND stack=? AND generation<>? AND state=? \
+             AND resource_id IN ( \
+                SELECT id FROM resources \
+                WHERE kind=? AND stack=? AND workspace=? AND generation<>? \
+                  AND state=? AND id GLOB 'setup-container:*' \
+                  AND NOT EXISTS ( \
+                    SELECT 1 FROM resource_uses AS other \
+                    WHERE other.resource_id=resources.id AND other.state=? \
+                      AND (other.workspace<>? OR other.stack<>?) \
+                  ) \
+             )",
+            &[
+                Value::Text(retired.into()),
+                Value::Text(workspace.into()),
+                Value::Text(stack.into()),
+                Value::Text(generation.into()),
+                Value::Text(active.into()),
+                Value::Text(container.into()),
+                Value::Text(stack.into()),
+                Value::Text(workspace.into()),
+                Value::Text(generation.into()),
+                Value::Text(active.into()),
+                Value::Text(active.into()),
+                Value::Text(workspace.into()),
+                Value::Text(stack.into()),
+            ],
+        )?;
+        self.transaction.execute(
+            "UPDATE resources SET state=? \
+             WHERE kind=? AND stack=? AND workspace=? AND generation<>? \
+               AND state=? AND id GLOB 'setup-container:*' \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM resource_uses AS other \
+                 WHERE other.resource_id=resources.id AND other.state=? \
+                   AND (other.workspace<>? OR other.stack<>?) \
+               )",
+            &[
+                Value::Text(retired.into()),
+                Value::Text(container.into()),
+                Value::Text(stack.into()),
+                Value::Text(workspace.into()),
+                Value::Text(generation.into()),
+                Value::Text(active.into()),
+                Value::Text(active.into()),
+                Value::Text(workspace.into()),
+                Value::Text(stack.into()),
+            ],
+        )?;
+        Ok(())
+    }
     pub fn put_lease(&mut self, v: &Lease) -> Result<(), Error> {
         self.transaction.execute("INSERT INTO leases(id,resource_id,pid,proc_start,acquired_at,heartbeat_at,ttl_seconds) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET resource_id=excluded.resource_id,pid=excluded.pid,proc_start=excluded.proc_start,acquired_at=excluded.acquired_at,heartbeat_at=excluded.heartbeat_at,ttl_seconds=excluded.ttl_seconds", &[Value::Text(v.id.clone()),Value::Text(v.resource_id.clone()),Value::Integer(i64::from(v.pid)),optional_value(v.proc_start),Value::Real(v.acquired_at),Value::Real(v.heartbeat_at),Value::Real(v.ttl_seconds)])?;
         Ok(())
