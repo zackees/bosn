@@ -181,6 +181,23 @@ PYO3_PYTHON="$PYTHON_BIN" LD_LIBRARY_PATH="$PYTHON_LIB${LD_LIBRARY_PATH:+:$LD_LI
 Installed-extension behavior is covered separately through
 `uv run maturin develop --locked && uv run pytest tests/test_native.py`.
 
+### Live Python native setup-ensure acceptance
+
+The following opt-in acceptance starts the package-local production daemon and
+uses only `bosn.Client` from the installed PyO3 extension to plan, submit,
+poll status/logs, and reuse a one-file pinned-image setup app after a daemon
+restart. Docker is used only to verify the app and to perform exact
+ownership-label cleanup. It needs a reachable local Docker daemon and the
+pre-pulled pinned Alpine digest named by the test:
+
+```bash
+BOSN_RUN_LIVE_DOCKER=1 uv run pytest tests/test_native_setup_ensure_docker.py -q
+```
+
+The test is excluded unless `BOSN_RUN_LIVE_DOCKER=1` is explicit. It also
+proves the Python binding rejects `docker_args`, `command`, and `mounts` as
+unknown submission fields; these controls are not part of the Python API.
+
 ### Installed native CLI wheel
 
 The distribution's `bosn` console entry point is a small Python launcher that
