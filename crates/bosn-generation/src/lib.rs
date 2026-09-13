@@ -12,6 +12,7 @@ use kernal_api::hash::Sha256Hasher;
 
 pub mod collector;
 pub mod dockerfile;
+pub mod resolver;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContextEntry {
@@ -73,6 +74,7 @@ pub enum StackGenerationError {
     Generation(GenerationError),
     Dockerfile(dockerfile::DockerfileError),
     RootMismatch,
+    BlockingTask(String),
 }
 impl std::fmt::Display for StackGenerationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -83,8 +85,32 @@ impl std::fmt::Display for StackGenerationError {
             Self::RootMismatch => {
                 f.write_str("manifest materialization root does not name the selected root")
             }
+            Self::BlockingTask(e) => write!(f, "generation blocking task failed: {e}"),
         }
     }
+}
+
+/// Run bounded filesystem observation and generation hashing on the kernel
+/// blocking lane. This awaits the blocking task to settlement: dropping the
+/// caller is not reported as cancellation of an in-progress filesystem walk.
+/// The collector's trusted-ancestor/non-atomic-tree caveats still apply.
+pub async fn stack_generation_async(
+    manifest: &Manifest,
+    stack: &Stack,
+    root: &std::path::Path,
+    limits: &collector::CollectorLimits,
+    observed: &[ExternalImageIdentity],
+) -> Result<String, StackGenerationError> {
+    let manifest = manifest.clone();
+    let stack = stack.clone();
+    let root = root.to_path_buf();
+    let limits = limits.clone();
+    let observed = observed.to_vec();
+    kernal_api::async_engine::launch_blocking(move || {
+        stack_generation(&manifest, &stack, &root, &limits, &observed)
+    })
+    .await
+    .map_err(|e| StackGenerationError::BlockingTask(e.to_string()))?
 }
 impl std::error::Error for StackGenerationError {}
 impl From<collector::CollectorError> for StackGenerationError {
