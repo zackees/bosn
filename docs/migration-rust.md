@@ -63,7 +63,7 @@ may emit only `docker run --rm` with document-derived bind mounts, environment,
 workdir, the observed image identity, and `sh -lc` with the declared task text.
 The primitive is submitted through typed daemon IPC and the bounded native,
 Python, and MCP job-submission surfaces. It deliberately still has no registry
-persistence, container lifecycle, or setup-ensure wiring.
+persistence or broader container lifecycle wiring.
 
 ### Setup-app ensure core primitive
 
@@ -74,9 +74,10 @@ then performs only inspect, create-if-absent, and start-if-stopped through the
 finite `SetupEnsureCommand` protocol. Create receives only the validated
 document's image receipt, mounts, environment, workdir, and optional declared
 `app.command` (as `sh -lc`). An existing candidate must exactly prove the
-expected image and Bosn labels or is refused before mutation. This is not yet
-daemon/CLI/Python/MCP exposed or registry-backed, and it never deletes,
-replaces, stops, adopts, or garbage-collects a container.
+expected image and Bosn labels or is refused before mutation. It is exposed
+through typed daemon jobs and the bounded native CLI, Python, and MCP
+submission surfaces, but is not registry-backed. It never deletes, replaces,
+stops, adopts, or garbage-collects a container.
 
 ## Current surface and characterization references
 
