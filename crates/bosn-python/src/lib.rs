@@ -11,6 +11,7 @@ use bosn_service::{
     SetupDoneResult as ServiceSetupDoneResult, SetupEnsureEventPage as ServiceSetupEnsureEventPage,
     SetupEnsureJobRequest, SetupGcApplyResult as ServiceSetupGcApplyResult,
     SetupGcPreviewPage as ServiceSetupGcPreviewPage, SetupPreparePolicy, SetupPrepareRequest,
+    SetupReconcileMissingRepairResult as ServiceSetupReconcileMissingRepairResult,
     SetupReconcilePreviewPage as ServiceSetupReconcilePreviewPage,
     SetupRetiredStopResult as ServiceSetupRetiredStopResult, SetupTaskJobRequest,
     Status as ServiceStatus,
@@ -146,6 +147,29 @@ impl Client {
         py.detach(move || {
             setup_reconcile_preview(&state_dir, workspace, after, limit)
                 .map(SetupReconcilePreviewPage::from)
+                .map_err(service_error)
+        })
+    }
+    /// Retire one preview-token-bound missing setup app in registry accounting
+    /// only. ``confirm=True`` is required; no Docker name, image, argv,
+    /// mount, or lifecycle control is accepted at this Python boundary.
+    #[pyo3(signature = (workspace, candidate_token, *, confirm))]
+    fn setup_reconcile_repair_missing(
+        &self,
+        workspace: PathBuf,
+        candidate_token: String,
+        confirm: bool,
+        py: Python<'_>,
+    ) -> PyResult<SetupReconcileMissingRepairResult> {
+        if !confirm {
+            return Err(PyValueError::new_err(
+                "setup_reconcile_repair_missing requires confirm=True",
+            ));
+        }
+        let state_dir = self.state_dir.clone();
+        py.detach(move || {
+            setup_reconcile_repair_missing(&state_dir, workspace, candidate_token)
+                .map(SetupReconcileMissingRepairResult::from)
                 .map_err(service_error)
         })
     }
@@ -730,6 +754,8 @@ pub struct SetupReconcileRecord {
     generation: String,
     #[pyo3(get)]
     drift: String,
+    #[pyo3(get)]
+    repair_token: Option<String>,
 }
 #[derive(Debug)]
 #[pyclass(module = "bosn._native", frozen)]
@@ -754,6 +780,7 @@ impl SetupReconcilePreviewPage {
                             name: v.name.clone(),
                             generation: v.generation.clone(),
                             drift: v.drift.clone(),
+                            repair_token: v.repair_token.clone(),
                         },
                     )
                 })
@@ -774,8 +801,26 @@ impl From<ServiceSetupReconcilePreviewPage> for SetupReconcilePreviewPage {
                     name: v.name,
                     generation: v.generation,
                     drift: v.drift,
+                    repair_token: v.repair_token,
                 })
                 .collect(),
+        }
+    }
+}
+
+#[derive(Debug)]
+#[pyclass(module = "bosn._native", frozen)]
+pub struct SetupReconcileMissingRepairResult {
+    #[pyo3(get)]
+    repaired: bool,
+    #[pyo3(get)]
+    already_repaired: bool,
+}
+impl From<ServiceSetupReconcileMissingRepairResult> for SetupReconcileMissingRepairResult {
+    fn from(value: ServiceSetupReconcileMissingRepairResult) -> Self {
+        Self {
+            repaired: value.repaired,
+            already_repaired: value.already_repaired,
         }
     }
 }
@@ -1082,6 +1127,21 @@ fn setup_reconcile_preview(
     runtime.run(async {
         ServiceClient::for_state(state_dir)?
             .setup_reconcile_preview(workspace, after, limit)
+            .await
+    })
+}
+fn setup_reconcile_repair_missing(
+    state_dir: &Path,
+    workspace: PathBuf,
+    candidate_token: String,
+) -> Result<ServiceSetupReconcileMissingRepairResult, bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async {
+        ServiceClient::for_state(state_dir)?
+            .setup_reconcile_repair_missing(workspace, &candidate_token, true)
             .await
     })
 }
@@ -1437,6 +1497,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SetupGcPreviewPage>()?;
     module.add_class::<SetupReconcileRecord>()?;
     module.add_class::<SetupReconcilePreviewPage>()?;
+    module.add_class::<SetupReconcileMissingRepairResult>()?;
     module.add_class::<SetupGcApplyResult>()?;
     module.add_class::<SetupRetiredStopResult>()?;
     module.add_class::<SetupDoneResult>()?;
@@ -1958,6 +2019,16 @@ mod tests {
             let error = client.job_status(1, py).unwrap_err();
             assert!(error.is_instance_of::<PyRuntimeError>(py));
             assert!(!error.to_string().contains("no-daemon"));
+
+            let error = client
+                .setup_reconcile_repair_missing(
+                    temporary.path().join("workspace"),
+                    "srm1-00".into(),
+                    false,
+                    py,
+                )
+                .unwrap_err();
+            assert!(error.is_instance_of::<PyValueError>(py));
         });
         assert_eq!(
             redact_diagnostic("https://user:secret@example.test/a?token=also-secret&safe=value"),

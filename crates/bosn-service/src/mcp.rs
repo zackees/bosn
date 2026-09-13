@@ -18,8 +18,8 @@ use crate::{
     Client, DoctorReport, Error, JobLogPage, JobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE,
     RegistryResourcePage, SetupAdoptRequest, SetupAdoptResult, SetupDoneResult,
     SetupEnsureEventPage, SetupEnsureJobRequest, SetupGcApplyResult, SetupGcPreviewPage,
-    SetupPreparePolicy, SetupPrepareRequest, SetupReconcilePreviewPage, SetupRetiredStopResult,
-    SetupTaskJobRequest, Status,
+    SetupPreparePolicy, SetupPrepareRequest, SetupReconcileMissingRepairResult,
+    SetupReconcilePreviewPage, SetupRetiredStopResult, SetupTaskJobRequest, Status,
 };
 use bosn_setup::{
     SetupAcquirePolicy, SetupPlan, SetupPlanAppSource, SetupPlanRequest, SetupSourceKind,
@@ -118,6 +118,11 @@ trait Backend {
         after: u64,
         limit: u32,
     ) -> Result<SetupReconcilePreviewPage, Error>;
+    fn setup_reconcile_repair_missing(
+        &mut self,
+        workspace: PathBuf,
+        token: String,
+    ) -> Result<SetupReconcileMissingRepairResult, Error>;
     fn setup_gc_apply(
         &mut self,
         workspace: PathBuf,
@@ -200,6 +205,16 @@ impl Backend for DaemonBackend<'_> {
     ) -> Result<SetupReconcilePreviewPage, Error> {
         self.runtime
             .run(self.client.setup_reconcile_preview(workspace, after, limit))
+    }
+    fn setup_reconcile_repair_missing(
+        &mut self,
+        workspace: PathBuf,
+        token: String,
+    ) -> Result<SetupReconcileMissingRepairResult, Error> {
+        self.runtime.run(
+            self.client
+                .setup_reconcile_repair_missing(workspace, &token, true),
+        )
     }
     fn setup_gc_apply(
         &mut self,
@@ -408,6 +423,7 @@ fn tools_list() -> Value {
                 "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
             },
             {"name":"bosn_setup_reconcile_preview","description":"Read-only compare of durable Bosn setup-container ownership with fixed Docker inspection for one workspace. It never repairs, writes SQLite, creates/starts/stops/removes Docker resources, or accepts engine controls.","inputSchema":setup_gc_preview_schema(),"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
+            {"name":"bosn_setup_reconcile_repair_missing","description":"STATE CHANGE: retire exactly one preview-token-bound active managed setup app only after the daemon rechecks ownership/use protection and fixed Docker inspection still proves it missing. It never starts, creates, stops, removes, or otherwise mutates Docker.","inputSchema":setup_gc_apply_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
             {
                 "name": "bosn_setup_gc_apply",
                 "description": "DESTRUCTIVE: remove exactly one retired Bosn-managed setup container using a preview candidate token and explicit confirmation. The daemon rechecks registry ownership and Docker labels before removal.",
@@ -648,6 +664,14 @@ fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
                 backend
                     .setup_reconcile_preview(workspace, after, limit)
                     .map(setup_reconcile_preview_json)
+                    .map_err(|_| ToolFailure::Daemon)
+            })
+        }
+        "bosn_setup_reconcile_repair_missing" => {
+            setup_gc_apply_arguments(arguments).and_then(|(workspace, token)| {
+                backend
+                    .setup_reconcile_repair_missing(workspace, token)
+                    .map(setup_reconcile_repair_missing_json)
                     .map_err(|_| ToolFailure::Daemon)
             })
         }
@@ -1196,7 +1220,10 @@ fn setup_gc_preview_json(page: SetupGcPreviewPage) -> Value {
     json!({"next": page.next, "candidates": candidates, "counts": {"protected_not_retired": page.counts.protected_not_retired, "protected_ambiguous_use": page.counts.protected_ambiguous_use, "protected_lease": page.counts.protected_lease, "protected_session": page.counts.protected_session, "excluded_unmanaged": page.counts.excluded_unmanaged}})
 }
 fn setup_reconcile_preview_json(page: SetupReconcilePreviewPage) -> Value {
-    json!({"preview_only":true,"next":page.next,"records":page.records.into_iter().map(|record| json!({"id":record.id,"name":record.name,"generation":record.generation,"drift":record.drift})).collect::<Vec<_>>()})
+    json!({"preview_only":true,"next":page.next,"records":page.records.into_iter().map(|record| json!({"id":record.id,"name":record.name,"generation":record.generation,"drift":record.drift,"repair_token":record.repair_token})).collect::<Vec<_>>()})
+}
+fn setup_reconcile_repair_missing_json(result: SetupReconcileMissingRepairResult) -> Value {
+    json!({"repaired":result.repaired,"already_repaired":result.already_repaired})
 }
 fn setup_gc_apply_json(result: SetupGcApplyResult) -> Value {
     json!({"removed":result.removed,"reconciled_missing":result.reconciled_missing})
@@ -1395,7 +1422,19 @@ mod tests {
                     name: "bosn-setup-abc".into(),
                     generation: "sha256:abc".into(),
                     drift: "matching_running".into(),
+                    repair_token: None,
                 }],
+            })
+        }
+        fn setup_reconcile_repair_missing(
+            &mut self,
+            _workspace: PathBuf,
+            _token: String,
+        ) -> Result<SetupReconcileMissingRepairResult, Error> {
+            self.daemon_reads += 1;
+            Ok(SetupReconcileMissingRepairResult {
+                repaired: true,
+                already_repaired: false,
             })
         }
         fn setup_gc_apply(
@@ -1568,6 +1607,7 @@ mod tests {
                 "bosn_setup_ensure_events",
                 "bosn_setup_gc_preview",
                 "bosn_setup_reconcile_preview",
+                "bosn_setup_reconcile_repair_missing",
                 "bosn_setup_gc_apply",
                 "bosn_setup_stop_retired",
                 "bosn_setup_done",
@@ -1727,6 +1767,30 @@ mod tests {
             &mut backend,
         );
         assert!(rejected["isError"].as_bool().unwrap());
+        assert_eq!(backend.daemon_reads, 1);
+    }
+
+    #[test]
+    fn reconcile_missing_repair_requires_confirmation_and_rejects_engine_controls() {
+        let mut backend = FakeBackend::default();
+        let rejected = call_tool(
+            json!({"name":"bosn_setup_reconcile_repair_missing","arguments":{"workspace":"/private/work","candidate_token":"srm1-00","confirm":false}}),
+            &mut backend,
+        );
+        assert_eq!(rejected["isError"], true);
+        assert_eq!(backend.daemon_reads, 0);
+        let rejected = call_tool(
+            json!({"name":"bosn_setup_reconcile_repair_missing","arguments":{"workspace":"/private/work","candidate_token":"srm1-00","confirm":true,"docker_args":["rm"]}}),
+            &mut backend,
+        );
+        assert_eq!(rejected["isError"], true);
+        assert_eq!(backend.daemon_reads, 0);
+        let repaired = call_tool(
+            json!({"name":"bosn_setup_reconcile_repair_missing","arguments":{"workspace":"/private/work","candidate_token":"srm1-00","confirm":true}}),
+            &mut backend,
+        );
+        assert_eq!(repaired["isError"], false);
+        assert_eq!(repaired["structuredContent"]["repaired"], true);
         assert_eq!(backend.daemon_reads, 1);
     }
 
