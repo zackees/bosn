@@ -740,8 +740,8 @@ mod tests {
     use super::*;
     #[cfg(feature = "embedded-python-tests")]
     use bosn_service::{
-        Service, SetupEnsureExecution, SetupEnsureExecutor, SetupEnsureResource,
-        SetupPrepareExecutor, SetupTaskExecutor,
+        Service, SetupEnsureExecution, SetupEnsureExecutor, SetupEnsureImageResource,
+        SetupEnsureResource, SetupPrepareExecutor, SetupTaskExecutor,
     };
     #[cfg(feature = "embedded-python-tests")]
     use kernal_api::async_engine::{self, CancellationToken, RuntimeBuilder, Sender};
@@ -880,6 +880,13 @@ mod tests {
                     resource: SetupEnsureResource {
                         id: "setup-container:python-test".into(),
                         name: "bosn-setup-python-test".into(),
+                        stack: "setup".into(),
+                        generation: "sha256:python-test".into(),
+                        workspace: request.workspace.to_string_lossy().into_owned(),
+                    },
+                    image: SetupEnsureImageResource {
+                        id: "setup-image:sha256:python-test".into(),
+                        name: "setup-image:sha256:python-test".into(),
                         stack: "setup".into(),
                         generation: "sha256:python-test".into(),
                         workspace: request.workspace.to_string_lossy().into_owned(),
