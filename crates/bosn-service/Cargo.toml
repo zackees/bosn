@@ -11,4 +11,4 @@ path = "src/bin/bosn-rs.rs"
 [dependencies]
 bosn-registry = { path = "../bosn-registry" }
 prost = "=0.14.4"
-kernal-api = { git = "https://github.com/zackees/kernal-api", rev = "ed197c5c606d6fd984190721e309c30d7d0383ef", version = "=0.1.0", default-features = false, features = ["sqlite", "fs", "ipc", "ipc-async", "secure-random", "daemon-frame-v1"] }
+kernal-api = { git = "https://github.com/zackees/kernal-api", rev = "fc634e507024d63ccaaf75fa564818b9dcfbff36", version = "=0.1.0", default-features = false, features = ["sqlite", "fs", "ipc", "ipc-async", "secure-random", "daemon-frame-v1"] }

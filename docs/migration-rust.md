@@ -328,3 +328,7 @@ uv run pytest tests/test_migration_fixture.py -q
 uv run ruff check tests/test_migration_fixture.py tests/fixtures/migration/create_python_v4_registry.py
 uv run pyright tests/test_migration_fixture.py tests/fixtures/migration/create_python_v4_registry.py
 ```
+# Rust migration
+
+See [Rust generation identity](rust-generation.md) for the bounded collector
+and immutable generation API migration status.
