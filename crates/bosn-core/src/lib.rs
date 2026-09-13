@@ -42,7 +42,7 @@ pub enum ResourceKind {
     Network,
 }
 impl ResourceKind {
-    fn parse(v: &str) -> Option<Self> {
+    pub fn parse(v: &str) -> Option<Self> {
         Some(match v {
             "container" => Self::Container,
             "volume" => Self::Volume,
@@ -52,7 +52,7 @@ impl ResourceKind {
             _ => return None,
         })
     }
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Container => "container",
             Self::Volume => "volume",
@@ -69,7 +69,7 @@ pub enum Scope {
     Machine,
 }
 impl Scope {
-    fn parse(v: &str) -> Option<Self> {
+    pub fn parse(v: &str) -> Option<Self> {
         Some(match v {
             "spec" => Self::Spec,
             "stack" => Self::Stack,
@@ -77,7 +77,7 @@ impl Scope {
             _ => return None,
         })
     }
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Spec => "spec",
             Self::Stack => "stack",
@@ -91,12 +91,18 @@ pub enum Retention {
     Pinned,
 }
 impl Retention {
-    fn parse(v: &str) -> Option<Self> {
+    pub fn parse(v: &str) -> Option<Self> {
         Some(match v {
             "warm" => Self::Warm,
             "pinned" => Self::Pinned,
             _ => return None,
         })
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Warm => "warm",
+            Self::Pinned => "pinned",
+        }
     }
 }
 
@@ -234,6 +240,15 @@ pub enum ResourceState {
     Active,
     Adopted,
     Done,
+}
+impl ResourceState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Adopted => "adopted",
+            Self::Done => "done",
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResourceSnapshot {

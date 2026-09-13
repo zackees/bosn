@@ -1,0 +1,14 @@
+[package]
+name = "bosn-registry"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+
+[dependencies]
+bosn-core = { path = "../bosn-core" }
+serde_json = "=1.0.149"
+# DEVELOPMENT ONLY: kernal-api 0.1.0 has not been published.  The release
+# verifier rejects this source before a Bosn release is made.
+kernal-api = { git = "https://github.com/zackees/kernal-api", rev = "10e558a9f2eb51c2989c89d05b13cf7636bd374e", version = "=0.1.0", default-features = false, features = ["sqlite", "fs", "secure-random"] }
+
+[dev-dependencies]
