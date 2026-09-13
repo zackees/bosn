@@ -892,7 +892,12 @@ struct RegistryActor {
 }
 enum DbCommand {
     Status(async_engine::OneshotSender<Result<Status, Error>>),
+    AppendSetupEnsureEvents {
+        events: Vec<SetupEnsureEvent>,
+        reply: async_engine::OneshotSender<Result<(), Error>>,
+    },
     RecordSetupEnsure {
+        job_id: u64,
         execution: Box<SetupEnsureExecution>,
         reply: async_engine::OneshotSender<Result<(), Error>>,
     },
@@ -956,11 +961,69 @@ enum JobCommand {
     Stop(async_engine::OneshotSender<()>),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum SetupJobKind {
     Prepare,
     Task,
     Ensure,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SetupEnsureEventOutcome {
+    Succeeded,
+    Failed,
+    Cancelled,
+    Superseded,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SetupEnsureEvent {
+    kind: &'static str,
+    detail: String,
+}
+
+impl SetupEnsureEvent {
+    fn submitted(id: u64, request: &SetupEnsureJobRequest) -> Self {
+        let policy = match request.policy {
+            SetupPreparePolicy::Refresh => "refresh",
+            SetupPreparePolicy::Offline => "offline",
+        };
+        // The event stream is diagnostic metadata, not a configuration
+        // archive. In particular, locators can contain credentials, signed
+        // query strings, or sensitive local path components.
+        let source = config_locator_kind(&request.config);
+        Self {
+            kind: "setup.ensure.submitted",
+            detail: format!("job_id={id} policy={policy} source={source}"),
+        }
+    }
+
+    fn terminal(id: u64, outcome: SetupEnsureEventOutcome) -> Self {
+        let (kind, outcome) = match outcome {
+            SetupEnsureEventOutcome::Succeeded => ("setup.ensure.succeeded", "succeeded"),
+            SetupEnsureEventOutcome::Failed => ("setup.ensure.failed", "failed"),
+            SetupEnsureEventOutcome::Cancelled => ("setup.ensure.cancelled", "cancelled"),
+            SetupEnsureEventOutcome::Superseded => ("setup.ensure.superseded", "superseded"),
+        };
+        Self {
+            kind,
+            // Never include executor receipts, engine output, workspace paths,
+            // container IDs, or a config locator in terminal diagnostics.
+            detail: format!("job_id={id} outcome={outcome}"),
+        }
+    }
+}
+
+fn config_locator_kind(config: &str) -> &'static str {
+    if config.starts_with("https://") {
+        "https"
+    } else if config.starts_with("http://") {
+        "http"
+    } else if config.starts_with("file://") {
+        "file"
+    } else {
+        "path"
+    }
 }
 
 enum SetupJobRequest {
@@ -1057,6 +1120,10 @@ async fn job_actor(
     registry: RegistryActor,
 ) {
     let mut requests: BTreeMap<u64, SetupJobRequest> = BTreeMap::new();
+    // Job status is intentionally in-memory in this milestone. Keep just
+    // enough typed identity to make its durable setup-ensure audit trail
+    // complete without treating generic jobs as setup operations.
+    let mut setup_kinds: BTreeMap<u64, SetupJobKind> = BTreeMap::new();
     let mut cancellations: BTreeMap<u64, CancellationSource> = BTreeMap::new();
     let mut tasks = async_engine::TaskGroup::new();
     let mut stopping = None;
@@ -1093,6 +1160,14 @@ async fn job_actor(
                         cancellation.cancel();
                     } else if jobs.job(id).is_ok_and(|job| job.state.terminal()) {
                         requests.remove(&id);
+                        if setup_kinds.remove(&id) == Some(SetupJobKind::Ensure) {
+                            let _ = registry
+                                .append_setup_ensure_events(vec![SetupEnsureEvent::terminal(
+                                    id,
+                                    SetupEnsureEventOutcome::Cancelled,
+                                )])
+                                .await;
+                        }
                     }
                 }
                 let _ = reply.send(result);
@@ -1165,20 +1240,63 @@ async fn job_actor(
             JobCommand::SubmitSetupEnsure { request, reply } => {
                 let digest = setup_ensure_digest(&request);
                 let workspace = request.workspace.to_string_lossy().into_owned();
-                let result = jobs
-                    .submit(&workspace, "setup-ensure", &digest)
-                    .map(|submission| match submission {
-                        Submission::Started(id) | Submission::Queued(id) => {
-                            requests.insert(id, SetupJobRequest::Ensure(request));
-                            id
+                let result = match jobs.submit(&workspace, "setup-ensure", &digest) {
+                    Ok(Submission::Joined(id)) => Ok(id),
+                    Ok(Submission::Started(id)) | Ok(Submission::Queued(id)) => {
+                        match registry
+                            .append_setup_ensure_events(vec![SetupEnsureEvent::submitted(
+                                id, &request,
+                            )])
+                            .await
+                        {
+                            Ok(()) => {
+                                setup_kinds.insert(id, SetupJobKind::Ensure);
+                                requests.insert(id, SetupJobRequest::Ensure(request));
+                                Ok(id)
+                            }
+                            Err(error) => {
+                                // Do not launch an operation whose durable
+                                // submission audit could not be written.
+                                let _ = jobs.settle_with_error(
+                                    id,
+                                    false,
+                                    Some("setup ensure submission audit unavailable".into()),
+                                );
+                                Err(error)
+                            }
                         }
-                        Submission::Joined(id) => id,
-                        Submission::Superseded { replacement, .. } => {
-                            requests.insert(replacement, SetupJobRequest::Ensure(request));
-                            replacement
+                    }
+                    Ok(Submission::Superseded { job, replacement }) => {
+                        let mut events = Vec::new();
+                        if setup_kinds.get(&job) == Some(&SetupJobKind::Ensure) {
+                            events.push(SetupEnsureEvent::terminal(
+                                job,
+                                SetupEnsureEventOutcome::Superseded,
+                            ));
                         }
-                    })
-                    .map_err(|_| Error::Protocol("setup ensure job admission"));
+                        events.push(SetupEnsureEvent::submitted(replacement, &request));
+                        match registry.append_setup_ensure_events(events).await {
+                            Ok(()) => {
+                                setup_kinds.remove(&job);
+                                requests.remove(&job);
+                                setup_kinds.insert(replacement, SetupJobKind::Ensure);
+                                requests.insert(replacement, SetupJobRequest::Ensure(request));
+                                Ok(replacement)
+                            }
+                            Err(error) => {
+                                let _ = jobs.settle_with_error(
+                                    replacement,
+                                    false,
+                                    Some("setup ensure submission audit unavailable".into()),
+                                );
+                                requests.remove(&job);
+                                setup_kinds.remove(&job);
+                                Err(error)
+                            }
+                        }
+                    }
+                    Err(_) => Err(Error::Protocol("setup ensure job admission")),
+                };
                 let _ = reply.send(result);
                 launch_started_setup_jobs(
                     &mut jobs,
@@ -1200,7 +1318,7 @@ async fn job_actor(
                 {
                     let receipt = execution.receipt.clone();
                     registry
-                        .record_setup_ensure(execution)
+                        .record_setup_ensure(id, execution)
                         .await
                         .map_err(|error| format!("setup ensure registry recording failed: {error}"))
                         .map(|()| {
@@ -1210,6 +1328,7 @@ async fn job_actor(
                             // rejected above; a later cancellation observes a
                             // terminal success and cannot be accepted.
                             cancellations.remove(&id);
+                            setup_kinds.remove(&id);
                             let _ = jobs.log(id, bounded_log_line(&receipt));
                             let _ = jobs.settle_with_error(id, true, None);
                         })
@@ -1225,6 +1344,34 @@ async fn job_actor(
             }
             JobCommand::Completed { id, kind, result } => {
                 cancellations.remove(&id);
+                let terminal_outcome = if matches!(kind, SetupJobKind::Ensure) {
+                    let cancelled = jobs
+                        .job(id)
+                        .is_ok_and(|job| job.state == jobs::JobState::Cancelling);
+                    Some(if cancelled {
+                        SetupEnsureEventOutcome::Cancelled
+                    } else if result.is_ok() {
+                        SetupEnsureEventOutcome::Succeeded
+                    } else {
+                        SetupEnsureEventOutcome::Failed
+                    })
+                } else {
+                    None
+                };
+                if let Some(outcome) = terminal_outcome {
+                    // A successful ensure settles in PersistSetupEnsure with
+                    // its event and resources in one transaction. This branch
+                    // therefore only records failed/cancelled terminal work.
+                    if outcome != SetupEnsureEventOutcome::Succeeded
+                        && setup_kinds.get(&id) == Some(&SetupJobKind::Ensure)
+                    {
+                        let _ = registry
+                            .append_setup_ensure_events(vec![SetupEnsureEvent::terminal(
+                                id, outcome,
+                            )])
+                            .await;
+                    }
+                }
                 match result {
                     Ok(receipt) => {
                         let _ = jobs.log(id, bounded_log_line(&receipt));
@@ -1241,9 +1388,33 @@ async fn job_actor(
                         let _ = jobs.settle_with_error(id, false, Some(error));
                     }
                 }
+                if jobs.job(id).is_ok_and(|job| job.state.terminal()) {
+                    setup_kinds.remove(&id);
+                }
             }
             JobCommand::Stop(reply) => {
                 jobs.close();
+                let cancelled: Vec<SetupEnsureEvent> = setup_kinds
+                    .iter()
+                    .filter_map(|(&id, kind)| {
+                        (*kind == SetupJobKind::Ensure
+                            && jobs
+                                .job(id)
+                                .is_ok_and(|job| job.state == jobs::JobState::Cancelled))
+                        .then_some(SetupEnsureEvent::terminal(
+                            id,
+                            SetupEnsureEventOutcome::Cancelled,
+                        ))
+                    })
+                    .collect();
+                if !cancelled.is_empty() {
+                    let _ = registry.append_setup_ensure_events(cancelled).await;
+                }
+                setup_kinds.retain(|&id, _| {
+                    !jobs
+                        .job(id)
+                        .is_ok_and(|job| job.state == jobs::JobState::Cancelled)
+                });
                 for (&id, cancellation) in &cancellations {
                     // Preserve cancellation semantics in durable status while
                     // the executor owns direct-child reaping.
@@ -1447,10 +1618,23 @@ impl RegistryActor {
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
     }
-    async fn record_setup_ensure(&self, execution: SetupEnsureExecution) -> Result<(), Error> {
+    async fn append_setup_ensure_events(&self, events: Vec<SetupEnsureEvent>) -> Result<(), Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::AppendSetupEnsureEvents { events, reply })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
+    async fn record_setup_ensure(
+        &self,
+        job_id: u64,
+        execution: SetupEnsureExecution,
+    ) -> Result<(), Error> {
         let (reply, wait) = async_engine::oneshot_channel();
         self.sender
             .send(DbCommand::RecordSetupEnsure {
+                job_id,
                 execution: Box::new(execution),
                 reply,
             })
@@ -1488,7 +1672,27 @@ async fn registry_actor(
                     }
                 }
             }
-            DbCommand::RecordSetupEnsure { execution, reply } => {
+            DbCommand::AppendSetupEnsureEvents { events, reply } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = append_setup_ensure_events(&mut registry, &events);
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
+            DbCommand::RecordSetupEnsure {
+                job_id,
+                execution,
+                reply,
+            } => {
                 #[cfg(test)]
                 if let Some(gate) = &mut setup_ensure_record_gate
                     && (gate.entered.send(()).await.is_err() || gate.release.recv().await.is_none())
@@ -1497,7 +1701,7 @@ async fn registry_actor(
                     continue;
                 }
                 let worker = async_engine::launch_blocking(move || {
-                    let result = record_setup_ensure(&mut registry, &execution);
+                    let result = record_setup_ensure(&mut registry, job_id, &execution);
                     (registry, result)
                 });
                 match worker.await {
@@ -1521,6 +1725,7 @@ async fn registry_actor(
 
 fn record_setup_ensure(
     registry: &mut Registry,
+    job_id: u64,
     execution: &SetupEnsureExecution,
 ) -> Result<(), bosn_registry::Error> {
     let now = SystemTime::now()
@@ -1574,6 +1779,28 @@ fn record_setup_ensure(
         last_used: now,
         state: ResourceState::Active,
     })?;
+    // Success is never visible in the event log until both durable ownership
+    // facts have been accepted by this very transaction.
+    let event = SetupEnsureEvent::terminal(job_id, SetupEnsureEventOutcome::Succeeded);
+    transaction.append_event(now, event.kind, &event.detail)?;
+    transaction.commit()
+}
+
+fn append_setup_ensure_events(
+    registry: &mut Registry,
+    events: &[SetupEnsureEvent],
+) -> Result<(), bosn_registry::Error> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
+        .as_secs_f64();
+    let mut transaction = registry.begin_immediate()?;
+    for event in events {
+        transaction.append_event(now, event.kind, &event.detail)?;
+    }
     transaction.commit()
 }
 impl Service {
@@ -1687,11 +1914,14 @@ impl Service {
             clients.spawn(async move { handle(stream, actor, jobs, stop).await });
         }
         while clients.join_next().await.is_some() {}
-        actor.stop().await;
+        // Keep the sole registry writer alive while the job actor cancels and
+        // drains typed work: a shutdown-cancelled setup ensure still needs its
+        // durable terminal audit event before the writer can be released.
         jobs.stop().await;
         drop(jobs);
-        let _ = worker.await;
         let _ = job_worker.await;
+        actor.stop().await;
+        let _ = worker.await;
         Ok(())
     }
 }
@@ -2964,13 +3194,33 @@ mod tests {
                 client.shutdown().await.unwrap();
                 stopped(server).await;
             });
+        let registry = Registry::open_read_only(state.join("registry.sqlite3")).unwrap();
+        let events = registry.events(0, 10).unwrap().items;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.kind.as_str(), event.detail.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "setup.ensure.submitted",
+                    "job_id=1 policy=refresh source=https",
+                ),
+                (
+                    "setup.ensure.submitted",
+                    "job_id=2 policy=refresh source=https",
+                ),
+                ("setup.ensure.cancelled", "job_id=1 outcome=cancelled"),
+                ("setup.ensure.succeeded", "job_id=2 outcome=succeeded"),
+            ]
+        );
     }
 
     #[test]
     fn setup_ensure_stops_after_prepare_failure_or_ownership_mismatch_without_mutation() {
         for config in [
-            "https://example.invalid/prepare-fail.toml",
-            "https://example.invalid/ensure-mismatch.toml",
+            "https://user:secret@example.invalid/prepare-fail.toml?token=not-for-events",
+            "https://user:secret@example.invalid/ensure-mismatch.toml?token=not-for-events",
         ] {
             let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
             let state = temporary.path().join("state");
@@ -3017,6 +3267,30 @@ mod tests {
             let registry = Registry::open_read_only(state.join("registry.sqlite3")).unwrap();
             assert!(registry.resources(0, 10).unwrap().items.is_empty());
             assert!(registry.resource_uses(0, 10).unwrap().items.is_empty());
+            let events = registry.events(0, 10).unwrap().items;
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| (event.kind.as_str(), event.detail.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    (
+                        "setup.ensure.submitted",
+                        "job_id=1 policy=offline source=https",
+                    ),
+                    ("setup.ensure.failed", "job_id=1 outcome=failed"),
+                ]
+            );
+            let rendered = format!("{events:?}");
+            for sensitive in [
+                "user:secret",
+                "token=",
+                "not-for-events",
+                "prepare-fail",
+                "ensure-mismatch",
+            ] {
+                assert!(!rendered.contains(sensitive), "event leaked {sensitive}");
+            }
         }
     }
 
@@ -3089,6 +3363,25 @@ mod tests {
             assert_eq!(use_record.stack, "setup");
             assert_eq!(use_record.state, ResourceState::Active);
         }
+        let events = registry.events(0, 10).unwrap().items;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.kind.as_str(), event.detail.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "setup.ensure.submitted",
+                    "job_id=1 policy=refresh source=https",
+                ),
+                ("setup.ensure.succeeded", "job_id=1 outcome=succeeded"),
+                (
+                    "setup.ensure.submitted",
+                    "job_id=1 policy=refresh source=https",
+                ),
+                ("setup.ensure.succeeded", "job_id=1 outcome=succeeded"),
+            ]
+        );
     }
 
     #[test]
@@ -3174,7 +3467,7 @@ mod tests {
             },
         };
         assert!(matches!(
-            record_setup_ensure(&mut registry, &execution),
+            record_setup_ensure(&mut registry, 7, &execution),
             Err(bosn_registry::Error::ResourceIdentityConflict)
         ));
         // The failed image upsert rolls back the preceding container and both
@@ -3183,6 +3476,9 @@ mod tests {
         assert_eq!(resources.len(), 1);
         assert_eq!(resources[0].id, "foreign-image-row");
         assert!(registry.resource_uses(0, 10).unwrap().items.is_empty());
+        // The terminal success event is part of the same transaction as its
+        // resources, so an identity conflict cannot leave a false success.
+        assert!(registry.events(0, 10).unwrap().items.is_empty());
     }
 
     #[test]
@@ -3222,6 +3518,74 @@ mod tests {
         let registry = Registry::open_read_only(state.join("registry.sqlite3")).unwrap();
         assert!(registry.resources(0, 10).unwrap().items.is_empty());
         assert!(registry.resource_uses(0, 10).unwrap().items.is_empty());
+        assert_eq!(
+            registry
+                .events(0, 10)
+                .unwrap()
+                .items
+                .iter()
+                .map(|event| (event.kind.as_str(), event.detail.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "setup.ensure.submitted",
+                    "job_id=1 policy=refresh source=https",
+                ),
+                ("setup.ensure.cancelled", "job_id=1 outcome=cancelled"),
+            ]
+        );
+    }
+
+    #[test]
+    fn shutdown_cancelled_setup_ensure_keeps_a_durable_terminal_event() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let fake = Arc::new(FakeSetupEnsureExecutor::new());
+        RuntimeBuilder::multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let server = async_engine::launch(
+                    Service::new(state.clone())
+                        .with_setup_ensure_executor(fake.clone())
+                        .serve(),
+                );
+                let client = wait_for_client(&state).await;
+                client
+                    .submit_setup_ensure(SetupEnsureJobRequest {
+                        workspace,
+                        config: "https://example.invalid/wait.toml".into(),
+                        policy: SetupPreparePolicy::Refresh,
+                        deadline: Duration::from_secs(2),
+                        output_limit: 4 * 1024,
+                    })
+                    .await
+                    .unwrap();
+                wait_for(|| fake.started.load(Ordering::SeqCst) == 1).await;
+                client.shutdown().await.unwrap();
+                stopped(server).await;
+            });
+        let registry = Registry::open_read_only(state.join("registry.sqlite3")).unwrap();
+        assert!(registry.resources(0, 10).unwrap().items.is_empty());
+        assert_eq!(
+            registry
+                .events(0, 10)
+                .unwrap()
+                .items
+                .iter()
+                .map(|event| (event.kind.as_str(), event.detail.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "setup.ensure.submitted",
+                    "job_id=1 policy=refresh source=https",
+                ),
+                ("setup.ensure.cancelled", "job_id=1 outcome=cancelled"),
+            ]
+        );
     }
 
     #[test]
