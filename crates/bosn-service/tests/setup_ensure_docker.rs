@@ -5,6 +5,8 @@
 //! pinned Alpine image documented below.  Its drop guard removes only the
 //! exact deterministic container after re-checking Bosn's ownership labels.
 
+mod support;
+
 use std::{
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
@@ -14,7 +16,8 @@ use std::{
 use bosn_engine::{CommandResult, DockerEngine, RunOptions};
 use bosn_service::{Client, SetupEnsureJobRequest, SetupPreparePolicy};
 use bosn_setup::{SetupAcquirePolicy, SetupPlanRequest, plan_setup};
-use kernal_api::async_engine::RuntimeBuilder;
+use kernal_api::{async_engine::RuntimeBuilder, hash::sha256_bytes};
+use support::tls_setup_server::{TlsSetupServer, certificate_path};
 
 const PINNED_ALPINE: &str =
     "alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b";
@@ -34,15 +37,24 @@ struct DaemonChild {
 
 impl DaemonChild {
     fn start(state: &Path) -> Self {
+        Self::start_with_certificate(state, None)
+    }
+
+    fn start_with_certificate(state: &Path, certificate: Option<&Path>) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bosn"));
+        command
+            .args(["daemon", "serve", "--state-dir"])
+            .arg(state)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(certificate) = certificate {
+            command
+                .env("SSL_CERT_FILE", certificate)
+                .env("NO_PROXY", "localhost,127.0.0.1");
+        }
         Self {
-            child: Command::new(env!("CARGO_BIN_EXE_bosn"))
-                .args(["daemon", "serve", "--state-dir"])
-                .arg(state)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("start production Bosn daemon"),
+            child: command.spawn().expect("start production Bosn daemon"),
         }
     }
 
@@ -572,5 +584,129 @@ fn live_docker_setup_ensure_builds_and_reuses_inline_app() {
             .expect("inspect exact inline container after cleanup")
             .is_none(),
         "exact inline live-test container remained after cleanup"
+    );
+}
+
+/// Run with:
+/// `soldr cargo test -j1 -p bosn-service --test setup_ensure_docker --locked -- --ignored --exact live_docker_setup_ensure_fetches_one_https_document_then_reuses_it_offline`
+///
+/// The Bosn daemons use their normal kernal-api verified HTTPS transport. The
+/// public fixture CA is passed only to those child processes. This test needs
+/// a usable local Docker daemon and the exact `PINNED_ALPINE` image, while the
+/// setup document itself exists only at one HTTPS URL.
+#[test]
+#[ignore = "requires a local Docker daemon and the pinned Alpine image"]
+fn live_docker_setup_ensure_fetches_one_https_document_then_reuses_it_offline() {
+    let engine = DockerEngine::docker();
+    let expected_image = pinned_alpine_identity(&engine);
+    let root = tempfile::tempdir().expect("temporary test root");
+    let state = root.path().join("state");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("create empty workspace");
+    let unique = test_unique_suffix();
+    let original = format!(
+        "version = 1\n[app]\nimage = '{PINNED_ALPINE}'\ncommand = 'exec sleep 120 # bosn-remote-live-{unique}'\n"
+    );
+    let changed = format!(
+        "version = 1\n[app]\nimage = '{PINNED_ALPINE}'\ncommand = 'exec sleep 120 # bosn-remote-changed-{unique}'\n"
+    );
+    let content_sha256 = sha256_bytes(original.as_bytes()).to_hex();
+    let container_name = format!("bosn-setup-{content_sha256}");
+    assert!(
+        inspect_container(&engine, &container_name)
+            .expect("inspect deterministic HTTPS test container")
+            .is_none(),
+        "unique HTTPS test container name already exists; refusing to touch it"
+    );
+    let cleanup = ExactContainerCleanup {
+        engine: engine.clone(),
+        container_name: container_name.clone(),
+        content_sha256: content_sha256.clone(),
+    };
+    let mut server = TlsSetupServer::start(original.as_bytes());
+    let locator = server.url("/docker-linux.toml?token=bosn-live-test-secret");
+    let certificate = certificate_path();
+    let request = SetupEnsureJobRequest {
+        workspace: workspace.clone(),
+        config: locator,
+        policy: SetupPreparePolicy::Refresh,
+        deadline: JOB_DEADLINE,
+        output_limit: OUTPUT_LIMIT,
+    };
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("construct kernal-api runtime");
+
+    let mut first_daemon = DaemonChild::start_with_certificate(&state, Some(&certificate));
+    let first_client = wait_for_client(&runtime, &mut first_daemon, &state);
+    let first_job = runtime
+        .run(first_client.submit_setup_ensure(request.clone()))
+        .expect("submit remote production setup ensure job");
+    wait_for_success(&runtime, &first_client, first_job);
+    assert_eq!(server.request_count(), 1, "remote document fetched once");
+    let first = inspect_container(&engine, &container_name)
+        .expect("inspect first remote setup app")
+        .expect("first remote setup app exists");
+    assert!(first.running, "first remote setup app is not running");
+    assert_eq!(first.image, expected_image, "remote app image identity");
+    assert_eq!(first.managed, "v1", "remote managed ownership label");
+    assert_eq!(first.content_sha256, content_sha256, "remote content label");
+    assert_eq!(first.container_name, container_name, "remote name label");
+    runtime
+        .run(first_client.shutdown())
+        .expect("shut down first remote daemon");
+    assert!(
+        first_daemon.wait_for_exit().success(),
+        "first remote daemon failed"
+    );
+
+    // Change the still-live endpoint, then take it away entirely. The second
+    // explicit offline request has no authority to fetch or apply that change.
+    server.replace_body(changed.as_bytes());
+    server.stop();
+    let mut offline_request = request;
+    offline_request.policy = SetupPreparePolicy::Offline;
+    let mut second_daemon = DaemonChild::start_with_certificate(&state, Some(&certificate));
+    let second_client = wait_for_client(&runtime, &mut second_daemon, &state);
+    let second_job = runtime
+        .run(second_client.submit_setup_ensure(offline_request))
+        .expect("submit cached remote setup ensure job");
+    wait_for_success(&runtime, &second_client, second_job);
+    assert_eq!(
+        server.request_count(),
+        1,
+        "offline ensure contacted the changed or stopped remote source"
+    );
+    let second = inspect_container(&engine, &container_name)
+        .expect("inspect cached remote setup app")
+        .expect("cached remote setup app exists");
+    assert!(second.running, "cached remote setup app is not running");
+    assert_eq!(
+        second.id, first.id,
+        "offline remote ensure replaced rather than reused the cached app"
+    );
+    assert_eq!(second.image, expected_image, "cached remote image identity");
+    runtime
+        .run(second_client.shutdown())
+        .expect("shut down cached remote daemon");
+    assert!(
+        second_daemon.wait_for_exit().success(),
+        "cached remote daemon failed"
+    );
+    assert!(
+        std::fs::read_dir(&workspace)
+            .expect("read remote workspace")
+            .next()
+            .is_none(),
+        "remote setup ensure wrote into the selected workspace"
+    );
+    drop(cleanup);
+    assert!(
+        inspect_container(&engine, &container_name)
+            .expect("inspect exact remote container after cleanup")
+            .is_none(),
+        "exact remote live-test container remained after cleanup"
     );
 }

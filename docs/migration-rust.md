@@ -359,6 +359,32 @@ planning are inert; apply validates again in the daemon.  Remote cache stores re
 content hash, schema version and selected workspace; path traversal, unpinned assets,
 unsupported schemes and oversized inputs are rejected/redacted.
 
+### Remote one-file setup acceptance
+
+`bosn setup plan --config https://…` uses the bounded, verified TLS client exposed by
+`kernal-api`; Bosn does not add an insecure-test or certificate-bypass API. A local public
+test CA is supplied only through `SSL_CERT_FILE` to a native CLI child in the black-box
+acceptance below. It proves that one HTTPS TOML is cached with redacted requested/resolved
+URL provenance and content receipt, an explicit offline request does not fetch a changed
+remote representation, and the same cached receipt works after the server has stopped:
+
+```bash
+soldr cargo test -j1 -p bosn-service --test setup_remote_https --locked
+```
+
+The matching daemon apply proof is opt-in because it creates a short-lived Docker container;
+it serves a self-contained pinned-image TOML only at HTTPS, ensures it through the production
+daemon, then stops the server and proves a new daemon reuses the verified cache offline:
+
+```bash
+soldr cargo test -j1 -p bosn-service --test setup_ensure_docker --locked \
+  -- --ignored --exact live_docker_setup_ensure_fetches_one_https_document_then_reuses_it_offline
+```
+
+It requires a running local Docker daemon and the documented pinned Alpine image. The test
+does not pull mutable images and its cleanup removes only the exact container after rechecking
+all Bosn ownership labels.
+
 The replacement internal protocol is Bosn-owned versioned protobuf over kernal-api local
 authenticated transport, not MCP JSON:
 

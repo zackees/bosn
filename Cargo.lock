@@ -138,6 +138,7 @@ dependencies = [
  "bosn-registry",
  "bosn-setup",
  "kernal-api",
+ "native-tls",
  "prost",
  "serde",
  "serde_json",
