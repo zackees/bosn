@@ -79,6 +79,18 @@ through typed daemon jobs and the bounded native CLI, Python, and MCP
 submission surfaces, but is not registry-backed. It never deletes, replaces,
 stops, adopts, or garbage-collects a container.
 
+An opt-in live proof exercises the production daemon and kernal-api Docker
+transport end to end, including daemon restart and matching-container reuse:
+
+```text
+cargo test -p bosn-service --test setup_ensure_docker -- --ignored --exact live_docker_setup_ensure_creates_and_reuses_one_managed_app
+```
+
+It requires a usable Docker daemon and the exact pre-pulled Alpine digest
+named by the test. The test creates one uniquely content-addressed app and its
+drop guard removes only that exact app after re-checking all ownership labels;
+it never uses Docker prune or a selector-based cleanup.
+
 ## Current surface and characterization references
 
 ### Main CLI (`bosn`)
