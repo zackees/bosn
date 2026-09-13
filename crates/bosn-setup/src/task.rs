@@ -692,6 +692,7 @@ mod tests {
                 source: bosn_core::SetupSource::PinnedImage(image.clone()),
                 environment: app_environment,
                 workdir: Some(".".into()),
+                command: None,
                 mounts: vec![bosn_core::WorkspaceMount {
                     source: ".".into(),
                     target: "/workspace".into(),

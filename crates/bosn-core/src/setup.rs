@@ -39,6 +39,10 @@ pub struct SetupApp {
     /// A path below the caller-selected workspace.  It is not a host absolute
     /// path and is materialized by the apply layer beneath the workspace mount.
     pub workdir: Option<String>,
+    /// Optional declared long-running application command.  When present, the
+    /// setup ensure primitive runs it as `sh -lc` inside the managed app
+    /// container.  This remains document data, never a caller-supplied argv.
+    pub command: Option<String>,
     pub mounts: Vec<WorkspaceMount>,
 }
 
@@ -194,7 +198,14 @@ pub fn parse_setup_config_locator(locator: &str) -> Result<SetupConfigLocator, S
 fn parse_app(raw: &toml::map::Map<String, toml::Value>) -> Result<SetupApp, SetupDocumentError> {
     reject_unknown(
         raw,
-        &["image", "dockerfile", "environment", "workdir", "mount"],
+        &[
+            "image",
+            "dockerfile",
+            "environment",
+            "workdir",
+            "command",
+            "mount",
+        ],
         "app",
     )?;
     let image = optional_string(raw, "image", "app")?;
@@ -222,11 +233,21 @@ fn parse_app(raw: &toml::map::Map<String, toml::Value>) -> Result<SetupApp, Setu
     let workdir = optional_string(raw, "workdir", "app")?
         .map(|path| workspace_relative_path(&path, "app.workdir"))
         .transpose()?;
+    let command = optional_string(raw, "command", "app")?
+        .map(|command| {
+            bounded_string(&command, 16 * 1024, "app.command")?;
+            if command.is_empty() || command.contains('\0') {
+                return err("app.command must be a nonempty bounded string without NUL");
+            }
+            Ok(command)
+        })
+        .transpose()?;
     let mounts = parse_mounts(optional_array(raw, "mount", "app")?)?;
     Ok(SetupApp {
         source,
         environment,
         workdir,
+        command,
         mounts,
     })
 }
@@ -596,4 +617,37 @@ fn empty_table() -> &'static toml::map::Map<String, toml::Value> {
     static EMPTY: std::sync::OnceLock<toml::map::Map<String, toml::Value>> =
         std::sync::OnceLock::new();
     EMPTY.get_or_init(toml::map::Map::new)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const IMAGE: &str = "registry.example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn app_command_is_optional_declared_document_data() {
+        let document = parse_setup_document_toml(&format!(
+            "version = 1\n[app]\nimage = \"{IMAGE}\"\ncommand = \"./serve --port 8080\"\n"
+        ))
+        .unwrap();
+        assert_eq!(document.app.command.as_deref(), Some("./serve --port 8080"));
+
+        let omitted =
+            parse_setup_document_toml(&format!("version = 1\n[app]\nimage = \"{IMAGE}\"\n"))
+                .unwrap();
+        assert_eq!(omitted.app.command, None);
+    }
+
+    #[test]
+    fn app_command_rejects_empty_nul_and_oversized_values() {
+        for command in [
+            "\"\"".to_owned(),
+            "\"bad\\u0000value\"".to_owned(),
+            format!("\"{}\"", "x".repeat(16 * 1024 + 1)),
+        ] {
+            let source = format!("version = 1\n[app]\nimage = \"{IMAGE}\"\ncommand = {command}\n");
+            assert!(parse_setup_document_toml(&source).is_err(), "{command:?}");
+        }
+    }
 }
