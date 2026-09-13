@@ -1,4 +1,9 @@
-use bosn_core::{ComposeErrorCode, MountSpec, parse_and_plan_compose_yaml, parse_compose_yaml};
+use bosn_core::{
+    ComposeErrorCode, MountSpec, SetupSource, parse_and_plan_compose_yaml,
+    parse_and_translate_compose_yaml, parse_compose_yaml,
+};
+
+const PINNED_IMAGE: &str = "registry.example/team/demo@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 // Characterization of src/bosn/compose.py::test_realistic_multi_service_file_parses_end_to_end.
 // The Rust foundation deliberately gives the accepted values a typed, inert plan instead of
@@ -150,4 +155,111 @@ fn parser_is_pure_and_has_no_source_path_api() {
     // planning layer to read a build context, call Docker, or resolve against CWD.
     let document = parse_compose_yaml("services:\n  app:\n    image: alpine\n").unwrap();
     assert_eq!(document.services.len(), 1);
+}
+
+#[test]
+fn translates_the_lossless_single_service_setup_subset() {
+    let source = format!(
+        r#"
+services:
+  app:
+    image: {PINNED_IMAGE}
+    environment:
+      LOG_LEVEL: info
+      FEATURE_X: enabled
+    volumes:
+      - .:/workspace
+      - ./src:/workspace/src:ro
+    working_dir: /workspace/src
+    command: [sh, -lc, 'exec ./serve --port 8080']
+"#
+    );
+    let plan = parse_and_translate_compose_yaml(&source).unwrap();
+    assert_eq!(plan.version, 1);
+    assert_eq!(plan.service, "app");
+    assert_eq!(
+        plan.setup.app.source,
+        SetupSource::PinnedImage(PINNED_IMAGE.into())
+    );
+    assert_eq!(plan.setup.app.environment["LOG_LEVEL"], "info");
+    assert_eq!(plan.setup.app.workdir.as_deref(), Some("src"));
+    assert_eq!(
+        plan.setup.app.command.as_deref(),
+        Some("exec ./serve --port 8080")
+    );
+    assert_eq!(plan.setup.app.mounts.len(), 2);
+    assert_eq!(plan.setup.app.mounts[0].source, ".");
+    assert_eq!(plan.setup.app.mounts[0].target, "/workspace");
+    assert!(plan.setup.app.mounts[1].readonly);
+    assert!(plan.setup.tasks.is_empty());
+    assert!(plan.setup.files.is_empty());
+    assert!(plan.normalized_json.contains("workspace"));
+    assert!(plan.digest.starts_with("sha256:"));
+}
+
+#[test]
+fn setup_translation_digest_is_canonical_for_equivalent_documents() {
+    let first = format!(
+        "services:\n  app:\n    image: {PINNED_IMAGE}\n    environment: {{B: two, A: one}}\n    volumes: [./src:/workspace/src:ro]\n    working_dir: /workspace/src\n"
+    );
+    let second = format!(
+        "services:\n  app:\n    working_dir: /workspace/src\n    volumes:\n      - ./src:/workspace/src:ro\n    environment:\n      A: one\n      B: two\n    image: {PINNED_IMAGE}\n"
+    );
+    let first = parse_and_translate_compose_yaml(&first).unwrap();
+    let second = parse_and_translate_compose_yaml(&second).unwrap();
+    assert_eq!(first.normalized_json, second.normalized_json);
+    assert_eq!(first.digest, second.digest);
+}
+
+#[test]
+fn setup_translation_refuses_non_lossless_compose_semantics_with_paths() {
+    let cases = [
+        (
+            format!(
+                "services:\n  app:\n    image: {PINNED_IMAGE}\n  db:\n    image: {PINNED_IMAGE}\n"
+            ),
+            "services",
+        ),
+        (
+            "services:\n  app:\n    build: .\n".into(),
+            "services.app.build",
+        ),
+        (
+            "services:\n  app:\n    image: alpine:3.21\n".into(),
+            "services.app.image",
+        ),
+        (
+            format!("services:\n  app:\n    image: {PINNED_IMAGE}\n    ports: ['8080:8080']\n"),
+            "services.app.ports",
+        ),
+        (
+            format!(
+                "services:\n  app:\n    image: {PINNED_IMAGE}\n    entrypoint: [/entrypoint.sh]\n"
+            ),
+            "services.app.entrypoint",
+        ),
+        (
+            format!(
+                "services:\n  app:\n    image: {PINNED_IMAGE}\n    command: [./serve, --port, '8080']\n"
+            ),
+            "services.app.command",
+        ),
+        (
+            format!(
+                "services:\n  app:\n    image: {PINNED_IMAGE}\n    volumes: [cache:/cache]\nvolumes:\n  cache:\n"
+            ),
+            "volumes",
+        ),
+        (
+            format!(
+                "services:\n  app:\n    image: {PINNED_IMAGE}\n    volumes: [./src:/workspace/src]\n    working_dir: /not-mounted\n"
+            ),
+            "services.app.working_dir",
+        ),
+    ];
+    for (source, path) in cases {
+        let error = parse_and_translate_compose_yaml(&source).unwrap_err();
+        assert_eq!(error.code, ComposeErrorCode::Unsupported, "{source}");
+        assert_eq!(error.path, path, "{source}");
+    }
 }

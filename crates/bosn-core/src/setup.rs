@@ -9,6 +9,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use serde::Serialize;
+
 /// The only setup-document schema accepted by this release.
 pub const SETUP_DOCUMENT_VERSION: u64 = 1;
 /// A deliberately bounded, inert document before it reaches a cache or parser.
@@ -22,7 +24,7 @@ pub const MAX_ENVIRONMENT_ENTRIES: usize = 128;
 
 /// A validated setup document.  All paths that name workspace or generated
 /// assets use slash-separated relative spelling and have no escaping component.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SetupDocument {
     pub version: u64,
     pub app: SetupApp,
@@ -30,7 +32,7 @@ pub struct SetupDocument {
     pub files: Vec<CompanionFile>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SetupApp {
     /// Exactly one immutable image or an inline Dockerfile.
     pub source: SetupSource,
@@ -46,7 +48,7 @@ pub struct SetupApp {
     pub mounts: Vec<WorkspaceMount>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum SetupSource {
     /// A Docker image name pinned by a canonical sha256 manifest digest.
     PinnedImage(String),
@@ -54,7 +56,7 @@ pub enum SetupSource {
     InlineDockerfile(String),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct WorkspaceMount {
     /// Relative to the caller-selected workspace, never a host absolute path.
     pub source: String,
@@ -63,7 +65,7 @@ pub struct WorkspaceMount {
     pub readonly: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SetupTask {
     pub command: String,
     /// An optional path below the caller-selected workspace.
@@ -71,7 +73,7 @@ pub struct SetupTask {
     pub environment: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CompanionFile {
     /// Relative to the generated build-asset root, never a host absolute path.
     pub path: String,
