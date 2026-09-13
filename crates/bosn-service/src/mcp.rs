@@ -16,8 +16,8 @@
 
 use crate::{
     Client, DoctorReport, Error, JobLogPage, JobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE,
-    RegistryResourcePage, SetupEnsureEventPage, SetupEnsureJobRequest, SetupPreparePolicy,
-    SetupPrepareRequest, SetupTaskJobRequest, Status,
+    RegistryResourcePage, SetupEnsureEventPage, SetupEnsureJobRequest, SetupGcPreviewPage,
+    SetupPreparePolicy, SetupPrepareRequest, SetupTaskJobRequest, Status,
 };
 use bosn_setup::{
     SetupAcquirePolicy, SetupPlan, SetupPlanAppSource, SetupPlanRequest, SetupSourceKind,
@@ -104,6 +104,12 @@ trait Backend {
         after: u64,
         limit: u32,
     ) -> Result<SetupEnsureEventPage, Error>;
+    fn setup_gc_preview(
+        &mut self,
+        workspace: PathBuf,
+        after: u64,
+        limit: u32,
+    ) -> Result<SetupGcPreviewPage, Error>;
     fn job_status(&mut self, id: u64) -> Result<JobStatus, Error>;
     fn job_logs(&mut self, id: u64, after: u64, limit: u32) -> Result<JobLogPage, Error>;
     fn cancel_job(&mut self, id: u64) -> Result<(), Error>;
@@ -156,6 +162,15 @@ impl Backend for DaemonBackend<'_> {
     ) -> Result<SetupEnsureEventPage, Error> {
         self.runtime
             .run(self.client.setup_ensure_events(after, limit))
+    }
+    fn setup_gc_preview(
+        &mut self,
+        workspace: PathBuf,
+        after: u64,
+        limit: u32,
+    ) -> Result<SetupGcPreviewPage, Error> {
+        self.runtime
+            .run(self.client.setup_gc_preview(workspace, after, limit))
     }
     fn job_status(&mut self, id: u64) -> Result<JobStatus, Error> {
         self.runtime.run(self.client.job_status(id))
@@ -336,6 +351,12 @@ fn tools_list() -> Value {
                 "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
             },
             {
+                "name": "bosn_setup_gc_preview",
+                "description": "Preview only future collection candidates for retired Bosn-managed setup containers in one workspace. This never starts a daemon, writes SQLite, calls Docker, stops, deletes, or applies GC. A future apply must recheck all ownership facts.",
+                "inputSchema": setup_gc_preview_schema(),
+                "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
+            },
+            {
                 "name": "bosn_job_status",
                 "description": "Read the state of one native daemon job.",
                 "inputSchema": job_id_schema(),
@@ -468,6 +489,13 @@ fn registry_page_schema() -> Value {
         }
     })
 }
+fn setup_gc_preview_schema() -> Value {
+    json!({"type": "object", "additionalProperties": false, "required": ["workspace"], "properties": {
+        "workspace": {"type": "string", "minLength": 1, "maxLength": MAX_MCP_SETUP_STRING_BYTES, "description": "Workspace selector; it is never returned in preview output."},
+        "after": {"type": "integer", "minimum": 0, "default": 0},
+        "limit": {"type": "integer", "minimum": 1, "maximum": MAX_MCP_REGISTRY_RECORDS, "default": MAX_MCP_REGISTRY_RECORDS}
+    }})
+}
 
 fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
     let Some(params) = params.as_object() else {
@@ -517,6 +545,14 @@ fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
                 backend
                     .setup_ensure_events(after, limit)
                     .map(setup_ensure_event_page_json)
+                    .map_err(|_| ToolFailure::Daemon)
+            })
+        }
+        "bosn_setup_gc_preview" => {
+            setup_gc_preview_arguments(arguments).and_then(|(workspace, after, limit)| {
+                backend
+                    .setup_gc_preview(workspace, after, limit)
+                    .map(setup_gc_preview_json)
                     .map_err(|_| ToolFailure::Daemon)
             })
         }
@@ -862,6 +898,30 @@ fn registry_page_arguments(
         .then_some((after, limit as u32))
         .ok_or(ToolFailure::Invalid("limit must be within 1..=64"))
 }
+fn setup_gc_preview_arguments(
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<(PathBuf, u64, u32), ToolFailure> {
+    only_arguments(arguments, &["workspace", "after", "limit"])?;
+    let workspace = arguments
+        .get("workspace")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= MAX_MCP_SETUP_STRING_BYTES
+                && !value.bytes().any(|byte| byte == 0)
+        })
+        .map(PathBuf::from)
+        .ok_or(ToolFailure::Invalid(
+            "workspace must be a non-empty bounded string",
+        ))?;
+    let after = optional_u64(arguments, "after", 0)?;
+    let limit = optional_u64(arguments, "limit", u64::from(MAX_MCP_REGISTRY_RECORDS))?;
+    if limit == 0 || limit > u64::from(MAX_MCP_REGISTRY_RECORDS) {
+        return Err(ToolFailure::Invalid("limit must be within 1..=64"));
+    }
+    let limit = limit as u32;
+    Ok((workspace, after, limit))
+}
 
 fn status_json(status: Status) -> Value {
     json!({
@@ -905,6 +965,10 @@ fn setup_ensure_event_page_json(page: SetupEnsureEventPage) -> Value {
         "cursor": record.cursor, "at": record.at, "kind": record.kind, "detail": record.detail,
     })).collect();
     json!({"next": page.next, "records": records})
+}
+fn setup_gc_preview_json(page: SetupGcPreviewPage) -> Value {
+    let candidates: Vec<_> = page.candidates.into_iter().map(|candidate| json!({"id": candidate.id, "name": candidate.name, "generation": candidate.generation, "reason": candidate.reason})).collect();
+    json!({"next": page.next, "candidates": candidates, "counts": {"protected_not_retired": page.counts.protected_not_retired, "protected_ambiguous_use": page.counts.protected_ambiguous_use, "protected_lease": page.counts.protected_lease, "protected_session": page.counts.protected_session, "excluded_unmanaged": page.counts.excluded_unmanaged}})
 }
 
 fn job_json(job: JobStatus) -> Value {
@@ -1061,6 +1125,24 @@ mod tests {
                 }],
             })
         }
+        fn setup_gc_preview(
+            &mut self,
+            _workspace: PathBuf,
+            after: u64,
+            _limit: u32,
+        ) -> Result<SetupGcPreviewPage, Error> {
+            self.daemon_reads += 1;
+            Ok(SetupGcPreviewPage {
+                next: (after == 0).then_some(1),
+                candidates: vec![crate::SetupGcCandidateDiagnostic {
+                    id: "setup-container:retired".into(),
+                    name: "bosn-setup-retired".into(),
+                    generation: "sha256:old".into(),
+                    reason: "retired_managed_setup_container".into(),
+                }],
+                counts: crate::SetupGcPreviewCounts::default(),
+            })
+        }
         fn job_status(&mut self, id: u64) -> Result<JobStatus, Error> {
             self.daemon_reads += 1;
             Ok(JobStatus {
@@ -1196,6 +1278,7 @@ mod tests {
                 "bosn_doctor",
                 "bosn_registry_resources",
                 "bosn_setup_ensure_events",
+                "bosn_setup_gc_preview",
                 "bosn_job_status",
                 "bosn_job_logs",
                 "bosn_job_cancel",
@@ -1221,6 +1304,15 @@ mod tests {
         assert_eq!(doctor["annotations"]["readOnlyHint"], true);
         assert_eq!(doctor["inputSchema"]["additionalProperties"], false);
         assert_eq!(resources["inputSchema"]["additionalProperties"], false);
+        let preview = replies[1]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "bosn_setup_gc_preview")
+            .unwrap();
+        assert_eq!(preview["annotations"]["readOnlyHint"], true);
+        assert_eq!(preview["annotations"]["destructiveHint"], false);
+        assert_eq!(preview["inputSchema"]["additionalProperties"], false);
         let prepare = replies[1]["result"]["tools"]
             .as_array()
             .unwrap()
@@ -1323,6 +1415,29 @@ mod tests {
             &mut backend,
         );
         assert_eq!(rejected["isError"], true);
+    }
+
+    #[test]
+    fn gc_preview_is_read_only_bounded_and_never_echoes_workspace() {
+        let mut backend = FakeBackend::default();
+        let value = call_tool(
+            json!({"name":"bosn_setup_gc_preview","arguments":{"workspace":"/private/work","limit":1}}),
+            &mut backend,
+        );
+        assert_eq!(value["isError"], false);
+        let content = value["structuredContent"].to_string();
+        assert!(!content.contains("/private/work"));
+        assert_eq!(
+            value["structuredContent"]["candidates"][0]["reason"],
+            "retired_managed_setup_container"
+        );
+        let before = backend.daemon_reads;
+        let rejected = call_tool(
+            json!({"name":"bosn_setup_gc_preview","arguments":{"workspace":"/private/work","force":true}}),
+            &mut backend,
+        );
+        assert_eq!(rejected["isError"], true);
+        assert_eq!(backend.daemon_reads, before);
     }
 
     #[test]

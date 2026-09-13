@@ -8,8 +8,9 @@ use bosn_service::{
     Client as ServiceClient, DoctorReport as ServiceDoctorReport, JobLogPage as ServiceJobLogPage,
     JobStatus as ServiceJobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE,
     RegistryResourcePage as ServiceRegistryResourcePage,
-    SetupEnsureEventPage as ServiceSetupEnsureEventPage, SetupEnsureJobRequest, SetupPreparePolicy,
-    SetupPrepareRequest, SetupTaskJobRequest, Status as ServiceStatus,
+    SetupEnsureEventPage as ServiceSetupEnsureEventPage, SetupEnsureJobRequest,
+    SetupGcPreviewPage as ServiceSetupGcPreviewPage, SetupPreparePolicy, SetupPrepareRequest,
+    SetupTaskJobRequest, Status as ServiceStatus,
 };
 use bosn_setup::{
     SetupAcquirePolicy, SetupPlan as RustSetupPlan, SetupPlanAppSource, SetupPlanRequest,
@@ -105,6 +106,25 @@ impl Client {
         py.detach(move || {
             setup_ensure_events(&state_dir, after, limit)
                 .map(SetupEnsureEventPage::from)
+                .map_err(service_error)
+        })
+    }
+    /// Return a non-destructive, bounded future-GC preview. The daemon uses
+    /// only durable ownership facts; this method cannot call Docker or apply
+    /// a collection operation.
+    #[pyo3(signature = (workspace, *, after = 0, limit = 64))]
+    fn setup_gc_preview(
+        &self,
+        workspace: PathBuf,
+        after: u64,
+        limit: u32,
+        py: Python<'_>,
+    ) -> PyResult<SetupGcPreviewPage> {
+        validate_registry_page(after, limit)?;
+        let state_dir = self.state_dir.clone();
+        py.detach(move || {
+            setup_gc_preview(&state_dir, workspace, after, limit)
+                .map(SetupGcPreviewPage::from)
                 .map_err(service_error)
         })
     }
@@ -485,6 +505,92 @@ impl From<ServiceRegistryResourcePage> for RegistryResourcePage {
     }
 }
 
+/// Safe logical identity returned by a GC preview; not an engine deletion
+/// handle. A future apply must obtain and revalidate ownership independently.
+#[derive(Debug)]
+#[pyclass(module = "bosn._native", frozen)]
+pub struct SetupGcCandidate {
+    #[pyo3(get)]
+    id: String,
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    generation: String,
+    #[pyo3(get)]
+    reason: String,
+}
+#[derive(Clone, Debug)]
+#[pyclass(module = "bosn._native", frozen, skip_from_py_object)]
+pub struct SetupGcPreviewCounts {
+    #[pyo3(get)]
+    protected_not_retired: u64,
+    #[pyo3(get)]
+    protected_ambiguous_use: u64,
+    #[pyo3(get)]
+    protected_lease: u64,
+    #[pyo3(get)]
+    protected_session: u64,
+    #[pyo3(get)]
+    excluded_unmanaged: u64,
+}
+#[derive(Debug)]
+#[pyclass(module = "bosn._native", frozen)]
+pub struct SetupGcPreviewPage {
+    #[pyo3(get)]
+    next: Option<u64>,
+    #[pyo3(get)]
+    counts: SetupGcPreviewCounts,
+    candidates: Vec<SetupGcCandidate>,
+}
+#[pymethods]
+impl SetupGcPreviewPage {
+    #[getter]
+    fn candidates(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        Ok(PyTuple::new(
+            py,
+            self.candidates
+                .iter()
+                .map(|value| {
+                    Py::new(
+                        py,
+                        SetupGcCandidate {
+                            id: value.id.clone(),
+                            name: value.name.clone(),
+                            generation: value.generation.clone(),
+                            reason: value.reason.clone(),
+                        },
+                    )
+                })
+                .collect::<PyResult<Vec<_>>>()?,
+        )?
+        .unbind())
+    }
+}
+impl From<ServiceSetupGcPreviewPage> for SetupGcPreviewPage {
+    fn from(value: ServiceSetupGcPreviewPage) -> Self {
+        Self {
+            next: value.next,
+            candidates: value
+                .candidates
+                .into_iter()
+                .map(|value| SetupGcCandidate {
+                    id: value.id,
+                    name: value.name,
+                    generation: value.generation,
+                    reason: value.reason,
+                })
+                .collect(),
+            counts: SetupGcPreviewCounts {
+                protected_not_retired: value.counts.protected_not_retired,
+                protected_ambiguous_use: value.counts.protected_ambiguous_use,
+                protected_lease: value.counts.protected_lease,
+                protected_session: value.counts.protected_session,
+                excluded_unmanaged: value.counts.excluded_unmanaged,
+            },
+        }
+    }
+}
+
 #[derive(Debug)]
 #[pyclass(module = "bosn._native", frozen)]
 pub struct SetupEnsureEvent {
@@ -704,6 +810,22 @@ fn setup_ensure_events(
     runtime.run(async {
         ServiceClient::for_state(state_dir)?
             .setup_ensure_events(after, limit)
+            .await
+    })
+}
+fn setup_gc_preview(
+    state_dir: &Path,
+    workspace: PathBuf,
+    after: u64,
+    limit: u32,
+) -> Result<ServiceSetupGcPreviewPage, bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async {
+        ServiceClient::for_state(state_dir)?
+            .setup_gc_preview(workspace, after, limit)
             .await
     })
 }
@@ -998,6 +1120,9 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<JobLogPage>()?;
     module.add_class::<RegistryResource>()?;
     module.add_class::<RegistryResourcePage>()?;
+    module.add_class::<SetupGcCandidate>()?;
+    module.add_class::<SetupGcPreviewCounts>()?;
+    module.add_class::<SetupGcPreviewPage>()?;
     module.add_class::<SetupEnsureEvent>()?;
     module.add_class::<SetupEnsureEventPage>()?;
     module.add_class::<SetupPlan>()?;
@@ -1539,7 +1664,8 @@ mod tests {
                 let server = async_engine::launch(Service::new(state.clone()).serve());
                 let wire = wait_for_client(&state).await;
                 let python_state = state.clone();
-                let (doctor, resources, events) = std::thread::spawn(move || {
+                let workspace = temporary.path().join("workspace");
+                let (doctor, resources, events, preview) = std::thread::spawn(move || {
                     Python::attach(|py| {
                         let client = Client {
                             state_dir: python_state,
@@ -1548,6 +1674,7 @@ mod tests {
                             client.doctor(py)?,
                             client.registry_resources(0, 1, py)?,
                             client.setup_ensure_events(0, 1, py)?,
+                            client.setup_gc_preview(workspace, 0, 1, py)?,
                         ))
                     })
                 })
@@ -1558,6 +1685,7 @@ mod tests {
                 assert_eq!(doctor.registry, "ready");
                 assert!(resources.records.is_empty());
                 assert!(events.records.is_empty());
+                assert!(preview.next.is_none());
                 let direct = wire.registry_resources(0, 1).await.unwrap();
                 assert_eq!(direct.records.len(), resources.records.len());
                 wire.shutdown().await.unwrap();

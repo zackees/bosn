@@ -296,6 +296,107 @@ fn resource(id: &str, name: &str) -> Resource {
 }
 
 #[test]
+fn setup_gc_preview_only_returns_unambiguously_retired_managed_containers() {
+    let (_directory, path) = database_path();
+    let mut registry =
+        Registry::create_writer(&path, "11111111-2222-4333-8444-555555555555").unwrap();
+    let mut tx = registry.begin_immediate().unwrap();
+    for (id, name, state) in [
+        (
+            "setup-container:eligible",
+            "bosn-setup-eligible",
+            ResourceState::Retired,
+        ),
+        (
+            "setup-container:active",
+            "bosn-setup-active",
+            ResourceState::Active,
+        ),
+        ("foreign", "foreign", ResourceState::Retired),
+        (
+            "setup-container:leased",
+            "bosn-setup-leased",
+            ResourceState::Retired,
+        ),
+        (
+            "setup-container:session",
+            "bosn-setup-session",
+            ResourceState::Retired,
+        ),
+        (
+            "setup-container:ambiguous",
+            "bosn-setup-ambiguous",
+            ResourceState::Retired,
+        ),
+    ] {
+        tx.put_resource(&Resource {
+            id: id.into(),
+            kind: ResourceKind::Container,
+            name: name.into(),
+            stack: "setup".into(),
+            generation: "g".into(),
+            scope: Scope::Machine,
+            workspace: "/work".into(),
+            created_at: 1.0,
+            last_used: 1.0,
+            state,
+            retention: Retention::Pinned,
+        })
+        .unwrap();
+        tx.put_resource_use(&ResourceUse {
+            resource_id: id.into(),
+            workspace: "/work".into(),
+            stack: "setup".into(),
+            generation: "g".into(),
+            last_used: 1.0,
+            state: if id == "setup-container:active" {
+                ResourceState::Active
+            } else {
+                ResourceState::Retired
+            },
+        })
+        .unwrap();
+    }
+    tx.put_resource_use(&ResourceUse {
+        resource_id: "setup-container:ambiguous".into(),
+        workspace: "/other".into(),
+        stack: "setup".into(),
+        generation: "g".into(),
+        last_used: 1.0,
+        state: ResourceState::Active,
+    })
+    .unwrap();
+    tx.put_lease(&Lease {
+        id: "lease".into(),
+        resource_id: "setup-container:leased".into(),
+        pid: 1,
+        proc_start: None,
+        acquired_at: 1.0,
+        heartbeat_at: 1.0,
+        ttl_seconds: 1.0,
+    })
+    .unwrap();
+    tx.put_execution_session(&ExecutionSession {
+        id: "session".into(),
+        container_id: "bosn-setup-session".into(),
+        engine_binary: "docker".into(),
+        client_pid: 1,
+        client_start: None,
+        lease_ids: vec![],
+    })
+    .unwrap();
+    tx.commit().unwrap();
+    let preview = registry.setup_gc_preview("/work", 0, 1).unwrap();
+    assert_eq!(preview.candidates.items.len(), 1);
+    assert_eq!(preview.candidates.items[0].id, "setup-container:eligible");
+    assert_eq!(preview.counts.protected_not_retired, 1);
+    assert_eq!(preview.counts.protected_ambiguous_use, 1);
+    assert_eq!(preview.counts.protected_lease, 1);
+    assert_eq!(preview.counts.protected_session, 1);
+    assert_eq!(preview.counts.excluded_unmanaged, 1);
+}
+
+#[test]
 fn typed_transaction_writes_round_trip_all_tables_and_roll_back() {
     let (_missing_dir, path) = database_path();
     let mut registry =

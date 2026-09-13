@@ -42,8 +42,74 @@ fn main() {
         "setup" => run_setup(arguments),
         "job" => run_job(arguments),
         "registry" => run_registry(arguments),
+        "gc" => run_gc(arguments),
         _ => usage(),
     }
+}
+
+/// Strictly non-destructive GC planning. There is intentionally no `apply`
+/// verb: callers receive registry facts only and a future apply must recheck.
+fn run_gc(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
+    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("preview")) {
+        usage();
+    }
+    let (state_dir, workspace, after, limit, json_output) =
+        parse_gc_preview_arguments(arguments).unwrap_or_else(|_| usage());
+    let client = Client::for_state(state_dir).unwrap_or_else(|_| gc_failure(json_output));
+    let runtime = RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|_| gc_failure(json_output));
+    match runtime.run(client.setup_gc_preview(workspace, after, limit)) {
+        Ok(page) => {
+            let candidates: Vec<_> = page.candidates.into_iter().map(|value| json!({"id": value.id, "name": value.name, "generation": value.generation, "reason": value.reason})).collect();
+            println!(
+                "{}",
+                json!({"action":"gc_preview", "preview_only":true, "next":page.next, "candidates":candidates, "counts":{"protected_not_retired":page.counts.protected_not_retired,"protected_ambiguous_use":page.counts.protected_ambiguous_use,"protected_lease":page.counts.protected_lease,"protected_session":page.counts.protected_session,"excluded_unmanaged":page.counts.excluded_unmanaged}})
+            );
+        }
+        Err(_) => gc_failure(json_output),
+    }
+}
+fn parse_gc_preview_arguments(
+    mut arguments: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(PathBuf, PathBuf, u64, u32, bool), ()> {
+    let mut state_dir = None;
+    let mut workspace = None;
+    let mut after = None;
+    let mut limit = None;
+    let mut json = false;
+    while let Some(argument) = arguments.next() {
+        match argument.to_string_lossy().as_ref() {
+            "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
+            "--workspace" => set_once_parsed(&mut workspace, arguments.next(), parse_state_dir),
+            "--after" => set_once_parsed(&mut after, arguments.next(), parse_u64),
+            "--limit" => set_once_parsed(&mut limit, arguments.next(), parse_registry_limit),
+            "--json" if !json => {
+                json = true;
+                Ok(())
+            }
+            _ => Err(()),
+        }?;
+    }
+    Ok((
+        state_dir.ok_or(())?,
+        workspace.ok_or(())?,
+        after.unwrap_or(0),
+        limit.unwrap_or(64),
+        json,
+    ))
+}
+fn gc_failure(json: bool) -> ! {
+    if json {
+        println!(
+            "{}",
+            json!({"action":"gc_preview","error":"daemon unavailable or request failed"})
+        );
+    } else {
+        eprintln!("bosn gc preview: daemon unavailable or request failed");
+    }
+    std::process::exit(1)
 }
 
 /// Read the fixed, daemon-owned health report. Argument parsing happens before
@@ -1199,5 +1265,8 @@ fn usage() -> ! {
         "   or: bosn job logs --state-dir STATE_DIR --job-id ID [--after CURSOR] [--limit 1..={MAX_JOB_LOG_LIMIT}] [--json]"
     );
     eprintln!("   or: bosn job cancel --state-dir STATE_DIR --job-id ID [--json]");
+    eprintln!(
+        "   or: bosn gc preview --state-dir STATE_DIR --workspace WORKSPACE [--after CURSOR] [--limit 1..=64] [--json]"
+    );
     std::process::exit(2)
 }
