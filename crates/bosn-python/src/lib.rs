@@ -7,7 +7,7 @@ use bosn_core::parse_setup_config_locator;
 use bosn_service::{
     Client as ServiceClient, DoctorReport as ServiceDoctorReport, JobLogPage as ServiceJobLogPage,
     JobStatus as ServiceJobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE,
-    RegistryResourcePage as ServiceRegistryResourcePage,
+    RegistryResourcePage as ServiceRegistryResourcePage, SetupDoneResult as ServiceSetupDoneResult,
     SetupEnsureEventPage as ServiceSetupEnsureEventPage, SetupEnsureJobRequest,
     SetupGcApplyResult as ServiceSetupGcApplyResult,
     SetupGcPreviewPage as ServiceSetupGcPreviewPage, SetupPreparePolicy, SetupPrepareRequest,
@@ -149,6 +149,27 @@ impl Client {
         py.detach(move || {
             setup_gc_apply(&state_dir, workspace, candidate_token)
                 .map(SetupGcApplyResult::from)
+                .map_err(service_error)
+        })
+    }
+
+    /// Mark this workspace's active setup ownership done in the daemon
+    /// registry. This is registry-only: it never contacts Docker or deletes
+    /// resources. Explicit ``confirm=True`` is required.
+    #[pyo3(signature = (workspace, *, confirm))]
+    fn setup_done(
+        &self,
+        workspace: PathBuf,
+        confirm: bool,
+        py: Python<'_>,
+    ) -> PyResult<SetupDoneResult> {
+        if !confirm {
+            return Err(PyValueError::new_err("setup_done requires confirm=True"));
+        }
+        let state_dir = self.state_dir.clone();
+        py.detach(move || {
+            setup_done(&state_dir, workspace)
+                .map(SetupDoneResult::from)
                 .map_err(service_error)
         })
     }
@@ -638,6 +659,23 @@ impl From<ServiceSetupGcApplyResult> for SetupGcApplyResult {
 
 #[derive(Debug)]
 #[pyclass(module = "bosn._native", frozen)]
+pub struct SetupDoneResult {
+    #[pyo3(get)]
+    uses_completed: u64,
+    #[pyo3(get)]
+    resources_completed: u64,
+}
+impl From<ServiceSetupDoneResult> for SetupDoneResult {
+    fn from(value: ServiceSetupDoneResult) -> Self {
+        Self {
+            uses_completed: value.uses_completed,
+            resources_completed: value.resources_completed,
+        }
+    }
+}
+
+#[derive(Debug)]
+#[pyclass(module = "bosn._native", frozen)]
 pub struct SetupEnsureEvent {
     #[pyo3(get)]
     cursor: u64,
@@ -888,6 +926,18 @@ fn setup_gc_apply(
             .setup_gc_apply(workspace, &candidate_token, true)
             .await
     })
+}
+
+fn setup_done(
+    state_dir: &Path,
+    workspace: PathBuf,
+) -> Result<ServiceSetupDoneResult, bosn_service::Error> {
+    let client = ServiceClient::for_state(state_dir)?;
+    let runtime = RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .map_err(bosn_service::Error::Io)?;
+    runtime.run(client.setup_done(workspace, true))
 }
 
 fn submit_setup_prepare(
@@ -1184,6 +1234,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SetupGcPreviewCounts>()?;
     module.add_class::<SetupGcPreviewPage>()?;
     module.add_class::<SetupGcApplyResult>()?;
+    module.add_class::<SetupDoneResult>()?;
     module.add_class::<SetupEnsureEvent>()?;
     module.add_class::<SetupEnsureEventPage>()?;
     module.add_class::<SetupPlan>()?;

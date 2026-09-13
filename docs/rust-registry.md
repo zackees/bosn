@@ -154,7 +154,10 @@ mcp_servers:
 
 This initial surface offers `bosn_status`, the fixed read-only `bosn_doctor`, `bosn_job_status`,
 `bosn_job_logs`, `bosn_job_cancel`, the read-only `bosn_setup_plan`, and
-`bosn_setup_prepare`, `bosn_setup_ensure`, and `bosn_setup_task`. The
+`bosn_setup_prepare`, `bosn_setup_ensure`, and `bosn_setup_task`. It also
+offers explicitly-confirmed registry-only `bosn_setup_done`: it marks one
+canonical workspace's active `setup` uses done and never contacts Docker or
+removes resources. The
 preparation and ensure tools accept only
 `workspace`, a local-or-HTTPS `config`, `policy` (`refresh` or `offline`), a
 1..=300000 ms deadline, and a 1..=8388608-byte output limit. The task tool has
@@ -169,8 +172,8 @@ arguments, app commands, image or container names, labels, mounts,
 environments, working directories, task selection, networks, privileges,
 output paths, state roots, or arbitrary configuration fields. Job logs are
 cursor-paginated and limited to 64 records per MCP page. MCP client disconnect
-does not cancel jobs. Registry persistence, reconciliation, adoption,
-replacement, garbage collection, converge, and run remain intentionally absent.
+does not cancel jobs. Reconciliation, adoption, replacement, converge, and
+run remain intentionally absent.
 
 ### Live MCP setup-ensure acceptance
 
@@ -202,7 +205,7 @@ runtime. A future kernel-compatible MCP adapter may replace it.
 Bosn pins its current MCP-client acceptance contract to **Hermes Agent
 0.21.0**. The opt-in Rust integration test uses Hermes' real `mcp add` and
 `mcp test` commands against the production `bosn mcp` executable, which proves
-the `initialize`/`tools/list` lifecycle and discovery of all eight Bosn tools.
+the `initialize`/`tools/list` lifecycle and discovery of the registered Bosn tools.
 It then uses a separate production stdio session with the same registered
 command and state root to prove semantic planning, prepare submission, bounded
 log polling, cancellation, stdout-only JSON-RPC, and a live daemon restart.

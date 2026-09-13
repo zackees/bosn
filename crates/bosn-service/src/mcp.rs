@@ -16,8 +16,9 @@
 
 use crate::{
     Client, DoctorReport, Error, JobLogPage, JobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE,
-    RegistryResourcePage, SetupEnsureEventPage, SetupEnsureJobRequest, SetupGcApplyResult,
-    SetupGcPreviewPage, SetupPreparePolicy, SetupPrepareRequest, SetupTaskJobRequest, Status,
+    RegistryResourcePage, SetupDoneResult, SetupEnsureEventPage, SetupEnsureJobRequest,
+    SetupGcApplyResult, SetupGcPreviewPage, SetupPreparePolicy, SetupPrepareRequest,
+    SetupTaskJobRequest, Status,
 };
 use bosn_setup::{
     SetupAcquirePolicy, SetupPlan, SetupPlanAppSource, SetupPlanRequest, SetupSourceKind,
@@ -115,6 +116,7 @@ trait Backend {
         workspace: PathBuf,
         token: String,
     ) -> Result<SetupGcApplyResult, Error>;
+    fn setup_done(&mut self, workspace: PathBuf) -> Result<SetupDoneResult, Error>;
     fn job_status(&mut self, id: u64) -> Result<JobStatus, Error>;
     fn job_logs(&mut self, id: u64, after: u64, limit: u32) -> Result<JobLogPage, Error>;
     fn cancel_job(&mut self, id: u64) -> Result<(), Error>;
@@ -184,6 +186,9 @@ impl Backend for DaemonBackend<'_> {
     ) -> Result<SetupGcApplyResult, Error> {
         self.runtime
             .run(self.client.setup_gc_apply(workspace, &token, true))
+    }
+    fn setup_done(&mut self, workspace: PathBuf) -> Result<SetupDoneResult, Error> {
+        self.runtime.run(self.client.setup_done(workspace, true))
     }
     fn job_status(&mut self, id: u64) -> Result<JobStatus, Error> {
         self.runtime.run(self.client.job_status(id))
@@ -376,6 +381,12 @@ fn tools_list() -> Value {
                 "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false}
             },
             {
+                "name": "bosn_setup_done",
+                "description": "STATE CHANGE: mark this workspace's active setup registry ownership done. It never calls Docker, stops/removes resources, or accepts engine controls; confirmation is required.",
+                "inputSchema": setup_done_schema(),
+                "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
+            },
+            {
                 "name": "bosn_job_status",
                 "description": "Read the state of one native daemon job.",
                 "inputSchema": job_id_schema(),
@@ -522,6 +533,12 @@ fn setup_gc_apply_schema() -> Value {
         "confirm":{"const":true,"description":"Explicit destructive confirmation."}
     }})
 }
+fn setup_done_schema() -> Value {
+    json!({"type":"object","additionalProperties":false,"required":["workspace","confirm"],"properties":{
+        "workspace":{"type":"string","minLength":1,"maxLength":MAX_MCP_SETUP_STRING_BYTES},
+        "confirm":{"const":true,"description":"Explicit state-change confirmation."}
+    }})
+}
 
 fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
     let Some(params) = params.as_object() else {
@@ -590,6 +607,12 @@ fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
                     .map_err(|_| ToolFailure::Daemon)
             })
         }
+        "bosn_setup_done" => setup_done_arguments(arguments).and_then(|workspace| {
+            backend
+                .setup_done(workspace)
+                .map(setup_done_json)
+                .map_err(|_| ToolFailure::Daemon)
+        }),
         "bosn_job_status" => job_id(arguments).and_then(|id| {
             only_arguments(arguments, &["job_id"])?;
             backend
@@ -985,6 +1008,26 @@ fn setup_gc_apply_arguments(
     }
     Ok((workspace, token))
 }
+fn setup_done_arguments(
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<PathBuf, ToolFailure> {
+    only_arguments(arguments, &["workspace", "confirm"])?;
+    if arguments.get("confirm") != Some(&Value::Bool(true)) {
+        return Err(ToolFailure::Invalid("confirm must be true"));
+    }
+    arguments
+        .get("workspace")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= MAX_MCP_SETUP_STRING_BYTES
+                && !value.bytes().any(|byte| byte == 0)
+        })
+        .map(PathBuf::from)
+        .ok_or(ToolFailure::Invalid(
+            "workspace must be a non-empty bounded string",
+        ))
+}
 
 fn status_json(status: Status) -> Value {
     json!({
@@ -1035,6 +1078,9 @@ fn setup_gc_preview_json(page: SetupGcPreviewPage) -> Value {
 }
 fn setup_gc_apply_json(result: SetupGcApplyResult) -> Value {
     json!({"removed":result.removed,"reconciled_missing":result.reconciled_missing})
+}
+fn setup_done_json(result: SetupDoneResult) -> Value {
+    json!({"uses_completed":result.uses_completed,"resources_completed":result.resources_completed})
 }
 
 fn job_json(job: JobStatus) -> Value {
@@ -1221,6 +1267,13 @@ mod tests {
                 reconciled_missing: false,
             })
         }
+        fn setup_done(&mut self, _workspace: PathBuf) -> Result<SetupDoneResult, Error> {
+            self.daemon_reads += 1;
+            Ok(SetupDoneResult {
+                uses_completed: 2,
+                resources_completed: 1,
+            })
+        }
         fn job_status(&mut self, id: u64) -> Result<JobStatus, Error> {
             self.daemon_reads += 1;
             Ok(JobStatus {
@@ -1358,6 +1411,7 @@ mod tests {
                 "bosn_setup_ensure_events",
                 "bosn_setup_gc_preview",
                 "bosn_setup_gc_apply",
+                "bosn_setup_done",
                 "bosn_job_status",
                 "bosn_job_logs",
                 "bosn_job_cancel",
@@ -1517,6 +1571,30 @@ mod tests {
         );
         assert_eq!(rejected["isError"], true);
         assert_eq!(backend.daemon_reads, before);
+    }
+
+    #[test]
+    fn setup_done_requires_confirmation_and_has_no_engine_controls() {
+        let mut backend = FakeBackend::default();
+        let rejected = call_tool(
+            json!({"name":"bosn_setup_done","arguments":{"workspace":"/private/work","confirm":false}}),
+            &mut backend,
+        );
+        assert_eq!(rejected["isError"], true);
+        assert_eq!(backend.daemon_reads, 0);
+        let rejected = call_tool(
+            json!({"name":"bosn_setup_done","arguments":{"workspace":"/private/work","confirm":true,"docker_args":["rm"]}}),
+            &mut backend,
+        );
+        assert_eq!(rejected["isError"], true);
+        assert_eq!(backend.daemon_reads, 0);
+        let completed = call_tool(
+            json!({"name":"bosn_setup_done","arguments":{"workspace":"/private/work","confirm":true}}),
+            &mut backend,
+        );
+        assert_eq!(completed["isError"], false);
+        assert_eq!(completed["structuredContent"]["uses_completed"], 2);
+        assert_eq!(completed["structuredContent"]["resources_completed"], 1);
     }
 
     #[test]

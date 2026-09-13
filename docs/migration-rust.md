@@ -187,6 +187,19 @@ ownership-verified test containers:
 soldr cargo test -j1 -p bosn-service --test setup_ensure_docker --locked -- --ignored --exact live_docker_setup_gc_apply_removes_only_retired_generation
 ```
 
+### Explicit setup completion
+
+`bosn setup done --state-dir STATE --workspace WORKSPACE --yes`, Python
+`Client.setup_done(workspace, confirm=True)`, and MCP `bosn_setup_done` with
+`confirm: true` record that one canonical workspace's active `setup` uses are
+done. This is a daemon-owned SQLite transaction only: it never invokes Docker,
+stops/removes a container, touches leases/sessions, or changes another
+workspace or stack. A machine resource becomes done only when it has no active
+uses anywhere, preserving shared/foreign ownership. Repeating completion is a
+no-op; a subsequent successful setup ensure reactivates its current resource
+and use. The sole event detail is the fixed redacted
+`workspace_setup_completed` marker, not a workspace path.
+
 An opt-in live proof exercises the production daemon and kernal-api Docker
 transport end to end, including daemon restart and matching-container reuse:
 
