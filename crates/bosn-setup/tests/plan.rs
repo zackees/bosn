@@ -85,6 +85,12 @@ fn pinned_local_plan_is_structured_and_offline_is_verified_cache_reuse() {
     assert_eq!(first.asset_root, None);
     assert_eq!(first.task_names, ["check", "lint"]);
     assert_eq!(
+        first.tasks.get("check").map(|task| task.command.as_str()),
+        Some("echo check")
+    );
+    assert_eq!(first.app.environment.len(), 0);
+    assert!(first.app.mounts.is_empty());
+    assert_eq!(
         first.app_source,
         SetupPlanAppSource::PinnedImage {
             image: format!("registry.example/demo@sha256:{DIGEST}"),
