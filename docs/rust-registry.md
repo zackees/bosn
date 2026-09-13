@@ -176,3 +176,44 @@ The official Rust MCP SDK currently owns a Tokio runtime and stdio transport.
 Bosn instead uses kernal-api's owned runtime, so the deliberately small adapter
 implements the required external JSON-RPC boundary without adding a second
 runtime. A future kernel-compatible MCP adapter may replace it.
+
+### Hermes acceptance proof
+
+Bosn pins its current MCP-client acceptance contract to **Hermes Agent
+0.21.0**. The opt-in Rust integration test uses Hermes' real `mcp add` and
+`mcp test` commands against the production `bosn mcp` executable, which proves
+the `initialize`/`tools/list` lifecycle and discovery of all eight Bosn tools.
+It then uses a separate production stdio session with the same registered
+command and state root to prove semantic planning, prepare submission, bounded
+log polling, cancellation, stdout-only JSON-RPC, and a live daemon restart.
+The semantic half is a standards-client black-box rather than a Hermes CLI
+call because Hermes intentionally has no command for invoking one MCP tool
+without launching an inference-backed agent (and therefore requiring model
+credentials and spending tokens).
+
+On a machine with that exact Hermes version installed, run:
+
+```sh
+hermes --version # must report: Hermes Agent v0.21.0
+# If this locally built Bosn binary is dynamically linked, set its actual
+# OpenSSL/zlib runtime-library directories here before running the test.
+BOSN_HERMES_ACCEPTANCE=1 soldr cargo test -j1 -p bosn-service --test hermes_mcp --locked \
+  -- --ignored --exact hermes_agent_stdio_contract_survives_daemon_restart
+```
+
+The test makes a fresh `HERMES_HOME`, state directory, workspace, and a
+short-lived fake `docker` executable. It never talks to a real Docker daemon;
+the fake process only holds a daemon-owned setup-prepare job long enough to
+prove safe cancellation. It requires Unix process permissions for that fake
+executable. Hermes intentionally forwards only explicitly registered stdio
+environment variables, so a Nix-built Bosn binary that dynamically links
+OpenSSL must register its `LD_LIBRARY_PATH` as the test does; release wheels
+and normally installed native binaries should not need that workaround.
+
+To register an installed Bosn command for normal use (not the test's temporary
+state), Hermes' documented flow is:
+
+```sh
+hermes mcp add bosn --command bosn --env BOSN_STATE_DIR=/absolute/path/to/bosn-state --args mcp
+hermes mcp test bosn
+```
