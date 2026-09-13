@@ -9,3 +9,4 @@ build/
 .coverage
 target/
 _vender/
+src/bosn/_native.*

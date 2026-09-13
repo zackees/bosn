@@ -26,17 +26,20 @@ bosn-compose = "bosn.docker_cli:compose_main"
 
 [dependency-groups]
 dev = [
+    "maturin>=1.9,<2",
     "pytest>=8.0",
     "ruff>=0.6",
     "pyright>=1.1.380",
 ]
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/bosn"]
+[tool.maturin]
+manifest-path = "crates/bosn-python/Cargo.toml"
+module-name = "bosn._native"
+python-source = "src"
 
 [tool.ruff]
 line-length = 100
