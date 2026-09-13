@@ -423,6 +423,36 @@ It never starts a daemon or invokes Docker itself, and it accepts no task
 command, container, mount, environment, working-directory, per-request state
 override, or other engine controls.
 
+`bosn setup app-task` is a separate Phase-3 runtime slice: it runs one named,
+declared task inside an already ensured setup application rather than creating
+the ephemeral `docker run --rm` task container used by `bosn setup task`.
+The daemon re-plans the document, verifies its image receipt, and performs a
+fresh exact ownership inspection of the content-addressed app name and Bosn
+labels before its only execution shape, `docker container exec NAME sh -lc
+DECLARED_COMMAND`. It records a live `execution_sessions` row with a redacted
+lifecycle event before exec. A known normal exit (success or nonzero task
+exit) removes that row transactionally. Cancellation, deadline, output, or
+transport uncertainty leaves the row and records `remote_completion_unknown`,
+so restart recovery and GC continue to protect the exact app until a future
+ownership-aware reconciliation establishes a terminal state.
+
+```text
+bosn setup app-task --state-dir STATE --workspace WORKSPACE --config LOCATOR \
+  (--refresh | --offline) --task NAME --deadline-ms 1..=300000 \
+  --output-limit 1..=8388608 [--json]
+```
+
+Native Python exposes the same typed operation as
+`Client.submit_setup_app_task(...)`, and MCP exposes `bosn_setup_app_task`
+with the same six semantic inputs and non-destructive job-submission
+annotation. It accepts no container ID/name, command, Docker argument, mount,
+environment, or guest/Compose control. It does not create, start, stop,
+replace, or remove an app; a missing, foreign, mismatched, or stopped app is
+refused before exec. Cancelling or timing out
+the local Docker exec client never claims that the remote in-container command
+stopped; its completion is reported as unknown. Multi-service Compose, guest,
+and generic shell execution remain outside this slice.
+
 `bosn setup ensure` submits the complete daemon-owned plan, image-preparation,
 and ownership-safe application ensure pipeline. It returns promptly with
 `action: setup_ensure`, `submitted: true`, and a `job_id`:

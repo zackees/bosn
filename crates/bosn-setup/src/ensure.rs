@@ -203,6 +203,10 @@ pub struct SetupEnsureResult {
     pub image_identity: String,
     pub created: bool,
     pub started: bool,
+    /// State observed after the ownership-safe operation. `adopt_setup_app`
+    /// preserves Docker state, while `ensure_setup_app` always returns a
+    /// running app on success.
+    pub running: bool,
 }
 
 /// Why a setup app ensure was refused or failed.
@@ -323,6 +327,7 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
                 image_identity: derived.image_identity,
                 created: false,
                 started: false,
+                running: true,
             });
         }
         let response = invoke(
@@ -347,6 +352,7 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
             image_identity: derived.image_identity,
             created: false,
             started: true,
+            running: true,
         });
     }
 
@@ -387,6 +393,7 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
         image_identity: derived.image_identity,
         created: true,
         started: true,
+        running: true,
     })
 }
 
@@ -449,6 +456,7 @@ pub async fn adopt_setup_app<E: SetupEnsureEngine>(
         image_identity: derived.image_identity,
         created: false,
         started: false,
+        running: observed.running,
     })
 }
 
@@ -1303,6 +1311,7 @@ mod tests {
                 image_identity: IDENTITY.into(),
                 created: true,
                 started: true,
+                running: true,
             }
         );
         let calls = engine.calls.lock().unwrap().clone();
