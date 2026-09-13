@@ -156,17 +156,36 @@ The equivalent read-only APIs are `bosn.Client.doctor()` in Python and the
 no-argument MCP tool `bosn_doctor`; both require the daemon selected when the
 client/server was created and accept no state path or diagnostic controls.
 
-### Setup GC preview only
+### Setup GC preview and narrowly confirmed apply
 
 `bosn gc preview --state-dir STATE --workspace WORKSPACE --json`, Python
 `Client.setup_gc_preview(workspace)`, and read-only MCP
 `bosn_setup_gc_preview` expose only a bounded registry preview. They never
-call Docker, write SQLite, stop or remove a container, or expose a GC apply
-operation. A candidate must be a retired Bosn-owned setup container with an
+call Docker or write SQLite. A candidate must be a retired Bosn-owned setup container with an
 unambiguous retired use and no lease or execution session; foreign, active,
 adopted/done, incomplete, or otherwise ambiguous ownership is protected.
-Any future apply must obtain the candidate again and recheck every ownership
-fact immediately before an engine action.
+Preview returns an opaque candidate token. Destructive apply is available only
+as `bosn gc apply --state-dir STATE --workspace WORKSPACE --candidate TOKEN
+--apply --yes`, Python `Client.setup_gc_apply(workspace, token,
+confirm=True)`, or MCP `bosn_setup_gc_apply` with `confirm: true`. It accepts
+no Docker identifier, raw arguments, selectors, image, or prune option. The
+daemon rereads registry protections before inspection and again in its final
+SQLite transaction; Docker is inspected twice and must be stopped with all
+three Bosn setup ownership labels matching the exact candidate. Only then does
+it run `docker container rm` for that exact known name. It never removes
+images, volumes, active containers, or ambiguous/foreign records. If the exact
+container is already absent, apply conservatively removes only its still-valid
+retired registry record and records `setup.gc.reconciled_missing`; this is
+idempotent reconciliation, not an engine deletion claim.
+
+The opt-in live acceptance proof creates two setup generations, applies only
+the preview token for the stopped retired generation, verifies that the current
+container and image remain, checks the durable GC event, and cleans exact
+ownership-verified test containers:
+
+```text
+soldr cargo test -j1 -p bosn-service --test setup_ensure_docker --locked -- --ignored --exact live_docker_setup_gc_apply_removes_only_retired_generation
+```
 
 An opt-in live proof exercises the production daemon and kernal-api Docker
 transport end to end, including daemon restart and matching-container reuse:

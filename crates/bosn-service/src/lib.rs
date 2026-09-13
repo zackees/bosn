@@ -705,7 +705,18 @@ pub struct SetupGcCandidateDiagnostic {
     pub id: String,
     pub name: String,
     pub generation: String,
+    /// Opaque, preview-derived binding. Apply accepts only this complete token
+    /// plus the exact workspace; it never accepts a Docker name or selector.
+    pub token: String,
     pub reason: String,
+}
+/// Result of one deliberate setup-GC apply.  `reconciled_missing` means Docker
+/// reported the exact previously-owned container absent and the daemon removed
+/// only its still-eligible registry record; it never means a broad prune ran.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetupGcApplyResult {
+    pub removed: bool,
+    pub reconciled_missing: bool,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SetupGcPreviewCounts {
@@ -730,6 +741,7 @@ fn setup_gc_preview_diagnostic(value: SetupGcPreview) -> SetupGcPreviewPage {
             .items
             .into_iter()
             .map(|candidate| SetupGcCandidateDiagnostic {
+                token: setup_gc_token(&candidate),
                 id: candidate.id,
                 name: candidate.name,
                 generation: candidate.generation,
@@ -744,6 +756,60 @@ fn setup_gc_preview_diagnostic(value: SetupGcPreview) -> SetupGcPreviewPage {
             excluded_unmanaged: value.counts.excluded_unmanaged,
         },
     }
+}
+
+fn setup_gc_token(candidate: &bosn_registry::SetupGcCandidate) -> String {
+    // Hex makes a delimiter-free opaque transport value without adding a
+    // parser-sensitive dependency. It is an identity binding, not a secret:
+    // the actor always revalidates the decoded tuple immediately before any
+    // engine operation and again while finalizing registry state.
+    let mut bytes = Vec::new();
+    for value in [&candidate.id, &candidate.name, &candidate.generation] {
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(0);
+    }
+    let mut token = String::from("sgc1-");
+    for byte in bytes {
+        token.push_str(&format!("{byte:02x}"));
+    }
+    token
+}
+
+fn parse_setup_gc_token(token: &str) -> Result<(String, String, String), Error> {
+    let encoded = token
+        .strip_prefix("sgc1-")
+        .ok_or(Error::Protocol("invalid setup gc candidate"))?;
+    if encoded.is_empty() || encoded.len() > 24 * 1024 || encoded.len() % 2 != 0 {
+        return Err(Error::Protocol("invalid setup gc candidate"));
+    }
+    let mut bytes = Vec::with_capacity(encoded.len() / 2);
+    for chunk in encoded.as_bytes().chunks_exact(2) {
+        let text = std::str::from_utf8(chunk)
+            .map_err(|_| Error::Protocol("invalid setup gc candidate"))?;
+        bytes.push(
+            u8::from_str_radix(text, 16)
+                .map_err(|_| Error::Protocol("invalid setup gc candidate"))?,
+        );
+    }
+    let mut fields = bytes.split(|value| *value == 0);
+    let field = |value: Option<&[u8]>| -> Result<String, Error> {
+        let value = value.ok_or(Error::Protocol("invalid setup gc candidate"))?;
+        if value.is_empty() || value.len() > 8 * 1024 || value.contains(&0) {
+            return Err(Error::Protocol("invalid setup gc candidate"));
+        }
+        std::str::from_utf8(value)
+            .map(str::to_owned)
+            .map_err(|_| Error::Protocol("invalid setup gc candidate"))
+    };
+    let result = (
+        field(fields.next())?,
+        field(fields.next())?,
+        field(fields.next())?,
+    );
+    if fields.next() != Some(&[]) || fields.next().is_some() {
+        return Err(Error::Protocol("invalid setup gc candidate"));
+    }
+    Ok(result)
 }
 
 /// One redacted setup-ensure registry event. Event details are authored by the
@@ -874,6 +940,42 @@ fn validate_setup_gc_preview_request_wire(request: &Request) -> Result<(), Error
         || !request.setup_task_name.is_empty()
     {
         return Err(Error::Protocol("nonsemantic setup gc preview fields"));
+    }
+    Ok(())
+}
+
+fn validate_setup_gc_apply_input(workspace: &str, token: &str, confirm: bool) -> Result<(), Error> {
+    if workspace.is_empty()
+        || workspace.len() > 8 * 1024
+        || workspace.bytes().any(|byte| byte == 0)
+        || !confirm
+    {
+        return Err(Error::Protocol("invalid setup gc apply request"));
+    }
+    let _ = parse_setup_gc_token(token)?;
+    Ok(())
+}
+
+fn validate_setup_gc_apply_request_wire(request: &Request) -> Result<(), Error> {
+    validate_setup_gc_apply_input(
+        &request.workspace,
+        &request.gc_candidate_token,
+        request.gc_confirm,
+    )?;
+    if !request.stack.is_empty()
+        || !request.digest.is_empty()
+        || request.job_id != 0
+        || request.log_after != 0
+        || request.log_limit != 0
+        || !request.setup_config.is_empty()
+        || request.setup_policy != 0
+        || request.setup_deadline_ms != 0
+        || request.setup_output_limit != 0
+        || !request.setup_task_name.is_empty()
+        || request.diagnostic_after != 0
+        || request.diagnostic_limit != 0
+    {
+        return Err(Error::Protocol("nonsemantic setup gc apply fields"));
     }
     Ok(())
 }
@@ -1019,6 +1121,30 @@ impl Client {
             _ => Err(Error::Protocol("unexpected setup gc preview response")),
         }
     }
+    /// Apply exactly one opaque candidate returned by a preceding GC preview.
+    /// Docker and registry mutation remain daemon-owned; no raw engine target
+    /// crosses this boundary.
+    pub async fn setup_gc_apply(
+        &self,
+        workspace: impl AsRef<Path>,
+        candidate_token: &str,
+        confirm: bool,
+    ) -> Result<SetupGcApplyResult, Error> {
+        let workspace = workspace.as_ref().to_string_lossy().into_owned();
+        validate_setup_gc_apply_input(&workspace, candidate_token, confirm)?;
+        match self
+            .call(Request {
+                workspace,
+                gc_candidate_token: candidate_token.into(),
+                gc_confirm: true,
+                ..Request::operation(15)
+            })
+            .await?
+        {
+            Reply::SetupGcApply(value) => Ok(value),
+            _ => Err(Error::Protocol("unexpected setup gc apply response")),
+        }
+    }
     pub async fn shutdown(&self) -> Result<(), Error> {
         match self.call(Request::operation(3)).await? {
             Reply::Shutdown => Ok(()),
@@ -1033,21 +1159,10 @@ impl Client {
     ) -> Result<u64, Error> {
         match self
             .call(Request {
-                protocol_version: PROTOCOL_VERSION,
-                operation: 4,
                 workspace: workspace.into(),
                 stack: stack.into(),
                 digest: digest.into(),
-                job_id: 0,
-                log_after: 0,
-                log_limit: 0,
-                setup_config: String::new(),
-                setup_policy: 0,
-                setup_deadline_ms: 0,
-                setup_output_limit: 0,
-                setup_task_name: String::new(),
-                diagnostic_after: 0,
-                diagnostic_limit: 0,
+                ..Request::operation(4)
             })
             .await?
         {
@@ -1261,6 +1376,21 @@ enum DbCommand {
         after: u64,
         limit: u32,
         reply: async_engine::OneshotSender<Result<SetupGcPreviewPage, Error>>,
+    },
+    SetupGcCandidate {
+        workspace: String,
+        id: String,
+        name: String,
+        generation: String,
+        reply: async_engine::OneshotSender<Result<Option<bosn_registry::SetupGcCandidate>, Error>>,
+    },
+    FinalizeSetupGc {
+        workspace: String,
+        id: String,
+        name: String,
+        generation: String,
+        missing: bool,
+        reply: async_engine::OneshotSender<Result<bool, Error>>,
     },
     AppendSetupEnsureEvents {
         events: Vec<SetupEnsureEvent>,
@@ -2053,6 +2183,48 @@ impl RegistryActor {
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
     }
+    async fn setup_gc_candidate(
+        &self,
+        workspace: String,
+        id: String,
+        name: String,
+        generation: String,
+    ) -> Result<Option<bosn_registry::SetupGcCandidate>, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::SetupGcCandidate {
+                workspace,
+                id,
+                name,
+                generation,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
+    async fn finalize_setup_gc(
+        &self,
+        workspace: String,
+        id: String,
+        name: String,
+        generation: String,
+        missing: bool,
+    ) -> Result<bool, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::FinalizeSetupGc {
+                workspace,
+                id,
+                name,
+                generation,
+                missing,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
     async fn append_setup_ensure_events(&self, events: Vec<SetupEnsureEvent>) -> Result<(), Error> {
         let (reply, wait) = async_engine::oneshot_channel();
         self.sender
@@ -2188,6 +2360,76 @@ async fn registry_actor(
                             registry.setup_gc_preview(&workspace, after, limit as usize)
                         })
                         .map(setup_gc_preview_diagnostic);
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
+            DbCommand::SetupGcCandidate {
+                workspace,
+                id,
+                name,
+                generation,
+                reply,
+            } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = registry.setup_gc_candidate(&workspace, &id, &name, &generation);
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
+            DbCommand::FinalizeSetupGc {
+                workspace,
+                id,
+                name,
+                generation,
+                missing,
+                reply,
+            } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = (|| {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
+                            .as_secs_f64();
+                        let mut transaction = registry.begin_immediate()?;
+                        let kind = if missing {
+                            "setup.gc.reconciled_missing"
+                        } else {
+                            "setup.gc.removed"
+                        };
+                        let removed = transaction.finalize_setup_gc_candidate(
+                            &workspace,
+                            &id,
+                            &name,
+                            &generation,
+                            now,
+                            kind,
+                        )?;
+                        // Dropping an uncommitted immediate transaction rolls it
+                        // back; no stale-preview event is persisted.
+                        if removed {
+                            transaction.commit()?;
+                        }
+                        Ok(removed)
+                    })();
                     (registry, result)
                 });
                 match worker.await {
@@ -2559,6 +2801,133 @@ fn uuid(bytes: &[u8]) -> String {
         b[15]
     )
 }
+
+const SETUP_GC_ENGINE_DEADLINE: Duration = Duration::from_secs(5);
+const SETUP_GC_ENGINE_OUTPUT: usize = 16 * 1024;
+
+/// Inspect exactly one known candidate. The format is deliberately fixed and
+/// returns only the three labels Bosn needs to prove its own ownership.
+async fn inspect_setup_gc_container(
+    engine: &DockerEngine,
+    candidate: &bosn_registry::SetupGcCandidate,
+) -> Result<Option<()>, Error> {
+    let format = "{{.Name}}\t{{.State.Running}}\t{{index .Config.Labels \"com.zackees.bosn.setup-managed\"}}\t{{index .Config.Labels \"com.zackees.bosn.setup-content-sha256\"}}\t{{index .Config.Labels \"com.zackees.bosn.setup-container\"}}";
+    let result = engine
+        .with_args(["container", "inspect", "--format", format, &candidate.name])
+        .capture_async(RunOptions::bounded(
+            SETUP_GC_ENGINE_DEADLINE,
+            SETUP_GC_ENGINE_OUTPUT,
+        ))
+        .await
+        .map_err(|_| Error::Protocol("setup gc container inspection failed"))?;
+    if result.exit_code == 1 {
+        return Ok(None);
+    }
+    if !result.ok() {
+        return Err(Error::Protocol("setup gc container inspection failed"));
+    }
+    let output = std::str::from_utf8(&result.stdout)
+        .map_err(|_| Error::Protocol("setup gc container inspection invalid"))?;
+    let fields: Vec<_> = output.trim_end_matches(['\r', '\n']).split('\t').collect();
+    let content = candidate
+        .generation
+        .strip_prefix("sha256:")
+        .ok_or(Error::Protocol("setup gc candidate identity invalid"))?;
+    if fields.len() != 5
+        || fields[0] != format!("/{}", candidate.name)
+        || fields[1] != "false"
+        || fields[2] != "v1"
+        || fields[3] != content
+        || fields[4] != candidate.name
+    {
+        return Err(Error::Protocol("setup gc container ownership mismatch"));
+    }
+    Ok(Some(()))
+}
+
+async fn apply_setup_gc_candidate(
+    actor: &RegistryActor,
+    workspace: String,
+    token: String,
+) -> Result<SetupGcApplyResult, Error> {
+    let (id, name, generation) = parse_setup_gc_token(&token)?;
+    let candidate = actor
+        .setup_gc_candidate(workspace.clone(), id, name, generation)
+        .await?
+        .ok_or(Error::Protocol("setup gc preview is stale or protected"))?;
+    let engine = DockerEngine::docker();
+    if inspect_setup_gc_container(&engine, &candidate)
+        .await?
+        .is_none()
+    {
+        let reconciled = actor
+            .finalize_setup_gc(
+                workspace,
+                candidate.id,
+                candidate.name,
+                candidate.generation,
+                true,
+            )
+            .await?;
+        return reconciled
+            .then_some(SetupGcApplyResult {
+                removed: false,
+                reconciled_missing: true,
+            })
+            .ok_or(Error::Protocol("setup gc preview became stale"));
+    }
+    // A second ownership inspection closes the only practical inspect/remove
+    // interval without ever using a name glob or Docker selector.
+    if inspect_setup_gc_container(&engine, &candidate)
+        .await?
+        .is_none()
+    {
+        let reconciled = actor
+            .finalize_setup_gc(
+                workspace,
+                candidate.id,
+                candidate.name,
+                candidate.generation,
+                true,
+            )
+            .await?;
+        return reconciled
+            .then_some(SetupGcApplyResult {
+                removed: false,
+                reconciled_missing: true,
+            })
+            .ok_or(Error::Protocol("setup gc preview became stale"));
+    }
+    let removed = engine
+        .with_args(["container", "rm", &candidate.name])
+        .capture_async(RunOptions::bounded(
+            SETUP_GC_ENGINE_DEADLINE,
+            SETUP_GC_ENGINE_OUTPUT,
+        ))
+        .await
+        .map_err(|_| Error::Protocol("setup gc container removal failed"))?;
+    if !removed.ok() {
+        return Err(Error::Protocol("setup gc container removal failed"));
+    }
+    let finalized = actor
+        .finalize_setup_gc(
+            workspace,
+            candidate.id,
+            candidate.name,
+            candidate.generation,
+            false,
+        )
+        .await?;
+    finalized
+        .then_some(SetupGcApplyResult {
+            removed: true,
+            reconciled_missing: false,
+        })
+        .ok_or(Error::Protocol(
+            "setup gc registry finalization failed after container removal",
+        ))
+}
+
 async fn handle(
     mut s: AsyncStream,
     actor: RegistryActor,
@@ -2577,82 +2946,209 @@ async fn handle(
         return Err(Error::Protocol("request frame"));
     }
     let r = Request::decode(f.payload()).map_err(|_| Error::Protocol("request decode"))?;
-    let reply =
-        if r.protocol_version != PROTOCOL_VERSION {
-            ReplyWire {
-                code: 1,
+    let reply = if r.protocol_version != PROTOCOL_VERSION {
+        ReplyWire {
+            code: 1,
+            ..Default::default()
+        }
+    } else {
+        match r.operation {
+            1 => ReplyWire {
+                code: 10,
                 ..Default::default()
+            },
+            2 => {
+                let status = actor.status().await?;
+                ReplyWire {
+                    code: 20,
+                    registry_id: status.registry_id,
+                    schema_version: status.schema_version,
+                    resources: status.resources,
+                    leases: status.leases,
+                    sessions: status.sessions,
+                    reconciliation_required: status.reconciliation_required,
+                    ..Default::default()
+                }
             }
-        } else {
-            match r.operation {
-                1 => ReplyWire {
-                    code: 10,
+            3 => {
+                stop.cancel();
+                ReplyWire {
+                    code: 30,
+                    ..Default::default()
+                }
+            }
+            4 => match jobs.submit(r.workspace, r.stack, r.digest).await {
+                Ok(job_id) => ReplyWire {
+                    code: 40,
+                    job_id,
                     ..Default::default()
                 },
-                2 => {
-                    let status = actor.status().await?;
-                    ReplyWire {
-                        code: 20,
-                        registry_id: status.registry_id,
-                        schema_version: status.schema_version,
-                        resources: status.resources,
-                        leases: status.leases,
-                        sessions: status.sessions,
-                        reconciliation_required: status.reconciliation_required,
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
+            5 => match jobs.status(r.job_id).await {
+                Ok(job) => ReplyWire {
+                    code: 50,
+                    job_id: job.id,
+                    job_state: format!("{:?}", job.state),
+                    job_error: job.error.unwrap_or_default(),
+                    ..Default::default()
+                },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
+            6 => match jobs.cancel(r.job_id).await {
+                Ok(()) => ReplyWire {
+                    code: 60,
+                    ..Default::default()
+                },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
+            7 => match jobs.logs(r.job_id, r.log_after, r.log_limit as usize).await {
+                Ok(page) => ReplyWire {
+                    code: 70,
+                    retained_from: page.retained_from,
+                    next_log_cursor: page.next,
+                    log_gap: page.gap,
+                    logs: page
+                        .records
+                        .into_iter()
+                        .map(|(cursor, line)| LogRecordWire { cursor, line })
+                        .collect(),
+                    ..Default::default()
+                },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
+            8 => {
+                let policy = SetupPreparePolicy::from_wire(r.setup_policy);
+                let request = policy.and_then(|policy| {
+                    validate_setup_prepare_wire(
+                        &r.workspace,
+                        &r.setup_config,
+                        policy,
+                        r.setup_deadline_ms,
+                        r.setup_output_limit,
+                    )
+                    .ok()
+                    .map(|()| SetupPrepareRequest {
+                        workspace: PathBuf::from(r.workspace),
+                        config: r.setup_config,
+                        policy,
+                        deadline: Duration::from_millis(r.setup_deadline_ms),
+                        output_limit: r.setup_output_limit as usize,
+                    })
+                });
+                match request {
+                    Some(request) => match jobs.submit_setup_prepare(request).await {
+                        Ok(job_id) => ReplyWire {
+                            code: 40,
+                            job_id,
+                            ..Default::default()
+                        },
+                        Err(_) => ReplyWire {
+                            code: 3,
+                            ..Default::default()
+                        },
+                    },
+                    None => ReplyWire {
+                        code: 3,
                         ..Default::default()
-                    }
+                    },
                 }
-                3 => {
-                    stop.cancel();
-                    ReplyWire {
-                        code: 30,
+            }
+            9 => {
+                let policy = SetupPreparePolicy::from_wire(r.setup_policy);
+                let request = policy.and_then(|policy| {
+                    validate_setup_task_wire(
+                        &r.workspace,
+                        &r.setup_config,
+                        policy,
+                        &r.setup_task_name,
+                        r.setup_deadline_ms,
+                        r.setup_output_limit,
+                    )
+                    .ok()
+                    .map(|()| SetupTaskJobRequest {
+                        workspace: PathBuf::from(r.workspace),
+                        config: r.setup_config,
+                        policy,
+                        task_name: r.setup_task_name,
+                        deadline: Duration::from_millis(r.setup_deadline_ms),
+                        output_limit: r.setup_output_limit as usize,
+                    })
+                });
+                match request {
+                    Some(request) => match jobs.submit_setup_task(request).await {
+                        Ok(job_id) => ReplyWire {
+                            code: 40,
+                            job_id,
+                            ..Default::default()
+                        },
+                        Err(_) => ReplyWire {
+                            code: 3,
+                            ..Default::default()
+                        },
+                    },
+                    None => ReplyWire {
+                        code: 3,
                         ..Default::default()
-                    }
+                    },
                 }
-                4 => match jobs.submit(r.workspace, r.stack, r.digest).await {
-                    Ok(job_id) => ReplyWire {
-                        code: 40,
-                        job_id,
-                        ..Default::default()
+            }
+            10 => {
+                let policy = SetupPreparePolicy::from_wire(r.setup_policy);
+                let request = policy.and_then(|policy| {
+                    validate_setup_ensure_request_wire(&r, policy)
+                        .ok()
+                        .map(|()| SetupEnsureJobRequest {
+                            workspace: PathBuf::from(r.workspace),
+                            config: r.setup_config,
+                            policy,
+                            deadline: Duration::from_millis(r.setup_deadline_ms),
+                            output_limit: r.setup_output_limit as usize,
+                        })
+                });
+                match request {
+                    Some(request) => match jobs.submit_setup_ensure(request).await {
+                        Ok(job_id) => ReplyWire {
+                            code: 40,
+                            job_id,
+                            ..Default::default()
+                        },
+                        Err(_) => ReplyWire {
+                            code: 3,
+                            ..Default::default()
+                        },
                     },
-                    Err(_) => ReplyWire {
+                    None => ReplyWire {
                         code: 3,
                         ..Default::default()
                     },
-                },
-                5 => match jobs.status(r.job_id).await {
-                    Ok(job) => ReplyWire {
-                        code: 50,
-                        job_id: job.id,
-                        job_state: format!("{:?}", job.state),
-                        job_error: job.error.unwrap_or_default(),
-                        ..Default::default()
-                    },
-                    Err(_) => ReplyWire {
-                        code: 3,
-                        ..Default::default()
-                    },
-                },
-                6 => match jobs.cancel(r.job_id).await {
-                    Ok(()) => ReplyWire {
-                        code: 60,
-                        ..Default::default()
-                    },
-                    Err(_) => ReplyWire {
-                        code: 3,
-                        ..Default::default()
-                    },
-                },
-                7 => match jobs.logs(r.job_id, r.log_after, r.log_limit as usize).await {
+                }
+            }
+            11 => match validate_registry_diagnostics_request_wire(&r) {
+                Ok(()) => match actor
+                    .resources(r.diagnostic_after, r.diagnostic_limit)
+                    .await
+                {
                     Ok(page) => ReplyWire {
-                        code: 70,
-                        retained_from: page.retained_from,
-                        next_log_cursor: page.next,
-                        log_gap: page.gap,
-                        logs: page
+                        code: 80,
+                        diagnostic_next: page.next.unwrap_or(0),
+                        diagnostic_has_next: page.next.is_some(),
+                        resources_diagnostic: page
                             .records
                             .into_iter()
-                            .map(|(cursor, line)| LogRecordWire { cursor, line })
+                            .map(ResourceDiagnosticWire::from)
                             .collect(),
                         ..Default::default()
                     },
@@ -2661,166 +3157,39 @@ async fn handle(
                         ..Default::default()
                     },
                 },
-                8 => {
-                    let policy = SetupPreparePolicy::from_wire(r.setup_policy);
-                    let request = policy.and_then(|policy| {
-                        validate_setup_prepare_wire(
-                            &r.workspace,
-                            &r.setup_config,
-                            policy,
-                            r.setup_deadline_ms,
-                            r.setup_output_limit,
-                        )
-                        .ok()
-                        .map(|()| SetupPrepareRequest {
-                            workspace: PathBuf::from(r.workspace),
-                            config: r.setup_config,
-                            policy,
-                            deadline: Duration::from_millis(r.setup_deadline_ms),
-                            output_limit: r.setup_output_limit as usize,
-                        })
-                    });
-                    match request {
-                        Some(request) => match jobs.submit_setup_prepare(request).await {
-                            Ok(job_id) => ReplyWire {
-                                code: 40,
-                                job_id,
-                                ..Default::default()
-                            },
-                            Err(_) => ReplyWire {
-                                code: 3,
-                                ..Default::default()
-                            },
-                        },
-                        None => ReplyWire {
-                            code: 3,
-                            ..Default::default()
-                        },
-                    }
-                }
-                9 => {
-                    let policy = SetupPreparePolicy::from_wire(r.setup_policy);
-                    let request = policy.and_then(|policy| {
-                        validate_setup_task_wire(
-                            &r.workspace,
-                            &r.setup_config,
-                            policy,
-                            &r.setup_task_name,
-                            r.setup_deadline_ms,
-                            r.setup_output_limit,
-                        )
-                        .ok()
-                        .map(|()| SetupTaskJobRequest {
-                            workspace: PathBuf::from(r.workspace),
-                            config: r.setup_config,
-                            policy,
-                            task_name: r.setup_task_name,
-                            deadline: Duration::from_millis(r.setup_deadline_ms),
-                            output_limit: r.setup_output_limit as usize,
-                        })
-                    });
-                    match request {
-                        Some(request) => match jobs.submit_setup_task(request).await {
-                            Ok(job_id) => ReplyWire {
-                                code: 40,
-                                job_id,
-                                ..Default::default()
-                            },
-                            Err(_) => ReplyWire {
-                                code: 3,
-                                ..Default::default()
-                            },
-                        },
-                        None => ReplyWire {
-                            code: 3,
-                            ..Default::default()
-                        },
-                    }
-                }
-                10 => {
-                    let policy = SetupPreparePolicy::from_wire(r.setup_policy);
-                    let request = policy.and_then(|policy| {
-                        validate_setup_ensure_request_wire(&r, policy)
-                            .ok()
-                            .map(|()| SetupEnsureJobRequest {
-                                workspace: PathBuf::from(r.workspace),
-                                config: r.setup_config,
-                                policy,
-                                deadline: Duration::from_millis(r.setup_deadline_ms),
-                                output_limit: r.setup_output_limit as usize,
-                            })
-                    });
-                    match request {
-                        Some(request) => match jobs.submit_setup_ensure(request).await {
-                            Ok(job_id) => ReplyWire {
-                                code: 40,
-                                job_id,
-                                ..Default::default()
-                            },
-                            Err(_) => ReplyWire {
-                                code: 3,
-                                ..Default::default()
-                            },
-                        },
-                        None => ReplyWire {
-                            code: 3,
-                            ..Default::default()
-                        },
-                    }
-                }
-                11 => match validate_registry_diagnostics_request_wire(&r) {
-                    Ok(()) => match actor
-                        .resources(r.diagnostic_after, r.diagnostic_limit)
-                        .await
-                    {
-                        Ok(page) => ReplyWire {
-                            code: 80,
-                            diagnostic_next: page.next.unwrap_or(0),
-                            diagnostic_has_next: page.next.is_some(),
-                            resources_diagnostic: page
-                                .records
-                                .into_iter()
-                                .map(ResourceDiagnosticWire::from)
-                                .collect(),
-                            ..Default::default()
-                        },
-                        Err(_) => ReplyWire {
-                            code: 3,
-                            ..Default::default()
-                        },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
+            12 => match validate_registry_diagnostics_request_wire(&r) {
+                Ok(()) => match actor
+                    .setup_ensure_events(r.diagnostic_after, r.diagnostic_limit)
+                    .await
+                {
+                    Ok(page) => ReplyWire {
+                        code: 90,
+                        diagnostic_next: page.next.unwrap_or(0),
+                        diagnostic_has_next: page.next.is_some(),
+                        setup_ensure_events: page
+                            .records
+                            .into_iter()
+                            .map(SetupEnsureEventWire::from)
+                            .collect(),
+                        ..Default::default()
                     },
                     Err(_) => ReplyWire {
                         code: 3,
                         ..Default::default()
                     },
                 },
-                12 => match validate_registry_diagnostics_request_wire(&r) {
-                    Ok(()) => match actor
-                        .setup_ensure_events(r.diagnostic_after, r.diagnostic_limit)
-                        .await
-                    {
-                        Ok(page) => ReplyWire {
-                            code: 90,
-                            diagnostic_next: page.next.unwrap_or(0),
-                            diagnostic_has_next: page.next.is_some(),
-                            setup_ensure_events: page
-                                .records
-                                .into_iter()
-                                .map(SetupEnsureEventWire::from)
-                                .collect(),
-                            ..Default::default()
-                        },
-                        Err(_) => ReplyWire {
-                            code: 3,
-                            ..Default::default()
-                        },
-                    },
-                    Err(_) => ReplyWire {
-                        code: 3,
-                        ..Default::default()
-                    },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
                 },
-                13 => match validate_doctor_request_wire(&r) {
+            },
+            13 => {
+                match validate_doctor_request_wire(&r) {
                     Ok(()) => {
                         let registry = actor.doctor_integrity().await;
                         let report =
@@ -2849,44 +3218,65 @@ async fn handle(
                         code: 3,
                         ..Default::default()
                     },
-                },
-                14 => match validate_setup_gc_preview_request_wire(&r) {
-                    Ok(()) => match actor
-                        .setup_gc_preview(r.workspace, r.diagnostic_after, r.diagnostic_limit)
-                        .await
-                    {
-                        Ok(page) => ReplyWire {
-                            code: 110,
-                            diagnostic_next: page.next.unwrap_or(0),
-                            diagnostic_has_next: page.next.is_some(),
-                            setup_gc_candidates: page
-                                .candidates
-                                .into_iter()
-                                .map(SetupGcCandidateWire::from)
-                                .collect(),
-                            gc_protected_not_retired: page.counts.protected_not_retired,
-                            gc_protected_ambiguous_use: page.counts.protected_ambiguous_use,
-                            gc_protected_lease: page.counts.protected_lease,
-                            gc_protected_session: page.counts.protected_session,
-                            gc_excluded_unmanaged: page.counts.excluded_unmanaged,
-                            ..Default::default()
-                        },
-                        Err(_) => ReplyWire {
-                            code: 3,
-                            ..Default::default()
-                        },
+                }
+            }
+            14 => match validate_setup_gc_preview_request_wire(&r) {
+                Ok(()) => match actor
+                    .setup_gc_preview(r.workspace, r.diagnostic_after, r.diagnostic_limit)
+                    .await
+                {
+                    Ok(page) => ReplyWire {
+                        code: 110,
+                        diagnostic_next: page.next.unwrap_or(0),
+                        diagnostic_has_next: page.next.is_some(),
+                        setup_gc_candidates: page
+                            .candidates
+                            .into_iter()
+                            .map(SetupGcCandidateWire::from)
+                            .collect(),
+                        gc_protected_not_retired: page.counts.protected_not_retired,
+                        gc_protected_ambiguous_use: page.counts.protected_ambiguous_use,
+                        gc_protected_lease: page.counts.protected_lease,
+                        gc_protected_session: page.counts.protected_session,
+                        gc_excluded_unmanaged: page.counts.excluded_unmanaged,
+                        ..Default::default()
                     },
                     Err(_) => ReplyWire {
                         code: 3,
                         ..Default::default()
                     },
                 },
-                _ => ReplyWire {
-                    code: 2,
+                Err(_) => ReplyWire {
+                    code: 3,
                     ..Default::default()
                 },
-            }
-        };
+            },
+            15 => match validate_setup_gc_apply_request_wire(&r) {
+                Ok(()) => match apply_setup_gc_candidate(&actor, r.workspace, r.gc_candidate_token)
+                    .await
+                {
+                    Ok(result) => ReplyWire {
+                        code: 120,
+                        gc_removed: result.removed,
+                        gc_reconciled_missing: result.reconciled_missing,
+                        ..Default::default()
+                    },
+                    Err(_) => ReplyWire {
+                        code: 3,
+                        ..Default::default()
+                    },
+                },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
+            _ => ReplyWire {
+                code: 2,
+                ..Default::default()
+            },
+        }
+    };
     let mut p = Vec::new();
     reply
         .encode(&mut p)
@@ -2974,6 +3364,10 @@ struct Request {
     diagnostic_after: u64,
     #[prost(uint32, tag = "15")]
     diagnostic_limit: u32,
+    #[prost(string, tag = "16")]
+    gc_candidate_token: String,
+    #[prost(bool, tag = "17")]
+    gc_confirm: bool,
 }
 impl Request {
     fn operation(operation: u32) -> Self {
@@ -2993,6 +3387,8 @@ impl Request {
             setup_task_name: String::new(),
             diagnostic_after: 0,
             diagnostic_limit: 0,
+            gc_candidate_token: String::new(),
+            gc_confirm: false,
         }
     }
 }
@@ -3141,6 +3537,10 @@ struct ReplyWire {
     gc_protected_session: u64,
     #[prost(uint64, tag = "29")]
     gc_excluded_unmanaged: u64,
+    #[prost(bool, tag = "30")]
+    gc_removed: bool,
+    #[prost(bool, tag = "31")]
+    gc_reconciled_missing: bool,
 }
 #[derive(Message)]
 struct LogRecordWire {
@@ -3210,6 +3610,8 @@ struct SetupGcCandidateWire {
     generation: String,
     #[prost(string, tag = "4")]
     reason: String,
+    #[prost(string, tag = "5")]
+    token: String,
 }
 impl From<SetupGcCandidateDiagnostic> for SetupGcCandidateWire {
     fn from(value: SetupGcCandidateDiagnostic) -> Self {
@@ -3218,6 +3620,7 @@ impl From<SetupGcCandidateDiagnostic> for SetupGcCandidateWire {
             name: value.name,
             generation: value.generation,
             reason: value.reason,
+            token: value.token,
         }
     }
 }
@@ -3228,6 +3631,7 @@ impl From<SetupGcCandidateWire> for SetupGcCandidateDiagnostic {
             name: value.name,
             generation: value.generation,
             reason: value.reason,
+            token: value.token,
         }
     }
 }
@@ -3273,6 +3677,7 @@ enum Reply {
     RegistryResources(RegistryResourcePage),
     SetupEnsureEvents(SetupEnsureEventPage),
     SetupGcPreview(SetupGcPreviewPage),
+    SetupGcApply(SetupGcApplyResult),
     Doctor(DoctorReport),
 }
 fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
@@ -3335,6 +3740,10 @@ fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
                 excluded_unmanaged: v.gc_excluded_unmanaged,
             },
         })),
+        120 => Ok(Reply::SetupGcApply(SetupGcApplyResult {
+            removed: v.gc_removed,
+            reconciled_missing: v.gc_reconciled_missing,
+        })),
         1 => Err(Error::Protocol("unsupported protocol")),
         2 => Err(Error::Protocol("unknown operation")),
         _ => Err(Error::Protocol("daemon error")),
@@ -3376,6 +3785,22 @@ mod tests {
                 workspace: workspace.into(),
             },
         }
+    }
+
+    #[test]
+    fn setup_gc_token_is_exact_and_rejects_tampering() {
+        let candidate = bosn_registry::SetupGcCandidate {
+            id: "setup-container:abc".into(),
+            name: "bosn-setup-abc".into(),
+            generation: "sha256:abc".into(),
+        };
+        let token = setup_gc_token(&candidate);
+        assert_eq!(
+            parse_setup_gc_token(&token).unwrap(),
+            (candidate.id, candidate.name, candidate.generation)
+        );
+        assert!(parse_setup_gc_token(&(token + "00")).is_err());
+        assert!(validate_setup_gc_apply_input("/work", "sgc1-00", false).is_err());
     }
 
     struct SlowFakeSetupExecutor {
@@ -5386,6 +5811,8 @@ mod tests {
                 setup_task_name: String::new(),
                 diagnostic_after: 0,
                 diagnostic_limit: 0,
+                gc_candidate_token: String::new(),
+                gc_confirm: false,
             }
             .encode(&mut payload)
             .unwrap();

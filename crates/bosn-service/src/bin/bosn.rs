@@ -47,10 +47,14 @@ fn main() {
     }
 }
 
-/// Strictly non-destructive GC planning. There is intentionally no `apply`
-/// verb: callers receive registry facts only and a future apply must recheck.
 fn run_gc(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("preview")) {
+    let Some(verb) = arguments.next() else {
+        usage();
+    };
+    if verb.as_os_str() == std::ffi::OsStr::new("apply") {
+        return run_gc_apply(arguments);
+    }
+    if verb.as_os_str() != std::ffi::OsStr::new("preview") {
         usage();
     }
     let (state_dir, workspace, after, limit, json_output) =
@@ -62,13 +66,71 @@ fn run_gc(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
         .unwrap_or_else(|_| gc_failure(json_output));
     match runtime.run(client.setup_gc_preview(workspace, after, limit)) {
         Ok(page) => {
-            let candidates: Vec<_> = page.candidates.into_iter().map(|value| json!({"id": value.id, "name": value.name, "generation": value.generation, "reason": value.reason})).collect();
+            let candidates: Vec<_> = page.candidates.into_iter().map(|value| json!({"id": value.id, "name": value.name, "generation": value.generation, "token":value.token, "reason": value.reason})).collect();
             println!(
                 "{}",
                 json!({"action":"gc_preview", "preview_only":true, "next":page.next, "candidates":candidates, "counts":{"protected_not_retired":page.counts.protected_not_retired,"protected_ambiguous_use":page.counts.protected_ambiguous_use,"protected_lease":page.counts.protected_lease,"protected_session":page.counts.protected_session,"excluded_unmanaged":page.counts.excluded_unmanaged}})
             );
         }
         Err(_) => gc_failure(json_output),
+    }
+}
+/// Explicit one-candidate destructive action. Both `--apply` and `--yes` are
+/// required even though the subcommand is named apply, preventing accidental
+/// shell/script invocation. The daemon revalidates ownership before Docker.
+fn run_gc_apply(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
+    let mut state_dir = None;
+    let mut workspace = None;
+    let mut token = None;
+    let mut apply = false;
+    let mut yes = false;
+    let mut json_output = false;
+    while let Some(argument) = arguments.next() {
+        match argument.to_string_lossy().as_ref() {
+            "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
+            "--workspace" => set_once_parsed(&mut workspace, arguments.next(), parse_state_dir),
+            "--candidate" => set_once_parsed(&mut token, arguments.next(), |value| {
+                value.to_str().map(str::to_owned).ok_or(())
+            }),
+            "--apply" if !apply => {
+                apply = true;
+                Ok(())
+            }
+            "--yes" if !yes => {
+                yes = true;
+                Ok(())
+            }
+            "--json" if !json_output => {
+                json_output = true;
+                Ok(())
+            }
+            _ => Err(()),
+        }
+        .unwrap_or_else(|_| usage());
+    }
+    let (Some(state_dir), Some(workspace), Some(token)) = (state_dir, workspace, token) else {
+        usage();
+    };
+    if !apply || !yes {
+        usage();
+    }
+    let result = Client::for_state(state_dir).ok().and_then(|client| {
+        RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .ok()
+            .and_then(|runtime| {
+                runtime
+                    .run(client.setup_gc_apply(workspace, &token, true))
+                    .ok()
+            })
+    });
+    match result {
+        Some(result) => println!(
+            "{}",
+            json!({"action":"gc_apply","removed":result.removed,"reconciled_missing":result.reconciled_missing})
+        ),
+        None => gc_failure(json_output),
     }
 }
 fn parse_gc_preview_arguments(
@@ -1267,6 +1329,9 @@ fn usage() -> ! {
     eprintln!("   or: bosn job cancel --state-dir STATE_DIR --job-id ID [--json]");
     eprintln!(
         "   or: bosn gc preview --state-dir STATE_DIR --workspace WORKSPACE [--after CURSOR] [--limit 1..=64] [--json]"
+    );
+    eprintln!(
+        "   or: bosn gc apply --state-dir STATE_DIR --workspace WORKSPACE --candidate TOKEN --apply --yes [--json]"
     );
     std::process::exit(2)
 }

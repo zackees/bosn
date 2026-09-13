@@ -244,6 +244,23 @@ fn wait_for_success(runtime: &kernal_api::async_engine::Runtime, client: &Client
     }
 }
 
+fn wait_for_stopped(engine: &DockerEngine, name: &str) -> ContainerInspection {
+    let deadline = Instant::now() + DOCKER_DEADLINE;
+    loop {
+        let observed = inspect_container(engine, name)
+            .expect("inspect exact managed app while waiting for stopped")
+            .expect("managed app disappeared before GC preview");
+        if !observed.running {
+            return observed;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "retired test app did not stop before GC"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn image_identity_for(engine: &DockerEngine, reference: &str) -> String {
     let result = docker_capture(
         engine,
@@ -414,15 +431,16 @@ fn live_docker_setup_ensure_creates_and_reuses_one_managed_app() {
 }
 
 /// Run with:
-/// `soldr cargo test -j1 -p bosn-service --test setup_ensure_docker --locked -- --ignored --exact live_docker_setup_ensure_rolls_registry_generation_without_deleting_old_app`
+/// `soldr cargo test -j1 -p bosn-service --test setup_ensure_docker --locked -- --ignored --exact live_docker_setup_gc_apply_removes_only_retired_generation`
 ///
 /// This opt-in observation uses two different one-file documents for one
-/// canonical workspace. Bosn may create the second managed app, but the old
-/// app must remain running in Docker while only its durable registry ownership
-/// is retired. Cleanup verifies ownership separately for each exact name.
+/// canonical workspace. The preview token may identify only the retired first
+/// app; production daemon apply must remove that exact stopped candidate while
+/// leaving the current app and its inspected image alone. Cleanup verifies
+/// ownership separately for each exact name.
 #[test]
 #[ignore = "requires a local Docker daemon and the pinned Alpine image"]
-fn live_docker_setup_ensure_rolls_registry_generation_without_deleting_old_app() {
+fn live_docker_setup_gc_apply_removes_only_retired_generation() {
     let engine = DockerEngine::docker();
     let expected_image = pinned_alpine_identity(&engine);
     let root = tempfile::tempdir().expect("temporary test root");
@@ -434,8 +452,9 @@ fn live_docker_setup_ensure_rolls_registry_generation_without_deleting_old_app()
     let config = config_root.join("setup.toml");
     let unique = test_unique_suffix();
     let document = |generation: &str| {
+        let sleep = if generation == "a" { 1 } else { 120 };
         format!(
-            "version = 1\n[app]\nimage = '{PINNED_ALPINE}'\ncommand = 'exec sleep 120 # bosn-rollover-{unique}-{generation}'\n"
+            "version = 1\n[app]\nimage = '{PINNED_ALPINE}'\ncommand = 'exec sleep {sleep} # bosn-rollover-{unique}-{generation}'\n"
         )
     };
     std::fs::write(&config, document("a")).expect("write first setup document");
@@ -512,16 +531,61 @@ fn live_docker_setup_ensure_rolls_registry_generation_without_deleting_old_app()
         .run(client.submit_setup_ensure(request))
         .expect("submit second generation");
     wait_for_success(&runtime, &client, second_job);
-    let old_after_rollover = inspect_container(&engine, &name_a)
-        .expect("inspect old generation after rollover")
-        .expect("rollover must not delete the old managed app");
     let current = inspect_container(&engine, &name_b)
         .expect("inspect current generation")
         .expect("current managed app exists");
-    assert!(old_after_rollover.running, "rollover must not stop old app");
+    // The test document deliberately exits by itself. GC may only remove a
+    // stopped retired container; it must never stop an app as a side effect.
+    let old_after_rollover = wait_for_stopped(&engine, &name_a);
+    assert!(
+        !old_after_rollover.running,
+        "old app stops by its declared command"
+    );
     assert!(current.running, "current app must be running");
     assert_ne!(old_after_rollover.id, current.id);
     assert_eq!(current.image, expected_image);
+
+    // The public preview gives a token, not a Docker name. It must contain
+    // exactly the retired first generation and no current candidate.
+    let preview = runtime
+        .run(client.setup_gc_preview(&workspace, 0, 16))
+        .expect("preview retired setup generation through daemon");
+    assert_eq!(
+        preview.candidates.len(),
+        1,
+        "only retired old app is eligible"
+    );
+    let candidate = &preview.candidates[0];
+    assert_eq!(candidate.name, name_a);
+    assert_eq!(
+        candidate.generation,
+        format!("sha256:{}", plan_a.content_sha256)
+    );
+    assert!(
+        !candidate.token.is_empty(),
+        "preview returns opaque apply token"
+    );
+    let applied = runtime
+        .run(client.setup_gc_apply(&workspace, &candidate.token, true))
+        .expect("apply exact preview candidate through daemon");
+    assert!(applied.removed);
+    assert!(!applied.reconciled_missing);
+    assert!(
+        inspect_container(&engine, &name_a)
+            .expect("inspect removed old candidate")
+            .is_none(),
+        "GC apply must remove only the previewed retired container"
+    );
+    let current_after_gc = inspect_container(&engine, &name_b)
+        .expect("inspect current generation after GC")
+        .expect("GC must retain current generation");
+    assert!(current_after_gc.running, "GC retains current running app");
+    assert_eq!(current_after_gc.image, expected_image);
+    assert_eq!(
+        image_identity_for(&engine, PINNED_ALPINE),
+        expected_image,
+        "GC must not remove the shared/current image"
+    );
 
     runtime.run(client.shutdown()).expect("shut down daemon");
     assert!(daemon.wait_for_exit().success(), "daemon failed");
@@ -533,7 +597,10 @@ fn live_docker_setup_ensure_rolls_registry_generation_without_deleting_old_app()
             .find(|value| value.kind == ResourceKind::Container && value.name == name)
             .expect("managed container registry row")
     };
-    assert_eq!(resource(&name_a).state, ResourceState::Retired);
+    assert!(
+        resources.iter().all(|value| value.name != name_a),
+        "successful exact Docker removal reconciles the retired registry row"
+    );
     assert_eq!(resource(&name_b).state, ResourceState::Active);
     assert_eq!(
         resources
@@ -542,6 +609,16 @@ fn live_docker_setup_ensure_rolls_registry_generation_without_deleting_old_app()
             .expect("shared inspected image registry row")
             .state,
         ResourceState::Active
+    );
+    assert!(
+        registry
+            .events(0, 64)
+            .expect("read GC event")
+            .items
+            .iter()
+            .any(|event| event.kind == "setup.gc.removed"
+                && event.detail == "retired_managed_setup_container"),
+        "successful apply records a redacted durable GC event"
     );
     drop(registry);
     drop(cleanup_b);
