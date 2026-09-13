@@ -93,8 +93,13 @@ document's image receipt, mounts, environment, workdir, and optional declared
 `app.command` (as `sh -lc`). An existing candidate must exactly prove the
 expected image and Bosn labels or is refused before mutation. It is exposed
 through typed daemon jobs and the bounded native CLI, Python, and MCP
-submission surfaces, but is not registry-backed. It never deletes, replaces,
-stops, adopts, or garbage-collects a container.
+submission surfaces. After a successful ensure, the daemon's sole registry
+writer atomically upserts the managed container and a separate machine-scoped
+`Image` resource with one `ResourceUse` each. The image's logical identity and
+registry generation are the inspected canonical Docker image ID; mutable
+document references and tags are never used as registry identity. Failed or
+cancelled ensures persist neither fact, and repeat ensures are idempotent. It
+never deletes, replaces, stops, adopts, or garbage-collects a container.
 
 An opt-in live proof exercises the production daemon and kernal-api Docker
 transport end to end, including daemon restart and matching-container reuse:

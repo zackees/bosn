@@ -3,10 +3,12 @@
 use bosn_core::{ResourceKind, ResourceState, Retention, Scope};
 use bosn_engine::{DockerEngine, EngineEvent, RunOptions};
 use bosn_registry::{Registry, RegistryStatus, Resource, ResourceUse};
+#[cfg(test)]
+use bosn_setup::PreparedImageKind;
 use bosn_setup::{
-    SetupAcquirePolicy, SetupEnsureEngine, SetupEnsureRequest as CoreSetupEnsureRequest,
-    SetupImageEngine, SetupPlan, SetupPlanRequest, SetupTaskRequest, ensure_setup_app,
-    execute_setup_task, plan_setup, prepare_setup_image,
+    PreparedImage, SetupAcquirePolicy, SetupEnsureEngine,
+    SetupEnsureRequest as CoreSetupEnsureRequest, SetupImageEngine, SetupPlan, SetupPlanRequest,
+    SetupTaskRequest, ensure_setup_app, execute_setup_task, plan_setup, prepare_setup_image,
 };
 use jobs::{Jobs, Submission};
 use kernal_api::{
@@ -151,7 +153,11 @@ pub trait SetupEnsureExecutor: Send + Sync {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetupEnsureExecution {
     pub receipt: String,
+    /// The managed application container fact.
     pub resource: SetupEnsureResource,
+    /// The image fact verified during the same successful ensure pipeline.
+    /// This is executor output, never an RPC-controlled image selector.
+    pub image: SetupEnsureImageResource,
 }
 
 /// Logical identity facts for a daemon-owned setup container. The registry
@@ -159,6 +165,19 @@ pub struct SetupEnsureExecution {
 /// from the executor or an RPC caller.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetupEnsureResource {
+    pub id: String,
+    pub name: String,
+    pub stack: String,
+    pub generation: String,
+    pub workspace: String,
+}
+
+/// Logical identity facts for a prepared application image used by a
+/// daemon-owned setup ensure. `generation` is the inspected Docker image ID,
+/// while `id` and `name` are derived from that content address rather than
+/// from a caller-supplied reference or tag.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupEnsureImageResource {
     pub id: String,
     pub name: String,
     pub stack: String,
@@ -308,7 +327,15 @@ impl SetupEnsureExecutor for DockerSetupEnsureExecutor {
             forwarder
                 .await
                 .map_err(|_| "setup log forwarder stopped".to_owned())??;
-            let ensured = result?;
+            let result = result?;
+            let prepared = result.prepared;
+            let ensured = result.ensured;
+            // This is redundant with `ensure_setup_app`'s validation, but it
+            // keeps the registry boundary fail-closed if a future core change
+            // ever returns a result not tied to the inspected preparation.
+            if ensured.image_identity != prepared.observed_identity {
+                return Err("setup ensure result image does not match prepared image".into());
+            }
             Ok(SetupEnsureExecution {
                 receipt: format!(
                     "ensured {} as {}",
@@ -325,6 +352,10 @@ impl SetupEnsureExecutor for DockerSetupEnsureExecutor {
                     generation: format!("sha256:{}", plan.content_sha256),
                     workspace: plan.workspace_root.to_string_lossy().into_owned(),
                 },
+                image: setup_ensure_image_resource(
+                    &prepared,
+                    &plan.workspace_root.to_string_lossy(),
+                ),
             })
         })
     }
@@ -341,13 +372,18 @@ struct SetupEnsurePipeline<'a> {
     ensure_output: usize,
 }
 
+struct PreparedSetupEnsure {
+    prepared: PreparedImage,
+    ensured: bosn_setup::SetupEnsureResult,
+}
+
 async fn execute_setup_ensure_pipeline<E: SetupImageEngine + SetupEnsureEngine>(
     engine: &E,
     pipeline: &SetupEnsurePipeline<'_>,
     cancellation: &async_engine::CancellationToken,
     events: &async_engine::Sender<EngineEvent>,
     logs: &async_engine::Sender<String>,
-) -> Result<bosn_setup::SetupEnsureResult, String> {
+) -> Result<PreparedSetupEnsure, String> {
     if cancellation.is_cancelled() {
         return Err("setup ensure cancelled".into());
     }
@@ -379,7 +415,7 @@ async fn execute_setup_ensure_pipeline<E: SetupImageEngine + SetupEnsureEngine>(
         .map_err(|_| "setup log consumer closed".to_owned())?;
     // `ensure_setup_app` validates the image receipt against the plan before
     // inspection. Any mismatch fails closed before create/start can occur.
-    ensure_setup_app(
+    let ensured = ensure_setup_app(
         engine,
         CoreSetupEnsureRequest {
             plan: pipeline.plan,
@@ -391,7 +427,25 @@ async fn execute_setup_ensure_pipeline<E: SetupImageEngine + SetupEnsureEngine>(
         },
     )
     .await
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    Ok(PreparedSetupEnsure { prepared, ensured })
+}
+
+fn setup_ensure_image_resource(
+    prepared: &PreparedImage,
+    workspace: &str,
+) -> SetupEnsureImageResource {
+    // `prepared.observed_identity` is accepted only from `prepare_setup_image`, which
+    // validates Docker's canonical sha256 image ID.  Do not use the document
+    // reference here: references/tags are not durable resource identities.
+    let logical_identity = format!("setup-image:{}", prepared.observed_identity);
+    SetupEnsureImageResource {
+        id: logical_identity.clone(),
+        name: logical_identity,
+        stack: "setup".into(),
+        generation: prepared.observed_identity.clone(),
+        workspace: workspace.into(),
+    }
 }
 
 /// Docker-backed implementation for a single setup task.  The daemon plans,
@@ -839,7 +893,7 @@ struct RegistryActor {
 enum DbCommand {
     Status(async_engine::OneshotSender<Result<Status, Error>>),
     RecordSetupEnsure {
-        resource: SetupEnsureResource,
+        execution: Box<SetupEnsureExecution>,
         reply: async_engine::OneshotSender<Result<(), Error>>,
     },
     Stop(async_engine::OneshotSender<()>),
@@ -1144,8 +1198,9 @@ async fn job_actor(
                     .job(id)
                     .is_ok_and(|job| job.state == jobs::JobState::Running)
                 {
+                    let receipt = execution.receipt.clone();
                     registry
-                        .record_setup_ensure(execution.resource)
+                        .record_setup_ensure(execution)
                         .await
                         .map_err(|error| format!("setup ensure registry recording failed: {error}"))
                         .map(|()| {
@@ -1155,7 +1210,7 @@ async fn job_actor(
                             // rejected above; a later cancellation observes a
                             // terminal success and cannot be accepted.
                             cancellations.remove(&id);
-                            let _ = jobs.log(id, bounded_log_line(&execution.receipt));
+                            let _ = jobs.log(id, bounded_log_line(&receipt));
                             let _ = jobs.settle_with_error(id, true, None);
                         })
                 } else {
@@ -1392,10 +1447,13 @@ impl RegistryActor {
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
     }
-    async fn record_setup_ensure(&self, resource: SetupEnsureResource) -> Result<(), Error> {
+    async fn record_setup_ensure(&self, execution: SetupEnsureExecution) -> Result<(), Error> {
         let (reply, wait) = async_engine::oneshot_channel();
         self.sender
-            .send(DbCommand::RecordSetupEnsure { resource, reply })
+            .send(DbCommand::RecordSetupEnsure {
+                execution: Box::new(execution),
+                reply,
+            })
             .await
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
@@ -1430,7 +1488,7 @@ async fn registry_actor(
                     }
                 }
             }
-            DbCommand::RecordSetupEnsure { resource, reply } => {
+            DbCommand::RecordSetupEnsure { execution, reply } => {
                 #[cfg(test)]
                 if let Some(gate) = &mut setup_ensure_record_gate
                     && (gate.entered.send(()).await.is_err() || gate.release.recv().await.is_none())
@@ -1439,7 +1497,7 @@ async fn registry_actor(
                     continue;
                 }
                 let worker = async_engine::launch_blocking(move || {
-                    let result = record_setup_ensure(&mut registry, &resource);
+                    let result = record_setup_ensure(&mut registry, &execution);
                     (registry, result)
                 });
                 match worker.await {
@@ -1463,32 +1521,56 @@ async fn registry_actor(
 
 fn record_setup_ensure(
     registry: &mut Registry,
-    resource: &SetupEnsureResource,
+    execution: &SetupEnsureExecution,
 ) -> Result<(), bosn_registry::Error> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
         .as_secs_f64();
     let mut transaction = registry.begin_immediate()?;
+    let container = &execution.resource;
+    let image = &execution.image;
     transaction.put_resource(&Resource {
-        id: resource.id.clone(),
+        id: container.id.clone(),
         kind: ResourceKind::Container,
-        name: resource.name.clone(),
-        stack: resource.stack.clone(),
-        generation: resource.generation.clone(),
+        name: container.name.clone(),
+        stack: container.stack.clone(),
+        generation: container.generation.clone(),
         // Setup app container names are machine-global and content-addressed.
         scope: Scope::Machine,
-        workspace: resource.workspace.clone(),
+        workspace: container.workspace.clone(),
         created_at: now,
         last_used: now,
         state: ResourceState::Active,
         retention: Retention::Pinned,
     })?;
     transaction.put_resource_use(&ResourceUse {
-        resource_id: resource.id.clone(),
-        workspace: resource.workspace.clone(),
-        stack: resource.stack.clone(),
-        generation: resource.generation.clone(),
+        resource_id: container.id.clone(),
+        workspace: container.workspace.clone(),
+        stack: container.stack.clone(),
+        generation: container.generation.clone(),
+        last_used: now,
+        state: ResourceState::Active,
+    })?;
+    transaction.put_resource(&Resource {
+        id: image.id.clone(),
+        kind: ResourceKind::Image,
+        name: image.name.clone(),
+        stack: image.stack.clone(),
+        generation: image.generation.clone(),
+        // The inspected image ID identifies a machine-local Docker image.
+        scope: Scope::Machine,
+        workspace: image.workspace.clone(),
+        created_at: now,
+        last_used: now,
+        state: ResourceState::Active,
+        retention: Retention::Pinned,
+    })?;
+    transaction.put_resource_use(&ResourceUse {
+        resource_id: image.id.clone(),
+        workspace: image.workspace.clone(),
+        stack: image.stack.clone(),
+        generation: image.generation.clone(),
         last_used: now,
         state: ResourceState::Active,
     })?;
@@ -2368,6 +2450,13 @@ mod tests {
                         generation: "sha256:fake".into(),
                         workspace: request.workspace.to_string_lossy().into_owned(),
                     },
+                    image: SetupEnsureImageResource {
+                        id: "setup-image:sha256:fake".into(),
+                        name: "setup-image:sha256:fake".into(),
+                        stack: "setup".into(),
+                        generation: "sha256:fake".into(),
+                        workspace: request.workspace.to_string_lossy().into_owned(),
+                    },
                 })
             })
         }
@@ -2932,7 +3021,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_ensure_persists_one_container_and_use_across_daemon_restart() {
+    fn setup_ensure_persists_container_and_content_addressed_image_across_daemon_restart() {
         let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
         let state = temporary.path().join("state");
         let workspace = temporary.path().join("workspace");
@@ -2967,23 +3056,133 @@ mod tests {
 
         let registry = Registry::open_read_only(state.join("registry.sqlite3")).unwrap();
         let resources = registry.resources(0, 10).unwrap().items;
-        assert_eq!(resources.len(), 1);
-        assert_eq!(resources[0].id, "setup-container:fake");
-        assert_eq!(resources[0].kind, ResourceKind::Container);
-        assert_eq!(resources[0].name, "bosn-setup-fake");
-        assert_eq!(resources[0].stack, "setup");
-        assert_eq!(resources[0].generation, "sha256:fake");
-        assert_eq!(resources[0].scope, Scope::Machine);
-        assert_eq!(resources[0].workspace, workspace.to_string_lossy());
-        assert_eq!(resources[0].state, ResourceState::Active);
-        assert_eq!(resources[0].retention, Retention::Pinned);
+        assert_eq!(resources.len(), 2);
+        let container = resources
+            .iter()
+            .find(|resource| resource.kind == ResourceKind::Container)
+            .unwrap();
+        assert_eq!(container.id, "setup-container:fake");
+        assert_eq!(container.name, "bosn-setup-fake");
+        assert_eq!(container.stack, "setup");
+        assert_eq!(container.generation, "sha256:fake");
+        assert_eq!(container.scope, Scope::Machine);
+        assert_eq!(container.workspace, workspace.to_string_lossy());
+        assert_eq!(container.state, ResourceState::Active);
+        assert_eq!(container.retention, Retention::Pinned);
+        let image = resources
+            .iter()
+            .find(|resource| resource.kind == ResourceKind::Image)
+            .unwrap();
+        assert_eq!(image.id, "setup-image:sha256:fake");
+        assert_eq!(image.name, "setup-image:sha256:fake");
+        // Image generation preserves the verified inspected identity; it is
+        // never a mutable tag or a caller-provided registry value.
+        assert_eq!(image.generation, "sha256:fake");
+        assert_eq!(image.scope, Scope::Machine);
+        assert_eq!(image.workspace, workspace.to_string_lossy());
+        assert_eq!(image.state, ResourceState::Active);
+        assert_eq!(image.retention, Retention::Pinned);
         let uses = registry.resource_uses(0, 10).unwrap().items;
-        assert_eq!(uses.len(), 1);
-        assert_eq!(uses[0].resource_id, "setup-container:fake");
-        assert_eq!(uses[0].workspace, workspace.to_string_lossy());
-        assert_eq!(uses[0].stack, "setup");
-        assert_eq!(uses[0].generation, "sha256:fake");
-        assert_eq!(uses[0].state, ResourceState::Active);
+        assert_eq!(uses.len(), 2);
+        for use_record in uses {
+            assert_eq!(use_record.workspace, workspace.to_string_lossy());
+            assert_eq!(use_record.stack, "setup");
+            assert_eq!(use_record.state, ResourceState::Active);
+        }
+    }
+
+    #[test]
+    fn setup_image_registry_identity_is_content_addressed_for_pinned_and_inline_forms() {
+        let workspace = "/verified/workspace";
+        let identity = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let pinned = PreparedImage {
+            setup_content_sha256: "pinned-document".into(),
+            kind: PreparedImageKind::PinnedImage {
+                image:
+                    "alpine@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        .into(),
+            },
+            reference:
+                "alpine@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .into(),
+            observed_identity: identity.into(),
+        };
+        let inline = PreparedImage {
+            setup_content_sha256: "inline-document".into(),
+            kind: PreparedImageKind::InlineDockerfile {
+                tag: "bosn-setup:inline-document".into(),
+            },
+            reference: "bosn-setup:inline-document".into(),
+            observed_identity: identity.into(),
+        };
+        let pinned_resource = setup_ensure_image_resource(&pinned, workspace);
+        let inline_resource = setup_ensure_image_resource(&inline, workspace);
+        // An immutable pulled image and an inline build which inspect to the
+        // same local Docker image share exactly one machine resource. Mutable
+        // references/tags never enter the durable identity.
+        assert_eq!(pinned_resource, inline_resource);
+        assert_eq!(pinned_resource.id, format!("setup-image:{identity}"));
+        assert_eq!(pinned_resource.name, format!("setup-image:{identity}"));
+        assert_eq!(pinned_resource.generation, identity);
+        assert_eq!(pinned_resource.workspace, workspace);
+    }
+
+    #[test]
+    fn setup_ensure_registry_recording_is_atomic_when_image_identity_conflicts() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let mut registry = Registry::create_writer(
+            temporary.path().join("registry.sqlite3"),
+            "11111111-2222-4333-8444-555555555555",
+        )
+        .unwrap();
+        let workspace = "/verified/workspace";
+        let image_name =
+            "setup-image:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut transaction = registry.begin_immediate().unwrap();
+        transaction
+            .put_resource(&Resource {
+                id: "foreign-image-row".into(),
+                kind: ResourceKind::Image,
+                name: image_name.into(),
+                stack: "foreign".into(),
+                generation: "sha256:foreign".into(),
+                scope: Scope::Machine,
+                workspace: workspace.into(),
+                created_at: 1.0,
+                last_used: 1.0,
+                state: ResourceState::Active,
+                retention: Retention::Pinned,
+            })
+            .unwrap();
+        transaction.commit().unwrap();
+
+        let execution = SetupEnsureExecution {
+            receipt: "ensured container".into(),
+            resource: SetupEnsureResource {
+                id: "setup-container:document".into(),
+                name: "bosn-setup-document".into(),
+                stack: "setup".into(),
+                generation: "sha256:document".into(),
+                workspace: workspace.into(),
+            },
+            image: SetupEnsureImageResource {
+                id: "setup-image:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                name: image_name.into(),
+                stack: "setup".into(),
+                generation: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                workspace: workspace.into(),
+            },
+        };
+        assert!(matches!(
+            record_setup_ensure(&mut registry, &execution),
+            Err(bosn_registry::Error::ResourceIdentityConflict)
+        ));
+        // The failed image upsert rolls back the preceding container and both
+        // use rows; only the deliberate pre-existing conflicting row remains.
+        let resources = registry.resources(0, 10).unwrap().items;
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].id, "foreign-image-row");
+        assert!(registry.resource_uses(0, 10).unwrap().items.is_empty());
     }
 
     #[test]
@@ -3107,8 +3306,8 @@ mod tests {
                 registry_task.await.unwrap();
             });
         let registry = Registry::open_read_only(state.join("registry.sqlite3")).unwrap();
-        assert_eq!(registry.resources(0, 10).unwrap().items.len(), 1);
-        assert_eq!(registry.resource_uses(0, 10).unwrap().items.len(), 1);
+        assert_eq!(registry.resources(0, 10).unwrap().items.len(), 2);
+        assert_eq!(registry.resource_uses(0, 10).unwrap().items.len(), 2);
     }
 
     #[test]
