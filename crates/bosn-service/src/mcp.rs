@@ -16,8 +16,8 @@
 
 use crate::{
     Client, DoctorReport, Error, JobLogPage, JobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE,
-    RegistryResourcePage, SetupEnsureEventPage, SetupEnsureJobRequest, SetupGcPreviewPage,
-    SetupPreparePolicy, SetupPrepareRequest, SetupTaskJobRequest, Status,
+    RegistryResourcePage, SetupEnsureEventPage, SetupEnsureJobRequest, SetupGcApplyResult,
+    SetupGcPreviewPage, SetupPreparePolicy, SetupPrepareRequest, SetupTaskJobRequest, Status,
 };
 use bosn_setup::{
     SetupAcquirePolicy, SetupPlan, SetupPlanAppSource, SetupPlanRequest, SetupSourceKind,
@@ -110,6 +110,11 @@ trait Backend {
         after: u64,
         limit: u32,
     ) -> Result<SetupGcPreviewPage, Error>;
+    fn setup_gc_apply(
+        &mut self,
+        workspace: PathBuf,
+        token: String,
+    ) -> Result<SetupGcApplyResult, Error>;
     fn job_status(&mut self, id: u64) -> Result<JobStatus, Error>;
     fn job_logs(&mut self, id: u64, after: u64, limit: u32) -> Result<JobLogPage, Error>;
     fn cancel_job(&mut self, id: u64) -> Result<(), Error>;
@@ -171,6 +176,14 @@ impl Backend for DaemonBackend<'_> {
     ) -> Result<SetupGcPreviewPage, Error> {
         self.runtime
             .run(self.client.setup_gc_preview(workspace, after, limit))
+    }
+    fn setup_gc_apply(
+        &mut self,
+        workspace: PathBuf,
+        token: String,
+    ) -> Result<SetupGcApplyResult, Error> {
+        self.runtime
+            .run(self.client.setup_gc_apply(workspace, &token, true))
     }
     fn job_status(&mut self, id: u64) -> Result<JobStatus, Error> {
         self.runtime.run(self.client.job_status(id))
@@ -357,6 +370,12 @@ fn tools_list() -> Value {
                 "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
             },
             {
+                "name": "bosn_setup_gc_apply",
+                "description": "DESTRUCTIVE: remove exactly one retired Bosn-managed setup container using a preview candidate token and explicit confirmation. The daemon rechecks registry ownership and Docker labels before removal.",
+                "inputSchema": setup_gc_apply_schema(),
+                "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false}
+            },
+            {
                 "name": "bosn_job_status",
                 "description": "Read the state of one native daemon job.",
                 "inputSchema": job_id_schema(),
@@ -496,6 +515,13 @@ fn setup_gc_preview_schema() -> Value {
         "limit": {"type": "integer", "minimum": 1, "maximum": MAX_MCP_REGISTRY_RECORDS, "default": MAX_MCP_REGISTRY_RECORDS}
     }})
 }
+fn setup_gc_apply_schema() -> Value {
+    json!({"type":"object","additionalProperties":false,"required":["workspace","candidate_token","confirm"],"properties":{
+        "workspace":{"type":"string","minLength":1,"maxLength":MAX_MCP_SETUP_STRING_BYTES},
+        "candidate_token":{"type":"string","minLength":5,"maxLength":24580},
+        "confirm":{"const":true,"description":"Explicit destructive confirmation."}
+    }})
+}
 
 fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
     let Some(params) = params.as_object() else {
@@ -553,6 +579,14 @@ fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
                 backend
                     .setup_gc_preview(workspace, after, limit)
                     .map(setup_gc_preview_json)
+                    .map_err(|_| ToolFailure::Daemon)
+            })
+        }
+        "bosn_setup_gc_apply" => {
+            setup_gc_apply_arguments(arguments).and_then(|(workspace, token)| {
+                backend
+                    .setup_gc_apply(workspace, token)
+                    .map(setup_gc_apply_json)
                     .map_err(|_| ToolFailure::Daemon)
             })
         }
@@ -922,6 +956,35 @@ fn setup_gc_preview_arguments(
     let limit = limit as u32;
     Ok((workspace, after, limit))
 }
+fn setup_gc_apply_arguments(
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<(PathBuf, String), ToolFailure> {
+    only_arguments(arguments, &["workspace", "candidate_token", "confirm"])?;
+    let workspace = arguments
+        .get("workspace")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= MAX_MCP_SETUP_STRING_BYTES
+                && !value.bytes().any(|byte| byte == 0)
+        })
+        .map(PathBuf::from)
+        .ok_or(ToolFailure::Invalid(
+            "workspace must be a non-empty bounded string",
+        ))?;
+    let token = arguments
+        .get("candidate_token")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 24 * 1024)
+        .map(str::to_owned)
+        .ok_or(ToolFailure::Invalid(
+            "candidate_token must be bounded string",
+        ))?;
+    if arguments.get("confirm") != Some(&Value::Bool(true)) {
+        return Err(ToolFailure::Invalid("confirm must be true"));
+    }
+    Ok((workspace, token))
+}
 
 fn status_json(status: Status) -> Value {
     json!({
@@ -967,8 +1030,11 @@ fn setup_ensure_event_page_json(page: SetupEnsureEventPage) -> Value {
     json!({"next": page.next, "records": records})
 }
 fn setup_gc_preview_json(page: SetupGcPreviewPage) -> Value {
-    let candidates: Vec<_> = page.candidates.into_iter().map(|candidate| json!({"id": candidate.id, "name": candidate.name, "generation": candidate.generation, "reason": candidate.reason})).collect();
+    let candidates: Vec<_> = page.candidates.into_iter().map(|candidate| json!({"id": candidate.id, "name": candidate.name, "generation": candidate.generation, "token":candidate.token, "reason": candidate.reason})).collect();
     json!({"next": page.next, "candidates": candidates, "counts": {"protected_not_retired": page.counts.protected_not_retired, "protected_ambiguous_use": page.counts.protected_ambiguous_use, "protected_lease": page.counts.protected_lease, "protected_session": page.counts.protected_session, "excluded_unmanaged": page.counts.excluded_unmanaged}})
+}
+fn setup_gc_apply_json(result: SetupGcApplyResult) -> Value {
+    json!({"removed":result.removed,"reconciled_missing":result.reconciled_missing})
 }
 
 fn job_json(job: JobStatus) -> Value {
@@ -1138,9 +1204,21 @@ mod tests {
                     id: "setup-container:retired".into(),
                     name: "bosn-setup-retired".into(),
                     generation: "sha256:old".into(),
+                    token: "sgc1-7465737400".into(),
                     reason: "retired_managed_setup_container".into(),
                 }],
                 counts: crate::SetupGcPreviewCounts::default(),
+            })
+        }
+        fn setup_gc_apply(
+            &mut self,
+            _workspace: PathBuf,
+            _token: String,
+        ) -> Result<SetupGcApplyResult, Error> {
+            self.daemon_reads += 1;
+            Ok(SetupGcApplyResult {
+                removed: true,
+                reconciled_missing: false,
             })
         }
         fn job_status(&mut self, id: u64) -> Result<JobStatus, Error> {
@@ -1279,6 +1357,7 @@ mod tests {
                 "bosn_registry_resources",
                 "bosn_setup_ensure_events",
                 "bosn_setup_gc_preview",
+                "bosn_setup_gc_apply",
                 "bosn_job_status",
                 "bosn_job_logs",
                 "bosn_job_cancel",
@@ -1438,6 +1517,24 @@ mod tests {
         );
         assert_eq!(rejected["isError"], true);
         assert_eq!(backend.daemon_reads, before);
+    }
+
+    #[test]
+    fn gc_apply_requires_token_and_explicit_confirmation() {
+        let mut backend = FakeBackend::default();
+        let rejected = call_tool(
+            json!({"name":"bosn_setup_gc_apply","arguments":{"workspace":"/private/work","candidate_token":"sgc1-00","confirm":false}}),
+            &mut backend,
+        );
+        assert_eq!(rejected["isError"], true);
+        assert_eq!(backend.daemon_reads, 0);
+        let applied = call_tool(
+            json!({"name":"bosn_setup_gc_apply","arguments":{"workspace":"/private/work","candidate_token":"sgc1-00","confirm":true}}),
+            &mut backend,
+        );
+        assert_eq!(applied["isError"], false);
+        assert_eq!(applied["structuredContent"]["removed"], true);
+        assert_eq!(backend.daemon_reads, 1);
     }
 
     #[test]

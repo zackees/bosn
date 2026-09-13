@@ -9,6 +9,7 @@ use bosn_service::{
     JobStatus as ServiceJobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE,
     RegistryResourcePage as ServiceRegistryResourcePage,
     SetupEnsureEventPage as ServiceSetupEnsureEventPage, SetupEnsureJobRequest,
+    SetupGcApplyResult as ServiceSetupGcApplyResult,
     SetupGcPreviewPage as ServiceSetupGcPreviewPage, SetupPreparePolicy, SetupPrepareRequest,
     SetupTaskJobRequest, Status as ServiceStatus,
 };
@@ -125,6 +126,29 @@ impl Client {
         py.detach(move || {
             setup_gc_preview(&state_dir, workspace, after, limit)
                 .map(SetupGcPreviewPage::from)
+                .map_err(service_error)
+        })
+    }
+    /// Destructively remove exactly one preview candidate. `confirm` must be
+    /// true and `candidate_token` must come from this API's preview result;
+    /// no Docker identifier, argv, image, or selector can be supplied.
+    #[pyo3(signature = (workspace, candidate_token, *, confirm))]
+    fn setup_gc_apply(
+        &self,
+        workspace: PathBuf,
+        candidate_token: String,
+        confirm: bool,
+        py: Python<'_>,
+    ) -> PyResult<SetupGcApplyResult> {
+        if !confirm {
+            return Err(PyValueError::new_err(
+                "setup_gc_apply requires confirm=True",
+            ));
+        }
+        let state_dir = self.state_dir.clone();
+        py.detach(move || {
+            setup_gc_apply(&state_dir, workspace, candidate_token)
+                .map(SetupGcApplyResult::from)
                 .map_err(service_error)
         })
     }
@@ -517,6 +541,8 @@ pub struct SetupGcCandidate {
     #[pyo3(get)]
     generation: String,
     #[pyo3(get)]
+    token: String,
+    #[pyo3(get)]
     reason: String,
 }
 #[derive(Clone, Debug)]
@@ -557,6 +583,7 @@ impl SetupGcPreviewPage {
                             id: value.id.clone(),
                             name: value.name.clone(),
                             generation: value.generation.clone(),
+                            token: value.token.clone(),
                             reason: value.reason.clone(),
                         },
                     )
@@ -577,6 +604,7 @@ impl From<ServiceSetupGcPreviewPage> for SetupGcPreviewPage {
                     id: value.id,
                     name: value.name,
                     generation: value.generation,
+                    token: value.token,
                     reason: value.reason,
                 })
                 .collect(),
@@ -587,6 +615,23 @@ impl From<ServiceSetupGcPreviewPage> for SetupGcPreviewPage {
                 protected_session: value.counts.protected_session,
                 excluded_unmanaged: value.counts.excluded_unmanaged,
             },
+        }
+    }
+}
+
+#[derive(Debug)]
+#[pyclass(module = "bosn._native", frozen)]
+pub struct SetupGcApplyResult {
+    #[pyo3(get)]
+    removed: bool,
+    #[pyo3(get)]
+    reconciled_missing: bool,
+}
+impl From<ServiceSetupGcApplyResult> for SetupGcApplyResult {
+    fn from(value: ServiceSetupGcApplyResult) -> Self {
+        Self {
+            removed: value.removed,
+            reconciled_missing: value.reconciled_missing,
         }
     }
 }
@@ -826,6 +871,21 @@ fn setup_gc_preview(
     runtime.run(async {
         ServiceClient::for_state(state_dir)?
             .setup_gc_preview(workspace, after, limit)
+            .await
+    })
+}
+fn setup_gc_apply(
+    state_dir: &Path,
+    workspace: PathBuf,
+    candidate_token: String,
+) -> Result<ServiceSetupGcApplyResult, bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async {
+        ServiceClient::for_state(state_dir)?
+            .setup_gc_apply(workspace, &candidate_token, true)
             .await
     })
 }
@@ -1123,6 +1183,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SetupGcCandidate>()?;
     module.add_class::<SetupGcPreviewCounts>()?;
     module.add_class::<SetupGcPreviewPage>()?;
+    module.add_class::<SetupGcApplyResult>()?;
     module.add_class::<SetupEnsureEvent>()?;
     module.add_class::<SetupEnsureEventPage>()?;
     module.add_class::<SetupPlan>()?;

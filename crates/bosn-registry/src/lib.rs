@@ -731,6 +731,33 @@ pub struct Immediate<'a> {
     transaction: Transaction<'a>,
 }
 impl<'a> Immediate<'a> {
+    /// Recheck and remove one exact retired Bosn setup-container candidate.
+    ///
+    /// This is deliberately not a generic resource deletion operation.  The
+    /// caller supplies facts obtained from a bounded GC preview, but the
+    /// immediate transaction repeats every protection predicate before it
+    /// removes the row (and cascading retired use rows).  A false result is a
+    /// stale preview or a newly protected resource, never permission to
+    /// broaden selection.
+    pub fn finalize_setup_gc_candidate(
+        &mut self,
+        workspace: &str,
+        id: &str,
+        name: &str,
+        generation: &str,
+        at: f64,
+        event_kind: &str,
+    ) -> Result<bool, Error> {
+        if !setup_gc_candidate_exists(&mut self.transaction, workspace, id, name, generation)? {
+            return Ok(false);
+        }
+        self.transaction.execute(
+            "DELETE FROM resources WHERE id=?",
+            &[Value::Text(id.into())],
+        )?;
+        self.append_event(at, event_kind, "retired_managed_setup_container")?;
+        Ok(true)
+    }
     pub fn set_meta(&mut self, key: &str, value: &str) -> Result<(), Error> {
         if matches!(key, "schema_version" | "registry_id") || key == RECONCILIATION_REQUIRED {
             return Err(Error::ReservedMeta("schema_version or registry_id"));
@@ -1266,6 +1293,17 @@ impl Registry {
     ) -> Result<SetupGcPreview, Error> {
         setup_gc_preview(&self.connection, workspace, offset, limit)
     }
+    /// Re-read one exact preview candidate.  This is used by the daemon before
+    /// any engine mutation; it intentionally accepts no selector or glob.
+    pub fn setup_gc_candidate(
+        &mut self,
+        workspace: &str,
+        id: &str,
+        name: &str,
+        generation: &str,
+    ) -> Result<Option<SetupGcCandidate>, Error> {
+        setup_gc_candidate(&mut self.connection, workspace, id, name, generation)
+    }
     pub fn resource_uses(&self, offset: usize, limit: usize) -> Result<Page<ResourceUse>, Error> {
         page(
             &self.connection,
@@ -1594,6 +1632,87 @@ fn setup_gc_preview(
         excluded_unmanaged: count(&format!("NOT ({managed})"))?,
     };
     Ok(SetupGcPreview { candidates, counts })
+}
+
+fn setup_gc_candidate(
+    connection: &mut Connection,
+    workspace: &str,
+    id: &str,
+    name: &str,
+    generation: &str,
+) -> Result<Option<SetupGcCandidate>, Error> {
+    if !setup_gc_candidate_exists(connection, workspace, id, name, generation)? {
+        return Ok(None);
+    }
+    Ok(Some(SetupGcCandidate {
+        id: id.into(),
+        name: name.into(),
+        generation: generation.into(),
+    }))
+}
+
+/// The exact predicate shared by preview revalidation and finalization.  Keep
+/// this deliberately explicit: a newly-created lease/session or a use from a
+/// different workspace makes a formerly eligible candidate ineligible.
+fn setup_gc_candidate_exists(
+    connection: &mut impl SetupGcQuery,
+    workspace: &str,
+    id: &str,
+    name: &str,
+    generation: &str,
+) -> Result<bool, Error> {
+    let rows = connection.setup_gc_query(
+        "SELECT 1 FROM resources AS r WHERE r.id=? AND r.name=? AND r.generation=? \
+         AND r.kind='container' AND r.stack='setup' AND r.workspace=? \
+         AND r.state='retired' AND r.scope='machine' \
+         AND r.id GLOB 'setup-container:*' AND r.name GLOB 'bosn-setup-*' \
+         AND EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id \
+            AND u.workspace=? AND u.stack='setup' AND u.state='retired') \
+         AND NOT EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id \
+            AND (u.workspace<>? OR u.stack<>'setup' OR u.state<>'retired')) \
+         AND NOT EXISTS (SELECT 1 FROM leases AS l WHERE l.resource_id=r.id) \
+         AND NOT EXISTS (SELECT 1 FROM execution_sessions AS s \
+            WHERE s.container_id=r.id OR s.container_id=r.name) LIMIT 1",
+        &[
+            Value::Text(id.into()),
+            Value::Text(name.into()),
+            Value::Text(generation.into()),
+            Value::Text(workspace.into()),
+            Value::Text(workspace.into()),
+            Value::Text(workspace.into()),
+        ],
+    )?;
+    Ok(!rows.is_empty())
+}
+
+trait SetupGcQuery {
+    fn setup_gc_query(&mut self, sql: &str, values: &[Value]) -> Result<Vec<Row>, Error>;
+}
+impl SetupGcQuery for Connection {
+    fn setup_gc_query(&mut self, sql: &str, values: &[Value]) -> Result<Vec<Row>, Error> {
+        self.query(
+            sql,
+            values,
+            QueryLimits {
+                max_rows: 1,
+                max_bytes: 1024,
+            },
+        )
+        .map_err(Into::into)
+    }
+}
+impl SetupGcQuery for Transaction<'_> {
+    fn setup_gc_query(&mut self, sql: &str, values: &[Value]) -> Result<Vec<Row>, Error> {
+        self.query(
+            sql,
+            values,
+            QueryLimits {
+                max_rows: 1,
+                max_bytes: 1024,
+            },
+        )
+        .map_err(Into::into)
+    }
 }
 fn text(r: &Row, i: usize) -> Result<String, Error> {
     match r.get(i) {
