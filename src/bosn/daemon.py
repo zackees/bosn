@@ -37,6 +37,7 @@ from bosn import __version__, ipc, labels
 from bosn.clock import Clock, SystemClock
 from bosn.config import Config
 from bosn.jobs import BuildOutcome, Job, JobError, JobManager
+from bosn.migration_lock import CutoverError, publish_cutover_marker
 from bosn.registry import Registry, default_state_dir
 
 DAEMON_NAME = "bosn-daemon"
@@ -58,6 +59,7 @@ MUTATING_VERBS = frozenset(
         "execution-release",
         "compose-acquire",
         "compose-release",
+        "migration-cutover",
     }
 )
 
@@ -315,7 +317,12 @@ class _Handler(socketserver.StreamRequestHandler):
         # `should_retire` counts jobs. A streaming `gc` is held by nothing, so without this
         # the watchdog could retire the daemon out from under the collection a client is
         # watching, which is the exact failure #110's field report describes.
-        daemon_ref.begin_request()
+        if not daemon_ref.begin_request(verb):
+            ipc.send_response(
+                self.connection,
+                {"ok": False, "error": "daemon is draining for Rust migration cutover"},
+            )
+            return
         try:
             if verb in STREAMING_VERBS:
                 self._stream(daemon_ref, verb, request)
@@ -440,6 +447,7 @@ class Daemon:
         self._execution_lock = threading.RLock()
         self._active_requests = 0
         self._stopping = False
+        self._cutover_started = False
         self.secret = secrets.token_urlsafe(32)
         self.registry = Registry(self.state_dir / "registry.sqlite3", clock=self.clock)
         # Foreground command ownership must outlive the daemon process itself. A restarted
@@ -545,9 +553,12 @@ class Daemon:
         self.last_activity = self.clock.now()
         self.heartbeat_at = self.last_activity
 
-    def begin_request(self) -> None:
+    def begin_request(self, verb: str | None = None) -> bool:
         with self._execution_lock:
+            if self._cutover_started and (verb in MUTATING_VERBS or verb in STREAMING_VERBS):
+                return False
             self._active_requests += 1
+            return True
 
     def finish_request(self) -> None:
         with self._execution_lock:
@@ -1011,6 +1022,7 @@ class Daemon:
             "execution-release": self._verb_execution_release,
             "compose-acquire": self._verb_compose_acquire,
             "compose-release": self._verb_compose_release,
+            "migration-cutover": self._verb_migration_cutover,
             "shutdown": self._verb_shutdown,
         }.get(verb)
         if handler is None:
@@ -1028,6 +1040,45 @@ class Daemon:
 
     def _verb_ping(self, _request: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "pong": True, "pid": os.getpid(), "version": __version__}
+
+    def _verb_migration_cutover(self, _request: dict[str, Any]) -> dict[str, Any]:
+        """Close legacy admission and publish the durable Rust-cutover marker.
+
+        The request handler itself counts as one active request.  Once the flag is
+        set, no further mutating/streaming request can enter; any request already
+        admitted makes this attempt fail rather than guessing it is harmless.
+        SQLite remains guarded by the Registry's shared migration lock until normal
+        shutdown has truly closed it, including deferred background-thread closure.
+        """
+        with self._execution_lock:
+            if self._cutover_started:
+                return {"ok": False, "error": "Rust migration cutover is already draining"}
+            self._cutover_started = True
+            if self._active_requests > 1:
+                self._cutover_started = False
+                return {"ok": False, "error": "active daemon requests prevent migration cutover"}
+            if self._execution_sessions:
+                self._cutover_started = False
+                return {"ok": False, "error": "execution ownership prevents migration cutover"}
+        if self.jobs.active_count() != 0:
+            with self._execution_lock:
+                self._cutover_started = False
+            return {"ok": False, "error": "active daemon jobs prevent migration cutover"}
+        # request_stop repeats the execution-ownership check under the daemon's lock
+        # before it starts shutdown; a race in liveness reaping therefore refuses rather
+        # than publishing a marker over a surviving foreground owner.
+        registry_id = self.registry.registry_id
+        if not self.request_stop():
+            with self._execution_lock:
+                self._cutover_started = False
+            return {"ok": False, "error": "daemon refused migration cutover while draining"}
+        try:
+            marker = publish_cutover_marker(self.state_dir, registry_id)
+        except CutoverError as exc:
+            # Shutdown has already been accepted; do not remove or overwrite any marker.
+            # A conflicting/partial marker is a fail-closed operator recovery condition.
+            return {"ok": False, "error": f"migration cutover marker refused: {exc}"}
+        return {"ok": True, "cutover_marker": str(marker), "registry_id": registry_id}
 
     def _verb_status(self, _request: dict[str, Any]) -> dict[str, Any]:
         from bosn.resources import process_alive

@@ -24,6 +24,15 @@ so normal development is pinned to upstream revision
 crates/bosn-registry/Cargo.toml` intentionally fails until that dependency is
 replaced with exact published `kernal-api = "=0.1.0"`.
 
+## Python-v4 bridge guard
+
+`acquire_legacy_migration_guard(state_dir)` takes the exclusive Rust half of the
+cooperative Python-v4 cutover lock at `state_dir/registry.migration.lock`. It uses
+only kernal-api's public filesystem lock facade. It proves all upgraded Python
+writers that hold the matching shared guard have closed; it does not claim to fence
+a pre-bridge Python release. The later importer must validate the durable cutover
+marker and old-process activation proof before treating this guard as quiescence.
+
 Fresh creation uses the kernel filesystem facade's atomic private create-new
 primitive and takes the advisory lock on the database inode itself. `create_writer`
 requires a UUID-shaped caller-supplied registry ID; its secure generation stays
