@@ -12,12 +12,23 @@ native = pytest.importorskip("bosn._native")
 
 def test_native_extension_is_reexported_by_python_package(tmp_path: Path) -> None:
     assert bosn.Client is native.Client
+    assert bosn.ComposePlan is native.ComposePlan
     assert bosn.DoctorReport is native.DoctorReport
     assert bosn.Status is native.Status
     assert bosn.RegistryResourcePage is native.RegistryResourcePage
     assert bosn.SetupEnsureEventPage is native.SetupEnsureEventPage
     assert bosn.native_version() == bosn.__version__
     assert bosn.protocol_version() == 1
+
+    compose_plan = bosn.plan_compose_yaml(
+        "services:\n  api:\n    image: alpine:3.21\n"
+    )
+    assert compose_plan.applied is False
+    assert compose_plan.version == 1
+    assert compose_plan.digest.startswith("sha256:")
+    assert "alpine:3.21" in compose_plan.document_json
+    with pytest.raises(AttributeError):
+        compose_plan.applied = True
 
     client = bosn.Client(tmp_path / "state")
     assert client.state_dir == str(tmp_path / "state")

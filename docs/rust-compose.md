@@ -45,6 +45,22 @@ cannot contain `..`; container targets must be normalized absolute paths without
 future daemon supplies the selected roots and revalidates them before any materialization or
 engine operation.
 
+## Read-only front doors
+
+The pure plan is available for review before any future execution work:
+
+```text
+bosn compose plan --file compose.yaml --json
+```
+
+The CLI reads only the explicitly supplied local file, caps it at one MiB, and returns
+`applied: false`. It never opens a Bosn state directory, contacts a daemon/Docker, or
+uses a Compose executable. Python callers can use `bosn.plan_compose_yaml(source)`;
+its immutable result exposes `version`, `digest`, `normalized_json`, `document_json`, and
+`applied` (always false). The MCP tool `bosn_compose_plan` accepts the full YAML in its
+bounded `document` string (32 KiB), specifically rather than accepting a path or URL. It
+returns the same typed document, digest, and `applied: false` receipt.
+
 ## Next migration work
 
 The next Compose work package must add daemon-owned planning/apply semantics, context-closure
