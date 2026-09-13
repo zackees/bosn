@@ -20,26 +20,32 @@ dependencies = [
 Homepage = "https://github.com/zackees/bosn"
 
 [project.scripts]
-bosn = "bosn.cli:main"
-bosn-docker = "bosn.docker_cli:main"
-bosn-compose = "bosn.docker_cli:compose_main"
+bosn = "bosn.native_cli:main"
 
 [dependency-groups]
 dev = [
-    "maturin>=1.9,<2",
+    "maturin>=1.15,<2",
     "pytest>=8.0",
     "ruff>=0.6",
     "pyright>=1.1.380",
 ]
 
 [build-system]
-requires = ["maturin>=1.9,<2"]
-build-backend = "maturin"
+requires = ["maturin>=1.15,<2"]
+build-backend = "bosn_build_backend"
+backend-path = ["."]
 
 [tool.maturin]
 manifest-path = "crates/bosn-python/Cargo.toml"
 module-name = "bosn._native"
 python-source = "src"
+data = "target/bosn-wheel-data"
+targets = [
+    { name = "bosn_native", kind = "cdylib" },
+]
+include = [
+    { path = "bosn_build_backend.py", format = "sdist" },
+]
 
 [tool.ruff]
 line-length = 100

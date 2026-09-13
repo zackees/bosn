@@ -148,6 +148,36 @@ PYO3_PYTHON="$PYTHON_BIN" LD_LIBRARY_PATH="$PYTHON_LIB${LD_LIBRARY_PATH:+:$LD_LI
 Installed-extension behavior is covered separately through
 `uv run maturin develop --locked && uv run pytest tests/test_native.py`.
 
+### Installed native CLI wheel
+
+The distribution's `bosn` console entry point is a small Python launcher that
+executes the version-matched Rust `bosn-native` target packaged inside the
+installed wheel. It resolves the executable relative to the installed `bosn`
+package, never by searching `PATH`, so it cannot select a source checkout or a
+different Bosn installation. The launcher exposes only the native CLI; the
+legacy Python lifecycle front doors are not installed as console scripts.
+
+Maturin 1.15's PyO3 bridge builds the extension but does not package a binary
+target from the same mixed project. `bosn_build_backend` is therefore the
+PEP 517 backend: it compiles the shared `bosn-native` target first, stages it
+in Maturin's `platlib` wheel data, and requests an audited platform wheel. On
+Linux it additionally stages the exact OpenSSL runtime objects needed by that
+standalone executable, while the launcher supplies only the package-local
+library directories at exec time. This is a build-time packaging concern, not
+a second daemon implementation.
+
+Run the hermetic artifact proof with:
+
+```bash
+uv run pytest tests/test_native_wheel.py -q
+```
+
+It builds the wheel through PEP 517, installs it in a fresh virtual environment,
+clears checkout and host-library paths, verifies `import bosn`, package-local
+native-executable discovery, `bosn --version`, and `bosn daemon --help`. The
+release matrix still needs equivalent macOS and Windows runtime-dependency
+proofs before cross-platform publication is declared complete.
+
 ### Native setup submission CLI
 
 `bosn setup prepare` submits a durable, daemon-owned image-preparation job and

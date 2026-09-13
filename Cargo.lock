@@ -91,6 +91,7 @@ dependencies = [
  "bosn-setup",
  "kernal-api",
  "pyo3",
+ "serde_json",
 ]
 
 [[package]]
