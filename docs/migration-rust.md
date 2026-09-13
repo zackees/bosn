@@ -61,8 +61,9 @@ existing workspace mounts before reaching the engine.  Its testable command is
 the finite `SetupTaskCommand::Run` semantic shape; the `DockerEngine` adapter
 may emit only `docker run --rm` with document-derived bind mounts, environment,
 workdir, the observed image identity, and `sh -lc` with the declared task text.
-This primitive has no daemon IPC, CLI, MCP, registry persistence, container
-lifecycle, or setup-ensure wiring yet.
+The primitive is submitted through typed daemon IPC and the bounded native,
+Python, and MCP job-submission surfaces. It deliberately still has no registry
+persistence, container lifecycle, or setup-ensure wiring.
 
 ## Current surface and characterization references
 
