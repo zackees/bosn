@@ -30,6 +30,12 @@ pub use materialize::{
     SetupAssetStore, SetupMaterializeError,
 };
 
+mod plan;
+pub use plan::{
+    SetupPlan, SetupPlanAppSource, SetupPlanError, SetupPlanRequest, plan_setup,
+    plan_setup_with_transport,
+};
+
 /// The current durable cache-record wire version.  It is intentionally
 /// independent of the setup-document schema version.
 pub const CACHE_RECORD_VERSION: u16 = 1;

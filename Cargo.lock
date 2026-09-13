@@ -131,10 +131,12 @@ name = "bosn-service"
 version = "0.1.0"
 dependencies = [
  "bosn-registry",
+ "bosn-setup",
  "kernal-api",
  "prost",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
