@@ -129,6 +129,24 @@ Python, and the read-only MCP tools `bosn_registry_resources` and
 the tools accept no state/file path, Docker, workspace, or raw SQL controls.
 Malformed page arguments are rejected before daemon IPC.
 
+### Bounded daemon doctor
+
+`bosn doctor --state-dir STATE --json` performs a fixed, daemon-owned
+read-only health check. The already-running daemon runs SQLite's integrity
+check through its sole writer and one fixed `docker version` probe through the
+`kernal-api` process facade. Its stable result has `daemon`, `registry`, and
+`engine` states plus client/server version strings only when the engine is
+reachable. Engine stderr, Docker endpoints, paths, environment, process
+errors, and arbitrary output are never returned. The complete diagnostic has
+a fixed two-second budget: 500 ms for SQLite and 1.5 seconds/512 bytes for
+Docker; callers cannot override any of those bounds or supply Docker
+arguments. A missing daemon reports the typed
+`"unavailable"` state without the CLI or client creating/migrating a registry.
+
+The equivalent read-only APIs are `bosn.Client.doctor()` in Python and the
+no-argument MCP tool `bosn_doctor`; both require the daemon selected when the
+client/server was created and accept no state path or diagnostic controls.
+
 An opt-in live proof exercises the production daemon and kernal-api Docker
 transport end to end, including daemon restart and matching-container reuse:
 

@@ -904,6 +904,12 @@ impl Registry {
         Self::validate(&connection, path)?;
         Ok(ReadOnlyRegistry { connection })
     }
+    /// Verify SQLite's internal consistency through the already-open sole
+    /// writer. This is a read-only integrity operation: it neither migrates
+    /// nor initializes a registry and does not begin a transaction.
+    pub fn integrity_check(&self) -> Result<(), Error> {
+        Ok(self.connection.integrity_check()?)
+    }
     fn validate(connection: &Connection, path: &Path) -> Result<(), Error> {
         let version = meta(connection, "schema_version")?
             .ok_or_else(|| Error::Uninitialized(path.to_path_buf()))?;

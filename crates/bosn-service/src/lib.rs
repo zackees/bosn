@@ -1,7 +1,7 @@
 //! Small, authenticated Rust daemon foundation. Product protobuf remains private.
 
 use bosn_core::{ResourceKind, ResourceState, Retention, Scope};
-use bosn_engine::{DockerEngine, EngineEvent, RunOptions};
+use bosn_engine::{DockerDoctorReport, DockerDoctorState, DockerEngine, EngineEvent, RunOptions};
 use bosn_registry::{Event, Registry, RegistryStatus, Resource, ResourceUse};
 #[cfg(test)]
 use bosn_setup::PreparedImageKind;
@@ -38,6 +38,12 @@ const SETUP_PREPARE_MAX_DEADLINE: Duration = Duration::from_secs(5 * 60);
 const SETUP_PREPARE_MAX_OUTPUT: usize = 8 * 1024 * 1024;
 const SETUP_PREPARE_COMMAND_QUEUE: usize = 64;
 const SETUP_PREPARE_EVENT_QUEUE: usize = 16;
+/// One fixed engine version probe. This is intentionally independent of setup
+/// job limits: diagnostic callers cannot select a deadline, output budget, or
+/// any Docker command.
+const DOCTOR_REGISTRY_DEADLINE: Duration = Duration::from_millis(500);
+const DOCTOR_ENGINE_DEADLINE: Duration = Duration::from_millis(1500);
+const DOCTOR_ENGINE_OUTPUT: usize = 512;
 /// A diagnostic page is deliberately small enough to fit comfortably in the
 /// authenticated IPC frame and every public front end.
 pub const MAX_REGISTRY_DIAGNOSTIC_PAGE: u32 = 64;
@@ -147,6 +153,37 @@ pub trait SetupEnsureExecutor: Send + Sync {
         cancellation: &'a async_engine::CancellationToken,
         logs: &'a async_engine::Sender<String>,
     ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>>;
+}
+
+/// Testable boundary for Bosn's one fixed, non-mutating engine health probe.
+/// It exposes no argv, environment, path, or output controls to the daemon
+/// protocol or any public frontend.
+pub trait DoctorExecutor: Send + Sync {
+    fn doctor<'a>(&'a self) -> Pin<Box<dyn Future<Output = DockerDoctorReport> + Send + 'a>>;
+}
+
+#[derive(Clone)]
+pub struct DockerDoctorExecutor {
+    engine: DockerEngine,
+}
+impl DockerDoctorExecutor {
+    fn new() -> Self {
+        Self {
+            engine: DockerEngine::docker(),
+        }
+    }
+}
+impl DoctorExecutor for DockerDoctorExecutor {
+    fn doctor<'a>(&'a self) -> Pin<Box<dyn Future<Output = DockerDoctorReport> + Send + 'a>> {
+        Box::pin(async move {
+            self.engine
+                .doctor_async(RunOptions::bounded(
+                    DOCTOR_ENGINE_DEADLINE,
+                    DOCTOR_ENGINE_OUTPUT,
+                ))
+                .await
+        })
+    }
 }
 
 /// A validated fact to be durably recorded after a successful setup-app
@@ -679,6 +716,46 @@ pub struct SetupEnsureEventPage {
     pub records: Vec<SetupEnsureEventDiagnostic>,
 }
 
+/// Bounded stable diagnostic result. A daemon-unavailable result is produced
+/// by the client without opening a registry; all other fields are authored by
+/// the existing daemon after its read-only integrity check and fixed engine
+/// probe. No paths, raw process output, endpoint names, or credentials occur.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DoctorReport {
+    pub daemon: String,
+    pub registry: String,
+    pub engine: String,
+    pub client_version: Option<String>,
+    pub server_version: Option<String>,
+}
+impl DoctorReport {
+    fn daemon_unavailable() -> Self {
+        Self {
+            daemon: "unavailable".into(),
+            registry: "unavailable".into(),
+            engine: "unavailable".into(),
+            client_version: None,
+            server_version: None,
+        }
+    }
+    fn from_engine(registry: &'static str, engine: DockerDoctorReport) -> Self {
+        Self {
+            daemon: "ready".into(),
+            registry: registry.into(),
+            engine: match engine.state {
+                DockerDoctorState::Ready => "ready",
+                DockerDoctorState::Unavailable => "unavailable",
+                DockerDoctorState::Deadline => "deadline",
+                DockerDoctorState::OutputLimit => "output_limit",
+                DockerDoctorState::InvalidResponse => "invalid_response",
+            }
+            .into(),
+            client_version: engine.client_version,
+            server_version: engine.server_version,
+        }
+    }
+}
+
 fn resource_diagnostic(value: Resource) -> RegistryResourceDiagnostic {
     RegistryResourceDiagnostic {
         id: value.id,
@@ -731,6 +808,28 @@ fn validate_registry_diagnostics_request_wire(request: &Request) -> Result<(), E
     }
     Ok(())
 }
+
+/// `doctor` has no parameters. In particular, it cannot inherit diagnostic
+/// pagination, setup policy, filesystem, job, output, or engine controls.
+fn validate_doctor_request_wire(request: &Request) -> Result<(), Error> {
+    if !request.workspace.is_empty()
+        || !request.stack.is_empty()
+        || !request.digest.is_empty()
+        || request.job_id != 0
+        || request.log_after != 0
+        || request.log_limit != 0
+        || !request.setup_config.is_empty()
+        || request.setup_policy != 0
+        || request.setup_deadline_ms != 0
+        || request.setup_output_limit != 0
+        || !request.setup_task_name.is_empty()
+        || request.diagnostic_after != 0
+        || request.diagnostic_limit != 0
+    {
+        return Err(Error::Protocol("nonsemantic doctor fields"));
+    }
+    Ok(())
+}
 impl From<RegistryStatus> for Status {
     fn from(v: RegistryStatus) -> Self {
         Self {
@@ -764,6 +863,19 @@ impl Client {
         match self.call(Request::operation(2)).await? {
             Reply::Status(v) => Ok(v),
             _ => Err(Error::Protocol("unexpected status response")),
+        }
+    }
+    /// Perform the fixed daemon-owned read-only registry integrity and Docker
+    /// version checks. An absent/unreachable daemon is a stable outcome, not a
+    /// client-side registry open or an unredacted transport error.
+    pub async fn doctor(&self) -> Result<DoctorReport, Error> {
+        match self.call(Request::operation(13)).await {
+            Ok(Reply::Doctor(v)) => Ok(v),
+            Ok(_) => Err(Error::Protocol("unexpected doctor response")),
+            Err(
+                Error::Deadline | Error::Io(_) | Error::ActorClosed | Error::EndpointOccupied(_),
+            ) => Ok(DoctorReport::daemon_unavailable()),
+            Err(error) => Err(error),
         }
     }
     /// Read a bounded, path-safe page of managed resource diagnostics from the
@@ -1020,6 +1132,7 @@ pub struct Service {
     setup_executor: Arc<dyn SetupPrepareExecutor>,
     setup_task_executor: Arc<dyn SetupTaskExecutor>,
     setup_ensure_executor: Arc<dyn SetupEnsureExecutor>,
+    doctor_executor: Arc<dyn DoctorExecutor>,
 }
 
 #[cfg(test)]
@@ -1033,6 +1146,7 @@ struct RegistryActor {
 }
 enum DbCommand {
     Status(async_engine::OneshotSender<Result<Status, Error>>),
+    DoctorIntegrity(async_engine::OneshotSender<&'static str>),
     Resources {
         after: u64,
         limit: u32,
@@ -1769,6 +1883,22 @@ impl RegistryActor {
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
     }
+    async fn doctor_integrity(&self) -> &'static str {
+        let (reply, wait) = async_engine::oneshot_channel();
+        if self
+            .sender
+            .send(DbCommand::DoctorIntegrity(reply))
+            .await
+            .is_err()
+        {
+            return "unavailable";
+        }
+        match async_engine::timeout(DOCTOR_REGISTRY_DEADLINE, wait).await {
+            Ok(Ok(state)) => state,
+            Ok(Err(_)) => "unavailable",
+            Err(_) => "deadline",
+        }
+    }
     async fn resources(&self, after: u64, limit: u32) -> Result<RegistryResourcePage, Error> {
         validate_registry_page(after, limit)?;
         let (reply, wait) = async_engine::oneshot_channel();
@@ -1849,6 +1979,22 @@ async fn registry_actor(
                     }
                     Err(_) => {
                         let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
+            DbCommand::DoctorIntegrity(reply) => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = registry.integrity_check();
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(if result.is_ok() { "ready" } else { "failed" });
+                    }
+                    Err(_) => {
+                        let _ = reply.send("unavailable");
                         return;
                     }
                 }
@@ -2043,6 +2189,7 @@ impl Service {
             setup_executor: Arc::new(DockerSetupPrepareExecutor::new(state_dir.clone())),
             setup_task_executor: Arc::new(DockerSetupTaskExecutor::new(state_dir.clone())),
             setup_ensure_executor: Arc::new(DockerSetupEnsureExecutor::new(state_dir.clone())),
+            doctor_executor: Arc::new(DockerDoctorExecutor::new()),
             state_dir,
             stop: CancellationSource::new(),
         }
@@ -2063,6 +2210,12 @@ impl Service {
     /// test seam; it does not add a caller-controlled container operation.
     pub fn with_setup_ensure_executor(mut self, executor: Arc<dyn SetupEnsureExecutor>) -> Self {
         self.setup_ensure_executor = executor;
+        self
+    }
+    /// Substitute the fixed semantic doctor probe for deterministic tests.
+    /// This is not an engine-command injection seam.
+    pub fn with_doctor_executor(mut self, executor: Arc<dyn DoctorExecutor>) -> Self {
+        self.doctor_executor = executor;
         self
     }
     /// Foreground lifecycle: acquires the sole registry writer before binding.
@@ -2144,7 +2297,8 @@ impl Service {
             let actor = actor.clone();
             let jobs = jobs.clone();
             let stop = self.stop.clone();
-            clients.spawn(async move { handle(stream, actor, jobs, stop).await });
+            let doctor = Arc::clone(&self.doctor_executor);
+            clients.spawn(async move { handle(stream, actor, jobs, stop, doctor).await });
         }
         while clients.join_next().await.is_some() {}
         // Keep the sole registry writer alive while the job actor cancels and
@@ -2247,6 +2401,7 @@ async fn handle(
     actor: RegistryActor,
     jobs: JobActor,
     stop: CancellationSource,
+    doctor: Arc<dyn DoctorExecutor>,
 ) -> Result<(), Error> {
     if !peer_is_authorized(&s.peer_identity()?.user_id, &ipc::current_user_id()?) {
         return Err(Error::Unauthorized);
@@ -2259,183 +2414,211 @@ async fn handle(
         return Err(Error::Protocol("request frame"));
     }
     let r = Request::decode(f.payload()).map_err(|_| Error::Protocol("request decode"))?;
-    let reply = if r.protocol_version != PROTOCOL_VERSION {
-        ReplyWire {
-            code: 1,
-            ..Default::default()
-        }
-    } else {
-        match r.operation {
-            1 => ReplyWire {
-                code: 10,
+    let reply =
+        if r.protocol_version != PROTOCOL_VERSION {
+            ReplyWire {
+                code: 1,
                 ..Default::default()
-            },
-            2 => {
-                let status = actor.status().await?;
-                ReplyWire {
-                    code: 20,
-                    registry_id: status.registry_id,
-                    schema_version: status.schema_version,
-                    resources: status.resources,
-                    leases: status.leases,
-                    sessions: status.sessions,
-                    reconciliation_required: status.reconciliation_required,
-                    ..Default::default()
-                }
             }
-            3 => {
-                stop.cancel();
-                ReplyWire {
-                    code: 30,
+        } else {
+            match r.operation {
+                1 => ReplyWire {
+                    code: 10,
                     ..Default::default()
+                },
+                2 => {
+                    let status = actor.status().await?;
+                    ReplyWire {
+                        code: 20,
+                        registry_id: status.registry_id,
+                        schema_version: status.schema_version,
+                        resources: status.resources,
+                        leases: status.leases,
+                        sessions: status.sessions,
+                        reconciliation_required: status.reconciliation_required,
+                        ..Default::default()
+                    }
                 }
-            }
-            4 => match jobs.submit(r.workspace, r.stack, r.digest).await {
-                Ok(job_id) => ReplyWire {
-                    code: 40,
-                    job_id,
-                    ..Default::default()
-                },
-                Err(_) => ReplyWire {
-                    code: 3,
-                    ..Default::default()
-                },
-            },
-            5 => match jobs.status(r.job_id).await {
-                Ok(job) => ReplyWire {
-                    code: 50,
-                    job_id: job.id,
-                    job_state: format!("{:?}", job.state),
-                    job_error: job.error.unwrap_or_default(),
-                    ..Default::default()
-                },
-                Err(_) => ReplyWire {
-                    code: 3,
-                    ..Default::default()
-                },
-            },
-            6 => match jobs.cancel(r.job_id).await {
-                Ok(()) => ReplyWire {
-                    code: 60,
-                    ..Default::default()
-                },
-                Err(_) => ReplyWire {
-                    code: 3,
-                    ..Default::default()
-                },
-            },
-            7 => match jobs.logs(r.job_id, r.log_after, r.log_limit as usize).await {
-                Ok(page) => ReplyWire {
-                    code: 70,
-                    retained_from: page.retained_from,
-                    next_log_cursor: page.next,
-                    log_gap: page.gap,
-                    logs: page
-                        .records
-                        .into_iter()
-                        .map(|(cursor, line)| LogRecordWire { cursor, line })
-                        .collect(),
-                    ..Default::default()
-                },
-                Err(_) => ReplyWire {
-                    code: 3,
-                    ..Default::default()
-                },
-            },
-            8 => {
-                let policy = SetupPreparePolicy::from_wire(r.setup_policy);
-                let request = policy.and_then(|policy| {
-                    validate_setup_prepare_wire(
-                        &r.workspace,
-                        &r.setup_config,
-                        policy,
-                        r.setup_deadline_ms,
-                        r.setup_output_limit,
-                    )
-                    .ok()
-                    .map(|()| SetupPrepareRequest {
-                        workspace: PathBuf::from(r.workspace),
-                        config: r.setup_config,
-                        policy,
-                        deadline: Duration::from_millis(r.setup_deadline_ms),
-                        output_limit: r.setup_output_limit as usize,
-                    })
-                });
-                match request {
-                    Some(request) => match jobs.submit_setup_prepare(request).await {
-                        Ok(job_id) => ReplyWire {
-                            code: 40,
-                            job_id,
-                            ..Default::default()
-                        },
-                        Err(_) => ReplyWire {
-                            code: 3,
-                            ..Default::default()
-                        },
+                3 => {
+                    stop.cancel();
+                    ReplyWire {
+                        code: 30,
+                        ..Default::default()
+                    }
+                }
+                4 => match jobs.submit(r.workspace, r.stack, r.digest).await {
+                    Ok(job_id) => ReplyWire {
+                        code: 40,
+                        job_id,
+                        ..Default::default()
                     },
-                    None => ReplyWire {
+                    Err(_) => ReplyWire {
                         code: 3,
                         ..Default::default()
                     },
-                }
-            }
-            9 => {
-                let policy = SetupPreparePolicy::from_wire(r.setup_policy);
-                let request = policy.and_then(|policy| {
-                    validate_setup_task_wire(
-                        &r.workspace,
-                        &r.setup_config,
-                        policy,
-                        &r.setup_task_name,
-                        r.setup_deadline_ms,
-                        r.setup_output_limit,
-                    )
-                    .ok()
-                    .map(|()| SetupTaskJobRequest {
-                        workspace: PathBuf::from(r.workspace),
-                        config: r.setup_config,
-                        policy,
-                        task_name: r.setup_task_name,
-                        deadline: Duration::from_millis(r.setup_deadline_ms),
-                        output_limit: r.setup_output_limit as usize,
-                    })
-                });
-                match request {
-                    Some(request) => match jobs.submit_setup_task(request).await {
-                        Ok(job_id) => ReplyWire {
-                            code: 40,
-                            job_id,
-                            ..Default::default()
-                        },
-                        Err(_) => ReplyWire {
-                            code: 3,
-                            ..Default::default()
-                        },
+                },
+                5 => match jobs.status(r.job_id).await {
+                    Ok(job) => ReplyWire {
+                        code: 50,
+                        job_id: job.id,
+                        job_state: format!("{:?}", job.state),
+                        job_error: job.error.unwrap_or_default(),
+                        ..Default::default()
                     },
-                    None => ReplyWire {
+                    Err(_) => ReplyWire {
                         code: 3,
                         ..Default::default()
                     },
-                }
-            }
-            10 => {
-                let policy = SetupPreparePolicy::from_wire(r.setup_policy);
-                let request = policy.and_then(|policy| {
-                    validate_setup_ensure_request_wire(&r, policy)
+                },
+                6 => match jobs.cancel(r.job_id).await {
+                    Ok(()) => ReplyWire {
+                        code: 60,
+                        ..Default::default()
+                    },
+                    Err(_) => ReplyWire {
+                        code: 3,
+                        ..Default::default()
+                    },
+                },
+                7 => match jobs.logs(r.job_id, r.log_after, r.log_limit as usize).await {
+                    Ok(page) => ReplyWire {
+                        code: 70,
+                        retained_from: page.retained_from,
+                        next_log_cursor: page.next,
+                        log_gap: page.gap,
+                        logs: page
+                            .records
+                            .into_iter()
+                            .map(|(cursor, line)| LogRecordWire { cursor, line })
+                            .collect(),
+                        ..Default::default()
+                    },
+                    Err(_) => ReplyWire {
+                        code: 3,
+                        ..Default::default()
+                    },
+                },
+                8 => {
+                    let policy = SetupPreparePolicy::from_wire(r.setup_policy);
+                    let request = policy.and_then(|policy| {
+                        validate_setup_prepare_wire(
+                            &r.workspace,
+                            &r.setup_config,
+                            policy,
+                            r.setup_deadline_ms,
+                            r.setup_output_limit,
+                        )
                         .ok()
-                        .map(|()| SetupEnsureJobRequest {
+                        .map(|()| SetupPrepareRequest {
                             workspace: PathBuf::from(r.workspace),
                             config: r.setup_config,
                             policy,
                             deadline: Duration::from_millis(r.setup_deadline_ms),
                             output_limit: r.setup_output_limit as usize,
                         })
-                });
-                match request {
-                    Some(request) => match jobs.submit_setup_ensure(request).await {
-                        Ok(job_id) => ReplyWire {
-                            code: 40,
-                            job_id,
+                    });
+                    match request {
+                        Some(request) => match jobs.submit_setup_prepare(request).await {
+                            Ok(job_id) => ReplyWire {
+                                code: 40,
+                                job_id,
+                                ..Default::default()
+                            },
+                            Err(_) => ReplyWire {
+                                code: 3,
+                                ..Default::default()
+                            },
+                        },
+                        None => ReplyWire {
+                            code: 3,
+                            ..Default::default()
+                        },
+                    }
+                }
+                9 => {
+                    let policy = SetupPreparePolicy::from_wire(r.setup_policy);
+                    let request = policy.and_then(|policy| {
+                        validate_setup_task_wire(
+                            &r.workspace,
+                            &r.setup_config,
+                            policy,
+                            &r.setup_task_name,
+                            r.setup_deadline_ms,
+                            r.setup_output_limit,
+                        )
+                        .ok()
+                        .map(|()| SetupTaskJobRequest {
+                            workspace: PathBuf::from(r.workspace),
+                            config: r.setup_config,
+                            policy,
+                            task_name: r.setup_task_name,
+                            deadline: Duration::from_millis(r.setup_deadline_ms),
+                            output_limit: r.setup_output_limit as usize,
+                        })
+                    });
+                    match request {
+                        Some(request) => match jobs.submit_setup_task(request).await {
+                            Ok(job_id) => ReplyWire {
+                                code: 40,
+                                job_id,
+                                ..Default::default()
+                            },
+                            Err(_) => ReplyWire {
+                                code: 3,
+                                ..Default::default()
+                            },
+                        },
+                        None => ReplyWire {
+                            code: 3,
+                            ..Default::default()
+                        },
+                    }
+                }
+                10 => {
+                    let policy = SetupPreparePolicy::from_wire(r.setup_policy);
+                    let request = policy.and_then(|policy| {
+                        validate_setup_ensure_request_wire(&r, policy)
+                            .ok()
+                            .map(|()| SetupEnsureJobRequest {
+                                workspace: PathBuf::from(r.workspace),
+                                config: r.setup_config,
+                                policy,
+                                deadline: Duration::from_millis(r.setup_deadline_ms),
+                                output_limit: r.setup_output_limit as usize,
+                            })
+                    });
+                    match request {
+                        Some(request) => match jobs.submit_setup_ensure(request).await {
+                            Ok(job_id) => ReplyWire {
+                                code: 40,
+                                job_id,
+                                ..Default::default()
+                            },
+                            Err(_) => ReplyWire {
+                                code: 3,
+                                ..Default::default()
+                            },
+                        },
+                        None => ReplyWire {
+                            code: 3,
+                            ..Default::default()
+                        },
+                    }
+                }
+                11 => match validate_registry_diagnostics_request_wire(&r) {
+                    Ok(()) => match actor
+                        .resources(r.diagnostic_after, r.diagnostic_limit)
+                        .await
+                    {
+                        Ok(page) => ReplyWire {
+                            code: 80,
+                            diagnostic_next: page.next.unwrap_or(0),
+                            diagnostic_has_next: page.next.is_some(),
+                            resources_diagnostic: page
+                                .records
+                                .into_iter()
+                                .map(ResourceDiagnosticWire::from)
+                                .collect(),
                             ..Default::default()
                         },
                         Err(_) => ReplyWire {
@@ -2443,70 +2626,73 @@ async fn handle(
                             ..Default::default()
                         },
                     },
-                    None => ReplyWire {
+                    Err(_) => ReplyWire {
                         code: 3,
                         ..Default::default()
                     },
-                }
+                },
+                12 => match validate_registry_diagnostics_request_wire(&r) {
+                    Ok(()) => match actor
+                        .setup_ensure_events(r.diagnostic_after, r.diagnostic_limit)
+                        .await
+                    {
+                        Ok(page) => ReplyWire {
+                            code: 90,
+                            diagnostic_next: page.next.unwrap_or(0),
+                            diagnostic_has_next: page.next.is_some(),
+                            setup_ensure_events: page
+                                .records
+                                .into_iter()
+                                .map(SetupEnsureEventWire::from)
+                                .collect(),
+                            ..Default::default()
+                        },
+                        Err(_) => ReplyWire {
+                            code: 3,
+                            ..Default::default()
+                        },
+                    },
+                    Err(_) => ReplyWire {
+                        code: 3,
+                        ..Default::default()
+                    },
+                },
+                13 => match validate_doctor_request_wire(&r) {
+                    Ok(()) => {
+                        let registry = actor.doctor_integrity().await;
+                        let report =
+                            match async_engine::timeout(DOCTOR_ENGINE_DEADLINE, doctor.doctor())
+                                .await
+                            {
+                                Ok(report) => report,
+                                Err(_) => DockerDoctorReport {
+                                    state: DockerDoctorState::Deadline,
+                                    client_version: None,
+                                    server_version: None,
+                                },
+                            };
+                        let report = DoctorReport::from_engine(registry, report);
+                        ReplyWire {
+                            code: 100,
+                            doctor_daemon: report.daemon,
+                            doctor_registry: report.registry,
+                            doctor_engine: report.engine,
+                            doctor_client_version: report.client_version.unwrap_or_default(),
+                            doctor_server_version: report.server_version.unwrap_or_default(),
+                            ..Default::default()
+                        }
+                    }
+                    Err(_) => ReplyWire {
+                        code: 3,
+                        ..Default::default()
+                    },
+                },
+                _ => ReplyWire {
+                    code: 2,
+                    ..Default::default()
+                },
             }
-            11 => match validate_registry_diagnostics_request_wire(&r) {
-                Ok(()) => match actor
-                    .resources(r.diagnostic_after, r.diagnostic_limit)
-                    .await
-                {
-                    Ok(page) => ReplyWire {
-                        code: 80,
-                        diagnostic_next: page.next.unwrap_or(0),
-                        diagnostic_has_next: page.next.is_some(),
-                        resources_diagnostic: page
-                            .records
-                            .into_iter()
-                            .map(ResourceDiagnosticWire::from)
-                            .collect(),
-                        ..Default::default()
-                    },
-                    Err(_) => ReplyWire {
-                        code: 3,
-                        ..Default::default()
-                    },
-                },
-                Err(_) => ReplyWire {
-                    code: 3,
-                    ..Default::default()
-                },
-            },
-            12 => match validate_registry_diagnostics_request_wire(&r) {
-                Ok(()) => match actor
-                    .setup_ensure_events(r.diagnostic_after, r.diagnostic_limit)
-                    .await
-                {
-                    Ok(page) => ReplyWire {
-                        code: 90,
-                        diagnostic_next: page.next.unwrap_or(0),
-                        diagnostic_has_next: page.next.is_some(),
-                        setup_ensure_events: page
-                            .records
-                            .into_iter()
-                            .map(SetupEnsureEventWire::from)
-                            .collect(),
-                        ..Default::default()
-                    },
-                    Err(_) => ReplyWire {
-                        code: 3,
-                        ..Default::default()
-                    },
-                },
-                Err(_) => ReplyWire {
-                    code: 3,
-                    ..Default::default()
-                },
-            },
-            _ => ReplyWire {
-                code: 2,
-                ..Default::default()
-            },
-        }
-    };
+        };
     let mut p = Vec::new();
     reply
         .encode(&mut p)
@@ -2739,6 +2925,16 @@ struct ReplyWire {
     resources_diagnostic: Vec<ResourceDiagnosticWire>,
     #[prost(message, repeated, tag = "18")]
     setup_ensure_events: Vec<SetupEnsureEventWire>,
+    #[prost(string, tag = "19")]
+    doctor_daemon: String,
+    #[prost(string, tag = "20")]
+    doctor_registry: String,
+    #[prost(string, tag = "21")]
+    doctor_engine: String,
+    #[prost(string, tag = "22")]
+    doctor_client_version: String,
+    #[prost(string, tag = "23")]
+    doctor_server_version: String,
 }
 #[derive(Message)]
 struct LogRecordWire {
@@ -2839,6 +3035,7 @@ enum Reply {
     JobLogs(JobLogPage),
     RegistryResources(RegistryResourcePage),
     SetupEnsureEvents(SetupEnsureEventPage),
+    Doctor(DoctorReport),
 }
 fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
     match v.code {
@@ -2879,6 +3076,15 @@ fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
         90 => Ok(Reply::SetupEnsureEvents(SetupEnsureEventPage {
             next: v.diagnostic_has_next.then_some(v.diagnostic_next),
             records: v.setup_ensure_events.into_iter().map(Into::into).collect(),
+        })),
+        100 => Ok(Reply::Doctor(DoctorReport {
+            daemon: v.doctor_daemon,
+            registry: v.doctor_registry,
+            engine: v.doctor_engine,
+            client_version: (!v.doctor_client_version.is_empty())
+                .then_some(v.doctor_client_version),
+            server_version: (!v.doctor_server_version.is_empty())
+                .then_some(v.doctor_server_version),
         })),
         1 => Err(Error::Protocol("unsupported protocol")),
         2 => Err(Error::Protocol("unknown operation")),
@@ -2931,6 +3137,43 @@ mod tests {
                     async_engine::sleep(Duration::from_millis(10)).await;
                 }
                 Ok("fake prepared sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
+            })
+        }
+    }
+
+    struct FakeDoctorExecutor {
+        report: DockerDoctorReport,
+        calls: AtomicUsize,
+    }
+    impl FakeDoctorExecutor {
+        fn ready() -> Self {
+            Self {
+                report: DockerDoctorReport {
+                    state: DockerDoctorState::Ready,
+                    client_version: Some("29.0.1".into()),
+                    server_version: Some("29.0.1".into()),
+                },
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+    impl DoctorExecutor for FakeDoctorExecutor {
+        fn doctor<'a>(&'a self) -> Pin<Box<dyn Future<Output = DockerDoctorReport> + Send + 'a>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(ready(self.report.clone()))
+        }
+    }
+
+    struct SlowDoctorExecutor;
+    impl DoctorExecutor for SlowDoctorExecutor {
+        fn doctor<'a>(&'a self) -> Pin<Box<dyn Future<Output = DockerDoctorReport> + Send + 'a>> {
+            Box::pin(async move {
+                async_engine::sleep(Duration::from_secs(10)).await;
+                DockerDoctorReport {
+                    state: DockerDoctorState::Ready,
+                    client_version: Some("never".into()),
+                    server_version: Some("never".into()),
+                }
             })
         }
     }
@@ -4685,6 +4928,108 @@ mod tests {
             assert!(!ep.target_exists().unwrap());
             assert_eq!(std::fs::read(&db).unwrap(), before);
         }
+    }
+
+    #[test]
+    fn doctor_is_daemon_owned_read_only_and_uses_a_typed_fake_engine() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let fake = Arc::new(FakeDoctorExecutor::ready());
+        let runtime = RuntimeBuilder::multi_thread().enable_all().build().unwrap();
+        runtime.run(async {
+            let server = async_engine::launch(
+                Service::new(state.clone())
+                    .with_doctor_executor(fake.clone())
+                    .serve(),
+            );
+            let client = wait_for_client(&state).await;
+            let database = state.join("registry.sqlite3");
+            let before = std::fs::read(&database).unwrap();
+            let report = client.doctor().await.unwrap();
+            assert_eq!(report.daemon, "ready");
+            assert_eq!(report.registry, "ready");
+            assert_eq!(report.engine, "ready");
+            assert_eq!(report.client_version.as_deref(), Some("29.0.1"));
+            assert_eq!(report.server_version.as_deref(), Some("29.0.1"));
+            assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(std::fs::read(&database).unwrap(), before);
+            client.shutdown().await.unwrap();
+            stopped(server).await;
+        });
+    }
+
+    #[test]
+    fn doctor_wire_rejects_every_caller_control() {
+        let request = || Request::operation(13);
+        assert!(validate_doctor_request_wire(&request()).is_ok());
+        for invalid in [
+            Request {
+                workspace: "/path".into(),
+                ..request()
+            },
+            Request {
+                setup_config: "https://user:secret@example.invalid/a".into(),
+                ..request()
+            },
+            Request {
+                setup_deadline_ms: 1,
+                ..request()
+            },
+            Request {
+                setup_output_limit: 1,
+                ..request()
+            },
+            Request {
+                diagnostic_limit: 1,
+                ..request()
+            },
+            Request {
+                job_id: 1,
+                ..request()
+            },
+        ] {
+            assert!(validate_doctor_request_wire(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn doctor_missing_daemon_is_typed_and_does_not_create_state() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("missing-state");
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let report = runtime
+            .run(Client::for_state(&state).unwrap().doctor())
+            .unwrap();
+        assert_eq!(report.daemon, "unavailable");
+        assert_eq!(report.registry, "unavailable");
+        assert_eq!(report.engine, "unavailable");
+        assert!(!state.exists());
+    }
+
+    #[test]
+    fn doctor_executor_deadline_is_typed_without_waiting_for_a_slow_engine() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let runtime = RuntimeBuilder::multi_thread().enable_all().build().unwrap();
+        runtime.run(async {
+            let server = async_engine::launch(
+                Service::new(state.clone())
+                    .with_doctor_executor(Arc::new(SlowDoctorExecutor))
+                    .serve(),
+            );
+            let client = wait_for_client(&state).await;
+            let started = std::time::Instant::now();
+            let report = client.doctor().await.unwrap();
+            assert_eq!(report.daemon, "ready");
+            assert_eq!(report.registry, "ready");
+            assert_eq!(report.engine, "deadline");
+            assert!(started.elapsed() < Duration::from_secs(3));
+            client.shutdown().await.unwrap();
+            stopped(server).await;
+        });
     }
 
     #[test]

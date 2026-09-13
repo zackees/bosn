@@ -152,7 +152,7 @@ mcp_servers:
       BOSN_STATE_DIR: /absolute/path/to/bosn-state
 ```
 
-This initial surface offers `bosn_status`, `bosn_job_status`,
+This initial surface offers `bosn_status`, the fixed read-only `bosn_doctor`, `bosn_job_status`,
 `bosn_job_logs`, `bosn_job_cancel`, the read-only `bosn_setup_plan`, and
 `bosn_setup_prepare`, `bosn_setup_ensure`, and `bosn_setup_task`. The
 preparation and ensure tools accept only

@@ -38,10 +38,53 @@ fn main() {
     match command.to_string_lossy().as_ref() {
         "mcp" => run_mcp(arguments),
         "daemon" => run_daemon(arguments),
+        "doctor" => run_doctor(arguments),
         "setup" => run_setup(arguments),
         "job" => run_job(arguments),
         "registry" => run_registry(arguments),
         _ => usage(),
+    }
+}
+
+/// Read the fixed, daemon-owned health report. Argument parsing happens before
+/// any runtime/IPC work and deliberately exposes neither Docker controls nor
+/// diagnostic output/deadline controls.
+fn run_doctor(arguments: impl Iterator<Item = std::ffi::OsString>) {
+    let (state_dir, json_output) =
+        parse_daemon_client_arguments(arguments).unwrap_or_else(|_| usage());
+    let report = Client::for_state(&state_dir)
+        .ok()
+        .and_then(|client| {
+            RuntimeBuilder::current_thread()
+                .enable_all()
+                .build()
+                .ok()
+                .and_then(|runtime| runtime.run(client.doctor()).ok())
+        })
+        .unwrap_or_else(|| bosn_service::DoctorReport {
+            daemon: "unavailable".into(),
+            registry: "unavailable".into(),
+            engine: "unavailable".into(),
+            client_version: None,
+            server_version: None,
+        });
+    let value = json!({
+        "action": "doctor",
+        "daemon": report.daemon,
+        "registry": report.registry,
+        "engine": report.engine,
+        "client_version": report.client_version,
+        "server_version": report.server_version,
+    });
+    if json_output {
+        println!("{value}");
+    } else {
+        println!("doctor");
+        for (key, value) in value.as_object().expect("literal object") {
+            if key != "action" {
+                println!("{key}: {value}");
+            }
+        }
     }
 }
 
