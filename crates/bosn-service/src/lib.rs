@@ -216,6 +216,75 @@ impl DoctorExecutor for DockerDoctorExecutor {
     }
 }
 
+/// Fixed, read-only inspection boundary for setup reconciliation.  It exposes
+/// no caller-selected Docker command, output budget, or lifecycle action.
+pub trait SetupReconcileExecutor: Send + Sync {
+    fn inspect<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<SetupReconcileObserved>, String>> + Send + 'a>>;
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupReconcileObserved {
+    pub name: String,
+    pub running: bool,
+    pub image_identity: String,
+    pub managed: String,
+    pub content: String,
+    pub container: String,
+}
+#[derive(Clone)]
+pub struct DockerSetupReconcileExecutor {
+    engine: DockerEngine,
+}
+impl DockerSetupReconcileExecutor {
+    fn new() -> Self {
+        Self {
+            engine: DockerEngine::docker(),
+        }
+    }
+}
+impl SetupReconcileExecutor for DockerSetupReconcileExecutor {
+    fn inspect<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<SetupReconcileObserved>, String>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            const FORMAT: &str = "{{.Name}}\t{{.State.Running}}\t{{.Image}}\t{{index .Config.Labels \"com.zackees.bosn.setup-managed\"}}\t{{index .Config.Labels \"com.zackees.bosn.setup-content-sha256\"}}\t{{index .Config.Labels \"com.zackees.bosn.setup-container\"}}";
+            let result = self
+                .engine
+                .with_args(["container", "inspect", "--format", FORMAT, name])
+                .capture_async(RunOptions::bounded(Duration::from_secs(3), 4 * 1024))
+                .await
+                .map_err(|_| "inspect_error".to_owned())?;
+            if result.exit_code == 1 {
+                return Ok(None);
+            }
+            if !result.ok() {
+                return Err("inspect_error".into());
+            }
+            let text =
+                std::str::from_utf8(&result.stdout).map_err(|_| "inspect_error".to_owned())?;
+            let values: Vec<_> = text.trim_end_matches(['\r', '\n']).split('\t').collect();
+            if values.len() != 6
+                || !matches!(values[1], "true" | "false")
+                || values.iter().any(|value| value.len() > 1024)
+            {
+                return Err("inspect_error".into());
+            }
+            Ok(Some(SetupReconcileObserved {
+                name: values[0].into(),
+                running: values[1] == "true",
+                image_identity: values[2].into(),
+                managed: values[3].into(),
+                content: values[4].into(),
+                container: values[5].into(),
+            }))
+        })
+    }
+}
+
 /// A validated fact to be durably recorded after a successful setup-app
 /// ensure. Production constructs this only after plan, image preparation, and
 /// ownership-safe ensure all succeed. It is public solely because the
@@ -901,6 +970,74 @@ pub struct SetupGcPreviewPage {
     pub counts: SetupGcPreviewCounts,
 }
 
+/// A bounded, read-only comparison between one durable managed-container
+/// record and Docker. It intentionally contains no workspace, URL, engine
+/// output, or repair token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetupReconcileRecord {
+    pub id: String,
+    pub name: String,
+    pub generation: String,
+    /// `matching_running`, `matching_stopped`, `missing`, `name_mismatch`,
+    /// `label_mismatch`, `image_mismatch`, `inspect_error`, or `unknown`.
+    /// Unknown is conservative and must never be treated as a
+    /// repair/GC candidate.
+    pub drift: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetupReconcilePreviewPage {
+    pub next: Option<u64>,
+    pub records: Vec<SetupReconcileRecord>,
+}
+
+#[derive(Clone, Debug)]
+struct SetupReconcileCandidate {
+    resource: Resource,
+    image_identities: Vec<String>,
+}
+type SetupReconcileCandidates = (Option<u64>, Vec<SetupReconcileCandidate>);
+
+fn classify_setup_reconcile(
+    candidate: &SetupReconcileCandidate,
+    inspected: Result<Option<SetupReconcileObserved>, String>,
+) -> &'static str {
+    match (
+        candidate.resource.generation.strip_prefix("sha256:"),
+        inspected,
+    ) {
+        (_, Ok(None)) => "missing",
+        (Some(_), Ok(Some(observed)))
+            if observed.name != format!("/{}", candidate.resource.name) =>
+        {
+            "name_mismatch"
+        }
+        (Some(content), Ok(Some(observed)))
+            if observed.managed != "v1"
+                || observed.content != content
+                || observed.container != candidate.resource.name =>
+        {
+            "label_mismatch"
+        }
+        (Some(_), Ok(Some(observed)))
+            if !candidate
+                .image_identities
+                .iter()
+                .any(|image| image == &observed.image_identity) =>
+        {
+            "image_mismatch"
+        }
+        (Some(_), Ok(Some(observed))) => {
+            if observed.running {
+                "matching_running"
+            } else {
+                "matching_stopped"
+            }
+        }
+        (_, Err(_)) => "inspect_error",
+        _ => "unknown",
+    }
+}
+
 fn setup_gc_preview_diagnostic(value: SetupGcPreview) -> SetupGcPreviewPage {
     SetupGcPreviewPage {
         next: value.candidates.next_offset.map(|value| value as u64),
@@ -1114,6 +1251,11 @@ fn validate_setup_gc_preview_request_wire(request: &Request) -> Result<(), Error
         return Err(Error::Protocol("nonsemantic setup gc preview fields"));
     }
     Ok(())
+}
+
+fn validate_setup_reconcile_preview_request_wire(request: &Request) -> Result<(), Error> {
+    validate_setup_gc_preview_request_wire(request)
+        .map_err(|_| Error::Protocol("nonsemantic setup reconcile preview fields"))
 }
 
 fn validate_setup_gc_apply_input(workspace: &str, token: &str, confirm: bool) -> Result<(), Error> {
@@ -1379,6 +1521,38 @@ impl Client {
         {
             Reply::SetupGcPreview(v) => Ok(v),
             _ => Err(Error::Protocol("unexpected setup gc preview response")),
+        }
+    }
+    /// Compare durable Bosn-managed setup container facts with fixed Docker
+    /// inspection. This is read-only: it never creates, opens, writes, or
+    /// migrates a registry and has no repair/apply operation.
+    pub async fn setup_reconcile_preview(
+        &self,
+        workspace: impl AsRef<Path>,
+        after: u64,
+        limit: u32,
+    ) -> Result<SetupReconcilePreviewPage, Error> {
+        validate_registry_page(after, limit)?;
+        let workspace = workspace.as_ref().to_string_lossy().into_owned();
+        if workspace.is_empty()
+            || workspace.len() > 8 * 1024
+            || workspace.bytes().any(|byte| byte == 0)
+        {
+            return Err(Error::Protocol("invalid setup reconcile preview workspace"));
+        }
+        match self
+            .call(Request {
+                workspace,
+                diagnostic_after: after,
+                diagnostic_limit: limit,
+                ..Request::operation(19)
+            })
+            .await?
+        {
+            Reply::SetupReconcilePreview(v) => Ok(v),
+            _ => Err(Error::Protocol(
+                "unexpected setup reconcile preview response",
+            )),
         }
     }
     /// Apply exactly one opaque candidate returned by a preceding GC preview.
@@ -1689,6 +1863,7 @@ pub struct Service {
     setup_ensure_executor: Arc<dyn SetupEnsureExecutor>,
     setup_adopt_executor: Arc<dyn SetupAdoptExecutor>,
     doctor_executor: Arc<dyn DoctorExecutor>,
+    setup_reconcile_executor: Arc<dyn SetupReconcileExecutor>,
 }
 
 #[cfg(test)]
@@ -1718,6 +1893,12 @@ enum DbCommand {
         after: u64,
         limit: u32,
         reply: async_engine::OneshotSender<Result<SetupGcPreviewPage, Error>>,
+    },
+    SetupReconcilePreview {
+        workspace: String,
+        after: u64,
+        limit: u32,
+        reply: async_engine::OneshotSender<Result<SetupReconcileCandidates, Error>>,
     },
     SetupGcCandidate {
         workspace: String,
@@ -2540,6 +2721,25 @@ impl RegistryActor {
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
     }
+    async fn setup_reconcile_preview(
+        &self,
+        workspace: String,
+        after: u64,
+        limit: u32,
+    ) -> Result<SetupReconcileCandidates, Error> {
+        validate_registry_page(after, limit)?;
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::SetupReconcilePreview {
+                workspace,
+                after,
+                limit,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
     async fn setup_gc_candidate(
         &self,
         workspace: String,
@@ -2756,6 +2956,54 @@ async fn registry_actor(
                             registry.setup_gc_preview(&workspace, after, limit as usize)
                         })
                         .map(setup_gc_preview_diagnostic);
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
+            DbCommand::SetupReconcilePreview {
+                workspace,
+                after,
+                limit,
+                reply,
+            } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = (|| {
+                        let after = usize::try_from(after)
+                            .map_err(|_| bosn_registry::Error::BadRow("page offset"))?;
+                        let containers = registry.setup_reconcile_containers(
+                            &workspace,
+                            after,
+                            limit as usize,
+                        )?;
+                        // Image IDs are durable facts recorded by successful ensure. A
+                        // bounded preview refuses to infer identity from a name/tag.
+                        let images = registry
+                            .setup_reconcile_images(&workspace)?
+                            .items
+                            .into_iter()
+                            .map(|r| r.generation)
+                            .collect::<Vec<_>>();
+                        Ok((
+                            containers.next_offset.map(|v| v as u64),
+                            containers
+                                .items
+                                .into_iter()
+                                .map(|resource| SetupReconcileCandidate {
+                                    resource,
+                                    image_identities: images.clone(),
+                                })
+                                .collect(),
+                        ))
+                    })();
                     (registry, result)
                 });
                 match worker.await {
@@ -3164,6 +3412,7 @@ impl Service {
             setup_ensure_executor: Arc::new(DockerSetupEnsureExecutor::new(state_dir.clone())),
             setup_adopt_executor: Arc::new(DockerSetupAdoptExecutor::new(state_dir.clone())),
             doctor_executor: Arc::new(DockerDoctorExecutor::new()),
+            setup_reconcile_executor: Arc::new(DockerSetupReconcileExecutor::new()),
             state_dir,
             stop: CancellationSource::new(),
         }
@@ -3194,6 +3443,13 @@ impl Service {
     /// This is not an engine-command injection seam.
     pub fn with_doctor_executor(mut self, executor: Arc<dyn DoctorExecutor>) -> Self {
         self.doctor_executor = executor;
+        self
+    }
+    pub fn with_setup_reconcile_executor(
+        mut self,
+        executor: Arc<dyn SetupReconcileExecutor>,
+    ) -> Self {
+        self.setup_reconcile_executor = executor;
         self
     }
     /// Foreground lifecycle: acquires the sole registry writer before binding.
@@ -3276,8 +3532,11 @@ impl Service {
             let jobs = jobs.clone();
             let stop = self.stop.clone();
             let doctor = Arc::clone(&self.doctor_executor);
+            let reconcile = Arc::clone(&self.setup_reconcile_executor);
             let adopt = Arc::clone(&self.setup_adopt_executor);
-            clients.spawn(async move { handle(stream, actor, jobs, stop, doctor, adopt).await });
+            clients.spawn(async move {
+                handle(stream, actor, jobs, stop, doctor, adopt, reconcile).await
+            });
         }
         while clients.join_next().await.is_some() {}
         // Keep the sole registry writer alive while the job actor cancels and
@@ -3581,6 +3840,7 @@ async fn handle(
     stop: CancellationSource,
     doctor: Arc<dyn DoctorExecutor>,
     adopt: Arc<dyn SetupAdoptExecutor>,
+    reconcile: Arc<dyn SetupReconcileExecutor>,
 ) -> Result<(), Error> {
     if !peer_is_authorized(&s.peer_identity()?.user_id, &ipc::current_user_id()?) {
         return Err(Error::Unauthorized);
@@ -4009,6 +4269,44 @@ async fn handle(
                     ..Default::default()
                 },
             },
+            19 => match validate_setup_reconcile_preview_request_wire(&r) {
+                Ok(()) => match actor
+                    .setup_reconcile_preview(r.workspace, r.diagnostic_after, r.diagnostic_limit)
+                    .await
+                {
+                    Ok((next, candidates)) => {
+                        let mut records = Vec::with_capacity(candidates.len());
+                        for candidate in candidates {
+                            let inspected = reconcile.inspect(&candidate.resource.name).await;
+                            let drift = classify_setup_reconcile(&candidate, inspected);
+                            records.push(SetupReconcileRecord {
+                                id: candidate.resource.id,
+                                name: candidate.resource.name,
+                                generation: candidate.resource.generation,
+                                drift: drift.into(),
+                            });
+                        }
+                        ReplyWire {
+                            code: 160,
+                            diagnostic_next: next.unwrap_or(0),
+                            diagnostic_has_next: next.is_some(),
+                            setup_reconcile_records: records
+                                .into_iter()
+                                .map(SetupReconcileRecordWire::from)
+                                .collect(),
+                            ..Default::default()
+                        }
+                    }
+                    Err(_) => ReplyWire {
+                        code: 3,
+                        ..Default::default()
+                    },
+                },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
             _ => ReplyWire {
                 code: 2,
                 ..Default::default()
@@ -4339,6 +4637,8 @@ struct ReplyWire {
     setup_retired_stopped: bool,
     #[prost(bool, tag = "36")]
     setup_retired_already_stopped: bool,
+    #[prost(message, repeated, tag = "37")]
+    setup_reconcile_records: Vec<SetupReconcileRecordWire>,
 }
 #[derive(Message)]
 struct LogRecordWire {
@@ -4464,6 +4764,37 @@ impl From<SetupEnsureEventWire> for SetupEnsureEventDiagnostic {
         }
     }
 }
+#[derive(Message)]
+struct SetupReconcileRecordWire {
+    #[prost(string, tag = "1")]
+    id: String,
+    #[prost(string, tag = "2")]
+    name: String,
+    #[prost(string, tag = "3")]
+    generation: String,
+    #[prost(string, tag = "4")]
+    drift: String,
+}
+impl From<SetupReconcileRecord> for SetupReconcileRecordWire {
+    fn from(value: SetupReconcileRecord) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            generation: value.generation,
+            drift: value.drift,
+        }
+    }
+}
+impl From<SetupReconcileRecordWire> for SetupReconcileRecord {
+    fn from(value: SetupReconcileRecordWire) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            generation: value.generation,
+            drift: value.drift,
+        }
+    }
+}
 enum Reply {
     Pong,
     Status(Status),
@@ -4480,6 +4811,7 @@ enum Reply {
     SetupDone(SetupDoneResult),
     SetupAdopt(SetupAdoptResult),
     Doctor(DoctorReport),
+    SetupReconcilePreview(SetupReconcilePreviewPage),
 }
 fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
     match v.code {
@@ -4556,6 +4888,14 @@ fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
             stopped: v.setup_retired_stopped,
             already_stopped: v.setup_retired_already_stopped,
         })),
+        160 => Ok(Reply::SetupReconcilePreview(SetupReconcilePreviewPage {
+            next: v.diagnostic_has_next.then_some(v.diagnostic_next),
+            records: v
+                .setup_reconcile_records
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        })),
         1 => Err(Error::Protocol("unsupported protocol")),
         2 => Err(Error::Protocol("unknown operation")),
         _ => Err(Error::Protocol("daemon error")),
@@ -4613,6 +4953,88 @@ mod tests {
         );
         assert!(parse_setup_gc_token(&(token + "00")).is_err());
         assert!(validate_setup_gc_apply_input("/work", "sgc1-00", false).is_err());
+    }
+
+    #[test]
+    fn reconcile_classifies_all_read_only_observations_conservatively() {
+        let candidate = SetupReconcileCandidate {
+            resource: Resource {
+                id: "setup-container:abc".into(),
+                kind: ResourceKind::Container,
+                name: "bosn-setup-abc".into(),
+                stack: "setup".into(),
+                generation: "sha256:abc".into(),
+                scope: Scope::Machine,
+                workspace: "/private/work".into(),
+                created_at: 1.0,
+                last_used: 1.0,
+                state: ResourceState::Active,
+                retention: Retention::Pinned,
+            },
+            image_identities: vec!["sha256:image".into()],
+        };
+        let observed = |running| SetupReconcileObserved {
+            name: "/bosn-setup-abc".into(),
+            running,
+            image_identity: "sha256:image".into(),
+            managed: "v1".into(),
+            content: "abc".into(),
+            container: "bosn-setup-abc".into(),
+        };
+        assert_eq!(
+            classify_setup_reconcile(&candidate, Ok(Some(observed(true)))),
+            "matching_running"
+        );
+        assert_eq!(
+            classify_setup_reconcile(&candidate, Ok(Some(observed(false)))),
+            "matching_stopped"
+        );
+        assert_eq!(classify_setup_reconcile(&candidate, Ok(None)), "missing");
+        let mut value = observed(true);
+        value.name = "/wrong".into();
+        assert_eq!(
+            classify_setup_reconcile(&candidate, Ok(Some(value))),
+            "name_mismatch"
+        );
+        let mut value = observed(true);
+        value.managed = "foreign".into();
+        assert_eq!(
+            classify_setup_reconcile(&candidate, Ok(Some(value))),
+            "label_mismatch"
+        );
+        let mut value = observed(true);
+        value.image_identity = "sha256:wrong".into();
+        assert_eq!(
+            classify_setup_reconcile(&candidate, Ok(Some(value))),
+            "image_mismatch"
+        );
+        assert_eq!(
+            classify_setup_reconcile(&candidate, Err("deadline".into())),
+            "inspect_error"
+        );
+        let mut malformed = candidate.clone();
+        malformed.resource.generation = "bad".into();
+        assert_eq!(
+            classify_setup_reconcile(&malformed, Ok(Some(observed(true)))),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn reconcile_preview_wire_is_bounded_and_rejects_every_nonsemantic_control() {
+        let valid = Request {
+            workspace: "/private/work".into(),
+            diagnostic_after: 0,
+            diagnostic_limit: 1,
+            ..Request::operation(19)
+        };
+        assert!(validate_setup_reconcile_preview_request_wire(&valid).is_ok());
+        let mut malformed = valid;
+        malformed.setup_config = "docker run attacker".into();
+        assert!(validate_setup_reconcile_preview_request_wire(&malformed).is_err());
+        malformed.setup_config.clear();
+        malformed.diagnostic_limit = MAX_REGISTRY_DIAGNOSTIC_PAGE + 1;
+        assert!(validate_setup_reconcile_preview_request_wire(&malformed).is_err());
     }
 
     #[test]

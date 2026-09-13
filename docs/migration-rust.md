@@ -156,6 +156,19 @@ The equivalent read-only APIs are `bosn.Client.doctor()` in Python and the
 no-argument MCP tool `bosn_doctor`; both require the daemon selected when the
 client/server was created and accept no state path or diagnostic controls.
 
+### Setup reconciliation preview
+
+`bosn setup reconcile preview --state-dir STATE --workspace WORKSPACE`, Python
+`Client.setup_reconcile_preview(workspace)`, and MCP
+`bosn_setup_reconcile_preview` compare only durable managed setup-container
+records with one fixed, bounded `docker container inspect` per record. Results
+are `matching_running`, `matching_stopped`, `missing`, `name_mismatch`,
+`label_mismatch`, `image_mismatch`, `inspect_error`, or `unknown`; `unknown` is conservative
+and never becomes a repair/GC candidate.
+The check requires exact deterministic name, all Bosn ownership labels, and a
+recorded Docker image identity. It returns neither workspace paths nor raw
+engine output, and has no apply, adoption, lifecycle, or SQLite-write path.
+
 ### Setup GC preview and narrowly confirmed apply
 
 `bosn gc preview --state-dir STATE --workspace WORKSPACE --json`, Python

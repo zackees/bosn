@@ -1396,6 +1396,36 @@ impl Registry {
     ) -> Result<SetupGcPreview, Error> {
         setup_gc_preview(&self.connection, workspace, offset, limit)
     }
+    /// Read only the durable setup-container facts for one exact workspace.
+    /// This is deliberately narrower than the general diagnostics page: a
+    /// reconciler must never discover ownership from Docker names or labels.
+    pub fn setup_reconcile_containers(
+        &self,
+        workspace: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Page<Resource>, Error> {
+        page_setup_workspace(
+            &self.connection,
+            workspace,
+            "container",
+            offset,
+            limit,
+            resource,
+        )
+    }
+    /// The image identities that may prove one observed setup container. The
+    /// caller still fails closed if the bounded set cannot prove its image.
+    pub fn setup_reconcile_images(&self, workspace: &str) -> Result<Page<Resource>, Error> {
+        page_setup_workspace(
+            &self.connection,
+            workspace,
+            "image",
+            0,
+            MAX_PAGE_SIZE,
+            resource,
+        )
+    }
     /// Re-read one exact preview candidate.  This is used by the daemon before
     /// any engine mutation; it intentionally accepts no selector or glob.
     pub fn setup_gc_candidate(
@@ -1481,6 +1511,40 @@ impl Registry {
             event,
         )
     }
+}
+fn page_setup_workspace<T>(
+    c: &Connection,
+    workspace: &str,
+    kind: &str,
+    offset: usize,
+    limit: usize,
+    parse: fn(&Row) -> Result<T, Error>,
+) -> Result<Page<T>, Error> {
+    let limit = limit.clamp(1, MAX_PAGE_SIZE);
+    let query_limit = limit.checked_add(1).ok_or(Error::BadRow("page limit"))?;
+    let rows = c.query(
+        "SELECT id,kind,name,stack,generation,scope,workspace,created_at,last_used,state,retention FROM resources WHERE kind=? AND stack='setup' AND workspace=? ORDER BY id LIMIT ? OFFSET ?",
+        &[Value::Text(kind.into()), Value::Text(workspace.into()), Value::Integer(query_limit as i64), Value::Integer(offset as i64)],
+        QueryLimits { max_rows: query_limit, max_bytes: 1_048_576 },
+    )?;
+    let more = rows.len() > limit;
+    let next_offset = if more {
+        Some(
+            offset
+                .checked_add(limit)
+                .ok_or(Error::BadRow("page offset"))?,
+        )
+    } else {
+        None
+    };
+    Ok(Page {
+        items: rows
+            .into_iter()
+            .take(limit)
+            .map(|row| parse(&row))
+            .collect::<Result<_, _>>()?,
+        next_offset,
+    })
 }
 fn is_uuid(value: &str) -> bool {
     value.len() == 36
