@@ -46,7 +46,7 @@ mod ensure;
 pub use ensure::{
     SetupEnsureCommand, SetupEnsureEngine, SetupEnsureError, SetupEnsureMount,
     SetupEnsureObservedContainer, SetupEnsureRequest, SetupEnsureResponse, SetupEnsureResult,
-    ensure_setup_app,
+    adopt_setup_app, ensure_setup_app,
 };
 
 mod task;

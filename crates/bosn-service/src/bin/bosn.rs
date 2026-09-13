@@ -548,8 +548,54 @@ fn run_setup(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
         Some(command) if command == "prepare" => run_setup_prepare(arguments),
         Some(command) if command == "task" => run_setup_task(arguments),
         Some(command) if command == "ensure" => run_setup_ensure(arguments),
+        Some(command) if command == "adopt" => run_setup_adopt(arguments),
         Some(command) if command == "done" => run_setup_done(arguments),
         _ => usage(),
+    }
+}
+
+/// Confirmed recovery of lost registry ownership for one already-existing
+/// managed app. The daemon re-derives all Docker identity; CLI never accepts it.
+fn run_setup_adopt(arguments: impl Iterator<Item = std::ffi::OsString>) {
+    let mut values = Vec::new();
+    let mut yes = false;
+    for arg in arguments {
+        if arg == "--yes" && !yes {
+            yes = true;
+        } else {
+            values.push(arg);
+        }
+    }
+    if !yes {
+        usage();
+    }
+    let invocation = match parse_ensure_arguments(values.into_iter()) {
+        Ok(value) => value,
+        Err(_) => usage(),
+    };
+    let request = bosn_service::SetupAdoptRequest {
+        workspace: invocation.request.workspace,
+        config: invocation.request.config,
+        policy: invocation.request.policy,
+        deadline: invocation.request.deadline,
+        output_limit: invocation.request.output_limit,
+        confirm: true,
+    };
+    let result = Client::for_state(&invocation.state_dir)
+        .ok()
+        .and_then(|client| {
+            RuntimeBuilder::current_thread()
+                .enable_all()
+                .build()
+                .ok()
+                .and_then(|runtime| runtime.run(client.setup_adopt(request)).ok())
+        });
+    match result {
+        Some(value) => println!(
+            "{}",
+            json!({"action":"setup_adopt","adopted":value.adopted})
+        ),
+        None => setup_ensure_failure(invocation.json),
     }
 }
 

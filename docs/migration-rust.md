@@ -282,6 +282,27 @@ Installed-extension behavior is covered separately through
 
 ### Live Python native setup-ensure acceptance
 
+### Safe registry-loss adoption
+
+`bosn setup adopt --yes --state-dir STATE --workspace WORKSPACE --config LOCATOR
+--refresh --deadline-ms 30000 --output-limit 1048576` is the explicit recovery
+path when a local registry was lost but the deterministic Bosn-managed setup
+container remains. The daemon re-plans and prepares only to obtain the verified
+image identity, then inspects exactly the derived container name. It requires
+all three Bosn labels, exact content-derived name, and exact inspected image
+identity. It records container/image resources and uses atomically with a
+redacted `setup.ensure.adopted` event. It never accepts Docker arguments,
+container or image selectors, and it never starts, stops, removes, replaces,
+or adopts a foreign/incomplete candidate. The same confirmed operation is
+available as `Client.setup_adopt(..., confirm=True)` and MCP
+`bosn_setup_adopt`.
+
+The opt-in Docker registry-loss proof is:
+
+```text
+soldr cargo test -j1 -p bosn-service --test setup_ensure_docker --locked -- --ignored --exact live_docker_setup_adopt_restores_lost_registry_without_touching_app
+```
+
 The following opt-in acceptance starts the package-local production daemon and
 uses only `bosn.Client` from the installed PyO3 extension to plan, submit,
 poll status/logs, and reuse a one-file pinned-image setup app after a daemon

@@ -10,7 +10,8 @@ use bosn_setup::PreparedImageKind;
 use bosn_setup::{
     PreparedImage, SetupAcquirePolicy, SetupEnsureEngine,
     SetupEnsureRequest as CoreSetupEnsureRequest, SetupImageEngine, SetupPlan, SetupPlanRequest,
-    SetupTaskRequest, ensure_setup_app, execute_setup_task, plan_setup, prepare_setup_image,
+    SetupTaskRequest, adopt_setup_app, ensure_setup_app, execute_setup_task, plan_setup,
+    prepare_setup_image,
 };
 use jobs::{Jobs, Submission};
 use kernal_api::{
@@ -120,6 +121,22 @@ pub struct SetupEnsureJobRequest {
     pub deadline: Duration,
     pub output_limit: usize,
 }
+/// Explicit, confirmed restoration of a lost local registry record for an
+/// already-existing Bosn-managed setup application. It has no engine targets:
+/// plan, image identity, deterministic name, and labels are all re-derived.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupAdoptRequest {
+    pub workspace: PathBuf,
+    pub config: String,
+    pub policy: SetupPreparePolicy,
+    pub deadline: Duration,
+    pub output_limit: usize,
+    pub confirm: bool,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupAdoptResult {
+    pub adopted: bool,
+}
 
 /// Testable daemon execution boundary.  Production uses
 /// [`DockerSetupPrepareExecutor`]; tests can provide a deterministic runner
@@ -155,6 +172,14 @@ pub trait SetupEnsureExecutor: Send + Sync {
     fn execute<'a>(
         &'a self,
         request: SetupEnsureJobRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a async_engine::Sender<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>>;
+}
+pub trait SetupAdoptExecutor: Send + Sync {
+    fn execute<'a>(
+        &'a self,
+        request: SetupAdoptRequest,
         cancellation: &'a async_engine::CancellationToken,
         logs: &'a async_engine::Sender<String>,
     ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>>;
@@ -393,6 +418,122 @@ impl SetupEnsureExecutor for DockerSetupEnsureExecutor {
                     // upsert idempotent across that recovery case.
                     id: format!("setup-container:{}", plan.content_sha256),
                     name: ensured.container_name,
+                    stack: "setup".into(),
+                    generation: format!("sha256:{}", plan.content_sha256),
+                    workspace: plan.workspace_root.to_string_lossy().into_owned(),
+                },
+                image: setup_ensure_image_resource(
+                    &prepared,
+                    &plan.workspace_root.to_string_lossy(),
+                ),
+            })
+        })
+    }
+}
+
+/// Docker-backed restoration. Preparation is deliberately retained because it
+/// produces the validated inspected image identity used to prove the existing
+/// candidate; it never creates, starts, stops, removes, or replaces Docker.
+#[derive(Clone)]
+pub struct DockerSetupAdoptExecutor {
+    state_dir: PathBuf,
+    engine: DockerEngine,
+}
+impl DockerSetupAdoptExecutor {
+    fn new(state_dir: PathBuf) -> Self {
+        Self {
+            state_dir,
+            engine: DockerEngine::docker(),
+        }
+    }
+}
+impl SetupAdoptExecutor for DockerSetupAdoptExecutor {
+    fn execute<'a>(
+        &'a self,
+        request: SetupAdoptRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a async_engine::Sender<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>> {
+        Box::pin(async move {
+            if !request.confirm {
+                return Err("setup adoption requires confirmation".into());
+            }
+            let prepare_output = request.output_limit / 2;
+            let inspect_output = request.output_limit.saturating_sub(prepare_output);
+            if prepare_output == 0 || inspect_output == 0 {
+                return Err(
+                    "setup adoption output budget cannot fund preparation and inspection".into(),
+                );
+            }
+            let deadline = async_engine::Deadline::after(request.deadline);
+            let plan = async_engine::cancellable(
+                cancellation,
+                async_engine::timeout_at(
+                    deadline,
+                    plan_setup(SetupPlanRequest {
+                        state_dir: self.state_dir.clone(),
+                        workspace: request.workspace.clone(),
+                        locator: request.config,
+                        policy: request.policy.acquire_policy(),
+                    }),
+                ),
+            )
+            .await
+            .map_err(|_| "setup adoption cancelled".to_owned())?
+            .map_err(|_| "setup adoption planning exceeded its deadline".to_owned())?
+            .map_err(|e| e.to_string())?;
+            let (events, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
+            let forwarded = logs.clone();
+            let forwarder = async_engine::launch(async move {
+                while let Some(event) = receiver.recv().await {
+                    forward_engine_event(&forwarded, event).await?;
+                }
+                Ok::<(), String>(())
+            });
+            logs.send("[setup] preparing application image for adoption".into())
+                .await
+                .map_err(|_| "setup log consumer closed".to_owned())?;
+            let prepared = prepare_setup_image(
+                &self.engine,
+                &plan,
+                RunOptions::streaming(deadline.remaining(), prepare_output),
+                cancellation,
+                &events,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            logs.send("[setup] proving existing managed application ownership".into())
+                .await
+                .map_err(|_| "setup log consumer closed".to_owned())?;
+            let adopted = adopt_setup_app(
+                &self.engine,
+                CoreSetupEnsureRequest {
+                    plan: &plan,
+                    workspace_root: request.workspace,
+                    prepared_image: &prepared,
+                    options: RunOptions::streaming(deadline.remaining(), inspect_output),
+                    cancellation,
+                    events: &events,
+                },
+            )
+            .await
+            .map_err(|e| e.to_string());
+            drop(events);
+            forwarder
+                .await
+                .map_err(|_| "setup log forwarder stopped".to_owned())??;
+            let adopted = adopted?;
+            if adopted.image_identity != prepared.observed_identity {
+                return Err("setup adoption result image does not match prepared image".into());
+            }
+            Ok(SetupEnsureExecution {
+                receipt: format!(
+                    "adopted {} as {}",
+                    adopted.container_name, adopted.container_id
+                ),
+                resource: SetupEnsureResource {
+                    id: format!("setup-container:{}", plan.content_sha256),
+                    name: adopted.container_name,
                     stack: "setup".into(),
                     generation: format!("sha256:{}", plan.content_sha256),
                     workspace: plan.workspace_root.to_string_lossy().into_owned(),
@@ -937,6 +1078,7 @@ fn validate_registry_diagnostics_request_wire(request: &Request) -> Result<(), E
         || request.setup_output_limit != 0
         || !request.setup_task_name.is_empty()
         || request.setup_done_confirm
+        || request.setup_adopt_confirm
     {
         return Err(Error::Protocol("nonsemantic registry diagnostic fields"));
     }
@@ -959,6 +1101,7 @@ fn validate_setup_gc_preview_request_wire(request: &Request) -> Result<(), Error
         || request.setup_output_limit != 0
         || !request.setup_task_name.is_empty()
         || request.setup_done_confirm
+        || request.setup_adopt_confirm
     {
         return Err(Error::Protocol("nonsemantic setup gc preview fields"));
     }
@@ -996,6 +1139,7 @@ fn validate_setup_gc_apply_request_wire(request: &Request) -> Result<(), Error> 
         || request.diagnostic_after != 0
         || request.diagnostic_limit != 0
         || request.setup_done_confirm
+        || request.setup_adopt_confirm
     {
         return Err(Error::Protocol("nonsemantic setup gc apply fields"));
     }
@@ -1044,6 +1188,7 @@ fn validate_setup_done_request_wire(request: &Request) -> Result<(), Error> {
         || request.diagnostic_limit != 0
         || !request.gc_candidate_token.is_empty()
         || request.gc_confirm
+        || request.setup_adopt_confirm
     {
         return Err(Error::Protocol("nonsemantic setup done fields"));
     }
@@ -1067,6 +1212,7 @@ fn validate_doctor_request_wire(request: &Request) -> Result<(), Error> {
         || request.diagnostic_after != 0
         || request.diagnostic_limit != 0
         || request.setup_done_confirm
+        || request.setup_adopt_confirm
     {
         return Err(Error::Protocol("nonsemantic doctor fields"));
     }
@@ -1239,6 +1385,38 @@ impl Client {
         {
             Reply::SetupDone(value) => Ok(value),
             _ => Err(Error::Protocol("unexpected setup done response")),
+        }
+    }
+    /// Confirmed, daemon-owned restoration of registry facts for one existing
+    /// managed setup app. This never accepts a container/image selector.
+    pub async fn setup_adopt(&self, request: SetupAdoptRequest) -> Result<SetupAdoptResult, Error> {
+        let workspace = request.workspace.to_string_lossy().into_owned();
+        let deadline_ms = u64::try_from(request.deadline.as_millis())
+            .map_err(|_| Error::Protocol("setup deadline too large"))?;
+        let output_limit = u32::try_from(request.output_limit)
+            .map_err(|_| Error::Protocol("setup output limit too large"))?;
+        validate_setup_adopt_input(
+            &workspace,
+            &request.config,
+            request.policy,
+            deadline_ms,
+            output_limit,
+            request.confirm,
+        )?;
+        match self
+            .call(Request {
+                workspace,
+                setup_config: request.config,
+                setup_policy: request.policy.wire(),
+                setup_deadline_ms: deadline_ms,
+                setup_output_limit: output_limit,
+                setup_adopt_confirm: true,
+                ..Request::operation(17)
+            })
+            .await?
+        {
+            Reply::SetupAdopt(v) => Ok(v),
+            _ => Err(Error::Protocol("unexpected setup adopt response")),
         }
     }
     pub async fn shutdown(&self) -> Result<(), Error> {
@@ -1442,6 +1620,7 @@ pub struct Service {
     setup_executor: Arc<dyn SetupPrepareExecutor>,
     setup_task_executor: Arc<dyn SetupTaskExecutor>,
     setup_ensure_executor: Arc<dyn SetupEnsureExecutor>,
+    setup_adopt_executor: Arc<dyn SetupAdoptExecutor>,
     doctor_executor: Arc<dyn DoctorExecutor>,
 }
 
@@ -1498,6 +1677,10 @@ enum DbCommand {
     },
     RecordSetupEnsure {
         job_id: u64,
+        execution: Box<SetupEnsureExecution>,
+        reply: async_engine::OneshotSender<Result<(), Error>>,
+    },
+    RecordSetupAdoption {
         execution: Box<SetupEnsureExecution>,
         reply: async_engine::OneshotSender<Result<(), Error>>,
     },
@@ -2357,6 +2540,17 @@ impl RegistryActor {
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
     }
+    async fn record_setup_adoption(&self, execution: SetupEnsureExecution) -> Result<(), Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::RecordSetupAdoption {
+                execution: Box::new(execution),
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
     async fn stop(&self) {
         let (reply, wait) = async_engine::oneshot_channel();
         if self.sender.send(DbCommand::Stop(reply)).await.is_ok() {
@@ -2623,6 +2817,22 @@ async fn registry_actor(
                     }
                 }
             }
+            DbCommand::RecordSetupAdoption { execution, reply } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = record_setup_adoption(&mut registry, &execution);
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
             DbCommand::Stop(reply) => {
                 let _ = reply.send(());
                 return;
@@ -2707,6 +2917,94 @@ fn record_setup_ensure(
     transaction.commit()
 }
 
+/// Restore only an absent registry view of an already proven Docker fact.
+/// Existing records must exactly agree with the re-derived ownership facts;
+/// adoption is never an overwrite or a way to cross workspace/stack state.
+fn record_setup_adoption(
+    registry: &mut Registry,
+    execution: &SetupEnsureExecution,
+) -> Result<(), bosn_registry::Error> {
+    let container = &execution.resource;
+    let image = &execution.image;
+    for (kind, id, name, stack, generation, workspace) in [
+        (
+            ResourceKind::Container,
+            &container.id,
+            &container.name,
+            &container.stack,
+            &container.generation,
+            &container.workspace,
+        ),
+        (
+            ResourceKind::Image,
+            &image.id,
+            &image.name,
+            &image.stack,
+            &image.generation,
+            &image.workspace,
+        ),
+    ] {
+        if let Some(existing) = registry.resource_by_kind_name(kind, name)?
+            && (existing.id != *id
+                || existing.stack != *stack
+                || existing.generation != *generation
+                || existing.workspace != *workspace
+                || existing.scope != Scope::Machine
+                || existing.state != ResourceState::Active
+                || existing.retention != Retention::Pinned)
+        {
+            return Err(bosn_registry::Error::ResourceIdentityConflict);
+        }
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
+        .as_secs_f64();
+    let mut tx = registry.begin_immediate()?;
+    for (kind, id, name, stack, generation, workspace) in [
+        (
+            ResourceKind::Container,
+            &container.id,
+            &container.name,
+            &container.stack,
+            &container.generation,
+            &container.workspace,
+        ),
+        (
+            ResourceKind::Image,
+            &image.id,
+            &image.name,
+            &image.stack,
+            &image.generation,
+            &image.workspace,
+        ),
+    ] {
+        tx.put_resource(&Resource {
+            id: id.clone(),
+            kind,
+            name: name.clone(),
+            stack: stack.clone(),
+            generation: generation.clone(),
+            scope: Scope::Machine,
+            workspace: workspace.clone(),
+            created_at: now,
+            last_used: now,
+            state: ResourceState::Active,
+            retention: Retention::Pinned,
+        })?;
+        tx.put_resource_use(&ResourceUse {
+            resource_id: id.clone(),
+            workspace: workspace.clone(),
+            stack: stack.clone(),
+            generation: generation.clone(),
+            last_used: now,
+            state: ResourceState::Active,
+        })?;
+    }
+    tx.append_event(now, "setup.ensure.adopted", "managed_setup_app_restored")?;
+    tx.commit()
+}
+
 fn append_setup_ensure_events(
     registry: &mut Registry,
     events: &[SetupEnsureEvent],
@@ -2731,6 +3029,7 @@ impl Service {
             setup_executor: Arc::new(DockerSetupPrepareExecutor::new(state_dir.clone())),
             setup_task_executor: Arc::new(DockerSetupTaskExecutor::new(state_dir.clone())),
             setup_ensure_executor: Arc::new(DockerSetupEnsureExecutor::new(state_dir.clone())),
+            setup_adopt_executor: Arc::new(DockerSetupAdoptExecutor::new(state_dir.clone())),
             doctor_executor: Arc::new(DockerDoctorExecutor::new()),
             state_dir,
             stop: CancellationSource::new(),
@@ -2752,6 +3051,10 @@ impl Service {
     /// test seam; it does not add a caller-controlled container operation.
     pub fn with_setup_ensure_executor(mut self, executor: Arc<dyn SetupEnsureExecutor>) -> Self {
         self.setup_ensure_executor = executor;
+        self
+    }
+    pub fn with_setup_adopt_executor(mut self, executor: Arc<dyn SetupAdoptExecutor>) -> Self {
+        self.setup_adopt_executor = executor;
         self
     }
     /// Substitute the fixed semantic doctor probe for deterministic tests.
@@ -2840,7 +3143,8 @@ impl Service {
             let jobs = jobs.clone();
             let stop = self.stop.clone();
             let doctor = Arc::clone(&self.doctor_executor);
-            clients.spawn(async move { handle(stream, actor, jobs, stop, doctor).await });
+            let adopt = Arc::clone(&self.setup_adopt_executor);
+            clients.spawn(async move { handle(stream, actor, jobs, stop, doctor, adopt).await });
         }
         while clients.join_next().await.is_some() {}
         // Keep the sole registry writer alive while the job actor cancels and
@@ -3071,6 +3375,7 @@ async fn handle(
     jobs: JobActor,
     stop: CancellationSource,
     doctor: Arc<dyn DoctorExecutor>,
+    adopt: Arc<dyn SetupAdoptExecutor>,
 ) -> Result<(), Error> {
     if !peer_is_authorized(&s.peer_identity()?.user_id, &ipc::current_user_id()?) {
         return Err(Error::Unauthorized);
@@ -3357,6 +3662,55 @@ async fn handle(
                     },
                 }
             }
+            17 => {
+                let policy = SetupPreparePolicy::from_wire(r.setup_policy);
+                let request = policy.and_then(|policy| {
+                    validate_setup_adopt_request_wire(&r, policy)
+                        .ok()
+                        .map(|()| SetupAdoptRequest {
+                            workspace: PathBuf::from(r.workspace),
+                            config: r.setup_config,
+                            policy,
+                            deadline: Duration::from_millis(r.setup_deadline_ms),
+                            output_limit: r.setup_output_limit as usize,
+                            confirm: true,
+                        })
+                });
+                match request {
+                    Some(request) => {
+                        let (logs, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
+                        let drain = async_engine::launch(async move {
+                            while receiver.recv().await.is_some() {}
+                        });
+                        let cancellation = async_engine::CancellationSource::new();
+                        let token = cancellation.token();
+                        let result = adopt.execute(request, &token, &logs).await;
+                        drop(logs);
+                        let _ = drain.await;
+                        match result {
+                            Ok(execution) => match actor.record_setup_adoption(execution).await {
+                                Ok(()) => ReplyWire {
+                                    code: 140,
+                                    setup_adopted: true,
+                                    ..Default::default()
+                                },
+                                Err(_) => ReplyWire {
+                                    code: 3,
+                                    ..Default::default()
+                                },
+                            },
+                            Err(_) => ReplyWire {
+                                code: 3,
+                                ..Default::default()
+                            },
+                        }
+                    }
+                    None => ReplyWire {
+                        code: 3,
+                        ..Default::default()
+                    },
+                }
+            }
             14 => match validate_setup_gc_preview_request_wire(&r) {
                 Ok(()) => match actor
                     .setup_gc_preview(r.workspace, r.diagnostic_after, r.diagnostic_limit)
@@ -3527,6 +3881,8 @@ struct Request {
     gc_confirm: bool,
     #[prost(bool, tag = "18")]
     setup_done_confirm: bool,
+    #[prost(bool, tag = "19")]
+    setup_adopt_confirm: bool,
 }
 impl Request {
     fn operation(operation: u32) -> Self {
@@ -3549,6 +3905,7 @@ impl Request {
             gc_candidate_token: String::new(),
             gc_confirm: false,
             setup_done_confirm: false,
+            setup_adopt_confirm: false,
         }
     }
 }
@@ -3633,8 +3990,51 @@ fn validate_setup_ensure_request_wire(
         || request.log_limit != 0
         || !request.setup_task_name.is_empty()
         || request.setup_done_confirm
+        || request.setup_adopt_confirm
     {
         return Err(Error::Protocol("nonsemantic setup ensure fields"));
+    }
+    Ok(())
+}
+fn validate_setup_adopt_input(
+    workspace: &str,
+    config: &str,
+    policy: SetupPreparePolicy,
+    deadline_ms: u64,
+    output_limit: u32,
+    confirm: bool,
+) -> Result<(), Error> {
+    validate_setup_ensure_wire(workspace, config, policy, deadline_ms, output_limit)?;
+    if !confirm {
+        return Err(Error::Protocol("setup adoption requires confirmation"));
+    }
+    Ok(())
+}
+fn validate_setup_adopt_request_wire(
+    request: &Request,
+    policy: SetupPreparePolicy,
+) -> Result<(), Error> {
+    validate_setup_adopt_input(
+        &request.workspace,
+        &request.setup_config,
+        policy,
+        request.setup_deadline_ms,
+        request.setup_output_limit,
+        request.setup_adopt_confirm,
+    )?;
+    if !request.stack.is_empty()
+        || !request.digest.is_empty()
+        || request.job_id != 0
+        || request.log_after != 0
+        || request.log_limit != 0
+        || !request.setup_task_name.is_empty()
+        || request.diagnostic_after != 0
+        || request.diagnostic_limit != 0
+        || !request.gc_candidate_token.is_empty()
+        || request.gc_confirm
+        || request.setup_done_confirm
+    {
+        return Err(Error::Protocol("nonsemantic setup adopt fields"));
     }
     Ok(())
 }
@@ -3706,6 +4106,8 @@ struct ReplyWire {
     setup_done_uses: u64,
     #[prost(uint64, tag = "33")]
     setup_done_resources: u64,
+    #[prost(bool, tag = "34")]
+    setup_adopted: bool,
 }
 #[derive(Message)]
 struct LogRecordWire {
@@ -3844,6 +4246,7 @@ enum Reply {
     SetupGcPreview(SetupGcPreviewPage),
     SetupGcApply(SetupGcApplyResult),
     SetupDone(SetupDoneResult),
+    SetupAdopt(SetupAdoptResult),
     Doctor(DoctorReport),
 }
 fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
@@ -3913,6 +4316,9 @@ fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
         130 => Ok(Reply::SetupDone(SetupDoneResult {
             uses_completed: v.setup_done_uses,
             resources_completed: v.setup_done_resources,
+        })),
+        140 => Ok(Reply::SetupAdopt(SetupAdoptResult {
+            adopted: v.setup_adopted,
         })),
         1 => Err(Error::Protocol("unsupported protocol")),
         2 => Err(Error::Protocol("unknown operation")),
@@ -5061,6 +5467,39 @@ mod tests {
     }
 
     #[test]
+    fn setup_adoption_restores_absent_records_but_refuses_incompatible_existing_state() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let mut registry = Registry::create_writer(
+            temporary.path().join("registry.sqlite3"),
+            "11111111-2222-4333-8444-555555555555",
+        )
+        .unwrap();
+        let execution = setup_ensure_execution("/verified/workspace", "document", "sha256:image");
+        record_setup_adoption(&mut registry, &execution).unwrap();
+        assert_eq!(registry.resources(0, 10).unwrap().items.len(), 2);
+        assert_eq!(registry.resource_uses(0, 10).unwrap().items.len(), 2);
+        assert_eq!(
+            registry.setup_ensure_events(0, 10).unwrap().items[0].kind,
+            "setup.ensure.adopted"
+        );
+        // Same exact durable state is idempotent.
+        record_setup_adoption(&mut registry, &execution).unwrap();
+        let mut conflicting = execution.clone();
+        conflicting.resource.workspace = "/other/workspace".into();
+        assert!(matches!(
+            record_setup_adoption(&mut registry, &conflicting),
+            Err(bosn_registry::Error::ResourceIdentityConflict)
+        ));
+        let resources = registry.resources(0, 10).unwrap().items;
+        assert_eq!(resources.len(), 2);
+        assert!(
+            resources
+                .iter()
+                .all(|resource| resource.workspace == "/verified/workspace")
+        );
+    }
+
+    #[test]
     fn setup_ensure_generation_rollover_retires_only_prior_setup_containers() {
         let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
         let path = temporary.path().join("registry.sqlite3");
@@ -6061,6 +6500,7 @@ mod tests {
                 gc_candidate_token: String::new(),
                 gc_confirm: false,
                 setup_done_confirm: false,
+                setup_adopt_confirm: false,
             }
             .encode(&mut payload)
             .unwrap();
