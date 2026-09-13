@@ -12,6 +12,7 @@ native = pytest.importorskip("bosn._native")
 
 def test_native_extension_is_reexported_by_python_package(tmp_path: Path) -> None:
     assert bosn.Client is native.Client
+    assert bosn.DoctorReport is native.DoctorReport
     assert bosn.Status is native.Status
     assert bosn.RegistryResourcePage is native.RegistryResourcePage
     assert bosn.SetupEnsureEventPage is native.SetupEnsureEventPage
@@ -22,6 +23,11 @@ def test_native_extension_is_reexported_by_python_package(tmp_path: Path) -> Non
     assert client.state_dir == str(tmp_path / "state")
     with pytest.raises(RuntimeError, match="Io"):
         client.status()
+    report = client.doctor()
+    assert report.daemon == "unavailable"
+    assert report.registry == "unavailable"
+    assert report.engine == "unavailable"
+    assert not (tmp_path / "state").exists()
 
 
 def test_native_registry_diagnostics_reject_bad_pages_without_initializing_state(
