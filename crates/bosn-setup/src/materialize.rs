@@ -492,6 +492,132 @@ fn verify_complete_assets(
     Ok(())
 }
 
+/// Revalidate the owner-private build tree named by an inert setup plan before
+/// it is handed to a Docker build.  This deliberately treats the durable
+/// receipt as untrusted input: a changed file, link, extra build-context entry,
+/// or mismatched content-addressed root fails closed.
+pub(crate) fn verify_materialized_assets(
+    content_hash: &str,
+    asset_root: &Path,
+) -> Result<(), SetupMaterializeError> {
+    let content_hash = validated_content_hash(content_hash)?;
+    match fs::context_path_metadata_no_follow(asset_root) {
+        Ok(metadata) if metadata.kind == fs::ContextPathKind::Directory => {}
+        _ => return Err(SetupMaterializeError::ExistingAssetsConflict),
+    }
+    match asset_root.parent() {
+        Some(parent) => match fs::context_path_metadata_no_follow(parent) {
+            Ok(metadata) if metadata.kind == fs::ContextPathKind::Directory => {}
+            _ => return Err(SetupMaterializeError::ExistingAssetsConflict),
+        },
+        None => return Err(SetupMaterializeError::ExistingAssetsConflict),
+    }
+    if asset_root.file_name().and_then(|value| value.to_str()) != Some(content_hash.as_str())
+        || asset_root
+            .parent()
+            .and_then(|value| value.file_name())
+            .and_then(|value| value.to_str())
+            != Some(ASSET_DIRECTORY)
+    {
+        return Err(SetupMaterializeError::ExistingAssetsConflict);
+    }
+
+    let receipt_path = asset_root.join(RECEIPT_NAME);
+    let receipt = fs::read_private_regular_file_bounded(&receipt_path, MAX_ASSET_RECEIPT_BYTES)
+        .map_err(|_| SetupMaterializeError::ExistingAssetsConflict)?;
+    let receipt_text =
+        std::str::from_utf8(&receipt).map_err(|_| SetupMaterializeError::ExistingAssetsConflict)?;
+    let mut lines = receipt_text.split_terminator('\n');
+    if lines.next() != Some(RECEIPT_MAGIC)
+        || lines.next() != Some(&format!("content-sha256={content_hash}"))
+        || !receipt_text.ends_with('\n')
+    {
+        return Err(SetupMaterializeError::ExistingAssetsConflict);
+    }
+
+    let mut expected = Vec::new();
+    let mut names = BTreeSet::new();
+    for line in lines {
+        let Some((relative, digest)) = line.split_once('\t') else {
+            return Err(SetupMaterializeError::ExistingAssetsConflict);
+        };
+        if relative.is_empty()
+            || !valid_relative_asset_path(relative)
+            || !valid_content_hash(digest)
+            || !names.insert(relative.to_owned())
+        {
+            return Err(SetupMaterializeError::ExistingAssetsConflict);
+        }
+        expected.push((relative.to_owned(), digest.to_owned()));
+    }
+    if !names.contains("Dockerfile") {
+        return Err(SetupMaterializeError::ExistingAssetsConflict);
+    }
+
+    let mut canonical = format!("{RECEIPT_MAGIC}\ncontent-sha256={content_hash}\n").into_bytes();
+    let mut allowed_files = BTreeSet::from([RECEIPT_NAME.to_owned(), LOCK_NAME.to_owned()]);
+    let mut allowed_directories = BTreeSet::new();
+    for (relative, digest) in &expected {
+        canonical.extend_from_slice(relative.as_bytes());
+        canonical.push(b'\t');
+        canonical.extend_from_slice(digest.as_bytes());
+        canonical.push(b'\n');
+        allowed_files.insert(relative.clone());
+        let mut parent = Path::new(relative).parent();
+        while let Some(directory) = parent {
+            if directory.as_os_str().is_empty() {
+                break;
+            }
+            allowed_directories.insert(directory.to_string_lossy().replace('\\', "/"));
+            parent = directory.parent();
+        }
+        let max_bytes = if relative == "Dockerfile" {
+            MAX_INLINE_DOCKERFILE_BYTES
+        } else {
+            MAX_COMPANION_FILE_BYTES
+        };
+        let bytes =
+            fs::read_private_regular_file_bounded(&asset_path(asset_root, relative)?, max_bytes)
+                .map_err(|_| SetupMaterializeError::ExistingAssetsConflict)?;
+        if sha256_bytes(&bytes).to_hex() != *digest {
+            return Err(SetupMaterializeError::ExistingAssetsConflict);
+        }
+    }
+    if receipt != canonical {
+        return Err(SetupMaterializeError::ExistingAssetsConflict);
+    }
+    for entry in fs::DirectoryWalk::new(asset_root.to_path_buf())
+        .sorted(true)
+        .walk()
+    {
+        let entry = entry.map_err(SetupMaterializeError::Filesystem)?;
+        if entry.depth() == 0 {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(asset_root)
+            .map_err(|_| SetupMaterializeError::ExistingAssetsConflict)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if entry.is_symbolic_link()
+            || (!entry.is_file() && !entry.is_directory())
+            || (entry.is_file() && !allowed_files.contains(&relative))
+            || (entry.is_directory() && !allowed_directories.contains(&relative))
+        {
+            return Err(SetupMaterializeError::ExistingAssetsConflict);
+        }
+    }
+    Ok(())
+}
+
+fn valid_content_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
