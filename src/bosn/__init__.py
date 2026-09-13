@@ -8,13 +8,26 @@ __all__ = ["__version__"]
 # compiled.  Installed maturin wheels always contain this module; any loader
 # failure inside an installed extension is surfaced rather than hidden.
 try:
-    from ._native import Client, SetupPlan, Status, native_version, protocol_version, run_mcp
+    from ._native import (
+        Client,
+        JobLogPage,
+        JobLogRecord,
+        JobStatus,
+        SetupPlan,
+        Status,
+        native_version,
+        protocol_version,
+        run_mcp,
+    )
 except ModuleNotFoundError as error:
     if error.name != "bosn._native":
         raise
 else:
     __all__ += [
         "Client",
+        "JobLogPage",
+        "JobLogRecord",
+        "JobStatus",
         "SetupPlan",
         "Status",
         "native_version",

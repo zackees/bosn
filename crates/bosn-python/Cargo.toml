@@ -8,8 +8,18 @@ rust-version = "1.95"
 name = "bosn_native"
 crate-type = ["cdylib"]
 
+[features]
+default = ["extension-module"]
+# Maturin builds the production wheel as an extension module, which correctly
+# leaves CPython symbols for the host interpreter to provide.
+extension-module = ["pyo3/extension-module"]
+# Test-only: link CPython and initialize it for the fake-daemon boundary test.
+# Run with `--no-default-features --features embedded-python-tests`.
+embedded-python-tests = ["pyo3/auto-initialize"]
+
 [dependencies]
+bosn-core = { path = "../bosn-core" }
 bosn-service = { path = "../bosn-service" }
 bosn-setup = { path = "../bosn-setup" }
 kernal-api = { git = "https://github.com/zackees/kernal-api", rev = "fc634e507024d63ccaaf75fa564818b9dcfbff36", version = "=0.1.0", default-features = false, features = ["ipc-async"] }
-pyo3 = { version = "=0.29.2", features = ["extension-module"] }
+pyo3 = "=0.29.2"
