@@ -24,6 +24,12 @@ use kernal_api::{
     platform::{fs, ipc},
 };
 
+mod materialize;
+pub use materialize::{
+    MAX_ASSET_RECEIPT_BYTES, MaterializedAsset, MaterializedSetupPlan, MaterializedSetupSource,
+    SetupAssetStore, SetupMaterializeError,
+};
+
 /// The current durable cache-record wire version.  It is intentionally
 /// independent of the setup-document schema version.
 pub const CACHE_RECORD_VERSION: u16 = 1;
