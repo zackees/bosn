@@ -13,6 +13,7 @@ name = "bosn"
 path = "src/bin/bosn.rs"
 
 [dependencies]
+bosn-core = { path = "../bosn-core" }
 bosn-registry = { path = "../bosn-registry" }
 bosn-setup = { path = "../bosn-setup" }
 bosn-engine = { path = "../bosn-engine" }

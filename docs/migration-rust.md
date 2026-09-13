@@ -92,6 +92,22 @@ available explicitly for development with
 Installed-extension behavior is covered separately through
 `uv run maturin develop --locked && uv run pytest tests/test_native.py`.
 
+### Native setup submission CLI
+
+`bosn setup prepare` submits a durable, daemon-owned image-preparation job and
+returns immediately; it never launches the daemon or invokes Docker itself.
+Every input is explicit and bounded:
+
+```text
+bosn setup prepare --state-dir STATE --workspace WORKSPACE --config LOCATOR \
+  (--refresh | --offline) --deadline-ms 1..=300000 \
+  --output-limit 1..=8388608 [--json]
+```
+
+The receipt is `action: setup_prepare`, `submitted: true`, and a `job_id`
+(the JSON form uses the same fields). Observe or cancel it through the typed
+Python/MCP client surfaces; a native job-observation CLI is not yet provided.
+
 ### `bosn-docker` / `bosn-compose`
 
 | Category | Existing capability | Characterization references |

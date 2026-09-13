@@ -155,3 +155,56 @@ fn plan_rejects_ambiguous_policy_before_creating_state() {
     assert!(output.stdout.is_empty());
     assert!(!state.exists());
 }
+
+#[test]
+fn prepare_rejects_malformed_or_ambiguous_inputs_before_state_or_daemon_contact() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let config = root.path().join("setup.toml");
+    std::fs::write(&config, pinned_document()).unwrap();
+
+    for (name, extra) in [
+        ("ambiguous-policy", vec!["--refresh", "--offline"]),
+        ("missing-deadline", vec!["--refresh"]),
+        ("zero-deadline", vec!["--refresh", "--deadline-ms", "0"]),
+        (
+            "oversize-output",
+            vec![
+                "--refresh",
+                "--deadline-ms",
+                "1",
+                "--output-limit",
+                "8388609",
+            ],
+        ),
+        (
+            "duplicate-json",
+            vec![
+                "--refresh",
+                "--deadline-ms",
+                "1",
+                "--output-limit",
+                "1",
+                "--json",
+                "--json",
+            ],
+        ),
+    ] {
+        let state = root.path().join(name);
+        let mut args: Vec<&std::ffi::OsStr> = vec![
+            "setup".as_ref(),
+            "prepare".as_ref(),
+            "--state-dir".as_ref(),
+            state.as_os_str(),
+            "--workspace".as_ref(),
+            workspace.path().as_os_str(),
+            "--config".as_ref(),
+            config.as_os_str(),
+        ];
+        args.extend(extra.into_iter().map(std::ffi::OsStr::new));
+        let output = run(&args);
+        assert_eq!(output.status.code(), Some(2), "{name}");
+        assert!(output.stdout.is_empty(), "{name}");
+        assert!(!state.exists(), "{name}");
+    }
+}
