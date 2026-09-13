@@ -5,10 +5,16 @@
 
 use std::collections::BTreeMap;
 
+pub mod compose;
 pub mod config;
 pub mod manifest;
 pub mod setup;
 
+pub use compose::{
+    BuildSpec, COMPOSE_PLAN_VERSION, ComposeDocument, ComposeError, ComposeErrorCode, ComposePlan,
+    DependencySpec, HealthcheckSpec, MountSpec, RelativePath, ResourceSpec, ServiceSpec,
+    parse_and_plan_compose_yaml, parse_compose_yaml, plan_compose,
+};
 pub use config::{
     AppPolicy, MachinePolicy, PolicyDefaults, PolicyError, PolicyOrigin, parse_machine_policy_toml,
     resolve_app_policy, resolve_machine_policy,
