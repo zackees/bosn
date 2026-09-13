@@ -131,6 +131,7 @@ dependencies = [
 name = "bosn-service"
 version = "0.1.0"
 dependencies = [
+ "bosn-engine",
  "bosn-registry",
  "bosn-setup",
  "kernal-api",
