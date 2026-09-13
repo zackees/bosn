@@ -145,6 +145,7 @@ name = "bosn-setup"
 version = "0.1.0"
 dependencies = [
  "bosn-core",
+ "bosn-engine",
  "kernal-api",
  "tempfile",
 ]

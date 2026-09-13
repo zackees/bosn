@@ -36,6 +36,12 @@ pub use plan::{
     plan_setup_with_transport,
 };
 
+mod prepare;
+pub use prepare::{
+    PreparedImage, PreparedImageKind, SetupImageCommand, SetupImageEngine, SetupPrepareError,
+    prepare_setup_image,
+};
+
 /// The current durable cache-record wire version.  It is intentionally
 /// independent of the setup-document schema version.
 pub const CACHE_RECORD_VERSION: u16 = 1;
