@@ -548,10 +548,47 @@ fn run_setup(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
         Some(command) if command == "prepare" => run_setup_prepare(arguments),
         Some(command) if command == "task" => run_setup_task(arguments),
         Some(command) if command == "ensure" => run_setup_ensure(arguments),
+        Some(command) if command == "reconcile" => run_setup_reconcile(arguments),
         Some(command) if command == "adopt" => run_setup_adopt(arguments),
         Some(command) if command == "stop-retired" => run_setup_stop_retired(arguments),
         Some(command) if command == "done" => run_setup_done(arguments),
         _ => usage(),
+    }
+}
+
+fn run_setup_reconcile(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
+    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("preview")) {
+        usage();
+    }
+    let (state_dir, workspace, after, limit, json_output) =
+        parse_gc_preview_arguments(arguments).unwrap_or_else(|_| usage());
+    let result = Client::for_state(state_dir).ok().and_then(|client| {
+        RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .ok()
+            .and_then(|runtime| {
+                runtime
+                    .run(client.setup_reconcile_preview(workspace, after, limit))
+                    .ok()
+            })
+    });
+    match result {
+        Some(page) => println!(
+            "{}",
+            json!({"action":"setup_reconcile_preview","preview_only":true,"next":page.next,"records":page.records.into_iter().map(|v| json!({"id":v.id,"name":v.name,"generation":v.generation,"drift":v.drift})).collect::<Vec<_>>() })
+        ),
+        None => {
+            if json_output {
+                println!(
+                    "{}",
+                    json!({"action":"setup_reconcile_preview","error":"daemon unavailable or request failed"})
+                );
+            } else {
+                eprintln!("bosn setup reconcile preview: daemon unavailable or request failed");
+            }
+            std::process::exit(1);
+        }
     }
 }
 
@@ -1493,6 +1530,9 @@ fn usage() -> ! {
     );
     eprintln!(
         "   or: bosn setup ensure --state-dir STATE_DIR --workspace WORKSPACE --config LOCATOR (--refresh | --offline) --deadline-ms 1..=300000 --output-limit 1..=8388608 [--json]"
+    );
+    eprintln!(
+        "   or: bosn setup reconcile preview --state-dir STATE_DIR --workspace WORKSPACE [--after CURSOR] [--limit 1..=64] [--json]"
     );
     eprintln!("   or: bosn setup done --state-dir STATE_DIR --workspace WORKSPACE --yes [--json]");
     eprintln!(

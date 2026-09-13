@@ -18,7 +18,8 @@ use crate::{
     Client, DoctorReport, Error, JobLogPage, JobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE,
     RegistryResourcePage, SetupAdoptRequest, SetupAdoptResult, SetupDoneResult,
     SetupEnsureEventPage, SetupEnsureJobRequest, SetupGcApplyResult, SetupGcPreviewPage,
-    SetupPreparePolicy, SetupPrepareRequest, SetupRetiredStopResult, SetupTaskJobRequest, Status,
+    SetupPreparePolicy, SetupPrepareRequest, SetupReconcilePreviewPage, SetupRetiredStopResult,
+    SetupTaskJobRequest, Status,
 };
 use bosn_setup::{
     SetupAcquirePolicy, SetupPlan, SetupPlanAppSource, SetupPlanRequest, SetupSourceKind,
@@ -111,6 +112,12 @@ trait Backend {
         after: u64,
         limit: u32,
     ) -> Result<SetupGcPreviewPage, Error>;
+    fn setup_reconcile_preview(
+        &mut self,
+        workspace: PathBuf,
+        after: u64,
+        limit: u32,
+    ) -> Result<SetupReconcilePreviewPage, Error>;
     fn setup_gc_apply(
         &mut self,
         workspace: PathBuf,
@@ -184,6 +191,15 @@ impl Backend for DaemonBackend<'_> {
     ) -> Result<SetupGcPreviewPage, Error> {
         self.runtime
             .run(self.client.setup_gc_preview(workspace, after, limit))
+    }
+    fn setup_reconcile_preview(
+        &mut self,
+        workspace: PathBuf,
+        after: u64,
+        limit: u32,
+    ) -> Result<SetupReconcilePreviewPage, Error> {
+        self.runtime
+            .run(self.client.setup_reconcile_preview(workspace, after, limit))
     }
     fn setup_gc_apply(
         &mut self,
@@ -391,6 +407,7 @@ fn tools_list() -> Value {
                 "inputSchema": setup_gc_preview_schema(),
                 "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
             },
+            {"name":"bosn_setup_reconcile_preview","description":"Read-only compare of durable Bosn setup-container ownership with fixed Docker inspection for one workspace. It never repairs, writes SQLite, creates/starts/stops/removes Docker resources, or accepts engine controls.","inputSchema":setup_gc_preview_schema(),"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
             {
                 "name": "bosn_setup_gc_apply",
                 "description": "DESTRUCTIVE: remove exactly one retired Bosn-managed setup container using a preview candidate token and explicit confirmation. The daemon rechecks registry ownership and Docker labels before removal.",
@@ -623,6 +640,14 @@ fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
                 backend
                     .setup_gc_preview(workspace, after, limit)
                     .map(setup_gc_preview_json)
+                    .map_err(|_| ToolFailure::Daemon)
+            })
+        }
+        "bosn_setup_reconcile_preview" => {
+            setup_gc_preview_arguments(arguments).and_then(|(workspace, after, limit)| {
+                backend
+                    .setup_reconcile_preview(workspace, after, limit)
+                    .map(setup_reconcile_preview_json)
                     .map_err(|_| ToolFailure::Daemon)
             })
         }
@@ -1170,6 +1195,9 @@ fn setup_gc_preview_json(page: SetupGcPreviewPage) -> Value {
     let candidates: Vec<_> = page.candidates.into_iter().map(|candidate| json!({"id": candidate.id, "name": candidate.name, "generation": candidate.generation, "token":candidate.token, "reason": candidate.reason})).collect();
     json!({"next": page.next, "candidates": candidates, "counts": {"protected_not_retired": page.counts.protected_not_retired, "protected_ambiguous_use": page.counts.protected_ambiguous_use, "protected_lease": page.counts.protected_lease, "protected_session": page.counts.protected_session, "excluded_unmanaged": page.counts.excluded_unmanaged}})
 }
+fn setup_reconcile_preview_json(page: SetupReconcilePreviewPage) -> Value {
+    json!({"preview_only":true,"next":page.next,"records":page.records.into_iter().map(|record| json!({"id":record.id,"name":record.name,"generation":record.generation,"drift":record.drift})).collect::<Vec<_>>()})
+}
 fn setup_gc_apply_json(result: SetupGcApplyResult) -> Value {
     json!({"removed":result.removed,"reconciled_missing":result.reconciled_missing})
 }
@@ -1353,6 +1381,23 @@ mod tests {
                 counts: crate::SetupGcPreviewCounts::default(),
             })
         }
+        fn setup_reconcile_preview(
+            &mut self,
+            _workspace: PathBuf,
+            after: u64,
+            _limit: u32,
+        ) -> Result<SetupReconcilePreviewPage, Error> {
+            self.daemon_reads += 1;
+            Ok(SetupReconcilePreviewPage {
+                next: (after == 0).then_some(1),
+                records: vec![crate::SetupReconcileRecord {
+                    id: "setup-container:abc".into(),
+                    name: "bosn-setup-abc".into(),
+                    generation: "sha256:abc".into(),
+                    drift: "matching_running".into(),
+                }],
+            })
+        }
         fn setup_gc_apply(
             &mut self,
             _workspace: PathBuf,
@@ -1522,6 +1567,7 @@ mod tests {
                 "bosn_registry_resources",
                 "bosn_setup_ensure_events",
                 "bosn_setup_gc_preview",
+                "bosn_setup_reconcile_preview",
                 "bosn_setup_gc_apply",
                 "bosn_setup_stop_retired",
                 "bosn_setup_done",
@@ -1662,6 +1708,26 @@ mod tests {
             &mut backend,
         );
         assert_eq!(rejected["isError"], true);
+    }
+
+    #[test]
+    fn reconcile_preview_is_read_only_bounded_and_rejects_engine_controls() {
+        let mut backend = FakeBackend::default();
+        let value = call_tool(
+            json!({"name":"bosn_setup_reconcile_preview","arguments":{"workspace":"/private/work","limit":1}}),
+            &mut backend,
+        );
+        assert_eq!(value["structuredContent"]["preview_only"], true);
+        assert_eq!(
+            value["structuredContent"]["records"][0]["drift"],
+            "matching_running"
+        );
+        let rejected = call_tool(
+            json!({"name":"bosn_setup_reconcile_preview","arguments":{"workspace":"/private/work","docker_args":["rm"]}}),
+            &mut backend,
+        );
+        assert!(rejected["isError"].as_bool().unwrap());
+        assert_eq!(backend.daemon_reads, 1);
     }
 
     #[test]

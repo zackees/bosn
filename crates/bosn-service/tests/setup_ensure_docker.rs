@@ -414,6 +414,77 @@ fn live_docker_setup_ensure_creates_and_reuses_one_managed_app() {
 }
 
 /// Run with:
+/// `soldr cargo test -j1 -p bosn-service --test setup_ensure_docker --locked -- --ignored --exact live_docker_setup_reconcile_preview_detects_exact_missing_app`
+#[test]
+#[ignore = "requires a local Docker daemon and the pinned Alpine image"]
+fn live_docker_setup_reconcile_preview_detects_exact_missing_app() {
+    let engine = DockerEngine::docker();
+    let root = tempfile::tempdir().expect("temporary test root");
+    let state = root.path().join("state");
+    let workspace = root.path().join("workspace");
+    let config_root = root.path().join("config");
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    std::fs::create_dir_all(&config_root).expect("create config root");
+    let config = config_root.join("setup.toml");
+    std::fs::write(&config, format!("version = 1\n[app]\nimage = '{PINNED_ALPINE}'\ncommand = 'exec sleep 120 # reconcile-{}'\n", test_unique_suffix())).expect("write config");
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let plan = runtime
+        .run(plan_setup(SetupPlanRequest {
+            state_dir: state.clone(),
+            workspace: workspace.clone(),
+            locator: config.to_string_lossy().into_owned(),
+            policy: SetupAcquirePolicy::OnlineRefresh,
+        }))
+        .expect("plan");
+    let container_name = format!("bosn-setup-{}", plan.content_sha256);
+    let cleanup = ExactContainerCleanup {
+        engine: engine.clone(),
+        container_name: container_name.clone(),
+        content_sha256: plan.content_sha256.clone(),
+    };
+    let mut daemon = DaemonChild::start(&state);
+    let client = wait_for_client(&runtime, &mut daemon, &state);
+    let job = runtime
+        .run(client.submit_setup_ensure(SetupEnsureJobRequest {
+            workspace: workspace.clone(),
+            config: config.to_string_lossy().into_owned(),
+            policy: SetupPreparePolicy::Refresh,
+            deadline: JOB_DEADLINE,
+            output_limit: OUTPUT_LIMIT,
+        }))
+        .expect("submit ensure");
+    wait_for_success(&runtime, &client, job);
+    let matching = runtime
+        .run(client.setup_reconcile_preview(&workspace, 0, 1))
+        .expect("matching preview");
+    assert_eq!(matching.records.len(), 1);
+    assert_eq!(matching.records[0].drift, "matching_running");
+    let observed = inspect_container(&engine, &container_name)
+        .expect("inspect")
+        .expect("managed app");
+    assert_eq!(observed.managed, "v1");
+    assert_eq!(observed.content_sha256, plan.content_sha256);
+    assert_eq!(observed.container_name, container_name);
+    let removed = docker_capture(
+        &engine,
+        ["container", "rm", "--force", container_name.as_str()],
+    );
+    assert!(removed.ok(), "exact managed test removal failed");
+    let missing = runtime
+        .run(client.setup_reconcile_preview(&workspace, 0, 1))
+        .expect("missing preview");
+    assert_eq!(missing.records.len(), 1);
+    assert_eq!(missing.records[0].drift, "missing");
+    runtime.run(client.shutdown()).expect("shutdown daemon");
+    assert!(daemon.wait_for_exit().success());
+    drop(cleanup);
+}
+
+/// Run with:
 /// `soldr cargo test -j1 -p bosn-service --test setup_ensure_docker --locked -- --ignored --exact live_docker_setup_adopt_restores_lost_registry_without_touching_app`
 ///
 /// This intentionally deletes only the disposable test registry after its

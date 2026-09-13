@@ -11,6 +11,7 @@ use bosn_service::{
     SetupDoneResult as ServiceSetupDoneResult, SetupEnsureEventPage as ServiceSetupEnsureEventPage,
     SetupEnsureJobRequest, SetupGcApplyResult as ServiceSetupGcApplyResult,
     SetupGcPreviewPage as ServiceSetupGcPreviewPage, SetupPreparePolicy, SetupPrepareRequest,
+    SetupReconcilePreviewPage as ServiceSetupReconcilePreviewPage,
     SetupRetiredStopResult as ServiceSetupRetiredStopResult, SetupTaskJobRequest,
     Status as ServiceStatus,
 };
@@ -127,6 +128,24 @@ impl Client {
         py.detach(move || {
             setup_gc_preview(&state_dir, workspace, after, limit)
                 .map(SetupGcPreviewPage::from)
+                .map_err(service_error)
+        })
+    }
+    /// Read-only fixed Docker/registry drift preview. No repair, lifecycle,
+    /// raw Docker arguments, or registry write is reachable from Python.
+    #[pyo3(signature = (workspace, *, after = 0, limit = 64))]
+    fn setup_reconcile_preview(
+        &self,
+        workspace: PathBuf,
+        after: u64,
+        limit: u32,
+        py: Python<'_>,
+    ) -> PyResult<SetupReconcilePreviewPage> {
+        validate_registry_page(after, limit)?;
+        let state_dir = self.state_dir.clone();
+        py.detach(move || {
+            setup_reconcile_preview(&state_dir, workspace, after, limit)
+                .map(SetupReconcilePreviewPage::from)
                 .map_err(service_error)
         })
     }
@@ -701,6 +720,67 @@ impl From<ServiceSetupGcPreviewPage> for SetupGcPreviewPage {
 
 #[derive(Debug)]
 #[pyclass(module = "bosn._native", frozen)]
+pub struct SetupReconcileRecord {
+    #[pyo3(get)]
+    id: String,
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    generation: String,
+    #[pyo3(get)]
+    drift: String,
+}
+#[derive(Debug)]
+#[pyclass(module = "bosn._native", frozen)]
+pub struct SetupReconcilePreviewPage {
+    #[pyo3(get)]
+    next: Option<u64>,
+    records: Vec<SetupReconcileRecord>,
+}
+#[pymethods]
+impl SetupReconcilePreviewPage {
+    #[getter]
+    fn records(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        Ok(PyTuple::new(
+            py,
+            self.records
+                .iter()
+                .map(|v| {
+                    Py::new(
+                        py,
+                        SetupReconcileRecord {
+                            id: v.id.clone(),
+                            name: v.name.clone(),
+                            generation: v.generation.clone(),
+                            drift: v.drift.clone(),
+                        },
+                    )
+                })
+                .collect::<PyResult<Vec<_>>>()?,
+        )?
+        .unbind())
+    }
+}
+impl From<ServiceSetupReconcilePreviewPage> for SetupReconcilePreviewPage {
+    fn from(value: ServiceSetupReconcilePreviewPage) -> Self {
+        Self {
+            next: value.next,
+            records: value
+                .records
+                .into_iter()
+                .map(|v| SetupReconcileRecord {
+                    id: v.id,
+                    name: v.name,
+                    generation: v.generation,
+                    drift: v.drift,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug)]
+#[pyclass(module = "bosn._native", frozen)]
 pub struct SetupGcApplyResult {
     #[pyo3(get)]
     removed: bool,
@@ -985,6 +1065,22 @@ fn setup_gc_preview(
     runtime.run(async {
         ServiceClient::for_state(state_dir)?
             .setup_gc_preview(workspace, after, limit)
+            .await
+    })
+}
+fn setup_reconcile_preview(
+    state_dir: &Path,
+    workspace: PathBuf,
+    after: u64,
+    limit: u32,
+) -> Result<ServiceSetupReconcilePreviewPage, bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async {
+        ServiceClient::for_state(state_dir)?
+            .setup_reconcile_preview(workspace, after, limit)
             .await
     })
 }
@@ -1338,6 +1434,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SetupGcCandidate>()?;
     module.add_class::<SetupGcPreviewCounts>()?;
     module.add_class::<SetupGcPreviewPage>()?;
+    module.add_class::<SetupReconcileRecord>()?;
+    module.add_class::<SetupReconcilePreviewPage>()?;
     module.add_class::<SetupGcApplyResult>()?;
     module.add_class::<SetupRetiredStopResult>()?;
     module.add_class::<SetupDoneResult>()?;
