@@ -205,6 +205,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "doctest-file"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2db04e74f0a9a93103b50e90b96024c9b2bdca8bce6a632ec71b88736d3d359"
+
+[[package]]
 name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -332,6 +338,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "interprocess"
+version = "2.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "798de1433ba514cc6c04c4144c2469af81396e4906195218737c776d47769572"
+dependencies = [
+ "doctest-file",
+ "libc",
+ "recvmsg",
+ "widestring",
+ "windows-sys",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -350,12 +369,13 @@ dependencies = [
 [[package]]
 name = "kernal-api"
 version = "0.1.0"
-source = "git+https://github.com/zackees/kernal-api?rev=10e558a9f2eb51c2989c89d05b13cf7636bd374e#10e558a9f2eb51c2989c89d05b13cf7636bd374e"
+source = "git+https://github.com/zackees/kernal-api?rev=ed197c5c606d6fd984190721e309c30d7d0383ef#ed197c5c606d6fd984190721e309c30d7d0383ef"
 dependencies = [
  "blake3",
  "dirs",
  "getrandom 0.4.3",
  "globset",
+ "interprocess",
  "jwalk",
  "libc",
  "mach2",
@@ -555,6 +575,12 @@ dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
 ]
+
+[[package]]
+name = "recvmsg"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3edd4d5d42c92f0a659926464d4cce56b562761267ecf0f469d85b7de384175"
 
 [[package]]
 name = "redox_users"

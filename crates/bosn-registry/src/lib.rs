@@ -11,7 +11,10 @@ use std::{
 
 use bosn_core::{ResourceKind, ResourceState, Retention, Scope};
 use kernal_api::{
-    platform::fs,
+    platform::{
+        fs, ipc,
+        process::{self, ProcessIdentityCapture},
+    },
     sqlite::{Connection, Error as SqlError, QueryLimits, Row, Transaction, Value},
 };
 
@@ -67,6 +70,13 @@ pub enum Error {
     InvalidSchema,
     ResourceIdentityConflict,
     ReservedMeta(&'static str),
+    InvalidCutoverMarker,
+    CutoverRegistryMismatch,
+    SourceOwnershipLive(u32),
+    SourceOwnershipUnknown(u32),
+    ImportTargetExists(PathBuf),
+    ReconciliationRequired,
+    InsecureDirectory(PathBuf),
 }
 impl From<SqlError> for Error {
     fn from(v: SqlError) -> Self {
@@ -170,6 +180,189 @@ pub struct LegacyMigrationGuard {
     _lock: kernal_api::platform::fs::OwnedFileLock,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportReport {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+    pub registry_id: String,
+    pub table_counts: BTreeMap<String, usize>,
+    pub reconciliation_required: bool,
+}
+
+const CUTOVER_MARKER: &str = "rust-cutover-v1.json";
+const RECONCILIATION_REQUIRED: &str = "migration.reconciliation_required";
+const IMPORT_BATCH: usize = 1_000;
+
+/// Import a bridge-quiesced Python schema-v4 registry into an unpublished v5
+/// destination. The destination appears only after the staged v5 database has
+/// committed and passed integrity checking; no lifecycle writer may open it
+/// until a future engine reconciliation clears the reserved gate.
+pub fn import_python_v4(
+    state_dir: impl AsRef<Path>,
+    source: impl AsRef<Path>,
+    destination: impl AsRef<Path>,
+) -> Result<ImportReport, Error> {
+    import_python_v4_inner(
+        state_dir.as_ref(),
+        source.as_ref(),
+        destination.as_ref(),
+        None,
+    )
+}
+
+// The callback is test-only plumbing for a deterministic replacement race.
+// Production callers always use the public wrapper above.
+fn import_python_v4_inner(
+    state_dir: &Path,
+    source: &Path,
+    destination: &Path,
+    after_identity_capture: Option<&dyn Fn()>,
+) -> Result<ImportReport, Error> {
+    let _guard = acquire_legacy_migration_guard(state_dir)?;
+    let expected_source = state_dir.join("registry.sqlite3");
+    let expected_identity = fs::path_identity(&expected_source)?;
+    let source_identity = fs::path_identity(source)?;
+    if expected_identity.is_none() || source_identity != expected_identity {
+        return Err(Error::InvalidSchema);
+    }
+    let marker = fs::read_private_regular_file_bounded(&state_dir.join(CUTOVER_MARKER), 4096)
+        .map_err(Error::Io)?;
+    let marker: serde_json::Value =
+        serde_json::from_slice(&marker).map_err(|_| Error::InvalidCutoverMarker)?;
+    let marker_id = marker
+        .get("registry_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|_| marker.get("protocol") == Some(&serde_json::Value::from(1)))
+        .ok_or(Error::InvalidCutoverMarker)?;
+    if !is_uuid(marker_id) {
+        return Err(Error::InvalidCutoverMarker);
+    }
+    if let Some(callback) = after_identity_capture {
+        callback();
+    }
+
+    // Open only the database anchored to the guarded state directory. The
+    // caller's alias is retained solely for the identity rechecks below.
+    let source_connection = Connection::open_read_only_with_busy_timeout(
+        &expected_source,
+        std::time::Duration::from_secs(5),
+    )?;
+    source_connection.integrity_check()?;
+    if fs::path_identity(&expected_source)? != expected_identity
+        || fs::path_identity(source)? != source_identity
+    {
+        return Err(Error::ReplacedPath(expected_source));
+    }
+    // A consistent backup captures committed WAL content without writing source.
+    let scratch = fs::TemporaryDirectory::new()?;
+    ipc::ensure_owner_private_directory(scratch.path()).map_err(Error::Io)?;
+    let snapshot = scratch.path().join("python-v4-snapshot.sqlite");
+    source_connection.backup_to(&snapshot)?;
+    if fs::path_identity(&expected_source)? != expected_identity
+        || fs::path_identity(source)? != source_identity
+    {
+        return Err(Error::ReplacedPath(expected_source));
+    }
+    drop(source_connection);
+    let snapshot_connection =
+        Connection::open_read_only_with_busy_timeout(&snapshot, std::time::Duration::from_secs(5))?;
+    snapshot_connection.integrity_check()?;
+    validate_v4_schema(&snapshot_connection)?;
+    let source_meta = import_meta(&snapshot_connection)?;
+    let source_id = source_meta.get("registry_id").ok_or(Error::InvalidSchema)?;
+    let version = source_meta
+        .get("schema_version")
+        .ok_or(Error::InvalidSchema)?
+        .parse::<u32>()
+        .map_err(|_| Error::BadRow("schema_version"))?;
+    if version < 4 {
+        return Err(Error::LegacyImportRequired(version));
+    }
+    if version > 4 {
+        return Err(Error::UnsupportedSchema(version));
+    }
+    if source_id != marker_id {
+        return Err(Error::CutoverRegistryMismatch);
+    }
+    let rows = ImportRows::read(&snapshot_connection)?;
+    rows.validate_owners()?;
+
+    let staged = scratch.path().join("imported-v5.sqlite");
+    let mut registry = Registry::create_writer(&staged, source_id)?;
+    let mut transaction = registry.begin_immediate()?;
+    for (key, value) in &rows.meta {
+        if !matches!(key.as_str(), "schema_version" | "registry_id") {
+            transaction.set_meta(key, value)?;
+        }
+    }
+    transaction.transaction.execute(
+        "INSERT INTO meta(key,value) VALUES(?,?)",
+        &[
+            Value::Text(RECONCILIATION_REQUIRED.into()),
+            Value::Text("true".into()),
+        ],
+    )?;
+    for value in &rows.resources {
+        transaction.put_resource(value)?;
+    }
+    for value in &rows.resource_uses {
+        transaction.put_resource_use(value)?;
+    }
+    for value in &rows.leases {
+        transaction.put_lease(value)?;
+    }
+    for value in &rows.sessions {
+        transaction.put_execution_session(value)?;
+    }
+    for value in &rows.intents {
+        transaction.put_volume_creation_intent(value)?;
+    }
+    for value in &rows.generations {
+        transaction.put_generation(value)?;
+    }
+    for value in &rows.events {
+        transaction.put_event_with_id(value)?;
+    }
+    if let Some(sequence) = rows.event_sequence {
+        let updated = transaction.transaction.execute(
+            "UPDATE sqlite_sequence SET seq=? WHERE name='events'",
+            &[Value::Integer(sequence)],
+        )?;
+        if updated == 0 {
+            transaction.transaction.execute(
+                "INSERT INTO sqlite_sequence(name,seq) VALUES('events',?)",
+                &[Value::Integer(sequence)],
+            )?;
+        }
+    }
+    transaction.commit()?;
+    drop(registry);
+    let staged_connection =
+        Connection::open_read_only_with_busy_timeout(&staged, std::time::Duration::from_secs(5))?;
+    staged_connection.integrity_check()?;
+    let destination_parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if !ipc::owner_private_directory(destination_parent).map_err(Error::Io)? {
+        return Err(Error::InsecureDirectory(destination_parent.into()));
+    }
+    staged_connection
+        .backup_to(destination)
+        .map_err(|error| match error {
+            SqlError::AlreadyExists(path) => Error::ImportTargetExists(path),
+            other => Error::Sql(other),
+        })?;
+    fs::sync_directory(destination_parent)?;
+    Ok(ImportReport {
+        source: source.into(),
+        destination: destination.into(),
+        registry_id: source_id.clone(),
+        table_counts: rows.counts(),
+        reconciliation_required: true,
+    })
+}
+
 /// Acquire the Rust half of the Python-v4 cooperative cutover protocol.
 ///
 /// This intentionally does not claim that a pre-bridge Python release was
@@ -190,12 +383,317 @@ pub fn acquire_legacy_migration_guard(
     })?;
     Ok(LegacyMigrationGuard { _lock: lock })
 }
+
+#[derive(Default)]
+struct ImportRows {
+    meta: BTreeMap<String, String>,
+    resources: Vec<Resource>,
+    resource_uses: Vec<ResourceUse>,
+    leases: Vec<Lease>,
+    sessions: Vec<ExecutionSession>,
+    intents: Vec<VolumeCreationIntent>,
+    generations: Vec<Generation>,
+    events: Vec<Event>,
+    event_sequence: Option<i64>,
+}
+impl ImportRows {
+    fn read(c: &Connection) -> Result<Self, Error> {
+        Ok(Self {
+            meta: import_meta(c)?,
+            resources: import_all(
+                c,
+                "SELECT id,kind,name,stack,generation,scope,workspace,created_at,last_used,state,retention FROM resources ORDER BY id",
+                resource,
+            )?,
+            resource_uses: import_all(
+                c,
+                "SELECT resource_id,workspace,stack,generation,last_used,state FROM resource_uses ORDER BY resource_id,workspace,stack,generation",
+                resource_use,
+            )?,
+            leases: import_all(
+                c,
+                "SELECT id,resource_id,pid,proc_start,acquired_at,heartbeat_at,ttl_seconds FROM leases ORDER BY id",
+                lease,
+            )?,
+            sessions: import_all(
+                c,
+                "SELECT id,container_id,engine_binary,client_pid,client_start,lease_ids FROM execution_sessions ORDER BY id",
+                session,
+            )?,
+            intents: import_all(
+                c,
+                "SELECT name,labels,stack,generation,scope,workspace FROM volume_creation_intents ORDER BY name",
+                intent,
+            )?,
+            generations: import_all(
+                c,
+                "SELECT workspace,stack,digest,created_at,superseded_at FROM generations ORDER BY workspace,stack,digest",
+                generation,
+            )?,
+            events: import_all(c, "SELECT id,at,kind,detail FROM events ORDER BY id", event)?,
+            event_sequence: event_sequence(c)?,
+        })
+    }
+    fn validate_owners(&self) -> Result<(), Error> {
+        for pid in self
+            .leases
+            .iter()
+            .map(|value| value.pid)
+            .chain(self.sessions.iter().map(|value| value.client_pid))
+        {
+            match process::capture_identity(pid) {
+                ProcessIdentityCapture::Exited => {}
+                ProcessIdentityCapture::Found(_) => return Err(Error::SourceOwnershipLive(pid)),
+                ProcessIdentityCapture::Unavailable(_) | ProcessIdentityCapture::Error(_) => {
+                    return Err(Error::SourceOwnershipUnknown(pid));
+                }
+            }
+        }
+        Ok(())
+    }
+    fn counts(&self) -> BTreeMap<String, usize> {
+        BTreeMap::from([
+            ("meta".into(), self.meta.len()),
+            ("resources".into(), self.resources.len()),
+            ("resource_uses".into(), self.resource_uses.len()),
+            ("leases".into(), self.leases.len()),
+            ("execution_sessions".into(), self.sessions.len()),
+            ("volume_creation_intents".into(), self.intents.len()),
+            ("generations".into(), self.generations.len()),
+            ("events".into(), self.events.len()),
+        ])
+    }
+}
+fn import_all<T>(
+    c: &Connection,
+    sql: &str,
+    parse: fn(&Row) -> Result<T, Error>,
+) -> Result<Vec<T>, Error> {
+    let mut output = Vec::new();
+    let mut offset = 0i64;
+    loop {
+        let rows = c.query(
+            &format!("{sql} LIMIT ? OFFSET ?"),
+            &[
+                Value::Integer((IMPORT_BATCH + 1) as i64),
+                Value::Integer(offset),
+            ],
+            QueryLimits {
+                max_rows: IMPORT_BATCH + 1,
+                max_bytes: 4 * 1024 * 1024,
+            },
+        )?;
+        let count = rows.len();
+        output.extend(
+            rows.into_iter()
+                .take(IMPORT_BATCH)
+                .map(|row| parse(&row))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        if count <= IMPORT_BATCH {
+            return Ok(output);
+        }
+        offset = offset
+            .checked_add(IMPORT_BATCH as i64)
+            .ok_or(Error::BadRow("import offset"))?;
+    }
+}
+fn import_meta(c: &Connection) -> Result<BTreeMap<String, String>, Error> {
+    let pairs = import_all(c, "SELECT key,value FROM meta ORDER BY key", |row| {
+        Ok((text(row, 0)?, text(row, 1)?))
+    })?;
+    let meta = pairs.iter().cloned().collect::<BTreeMap<_, _>>();
+    if meta.len() != pairs.len() {
+        return Err(Error::InvalidSchema);
+    }
+    Ok(meta)
+}
+fn event_sequence(c: &Connection) -> Result<Option<i64>, Error> {
+    let rows = c.query(
+        "SELECT seq FROM sqlite_sequence WHERE name='events'",
+        &[],
+        QueryLimits {
+            max_rows: 2,
+            max_bytes: 128,
+        },
+    )?;
+    if rows.len() > 1 {
+        return Err(Error::InvalidSchema);
+    }
+    let sequence = rows.first().map(|row| integer(row, 0)).transpose()?;
+    if let Some(sequence) = sequence {
+        let maximum = c.query(
+            "SELECT max(id) FROM events",
+            &[],
+            QueryLimits {
+                max_rows: 1,
+                max_bytes: 128,
+            },
+        )?;
+        let maximum = maximum
+            .first()
+            .and_then(|row| row.get(0))
+            .and_then(|value| match value {
+                Value::Integer(value) => Some(*value),
+                Value::Null => Some(0),
+                _ => None,
+            })
+            .ok_or(Error::InvalidSchema)?;
+        if sequence < 0 || sequence < maximum {
+            return Err(Error::InvalidSchema);
+        }
+    }
+    Ok(sequence)
+}
+fn validate_v4_schema(c: &Connection) -> Result<(), Error> {
+    let tables = import_all(
+        c,
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+        |row| text(row, 0),
+    )?;
+    let expected = [
+        ("meta", &["key", "value"][..]),
+        (
+            "resources",
+            &[
+                "id",
+                "kind",
+                "name",
+                "stack",
+                "generation",
+                "scope",
+                "workspace",
+                "created_at",
+                "last_used",
+                "state",
+                "retention",
+            ][..],
+        ),
+        (
+            "resource_uses",
+            &[
+                "resource_id",
+                "workspace",
+                "stack",
+                "generation",
+                "last_used",
+                "state",
+            ][..],
+        ),
+        (
+            "leases",
+            &[
+                "id",
+                "resource_id",
+                "pid",
+                "proc_start",
+                "acquired_at",
+                "heartbeat_at",
+                "ttl_seconds",
+            ][..],
+        ),
+        (
+            "execution_sessions",
+            &[
+                "id",
+                "container_id",
+                "engine_binary",
+                "client_pid",
+                "client_start",
+                "lease_ids",
+            ][..],
+        ),
+        (
+            "volume_creation_intents",
+            &[
+                "name",
+                "labels",
+                "stack",
+                "generation",
+                "scope",
+                "workspace",
+            ][..],
+        ),
+        (
+            "generations",
+            &[
+                "workspace",
+                "stack",
+                "digest",
+                "created_at",
+                "superseded_at",
+            ][..],
+        ),
+        ("events", &["id", "at", "kind", "detail"][..]),
+    ];
+    for (table, columns) in expected {
+        if !tables.iter().any(|found| found == table) {
+            return Err(Error::InvalidSchema);
+        }
+        let actual = import_all(
+            c,
+            &format!("SELECT name FROM pragma_table_info('{table}') ORDER BY cid"),
+            |row| text(row, 0),
+        )?;
+        if actual.iter().map(String::as_str).collect::<Vec<_>>() != columns {
+            return Err(Error::InvalidSchema);
+        }
+    }
+    for (table, key) in [
+        ("meta", "key"),
+        ("resources", "id"),
+        ("leases", "id"),
+        ("execution_sessions", "id"),
+        ("volume_creation_intents", "name"),
+        ("events", "id"),
+    ] {
+        let duplicates = c.query(
+            &format!("SELECT 1 FROM {table} GROUP BY {key} HAVING count(*) > 1 LIMIT 1"),
+            &[],
+            QueryLimits {
+                max_rows: 1,
+                max_bytes: 64,
+            },
+        )?;
+        if !duplicates.is_empty() {
+            return Err(Error::InvalidSchema);
+        }
+    }
+    for (table, keys) in [
+        ("resource_uses", "resource_id,workspace,stack,generation"),
+        ("generations", "workspace,stack,digest"),
+    ] {
+        let duplicates = c.query(
+            &format!("SELECT 1 FROM {table} GROUP BY {keys} HAVING count(*) > 1 LIMIT 1"),
+            &[],
+            QueryLimits {
+                max_rows: 1,
+                max_bytes: 64,
+            },
+        )?;
+        if !duplicates.is_empty() {
+            return Err(Error::InvalidSchema);
+        }
+    }
+    let foreign = c.query(
+        "SELECT 1 FROM pragma_foreign_key_check LIMIT 1",
+        &[],
+        QueryLimits {
+            max_rows: 1,
+            max_bytes: 1024,
+        },
+    )?;
+    if !foreign.is_empty() {
+        return Err(Error::InvalidSchema);
+    }
+    Ok(())
+}
 pub struct Immediate<'a> {
     transaction: Transaction<'a>,
 }
 impl<'a> Immediate<'a> {
     pub fn set_meta(&mut self, key: &str, value: &str) -> Result<(), Error> {
-        if matches!(key, "schema_version" | "registry_id") {
+        if matches!(key, "schema_version" | "registry_id") || key == RECONCILIATION_REQUIRED {
             return Err(Error::ReservedMeta("schema_version or registry_id"));
         }
         self.transaction.execute("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", &[Value::Text(key.into()), Value::Text(value.into())])?;
@@ -248,6 +746,18 @@ impl<'a> Immediate<'a> {
                 Value::Real(at),
                 Value::Text(kind.into()),
                 Value::Text(detail.into()),
+            ],
+        )?;
+        Ok(())
+    }
+    fn put_event_with_id(&mut self, value: &Event) -> Result<(), Error> {
+        self.transaction.execute(
+            "INSERT INTO events(id,at,kind,detail) VALUES(?,?,?,?)",
+            &[
+                Value::Integer(value.id),
+                Value::Real(value.at),
+                Value::Text(value.kind.clone()),
+                Value::Text(value.detail.clone()),
             ],
         )?;
         Ok(())
@@ -396,6 +906,9 @@ impl Registry {
             return Err(Error::UnsupportedSchema(version));
         }
         let registry_id = meta(connection, "registry_id")?.ok_or(Error::BadRow("registry_id"))?;
+        if meta(connection, RECONCILIATION_REQUIRED)?.as_deref() == Some("true") {
+            return Err(Error::ReconciliationRequired);
+        }
         if !is_uuid(&registry_id) {
             return Err(Error::BadRow("registry_id"));
         }
@@ -802,10 +1315,15 @@ fn text(r: &Row, i: usize) -> Result<String, Error> {
     }
 }
 fn real(r: &Row, i: usize) -> Result<f64, Error> {
-    match r.get(i) {
+    let value = match r.get(i) {
         Some(Value::Real(v)) => Ok(*v),
         Some(Value::Integer(v)) => Ok(*v as f64),
         _ => Err(Error::BadRow("real")),
+    }?;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(Error::BadRow("finite real"))
     }
 }
 fn integer(r: &Row, i: usize) -> Result<i64, Error> {
@@ -815,11 +1333,16 @@ fn integer(r: &Row, i: usize) -> Result<i64, Error> {
     }
 }
 fn optional_real(r: &Row, i: usize) -> Result<Option<f64>, Error> {
-    match r.get(i) {
+    let value = match r.get(i) {
         Some(Value::Null) => Ok(None),
         Some(Value::Real(v)) => Ok(Some(*v)),
         Some(Value::Integer(v)) => Ok(Some(*v as f64)),
         _ => Err(Error::BadRow("optional real")),
+    }?;
+    if value.is_none_or(f64::is_finite) {
+        Ok(value)
+    } else {
+        Err(Error::BadRow("finite optional real"))
     }
 }
 fn kind(v: String) -> Result<ResourceKind, Error> {
@@ -845,6 +1368,7 @@ fn state(v: String) -> Result<ResourceState, Error> {
         "active" => Ok(ResourceState::Active),
         "adopted" => Ok(ResourceState::Adopted),
         "done" => Ok(ResourceState::Done),
+        "retired" => Ok(ResourceState::Retired),
         _ => Err(Error::BadRow("state")),
     }
 }
@@ -927,4 +1451,49 @@ fn event(r: &Row) -> Result<Event, Error> {
         kind: text(r, 2)?,
         detail: text(r, 3)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+
+    use super::*;
+
+    // This runs before the read-only SQLite open, so the rename is portable:
+    // Windows does not permit replacing a file with an already-open handle.
+    #[test]
+    fn v4_import_refuses_source_replacement_after_identity_capture() {
+        let directory = fs::TemporaryDirectory::new().unwrap();
+        let source = directory.path().join("registry.sqlite3");
+        let replacement = directory.path().join("replacement.sqlite3");
+        let destination = directory.path().join("destination.sqlite3");
+        let marker = directory.path().join(CUTOVER_MARKER);
+        let registry_id = "11111111-2222-4333-8444-555555555555";
+
+        let mut marker_file = fs::create_private_file(&marker).unwrap();
+        marker_file
+            .write_all(format!(r#"{{"protocol":1,"registry_id":"{registry_id}"}}"#).as_bytes())
+            .unwrap();
+        marker_file.sync_all().unwrap();
+        drop(marker_file);
+
+        for path in [&source, &replacement] {
+            drop(fs::create_private_file(path).unwrap());
+            let connection = Connection::open(path).unwrap();
+            connection
+                .execute("CREATE TABLE marker(value TEXT)", &[])
+                .unwrap();
+        }
+
+        let error = import_python_v4_inner(
+            directory.path(),
+            &source,
+            &destination,
+            Some(&|| std::fs::rename(&replacement, &source).unwrap()),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::ReplacedPath(path) if path == source));
+        assert!(!destination.exists());
+    }
 }
