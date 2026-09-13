@@ -172,6 +172,26 @@ cursor-paginated and limited to 64 records per MCP page. MCP client disconnect
 does not cancel jobs. Registry persistence, reconciliation, adoption,
 replacement, garbage collection, converge, and run remain intentionally absent.
 
+### Live MCP setup-ensure acceptance
+
+The following ignored test exercises a self-contained pinned-image TOML over
+two fresh production `bosn mcp` stdio sessions and two daemon lifetimes. It
+uses MCP only for setup planning, ensure submission, job status, and job-log
+observation; the test's direct Docker calls are verifier-only. It also sends
+raw Docker-argument, mount, and command injection fields and proves each is
+rejected by the closed MCP schema. The managed app is inspected for image and
+all three ownership labels, then its exact identity is reused after restart.
+
+```sh
+soldr cargo test -j1 -p bosn-service --test mcp_setup_ensure_docker --locked \
+  -- --ignored --exact live_docker_mcp_setup_ensure_creates_and_reuses_one_managed_app
+```
+
+It needs a running local Docker daemon and the exact Alpine digest named by
+the test. It does not pull mutable images, use Docker prune or selectors, or
+delete images. Its cleanup first rechecks the managed/content/container-name
+labels and removes only the one deterministic test container.
+
 The official Rust MCP SDK currently owns a Tokio runtime and stdio transport.
 Bosn instead uses kernal-api's owned runtime, so the deliberately small adapter
 implements the required external JSON-RPC boundary without adding a second
