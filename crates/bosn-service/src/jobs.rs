@@ -163,6 +163,9 @@ impl Jobs {
         self.finish(id, JobState::Cancelled, Some("cancelled".into()));
         Ok(())
     }
+    pub fn job(&self, id: u64) -> Result<Job, JobError> {
+        self.jobs.get(&id).cloned().ok_or(JobError::Unknown)
+    }
     pub fn settle(&mut self, id: u64, ok: bool) -> Result<(), JobError> {
         let state = self.jobs.get(&id).ok_or(JobError::Unknown)?.state;
         if state.terminal() {
