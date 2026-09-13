@@ -2,7 +2,9 @@
 
 use bosn_core::{ResourceKind, ResourceState, Retention, Scope};
 use bosn_engine::{DockerDoctorReport, DockerDoctorState, DockerEngine, EngineEvent, RunOptions};
-use bosn_registry::{Event, Registry, RegistryStatus, Resource, ResourceUse, SetupGcPreview};
+use bosn_registry::{
+    Event, Registry, RegistryStatus, Resource, ResourceUse, SetupDone, SetupGcPreview,
+};
 #[cfg(test)]
 use bosn_setup::PreparedImageKind;
 use bosn_setup::{
@@ -16,7 +18,10 @@ use kernal_api::{
     daemon_frame_v1::{
         DaemonFrame, DaemonFrameCodec, DaemonFrameDecode, DaemonFrameKind, DaemonPayloadEncoding,
     },
-    platform::ipc::{self, AsyncListener, AsyncStream, Endpoint, EndpointAddressCandidates},
+    platform::{
+        fs,
+        ipc::{self, AsyncListener, AsyncStream, Endpoint, EndpointAddressCandidates},
+    },
 };
 use prost::Message;
 use std::{
@@ -718,6 +723,20 @@ pub struct SetupGcApplyResult {
     pub removed: bool,
     pub reconciled_missing: bool,
 }
+/// Result of an explicit, registry-only setup workspace completion.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SetupDoneResult {
+    pub uses_completed: u64,
+    pub resources_completed: u64,
+}
+impl From<SetupDone> for SetupDoneResult {
+    fn from(value: SetupDone) -> Self {
+        Self {
+            uses_completed: value.uses_completed,
+            resources_completed: value.resources_completed,
+        }
+    }
+}
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SetupGcPreviewCounts {
     pub protected_not_retired: u64,
@@ -917,6 +936,7 @@ fn validate_registry_diagnostics_request_wire(request: &Request) -> Result<(), E
         || request.setup_deadline_ms != 0
         || request.setup_output_limit != 0
         || !request.setup_task_name.is_empty()
+        || request.setup_done_confirm
     {
         return Err(Error::Protocol("nonsemantic registry diagnostic fields"));
     }
@@ -938,6 +958,7 @@ fn validate_setup_gc_preview_request_wire(request: &Request) -> Result<(), Error
         || request.setup_deadline_ms != 0
         || request.setup_output_limit != 0
         || !request.setup_task_name.is_empty()
+        || request.setup_done_confirm
     {
         return Err(Error::Protocol("nonsemantic setup gc preview fields"));
     }
@@ -974,8 +995,57 @@ fn validate_setup_gc_apply_request_wire(request: &Request) -> Result<(), Error> 
         || !request.setup_task_name.is_empty()
         || request.diagnostic_after != 0
         || request.diagnostic_limit != 0
+        || request.setup_done_confirm
     {
         return Err(Error::Protocol("nonsemantic setup gc apply fields"));
+    }
+    Ok(())
+}
+
+fn validate_setup_done_input(workspace: &str, confirm: bool) -> Result<(), Error> {
+    if workspace.is_empty()
+        || workspace.len() > 8 * 1024
+        || workspace.bytes().any(|byte| byte == 0)
+        || !confirm
+    {
+        return Err(Error::Protocol("invalid setup done request"));
+    }
+    Ok(())
+}
+/// Completion names the same canonical directory spelling recorded by setup
+/// planning/ensure. Alias spellings therefore cannot accidentally become a
+/// second registry scope. This performs only local path observation before
+/// any daemon request and deliberately does not create anything.
+fn canonical_setup_done_workspace(path: impl AsRef<Path>) -> Result<String, Error> {
+    let canonical = fs::canonical_context_path(path.as_ref())
+        .map_err(|_| Error::Protocol("setup done workspace cannot be canonicalized"))?;
+    let metadata = fs::context_path_metadata_no_follow(&canonical)
+        .map_err(|_| Error::Protocol("setup done workspace cannot be inspected"))?;
+    if metadata.kind != fs::ContextPathKind::Directory {
+        return Err(Error::Protocol("setup done workspace is not a directory"));
+    }
+    let value = canonical.to_string_lossy().into_owned();
+    validate_setup_done_input(&value, true)?;
+    Ok(value)
+}
+fn validate_setup_done_request_wire(request: &Request) -> Result<(), Error> {
+    validate_setup_done_input(&request.workspace, request.setup_done_confirm)?;
+    if !request.stack.is_empty()
+        || !request.digest.is_empty()
+        || request.job_id != 0
+        || request.log_after != 0
+        || request.log_limit != 0
+        || !request.setup_config.is_empty()
+        || request.setup_policy != 0
+        || request.setup_deadline_ms != 0
+        || request.setup_output_limit != 0
+        || !request.setup_task_name.is_empty()
+        || request.diagnostic_after != 0
+        || request.diagnostic_limit != 0
+        || !request.gc_candidate_token.is_empty()
+        || request.gc_confirm
+    {
+        return Err(Error::Protocol("nonsemantic setup done fields"));
     }
     Ok(())
 }
@@ -996,6 +1066,7 @@ fn validate_doctor_request_wire(request: &Request) -> Result<(), Error> {
         || !request.setup_task_name.is_empty()
         || request.diagnostic_after != 0
         || request.diagnostic_limit != 0
+        || request.setup_done_confirm
     {
         return Err(Error::Protocol("nonsemantic doctor fields"));
     }
@@ -1143,6 +1214,31 @@ impl Client {
         {
             Reply::SetupGcApply(value) => Ok(value),
             _ => Err(Error::Protocol("unexpected setup gc apply response")),
+        }
+    }
+    /// Explicitly mark this setup workspace's active registry ownership done.
+    /// This does not contact Docker or remove any resource. `confirm` is
+    /// required so normal inspection cannot accidentally change lifecycle
+    /// accounting.
+    pub async fn setup_done(
+        &self,
+        workspace: impl AsRef<Path>,
+        confirm: bool,
+    ) -> Result<SetupDoneResult, Error> {
+        if !confirm {
+            return Err(Error::Protocol("invalid setup done request"));
+        }
+        let workspace = canonical_setup_done_workspace(workspace)?;
+        match self
+            .call(Request {
+                workspace,
+                setup_done_confirm: true,
+                ..Request::operation(16)
+            })
+            .await?
+        {
+            Reply::SetupDone(value) => Ok(value),
+            _ => Err(Error::Protocol("unexpected setup done response")),
         }
     }
     pub async fn shutdown(&self) -> Result<(), Error> {
@@ -1391,6 +1487,10 @@ enum DbCommand {
         generation: String,
         missing: bool,
         reply: async_engine::OneshotSender<Result<bool, Error>>,
+    },
+    CompleteSetupWorkspace {
+        workspace: String,
+        reply: async_engine::OneshotSender<Result<SetupDoneResult, Error>>,
     },
     AppendSetupEnsureEvents {
         events: Vec<SetupEnsureEvent>,
@@ -2225,6 +2325,14 @@ impl RegistryActor {
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
     }
+    async fn complete_setup_workspace(&self, workspace: String) -> Result<SetupDoneResult, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::CompleteSetupWorkspace { workspace, reply })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
     async fn append_setup_ensure_events(&self, events: Vec<SetupEnsureEvent>) -> Result<(), Error> {
         let (reply, wait) = async_engine::oneshot_channel();
         self.sender
@@ -2429,6 +2537,35 @@ async fn registry_actor(
                             transaction.commit()?;
                         }
                         Ok(removed)
+                    })();
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
+            DbCommand::CompleteSetupWorkspace { workspace, reply } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = (|| {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
+                            .as_secs_f64();
+                        let mut transaction = registry.begin_immediate()?;
+                        let completed = transaction.complete_setup_workspace(&workspace, now)?;
+                        // An already-complete workspace is a genuine no-op:
+                        // no event or timestamp write is committed.
+                        if completed.uses_completed != 0 {
+                            transaction.commit()?;
+                        }
+                        Ok(SetupDoneResult::from(completed))
                     })();
                     (registry, result)
                 });
@@ -3271,6 +3408,26 @@ async fn handle(
                     ..Default::default()
                 },
             },
+            16 => match validate_setup_done_request_wire(&r)
+                .and_then(|()| canonical_setup_done_workspace(Path::new(&r.workspace)))
+            {
+                Ok(workspace) => match actor.complete_setup_workspace(workspace).await {
+                    Ok(result) => ReplyWire {
+                        code: 130,
+                        setup_done_uses: result.uses_completed,
+                        setup_done_resources: result.resources_completed,
+                        ..Default::default()
+                    },
+                    Err(_) => ReplyWire {
+                        code: 3,
+                        ..Default::default()
+                    },
+                },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
             _ => ReplyWire {
                 code: 2,
                 ..Default::default()
@@ -3368,6 +3525,8 @@ struct Request {
     gc_candidate_token: String,
     #[prost(bool, tag = "17")]
     gc_confirm: bool,
+    #[prost(bool, tag = "18")]
+    setup_done_confirm: bool,
 }
 impl Request {
     fn operation(operation: u32) -> Self {
@@ -3389,6 +3548,7 @@ impl Request {
             diagnostic_limit: 0,
             gc_candidate_token: String::new(),
             gc_confirm: false,
+            setup_done_confirm: false,
         }
     }
 }
@@ -3472,6 +3632,7 @@ fn validate_setup_ensure_request_wire(
         || request.log_after != 0
         || request.log_limit != 0
         || !request.setup_task_name.is_empty()
+        || request.setup_done_confirm
     {
         return Err(Error::Protocol("nonsemantic setup ensure fields"));
     }
@@ -3541,6 +3702,10 @@ struct ReplyWire {
     gc_removed: bool,
     #[prost(bool, tag = "31")]
     gc_reconciled_missing: bool,
+    #[prost(uint64, tag = "32")]
+    setup_done_uses: u64,
+    #[prost(uint64, tag = "33")]
+    setup_done_resources: u64,
 }
 #[derive(Message)]
 struct LogRecordWire {
@@ -3678,6 +3843,7 @@ enum Reply {
     SetupEnsureEvents(SetupEnsureEventPage),
     SetupGcPreview(SetupGcPreviewPage),
     SetupGcApply(SetupGcApplyResult),
+    SetupDone(SetupDoneResult),
     Doctor(DoctorReport),
 }
 fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
@@ -3744,6 +3910,10 @@ fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
             removed: v.gc_removed,
             reconciled_missing: v.gc_reconciled_missing,
         })),
+        130 => Ok(Reply::SetupDone(SetupDoneResult {
+            uses_completed: v.setup_done_uses,
+            resources_completed: v.setup_done_resources,
+        })),
         1 => Err(Error::Protocol("unsupported protocol")),
         2 => Err(Error::Protocol("unknown operation")),
         _ => Err(Error::Protocol("daemon error")),
@@ -3801,6 +3971,83 @@ mod tests {
         );
         assert!(parse_setup_gc_token(&(token + "00")).is_err());
         assert!(validate_setup_gc_apply_input("/work", "sgc1-00", false).is_err());
+    }
+
+    #[test]
+    fn setup_done_wire_requires_only_explicit_confirmation() {
+        let request = || Request {
+            workspace: "/workspace".into(),
+            setup_done_confirm: true,
+            ..Request::operation(16)
+        };
+        assert!(validate_setup_done_request_wire(&request()).is_ok());
+        for invalid in [
+            Request {
+                setup_done_confirm: false,
+                ..request()
+            },
+            Request {
+                setup_config: "https://user:secret@example.invalid/setup.toml".into(),
+                ..request()
+            },
+            Request {
+                gc_confirm: true,
+                ..request()
+            },
+            Request {
+                setup_task_name: "injected".into(),
+                ..request()
+            },
+        ] {
+            assert!(validate_setup_done_request_wire(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn setup_ensure_reactivates_records_after_explicit_done() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let mut registry = Registry::create_writer(
+            temporary.path().join("registry.sqlite3"),
+            "11111111-2222-4333-8444-555555555555",
+        )
+        .unwrap();
+        let workspace = "/canonical/workspace";
+        let execution = setup_ensure_execution(workspace, "same", "sha256:image");
+        record_setup_ensure(&mut registry, 1, &execution).unwrap();
+        let mut transaction = registry.begin_immediate().unwrap();
+        assert_eq!(
+            transaction
+                .complete_setup_workspace(workspace, 2.0)
+                .unwrap()
+                .uses_completed,
+            2
+        );
+        transaction.commit().unwrap();
+        assert!(
+            registry
+                .resource_uses(0, 10)
+                .unwrap()
+                .items
+                .iter()
+                .all(|use_row| use_row.state == ResourceState::Done)
+        );
+        record_setup_ensure(&mut registry, 2, &execution).unwrap();
+        assert!(
+            registry
+                .resources(0, 10)
+                .unwrap()
+                .items
+                .iter()
+                .all(|resource| resource.state == ResourceState::Active)
+        );
+        assert!(
+            registry
+                .resource_uses(0, 10)
+                .unwrap()
+                .items
+                .iter()
+                .all(|use_row| use_row.state == ResourceState::Active)
+        );
     }
 
     struct SlowFakeSetupExecutor {
@@ -5813,6 +6060,7 @@ mod tests {
                 diagnostic_limit: 0,
                 gc_candidate_token: String::new(),
                 gc_confirm: false,
+                setup_done_confirm: false,
             }
             .encode(&mut payload)
             .unwrap();

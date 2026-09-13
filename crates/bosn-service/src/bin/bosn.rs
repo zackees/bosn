@@ -548,6 +548,7 @@ fn run_setup(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
         Some(command) if command == "prepare" => run_setup_prepare(arguments),
         Some(command) if command == "task" => run_setup_task(arguments),
         Some(command) if command == "ensure" => run_setup_ensure(arguments),
+        Some(command) if command == "done" => run_setup_done(arguments),
         _ => usage(),
     }
 }
@@ -669,6 +670,61 @@ fn run_setup_ensure(arguments: impl Iterator<Item = std::ffi::OsString>) {
     } else {
         println!("setup ensure submitted");
         println!("job_id: {job_id}");
+    }
+}
+
+/// Explicitly finish one workspace's setup accounting. This is a daemon-only
+/// registry transition: it never invokes Docker or removes resources.
+fn run_setup_done(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
+    let mut state_dir = None;
+    let mut workspace = None;
+    let mut yes = false;
+    let mut json_output = false;
+    while let Some(argument) = arguments.next() {
+        match argument.to_string_lossy().as_ref() {
+            "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
+            "--workspace" => set_once_parsed(&mut workspace, arguments.next(), parse_state_dir),
+            "--yes" if !yes => {
+                yes = true;
+                Ok(())
+            }
+            "--json" if !json_output => {
+                json_output = true;
+                Ok(())
+            }
+            _ => Err(()),
+        }
+        .unwrap_or_else(|_| usage());
+    }
+    let (Some(state_dir), Some(workspace)) = (state_dir, workspace) else {
+        usage();
+    };
+    if !yes {
+        usage();
+    }
+    let result = Client::for_state(&state_dir).ok().and_then(|client| {
+        RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .ok()
+            .and_then(|runtime| runtime.run(client.setup_done(workspace, true)).ok())
+    });
+    match result {
+        Some(result) => println!(
+            "{}",
+            json!({"action":"setup_done","uses_completed":result.uses_completed,"resources_completed":result.resources_completed})
+        ),
+        None => {
+            if json_output {
+                println!(
+                    "{}",
+                    json!({"action":"setup_done","error":"daemon unavailable or request failed"})
+                );
+            } else {
+                eprintln!("bosn setup done: daemon unavailable or request failed");
+            }
+            std::process::exit(1);
+        }
     }
 }
 
@@ -1322,6 +1378,7 @@ fn usage() -> ! {
     eprintln!(
         "   or: bosn setup ensure --state-dir STATE_DIR --workspace WORKSPACE --config LOCATOR (--refresh | --offline) --deadline-ms 1..=300000 --output-limit 1..=8388608 [--json]"
     );
+    eprintln!("   or: bosn setup done --state-dir STATE_DIR --workspace WORKSPACE --yes [--json]");
     eprintln!("   or: bosn job status --state-dir STATE_DIR --job-id ID [--json]");
     eprintln!(
         "   or: bosn job logs --state-dir STATE_DIR --job-id ID [--after CURSOR] [--limit 1..={MAX_JOB_LOG_LIMIT}] [--json]"

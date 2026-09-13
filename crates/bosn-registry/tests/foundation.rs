@@ -397,6 +397,184 @@ fn setup_gc_preview_only_returns_unambiguously_retired_managed_containers() {
 }
 
 #[test]
+fn setup_done_is_workspace_isolated_idempotent_and_preserves_shared_resources() {
+    let (_directory, path) = database_path();
+    let mut registry =
+        Registry::create_writer(&path, "11111111-2222-4333-8444-555555555555").unwrap();
+    let mut tx = registry.begin_immediate().unwrap();
+    for (id, workspace) in [
+        ("shared", "/canonical/a"),
+        ("only-a", "/canonical/a"),
+        ("only-b", "/canonical/b"),
+    ] {
+        tx.put_resource(&Resource {
+            id: id.into(),
+            kind: ResourceKind::Image,
+            name: format!("image-{id}"),
+            stack: "setup".into(),
+            generation: "g".into(),
+            scope: Scope::Machine,
+            workspace: workspace.into(),
+            created_at: 1.0,
+            last_used: 1.0,
+            state: ResourceState::Active,
+            retention: Retention::Pinned,
+        })
+        .unwrap();
+        tx.put_resource_use(&ResourceUse {
+            resource_id: id.into(),
+            workspace: workspace.into(),
+            stack: "setup".into(),
+            generation: "g".into(),
+            last_used: 1.0,
+            state: ResourceState::Active,
+        })
+        .unwrap();
+    }
+    // This foreign active use protects the machine-global resource state.
+    tx.put_resource_use(&ResourceUse {
+        resource_id: "shared".into(),
+        workspace: "/canonical/b".into(),
+        stack: "setup".into(),
+        generation: "g2".into(),
+        last_used: 1.0,
+        state: ResourceState::Active,
+    })
+    .unwrap();
+    // A non-setup use is never selected.
+    tx.put_resource_use(&ResourceUse {
+        resource_id: "only-a".into(),
+        workspace: "/canonical/a".into(),
+        stack: "other".into(),
+        generation: "g3".into(),
+        last_used: 1.0,
+        state: ResourceState::Active,
+    })
+    .unwrap();
+    tx.commit().unwrap();
+
+    let mut rollback = registry.begin_immediate().unwrap();
+    assert_eq!(
+        rollback
+            .complete_setup_workspace("/canonical/a", 2.0)
+            .unwrap()
+            .uses_completed,
+        2
+    );
+    drop(rollback);
+    assert!(
+        registry
+            .resource_uses(0, 20)
+            .unwrap()
+            .items
+            .iter()
+            .filter(|use_row| use_row.workspace == "/canonical/a" && use_row.stack == "setup")
+            .all(|use_row| use_row.state == ResourceState::Active)
+    );
+    assert!(registry.events(0, 20).unwrap().items.is_empty());
+
+    let mut tx = registry.begin_immediate().unwrap();
+    let result = tx.complete_setup_workspace("/canonical/a", 2.0).unwrap();
+    assert_eq!(result.uses_completed, 2);
+    assert_eq!(result.resources_completed, 0); // shared + other-stack active uses protect both
+    tx.commit().unwrap();
+    let uses = registry.resource_uses(0, 20).unwrap().items;
+    assert!(
+        uses.iter()
+            .any(|u| u.resource_id == "only-b" && u.state == ResourceState::Active)
+    );
+    assert!(uses.iter().any(|u| u.resource_id == "only-a"
+        && u.stack == "setup"
+        && u.state == ResourceState::Done));
+    assert!(uses.iter().any(|u| u.resource_id == "only-a"
+        && u.stack == "other"
+        && u.state == ResourceState::Active));
+    assert!(
+        registry
+            .resources(0, 20)
+            .unwrap()
+            .items
+            .iter()
+            .all(|r| r.state == ResourceState::Active)
+    );
+    // Completion is not a GC retirement transition, so it cannot make a
+    // candidate collectible merely by setting a use to done.
+    assert!(
+        registry
+            .setup_gc_preview("/canonical/a", 0, 10)
+            .unwrap()
+            .candidates
+            .items
+            .is_empty()
+    );
+    let events = registry.events(0, 20).unwrap().items;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "setup.done")
+            .count(),
+        1
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| !event.detail.contains("/canonical"))
+    );
+
+    let mut tx = registry.begin_immediate().unwrap();
+    assert_eq!(
+        tx.complete_setup_workspace("/canonical/a", 3.0)
+            .unwrap()
+            .uses_completed,
+        0
+    );
+    // Do not commit an idempotent no-op: no second event or timestamp write.
+    drop(tx);
+    assert_eq!(
+        registry
+            .events(0, 20)
+            .unwrap()
+            .items
+            .iter()
+            .filter(|event| event.kind == "setup.done")
+            .count(),
+        1
+    );
+
+    // A following ensure upsert can reactivate the previously done use/resource.
+    let mut reactivated = registry
+        .resources(0, 20)
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|r| r.id == "shared")
+        .unwrap();
+    reactivated.state = ResourceState::Active;
+    let mut tx = registry.begin_immediate().unwrap();
+    tx.put_resource(&reactivated).unwrap();
+    tx.put_resource_use(&ResourceUse {
+        resource_id: "shared".into(),
+        workspace: "/canonical/a".into(),
+        stack: "setup".into(),
+        generation: "g".into(),
+        last_used: 4.0,
+        state: ResourceState::Active,
+    })
+    .unwrap();
+    tx.commit().unwrap();
+    assert!(
+        registry
+            .resource_uses(0, 20)
+            .unwrap()
+            .items
+            .iter()
+            .any(|u| u.resource_id == "shared"
+                && u.workspace == "/canonical/a"
+                && u.state == ResourceState::Active)
+    );
+}
+
+#[test]
 fn typed_transaction_writes_round_trip_all_tables_and_roll_back() {
     let (_missing_dir, path) = database_path();
     let mut registry =

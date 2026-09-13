@@ -165,6 +165,13 @@ pub struct SetupGcPreview {
     pub candidates: Page<SetupGcCandidate>,
     pub counts: SetupGcPreviewCounts,
 }
+/// The durable effect of explicitly completing one setup workspace.  Counts
+/// are registry rows only; this operation never observes or changes an engine.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SetupDone {
+    pub uses_completed: u64,
+    pub resources_completed: u64,
+}
 #[derive(Clone, Debug, PartialEq)]
 pub struct VolumeCreationIntent {
     pub name: String,
@@ -731,6 +738,61 @@ pub struct Immediate<'a> {
     transaction: Transaction<'a>,
 }
 impl<'a> Immediate<'a> {
+    /// Mark active setup ownership in one exact canonical workspace as done.
+    ///
+    /// This is intentionally a narrow product transition rather than a
+    /// general resource state setter.  It only changes `setup` use rows in
+    /// the selected workspace. A machine resource is marked done only after
+    /// the transition leaves it with no active uses anywhere, so shared or
+    /// foreign ownership remains active. Callers commit this transaction only
+    /// when at least one use changed, making repeated completion idempotent.
+    pub fn complete_setup_workspace(
+        &mut self,
+        workspace: &str,
+        at: f64,
+    ) -> Result<SetupDone, Error> {
+        let active = ResourceState::Active.as_str();
+        let done = ResourceState::Done.as_str();
+        // First capture exactly the affected identities. The temporary table
+        // lives only for this transaction/connection and avoids a broad
+        // resource-state update after the use rows have changed.
+        self.transaction.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS bosn_setup_done_ids (id TEXT PRIMARY KEY)",
+            &[],
+        )?;
+        self.transaction
+            .execute("DELETE FROM bosn_setup_done_ids", &[])?;
+        self.transaction.execute(
+            "INSERT INTO bosn_setup_done_ids(id) \
+             SELECT DISTINCT resource_id FROM resource_uses \
+             WHERE workspace=? AND stack='setup' AND state=?",
+            &[Value::Text(workspace.into()), Value::Text(active.into())],
+        )?;
+        let uses = self.transaction.execute(
+            "UPDATE resource_uses SET state=?,last_used=? \
+             WHERE workspace=? AND stack='setup' AND state=?",
+            &[
+                Value::Text(done.into()),
+                Value::Real(at),
+                Value::Text(workspace.into()),
+                Value::Text(active.into()),
+            ],
+        )?;
+        if uses == 0 {
+            return Ok(SetupDone::default());
+        }
+        let resources = self.transaction.execute(
+            "UPDATE resources SET state=?,last_used=? \
+             WHERE id IN (SELECT id FROM bosn_setup_done_ids) AND state=? \
+               AND NOT EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=resources.id AND u.state=?)",
+            &[Value::Text(done.into()), Value::Real(at), Value::Text(active.into()), Value::Text(active.into())],
+        )?;
+        self.append_event(at, "setup.done", "workspace_setup_completed")?;
+        Ok(SetupDone {
+            uses_completed: uses as u64,
+            resources_completed: resources as u64,
+        })
+    }
     /// Recheck and remove one exact retired Bosn setup-container candidate.
     ///
     /// This is deliberately not a generic resource deletion operation.  The
