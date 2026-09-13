@@ -210,6 +210,118 @@ fn prepare_rejects_malformed_or_ambiguous_inputs_before_state_or_daemon_contact(
 }
 
 #[test]
+fn task_rejects_malformed_or_ambiguous_inputs_before_state_or_daemon_contact() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let config = root.path().join("setup.toml");
+    std::fs::write(&config, pinned_document()).unwrap();
+
+    for (name, extra) in [
+        ("ambiguous-policy", vec!["--refresh", "--offline"]),
+        ("missing-task", vec!["--refresh"]),
+        (
+            "invalid-task",
+            vec![
+                "--refresh",
+                "--task",
+                "-bad",
+                "--deadline-ms",
+                "1",
+                "--output-limit",
+                "1",
+            ],
+        ),
+        (
+            "zero-deadline",
+            vec![
+                "--refresh",
+                "--task",
+                "check",
+                "--deadline-ms",
+                "0",
+                "--output-limit",
+                "1",
+            ],
+        ),
+        (
+            "oversize-output",
+            vec![
+                "--refresh",
+                "--task",
+                "check",
+                "--deadline-ms",
+                "1",
+                "--output-limit",
+                "8388609",
+            ],
+        ),
+        (
+            "duplicate-task",
+            vec![
+                "--refresh",
+                "--task",
+                "check",
+                "--task",
+                "other",
+                "--deadline-ms",
+                "1",
+                "--output-limit",
+                "1",
+            ],
+        ),
+    ] {
+        let state = root.path().join(name);
+        let mut args: Vec<&std::ffi::OsStr> = vec![
+            "setup".as_ref(),
+            "task".as_ref(),
+            "--state-dir".as_ref(),
+            state.as_os_str(),
+            "--workspace".as_ref(),
+            workspace.path().as_os_str(),
+            "--config".as_ref(),
+            config.as_os_str(),
+        ];
+        args.extend(extra.into_iter().map(std::ffi::OsStr::new));
+        let output = run(&args);
+        assert_eq!(output.status.code(), Some(2), "{name}");
+        assert!(output.stdout.is_empty(), "{name}");
+        assert!(!state.exists(), "{name}");
+    }
+}
+
+#[test]
+fn task_json_failure_is_stable_redacted_and_does_not_create_state() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("no-daemon-state");
+    let workspace = tempfile::tempdir().unwrap();
+    let output = run(&[
+        "setup".as_ref(),
+        "task".as_ref(),
+        "--state-dir".as_ref(),
+        state.as_os_str(),
+        "--workspace".as_ref(),
+        workspace.path().as_os_str(),
+        "--config".as_ref(),
+        "https://example.invalid/setup.toml".as_ref(),
+        "--refresh".as_ref(),
+        "--task".as_ref(),
+        "check".as_ref(),
+        "--deadline-ms".as_ref(),
+        "1".as_ref(),
+        "--output-limit".as_ref(),
+        "1".as_ref(),
+        "--json".as_ref(),
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    assert!(!state.exists());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        serde_json::json!({"action": "setup_task", "error": "request failed"})
+    );
+}
+
+#[test]
 fn job_commands_reject_malformed_inputs_before_state_or_daemon_contact() {
     let root = tempfile::tempdir().unwrap();
     for (name, command, extra) in [
