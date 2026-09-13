@@ -240,6 +240,9 @@ pub enum ResourceState {
     Active,
     Adopted,
     Done,
+    /// Python-v4's durable terminal state. It must survive import even though
+    /// no Rust lifecycle consumer has reconciliation authority yet.
+    Retired,
 }
 impl ResourceState {
     pub fn as_str(self) -> &'static str {
@@ -247,6 +250,7 @@ impl ResourceState {
             Self::Active => "active",
             Self::Adopted => "adopted",
             Self::Done => "done",
+            Self::Retired => "retired",
         }
     }
 }
