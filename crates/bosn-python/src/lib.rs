@@ -739,7 +739,10 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
     #[cfg(feature = "embedded-python-tests")]
-    use bosn_service::{Service, SetupEnsureExecutor, SetupPrepareExecutor, SetupTaskExecutor};
+    use bosn_service::{
+        Service, SetupEnsureExecution, SetupEnsureExecutor, SetupEnsureResource,
+        SetupPrepareExecutor, SetupTaskExecutor,
+    };
     #[cfg(feature = "embedded-python-tests")]
     use kernal_api::async_engine::{self, CancellationToken, RuntimeBuilder, Sender};
     #[cfg(feature = "embedded-python-tests")]
@@ -855,10 +858,11 @@ mod tests {
     impl SetupEnsureExecutor for FakeSetupEnsureExecutor {
         fn execute<'a>(
             &'a self,
-            _request: SetupEnsureJobRequest,
+            request: SetupEnsureJobRequest,
             cancellation: &'a CancellationToken,
             logs: &'a Sender<String>,
-        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>>
+        {
             Box::pin(async move {
                 self.started.fetch_add(1, Ordering::SeqCst);
                 logs.send("[fake] setup ensure started".into())
@@ -871,7 +875,16 @@ mod tests {
                     }
                     async_engine::sleep(Duration::from_millis(10)).await;
                 }
-                Ok("fake setup ensured".into())
+                Ok(SetupEnsureExecution {
+                    receipt: "fake setup ensured".into(),
+                    resource: SetupEnsureResource {
+                        id: "setup-container:python-test".into(),
+                        name: "bosn-setup-python-test".into(),
+                        stack: "setup".into(),
+                        generation: "sha256:python-test".into(),
+                        workspace: request.workspace.to_string_lossy().into_owned(),
+                    },
+                })
             })
         }
     }
