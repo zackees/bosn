@@ -42,14 +42,15 @@ pub struct SetupAssetStore {
     directory: PathBuf,
 }
 
-/// One already-observed regular file from a legacy manifest Docker build
-/// context.  The daemon obtains these bytes through the bounded generation
-/// collector before asking the setup layer to create any private assets; this
-/// type is deliberately not a host path or a Docker argument.
+/// One already-observed entry from a manifest Docker build context. The daemon
+/// obtains these values through the bounded generation collector before asking
+/// the setup layer to create private assets; this type is deliberately not a
+/// host path or a Docker argument.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ManifestBuildFile {
-    pub path: String,
-    pub content: Vec<u8>,
+pub enum ManifestBuildEntry {
+    File { path: String, content: Vec<u8> },
+    Directory { path: String },
+    Symlink { path: String, target: String },
 }
 
 impl SetupAssetStore {
@@ -100,7 +101,8 @@ impl SetupAssetStore {
             SetupSource::InlineDockerfile(dockerfile) => {
                 let content_hash = validated_content_hash(&provenance.content_sha256)?;
                 let expected = expected_assets(dockerfile, &resolved.document.files)?;
-                let asset_root = self.materialize_expected_assets(&content_hash, &expected)?;
+                let asset_root =
+                    self.materialize_expected_assets(&content_hash, &expected, "Dockerfile")?;
 
                 let dockerfile_path = asset_root.join("Dockerfile");
                 let files = expected
@@ -108,7 +110,10 @@ impl SetupAssetStore {
                     .filter(|asset| asset.relative != "Dockerfile")
                     .map(|asset| MaterializedAsset {
                         path: asset_root.join(&asset.relative),
-                        content_sha256: sha256_bytes(&asset.content).to_hex(),
+                        content_sha256: match &asset.kind {
+                            ExpectedAssetKind::File(content) => sha256_bytes(content).to_hex(),
+                            _ => unreachable!("inline setup assets are regular files"),
+                        },
                     })
                     .collect();
                 Ok(MaterializedSetupPlan {
@@ -129,48 +134,74 @@ impl SetupAssetStore {
     /// Materialize a bounded, already-selected manifest Docker context below
     /// Bosn-owned state.  This is intentionally narrower than Docker's raw
     /// build interface: callers supply content bytes, never a host context
-    /// path, build args, tag, or Docker argv.  The selected Dockerfile must be
-    /// the context-root `Dockerfile`; alternate Dockerfile locations are
-    /// refused by the manifest runtime until that shape has a separately
-    /// audited typed representation.
+    /// path, build args, tag, or Docker argv. `dockerfile` is a safe relative
+    /// context label, never a host path.
     pub fn materialize_manifest_context(
         &self,
         content_sha256: &str,
-        files: &[ManifestBuildFile],
+        dockerfile: &str,
+        entries: &[ManifestBuildEntry],
     ) -> Result<PathBuf, SetupMaterializeError> {
         let content_hash = validated_content_hash(content_sha256)?;
-        let mut expected = Vec::with_capacity(files.len());
+        if !valid_relative_asset_path(dockerfile) {
+            return Err(SetupMaterializeError::InvalidAssetPath);
+        }
+        let mut expected = Vec::with_capacity(entries.len());
         let mut paths = BTreeSet::new();
         let mut total = 0_usize;
-        for file in files {
-            if !valid_relative_asset_path(&file.path)
-                || matches!(file.path.as_str(), RECEIPT_NAME | LOCK_NAME)
-                || !paths.insert(file.path.clone())
-                || file.content.len() > MAX_COMPANION_FILE_BYTES
+        for entry in entries {
+            let path = manifest_entry_path(entry);
+            if !valid_relative_asset_path(path)
+                || matches!(path, RECEIPT_NAME | LOCK_NAME)
+                || !paths.insert(path.to_owned())
             {
                 return Err(SetupMaterializeError::InvalidAssetPath);
             }
-            total = total
-                .checked_add(file.content.len())
-                .ok_or(SetupMaterializeError::InvalidAssetPath)?;
-            if total > 64 * 1024 * 1024 {
-                return Err(SetupMaterializeError::InvalidAssetPath);
+            match entry {
+                ManifestBuildEntry::File { content, .. } => {
+                    if content.len() > MAX_COMPANION_FILE_BYTES {
+                        return Err(SetupMaterializeError::InvalidAssetPath);
+                    }
+                    total = total
+                        .checked_add(content.len())
+                        .ok_or(SetupMaterializeError::InvalidAssetPath)?;
+                    if total > 64 * 1024 * 1024 {
+                        return Err(SetupMaterializeError::InvalidAssetPath);
+                    }
+                    expected.push(ExpectedAsset::file(path, content.clone()));
+                }
+                ManifestBuildEntry::Directory { .. } => {
+                    expected.push(ExpectedAsset::directory(path));
+                }
+                ManifestBuildEntry::Symlink { target, .. } => {
+                    if !safe_link_target(path, target) {
+                        return Err(SetupMaterializeError::InvalidAssetPath);
+                    }
+                    // Pinned kernal-api can observe links but has no public
+                    // capability to create one below a private root. Do not
+                    // bypass Bosn's OS facade boundary with std::fs here.
+                    return Err(SetupMaterializeError::SymlinkCreationUnavailable);
+                }
             }
-            expected.push(ExpectedAsset {
-                relative: file.path.clone(),
-                content: file.content.clone(),
-            });
         }
-        if !paths.contains("Dockerfile") {
+        if !matches!(
+            expected.iter().find(|asset| asset.relative == dockerfile),
+            Some(ExpectedAsset {
+                kind: ExpectedAssetKind::File(_),
+                ..
+            })
+        ) {
             return Err(SetupMaterializeError::InvalidAssetPath);
         }
-        self.materialize_expected_assets(&content_hash, &expected)
+        expected.sort_by(|left, right| left.relative.cmp(&right.relative));
+        self.materialize_expected_assets(&content_hash, &expected, dockerfile)
     }
 
     fn materialize_expected_assets(
         &self,
         content_hash: &str,
         expected: &[ExpectedAsset],
+        dockerfile: &str,
     ) -> Result<PathBuf, SetupMaterializeError> {
         let asset_root = self.directory.join(content_hash);
         let created = ensure_private_directory(&asset_root)?;
@@ -178,7 +209,7 @@ impl SetupAssetStore {
         let lock = fs::open_lock_file(&lock_path).map_err(SetupMaterializeError::Filesystem)?;
         let _lock = fs::lock_exclusive(&lock).map_err(SetupMaterializeError::Filesystem)?;
 
-        let receipt = receipt_bytes(content_hash, expected)?;
+        let receipt = receipt_bytes(content_hash, dockerfile, expected)?;
         let receipt_path = asset_root.join(RECEIPT_NAME);
         match fs::context_path_metadata_no_follow(&receipt_path) {
             Ok(metadata) if metadata.kind == fs::ContextPathKind::RegularFile => {
@@ -265,6 +296,10 @@ pub enum SetupMaterializeError {
     InvalidAssetPath,
     ExistingAssetsConflict,
     IncompleteAssets,
+    /// The pinned kernal-api revision has no public, safe private-root link
+    /// creation facade. Manifest link transport must remain fail-closed until
+    /// that facade exists.
+    SymlinkCreationUnavailable,
     Filesystem(io::Error),
 }
 
@@ -284,6 +319,8 @@ impl std::fmt::Display for SetupMaterializeError {
             Self::IncompleteAssets => {
                 formatter.write_str("existing setup assets are incomplete and were not repaired")
             }
+            Self::SymlinkCreationUnavailable => formatter
+                .write_str("kernal-api does not provide safe private-root symlink creation"),
             Self::Filesystem(_) => formatter.write_str("setup asset filesystem operation failed"),
         }
     }
@@ -343,7 +380,33 @@ fn validated_content_hash(value: &str) -> Result<String, SetupMaterializeError> 
 #[derive(Clone, Debug)]
 struct ExpectedAsset {
     relative: String,
-    content: Vec<u8>,
+    kind: ExpectedAssetKind,
+}
+
+#[derive(Clone, Debug)]
+enum ExpectedAssetKind {
+    File(Vec<u8>),
+    Directory,
+    // This remains part of the authenticated receipt grammar even while the
+    // pinned kernel lacks a safe private-root link-creation facade.
+    #[allow(dead_code)]
+    Symlink(String),
+}
+
+impl ExpectedAsset {
+    fn file(path: &str, content: Vec<u8>) -> Self {
+        Self {
+            relative: path.into(),
+            kind: ExpectedAssetKind::File(content),
+        }
+    }
+
+    fn directory(path: &str) -> Self {
+        Self {
+            relative: path.into(),
+            kind: ExpectedAssetKind::Directory,
+        }
+    }
 }
 
 fn expected_assets(
@@ -355,7 +418,7 @@ fn expected_assets(
     }
     let mut output = vec![ExpectedAsset {
         relative: "Dockerfile".into(),
-        content: dockerfile.as_bytes().to_vec(),
+        kind: ExpectedAssetKind::File(dockerfile.as_bytes().to_vec()),
     }];
     let mut names = BTreeSet::from(["Dockerfile".to_owned()]);
     for file in files {
@@ -368,7 +431,7 @@ fn expected_assets(
         }
         output.push(ExpectedAsset {
             relative: file.path.clone(),
-            content: file.content.as_bytes().to_vec(),
+            kind: ExpectedAssetKind::File(file.content.as_bytes().to_vec()),
         });
     }
     Ok(output)
@@ -392,16 +455,74 @@ fn valid_relative_asset_path(path: &str) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
+fn manifest_entry_path(entry: &ManifestBuildEntry) -> &str {
+    match entry {
+        ManifestBuildEntry::File { path, .. }
+        | ManifestBuildEntry::Directory { path }
+        | ManifestBuildEntry::Symlink { path, .. } => path,
+    }
+}
+
+/// Accept only a non-absolute UTF-8 target whose lexical resolution from the
+/// link's parent remains within the materialized context. The target need not
+/// exist: Docker permits a dangling in-context link, but it must never spell an
+/// escape from the private context root.
+fn safe_link_target(link_path: &str, target: &str) -> bool {
+    if target.is_empty()
+        || target.contains(['\\', '\0', ':'])
+        || target.starts_with('/')
+        || !valid_relative_asset_path(link_path)
+    {
+        return false;
+    }
+    let mut resolved: Vec<&str> = link_path.split('/').collect();
+    resolved.pop();
+    for component in target.split('/') {
+        match component {
+            "" => return false,
+            "." => (),
+            ".." => {
+                if resolved.pop().is_none() {
+                    return false;
+                }
+            }
+            normal if !normal.contains(['\\', '\0', ':']) => resolved.push(normal),
+            _ => return false,
+        }
+    }
+    true
+}
+
 fn receipt_bytes(
     content_hash: &str,
+    dockerfile: &str,
     expected: &[ExpectedAsset],
 ) -> Result<Vec<u8>, SetupMaterializeError> {
-    let mut receipt = format!("{RECEIPT_MAGIC}\ncontent-sha256={content_hash}\n").into_bytes();
+    let mut receipt =
+        format!("{RECEIPT_MAGIC}\ncontent-sha256={content_hash}\ndockerfile-path={dockerfile}\n")
+            .into_bytes();
     for asset in expected {
-        receipt.extend_from_slice(asset.relative.as_bytes());
-        receipt.push(b'\t');
-        receipt.extend_from_slice(sha256_bytes(&asset.content).to_hex().as_bytes());
-        receipt.push(b'\n');
+        match &asset.kind {
+            ExpectedAssetKind::File(content) => {
+                receipt.extend_from_slice(b"F\t");
+                receipt.extend_from_slice(asset.relative.as_bytes());
+                receipt.push(b'\t');
+                receipt.extend_from_slice(sha256_bytes(content).to_hex().as_bytes());
+                receipt.push(b'\n');
+            }
+            ExpectedAssetKind::Directory => {
+                receipt.extend_from_slice(b"D\t");
+                receipt.extend_from_slice(asset.relative.as_bytes());
+                receipt.push(b'\n');
+            }
+            ExpectedAssetKind::Symlink(target) => {
+                receipt.extend_from_slice(b"L\t");
+                receipt.extend_from_slice(asset.relative.as_bytes());
+                receipt.push(b'\t');
+                receipt.extend_from_slice(target.as_bytes());
+                receipt.push(b'\n');
+            }
+        }
     }
     if receipt.len() > MAX_ASSET_RECEIPT_BYTES {
         return Err(SetupMaterializeError::ExistingAssetsConflict);
@@ -415,11 +536,21 @@ fn write_expected_assets(
 ) -> Result<(), SetupMaterializeError> {
     for asset in expected {
         let path = asset_path(asset_root, &asset.relative)?;
-        let parent = path
-            .parent()
-            .ok_or(SetupMaterializeError::InvalidAssetPath)?;
-        ensure_asset_parent(asset_root, parent)?;
-        atomic_write_new(&path, &asset.content)?;
+        match &asset.kind {
+            ExpectedAssetKind::File(content) => {
+                let parent = path
+                    .parent()
+                    .ok_or(SetupMaterializeError::InvalidAssetPath)?;
+                ensure_asset_parent(asset_root, parent)?;
+                atomic_write_new(&path, content)?;
+            }
+            ExpectedAssetKind::Directory => {
+                ensure_asset_parent(asset_root, &path)?;
+            }
+            ExpectedAssetKind::Symlink(_) => {
+                return Err(SetupMaterializeError::SymlinkCreationUnavailable);
+            }
+        }
     }
     Ok(())
 }
@@ -507,8 +638,25 @@ fn verify_complete_assets(
 
     let mut allowed_files = BTreeSet::from([RECEIPT_NAME.to_owned(), LOCK_NAME.to_owned()]);
     let mut allowed_directories = BTreeSet::new();
+    let mut allowed_links = BTreeMap::new();
     for asset in expected {
-        allowed_files.insert(asset.relative.clone());
+        match &asset.kind {
+            ExpectedAssetKind::File(content) => {
+                allowed_files.insert(asset.relative.clone());
+                let path = asset_path(asset_root, &asset.relative)?;
+                let bytes = fs::read_private_regular_file_bounded(&path, content.len())
+                    .map_err(|_| SetupMaterializeError::ExistingAssetsConflict)?;
+                if bytes != *content {
+                    return Err(SetupMaterializeError::ExistingAssetsConflict);
+                }
+            }
+            ExpectedAssetKind::Directory => {
+                allowed_directories.insert(asset.relative.clone());
+            }
+            ExpectedAssetKind::Symlink(target) => {
+                allowed_links.insert(asset.relative.clone(), target.clone());
+            }
+        }
         let mut parent = Path::new(&asset.relative).parent();
         while let Some(directory) = parent {
             if directory.as_os_str().is_empty() {
@@ -516,12 +664,6 @@ fn verify_complete_assets(
             }
             allowed_directories.insert(directory.to_string_lossy().replace('\\', "/"));
             parent = directory.parent();
-        }
-        let path = asset_path(asset_root, &asset.relative)?;
-        let bytes = fs::read_private_regular_file_bounded(&path, asset.content.len())
-            .map_err(|_| SetupMaterializeError::ExistingAssetsConflict)?;
-        if bytes != asset.content {
-            return Err(SetupMaterializeError::ExistingAssetsConflict);
         }
     }
 
@@ -539,10 +681,15 @@ fn verify_complete_assets(
             .map_err(|_| SetupMaterializeError::ExistingAssetsConflict)?
             .to_string_lossy()
             .replace('\\', "/");
-        if entry.is_symbolic_link()
-            || (!entry.is_file() && !entry.is_directory())
+        if (!entry.is_file() && !entry.is_directory() && !entry.is_symbolic_link())
             || (entry.is_file() && !allowed_files.contains(&relative))
             || (entry.is_directory() && !allowed_directories.contains(&relative))
+            || (entry.is_symbolic_link()
+                && fs::read_context_link(entry.path())
+                    .ok()
+                    .and_then(|target| target.to_str().map(str::to_owned))
+                    .as_ref()
+                    != allowed_links.get(&relative))
         {
             return Err(SetupMaterializeError::ExistingAssetsConflict);
         }
@@ -593,34 +740,70 @@ pub(crate) fn verify_materialized_assets(
         return Err(SetupMaterializeError::ExistingAssetsConflict);
     }
 
+    let dockerfile = lines
+        .next()
+        .and_then(|line| line.strip_prefix("dockerfile-path="))
+        .filter(|path| valid_relative_asset_path(path))
+        .ok_or(SetupMaterializeError::ExistingAssetsConflict)?;
     let mut expected = Vec::new();
     let mut names = BTreeSet::new();
     for line in lines {
-        let Some((relative, digest)) = line.split_once('\t') else {
-            return Err(SetupMaterializeError::ExistingAssetsConflict);
+        let fields = line.split('\t').collect::<Vec<_>>();
+        let (kind, relative, value) = match fields.as_slice() {
+            ["F", relative, digest] if valid_content_hash(digest) => ('F', *relative, *digest),
+            ["D", relative] => ('D', *relative, ""),
+            ["L", relative, target] if safe_link_target(relative, target) => {
+                ('L', *relative, *target)
+            }
+            _ => return Err(SetupMaterializeError::ExistingAssetsConflict),
         };
-        if relative.is_empty()
-            || !valid_relative_asset_path(relative)
-            || !valid_content_hash(digest)
-            || !names.insert(relative.to_owned())
-        {
+        if !valid_relative_asset_path(relative) || !names.insert(relative.to_owned()) {
             return Err(SetupMaterializeError::ExistingAssetsConflict);
         }
-        expected.push((relative.to_owned(), digest.to_owned()));
+        expected.push((kind, relative.to_owned(), value.to_owned()));
     }
-    if !names.contains("Dockerfile") {
+    if !matches!(
+        expected.iter().find(|(_, path, _)| path == dockerfile),
+        Some(('F', _, _))
+    ) {
         return Err(SetupMaterializeError::ExistingAssetsConflict);
     }
 
-    let mut canonical = format!("{RECEIPT_MAGIC}\ncontent-sha256={content_hash}\n").into_bytes();
+    let mut canonical =
+        format!("{RECEIPT_MAGIC}\ncontent-sha256={content_hash}\ndockerfile-path={dockerfile}\n")
+            .into_bytes();
     let mut allowed_files = BTreeSet::from([RECEIPT_NAME.to_owned(), LOCK_NAME.to_owned()]);
     let mut allowed_directories = BTreeSet::new();
-    for (relative, digest) in &expected {
-        canonical.extend_from_slice(relative.as_bytes());
+    let mut allowed_links = BTreeMap::new();
+    for (kind, relative, value) in &expected {
+        canonical.extend_from_slice(kind.to_string().as_bytes());
         canonical.push(b'\t');
-        canonical.extend_from_slice(digest.as_bytes());
+        canonical.extend_from_slice(relative.as_bytes());
+        if *kind != 'D' {
+            canonical.push(b'\t');
+            canonical.extend_from_slice(value.as_bytes());
+        }
         canonical.push(b'\n');
-        allowed_files.insert(relative.clone());
+        match kind {
+            'F' => {
+                allowed_files.insert(relative.clone());
+                let bytes = fs::read_private_regular_file_bounded(
+                    &asset_path(asset_root, relative)?,
+                    MAX_COMPANION_FILE_BYTES,
+                )
+                .map_err(|_| SetupMaterializeError::ExistingAssetsConflict)?;
+                if sha256_bytes(&bytes).to_hex() != *value {
+                    return Err(SetupMaterializeError::ExistingAssetsConflict);
+                }
+            }
+            'D' => {
+                allowed_directories.insert(relative.clone());
+            }
+            'L' => {
+                allowed_links.insert(relative.clone(), value.clone());
+            }
+            _ => unreachable!(),
+        }
         let mut parent = Path::new(relative).parent();
         while let Some(directory) = parent {
             if directory.as_os_str().is_empty() {
@@ -628,17 +811,6 @@ pub(crate) fn verify_materialized_assets(
             }
             allowed_directories.insert(directory.to_string_lossy().replace('\\', "/"));
             parent = directory.parent();
-        }
-        let max_bytes = if relative == "Dockerfile" {
-            MAX_INLINE_DOCKERFILE_BYTES
-        } else {
-            MAX_COMPANION_FILE_BYTES
-        };
-        let bytes =
-            fs::read_private_regular_file_bounded(&asset_path(asset_root, relative)?, max_bytes)
-                .map_err(|_| SetupMaterializeError::ExistingAssetsConflict)?;
-        if sha256_bytes(&bytes).to_hex() != *digest {
-            return Err(SetupMaterializeError::ExistingAssetsConflict);
         }
     }
     if receipt != canonical {
@@ -658,10 +830,15 @@ pub(crate) fn verify_materialized_assets(
             .map_err(|_| SetupMaterializeError::ExistingAssetsConflict)?
             .to_string_lossy()
             .replace('\\', "/");
-        if entry.is_symbolic_link()
-            || (!entry.is_file() && !entry.is_directory())
+        if (!entry.is_file() && !entry.is_directory() && !entry.is_symbolic_link())
             || (entry.is_file() && !allowed_files.contains(&relative))
             || (entry.is_directory() && !allowed_directories.contains(&relative))
+            || (entry.is_symbolic_link()
+                && fs::read_context_link(entry.path())
+                    .ok()
+                    .and_then(|target| target.to_str().map(str::to_owned))
+                    .as_ref()
+                    != allowed_links.get(&relative))
         {
             return Err(SetupMaterializeError::ExistingAssetsConflict);
         }
@@ -786,6 +963,94 @@ content = "config\n"
         }
         let mut cursor = fs::DirectoryCursor::open(store.directory()).unwrap();
         assert!(cursor.next_entry().unwrap().is_none());
+    }
+
+    #[test]
+    fn manifest_context_preserves_alternate_dockerfile_and_empty_directory() {
+        let (_temp, store, _workspace) = store_and_workspace();
+        let root = store
+            .materialize_manifest_context(
+                DIGEST,
+                "docker/Dockerfile",
+                &[
+                    ManifestBuildEntry::Directory {
+                        path: "docker".into(),
+                    },
+                    ManifestBuildEntry::Directory {
+                        path: "empty".into(),
+                    },
+                    ManifestBuildEntry::File {
+                        path: "docker/Dockerfile".into(),
+                        content: b"FROM scratch\nCOPY payload /payload\n".to_vec(),
+                    },
+                    ManifestBuildEntry::File {
+                        path: "payload".into(),
+                        content: b"ok\n".to_vec(),
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            fs::context_path_metadata_no_follow(&root.join("empty"))
+                .unwrap()
+                .kind,
+            fs::ContextPathKind::Directory
+        );
+        assert!(verify_materialized_assets(DIGEST, &root).is_ok());
+    }
+
+    #[test]
+    fn manifest_context_rejects_escaping_links_and_fails_closed_without_kernel_creation() {
+        let (_temp, store, _workspace) = store_and_workspace();
+        for (target, expected) in [
+            ("../outside", SetupMaterializeError::InvalidAssetPath),
+            ("payload", SetupMaterializeError::SymlinkCreationUnavailable),
+        ] {
+            let result = store.materialize_manifest_context(
+                DIGEST,
+                "Dockerfile",
+                &[
+                    ManifestBuildEntry::File {
+                        path: "Dockerfile".into(),
+                        content: b"FROM scratch\n".to_vec(),
+                    },
+                    ManifestBuildEntry::Symlink {
+                        path: "link".into(),
+                        target: target.into(),
+                    },
+                ],
+            );
+            assert_eq!(result.unwrap_err().to_string(), expected.to_string());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_verification_rejects_a_mutated_typed_link() {
+        let (_temp, store, _workspace) = store_and_workspace();
+        let root = store.directory().join(DIGEST);
+        ipc::ensure_owner_private_directory(&root).unwrap();
+        let expected = [
+            ExpectedAsset::file("Dockerfile", b"FROM scratch\n".to_vec()),
+            ExpectedAsset {
+                relative: "alias".into(),
+                kind: ExpectedAssetKind::Symlink("Dockerfile".into()),
+            },
+        ];
+        atomic_write_new(
+            &root.join(RECEIPT_NAME),
+            &receipt_bytes(DIGEST, "Dockerfile", &expected).unwrap(),
+        )
+        .unwrap();
+        atomic_write_new(&root.join("Dockerfile"), b"FROM scratch\n").unwrap();
+        std::os::unix::fs::symlink("Dockerfile", root.join("alias")).unwrap();
+        assert!(verify_materialized_assets(DIGEST, &root).is_ok());
+        std::fs::remove_file(root.join("alias")).unwrap();
+        std::os::unix::fs::symlink("../outside", root.join("alias")).unwrap();
+        assert!(matches!(
+            verify_materialized_assets(DIGEST, &root),
+            Err(SetupMaterializeError::ExistingAssetsConflict)
+        ));
     }
 
     #[test]

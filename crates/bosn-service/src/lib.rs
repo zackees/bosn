@@ -21,7 +21,7 @@ use bosn_registry::{
 #[cfg(test)]
 use bosn_setup::PreparedImageKind;
 use bosn_setup::{
-    ManifestBuildFile, PreparedImage, SetupAcquirePolicy, SetupAppTaskRequest, SetupAssetStore,
+    ManifestBuildEntry, PreparedImage, SetupAcquirePolicy, SetupAppTaskRequest, SetupAssetStore,
     SetupEnsureEngine, SetupEnsureRequest as CoreSetupEnsureRequest, SetupEnsureResult,
     SetupImageEngine, SetupMacosGuest, SetupNamedVolume, SetupPlan, SetupPlanAppSource,
     SetupPlanRequest, SetupTaskRequest, SetupTmpfs, SetupTmpfsSize, SetupTmpfsSizeUnit,
@@ -1458,17 +1458,22 @@ async fn manifest_stack_plan(
             })?
             .to_path_buf();
         let materialization_hash = content_sha256.clone();
+        let materialization_dockerfile = build.dockerfile_path.clone();
+        let materialization_entries = build.entries.clone();
         let asset_root = async_engine::launch_blocking(move || {
-            SetupAssetStore::under_state_dir(state_dir)?
-                .materialize_manifest_context(&materialization_hash, &build.files)
+            SetupAssetStore::under_state_dir(state_dir)?.materialize_manifest_context(
+                &materialization_hash,
+                &materialization_dockerfile,
+                &materialization_entries,
+            )
         })
         .await
         .map_err(|_| "manifest Dockerfile materialization stopped".to_owned())?
         .map_err(|_| "manifest Dockerfile materialization was refused".to_owned())?;
         (
-            SetupSource::InlineDockerfile(build.dockerfile),
+            SetupSource::InlineDockerfile(build.dockerfile_text),
             SetupPlanAppSource::InlineDockerfile {
-                dockerfile_path: asset_root.join("Dockerfile"),
+                dockerfile_path: asset_root.join(build.dockerfile_path),
             },
             Some(asset_root),
         )
@@ -1778,14 +1783,15 @@ fn validate_manifest_macos_guest_storage(stack: &bosn_core::manifest::Stack) -> 
     Ok(())
 }
 
-/// One immutable, already-selected Docker build context.  It carries bytes
-/// rather than paths so the later setup materializer cannot be redirected by a
-/// changed workspace entry.
+/// One immutable, already-selected Docker build context. It carries typed
+/// entries rather than workspace paths so the later setup materializer cannot
+/// be redirected by a changed workspace entry.
 #[derive(Clone, Debug)]
 struct ManifestDockerfileBuild {
     generation: String,
-    dockerfile: String,
-    files: Vec<ManifestBuildFile>,
+    dockerfile_path: String,
+    dockerfile_text: String,
+    entries: Vec<ManifestBuildEntry>,
 }
 
 /// Collect and authorize the exact build bytes for the deliberately narrow
@@ -1805,44 +1811,33 @@ async fn manifest_dockerfile_build_plan(
             .dockerfile
             .as_deref()
             .ok_or_else(|| "manifest Dockerfile build is missing its Dockerfile".to_owned())?;
-        if dockerfile != "Dockerfile" {
-            return Err(
-                "manifest Dockerfile build supports only the workspace-root Dockerfile".into(),
-            );
-        }
         let context = collect_context(&workspace, Some(dockerfile), &CollectorLimits::default())
             .map_err(|_| "manifest Dockerfile context was refused".to_owned())?;
-        let mut files = Vec::new();
-        let mut directories = std::collections::BTreeSet::new();
+        let mut entries = Vec::new();
         for entry in &context.entries {
             match entry {
-                ContextEntry::File { path, bytes } => files.push(ManifestBuildFile {
+                ContextEntry::File { path, bytes } => entries.push(ManifestBuildEntry::File {
                     path: path.clone(),
                     content: bytes.clone(),
                 }),
                 ContextEntry::Directory { path } => {
-                    directories.insert(path.clone());
+                    entries.push(ManifestBuildEntry::Directory { path: path.clone() })
                 }
-                ContextEntry::Symlink { .. } => {
-                    return Err("manifest Dockerfile context contains a symlink".into());
+                ContextEntry::Symlink { path, target } => {
+                    entries.push(ManifestBuildEntry::Symlink {
+                        path: path.clone(),
+                        target: target.clone(),
+                    })
                 }
             }
         }
-        if directories.iter().any(|directory| {
-            !files.iter().any(|file| {
-                file.path
-                    .strip_prefix(directory)
-                    .is_some_and(|suffix| suffix.starts_with('/'))
-            })
-        }) {
-            return Err(
-                "manifest Dockerfile context contains an unsupported empty directory".into(),
-            );
-        }
-        let dockerfile_bytes = files
+        let dockerfile_bytes = context
+            .entries
             .iter()
-            .find(|file| file.path == dockerfile)
-            .map(|file| file.content.as_slice())
+            .find_map(|entry| match entry {
+                ContextEntry::File { path, bytes } if path == dockerfile => Some(bytes.as_slice()),
+                _ => None,
+            })
             .ok_or_else(|| "manifest Dockerfile context has no root Dockerfile".to_owned())?;
         let dockerfile_text = std::str::from_utf8(dockerfile_bytes)
             .map_err(|_| "manifest Dockerfile is not UTF-8".to_owned())?
@@ -1875,8 +1870,9 @@ async fn manifest_dockerfile_build_plan(
             .map_err(|_| "manifest Dockerfile generation could not be derived".to_owned())?;
         Ok(ManifestDockerfileBuild {
             generation,
-            dockerfile: dockerfile_text,
-            files,
+            dockerfile_path: dockerfile.into(),
+            dockerfile_text,
+            entries,
         })
     })
     .await
@@ -10355,16 +10351,28 @@ mod tests {
             "[stack.app]\ndockerfile = 'docker/Dockerfile'\n",
         )
         .unwrap();
-        assert!(
-            runtime
-                .run(manifest_stack_setup_plan_at(&request, Some(&state)))
-                .is_err()
+        std::fs::create_dir(workspace.join("docker")).unwrap();
+        std::fs::write(
+            workspace.join("docker/Dockerfile"),
+            "FROM scratch\nCOPY payload /payload\n",
+        )
+        .unwrap();
+        let alternate = runtime
+            .run(manifest_stack_setup_plan_at(&request, Some(&state)))
+            .unwrap();
+        let alternate_root = alternate.plan.asset_root.unwrap();
+        assert_eq!(
+            alternate.plan.app_source,
+            SetupPlanAppSource::InlineDockerfile {
+                dockerfile_path: alternate_root.join("docker/Dockerfile"),
+            }
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn manifest_dockerfile_plan_refuses_selected_context_symlinks_and_empty_directories() {
+    fn manifest_dockerfile_plan_refuses_links_until_kernel_can_create_them_and_preserves_empty_directories()
+     {
         use std::os::unix::fs::symlink;
 
         let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
@@ -10406,10 +10414,15 @@ mod tests {
             "FROM scratch\nCOPY empty /empty\n",
         )
         .unwrap();
-        assert!(
-            runtime
-                .run(manifest_stack_setup_plan_at(&request, Some(&state)))
-                .is_err()
+        let plan = runtime
+            .run(manifest_stack_setup_plan_at(&request, Some(&state)))
+            .unwrap();
+        let asset_root = plan.plan.asset_root.unwrap();
+        assert_eq!(
+            kernal_api::platform::fs::context_path_metadata_no_follow(&asset_root.join("empty"))
+                .unwrap()
+                .kind,
+            kernal_api::platform::fs::ContextPathKind::Directory
         );
     }
 

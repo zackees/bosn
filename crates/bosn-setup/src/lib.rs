@@ -26,7 +26,7 @@ use kernal_api::{
 
 mod materialize;
 pub use materialize::{
-    MAX_ASSET_RECEIPT_BYTES, ManifestBuildFile, MaterializedAsset, MaterializedSetupPlan,
+    MAX_ASSET_RECEIPT_BYTES, ManifestBuildEntry, MaterializedAsset, MaterializedSetupPlan,
     MaterializedSetupSource, SetupAssetStore, SetupMaterializeError,
 };
 
