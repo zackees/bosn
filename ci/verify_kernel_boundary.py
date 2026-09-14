@@ -10,9 +10,10 @@ metadata check proves the checked-in resolution can be reproduced.
 from __future__ import annotations
 
 import argparse
-import tomllib
 from collections.abc import Iterator
 from pathlib import Path
+
+import tomllib
 
 EXPECTED_KERNEL_VERSION = "=0.1.0"
 EXPECTED_KERNEL_REVISION = "fc634e507024d63ccaaf75fa564818b9dcfbff36"

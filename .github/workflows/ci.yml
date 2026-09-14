@@ -15,6 +15,17 @@ permissions:
   contents: read
 
 jobs:
+  lint-no-macos-runners:
+    name: CI policy (no hosted macOS runners)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Refuse native macOS runner labels
+        run: uv run python ci/lint_no_macos_runners.py
+
   rust:
     name: Rust workspace (locked tests)
     runs-on: ubuntu-latest
@@ -85,7 +96,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest]
         python: ["3.11"]
     steps:
       - uses: actions/checkout@v4
@@ -105,12 +116,6 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Provide OpenSSL to Cargo (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install openssl@3 pkg-config
-          echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig" >> "$GITHUB_ENV"
-
       - name: Provide OpenSSL to Cargo (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -127,3 +132,68 @@ jobs:
 
       - name: Install and smoke-test platform wheel outside the checkout
         run: python ci/verify_installed_wheel.py "dist/bosn-*.whl"
+
+  darwin-cross-wheel:
+    name: Darwin wheel (${{ matrix.target }}, Linux-hosted Soldr)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            deployment_target: "10.12"
+          - target: aarch64-apple-darwin
+            deployment_target: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      # Pinned setup-soldr v0. The action supplies Soldr's blessed LLVM 21.1.5
+      # and Apple SDK 14.5, not a host macOS runner or zig/osxcross fallback.
+      - name: Set up Soldr Darwin target
+        uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
+        with:
+          cache: false
+          cross-targets: ${{ matrix.target }}
+
+      - name: Export Soldr target environment
+        run: soldr prepare --target "${{ matrix.target }}" --github-env "$GITHUB_ENV"
+
+      # Maturin invokes Cargo directly through the PEP 517 backend.  Ensure
+      # that the runner's pinned Rust toolchain has the same std component
+      # Soldr prepared, rather than relying on a host default target set.
+      - name: Install Rust standard library for Darwin target
+        run: rustup target add "${{ matrix.target }}" --toolchain 1.95.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Build Darwin wheel on Linux
+        env:
+          BOSN_WHEEL_TARGET: ${{ matrix.target }}
+          PYO3_CROSS_PYTHON_VERSION: "3.10"
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+        run: uv build --wheel --out-dir dist
+
+      - name: Verify Darwin wheel statically on Linux
+        run: >-
+          python ci/verify_cross_wheel.py "dist/bosn-*.whl"
+          --target "${{ matrix.target }}"
+
+      - name: Upload Darwin wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: bosn-wheel-${{ matrix.target }}
+          path: dist/bosn-*.whl
+          if-no-files-found: error

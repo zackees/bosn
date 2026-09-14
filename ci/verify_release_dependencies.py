@@ -8,8 +8,9 @@ is published.  This check is for release automation only; it must fail now.
 from __future__ import annotations
 
 import argparse
-import tomllib
 from pathlib import Path
+
+import tomllib
 
 
 def verify(manifest: Path, expected_version: str = "=0.1.0") -> list[str]:

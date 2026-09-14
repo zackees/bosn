@@ -11,13 +11,11 @@ Windows native-wheel CI lanes:
 from __future__ import annotations
 
 import argparse
-import importlib.machinery
 import json
 import os
 import shutil
 import subprocess
 import sys
-import sysconfig
 import tempfile
 import textwrap
 import time
@@ -116,10 +114,9 @@ def platform_executable_suffix() -> str:
 
 
 def platform_extension_suffix() -> str:
-    suffix = sysconfig.get_config_var("EXT_SUFFIX")
-    if not isinstance(suffix, str) or suffix not in importlib.machinery.EXTENSION_SUFFIXES:
-        fail(f"Python has no usable extension suffix: {suffix!r}")
-    return suffix
+    """The one extension suffix ABI3 promises across supported Python hosts."""
+
+    return ".abi3.pyd" if os.name == "nt" else ".abi3.so"
 
 
 def smoke_temporary_directory() -> str | None:
@@ -393,7 +390,6 @@ def verify_installed_wheel(wheel: Path) -> None:
                     import os
                     import pathlib
                     import sys
-                    import sysconfig
 
                     import bosn
                     from bosn.native_cli import native_executable
@@ -403,7 +399,7 @@ def verify_installed_wheel(wheel: Path) -> None:
                     assert pathlib.Path(bosn.__file__).resolve().is_relative_to(
                         pathlib.Path(sys.prefix).resolve()
                     )
-                    assert origin.name == "_native" + sysconfig.get_config_var("EXT_SUFFIX")
+                    assert origin.name == "_native.abi3" + (".pyd" if os.name == "nt" else ".so")
                     assert executable.is_file()
                     assert executable.name == "bosn-native" + (".exe" if os.name == "nt" else "")
                     versions = {
