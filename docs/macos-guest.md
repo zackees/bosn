@@ -28,6 +28,22 @@ stack = "macos-x64"
 cmd = "cargo-nextest nextest run --archive-file ~/kernal-x64.tar.zst"
 ```
 
+## Native runtime status
+
+The Rust native `bosn manifest app-task` path now uses bounded OpenSSH rather
+than `docker exec` for a supported guest task, after re-proving the exact
+managed dockurr container is running. Its target is fixed to loopback; native
+manifests must leave `guest.ssh_host` as `127.0.0.1`. It reads only the
+daemon-state key `STATE_DIR/guest-ssh/id_ed25519` (mode `0600` or stricter),
+ignores ambient SSH configuration and agents, and requires that key's public
+half to have been installed for `ssh_user` during the one-time bootstrap.
+
+The native task path does not yet implement the legacy SCP payload protocol.
+For now, do not set `guest.payload` for a native guest task: Bosn refuses it
+instead of executing against a stale guest artifact. The broader historical
+design below describes the desired typed SCP follow-up, not an implemented
+native behavior.
+
 ## Why this is a stack *kind* and not a stack with unusual options
 
 Four things a guest stack needs that no Linux stack does. Each one is a place bosn's normal

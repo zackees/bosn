@@ -4,7 +4,10 @@ use bosn_core::{
     ManifestRoots, ResourceKind, ResourceState, Retention, Scope, SetupApp, SetupSource, SetupTask,
     parse_manifest_toml,
 };
-use bosn_engine::{DockerDoctorReport, DockerDoctorState, DockerEngine, EngineEvent, RunOptions};
+use bosn_engine::{
+    CommandError, CommandResult, DockerDoctorReport, DockerDoctorState, DockerEngine, EngineEvent,
+    GuestSshCommand, GuestSshEngine, RunOptions,
+};
 use bosn_generation::{
     ContextEntry, ExternalImageIdentity,
     collector::{CollectorLimits, collect_context},
@@ -308,6 +311,37 @@ pub trait ManifestAppTaskSessionRecorder: Send + Sync {
         &'a self,
         outcome: &'static str,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+}
+
+/// Narrow test seam for the one guest SSH transport.  The daemon supplies a
+/// fully derived [`GuestSshCommand`]; this trait deliberately has no host,
+/// port, argv, user, credential, or SCP parameter.
+trait GuestSshTaskTransport: Send + Sync {
+    fn stream<'a>(
+        &'a self,
+        command: GuestSshCommand,
+        options: RunOptions,
+        cancellation: &'a async_engine::CancellationToken,
+        events: &'a async_engine::Sender<EngineEvent>,
+    ) -> Pin<Box<dyn Future<Output = Result<CommandResult, CommandError>> + Send + 'a>>;
+}
+
+#[derive(Clone, Default)]
+struct NativeGuestSshTaskTransport;
+impl GuestSshTaskTransport for NativeGuestSshTaskTransport {
+    fn stream<'a>(
+        &'a self,
+        command: GuestSshCommand,
+        options: RunOptions,
+        cancellation: &'a async_engine::CancellationToken,
+        events: &'a async_engine::Sender<EngineEvent>,
+    ) -> Pin<Box<dyn Future<Output = Result<CommandResult, CommandError>> + Send + 'a>> {
+        Box::pin(async move {
+            GuestSshEngine::system()
+                .stream(&command, options, Some(cancellation), events)
+                .await
+        })
+    }
 }
 pub trait SetupAdoptExecutor: Send + Sync {
     fn execute<'a>(
@@ -813,6 +847,7 @@ impl ManifestEnsureExecutor for DockerManifestEnsureExecutor {
                 generation,
                 volumes,
                 is_guest,
+                ..
             } = runtime;
             let (events, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
             let forwarded_logs = logs.clone();
@@ -888,12 +923,14 @@ impl ManifestEnsureExecutor for DockerManifestEnsureExecutor {
 pub struct DockerManifestAppTaskExecutor {
     state_dir: PathBuf,
     engine: DockerEngine,
+    guest_ssh: Arc<dyn GuestSshTaskTransport>,
 }
 impl DockerManifestAppTaskExecutor {
     fn new(state_dir: PathBuf) -> Self {
         Self {
             state_dir,
             engine: DockerEngine::docker(),
+            guest_ssh: Arc::new(NativeGuestSshTaskTransport),
         }
     }
 }
@@ -924,6 +961,7 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
             .await
             .map_err(|_| "manifest app task cancelled before ownership inspection".to_owned())?
             .map_err(|_| "manifest app task planning exceeded its deadline".to_owned())??;
+            let guest_task = runtime.guest_task;
             let plan = runtime.plan;
             let (events, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
             let forwarded_logs = logs.clone();
@@ -982,6 +1020,22 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                             .into(),
                     );
                 }
+                if let Some(guest_task) = guest_task {
+                    return execute_manifest_guest_ssh_task(
+                        self.guest_ssh.as_ref(),
+                        &self.state_dir,
+                        &observed,
+                        &guest_task,
+                        &request.task_name,
+                        &deadline,
+                        exec_output,
+                        cancellation,
+                        logs,
+                        &events,
+                        session,
+                    )
+                    .await;
+                }
                 logs.send(format!(
                     "[manifest-app-task] running declared task {}",
                     request.task_name
@@ -1035,6 +1089,191 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
             result
         })
     }
+}
+
+#[derive(Debug)]
+enum ManifestGuestTaskOutcome {
+    Failed { exit_code: i32, detail: String },
+    Uncertain(String),
+}
+
+/// Run one already-authorized guest task only after the regular manifest
+/// executor has freshly proved the deterministic dockurr container is exact
+/// and running.  The SSH endpoint is never taken from the caller or ambient
+/// SSH configuration: [`GuestSshCommand`] itself hard-codes loopback and this
+/// function derives every remaining field from the current manifest receipt.
+#[allow(clippy::too_many_arguments)]
+async fn execute_manifest_guest_ssh_task(
+    transport: &dyn GuestSshTaskTransport,
+    state_dir: &Path,
+    observed: &SetupEnsureResult,
+    guest_task: &ManifestGuestTask,
+    task_name: &str,
+    deadline: &async_engine::Deadline,
+    output_limit: usize,
+    cancellation: &async_engine::CancellationToken,
+    logs: &async_engine::Sender<String>,
+    events: &async_engine::Sender<EngineEvent>,
+    session: &dyn ManifestAppTaskSessionRecorder,
+) -> Result<String, String> {
+    let identity_file = manifest_guest_ssh_identity_file(state_dir)?;
+    let command = guest_remote_command(&guest_task.command, guest_task.workdir.as_deref())?;
+    let ready_output = output_limit / 4;
+    let task_output = output_limit.saturating_sub(ready_output);
+    if ready_output == 0 || task_output == 0 {
+        return Err(
+            "manifest guest app task output budget cannot fund readiness and execution".into(),
+        );
+    }
+    let guest_command = |command| GuestSshCommand {
+        user: guest_task.ssh_user.clone(),
+        port: guest_task.ssh_port,
+        identity_file: identity_file.clone(),
+        command,
+    };
+    if cancellation.is_cancelled() || deadline.remaining().is_zero() {
+        return Err(
+            "manifest guest app task ended before SSH readiness; remote task was not started"
+                .into(),
+        );
+    }
+    logs.send("[manifest-guest-app-task] verifying guest SSH readiness".into())
+        .await
+        .map_err(|_| "manifest guest app task log consumer closed".to_owned())?;
+    let ready = transport
+        .stream(
+            guest_command("true".into()),
+            RunOptions::streaming(deadline.remaining(), ready_output),
+            cancellation,
+            events,
+        )
+        .await
+        .map_err(|error| format!("manifest guest SSH readiness transport failed: {error}"))?;
+    if !ready.ok() {
+        return Err(format!(
+            "manifest guest SSH readiness failed with exit {}; the declared task was not started",
+            ready.exit_code
+        ));
+    }
+    if cancellation.is_cancelled() || deadline.remaining().is_zero() {
+        return Err(
+            "manifest guest app task ended before SSH execution; remote task was not started"
+                .into(),
+        );
+    }
+    logs.send(format!(
+        "[manifest-guest-app-task] running declared task {task_name} through verified guest SSH"
+    ))
+    .await
+    .map_err(|_| "manifest guest app task log consumer closed".to_owned())?;
+    session
+        .begin(manifest_app_task_session_container_identity(observed))
+        .await
+        .map_err(|_| "manifest guest app task ownership recording unavailable".to_owned())?;
+    let result = match transport
+        .stream(
+            guest_command(command),
+            RunOptions::streaming(deadline.remaining(), task_output),
+            cancellation,
+            events,
+        )
+        .await
+    {
+        Ok(result) if result.ok() => Ok(()),
+        // OpenSSH reserves 255 for connection/protocol failure, but a remote
+        // command may also return it. Either way the daemon cannot prove
+        // whether a command reached or completed on the VM.
+        Ok(result) if result.exit_code == 255 => Err(ManifestGuestTaskOutcome::Uncertain(
+            "guest SSH exited 255; remote task completion is unknown".into(),
+        )),
+        Ok(result) => Err(ManifestGuestTaskOutcome::Failed {
+            exit_code: result.exit_code,
+            detail: bounded_guest_failure_detail(&result),
+        }),
+        Err(error) => Err(ManifestGuestTaskOutcome::Uncertain(format!(
+            "guest SSH client ended; remote task completion is unknown: {error}"
+        ))),
+    };
+    let outcome = match &result {
+        Ok(()) => "succeeded",
+        Err(ManifestGuestTaskOutcome::Failed { .. }) => "failed",
+        Err(ManifestGuestTaskOutcome::Uncertain(_)) => "uncertain",
+    };
+    session
+        .finish(outcome)
+        .await
+        .map_err(|_| "manifest guest app task completion recording unavailable".to_owned())?;
+    match result {
+        Ok(()) => Ok(format!(
+            "completed declared manifest guest task {task_name} through managed container {} with image {}",
+            observed.container_name, observed.image_identity
+        )),
+        Err(ManifestGuestTaskOutcome::Failed { exit_code, detail }) => Err(format!(
+            "declared manifest guest task exited with {exit_code}: {detail}"
+        )),
+        Err(ManifestGuestTaskOutcome::Uncertain(detail)) => Err(detail),
+    }
+}
+
+fn manifest_guest_ssh_identity_file(state_dir: &Path) -> Result<PathBuf, String> {
+    let root = fs::canonical_context_path(state_dir)
+        .map_err(|_| "manifest guest SSH state directory cannot be canonicalized".to_owned())?;
+    if fs::context_path_metadata_no_follow(&root)
+        .map_err(|_| "manifest guest SSH state directory cannot be inspected".to_owned())?
+        .kind
+        != fs::ContextPathKind::Directory
+    {
+        return Err("manifest guest SSH state root is not a directory".into());
+    }
+    let identity = root.join("guest-ssh").join("id_ed25519");
+    if fs::context_path_metadata_no_follow(&identity)
+        .map_err(|_| "manifest guest SSH identity is not provisioned in daemon state".to_owned())?
+        .kind
+        != fs::ContextPathKind::RegularFile
+    {
+        return Err("manifest guest SSH identity is not a regular daemon-state file".into());
+    }
+    let canonical = fs::canonical_context_path(&identity)
+        .map_err(|_| "manifest guest SSH identity cannot be canonicalized".to_owned())?;
+    // Reject every symlink (including a parent component) rather than merely
+    // proving that its target happens to lie below state today.
+    if canonical != identity || !canonical.starts_with(&root) {
+        return Err("manifest guest SSH identity must not traverse a symlink".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mode = std::fs::metadata(&identity)
+            .map_err(|_| "manifest guest SSH identity cannot be inspected".to_owned())?
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err("manifest guest SSH identity must not be group- or world-readable".into());
+        }
+    }
+    Ok(identity)
+}
+
+fn guest_remote_command(command: &str, workdir: Option<&str>) -> Result<String, String> {
+    if command.is_empty() || command.len() > 16 * 1024 || command.contains('\0') {
+        return Err("manifest guest task command is unsafe".into());
+    }
+    let Some(workdir) = workdir else {
+        return Ok(command.into());
+    };
+    validate_manifest_guest_workdir(workdir)?;
+    Ok(format!("cd {} && {command}", shell_single_quote(workdir)))
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\\"'\\\"'"))
+}
+
+fn bounded_guest_failure_detail(result: &CommandResult) -> String {
+    let mut detail = String::from_utf8_lossy(&result.stderr).trim().to_owned();
+    if detail.is_empty() {
+        detail = String::from_utf8_lossy(&result.stdout).trim().to_owned();
+    }
+    bounded_log_line(&detail)
 }
 
 /// Translate the strictly supported manifest runtime subset to the existing
@@ -1099,7 +1338,7 @@ async fn manifest_stack_plan(
         .stack(request_stack)
         .map_err(|_| "selected manifest stack does not exist".to_owned())?;
     let macos_guest =
-        derive_manifest_macos_guest(stack, task_name, &observe_manifest_guest_host_capability())?;
+        derive_manifest_macos_guest(stack, &observe_manifest_guest_host_capability())?;
     if stack.env.len() > bosn_core::MAX_ENVIRONMENT_ENTRIES
         || stack.env.iter().any(|(key, value)| {
             key.is_empty()
@@ -1120,11 +1359,23 @@ async fn manifest_stack_plan(
         .iter()
         .map(|mount| manifest_workspace_mount(&workspace, mount))
         .collect::<Result<Vec<_>, _>>()?;
-    let workdir = stack
-        .workdir
-        .as_deref()
-        .map(|value| manifest_workdir_to_workspace_relative(&workspace, value, &mounts))
+    // A dockurr bind exists outside the VM and is therefore intentionally not
+    // a guest workdir. Keep the VM path separately for the typed SSH command;
+    // the setup receipt itself must remain a pure guest container shape.
+    let guest_workdir = macos_guest
+        .as_ref()
+        .and_then(|_| stack.workdir.clone())
+        .map(|value| validate_manifest_guest_workdir(&value).map(|_| value))
         .transpose()?;
+    let workdir = if macos_guest.is_some() {
+        None
+    } else {
+        stack
+            .workdir
+            .as_deref()
+            .map(|value| manifest_workdir_to_workspace_relative(&workspace, value, &mounts))
+            .transpose()?
+    };
     let tmpfs = manifest_tmpfs(stack)?;
     let (pinned_image, dockerfile_build, base_generation) = if stack.dockerfile.is_some() {
         if stack.image.is_some() {
@@ -1168,7 +1419,7 @@ async fn manifest_stack_plan(
     let generation = manifest_runtime_generation(
         &base_generation,
         &mounts,
-        workdir.as_deref(),
+        guest_workdir.as_deref().or(workdir.as_deref()),
         &stack.volumes,
         &tmpfs,
         macos_guest.as_ref(),
@@ -1207,6 +1458,7 @@ async fn manifest_stack_plan(
         )
     };
     let mut tasks = BTreeMap::new();
+    let mut guest_task = None;
     if let Some(task_name) = task_name {
         let task = manifest
             .task(task_name)
@@ -1225,6 +1477,21 @@ async fn manifest_stack_plan(
                 environment: BTreeMap::new(),
             },
         );
+        if let Some(guest) = stack.guest.as_ref() {
+            if guest.payload.is_some() {
+                return Err(
+                    "macOS guest task payload requires the native typed SCP transport, which is not implemented"
+                        .into(),
+                );
+            }
+            guest_task = Some(ManifestGuestTask {
+                ssh_user: guest.ssh_user.clone(),
+                ssh_port: u16::try_from(guest.ssh_port)
+                    .map_err(|_| "macOS guest SSH port is invalid".to_owned())?,
+                workdir: guest_workdir,
+                command: task.cmd.clone(),
+            });
+        }
     }
     let task_names = tasks.keys().cloned().collect();
     let workspace_string = workspace.to_string_lossy().into_owned();
@@ -1270,6 +1537,7 @@ async fn manifest_stack_plan(
         generation,
         volumes,
         is_guest: stack.kind.as_deref() == Some("macos-x64-guest"),
+        guest_task,
     })
 }
 
@@ -1337,6 +1605,17 @@ struct ManifestRuntimePlan {
     generation: String,
     volumes: Vec<ManifestVolumeResource>,
     is_guest: bool,
+    /// Remote-only details retained outside `SetupPlan`: the setup container
+    /// receipt must stay free of a Linux-container workdir for a VM guest.
+    guest_task: Option<ManifestGuestTask>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManifestGuestTask {
+    ssh_user: String,
+    ssh_port: u16,
+    workdir: Option<String>,
+    command: String,
 }
 
 /// Read-only guest host facts composed from kernal-api's existing host and
@@ -1366,7 +1645,6 @@ fn observe_manifest_guest_host_capability() -> ManifestGuestHostCapability {
 /// the refusal/default rules without a KVM host.
 fn derive_manifest_macos_guest(
     stack: &bosn_core::manifest::Stack,
-    task_name: Option<&str>,
     capability: &ManifestGuestHostCapability,
 ) -> Result<Option<SetupMacosGuest>, String> {
     let (kind, guest) = (&stack.kind, &stack.guest);
@@ -1394,17 +1672,14 @@ fn derive_manifest_macos_guest(
             "macOS guest stack must use an immutable guest image, not Dockerfile build".into(),
         );
     }
-    if stack.workdir.is_some() {
+    if guest.ssh_host != "127.0.0.1" {
         return Err(
-            "macOS guest workdir requires the native SSH task transport, which is not implemented"
+            "macOS guest SSH transport is fixed to 127.0.0.1; guest.ssh_host must be 127.0.0.1"
                 .into(),
         );
     }
-    if task_name.is_some() {
-        return Err(
-            "macOS guest tasks require the native SSH task transport, which is not implemented"
-                .into(),
-        );
+    if !valid_manifest_guest_ssh_user(&guest.ssh_user) {
+        return Err("macOS guest ssh_user is unsafe for the typed SSH transport".into());
     }
     validate_manifest_macos_guest_storage(stack)?;
     if [
@@ -1440,6 +1715,22 @@ fn derive_manifest_macos_guest(
         storage_scope: Scope::Machine,
         storage_retention: Retention::Pinned,
     }))
+}
+
+fn valid_manifest_guest_ssh_user(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.as_bytes()[0].is_ascii_alphabetic()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn validate_manifest_guest_workdir(value: &str) -> Result<(), String> {
+    if !normalized_container_path(value) {
+        return Err("macOS guest workdir is not a normalized absolute path".into());
+    }
+    Ok(())
 }
 
 fn validate_manifest_macos_guest_storage(stack: &bosn_core::manifest::Stack) -> Result<(), String> {
@@ -9047,23 +9338,29 @@ mod tests {
             kvm_available: false,
             tun_available: false,
         };
-        assert!(derive_manifest_macos_guest(stack, None, &unsupported).is_err());
+        assert!(derive_manifest_macos_guest(stack, &unsupported).is_err());
         let capable = ManifestGuestHostCapability {
             os: "linux",
             kvm_available: true,
             tun_available: true,
         };
         assert_eq!(
-            derive_manifest_macos_guest(stack, None, &capable)
+            derive_manifest_macos_guest(stack, &capable)
                 .unwrap()
                 .unwrap()
                 .cpu_cores,
             1
         );
+        assert!(derive_manifest_macos_guest(stack, &capable).is_ok());
+        let non_loopback = parse_manifest_toml(
+            "[stack.mac]\nkind = 'macos-x64-guest'\nacknowledge_macos_license = true\nimage = 'dockurr/macos@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n[stack.mac.guest]\nssh_host = 'guest.example'\n[stack.mac.volumes.storage]\nscope = 'machine'\ndestination = '/storage'\nretention = 'pinned'\n",
+            ManifestRoots::new("test", "/workspace", "/workspace"),
+        )
+        .unwrap();
         assert!(
-            derive_manifest_macos_guest(stack, Some("test"), &capable)
+            derive_manifest_macos_guest(non_loopback.stack("mac").unwrap(), &capable)
                 .unwrap_err()
-                .contains("SSH task transport")
+                .contains("127.0.0.1")
         );
     }
 
@@ -9097,7 +9394,7 @@ mod tests {
         let valid = manifest(
             "[stack.mac]\nkind = 'macos-x64-guest'\nacknowledge_macos_license = true\nimage = 'dockurr/macos@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n[stack.mac.volumes.storage]\nscope = 'machine'\ndestination = '/storage'\nretention = 'pinned'\n",
         );
-        assert!(derive_manifest_macos_guest(valid.stack("mac").unwrap(), None, &capable).is_ok());
+        assert!(derive_manifest_macos_guest(valid.stack("mac").unwrap(), &capable).is_ok());
 
         for body in [
             "[stack.mac]\nkind = 'macos-x64-guest'\nacknowledge_macos_license = true\nimage = 'example.invalid/macos@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n[stack.mac.volumes.storage]\nscope = 'machine'\ndestination = '/storage'\nretention = 'pinned'\n",
@@ -9106,9 +9403,7 @@ mod tests {
             "[stack.mac]\nkind = 'macos-x64-guest'\nacknowledge_macos_license = true\nimage = 'dockurr/macos@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n[stack.mac.volumes.storage]\nscope = 'stack'\ndestination = '/storage'\nretention = 'pinned'\n",
         ] {
             let invalid = manifest(body);
-            assert!(
-                derive_manifest_macos_guest(invalid.stack("mac").unwrap(), None, &capable).is_err()
-            );
+            assert!(derive_manifest_macos_guest(invalid.stack("mac").unwrap(), &capable).is_err());
         }
     }
 
@@ -10961,6 +11256,214 @@ mod tests {
             stdout: stdout.into(),
             stderr: Vec::new(),
         }
+    }
+
+    struct FakeGuestSshTransport {
+        calls: Mutex<Vec<GuestSshCommand>>,
+        results: Mutex<VecDeque<Result<CommandResult, CommandError>>>,
+    }
+    impl FakeGuestSshTransport {
+        fn new(results: impl IntoIterator<Item = Result<CommandResult, CommandError>>) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                results: Mutex::new(results.into_iter().collect()),
+            }
+        }
+    }
+    impl GuestSshTaskTransport for FakeGuestSshTransport {
+        fn stream<'a>(
+            &'a self,
+            command: GuestSshCommand,
+            _options: RunOptions,
+            _cancellation: &'a async_engine::CancellationToken,
+            _events: &'a async_engine::Sender<EngineEvent>,
+        ) -> Pin<Box<dyn Future<Output = Result<CommandResult, CommandError>> + Send + 'a>>
+        {
+            self.calls.lock().unwrap().push(command);
+            Box::pin(ready(self.results.lock().unwrap().pop_front().unwrap()))
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeManifestGuestSession {
+        events: Mutex<Vec<String>>,
+    }
+    impl ManifestAppTaskSessionRecorder for FakeManifestGuestSession {
+        fn begin<'a>(
+            &'a self,
+            identity: String,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("begin:{identity}"));
+            Box::pin(ready(Ok(())))
+        }
+        fn finish<'a>(
+            &'a self,
+            outcome: &'static str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("finish:{outcome}"));
+            Box::pin(ready(Ok(())))
+        }
+    }
+
+    #[test]
+    fn guest_task_uses_only_daemon_identity_loopback_and_retains_uncertain_session() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let identity = state.join("guest-ssh").join("id_ed25519");
+        std::fs::create_dir_all(identity.parent().unwrap()).unwrap();
+        std::fs::write(&identity, "not-a-real-key-for-unit-test").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &identity,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        let transport = FakeGuestSshTransport::new([
+            Ok(command_result(0, [])),
+            // SSH exit 255 is intentionally ambiguous: the local client
+            // cannot prove whether the remote command completed.
+            Ok(command_result(255, "connection reset")),
+        ]);
+        let session = FakeManifestGuestSession::default();
+        let observed = SetupEnsureResult {
+            container_name: format!("bosn-setup-{TEST_HASH}"),
+            container_id: TEST_CONTAINER_ID.into(),
+            image_identity: TEST_IDENTITY.into(),
+            created: false,
+            started: false,
+            running: true,
+        };
+        let (events, _receiver) = async_engine::channel(8);
+        let (logs, _log_receiver) = async_engine::channel(8);
+        let cancellation = CancellationSource::new();
+        let token = cancellation.token();
+        RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let error = execute_manifest_guest_ssh_task(
+                    &transport,
+                    &state,
+                    &observed,
+                    &ManifestGuestTask {
+                        ssh_user: "runner".into(),
+                        ssh_port: 2222,
+                        workdir: Some("/Users/runner/space dir".into()),
+                        command: "echo declared; true".into(),
+                    },
+                    "check",
+                    &async_engine::Deadline::after(Duration::from_secs(1)),
+                    1024,
+                    &token,
+                    &logs,
+                    &events,
+                    &session,
+                )
+                .await
+                .unwrap_err();
+                assert!(error.contains("completion is unknown"));
+            });
+        let calls = transport.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].command, "true");
+        assert_eq!(calls[1].port, 2222);
+        assert_eq!(calls[1].user, "runner");
+        assert_eq!(calls[1].identity_file, identity);
+        assert_eq!(
+            calls[1].command,
+            "cd '/Users/runner/space dir' && echo declared; true"
+        );
+        assert_eq!(
+            session.events.lock().unwrap().as_slice(),
+            [
+                format!("begin:bosn-setup-{TEST_HASH}"),
+                "finish:uncertain".into()
+            ]
+        );
+    }
+
+    #[test]
+    fn guest_task_cancellation_after_remote_start_is_uncertain() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let identity = state.join("guest-ssh").join("id_ed25519");
+        std::fs::create_dir_all(identity.parent().unwrap()).unwrap();
+        std::fs::write(&identity, "unit-test-key").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &identity,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        let transport = FakeGuestSshTransport::new([
+            Ok(command_result(0, [])),
+            Err(CommandError::Cancelled {
+                reaped_pid: Some(1),
+                cleanup: None,
+            }),
+        ]);
+        let session = FakeManifestGuestSession::default();
+        let observed = SetupEnsureResult {
+            container_name: format!("bosn-setup-{TEST_HASH}"),
+            container_id: TEST_CONTAINER_ID.into(),
+            image_identity: TEST_IDENTITY.into(),
+            created: false,
+            started: false,
+            running: true,
+        };
+        let (events, _receiver) = async_engine::channel(8);
+        let (logs, _log_receiver) = async_engine::channel(8);
+        let cancellation = CancellationSource::new();
+        let token = cancellation.token();
+        RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                assert!(
+                    execute_manifest_guest_ssh_task(
+                        &transport,
+                        &state,
+                        &observed,
+                        &ManifestGuestTask {
+                            ssh_user: "runner".into(),
+                            ssh_port: 2222,
+                            workdir: None,
+                            command: "sleep 10".into(),
+                        },
+                        "wait",
+                        &async_engine::Deadline::after(Duration::from_secs(1)),
+                        1024,
+                        &token,
+                        &logs,
+                        &events,
+                        &session,
+                    )
+                    .await
+                    .unwrap_err()
+                    .contains("completion is unknown")
+                );
+            });
+        assert_eq!(
+            session.events.lock().unwrap().as_slice(),
+            [
+                format!("begin:bosn-setup-{TEST_HASH}"),
+                "finish:uncertain".into()
+            ]
+        );
     }
 
     #[test]
