@@ -75,11 +75,21 @@ PYO3_PYTHON="$PYTHON_BIN" LD_LIBRARY_PATH="$PYTHON_LIB${LD_LIBRARY_PATH:+:$LD_LI
   soldr cargo test -j1 -p bosn --lib --locked --no-default-features --features embedded-python-tests
 ```
 
-The wheel proof builds and installs a fresh artifact without the checkout:
+The wheel proof builds a platform wheel, then installs it into a clean virtual
+environment outside the checkout. It verifies the host-specific extension and
+native executable filenames, imports the extension, and starts/stops the
+bundled daemon while exercising `daemon status` and `doctor` with Docker
+deliberately unreachable:
 
 ```bash
 uv run pytest tests/test_native_wheel.py -q
+# Or, after `uv build --wheel`:
+python ci/verify_installed_wheel.py 'dist/bosn-*.whl'
 ```
+
+GitHub Actions runs that proof on Python 3.11 for Linux, macOS, and Windows.
+Those native-wheel lanes do not need Docker; the separate Linux lane remains
+the Docker integration test.
 
 ## Performance comparison baseline
 
