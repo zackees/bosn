@@ -6,7 +6,7 @@
 use bosn_core::{parse_and_plan_compose_yaml, parse_setup_config_locator};
 use bosn_service::{
     Client as ServiceClient, DoctorReport as ServiceDoctorReport, JobLogPage as ServiceJobLogPage,
-    JobStatus as ServiceJobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE,
+    JobStatus as ServiceJobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE, ManifestEnsureJobRequest,
     RegistryResourcePage as ServiceRegistryResourcePage, SetupAdoptRequest, SetupAppTaskJobRequest,
     SetupDoneResult as ServiceSetupDoneResult, SetupEnsureEventPage as ServiceSetupEnsureEventPage,
     SetupEnsureJobRequest, SetupGcApplyResult as ServiceSetupGcApplyResult,
@@ -430,6 +430,36 @@ impl Client {
                     workspace,
                     config: config_locator,
                     policy,
+                    deadline: Duration::from_millis(deadline_ms),
+                    output_limit: output_limit as usize,
+                },
+            )
+            .map_err(service_error)
+        })
+    }
+    /// Submit one bounded native ensure for an explicitly selected legacy
+    /// manifest stack. The manifest path is relative to workspace; the daemon
+    /// derives every image/container detail and rejects unsupported fields.
+    #[pyo3(signature = (workspace, manifest, stack, *, deadline_ms, output_limit))]
+    #[allow(clippy::too_many_arguments)]
+    fn submit_manifest_ensure(
+        &self,
+        workspace: PathBuf,
+        manifest: String,
+        stack: String,
+        deadline_ms: u64,
+        output_limit: u32,
+        py: Python<'_>,
+    ) -> PyResult<u64> {
+        validate_manifest_ensure_input(&workspace, &manifest, &stack, deadline_ms, output_limit)?;
+        let state_dir = self.state_dir.clone();
+        py.detach(move || {
+            submit_manifest_ensure(
+                &state_dir,
+                ManifestEnsureJobRequest {
+                    workspace,
+                    manifest,
+                    stack,
                     deadline: Duration::from_millis(deadline_ms),
                     output_limit: output_limit as usize,
                 },
@@ -1349,6 +1379,21 @@ fn submit_setup_ensure(
     })
 }
 
+fn submit_manifest_ensure(
+    state_dir: &Path,
+    request: ManifestEnsureJobRequest,
+) -> Result<u64, bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async {
+        ServiceClient::for_state(state_dir)?
+            .submit_manifest_ensure(request)
+            .await
+    })
+}
+
 fn job_status(state_dir: &Path, job_id: u64) -> Result<ServiceJobStatus, bosn_service::Error> {
     let runtime = RuntimeBuilder::multi_thread()
         .worker_threads(1)
@@ -1460,6 +1505,54 @@ fn validate_setup_task_input(
         })
     {
         return Err(PyValueError::new_err("task_name is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_manifest_ensure_input(
+    workspace: &Path,
+    manifest: &str,
+    stack: &str,
+    deadline_ms: u64,
+    output_limit: u32,
+) -> PyResult<()> {
+    let workspace = workspace
+        .to_str()
+        .ok_or_else(|| PyValueError::new_err("workspace must be valid UTF-8"))?;
+    if workspace.is_empty() || workspace.len() > 8 * 1024 || workspace.bytes().any(|byte| byte == 0)
+    {
+        return Err(PyValueError::new_err("workspace is empty or invalid"));
+    }
+    if manifest.is_empty()
+        || manifest.len() > 4096
+        || manifest.contains('\0')
+        || manifest.starts_with('/')
+        || manifest.contains('\\')
+        || manifest
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(PyValueError::new_err(
+            "manifest must be a safe workspace-relative path",
+        ));
+    }
+    if stack.is_empty()
+        || stack.len() > 128
+        || !stack
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return Err(PyValueError::new_err("stack is invalid"));
+    }
+    if deadline_ms == 0 || deadline_ms > MAX_SETUP_PREPARE_DEADLINE_MS {
+        return Err(PyValueError::new_err(
+            "deadline_ms must be between 1 and 300000",
+        ));
+    }
+    if output_limit == 0 || output_limit > MAX_SETUP_PREPARE_OUTPUT_BYTES {
+        return Err(PyValueError::new_err(
+            "output_limit must be between 1 and 8388608",
+        ));
     }
     Ok(())
 }

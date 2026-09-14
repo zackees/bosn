@@ -1,7 +1,11 @@
 //! Small, authenticated Rust daemon foundation. Product protobuf remains private.
 
-use bosn_core::{ResourceKind, ResourceState, Retention, Scope};
+use bosn_core::{
+    ManifestRoots, ResourceKind, ResourceState, Retention, Scope, SetupApp, SetupSource,
+    parse_manifest_toml,
+};
 use bosn_engine::{DockerDoctorReport, DockerDoctorState, DockerEngine, EngineEvent, RunOptions};
+use bosn_generation::{ExternalImageIdentity, collector::CollectorLimits, stack_generation_async};
 use bosn_registry::{
     Event, ExecutionSession, Registry, RegistryStatus, Resource, ResourceUse, SetupDone,
     SetupGcPreview,
@@ -11,8 +15,8 @@ use bosn_setup::PreparedImageKind;
 use bosn_setup::{
     PreparedImage, SetupAcquirePolicy, SetupAppTaskRequest, SetupEnsureEngine,
     SetupEnsureRequest as CoreSetupEnsureRequest, SetupEnsureResult, SetupImageEngine, SetupPlan,
-    SetupPlanRequest, SetupTaskRequest, adopt_setup_app, ensure_setup_app, execute_setup_app_task,
-    execute_setup_task, plan_setup, prepare_setup_image,
+    SetupPlanAppSource, SetupPlanRequest, SetupTaskRequest, adopt_setup_app, ensure_setup_app,
+    execute_setup_app_task, execute_setup_task, plan_setup, prepare_setup_image,
 };
 use jobs::{Jobs, Submission};
 use kernal_api::{
@@ -136,6 +140,19 @@ pub struct SetupEnsureJobRequest {
     pub deadline: Duration,
     pub output_limit: usize,
 }
+/// One bounded daemon-owned ensure of an explicitly selected legacy Bosn
+/// manifest stack. The caller selects neither an image nor Docker controls:
+/// those remain in the parsed manifest. `manifest` must be a safe relative
+/// path beneath `workspace`; remote manifests are intentionally not a part of
+/// this initial runtime slice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManifestEnsureJobRequest {
+    pub workspace: PathBuf,
+    pub manifest: String,
+    pub stack: String,
+    pub deadline: Duration,
+    pub output_limit: usize,
+}
 /// Explicit, confirmed restoration of a lost local registry record for an
 /// already-existing Bosn-managed setup application. It has no engine targets:
 /// plan, image identity, deterministic name, and labels are all re-derived.
@@ -217,6 +234,16 @@ pub trait SetupEnsureExecutor: Send + Sync {
     fn execute<'a>(
         &'a self,
         request: SetupEnsureJobRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a async_engine::Sender<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>>;
+}
+/// Testable semantic boundary for a single manifest stack ensure. It receives
+/// no raw Docker command, name, label, image, mount, environment, or command.
+pub trait ManifestEnsureExecutor: Send + Sync {
+    fn execute<'a>(
+        &'a self,
+        request: ManifestEnsureJobRequest,
         cancellation: &'a async_engine::CancellationToken,
         logs: &'a async_engine::Sender<String>,
     ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>>;
@@ -543,6 +570,237 @@ impl SetupEnsureExecutor for DockerSetupEnsureExecutor {
             })
         })
     }
+}
+
+/// Docker-backed implementation of the deliberately narrow legacy-manifest
+/// runtime bridge. It translates only the accepted typed manifest shape into
+/// the existing finite image-prepare and ownership-safe ensure primitives;
+/// it never invokes a generic Compose/Docker runner.
+#[derive(Clone)]
+pub struct DockerManifestEnsureExecutor {
+    engine: DockerEngine,
+}
+impl DockerManifestEnsureExecutor {
+    fn new() -> Self {
+        Self {
+            engine: DockerEngine::docker(),
+        }
+    }
+}
+impl ManifestEnsureExecutor for DockerManifestEnsureExecutor {
+    fn execute<'a>(
+        &'a self,
+        request: ManifestEnsureJobRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a async_engine::Sender<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let prepare_output = request.output_limit / 2;
+            let ensure_output = request.output_limit.saturating_sub(prepare_output);
+            if prepare_output == 0 || ensure_output == 0 {
+                return Err(
+                    "manifest ensure output budget cannot fund preparation and ensure".into(),
+                );
+            }
+            let deadline = async_engine::Deadline::after(request.deadline);
+            let (plan, generation) = async_engine::cancellable(
+                cancellation,
+                async_engine::timeout_at(deadline, manifest_stack_setup_plan(&request)),
+            )
+            .await
+            .map_err(|_| "manifest ensure cancelled".to_owned())?
+            .map_err(|_| "manifest ensure planning exceeded its deadline".to_owned())??;
+            let (events, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
+            let forwarded_logs = logs.clone();
+            let forwarder = async_engine::launch(async move {
+                while let Some(event) = receiver.recv().await {
+                    forward_engine_event(&forwarded_logs, event).await?;
+                }
+                Ok::<(), String>(())
+            });
+            let pipeline = SetupEnsurePipeline {
+                plan: &plan,
+                workspace: request.workspace.clone(),
+                deadline: &deadline,
+                prepare_output,
+                ensure_output,
+            };
+            logs.send("[manifest] preparing immutable application image".into())
+                .await
+                .map_err(|_| "manifest log consumer closed".to_owned())?;
+            let result =
+                execute_setup_ensure_pipeline(&self.engine, &pipeline, cancellation, &events, logs)
+                    .await;
+            drop(events);
+            forwarder
+                .await
+                .map_err(|_| "manifest log forwarder stopped".to_owned())??;
+            let result = result?;
+            if result.ensured.image_identity != result.prepared.observed_identity {
+                return Err("manifest ensure image receipt does not match ensured app".into());
+            }
+            let workspace = plan.workspace_root.to_string_lossy().into_owned();
+            Ok(SetupEnsureExecution {
+                receipt: format!(
+                    "ensured manifest stack {} as {}",
+                    request.stack, result.ensured.container_name
+                ),
+                resource: SetupEnsureResource {
+                    id: format!("manifest-container:{}:{}", request.stack, generation),
+                    name: result.ensured.container_name,
+                    stack: request.stack.clone(),
+                    generation: generation.clone(),
+                    workspace: workspace.clone(),
+                },
+                image: SetupEnsureImageResource {
+                    id: format!("manifest-image:{}", result.prepared.observed_identity),
+                    name: format!("manifest-image:{}", result.prepared.observed_identity),
+                    stack: request.stack,
+                    generation: result.prepared.observed_identity,
+                    workspace,
+                },
+            })
+        })
+    }
+}
+
+/// Translate the strictly supported manifest runtime subset to the existing
+/// typed setup receipt. This is intentionally a refusal boundary, not a
+/// lossy migration: fields which would need more lifecycle semantics are
+/// rejected before Docker is contacted.
+async fn manifest_stack_setup_plan(
+    request: &ManifestEnsureJobRequest,
+) -> Result<(SetupPlan, String), String> {
+    let workspace = fs::canonical_context_path(&request.workspace)
+        .map_err(|_| "manifest workspace cannot be canonicalized".to_owned())?;
+    let metadata = fs::context_path_metadata_no_follow(&workspace)
+        .map_err(|_| "manifest workspace is not a directory".to_owned())?;
+    if metadata.kind != fs::ContextPathKind::Directory {
+        return Err("manifest workspace is not a directory".into());
+    }
+    if !safe_manifest_relative_path(&request.manifest) {
+        return Err("manifest path must be a safe workspace-relative path".into());
+    }
+    let manifest_path = workspace.join(&request.manifest);
+    let manifest_path = fs::canonical_context_path(&manifest_path)
+        .map_err(|_| "manifest file cannot be canonicalized".to_owned())?;
+    if !manifest_path.starts_with(&workspace) {
+        return Err("manifest path escapes selected workspace".into());
+    }
+    let bytes = fs::read_context_regular_file_bounded(&manifest_path, 1024 * 1024)
+        .map_err(|_| "manifest file is not a bounded regular UTF-8 file".to_owned())?;
+    let source =
+        std::str::from_utf8(&bytes.bytes).map_err(|_| "manifest file is not UTF-8".to_owned())?;
+    let manifest = parse_manifest_toml(
+        source,
+        ManifestRoots::new(
+            "workspace manifest",
+            workspace.to_string_lossy(),
+            workspace.to_string_lossy(),
+        ),
+    )
+    .map_err(|_| "manifest is invalid".to_owned())?;
+    let stack = manifest
+        .stack(&request.stack)
+        .map_err(|_| "selected manifest stack does not exist".to_owned())?;
+    if stack.dockerfile.is_some()
+        || stack.kind.is_some()
+        || stack.guest.is_some()
+        || !stack.volumes.is_empty()
+        || !stack.mounts.is_empty()
+        || !stack.tmpfs.is_empty()
+        || stack.workdir.is_some()
+        || stack.family.is_some()
+    {
+        return Err("selected manifest stack uses an unsupported runtime field".into());
+    }
+    let image = stack
+        .image
+        .as_deref()
+        .filter(|image| valid_manifest_pinned_image(image))
+        .ok_or_else(|| {
+            "selected manifest stack must use an immutable digest-pinned image".to_owned()
+        })?
+        .to_owned();
+    if stack.env.len() > bosn_core::MAX_ENVIRONMENT_ENTRIES
+        || stack.env.iter().any(|(key, value)| {
+            key.is_empty()
+                || key.contains('=')
+                || key.contains('\0')
+                || value.contains('\0')
+                || value.len() > 16 * 1024
+        })
+    {
+        return Err("selected manifest stack has unsafe environment data".into());
+    }
+    let digest = image
+        .rsplit_once("@sha256:")
+        .map(|(_, value)| format!("sha256:{value}"))
+        .expect("validated pinned image has digest");
+    let generation = stack_generation_async(
+        &manifest,
+        stack,
+        &workspace,
+        &CollectorLimits::default(),
+        &[ExternalImageIdentity {
+            reference: image.clone(),
+            platform: None,
+            identity: Some(digest),
+        }],
+    )
+    .await
+    .map_err(|_| "manifest generation could not be derived".to_owned())?;
+    let content_sha256 = generation
+        .strip_prefix("sha256:")
+        .ok_or_else(|| "manifest generation is invalid".to_owned())?
+        .to_owned();
+    let app = SetupApp {
+        source: SetupSource::PinnedImage(image.clone()),
+        environment: stack.env.clone(),
+        workdir: None,
+        command: None,
+        mounts: Vec::new(),
+    };
+    Ok((
+        SetupPlan {
+            source_kind: bosn_setup::SetupSourceKind::LocalFile,
+            content_sha256,
+            schema_version: bosn_core::SETUP_DOCUMENT_VERSION,
+            workspace_root: workspace,
+            asset_root: None,
+            task_names: Vec::new(),
+            app,
+            tasks: BTreeMap::new(),
+            app_source: SetupPlanAppSource::PinnedImage { image },
+        },
+        generation,
+    ))
+}
+
+fn safe_manifest_relative_path(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 4096
+        && !value.contains('\0')
+        && !value.contains('\\')
+        && !value.starts_with('/')
+        && !value
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+}
+
+fn valid_manifest_pinned_image(value: &str) -> bool {
+    let Some((name, digest)) = value.rsplit_once("@sha256:") else {
+        return false;
+    };
+    !name.is_empty()
+        && value.len() <= 512
+        && !value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Docker-backed restoration. Preparation is deliberately retained because it
@@ -2225,6 +2483,43 @@ impl Client {
             _ => Err(Error::Protocol("unexpected setup ensure response")),
         }
     }
+    /// Submit one explicit manifest stack runtime ensure. The selected stack
+    /// is a manifest declaration, never a Docker target or command.
+    pub async fn submit_manifest_ensure(
+        &self,
+        request: ManifestEnsureJobRequest,
+    ) -> Result<u64, Error> {
+        let workspace = request
+            .workspace
+            .to_str()
+            .ok_or(Error::Protocol("manifest workspace is not UTF-8"))?
+            .to_owned();
+        let deadline_ms = u64::try_from(request.deadline.as_millis())
+            .map_err(|_| Error::Protocol("manifest deadline too large"))?;
+        let output_limit = u32::try_from(request.output_limit)
+            .map_err(|_| Error::Protocol("manifest output limit too large"))?;
+        validate_manifest_ensure_wire(
+            &workspace,
+            &request.manifest,
+            &request.stack,
+            deadline_ms,
+            output_limit,
+        )?;
+        match self
+            .call(Request {
+                workspace,
+                stack: request.stack,
+                setup_config: request.manifest,
+                setup_deadline_ms: deadline_ms,
+                setup_output_limit: output_limit,
+                ..Request::operation(22)
+            })
+            .await?
+        {
+            Reply::Job(id) => Ok(id),
+            _ => Err(Error::Protocol("unexpected manifest ensure response")),
+        }
+    }
     async fn call(&self, request: Request) -> Result<Reply, Error> {
         // Resolve on every call: a Client may have been constructed while a
         // fresh daemon was still creating its registry, before an inode-based
@@ -2257,6 +2552,7 @@ pub struct Service {
     setup_task_executor: Arc<dyn SetupTaskExecutor>,
     setup_app_task_executor: Arc<dyn SetupAppTaskExecutor>,
     setup_ensure_executor: Arc<dyn SetupEnsureExecutor>,
+    manifest_ensure_executor: Arc<dyn ManifestEnsureExecutor>,
     setup_adopt_executor: Arc<dyn SetupAdoptExecutor>,
     doctor_executor: Arc<dyn DoctorExecutor>,
     setup_reconcile_executor: Arc<dyn SetupReconcileExecutor>,
@@ -2346,6 +2642,11 @@ enum DbCommand {
         execution: Box<SetupEnsureExecution>,
         reply: async_engine::OneshotSender<Result<(), Error>>,
     },
+    RecordManifestEnsure {
+        job_id: u64,
+        execution: Box<SetupEnsureExecution>,
+        reply: async_engine::OneshotSender<Result<(), Error>>,
+    },
     RecordSetupAdoption {
         execution: Box<SetupEnsureExecution>,
         reply: async_engine::OneshotSender<Result<(), Error>>,
@@ -2403,11 +2704,20 @@ enum JobCommand {
         request: SetupEnsureJobRequest,
         reply: async_engine::OneshotSender<Result<u64, Error>>,
     },
+    SubmitManifestEnsure {
+        request: ManifestEnsureJobRequest,
+        reply: async_engine::OneshotSender<Result<u64, Error>>,
+    },
     /// The job actor, rather than an executor task, owns the transition from
     /// a cancellable running job to a durably recorded successful ensure.
     /// It deliberately awaits the registry transaction before it processes a
     /// later Cancel command, then settles the job before replying.
     PersistSetupEnsure {
+        id: u64,
+        execution: SetupEnsureExecution,
+        reply: async_engine::OneshotSender<Result<(), String>>,
+    },
+    PersistManifestEnsure {
         id: u64,
         execution: SetupEnsureExecution,
         reply: async_engine::OneshotSender<Result<(), String>>,
@@ -2430,6 +2740,7 @@ enum SetupJobKind {
     Task,
     AppTask,
     Ensure,
+    ManifestEnsure,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2495,6 +2806,7 @@ enum SetupJobRequest {
     Task(SetupTaskJobRequest),
     AppTask(SetupAppTaskJobRequest),
     Ensure(SetupEnsureJobRequest),
+    ManifestEnsure(ManifestEnsureJobRequest),
 }
 
 #[derive(Clone)]
@@ -2503,6 +2815,7 @@ struct SetupExecutors {
     task: Arc<dyn SetupTaskExecutor>,
     app_task: Arc<dyn SetupAppTaskExecutor>,
     ensure: Arc<dyn SetupEnsureExecutor>,
+    manifest_ensure: Arc<dyn ManifestEnsureExecutor>,
 }
 impl JobActor {
     async fn submit(&self, workspace: String, stack: String, digest: String) -> Result<u64, Error> {
@@ -2575,6 +2888,17 @@ impl JobActor {
         let (reply, wait) = async_engine::oneshot_channel();
         self.sender
             .send(JobCommand::SubmitSetupEnsure { request, reply })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
+    async fn submit_manifest_ensure(
+        &self,
+        request: ManifestEnsureJobRequest,
+    ) -> Result<u64, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(JobCommand::SubmitManifestEnsure { request, reply })
             .await
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
@@ -2812,6 +3136,35 @@ async fn job_actor(
                     registry.clone(),
                 );
             }
+            JobCommand::SubmitManifestEnsure { request, reply } => {
+                let digest = manifest_ensure_digest(&request);
+                let workspace = request.workspace.to_string_lossy().into_owned();
+                let job_stack = format!("manifest-ensure:{}", request.stack);
+                let result = jobs
+                    .submit(&workspace, &job_stack, &digest)
+                    .map(|submission| match submission {
+                        Submission::Started(id) | Submission::Queued(id) => {
+                            requests.insert(id, SetupJobRequest::ManifestEnsure(request));
+                            id
+                        }
+                        Submission::Joined(id) => id,
+                        Submission::Superseded { replacement, .. } => {
+                            requests.insert(replacement, SetupJobRequest::ManifestEnsure(request));
+                            replacement
+                        }
+                    })
+                    .map_err(|_| Error::Protocol("manifest ensure job admission"));
+                let _ = reply.send(result);
+                launch_started_setup_jobs(
+                    &mut jobs,
+                    &mut requests,
+                    &mut cancellations,
+                    &mut tasks,
+                    &executors,
+                    sender.clone(),
+                    registry.clone(),
+                );
+            }
             JobCommand::PersistSetupEnsure {
                 id,
                 execution,
@@ -2839,6 +3192,32 @@ async fn job_actor(
                         })
                 } else {
                     Err("setup ensure cancelled".into())
+                };
+                let _ = reply.send(result);
+            }
+            JobCommand::PersistManifestEnsure {
+                id,
+                execution,
+                reply,
+            } => {
+                let result = if jobs
+                    .job(id)
+                    .is_ok_and(|job| job.state == jobs::JobState::Running)
+                {
+                    let receipt = execution.receipt.clone();
+                    registry
+                        .record_manifest_ensure(id, execution)
+                        .await
+                        .map_err(|error| {
+                            format!("manifest ensure registry recording failed: {error}")
+                        })
+                        .map(|()| {
+                            cancellations.remove(&id);
+                            let _ = jobs.log(id, bounded_log_line(&receipt));
+                            let _ = jobs.settle_with_error(id, true, None);
+                        })
+                } else {
+                    Err("manifest ensure cancelled".into())
                 };
                 let _ = reply.send(result);
             }
@@ -2889,6 +3268,7 @@ async fn job_actor(
                             SetupJobKind::Task => "setup task",
                             SetupJobKind::AppTask => "setup app task",
                             SetupJobKind::Ensure => "setup ensure",
+                            SetupJobKind::ManifestEnsure => "manifest ensure",
                         };
                         let _ = jobs.log(id, format!("{operation} failed: {error}"));
                         let _ = jobs.settle_with_error(id, false, Some(error));
@@ -2981,6 +3361,7 @@ fn launch_started_setup_jobs(
         let task_executor = Arc::clone(&executors.task);
         let app_task_executor = Arc::clone(&executors.app_task);
         let ensure_executor = Arc::clone(&executors.ensure);
+        let manifest_ensure_executor = Arc::clone(&executors.manifest_ensure);
         tasks.spawn(async move {
             let (logs, mut log_receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
             let log_sender = task_sender.clone();
@@ -3032,6 +3413,38 @@ fn launch_started_setup_jobs(
                                 .map(|error| (SetupJobKind::Ensure, Err(error)))
                         }
                         Err(error) => Some((SetupJobKind::Ensure, Err(error))),
+                    }
+                }
+                SetupJobRequest::ManifestEnsure(request) => {
+                    let result = manifest_ensure_executor
+                        .execute(request, &token, &logs)
+                        .await;
+                    match result {
+                        Ok(execution) => {
+                            let (reply, wait) = async_engine::oneshot_channel();
+                            let persisted = if task_sender
+                                .send(JobCommand::PersistManifestEnsure {
+                                    id,
+                                    execution,
+                                    reply,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                Err("manifest ensure registry actor stopped".to_owned())
+                            } else {
+                                match wait.await {
+                                    Ok(result) => result,
+                                    Err(_) => {
+                                        Err("manifest ensure registry actor stopped".to_owned())
+                                    }
+                                }
+                            };
+                            persisted
+                                .err()
+                                .map(|error| (SetupJobKind::ManifestEnsure, Err(error)))
+                        }
+                        Err(error) => Some((SetupJobKind::ManifestEnsure, Err(error))),
                     }
                 }
             };
@@ -3180,6 +3593,28 @@ fn setup_ensure_digest(request: &SetupEnsureJobRequest) -> String {
     }
     format!(
         "setup:{}",
+        kernal_api::hash::blake3_bytes(&material).to_hex()
+    )
+}
+
+fn manifest_ensure_digest(request: &ManifestEnsureJobRequest) -> String {
+    let mut material = Vec::new();
+    let workspace = request.workspace.to_string_lossy();
+    let deadline = request.deadline.as_millis().to_le_bytes();
+    let output_limit = (request.output_limit as u64).to_le_bytes();
+    for part in [
+        b"bosn.manifest-ensure.v1".as_slice(),
+        workspace.as_bytes(),
+        request.manifest.as_bytes(),
+        request.stack.as_bytes(),
+        &deadline,
+        &output_limit,
+    ] {
+        material.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        material.extend_from_slice(part);
+    }
+    format!(
+        "manifest:{}",
         kernal_api::hash::blake3_bytes(&material).to_hex()
     )
 }
@@ -3443,6 +3878,22 @@ impl RegistryActor {
         let (reply, wait) = async_engine::oneshot_channel();
         self.sender
             .send(DbCommand::RecordSetupEnsure {
+                job_id,
+                execution: Box::new(execution),
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
+    async fn record_manifest_ensure(
+        &self,
+        job_id: u64,
+        execution: SetupEnsureExecution,
+    ) -> Result<(), Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::RecordManifestEnsure {
                 job_id,
                 execution: Box::new(execution),
                 reply,
@@ -3891,6 +4342,26 @@ async fn registry_actor(
                     }
                 }
             }
+            DbCommand::RecordManifestEnsure {
+                job_id,
+                execution,
+                reply,
+            } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = record_manifest_ensure(&mut registry, job_id, &execution);
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
             DbCommand::RecordSetupAdoption { execution, reply } => {
                 let worker = async_engine::launch_blocking(move || {
                     let result = record_setup_adoption(&mut registry, &execution);
@@ -4079,6 +4550,67 @@ fn record_setup_ensure(
     transaction.commit()
 }
 
+/// Persist one successful manifest-runtime ensure atomically. Unlike setup
+/// documents, this first manifest slice explicitly refuses replacement and
+/// rollover, so it never retires a prior generation as a side effect.
+fn record_manifest_ensure(
+    registry: &mut Registry,
+    job_id: u64,
+    execution: &SetupEnsureExecution,
+) -> Result<(), bosn_registry::Error> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
+        .as_secs_f64();
+    let mut transaction = registry.begin_immediate()?;
+    for (kind, id, name, stack, generation, workspace) in [
+        (
+            ResourceKind::Container,
+            &execution.resource.id,
+            &execution.resource.name,
+            &execution.resource.stack,
+            &execution.resource.generation,
+            &execution.resource.workspace,
+        ),
+        (
+            ResourceKind::Image,
+            &execution.image.id,
+            &execution.image.name,
+            &execution.image.stack,
+            &execution.image.generation,
+            &execution.image.workspace,
+        ),
+    ] {
+        transaction.put_resource(&Resource {
+            id: id.clone(),
+            kind,
+            name: name.clone(),
+            stack: stack.clone(),
+            generation: generation.clone(),
+            scope: Scope::Machine,
+            workspace: workspace.clone(),
+            created_at: now,
+            last_used: now,
+            state: ResourceState::Active,
+            retention: Retention::Pinned,
+        })?;
+        transaction.put_resource_use(&ResourceUse {
+            resource_id: id.clone(),
+            workspace: workspace.clone(),
+            stack: stack.clone(),
+            generation: generation.clone(),
+            last_used: now,
+            state: ResourceState::Active,
+        })?;
+    }
+    transaction.append_event(
+        now,
+        "manifest.ensure.succeeded",
+        &format!("job_id={job_id}"),
+    )?;
+    transaction.commit()
+}
+
 /// Restore only an absent registry view of an already proven Docker fact.
 /// Existing records must exactly agree with the re-derived ownership facts;
 /// adoption is never an overwrite or a way to cross workspace/stack state.
@@ -4192,6 +4724,7 @@ impl Service {
             setup_task_executor: Arc::new(DockerSetupTaskExecutor::new(state_dir.clone())),
             setup_app_task_executor: Arc::new(DockerSetupAppTaskExecutor::new(state_dir.clone())),
             setup_ensure_executor: Arc::new(DockerSetupEnsureExecutor::new(state_dir.clone())),
+            manifest_ensure_executor: Arc::new(DockerManifestEnsureExecutor::new()),
             setup_adopt_executor: Arc::new(DockerSetupAdoptExecutor::new(state_dir.clone())),
             doctor_executor: Arc::new(DockerDoctorExecutor::new()),
             setup_reconcile_executor: Arc::new(DockerSetupReconcileExecutor::new()),
@@ -4222,6 +4755,14 @@ impl Service {
     /// test seam; it does not add a caller-controlled container operation.
     pub fn with_setup_ensure_executor(mut self, executor: Arc<dyn SetupEnsureExecutor>) -> Self {
         self.setup_ensure_executor = executor;
+        self
+    }
+    /// Substitute the finite semantic manifest-runtime executor for tests.
+    pub fn with_manifest_ensure_executor(
+        mut self,
+        executor: Arc<dyn ManifestEnsureExecutor>,
+    ) -> Self {
+        self.manifest_ensure_executor = executor;
         self
     }
     pub fn with_setup_adopt_executor(mut self, executor: Arc<dyn SetupAdoptExecutor>) -> Self {
@@ -4281,6 +4822,7 @@ impl Service {
                 task: Arc::clone(&self.setup_task_executor),
                 app_task: Arc::clone(&self.setup_app_task_executor),
                 ensure: Arc::clone(&self.setup_ensure_executor),
+                manifest_ensure: Arc::clone(&self.manifest_ensure_executor),
             },
             job_sender.clone(),
             actor.clone(),
@@ -4945,6 +5487,32 @@ async fn handle(
                     },
                 }
             }
+            22 => match validate_manifest_ensure_request_wire(&r) {
+                Ok(()) => match jobs
+                    .submit_manifest_ensure(ManifestEnsureJobRequest {
+                        workspace: PathBuf::from(r.workspace),
+                        manifest: r.setup_config,
+                        stack: r.stack,
+                        deadline: Duration::from_millis(r.setup_deadline_ms),
+                        output_limit: r.setup_output_limit as usize,
+                    })
+                    .await
+                {
+                    Ok(job_id) => ReplyWire {
+                        code: 40,
+                        job_id,
+                        ..Default::default()
+                    },
+                    Err(_) => ReplyWire {
+                        code: 3,
+                        ..Default::default()
+                    },
+                },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
             11 => match validate_registry_diagnostics_request_wire(&r) {
                 Ok(()) => match actor
                     .resources(r.diagnostic_after, r.diagnostic_limit)
@@ -5424,6 +5992,58 @@ fn validate_setup_ensure_wire(
     validate_setup_prepare_wire(workspace, config, policy, deadline_ms, output_limit)
 }
 
+fn validate_manifest_ensure_wire(
+    workspace: &str,
+    manifest: &str,
+    stack: &str,
+    deadline_ms: u64,
+    output_limit: u32,
+) -> Result<(), Error> {
+    validate_setup_prepare_wire(
+        workspace,
+        manifest,
+        SetupPreparePolicy::Refresh,
+        deadline_ms,
+        output_limit,
+    )?;
+    if !safe_manifest_relative_path(manifest)
+        || stack.is_empty()
+        || stack.len() > 128
+        || !stack
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return Err(Error::Protocol("invalid manifest ensure selector"));
+    }
+    Ok(())
+}
+
+fn validate_manifest_ensure_request_wire(request: &Request) -> Result<(), Error> {
+    validate_manifest_ensure_wire(
+        &request.workspace,
+        &request.setup_config,
+        &request.stack,
+        request.setup_deadline_ms,
+        request.setup_output_limit,
+    )?;
+    if !request.digest.is_empty()
+        || request.job_id != 0
+        || request.log_after != 0
+        || request.log_limit != 0
+        || request.setup_policy != 0
+        || !request.setup_task_name.is_empty()
+        || request.diagnostic_after != 0
+        || request.diagnostic_limit != 0
+        || !request.gc_candidate_token.is_empty()
+        || request.gc_confirm
+        || request.setup_done_confirm
+        || request.setup_adopt_confirm
+    {
+        return Err(Error::Protocol("nonsemantic manifest ensure fields"));
+    }
+    Ok(())
+}
+
 /// The operation reuses the compact private protobuf envelope, but accepts no
 /// legacy job or task fields. Rejecting rather than ignoring these values
 /// makes the semantic surface exactly the five documented immutable inputs.
@@ -5898,6 +6518,124 @@ mod tests {
         );
         assert!(parse_setup_gc_token(&(token + "00")).is_err());
         assert!(validate_setup_gc_apply_input("/work", "sgc1-00", false).is_err());
+    }
+
+    #[test]
+    fn manifest_ensure_wire_accepts_only_its_typed_selectors() {
+        let valid = || Request {
+            workspace: "/workspace".into(),
+            setup_config: "bosn.toml".into(),
+            stack: "app_one".into(),
+            setup_deadline_ms: 1,
+            setup_output_limit: 1,
+            ..Request::operation(22)
+        };
+        assert!(validate_manifest_ensure_request_wire(&valid()).is_ok());
+        for invalid in [
+            Request {
+                setup_config: "../bosn.toml".into(),
+                ..valid()
+            },
+            Request {
+                setup_policy: 1,
+                ..valid()
+            },
+            Request {
+                setup_task_name: "shell".into(),
+                ..valid()
+            },
+        ] {
+            assert!(validate_manifest_ensure_request_wire(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn manifest_stack_plan_derives_generation_and_refuses_unsupported_fields() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let image = format!("example.invalid/app@sha256:{}", "a".repeat(64));
+        std::fs::write(
+            workspace.join("bosn.toml"),
+            format!("[stack.app]\nimage = '{image}'\n[stack.app.env]\nMODE = 'test'\n"),
+        )
+        .unwrap();
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (plan, generation) = runtime
+            .run(manifest_stack_setup_plan(&ManifestEnsureJobRequest {
+                workspace: workspace.clone(),
+                manifest: "bosn.toml".into(),
+                stack: "app".into(),
+                deadline: Duration::from_secs(1),
+                output_limit: 64,
+            }))
+            .unwrap();
+        assert!(generation.starts_with("sha256:"));
+        assert_eq!(plan.app.environment["MODE"], "test");
+        std::fs::write(
+            workspace.join("bosn.toml"),
+            format!("[stack.app]\nimage = '{image}'\nworkdir = '/'\n"),
+        )
+        .unwrap();
+        assert!(
+            runtime
+                .run(manifest_stack_setup_plan(&ManifestEnsureJobRequest {
+                    workspace,
+                    manifest: "bosn.toml".into(),
+                    stack: "app".into(),
+                    deadline: Duration::from_secs(1),
+                    output_limit: 64,
+                }))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn manifest_ensure_is_daemon_owned_and_records_atomic_facts_with_fake_executor() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let fake = Arc::new(FakeManifestEnsureExecutor::default());
+        RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let server = async_engine::launch(
+                    Service::new(state.clone())
+                        .with_manifest_ensure_executor(fake.clone())
+                        .serve(),
+                );
+                let client = wait_for_client(&state).await;
+                let request = ManifestEnsureJobRequest {
+                    workspace: workspace.clone(),
+                    manifest: "bosn.toml".into(),
+                    stack: "app".into(),
+                    deadline: Duration::from_secs(2),
+                    output_limit: 4096,
+                };
+                let first = client.submit_manifest_ensure(request).await.unwrap();
+                wait_for_job_state(&client, first, "Succeeded").await;
+                assert_eq!(fake.calls.lock().unwrap().len(), 1);
+                let resources = client.registry_resources(0, 16).await.unwrap();
+                assert!(resources.records.iter().any(|record| record.stack == "app"));
+                let events = Registry::open_read_only(state.join("registry.sqlite3"))
+                    .unwrap()
+                    .events(0, 16)
+                    .unwrap();
+                assert!(
+                    events
+                        .items
+                        .iter()
+                        .any(|record| record.kind == "manifest.ensure.succeeded")
+                );
+                client.shutdown().await.unwrap();
+                stopped(server).await;
+            });
     }
 
     #[test]
@@ -6404,6 +7142,45 @@ mod tests {
                         stack: "setup".into(),
                         generation: "sha256:fake".into(),
                         workspace: request.workspace.to_string_lossy().into_owned(),
+                    },
+                })
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeManifestEnsureExecutor {
+        calls: Mutex<Vec<ManifestEnsureJobRequest>>,
+    }
+    impl ManifestEnsureExecutor for FakeManifestEnsureExecutor {
+        fn execute<'a>(
+            &'a self,
+            request: ManifestEnsureJobRequest,
+            _cancellation: &'a async_engine::CancellationToken,
+            logs: &'a async_engine::Sender<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                logs.send("[fake] manifest stack ensured".into())
+                    .await
+                    .map_err(|_| "fake manifest log consumer closed".to_owned())?;
+                self.calls.lock().unwrap().push(request.clone());
+                let workspace = request.workspace.to_string_lossy().into_owned();
+                Ok(SetupEnsureExecution {
+                    receipt: "fake manifest ensured".into(),
+                    resource: SetupEnsureResource {
+                        id: "manifest-container:app:sha256:fake".into(),
+                        name: "bosn-setup-fake".into(),
+                        stack: request.stack.clone(),
+                        generation: "sha256:fake".into(),
+                        workspace: workspace.clone(),
+                    },
+                    image: SetupEnsureImageResource {
+                        id: "manifest-image:sha256:fake".into(),
+                        name: "manifest-image:sha256:fake".into(),
+                        stack: request.stack,
+                        generation: "sha256:fake".into(),
+                        workspace,
                     },
                 })
             })
@@ -7953,6 +8730,7 @@ mod tests {
                         task: Arc::new(FakeSetupTaskExecutor::new()),
                         app_task: Arc::new(FakeSetupAppTaskExecutor::new()),
                         ensure: fake,
+                        manifest_ensure: Arc::new(DockerManifestEnsureExecutor::new()),
                     },
                     job_sender.clone(),
                     registry_handle.clone(),
