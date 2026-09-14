@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import sysconfig
 import tempfile
 import textwrap
@@ -53,6 +54,18 @@ def platform_extension_suffix() -> str:
     if not isinstance(suffix, str) or suffix not in importlib.machinery.EXTENSION_SUFFIXES:
         fail(f"Python has no usable extension suffix: {suffix!r}")
     return suffix
+
+
+def smoke_temporary_directory() -> str | None:
+    """Keep macOS Unix-domain socket names within its small path budget.
+
+    The daemon's portable IPC endpoint is derived beneath the supplied state
+    directory.  GitHub's macOS temporary root is already long enough that a
+    normal ``TemporaryDirectory`` name makes ``state/bosn-rs.sock`` exceed the
+    platform's Unix-domain socket limit before the daemon can bind it.
+    """
+
+    return "/tmp" if sys.platform == "darwin" else None
 
 
 def wheel_from_argument(argument: str) -> Path:
@@ -132,6 +145,7 @@ def wait_for_daemon(
     daemon: subprocess.Popen[str],
 ) -> None:
     deadline = time.monotonic() + 10
+    last_status = "no status request was attempted"
     while time.monotonic() < deadline:
         if daemon.poll() is not None:
             stdout, stderr = daemon.communicate()
@@ -143,12 +157,22 @@ def wait_for_daemon(
             text=True,
             capture_output=True,
         )
+        last_status = (
+            f"exit={status.returncode}, stdout={status.stdout[-512:]!r}, "
+            f"stderr={status.stderr[-512:]!r}"
+        )
         if status.returncode == 0:
             value = json.loads(status.stdout)
             if value.get("action") == "daemon_status" and value.get("daemon") == "online":
                 return
         time.sleep(0.05)
-    fail("installed daemon did not become ready")
+    socket_candidate = state / "bosn-rs.sock"
+    fail(
+        "installed daemon did not become ready; "
+        f"daemon_running={daemon.poll() is None}; "
+        f"socket_candidate_length={len(os.fsencode(socket_candidate))}; "
+        f"last_status={last_status}"
+    )
 
 
 def verify_installed_wheel(wheel: Path) -> None:
@@ -157,7 +181,9 @@ def verify_installed_wheel(wheel: Path) -> None:
     if uv is None:
         fail("uv is required to install the wheel")
 
-    with tempfile.TemporaryDirectory(prefix="bosn-wheel-smoke-") as temporary:
+    with tempfile.TemporaryDirectory(
+        prefix="bosn-wheel-smoke-", dir=smoke_temporary_directory()
+    ) as temporary:
         root = Path(temporary)
         environment = root / "environment"
         workdir = root / "outside-checkout"
