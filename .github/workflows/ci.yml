@@ -15,6 +15,46 @@ permissions:
   contents: read
 
 jobs:
+  rust:
+    name: Rust workspace (locked tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Set up Python for PyO3 tests
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Restore Cargo build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-workspace-v1
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes pkg-config libssl-dev
+
+      - name: Verify kernal-api boundary and locked resolution
+        run: |
+          python3 ci/verify_kernel_boundary.py
+          cargo metadata --locked --format-version 1 --no-deps > /dev/null
+
+      # Deliberately does not include --ignored: Docker and Hermes acceptance
+      # cases retain their explicit opt-in prerequisites and dedicated proofs.
+      # The extension-module feature leaves CPython symbols for a wheel host;
+      # unit tests instead link the selected CPython explicitly.
+      - name: Test Rust workspace
+        run: |
+          cargo test --workspace --exclude bosn --locked
+          PYO3_PYTHON="$(command -v python)" cargo test -p bosn --lib --locked --no-default-features --features embedded-python-tests
+
   linux:
     name: Linux (lint + unit + docker)
     runs-on: ubuntu-latest

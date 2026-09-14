@@ -2232,6 +2232,9 @@ mod tests {
                         workspace: request.workspace.to_string_lossy().into_owned(),
                     },
                     volumes: Vec::new(),
+                    // Generic setup documents cannot opt into manifest
+                    // startup behavior; this fake mirrors production.
+                    manifest_autostart: false,
                 })
             })
         }
