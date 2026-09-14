@@ -846,6 +846,100 @@ fn manifest_volume_gc_only_allows_retired_warm_spec_native_volumes() {
 }
 
 #[test]
+fn manifest_volume_release_only_allows_unambiguous_active_durable_native_volumes() {
+    let (_directory, path) = database_path();
+    let mut registry =
+        Registry::create_writer(&path, "11111111-2222-4333-8444-555555555555").unwrap();
+    let mut tx = registry.begin_immediate().unwrap();
+    for (id, name, scope, retention) in [
+        (
+            "manifest-volume:stack",
+            "bosn-v-stack-release",
+            Scope::Stack,
+            Retention::Warm,
+        ),
+        (
+            "manifest-volume:pinned",
+            "bosn-v-spec-release",
+            Scope::Spec,
+            Retention::Pinned,
+        ),
+        (
+            "manifest-volume:warm",
+            "bosn-v-spec-warm",
+            Scope::Spec,
+            Retention::Warm,
+        ),
+    ] {
+        tx.put_resource(&Resource {
+            id: id.into(),
+            kind: ResourceKind::Volume,
+            name: name.into(),
+            stack: "app".into(),
+            generation: "sha256:release".into(),
+            scope,
+            workspace: "/work".into(),
+            created_at: 1.0,
+            last_used: 1.0,
+            state: ResourceState::Active,
+            retention,
+        })
+        .unwrap();
+        tx.put_resource_use(&ResourceUse {
+            resource_id: id.into(),
+            workspace: "/work".into(),
+            stack: "app".into(),
+            generation: "sha256:release".into(),
+            last_used: 1.0,
+            state: ResourceState::Active,
+        })
+        .unwrap();
+    }
+    tx.put_lease(&Lease {
+        id: "lease".into(),
+        resource_id: "manifest-volume:pinned".into(),
+        pid: 1,
+        proc_start: None,
+        acquired_at: 1.0,
+        heartbeat_at: 1.0,
+        ttl_seconds: 30.0,
+    })
+    .unwrap();
+    tx.commit().unwrap();
+    let preview = registry
+        .manifest_volume_release_preview("/work", 0, 16)
+        .unwrap();
+    assert_eq!(
+        preview
+            .items
+            .iter()
+            .map(|v| v.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["manifest-volume:stack"]
+    );
+    let candidate = preview.items[0].clone();
+    let mut tx = registry.begin_immediate().unwrap();
+    assert!(
+        tx.finalize_manifest_volume_release_candidate(
+            "/work",
+            &candidate.id,
+            &candidate.name,
+            &candidate.generation,
+            2.0,
+            "manifest.volume_release.removed"
+        )
+        .unwrap()
+    );
+    tx.commit().unwrap();
+    assert!(
+        registry
+            .resource_by_kind_name(ResourceKind::Volume, &candidate.name)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn manifest_volume_rollover_retires_only_warm_spec_data() {
     let (_directory, path) = database_path();
     let mut registry =

@@ -101,12 +101,15 @@ sweep would take it.
 Releasing one is deliberate and manual:
 
 ```bash
-bosn release-volume --stack macos-x64 --volume storage            # preview
-bosn release-volume --stack macos-x64 --volume storage --apply --yes
+bosn manifest volume-release preview --state-dir "$BOSN_STATE_DIR" --workspace "$PWD"
+# Copy exactly one returned mvr1- candidate token, then confirm the removal:
+bosn manifest volume-release apply --state-dir "$BOSN_STATE_DIR" --workspace "$PWD" \
+  --candidate mvr1-... --apply --yes
 ```
 
-The release re-proves ownership from the engine's labels, refuses an active lease, and
-refuses a volume still attached to a container — the same three proofs GC requires.
+The release re-proves the registry identity and its unambiguous active use, refuses
+leases, sessions, and creation intents, rechecks exact engine labels twice, and refuses a
+volume attached to any container. It never accepts a Docker volume name or Docker controls.
 
 ## Recommended shape: build outside, execute inside
 

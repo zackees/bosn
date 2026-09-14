@@ -3163,6 +3163,18 @@ fn manifest_volume_gc_token(candidate: &bosn_registry::ManifestVolumeGcCandidate
     }
     token
 }
+fn manifest_volume_release_token(candidate: &bosn_registry::ManifestVolumeGcCandidate) -> String {
+    let mut bytes = Vec::new();
+    for value in [&candidate.id, &candidate.name, &candidate.generation] {
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(0);
+    }
+    let mut token = String::from("mvr1-");
+    for byte in bytes {
+        token.push_str(&format!("{byte:02x}"));
+    }
+    token
+}
 
 fn setup_reconcile_missing_token(candidate: &SetupReconcileCandidate) -> String {
     let mut bytes = Vec::new();
@@ -3223,6 +3235,13 @@ fn parse_manifest_volume_gc_token(token: &str) -> Result<(String, String, String
         .ok_or(Error::Protocol("invalid manifest volume gc candidate"))?;
     parse_setup_gc_token(&format!("sgc1-{encoded}"))
         .map_err(|_| Error::Protocol("invalid manifest volume gc candidate"))
+}
+fn parse_manifest_volume_release_token(token: &str) -> Result<(String, String, String), Error> {
+    let encoded = token
+        .strip_prefix("mvr1-")
+        .ok_or(Error::Protocol("invalid manifest volume release candidate"))?;
+    parse_setup_gc_token(&format!("sgc1-{encoded}"))
+        .map_err(|_| Error::Protocol("invalid manifest volume release candidate"))
 }
 
 fn parse_setup_reconcile_missing_token(token: &str) -> Result<(String, String, String), Error> {
@@ -3508,6 +3527,50 @@ fn validate_manifest_volume_gc_apply_request_wire(request: &Request) -> Result<(
     }
     Ok(())
 }
+fn validate_manifest_volume_release_apply_input(
+    workspace: &str,
+    token: &str,
+    confirm: bool,
+) -> Result<(), Error> {
+    if workspace.is_empty()
+        || workspace.len() > 8 * 1024
+        || workspace.bytes().any(|b| b == 0)
+        || !confirm
+    {
+        return Err(Error::Protocol(
+            "invalid manifest volume release apply request",
+        ));
+    }
+    let _ = parse_manifest_volume_release_token(token)?;
+    Ok(())
+}
+fn validate_manifest_volume_release_apply_request_wire(request: &Request) -> Result<(), Error> {
+    validate_manifest_volume_release_apply_input(
+        &request.workspace,
+        &request.gc_candidate_token,
+        request.gc_confirm,
+    )?;
+    if !request.stack.is_empty()
+        || !request.digest.is_empty()
+        || request.job_id != 0
+        || request.log_after != 0
+        || request.log_limit != 0
+        || !request.setup_config.is_empty()
+        || request.setup_policy != 0
+        || request.setup_deadline_ms != 0
+        || request.setup_output_limit != 0
+        || !request.setup_task_name.is_empty()
+        || request.diagnostic_after != 0
+        || request.diagnostic_limit != 0
+        || request.setup_done_confirm
+        || request.setup_adopt_confirm
+    {
+        return Err(Error::Protocol(
+            "nonsemantic manifest volume release apply fields",
+        ));
+    }
+    Ok(())
+}
 
 fn validate_setup_retired_stop_request_wire(request: &Request) -> Result<(), Error> {
     validate_setup_retired_stop_input(
@@ -3758,6 +3821,36 @@ impl Client {
             )),
         }
     }
+    /// Preview durable manifest volumes which can only be removed through the
+    /// explicit release contract. Normal volume GC never returns these rows.
+    pub async fn manifest_volume_release_preview(
+        &self,
+        workspace: impl AsRef<Path>,
+        after: u64,
+        limit: u32,
+    ) -> Result<ManifestVolumeGcPreviewPage, Error> {
+        validate_registry_page(after, limit)?;
+        let workspace = workspace.as_ref().to_string_lossy().into_owned();
+        if workspace.is_empty() || workspace.len() > 8 * 1024 || workspace.bytes().any(|b| b == 0) {
+            return Err(Error::Protocol(
+                "invalid manifest volume release preview workspace",
+            ));
+        }
+        match self
+            .call(Request {
+                workspace,
+                diagnostic_after: after,
+                diagnostic_limit: limit,
+                ..Request::operation(33)
+            })
+            .await?
+        {
+            Reply::ManifestVolumeGcPreview(v) => Ok(v),
+            _ => Err(Error::Protocol(
+                "unexpected manifest volume release preview response",
+            )),
+        }
+    }
     /// Compare durable Bosn-managed setup container facts with fixed Docker
     /// inspection. This is read-only: it never creates, opens, writes, or
     /// migrates a registry and has no repair/apply operation.
@@ -3862,6 +3955,32 @@ impl Client {
             Reply::ManifestVolumeGcApply(v) => Ok(v),
             _ => Err(Error::Protocol(
                 "unexpected manifest volume gc apply response",
+            )),
+        }
+    }
+    /// Destructively release exactly one preview-token-bound durable manifest
+    /// volume. The daemon owns every Docker argument and rechecks registry,
+    /// label, and attachment facts immediately before removal.
+    pub async fn manifest_volume_release_apply(
+        &self,
+        workspace: impl AsRef<Path>,
+        candidate_token: &str,
+        confirm: bool,
+    ) -> Result<ManifestVolumeGcApplyResult, Error> {
+        let workspace = workspace.as_ref().to_string_lossy().into_owned();
+        validate_manifest_volume_release_apply_input(&workspace, candidate_token, confirm)?;
+        match self
+            .call(Request {
+                workspace,
+                gc_candidate_token: candidate_token.into(),
+                gc_confirm: true,
+                ..Request::operation(34)
+            })
+            .await?
+        {
+            Reply::ManifestVolumeGcApply(v) => Ok(v),
+            _ => Err(Error::Protocol(
+                "unexpected manifest volume release apply response",
             )),
         }
     }
@@ -4337,6 +4456,12 @@ enum DbCommand {
         limit: u32,
         reply: async_engine::OneshotSender<Result<ManifestVolumeGcPreviewPage, Error>>,
     },
+    ManifestVolumeReleasePreview {
+        workspace: String,
+        after: u64,
+        limit: u32,
+        reply: async_engine::OneshotSender<Result<ManifestVolumeGcPreviewPage, Error>>,
+    },
     SetupReconcilePreview {
         workspace: String,
         after: u64,
@@ -4382,7 +4507,24 @@ enum DbCommand {
             Result<Option<bosn_registry::ManifestVolumeGcCandidate>, Error>,
         >,
     },
+    ManifestVolumeReleaseCandidate {
+        workspace: String,
+        id: String,
+        name: String,
+        generation: String,
+        reply: async_engine::OneshotSender<
+            Result<Option<bosn_registry::ManifestVolumeGcCandidate>, Error>,
+        >,
+    },
     FinalizeManifestVolumeGc {
+        workspace: String,
+        id: String,
+        name: String,
+        generation: String,
+        missing: bool,
+        reply: async_engine::OneshotSender<Result<bool, Error>>,
+    },
+    FinalizeManifestVolumeRelease {
         workspace: String,
         id: String,
         name: String,
@@ -6207,6 +6349,25 @@ impl RegistryActor {
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
     }
+    async fn manifest_volume_release_preview(
+        &self,
+        workspace: String,
+        after: u64,
+        limit: u32,
+    ) -> Result<ManifestVolumeGcPreviewPage, Error> {
+        validate_registry_page(after, limit)?;
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::ManifestVolumeReleasePreview {
+                workspace,
+                after,
+                limit,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
     async fn setup_reconcile_preview(
         &self,
         workspace: String,
@@ -6306,6 +6467,26 @@ impl RegistryActor {
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
     }
+    async fn manifest_volume_release_candidate(
+        &self,
+        workspace: String,
+        id: String,
+        name: String,
+        generation: String,
+    ) -> Result<Option<bosn_registry::ManifestVolumeGcCandidate>, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::ManifestVolumeReleaseCandidate {
+                workspace,
+                id,
+                name,
+                generation,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
     async fn finalize_manifest_volume_gc(
         &self,
         workspace: String,
@@ -6317,6 +6498,28 @@ impl RegistryActor {
         let (reply, wait) = async_engine::oneshot_channel();
         self.sender
             .send(DbCommand::FinalizeManifestVolumeGc {
+                workspace,
+                id,
+                name,
+                generation,
+                missing,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
+    async fn finalize_manifest_volume_release(
+        &self,
+        workspace: String,
+        id: String,
+        name: String,
+        generation: String,
+        missing: bool,
+    ) -> Result<bool, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::FinalizeManifestVolumeRelease {
                 workspace,
                 id,
                 name,
@@ -6628,6 +6831,50 @@ async fn registry_actor(
                     }
                 }
             }
+            DbCommand::ManifestVolumeReleasePreview {
+                workspace,
+                after,
+                limit,
+                reply,
+            } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = usize::try_from(after)
+                        .map_err(|_| bosn_registry::Error::BadRow("page offset"))
+                        .and_then(|after| {
+                            registry.manifest_volume_release_preview(
+                                &workspace,
+                                after,
+                                limit as usize,
+                            )
+                        })
+                        .map(|page| ManifestVolumeGcPreviewPage {
+                            next: page.next_offset.map(|v| v as u64),
+                            candidates: page
+                                .items
+                                .into_iter()
+                                .map(|v| ManifestVolumeGcCandidateDiagnostic {
+                                    token: manifest_volume_release_token(&v),
+                                    id: v.id,
+                                    name: v.name,
+                                    generation: v.generation,
+                                    reason: "explicit_durable_manifest_volume_release".into(),
+                                })
+                                .collect(),
+                            counts: ManifestVolumeGcPreviewCounts::default(),
+                        });
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
             DbCommand::SetupReconcilePreview {
                 workspace,
                 after,
@@ -6797,6 +7044,33 @@ async fn registry_actor(
                     }
                 }
             }
+            DbCommand::ManifestVolumeReleaseCandidate {
+                workspace,
+                id,
+                name,
+                generation,
+                reply,
+            } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = registry.manifest_volume_release_candidate(
+                        &workspace,
+                        &id,
+                        &name,
+                        &generation,
+                    );
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
             DbCommand::FinalizeSetupGc {
                 workspace,
                 id,
@@ -6870,6 +7144,51 @@ async fn registry_actor(
                                 "manifest.volume_gc.reconciled_missing"
                             } else {
                                 "manifest.volume_gc.removed"
+                            },
+                        )?;
+                        if removed {
+                            transaction.commit()?;
+                        }
+                        Ok(removed)
+                    })();
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
+            DbCommand::FinalizeManifestVolumeRelease {
+                workspace,
+                id,
+                name,
+                generation,
+                missing,
+                reply,
+            } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = (|| {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
+                            .as_secs_f64();
+                        let mut transaction = registry.begin_immediate()?;
+                        let removed = transaction.finalize_manifest_volume_release_candidate(
+                            &workspace,
+                            &id,
+                            &name,
+                            &generation,
+                            now,
+                            if missing {
+                                "manifest.volume_release.reconciled_missing"
+                            } else {
+                                "manifest.volume_release.removed"
                             },
                         )?;
                         if removed {
@@ -8234,6 +8553,114 @@ async fn apply_manifest_volume_gc_candidate(
         ))
 }
 
+/// The explicit durable path intentionally shares the fixed engine proof with
+/// automatic volume GC but has its own registry predicate and opaque token
+/// namespace.  A durable row can therefore never become removable merely by
+/// entering the GC API.
+async fn apply_manifest_volume_release_candidate(
+    actor: &RegistryActor,
+    workspace: String,
+    token: String,
+) -> Result<ManifestVolumeGcApplyResult, Error> {
+    let (id, name, generation) = parse_manifest_volume_release_token(&token)?;
+    let candidate = actor
+        .manifest_volume_release_candidate(workspace.clone(), id, name, generation)
+        .await?
+        .ok_or(Error::Protocol(
+            "manifest volume release preview is stale or protected",
+        ))?;
+    let engine = DockerEngine::docker();
+    let first = inspect_manifest_volume_gc(&engine, &candidate).await?;
+    if first.is_none() {
+        return actor
+            .finalize_manifest_volume_release(
+                workspace,
+                candidate.id,
+                candidate.name,
+                candidate.generation,
+                true,
+            )
+            .await?
+            .then_some(ManifestVolumeGcApplyResult {
+                removed: false,
+                reconciled_missing: true,
+            })
+            .ok_or(Error::Protocol(
+                "manifest volume release preview became stale",
+            ));
+    }
+    if first != Some(false) {
+        return Err(Error::Protocol(
+            "manifest volume release candidate is attached",
+        ));
+    }
+    let second = inspect_manifest_volume_gc(&engine, &candidate).await?;
+    if second.is_none() {
+        return actor
+            .finalize_manifest_volume_release(
+                workspace,
+                candidate.id,
+                candidate.name,
+                candidate.generation,
+                true,
+            )
+            .await?
+            .then_some(ManifestVolumeGcApplyResult {
+                removed: false,
+                reconciled_missing: true,
+            })
+            .ok_or(Error::Protocol(
+                "manifest volume release preview became stale",
+            ));
+    }
+    if second != Some(false) {
+        return Err(Error::Protocol(
+            "manifest volume release candidate is attached",
+        ));
+    }
+    // Re-run the complete durable predicate after the final engine proof and
+    // immediately before the only destructive Docker command. This closes a
+    // lease/session/intent or shared-use race without accepting a fresh name.
+    let candidate = actor
+        .manifest_volume_release_candidate(
+            workspace.clone(),
+            candidate.id,
+            candidate.name,
+            candidate.generation,
+        )
+        .await?
+        .ok_or(Error::Protocol(
+            "manifest volume release preview became stale",
+        ))?;
+    let removed = engine
+        .with_args(["volume", "rm", &candidate.name])
+        .capture_async(RunOptions::bounded(
+            SETUP_GC_ENGINE_DEADLINE,
+            SETUP_GC_ENGINE_OUTPUT,
+        ))
+        .await
+        .map_err(|_| Error::Protocol("manifest volume release removal failed"))?;
+    if !removed.ok() {
+        return Err(Error::Protocol("manifest volume release removal failed"));
+    }
+    actor
+        .finalize_manifest_volume_release(
+            workspace,
+            candidate.id,
+            candidate.name,
+            candidate.generation,
+            false,
+        )
+        .await?
+        .then_some(ManifestVolumeGcApplyResult {
+            removed: true,
+            reconciled_missing: false,
+        })
+        .ok_or(Error::Protocol(
+            "manifest volume release registry finalization failed after volume removal",
+        ))
+}
+
 /// Repair only the durable lifecycle accounting for one previewed setup app
 /// that fixed Docker inspection proves absent. No Docker mutation occurs: the
 /// next semantic ensure is solely responsible for creating/re-recording an
@@ -9033,6 +9460,60 @@ async fn handle(
             },
             32 => match validate_manifest_volume_gc_apply_request_wire(&r) {
                 Ok(()) => match apply_manifest_volume_gc_candidate(
+                    &actor,
+                    r.workspace,
+                    r.gc_candidate_token,
+                )
+                .await
+                {
+                    Ok(result) => ReplyWire {
+                        code: 190,
+                        volume_gc_removed: result.removed,
+                        volume_gc_reconciled_missing: result.reconciled_missing,
+                        ..Default::default()
+                    },
+                    Err(_) => ReplyWire {
+                        code: 3,
+                        ..Default::default()
+                    },
+                },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
+            33 => match validate_manifest_volume_gc_preview_request_wire(&r) {
+                Ok(()) => match actor
+                    .manifest_volume_release_preview(
+                        r.workspace,
+                        r.diagnostic_after,
+                        r.diagnostic_limit,
+                    )
+                    .await
+                {
+                    Ok(page) => ReplyWire {
+                        code: 180,
+                        diagnostic_next: page.next.unwrap_or(0),
+                        diagnostic_has_next: page.next.is_some(),
+                        manifest_volume_gc_candidates: page
+                            .candidates
+                            .into_iter()
+                            .map(ManifestVolumeGcCandidateWire::from)
+                            .collect(),
+                        ..Default::default()
+                    },
+                    Err(_) => ReplyWire {
+                        code: 3,
+                        ..Default::default()
+                    },
+                },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
+            34 => match validate_manifest_volume_release_apply_request_wire(&r) {
+                Ok(()) => match apply_manifest_volume_release_candidate(
                     &actor,
                     r.workspace,
                     r.gc_candidate_token,
@@ -10022,6 +10503,23 @@ mod tests {
         assert!(parse_manifest_volume_gc_token(&(token.clone() + "00")).is_err());
         assert!(parse_setup_gc_token(&token).is_err());
         assert!(validate_manifest_volume_gc_apply_input("/work", &token, false).is_err());
+    }
+
+    #[test]
+    fn manifest_volume_release_token_is_exact_and_separate_from_gc() {
+        let candidate = bosn_registry::ManifestVolumeGcCandidate {
+            id: "manifest-volume:durable".into(),
+            name: "bosn-v-machine-durable".into(),
+            generation: "sha256:durable".into(),
+        };
+        let token = manifest_volume_release_token(&candidate);
+        assert_eq!(
+            parse_manifest_volume_release_token(&token).unwrap(),
+            (candidate.id, candidate.name, candidate.generation)
+        );
+        assert!(parse_manifest_volume_release_token(&(token.clone() + "00")).is_err());
+        assert!(parse_manifest_volume_gc_token(&token).is_err());
+        assert!(validate_manifest_volume_release_apply_input("/work", &token, false).is_err());
     }
 
     #[test]

@@ -155,6 +155,24 @@ impl Client {
                 .map_err(service_error)
         })
     }
+    /// Preview durable manifest data that is excluded from normal GC. Apply
+    /// accepts only one resulting opaque token with explicit confirmation.
+    #[pyo3(signature = (workspace, *, after = 0, limit = 64))]
+    fn manifest_volume_release_preview(
+        &self,
+        workspace: PathBuf,
+        after: u64,
+        limit: u32,
+        py: Python<'_>,
+    ) -> PyResult<ManifestVolumeGcPreviewPage> {
+        validate_registry_page(after, limit)?;
+        let state_dir = self.state_dir.clone();
+        py.detach(move || {
+            manifest_volume_release_preview(&state_dir, workspace, after, limit)
+                .map(ManifestVolumeGcPreviewPage::from)
+                .map_err(service_error)
+        })
+    }
     /// Read-only fixed Docker/registry drift preview. No repair, lifecycle,
     /// raw Docker arguments, or registry write is reachable from Python.
     #[pyo3(signature = (workspace, *, after = 0, limit = 64))]
@@ -235,6 +253,26 @@ impl Client {
         let state_dir = self.state_dir.clone();
         py.detach(move || {
             manifest_volume_gc_apply(&state_dir, workspace, candidate_token)
+                .map(ManifestVolumeGcApplyResult::from)
+                .map_err(service_error)
+        })
+    }
+    #[pyo3(signature = (workspace, candidate_token, *, confirm))]
+    fn manifest_volume_release_apply(
+        &self,
+        workspace: PathBuf,
+        candidate_token: String,
+        confirm: bool,
+        py: Python<'_>,
+    ) -> PyResult<ManifestVolumeGcApplyResult> {
+        if !confirm {
+            return Err(PyValueError::new_err(
+                "manifest_volume_release_apply requires confirm=True",
+            ));
+        }
+        let state_dir = self.state_dir.clone();
+        py.detach(move || {
+            manifest_volume_release_apply(&state_dir, workspace, candidate_token)
                 .map(ManifestVolumeGcApplyResult::from)
                 .map_err(service_error)
         })
@@ -1458,6 +1496,22 @@ fn manifest_volume_gc_preview(
             .await
     })
 }
+fn manifest_volume_release_preview(
+    state_dir: &Path,
+    workspace: PathBuf,
+    after: u64,
+    limit: u32,
+) -> Result<ServiceManifestVolumeGcPreviewPage, bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async {
+        ServiceClient::for_state(state_dir)?
+            .manifest_volume_release_preview(workspace, after, limit)
+            .await
+    })
+}
 fn setup_reconcile_preview(
     state_dir: &Path,
     workspace: PathBuf,
@@ -1516,6 +1570,21 @@ fn manifest_volume_gc_apply(
     runtime.run(async {
         ServiceClient::for_state(state_dir)?
             .manifest_volume_gc_apply(workspace, &candidate_token, true)
+            .await
+    })
+}
+fn manifest_volume_release_apply(
+    state_dir: &Path,
+    workspace: PathBuf,
+    candidate_token: String,
+) -> Result<ServiceManifestVolumeGcApplyResult, bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async {
+        ServiceClient::for_state(state_dir)?
+            .manifest_volume_release_apply(workspace, &candidate_token, true)
             .await
     })
 }
