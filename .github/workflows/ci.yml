@@ -194,3 +194,26 @@ jobs:
           name: bosn-wheel-${{ matrix.target }}
           path: dist/bosn-*.whl
           if-no-files-found: error
+
+  # Queue visibility (issue #257). The hosted runner pool is shared account-wide,
+  # so a run can wait behind other repositories' work for longer than it takes
+  # to execute. This job reports every lane's queue and execution time to the
+  # step summary and warns, naming the delayed jobs and the escalation owner,
+  # when the docs/ci-queue-slo.md SLO is breached. It never fails the run:
+  # capacity is an account-level condition, not a Bosn defect.
+  ci-queue-timing:
+    name: CI queue timing
+    if: always()
+    needs: [lint-no-macos-runners, rust, linux, native-wheel, darwin-cross-wheel]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Report queue and execution timing against the SLO
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 ci/ci_queue_timing.py report --run-id "${{ github.run_id }}"
+          --summary-file "$GITHUB_STEP_SUMMARY"
