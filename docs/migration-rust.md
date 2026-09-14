@@ -6,6 +6,11 @@ seam, native CLI, PyO3 binding, MCP server, and URL setup path are Rust code.
 `kernal-api` is the OS boundary and is pinned by reviewed revision until its
 required publishing workflow is available.
 
+The authoritative implementation/fixture/consumer inventory is the
+[issue #153 coverage matrix](issue153-coverage-matrix.md). It explicitly
+separates implemented surfaces from external release blockers and opt-in live
+acceptance gaps.
+
 ## Python lifecycle retirement
 
 The legacy Python implementation was removed in the Phase 7 consumer-migration
