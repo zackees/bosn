@@ -38,27 +38,52 @@ jobs:
       - name: Test (unit + docker)
         run: ./test
 
-      - name: Build wheel
-        run: uv build --wheel
 
-      - name: Assert native wheel contents
+  native-wheel:
+    name: Native wheel (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.11"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Provide OpenSSL to Cargo (macOS)
+        if: runner.os == 'macOS'
         run: |
-          set -e
-          ls dist/
-          wheel="$(ls dist/*.whl)"
-          uv run python - "$wheel" <<'PY'
-          import sys
-          import zipfile
+          brew install openssl@3 pkg-config
+          echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig" >> "$GITHUB_ENV"
 
-          names = zipfile.ZipFile(sys.argv[1]).namelist()
-          assert any(
-              name.startswith("bosn/_native.")
-              and name.rsplit(".", 1)[-1] in {"so", "pyd", "dylib"}
-              for name in names
-          ), names
-          assert any(
-              name.endswith(".data/platlib/bosn/_bin/bosn-native")
-              or name.endswith(".data/platlib/bosn/_bin/bosn-native.exe")
-              for name in names
-          ), names
-          PY
+      - name: Provide OpenSSL to Cargo (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vcpkg = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $vcpkg) { $vcpkg = 'C:\vcpkg' }
+          & "$vcpkg\vcpkg.exe" install openssl:x64-windows
+          "VCPKG_ROOT=$vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # This matrix intentionally has no Docker setup or Docker invocation.
+      # The Linux job above remains the dedicated Docker integration lane.
+      - name: Build platform wheel
+        run: uv build --wheel --out-dir dist
+
+      - name: Install and smoke-test platform wheel outside the checkout
+        run: python ci/verify_installed_wheel.py "dist/bosn-*.whl"

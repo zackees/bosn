@@ -33,9 +33,7 @@ MAX_SAMPLES = 30
 READY_TIMEOUT_SECONDS = 10.0
 JOB_TIMEOUT_SECONDS = 90.0
 COMMAND_TIMEOUT_SECONDS = 120.0
-PINNED_ALPINE = (
-    "alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b"
-)
+PINNED_ALPINE = "alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b"
 
 
 class MeasurementError(RuntimeError):
@@ -151,6 +149,9 @@ class NativeBenchmark:
             self._wait_until_ready()
             if self.docker:
                 self._prepare_docker_fixture()
+        except KeyboardInterrupt:
+            self.__exit__(None, None, None)
+            raise
         except BaseException:
             # A context manager whose enter step fails is never given
             # __exit__ by ``with``.  Keep its daemon/container lifetime just
@@ -329,9 +330,9 @@ class NativeBenchmark:
                     "container",
                     "inspect",
                     "--format",
-                    "{{index .Config.Labels \"com.zackees.bosn.setup-managed\"}}\t"
-                    "{{index .Config.Labels \"com.zackees.bosn.setup-content-sha256\"}}\t"
-                    "{{index .Config.Labels \"com.zackees.bosn.setup-container\"}}",
+                    '{{index .Config.Labels "com.zackees.bosn.setup-managed"}}\t'
+                    '{{index .Config.Labels "com.zackees.bosn.setup-content-sha256"}}\t'
+                    '{{index .Config.Labels "com.zackees.bosn.setup-container"}}',
                     self.container_name,
                 ],
                 stdin=subprocess.DEVNULL,
@@ -361,9 +362,7 @@ class NativeBenchmark:
 
     def daemon_idle_rss(self) -> dict[str, object]:
         if not sys.platform.startswith("linux"):
-            return unsupported_metric("rss_proc_status_is_linux_only") | {
-                "platform": sys.platform
-            }
+            return unsupported_metric("rss_proc_status_is_linux_only") | {"platform": sys.platform}
         if self.daemon is None:
             raise MeasurementError("native daemon is unavailable")
         status = Path(f"/proc/{self.daemon.pid}/status")
@@ -380,9 +379,7 @@ class NativeBenchmark:
         state, _workspace = self._require_paths()
 
         def status() -> None:
-            value = json.loads(
-                self._run(["daemon", "status", "--state-dir", str(state), "--json"])
-            )
+            value = json.loads(self._run(["daemon", "status", "--state-dir", str(state), "--json"]))
             if value.get("action") != "daemon_status" or value.get("daemon") != "online":
                 raise MeasurementError("native daemon status returned an invalid receipt")
 

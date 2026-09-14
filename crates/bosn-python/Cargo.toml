@@ -26,6 +26,7 @@ embedded-python-tests = ["pyo3/auto-initialize"]
 
 [dependencies]
 bosn-core = { path = "../bosn-core" }
+bosn-engine = { path = "../bosn-engine" }
 bosn-service = { path = "../bosn-service" }
 bosn-registry = { path = "../bosn-registry" }
 bosn-setup = { path = "../bosn-setup" }

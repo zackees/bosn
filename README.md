@@ -64,11 +64,15 @@ from pathlib import Path
 import bosn
 
 client = bosn.Client(Path.home() / ".local/state/bosn")
-plan = client.plan_setup(Path.cwd(), "https://example.invalid/bosn-setup.toml",
-                         policy="online_refresh")
+plan = client.plan_setup(
+    Path.cwd(), "https://example.invalid/bosn-setup.toml", policy="online_refresh"
+)
 job_id = client.submit_setup_ensure(
-    Path.cwd(), "https://example.invalid/bosn-setup.toml",
-    policy="online_refresh", deadline_ms=300_000, output_limit=8 * 1024 * 1024,
+    Path.cwd(),
+    "https://example.invalid/bosn-setup.toml",
+    policy="online_refresh",
+    deadline_ms=300_000,
+    output_limit=8 * 1024 * 1024,
 )
 ```
 

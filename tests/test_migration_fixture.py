@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -12,6 +13,37 @@ from pathlib import Path
 import pytest
 
 FIXTURE = Path(__file__).parent / "fixtures" / "migration" / "create_python_v4_registry.py"
+
+
+def _native_cli_command() -> list[str]:
+    """Return the workspace CLI command on both developer and CI hosts.
+
+    ``soldr`` is the local build wrapper used for fast Rust iteration, but it
+    is intentionally not required by the GitHub Actions images.  The test
+    still invokes the same Cargo binary with the same locked dependency graph
+    when the wrapper is unavailable.
+    """
+    if soldr := shutil.which("soldr"):
+        return [soldr, "cargo"]
+    return ["cargo"]
+
+
+def test_native_cli_command_uses_cargo_when_soldr_is_not_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda executable: None)
+
+    assert _native_cli_command() == ["cargo"]
+
+
+def test_native_cli_command_uses_soldr_when_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda executable: "/opt/bin/soldr" if executable == "soldr" else None,
+    )
+
+    assert _native_cli_command() == ["/opt/bin/soldr", "cargo"]
 
 
 def test_python_v4_registry_fixture_covers_import_relationships(tmp_path: Path) -> None:
@@ -100,8 +132,7 @@ def test_native_cli_imports_the_complete_v4_fixture_without_changing_source(
     os.chmod(marker, 0o600)
     source_before = source.read_bytes()
     command = [
-        "soldr",
-        "cargo",
+        *_native_cli_command(),
         "run",
         "-j1",
         "-p",

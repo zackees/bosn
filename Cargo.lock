@@ -87,6 +87,7 @@ name = "bosn"
 version = "0.1.3"
 dependencies = [
  "bosn-core",
+ "bosn-engine",
  "bosn-registry",
  "bosn-service",
  "bosn-setup",
