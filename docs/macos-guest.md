@@ -38,11 +38,13 @@ daemon-state key `STATE_DIR/guest-ssh/id_ed25519` (mode `0600` or stricter),
 ignores ambient SSH configuration and agents, and requires that key's public
 half to have been installed for `ssh_user` during the one-time bootstrap.
 
-The native task path does not yet implement the legacy SCP payload protocol.
-For now, do not set `guest.payload` for a native guest task: Bosn refuses it
-instead of executing against a stale guest artifact. The broader historical
-design below describes the desired typed SCP follow-up, not an implemented
-native behavior.
+When `guest.payload` is set, the native task path copies exactly that one file
+through fixed OpenSSH SCP after SSH readiness and immediately before the
+declared task. The source must remain a regular, non-symlinked file below the
+canonical workspace and is capped at 4 GiB; `payload_destination` must be a
+normalized absolute guest path or `~/` path. An SCP failure, cancellation,
+deadline, or output limit prevents the task from starting, rather than letting
+the guest use an older artifact.
 
 ## Why this is a stack *kind* and not a stack with unusual options
 

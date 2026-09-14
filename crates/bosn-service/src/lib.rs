@@ -6,7 +6,7 @@ use bosn_core::{
 };
 use bosn_engine::{
     CommandError, CommandResult, DockerDoctorReport, DockerDoctorState, DockerEngine, EngineEvent,
-    GuestSshCommand, GuestSshEngine, RunOptions,
+    GuestScpCommand, GuestScpEngine, GuestSshCommand, GuestSshEngine, RunOptions,
 };
 use bosn_generation::{
     ContextEntry, ExternalImageIdentity,
@@ -313,13 +313,20 @@ pub trait ManifestAppTaskSessionRecorder: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 }
 
-/// Narrow test seam for the one guest SSH transport.  The daemon supplies a
-/// fully derived [`GuestSshCommand`]; this trait deliberately has no host,
-/// port, argv, user, credential, or SCP parameter.
+/// Narrow test seam for the two fixed guest transports. The daemon supplies
+/// fully-derived commands; this trait deliberately has no raw host, port,
+/// argv, credential, or shell parameter.
 trait GuestSshTaskTransport: Send + Sync {
     fn stream<'a>(
         &'a self,
         command: GuestSshCommand,
+        options: RunOptions,
+        cancellation: &'a async_engine::CancellationToken,
+        events: &'a async_engine::Sender<EngineEvent>,
+    ) -> Pin<Box<dyn Future<Output = Result<CommandResult, CommandError>> + Send + 'a>>;
+    fn stream_scp<'a>(
+        &'a self,
+        command: GuestScpCommand,
         options: RunOptions,
         cancellation: &'a async_engine::CancellationToken,
         events: &'a async_engine::Sender<EngineEvent>,
@@ -338,6 +345,19 @@ impl GuestSshTaskTransport for NativeGuestSshTaskTransport {
     ) -> Pin<Box<dyn Future<Output = Result<CommandResult, CommandError>> + Send + 'a>> {
         Box::pin(async move {
             GuestSshEngine::system()
+                .stream(&command, options, Some(cancellation), events)
+                .await
+        })
+    }
+    fn stream_scp<'a>(
+        &'a self,
+        command: GuestScpCommand,
+        options: RunOptions,
+        cancellation: &'a async_engine::CancellationToken,
+        events: &'a async_engine::Sender<EngineEvent>,
+    ) -> Pin<Box<dyn Future<Output = Result<CommandResult, CommandError>> + Send + 'a>> {
+        Box::pin(async move {
+            GuestScpEngine::system()
                 .stream(&command, options, Some(cancellation), events)
                 .await
         })
@@ -1039,6 +1059,7 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                     return execute_manifest_guest_ssh_task(
                         self.guest_ssh.as_ref(),
                         &self.state_dir,
+                        &plan.workspace_root,
                         &observed,
                         &guest_task,
                         &request.task_name,
@@ -1121,6 +1142,7 @@ enum ManifestGuestTaskOutcome {
 async fn execute_manifest_guest_ssh_task(
     transport: &dyn GuestSshTaskTransport,
     state_dir: &Path,
+    workspace: &Path,
     observed: &SetupEnsureResult,
     guest_task: &ManifestGuestTask,
     task_name: &str,
@@ -1134,10 +1156,19 @@ async fn execute_manifest_guest_ssh_task(
     let identity_file = manifest_guest_ssh_identity_file(state_dir)?;
     let command = guest_remote_command(&guest_task.command, guest_task.workdir.as_deref())?;
     let ready_output = output_limit / 4;
-    let task_output = output_limit.saturating_sub(ready_output);
-    if ready_output == 0 || task_output == 0 {
+    let payload_output = if guest_task.payload.is_some() {
+        output_limit / 4
+    } else {
+        0
+    };
+    let task_output = output_limit.saturating_sub(ready_output + payload_output);
+    if ready_output == 0
+        || task_output == 0
+        || (guest_task.payload.is_some() && payload_output == 0)
+    {
         return Err(
-            "manifest guest app task output budget cannot fund readiness and execution".into(),
+            "manifest guest app task output budget cannot fund readiness, payload, and execution"
+                .into(),
         );
     }
     let guest_command = |command| GuestSshCommand {
@@ -1169,6 +1200,48 @@ async fn execute_manifest_guest_ssh_task(
             "manifest guest SSH readiness failed with exit {}; the declared task was not started",
             ready.exit_code
         ));
+    }
+    if let Some(payload) = &guest_task.payload {
+        if cancellation.is_cancelled() || deadline.remaining().is_zero() {
+            return Err(
+                "manifest guest app task ended before SCP payload upload; remote task was not started"
+                    .into(),
+            );
+        }
+        // The payload may be a fresh build output, so prove it again at the
+        // last responsible point rather than trusting planning-time facts.
+        let source = manifest_guest_payload_file(workspace, &payload.source)?;
+        logs.send(
+            "[manifest-guest-app-task] copying declared payload through verified guest SCP".into(),
+        )
+        .await
+        .map_err(|_| "manifest guest app task log consumer closed".to_owned())?;
+        let copied = transport
+            .stream_scp(
+                GuestScpCommand {
+                    user: guest_task.ssh_user.clone(),
+                    port: guest_task.ssh_port,
+                    identity_file: identity_file.clone(),
+                    source,
+                    destination: payload.destination.clone(),
+                },
+                RunOptions::streaming(deadline.remaining(), payload_output),
+                cancellation,
+                events,
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "manifest guest SCP payload upload failed; declared task was not started: {error}"
+                )
+            })?;
+        if !copied.ok() {
+            return Err(format!(
+                "manifest guest SCP payload upload failed with exit {}; declared task was not started: {}",
+                copied.exit_code,
+                bounded_guest_failure_detail(&copied)
+            ));
+        }
     }
     if cancellation.is_cancelled() || deadline.remaining().is_zero() {
         return Err(
@@ -1266,6 +1339,88 @@ fn manifest_guest_ssh_identity_file(state_dir: &Path) -> Result<PathBuf, String>
         }
     }
     Ok(identity)
+}
+
+// SCP is a streaming process, rather than a read-into-memory operation, but a
+// finite manifest payload still needs a product-level upper bound.
+const MAX_MANIFEST_GUEST_PAYLOAD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Re-prove that the one manifest-declared source is a regular, bounded file
+/// directly beneath the selected canonical workspace. This is intentionally
+/// performed immediately before SCP because payloads are normally build
+/// outputs and can change after manifest planning.
+fn manifest_guest_payload_file(workspace: &Path, source: &str) -> Result<PathBuf, String> {
+    if !safe_manifest_relative_path(source) {
+        return Err("manifest guest payload must be a safe workspace-relative path".into());
+    }
+    let root = fs::canonical_context_path(workspace)
+        .map_err(|_| "manifest guest payload workspace cannot be canonicalized".to_owned())?;
+    if fs::context_path_metadata_no_follow(&root)
+        .map_err(|_| "manifest guest payload workspace cannot be inspected".to_owned())?
+        .kind
+        != fs::ContextPathKind::Directory
+    {
+        return Err("manifest guest payload workspace is not a directory".into());
+    }
+    let candidate = root.join(source);
+    let metadata = fs::context_path_metadata_no_follow(&candidate)
+        .map_err(|_| "declared manifest guest payload does not exist".to_owned())?;
+    if metadata.kind != fs::ContextPathKind::RegularFile {
+        return Err("declared manifest guest payload is not a regular file".into());
+    }
+    let size = metadata
+        .len
+        .ok_or_else(|| "declared manifest guest payload size cannot be determined".to_owned())?;
+    if size > MAX_MANIFEST_GUEST_PAYLOAD_BYTES {
+        return Err(format!(
+            "declared manifest guest payload exceeds the {} byte limit",
+            MAX_MANIFEST_GUEST_PAYLOAD_BYTES
+        ));
+    }
+    let canonical = fs::canonical_context_path(&candidate)
+        .map_err(|_| "declared manifest guest payload cannot be canonicalized".to_owned())?;
+    // Equality, rather than only starts_with, rejects a symlink in every
+    // component below the selected workspace as well as a symlinked leaf.
+    if canonical != candidate || !canonical.starts_with(&root) {
+        return Err("declared manifest guest payload must not traverse a symlink".into());
+    }
+    if candidate.to_str().is_none() {
+        return Err("declared manifest guest payload path is not UTF-8".into());
+    }
+    Ok(candidate)
+}
+
+/// Accept only a stable guest file pathname. SCP's remote target has its own
+/// colon grammar, so punctuation accepted by a shell or a general remote-path
+/// API is deliberately not accepted here.
+fn normalize_manifest_guest_payload_destination(value: &str) -> Result<String, String> {
+    if value.len() > 4096
+        || value.is_empty()
+        || !value.is_ascii()
+        || value.contains(['\0', '\\', ':'])
+    {
+        return Err("manifest guest payload_destination is unsafe".into());
+    }
+    let suffix = if let Some(value) = value.strip_prefix("~/") {
+        value
+    } else if let Some(value) = value.strip_prefix('/') {
+        value
+    } else {
+        return Err(
+            "manifest guest payload_destination must be a normalized absolute or ~/ path".into(),
+        );
+    };
+    if suffix.is_empty()
+        || suffix
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'~' | b'_' | b'-' | b'.')
+        })
+    {
+        return Err("manifest guest payload_destination is not normalized".into());
+    }
+    Ok(value.into())
 }
 
 fn guest_remote_command(command: &str, workdir: Option<&str>) -> Result<String, String> {
@@ -1506,18 +1661,30 @@ async fn manifest_stack_plan(
             },
         );
         if let Some(guest) = stack.guest.as_ref() {
-            if guest.payload.is_some() {
-                return Err(
-                    "macOS guest task payload requires the native typed SCP transport, which is not implemented"
-                        .into(),
-                );
-            }
             guest_task = Some(ManifestGuestTask {
                 ssh_user: guest.ssh_user.clone(),
                 ssh_port: u16::try_from(guest.ssh_port)
                     .map_err(|_| "macOS guest SSH port is invalid".to_owned())?,
                 workdir: guest_workdir,
                 command: task.cmd.clone(),
+                payload: guest
+                    .payload
+                    .as_ref()
+                    .map(|source| {
+                        if !safe_manifest_relative_path(source) {
+                            return Err(
+                                "manifest guest payload must be a safe workspace-relative path"
+                                    .to_owned(),
+                            );
+                        }
+                        Ok(ManifestGuestPayload {
+                            source: source.clone(),
+                            destination: normalize_manifest_guest_payload_destination(
+                                &guest.payload_destination,
+                            )?,
+                        })
+                    })
+                    .transpose()?,
             });
         }
     }
@@ -1648,6 +1815,13 @@ struct ManifestGuestTask {
     ssh_port: u16,
     workdir: Option<String>,
     command: String,
+    payload: Option<ManifestGuestPayload>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManifestGuestPayload {
+    source: String,
+    destination: String,
 }
 
 /// Read-only guest host facts composed from kernal-api's existing host and
@@ -12658,12 +12832,16 @@ mod tests {
 
     struct FakeGuestSshTransport {
         calls: Mutex<Vec<GuestSshCommand>>,
+        scp_calls: Mutex<Vec<GuestScpCommand>>,
+        sequence: Mutex<Vec<String>>,
         results: Mutex<VecDeque<Result<CommandResult, CommandError>>>,
     }
     impl FakeGuestSshTransport {
         fn new(results: impl IntoIterator<Item = Result<CommandResult, CommandError>>) -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
+                scp_calls: Mutex::new(Vec::new()),
+                sequence: Mutex::new(Vec::new()),
                 results: Mutex::new(results.into_iter().collect()),
             }
         }
@@ -12677,7 +12855,26 @@ mod tests {
             _events: &'a async_engine::Sender<EngineEvent>,
         ) -> Pin<Box<dyn Future<Output = Result<CommandResult, CommandError>> + Send + 'a>>
         {
+            self.sequence
+                .lock()
+                .unwrap()
+                .push(format!("ssh:{}", command.command));
             self.calls.lock().unwrap().push(command);
+            Box::pin(ready(self.results.lock().unwrap().pop_front().unwrap()))
+        }
+        fn stream_scp<'a>(
+            &'a self,
+            command: GuestScpCommand,
+            _options: RunOptions,
+            _cancellation: &'a async_engine::CancellationToken,
+            _events: &'a async_engine::Sender<EngineEvent>,
+        ) -> Pin<Box<dyn Future<Output = Result<CommandResult, CommandError>> + Send + 'a>>
+        {
+            self.sequence
+                .lock()
+                .unwrap()
+                .push(format!("scp:{}", command.destination));
+            self.scp_calls.lock().unwrap().push(command);
             Box::pin(ready(self.results.lock().unwrap().pop_front().unwrap()))
         }
     }
@@ -12752,12 +12949,14 @@ mod tests {
                 let error = execute_manifest_guest_ssh_task(
                     &transport,
                     &state,
+                    &workspace,
                     &observed,
                     &ManifestGuestTask {
                         ssh_user: "runner".into(),
                         ssh_port: 2222,
                         workdir: Some("/Users/runner/space dir".into()),
                         command: "echo declared; true".into(),
+                        payload: None,
                     },
                     "check",
                     &async_engine::Deadline::after(Duration::from_secs(1)),
@@ -12835,12 +13034,14 @@ mod tests {
                     execute_manifest_guest_ssh_task(
                         &transport,
                         &state,
+                        &workspace,
                         &observed,
                         &ManifestGuestTask {
                             ssh_user: "runner".into(),
                             ssh_port: 2222,
                             workdir: None,
                             command: "sleep 10".into(),
+                            payload: None,
                         },
                         "wait",
                         &async_engine::Deadline::after(Duration::from_secs(1)),
@@ -12862,6 +13063,223 @@ mod tests {
                 "finish:uncertain".into()
             ]
         );
+    }
+
+    #[test]
+    fn guest_payload_is_copied_before_the_declared_task_with_no_raw_transport_inputs() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let identity = state.join("guest-ssh").join("id_ed25519");
+        std::fs::create_dir_all(identity.parent().unwrap()).unwrap();
+        std::fs::write(&identity, "unit-test-key").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &identity,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        let payload = workspace.join("out").join("archive.tar.zst");
+        std::fs::create_dir(payload.parent().unwrap()).unwrap();
+        std::fs::write(&payload, "archive").unwrap();
+        let transport = FakeGuestSshTransport::new([
+            Ok(command_result(0, [])),
+            Ok(command_result(0, [])),
+            Ok(command_result(0, [])),
+        ]);
+        let session = FakeManifestGuestSession::default();
+        let observed = SetupEnsureResult {
+            container_name: format!("bosn-setup-{TEST_HASH}"),
+            container_id: TEST_CONTAINER_ID.into(),
+            image_identity: TEST_IDENTITY.into(),
+            created: false,
+            started: false,
+            running: true,
+        };
+        let (events, _receiver) = async_engine::channel(8);
+        let (logs, _log_receiver) = async_engine::channel(8);
+        let cancellation = CancellationSource::new();
+        let token = cancellation.token();
+        RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                execute_manifest_guest_ssh_task(
+                    &transport,
+                    &state,
+                    &workspace,
+                    &observed,
+                    &ManifestGuestTask {
+                        ssh_user: "runner".into(),
+                        ssh_port: 2222,
+                        workdir: None,
+                        command: "run-declared-task".into(),
+                        payload: Some(ManifestGuestPayload {
+                            source: "out/archive.tar.zst".into(),
+                            destination: "~/archive.tar.zst".into(),
+                        }),
+                    },
+                    "check",
+                    &async_engine::Deadline::after(Duration::from_secs(1)),
+                    1024,
+                    &token,
+                    &logs,
+                    &events,
+                    &session,
+                )
+                .await
+                .unwrap();
+            });
+        let ssh = transport.calls.lock().unwrap();
+        assert_eq!(ssh.len(), 2);
+        assert_eq!(ssh[0].command, "true");
+        assert_eq!(ssh[1].command, "run-declared-task");
+        let scp = transport.scp_calls.lock().unwrap();
+        assert_eq!(scp.len(), 1);
+        assert_eq!(scp[0].source, payload);
+        assert_eq!(scp[0].destination, "~/archive.tar.zst");
+        assert_eq!(scp[0].user, "runner");
+        assert_eq!(scp[0].port, 2222);
+        assert_eq!(scp[0].identity_file, identity);
+        assert_eq!(
+            transport.sequence.lock().unwrap().as_slice(),
+            ["ssh:true", "scp:~/archive.tar.zst", "ssh:run-declared-task"]
+        );
+        assert_eq!(
+            session.events.lock().unwrap().as_slice(),
+            [
+                format!("begin:bosn-setup-{TEST_HASH}"),
+                "finish:succeeded".into()
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_guest_payload_upload_never_starts_or_records_the_task() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let identity = state.join("guest-ssh").join("id_ed25519");
+        std::fs::create_dir_all(identity.parent().unwrap()).unwrap();
+        std::fs::write(&identity, "unit-test-key").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &identity,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        std::fs::write(workspace.join("archive.tar.zst"), "archive").unwrap();
+        let transport = FakeGuestSshTransport::new([
+            Ok(command_result(0, [])),
+            Ok(command_result(1, "permission denied")),
+        ]);
+        let session = FakeManifestGuestSession::default();
+        let observed = SetupEnsureResult {
+            container_name: format!("bosn-setup-{TEST_HASH}"),
+            container_id: TEST_CONTAINER_ID.into(),
+            image_identity: TEST_IDENTITY.into(),
+            created: false,
+            started: false,
+            running: true,
+        };
+        let (events, _receiver) = async_engine::channel(8);
+        let (logs, _log_receiver) = async_engine::channel(8);
+        let cancellation = CancellationSource::new();
+        let token = cancellation.token();
+        let error = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                execute_manifest_guest_ssh_task(
+                    &transport,
+                    &state,
+                    &workspace,
+                    &observed,
+                    &ManifestGuestTask {
+                        ssh_user: "runner".into(),
+                        ssh_port: 2222,
+                        workdir: None,
+                        command: "must-not-run".into(),
+                        payload: Some(ManifestGuestPayload {
+                            source: "archive.tar.zst".into(),
+                            destination: "/Users/runner/archive.tar.zst".into(),
+                        }),
+                    },
+                    "check",
+                    &async_engine::Deadline::after(Duration::from_secs(1)),
+                    1024,
+                    &token,
+                    &logs,
+                    &events,
+                    &session,
+                )
+                .await
+                .unwrap_err()
+            });
+        assert!(error.contains("SCP payload upload failed"));
+        assert!(error.contains("declared task was not started"));
+        assert_eq!(transport.calls.lock().unwrap().len(), 1);
+        assert_eq!(transport.scp_calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            transport.sequence.lock().unwrap().as_slice(),
+            ["ssh:true", "scp:/Users/runner/archive.tar.zst"]
+        );
+        assert!(session.events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn guest_payload_preflight_requires_a_bounded_regular_workspace_file_and_normal_destination() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let payload = workspace.join("archive.tar.zst");
+        std::fs::write(&payload, "archive").unwrap();
+        assert_eq!(
+            manifest_guest_payload_file(&workspace, "archive.tar.zst").unwrap(),
+            payload
+        );
+        assert!(manifest_guest_payload_file(&workspace, "../outside").is_err());
+        assert!(manifest_guest_payload_file(&workspace, ".").is_err());
+        assert!(manifest_guest_payload_file(&workspace, "missing").is_err());
+        let oversized = workspace.join("oversized");
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_MANIFEST_GUEST_PAYLOAD_BYTES + 1)
+            .unwrap();
+        assert!(
+            manifest_guest_payload_file(&workspace, "oversized")
+                .unwrap_err()
+                .contains("exceeds")
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("archive.tar.zst", workspace.join("linked")).unwrap();
+            assert!(
+                manifest_guest_payload_file(&workspace, "linked")
+                    .unwrap_err()
+                    .contains("regular file")
+            );
+        }
+        assert_eq!(
+            normalize_manifest_guest_payload_destination("~/archive.tar.zst").unwrap(),
+            "~/archive.tar.zst"
+        );
+        assert_eq!(
+            normalize_manifest_guest_payload_destination("/Users/runner/archive.tar.zst").unwrap(),
+            "/Users/runner/archive.tar.zst"
+        );
+        for invalid in ["relative", "~/dir/../file", "/tmp//file", "~/file:name"] {
+            assert!(
+                normalize_manifest_guest_payload_destination(invalid).is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]

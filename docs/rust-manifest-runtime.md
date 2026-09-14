@@ -112,10 +112,14 @@ with no group/world permissions, and install its public key for the declared
 guest user during the guest's one-time manual bootstrap. The daemon refuses
 missing, non-regular, symlinked, or overly permissive identity files. This
 avoids passwords, SSH agents, user config, and manifest-selected secret paths.
-`guest.payload` remains refused for native guest tasks: the old Python behavior
-used SCP, and a bounded typed SCP source, destination, and completion model has
-not yet been implemented. The native task path will never silently skip a
-declared payload.
+For a declared `guest.payload`, native guest tasks re-prove one regular,
+non-symlinked workspace-relative file immediately before the task and copy it
+through the fixed loopback OpenSSH SCP channel. The source is limited to 4 GiB;
+the destination must be a normalized absolute guest path or a normalized `~/`
+path. SCP receives the same daemon-state identity, manifest-derived user and
+published port, and config/agent isolation as SSH. SCP failure, cancellation,
+deadline, or output-limit failure stops before the task session begins, so Bosn
+never executes a task against a stale declared payload.
 
 SSH exit status 255 and local client cancellation/deadline/output failures
 after task launch are recorded as uncertain because they cannot prove whether
