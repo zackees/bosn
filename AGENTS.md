@@ -16,22 +16,19 @@ explicit new decision, not by inference.
     `cp310-abi3` tag and the `_native.abi3.so` / `.pyd` extension name. Keep them in
     lockstep with any change here.
 
-- **Build backend: target state is `build-backend = "soldr"`; current state is the
-  custom `bosn_build_backend`.** soldr dogfoods `build-backend = "soldr"` for its own
-  wheel (no delegate, no `maturin` in `build-system.requires` — soldr provisions its
-  own pinned maturin and reads `[tool.maturin]`). Bosn cannot use the pure soldr path
-  **yet**: Bosn ships a *second* artifact in the wheel — the `bosn-native` CLI
-  (`crates/bosn-service/src/bin/bosn.rs`, staged into `.data/platlib/bosn/_bin/`) — and
-  soldr's native build has no hook to build+stage an auxiliary Cargo bin. So
-  `bosn_build_backend.py` builds+stages the CLI, then delegates the extension to
-  maturin.
-  - Do not "simplify" `bosn_build_backend.py` down to plain maturin: that drops the CLI
-    from the wheel and breaks the `bosn` entry point.
-  - Migration is tracked: **zackees/soldr#3239** (native auxiliary-bin staging) →
-    **zackees/bosn#262** (adopt the soldr backend once it lands). When adopting the
-    interim delegate form, `zackees/setup-soldr` must be added to **every** build lane
-    (the Linux/Windows `native-wheel` jobs currently have none; a soldr backend without
-    it fails with "cannot resolve the broker daemon route").
+- **Build backend: target state is `build-backend = "soldr"` (soldr's own pattern).**
+  `bosn_build_backend.py` is a custom PEP 517 wrapper built on a **false premise**
+  its docstring states outright — that maturin "does not package a Cargo binary from
+  the same mixed project." maturin **does**: soldr's own wheel (`soldr-cli` = `[lib]`
+  → `soldr._native` + `[[bin]] name="soldr"`) ships a `bin/soldr` next to the
+  extension via pure `build-backend = "soldr"`, no delegate. `bosn-python` has the
+  same shape but disabled the bin (`[tool.maturin] targets = [cdylib]`) and
+  hand-stages it. Bosn can drop the custom backend and mirror soldr; the Linux
+  OpenSSL bundling is maturin+patchelf (why soldr adds `patchelf` to build-requires).
+  Migration and the one open validation (cross-crate `[[bin]]` source) are tracked in
+  **zackees/bosn#262**. Until then `bosn_build_backend.py` stays — do not reduce it to
+  plain maturin without also un-disabling the bin target and rewiring the `bosn`
+  command.
 
 ## macOS (issue #252)
 
