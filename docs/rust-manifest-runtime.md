@@ -66,8 +66,8 @@ changed.
 | Dockerfile/build context | Refused |
 | macOS guest / guest fields | Refused |
 | volumes, tmpfs | Refused |
-| bind mounts | Refused in this first slice |
-| workdir | Refused in this first slice |
+| `[stack.NAME.mounts]` workspace bind mounts | Supported for existing paths that canonicalize beneath the selected workspace. Sources may be legacy absolute paths only when they resolve beneath that workspace; traversal, source symlinks, escapes, duplicate targets, reserved targets, and unrepresentable Docker paths are refused. `readonly` is retained. |
+| `workdir` | Supported only when its normalized absolute container path is covered by a declared workspace bind. It is translated to the typed workspace-relative form, becomes the persistent container workdir, and is therefore inherited by declared `manifest app-task` exec. Image-only workdirs are refused. |
 | image tags or unpinned image references | Refused |
 | generic `run`, shell, arbitrary Docker arguments | Not exposed |
 | multi-stack orchestration | Refused; submit one named stack only |
@@ -75,12 +75,18 @@ changed.
 
 The deterministic engine container is still checked against its exact derived
 image and labels before reuse. An occupied mismatched candidate fails closed.
+The runtime generation incorporates the accepted effective bind/workdir shape
+in addition to the historical manifest generation, so a bind target/source/
+readonly or workdir change cannot reuse a container configured for the prior
+lifecycle declaration. Before each ensure and manifest app-task operation the
+daemon re-reads the manifest; the typed setup primitive then canonicalizes the
+same mount sources again immediately before its engine operation.
 
 ## Remaining work
 
 This does not claim completion of manifest migration. Future slices must add
-explicit lifecycle designs for bind mounts/workdir, managed volumes, build
-materialization, multi-stack dependency ordering, guest lifecycle, declarative
-tasks, autostart/recovery, and generation reconciliation. Each must
+explicit lifecycle designs for managed volumes, build materialization,
+multi-stack dependency ordering, guest lifecycle, declarative tasks,
+autostart/recovery, and generation reconciliation. Each must
 remain daemon-owned and registry-backed rather than reintroducing raw Docker or
 Python business logic.

@@ -574,7 +574,7 @@ fn derive_command(request: &SetupEnsureRequest<'_>) -> Result<DerivedEnsure, Set
         .app
         .workdir
         .as_deref()
-        .map(|value| resolve_workdir(value, &request.plan.app.mounts))
+        .map(|value| resolve_workdir(value, &request.plan.app.mounts, &workspace_root))
         .transpose()?;
     let command = request.plan.app.command.clone();
     if command
@@ -704,6 +704,7 @@ fn derive_mounts(
 fn resolve_workdir(
     workdir: &str,
     mounts: &[bosn_core::WorkspaceMount],
+    workspace_root: &Path,
 ) -> Result<String, SetupEnsureError> {
     validate_workspace_relative(Some(workdir))?;
     let selected = mounts
@@ -714,6 +715,18 @@ fn resolve_workdir(
             "declared workdir is not covered by a declared workspace mount",
         ))?;
     let suffix = relative_suffix(workdir, &selected.source).expect("selected mount covers workdir");
+    // Recheck the selected source at apply time. A manifest/setup document can
+    // be planned while a source is a directory and changed before Docker is
+    // invoked; a file bind cannot meaningfully back a container workdir.
+    let source = canonical_workspace_member(workspace_root, &selected.source)?;
+    let metadata = fs::context_path_metadata_no_follow(&source).map_err(|_| {
+        SetupEnsureError::InvalidRequest("declared workdir mount source does not exist")
+    })?;
+    if metadata.kind != fs::ContextPathKind::Directory {
+        return Err(SetupEnsureError::InvalidRequest(
+            "declared workdir must be backed by a directory mount",
+        ));
+    }
     let resolved = if suffix.is_empty() {
         selected.target.clone()
     } else if selected.target == "/" {
@@ -1356,6 +1369,32 @@ mod tests {
             labels.get(LABEL_CONTENT_SHA256).map(String::as_str),
             Some(HASH)
         );
+    }
+
+    #[test]
+    fn workdir_backed_by_a_file_is_refused_before_any_engine_command() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("not-a-directory"), "proof").unwrap();
+        let mut plan = plan(&workspace);
+        plan.app.workdir = Some("not-a-directory".into());
+        plan.app.mounts[0].source = "not-a-directory".into();
+        let image = prepared(&plan);
+        let engine = FakeEngine::with_results([]);
+        let cancellation = CancellationSource::new();
+        assert!(
+            run(
+                &engine,
+                &plan,
+                &workspace,
+                &image,
+                &cancellation.token(),
+                RunOptions::streaming(Duration::from_secs(2), 4096),
+            )
+            .is_err()
+        );
+        assert!(engine.calls.lock().unwrap().is_empty());
     }
 
     #[test]

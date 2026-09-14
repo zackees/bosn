@@ -416,7 +416,7 @@ fn derive_command(request: &SetupTaskRequest<'_>) -> Result<SetupTaskCommand, Se
         .as_deref()
         .or(request.plan.app.workdir.as_deref());
     let workdir = selected_workdir
-        .map(|value| resolve_workdir(value, &request.plan.app.mounts))
+        .map(|value| resolve_workdir(value, &request.plan.app.mounts, &workspace_root))
         .transpose()?;
     Ok(SetupTaskCommand::Run {
         image_identity: request.prepared_image.observed_identity.clone(),
@@ -525,6 +525,7 @@ fn derive_mounts(
 fn resolve_workdir(
     workdir: &str,
     mounts: &[bosn_core::WorkspaceMount],
+    workspace_root: &Path,
 ) -> Result<String, SetupTaskError> {
     validate_workspace_relative(Some(workdir))?;
     let selected = mounts
@@ -536,6 +537,17 @@ fn resolve_workdir(
         ))?;
     let suffix =
         relative_suffix(workdir, &selected.source).expect("workspace_prefix selected this mount");
+    // Recheck the source at application time. The semantic workdir contract is
+    // a directory bind, not merely a path that existed when its plan was read.
+    let source = canonical_workspace_member(workspace_root, &selected.source)?;
+    let metadata = fs::context_path_metadata_no_follow(&source).map_err(|_| {
+        SetupTaskError::InvalidRequest("declared workdir mount source does not exist")
+    })?;
+    if metadata.kind != fs::ContextPathKind::Directory {
+        return Err(SetupTaskError::InvalidRequest(
+            "declared workdir must be backed by a directory mount",
+        ));
+    }
     let resolved = if suffix.is_empty() {
         selected.target.clone()
     } else if selected.target == "/" {
@@ -1043,6 +1055,39 @@ mod tests {
                 "cargo test --locked",
             ]
         );
+    }
+
+    #[test]
+    fn app_task_rechecks_that_its_workdir_bind_is_a_directory_before_exec() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("not-a-directory"), "proof").unwrap();
+        let mut plan = plan(&workspace);
+        plan.app.workdir = Some("not-a-directory".into());
+        plan.tasks.get_mut("check").unwrap().workdir = None;
+        plan.app.mounts[0].source = "not-a-directory".into();
+        let image = prepared(&plan);
+        let engine = FakeAppEngine::with_results([]);
+        let cancellation = CancellationSource::new();
+        let (events, _receiver) = channel(8);
+        assert!(
+            runtime()
+                .run(execute_setup_app_task(
+                    &engine,
+                    SetupAppTaskRequest {
+                        plan: &plan,
+                        workspace_root: workspace,
+                        task_name: "check".into(),
+                        prepared_image: &image,
+                        options: RunOptions::streaming(Duration::from_secs(2), 4096),
+                        cancellation: &cancellation.token(),
+                        events: &events,
+                    },
+                ))
+                .is_err()
+        );
+        assert!(engine.calls.lock().unwrap().is_empty());
     }
 
     #[test]

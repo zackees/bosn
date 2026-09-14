@@ -19,7 +19,7 @@ bosn-setup = { path = "../bosn-setup" }
 bosn-engine = { path = "../bosn-engine" }
 bosn-generation = { path = "../bosn-generation" }
 prost = "=0.14.4"
-kernal-api = { git = "https://github.com/zackees/kernal-api", rev = "fc634e507024d63ccaaf75fa564818b9dcfbff36", version = "=0.1.0", default-features = false, features = ["sqlite", "fs", "ipc", "ipc-async", "secure-random", "daemon-frame-v1"] }
+kernal-api = { git = "https://github.com/zackees/kernal-api", rev = "fc634e507024d63ccaaf75fa564818b9dcfbff36", version = "=0.1.0", default-features = false, features = ["sqlite", "fs", "ipc", "ipc-async", "secure-random", "daemon-frame-v1", "hash-sha256"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.149"
 
