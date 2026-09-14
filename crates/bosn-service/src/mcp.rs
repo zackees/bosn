@@ -1804,6 +1804,7 @@ mod tests {
                 },
                 named_volumes: Vec::new(),
                 tmpfs: Vec::new(),
+                macos_guest: None,
             })
         }
     }

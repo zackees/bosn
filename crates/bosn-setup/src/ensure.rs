@@ -12,7 +12,7 @@ use std::{
     pin::Pin,
 };
 
-use bosn_core::{MAX_ENVIRONMENT_ENTRIES, SETUP_DOCUMENT_VERSION};
+use bosn_core::{MAX_ENVIRONMENT_ENTRIES, Retention, SETUP_DOCUMENT_VERSION, Scope};
 use bosn_engine::{CommandError, CommandResult, DockerEngine, EngineEvent, RunOptions};
 use kernal_api::{
     async_engine::{CancellationToken, Deadline, Sender},
@@ -52,6 +52,18 @@ pub struct SetupEnsureTmpfs {
     pub size: Option<crate::SetupTmpfsSize>,
 }
 
+/// The only privileged container shape accepted by setup ensure.  Every value
+/// originates in a parsed `macos-x64-guest` manifest declaration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupEnsureMacosGuest {
+    pub ssh_port: u16,
+    pub web_port: u16,
+    pub version: String,
+    pub ram_size: String,
+    pub disk_size: String,
+    pub cpu_cores: u16,
+}
+
 /// A finite semantic engine command used by [`ensure_setup_app`].
 ///
 /// The operation deliberately has no generic Docker argument, network,
@@ -78,6 +90,7 @@ pub enum SetupEnsureCommand {
         workdir: Option<String>,
         command: Option<String>,
         labels: BTreeMap<String, String>,
+        macos_guest: Box<Option<SetupEnsureMacosGuest>>,
     },
     Start {
         container_name: String,
@@ -124,6 +137,7 @@ impl SetupEnsureCommand {
                 workdir,
                 command,
                 labels,
+                macos_guest,
             } => {
                 let mut args = vec![
                     "container".into(),
@@ -166,8 +180,35 @@ impl SetupEnsureCommand {
                     args.push("--workdir".into());
                     args.push(workdir.clone());
                 }
+                if let Some(guest) = macos_guest.as_ref() {
+                    args.extend([
+                        "--device".into(),
+                        "/dev/kvm".into(),
+                        "--device".into(),
+                        "/dev/net/tun".into(),
+                        "--cap-add".into(),
+                        "NET_ADMIN".into(),
+                        "--publish".into(),
+                        format!("127.0.0.1:{}:22", guest.ssh_port),
+                        "--publish".into(),
+                        format!("127.0.0.1:{}:8006", guest.web_port),
+                        "--stop-timeout".into(),
+                        "120".into(),
+                    ]);
+                    for (key, value) in [
+                        ("VERSION", &guest.version),
+                        ("RAM_SIZE", &guest.ram_size),
+                        ("DISK_SIZE", &guest.disk_size),
+                        ("CPU_CORES", &guest.cpu_cores.to_string()),
+                    ] {
+                        args.push("--env".into());
+                        args.push(format!("{key}={value}"));
+                    }
+                }
                 args.push(image_identity.clone());
-                if let Some(command) = command {
+                if macos_guest.is_none()
+                    && let Some(command) = command
+                {
                     args.extend(["sh".into(), "-lc".into(), command.clone()]);
                 }
                 args
@@ -664,6 +705,7 @@ struct DerivedEnsure {
     labels: BTreeMap<String, String>,
     volumes: Vec<SetupEnsureVolume>,
     tmpfs: Vec<SetupEnsureTmpfs>,
+    macos_guest: Option<SetupEnsureMacosGuest>,
 }
 
 impl DerivedEnsure {
@@ -678,6 +720,7 @@ impl DerivedEnsure {
             workdir: self.workdir.clone(),
             command: self.command.clone(),
             labels: self.labels.clone(),
+            macos_guest: Box::new(self.macos_guest.clone()),
         }
     }
 }
@@ -719,6 +762,18 @@ fn derive_command(request: &SetupEnsureRequest<'_>) -> Result<DerivedEnsure, Set
     ]);
     let volumes = derive_volumes(request.plan)?;
     let tmpfs = derive_tmpfs(request.plan)?;
+    let macos_guest = request
+        .plan
+        .macos_guest
+        .as_ref()
+        .map(|guest| SetupEnsureMacosGuest {
+            ssh_port: guest.ssh_port,
+            web_port: guest.web_port,
+            version: guest.version.clone(),
+            ram_size: guest.ram_size.clone(),
+            disk_size: guest.disk_size.clone(),
+            cpu_cores: guest.cpu_cores,
+        });
     Ok(DerivedEnsure {
         container_name,
         image_identity: request.prepared_image.observed_identity.clone(),
@@ -729,6 +784,7 @@ fn derive_command(request: &SetupEnsureRequest<'_>) -> Result<DerivedEnsure, Set
         labels,
         volumes,
         tmpfs,
+        macos_guest,
     })
 }
 
@@ -799,7 +855,76 @@ fn validate_plan_shape(plan: &SetupPlan) -> Result<(), SetupEnsureError> {
             ));
         }
     }
+    if let Some(guest) = &plan.macos_guest
+        && (!matches!(plan.app.source, bosn_core::SetupSource::PinnedImage(_))
+            || !matches!(&plan.app.source, bosn_core::SetupSource::PinnedImage(image) if valid_macos_guest_image(image))
+            || !plan.app.mounts.is_empty()
+            || plan.app.workdir.is_some()
+            || plan.app.command.is_some()
+            || guest.ssh_port == 0
+            || guest.web_port == 0
+            || guest.ssh_port == guest.web_port
+            || guest.cpu_cores == 0
+            || !valid_guest_env_value(&guest.version)
+            || !valid_guest_env_value(&guest.ram_size)
+            || !valid_guest_env_value(&guest.disk_size))
+    {
+        return Err(SetupEnsureError::InvalidRequest(
+            "macOS guest receipt was modified",
+        ));
+    }
+    if let Some(guest) = &plan.macos_guest {
+        let matching_storage = plan
+            .named_volumes
+            .iter()
+            .filter(|volume| volume.target == "/storage")
+            .collect::<Vec<_>>();
+        if guest.storage_volume.is_empty()
+            || matching_storage.len() != 1
+            || matching_storage[0].name != guest.storage_volume
+            || !valid_volume_name(&guest.storage_volume)
+            || guest.storage_scope != Scope::Machine
+            || guest.storage_retention != Retention::Pinned
+        {
+            return Err(SetupEnsureError::InvalidRequest(
+                "macOS guest storage volume receipt was modified",
+            ));
+        }
+    }
     Ok(())
+}
+
+fn valid_guest_env_value(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && !value.contains(['\0', '\n', '\r', '='])
+}
+
+/// Docker Hub's documented registry spellings all designate the one trusted
+/// dockurr entrypoint image. A digest pins the bytes; accepting another
+/// repository here would turn the fixed KVM/tun create shape into a generic
+/// privileged-container escape hatch.
+fn valid_macos_guest_image(value: &str) -> bool {
+    let Some((name, digest)) = value.rsplit_once("@sha256:") else {
+        return false;
+    };
+    let repository = if let Some((prefix, final_component)) = name.rsplit_once('/') {
+        if let Some((repository, _tag)) = final_component.split_once(':') {
+            format!("{prefix}/{repository}")
+        } else {
+            name.to_owned()
+        }
+    } else {
+        name.to_owned()
+    };
+    matches!(
+        repository.as_str(),
+        "dockurr/macos"
+            | "docker.io/dockurr/macos"
+            | "index.docker.io/dockurr/macos"
+            | "registry-1.docker.io/dockurr/macos"
+    ) && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn derive_volumes(plan: &SetupPlan) -> Result<Vec<SetupEnsureVolume>, SetupEnsureError> {
@@ -1336,6 +1461,7 @@ mod tests {
             app_source: SetupPlanAppSource::PinnedImage { image },
             named_volumes: Vec::new(),
             tmpfs: Vec::new(),
+            macos_guest: None,
         }
     }
 
@@ -1351,6 +1477,38 @@ mod tests {
             reference: image.clone(),
             observed_identity: IDENTITY.into(),
         }
+    }
+
+    fn macos_guest_plan(workspace: &Path) -> SetupPlan {
+        let mut plan = plan(workspace);
+        let image = format!("dockurr/macos@sha256:{HASH}");
+        plan.app.source = bosn_core::SetupSource::PinnedImage(image.clone());
+        plan.app_source = SetupPlanAppSource::PinnedImage { image };
+        plan.app.mounts.clear();
+        plan.app.workdir = None;
+        plan.app.command = None;
+        let storage_volume = "bosn-v-machine-macos-storage".to_owned();
+        plan.named_volumes = vec![crate::SetupNamedVolume {
+            name: storage_volume.clone(),
+            target: "/storage".into(),
+            labels: BTreeMap::from([
+                (LABEL_MANAGED.into(), MANAGED_VALUE.into()),
+                (LABEL_CONTENT_SHA256.into(), HASH.into()),
+                (LABEL_CONTAINER_NAME.into(), storage_volume.clone()),
+            ]),
+        }];
+        plan.macos_guest = Some(crate::SetupMacosGuest {
+            ssh_port: 2222,
+            web_port: 8006,
+            version: "ventura".into(),
+            ram_size: "8G".into(),
+            disk_size: "128G".into(),
+            cpu_cores: 1,
+            storage_volume,
+            storage_scope: Scope::Machine,
+            storage_retention: Retention::Pinned,
+        });
+        plan
     }
 
     fn run(
@@ -1553,6 +1711,7 @@ mod tests {
             workdir: None,
             command: None,
             labels: BTreeMap::new(),
+            macos_guest: Box::new(None),
         };
         let args = command.docker_args();
         assert_eq!(
@@ -1561,6 +1720,85 @@ mod tests {
                 .map(|pair| pair[1].as_str()),
             Some("/run/cache:ro,size=64m")
         );
+    }
+
+    #[test]
+    fn typed_macos_guest_emits_only_its_fixed_privileged_runtime_shape() {
+        let command = SetupEnsureCommand::Create {
+            container_name: "bosn-setup-test".into(),
+            image_identity: IDENTITY.into(),
+            mounts: Vec::new(),
+            volumes: Vec::new(),
+            tmpfs: Vec::new(),
+            environment: BTreeMap::new(),
+            workdir: None,
+            command: Some("must-not-be-emitted".into()),
+            labels: BTreeMap::new(),
+            macos_guest: Box::new(Some(SetupEnsureMacosGuest {
+                ssh_port: 2222,
+                web_port: 8006,
+                version: "ventura".into(),
+                ram_size: "8G".into(),
+                disk_size: "128G".into(),
+                cpu_cores: 1,
+            })),
+        };
+        let args = command.docker_args();
+        for expected in [
+            "/dev/kvm",
+            "/dev/net/tun",
+            "NET_ADMIN",
+            "127.0.0.1:2222:22",
+            "127.0.0.1:8006:8006",
+            "VERSION=ventura",
+            "RAM_SIZE=8G",
+            "DISK_SIZE=128G",
+            "CPU_CORES=1",
+        ] {
+            assert!(
+                args.iter().any(|value| value == expected),
+                "missing {expected}"
+            );
+        }
+        assert!(!args.iter().any(|value| value == "must-not-be-emitted"));
+    }
+
+    #[test]
+    fn macos_guest_plan_requires_trusted_image_and_exact_durable_storage_receipt() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let plan = macos_guest_plan(&workspace);
+        assert!(validate_plan_shape(&plan).is_ok());
+
+        let mut untrusted_image = plan.clone();
+        let image = format!("registry.example/dockurr/macos@sha256:{HASH}");
+        untrusted_image.app.source = bosn_core::SetupSource::PinnedImage(image.clone());
+        untrusted_image.app_source = SetupPlanAppSource::PinnedImage { image };
+        assert!(matches!(
+            validate_plan_shape(&untrusted_image),
+            Err(SetupEnsureError::InvalidRequest(
+                "macOS guest receipt was modified"
+            ))
+        ));
+
+        let mut missing_storage = plan.clone();
+        missing_storage.named_volumes.clear();
+        assert!(matches!(
+            validate_plan_shape(&missing_storage),
+            Err(SetupEnsureError::InvalidRequest(
+                "macOS guest storage volume receipt was modified"
+            ))
+        ));
+
+        let mut unsafe_storage = plan;
+        unsafe_storage.macos_guest.as_mut().unwrap().storage_scope = Scope::Stack;
+        assert!(matches!(
+            validate_plan_shape(&unsafe_storage),
+            Err(SetupEnsureError::InvalidRequest(
+                "macOS guest storage volume receipt was modified"
+            ))
+        ));
     }
 
     #[test]

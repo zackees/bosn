@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use bosn_core::{SetupApp, SetupSource, SetupTask};
+use bosn_core::{Retention, Scope, SetupApp, SetupSource, SetupTask};
 use std::collections::BTreeMap;
 
 use crate::{
@@ -78,6 +78,25 @@ pub struct SetupTmpfsSize {
     pub unit: SetupTmpfsSizeUnit,
 }
 
+/// A finite KVM-backed macOS guest shape derived solely from a legacy Bosn
+/// manifest. Setup documents cannot express this privileged runtime mode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupMacosGuest {
+    pub ssh_port: u16,
+    pub web_port: u16,
+    pub version: String,
+    pub ram_size: String,
+    pub disk_size: String,
+    pub cpu_cores: u16,
+    /// Exact Bosn-managed named volume that persists dockurr's VM disk at
+    /// `/storage`; derived from the manifest's required pinned machine volume.
+    pub storage_volume: String,
+    /// Policy receipt retained so setup apply cannot turn the required durable
+    /// machine disk into a stack/spec or warm volume after manifest parsing.
+    pub storage_scope: Scope,
+    pub storage_retention: Retention,
+}
+
 /// Typed receipt of a setup plan.  The source bytes have been validated and
 /// cached according to the request, while Docker and the Bosn daemon remain
 /// untouched.
@@ -113,6 +132,9 @@ pub struct SetupPlan {
     /// Tmpfs mounts derived from an accepted manifest declaration. Ordinary
     /// setup documents leave this empty.
     pub tmpfs: Vec<SetupTmpfs>,
+    /// A macOS KVM guest derived by the native manifest runtime. Ordinary
+    /// setup documents leave this absent.
+    pub macos_guest: Option<SetupMacosGuest>,
 }
 
 /// Planning stops before side effects outside Bosn-owned cache/asset state.
@@ -199,5 +221,6 @@ pub async fn plan_setup_with_transport<T: SetupRemoteTransport>(
         app_source,
         named_volumes: Vec::new(),
         tmpfs: Vec::new(),
+        macos_guest: None,
     })
 }

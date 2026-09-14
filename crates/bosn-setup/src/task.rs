@@ -428,6 +428,11 @@ fn derive_command(request: &SetupTaskRequest<'_>) -> Result<SetupTaskCommand, Se
 }
 
 fn validate_plan_shape(plan: &SetupPlan) -> Result<(), SetupTaskError> {
+    if plan.macos_guest.is_some() {
+        return Err(SetupTaskError::InvalidRequest(
+            "macOS guests require a bounded SSH task transport",
+        ));
+    }
     if !valid_hash(&plan.content_sha256) {
         return Err(SetupTaskError::InvalidRequest(
             "plan content hash is not canonical",
@@ -897,6 +902,7 @@ mod tests {
             app_source: SetupPlanAppSource::PinnedImage { image },
             named_volumes: Vec::new(),
             tmpfs: Vec::new(),
+            macos_guest: None,
         }
     }
 
