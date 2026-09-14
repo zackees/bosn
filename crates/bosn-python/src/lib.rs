@@ -7,10 +7,10 @@ use bosn_core::{parse_and_plan_compose_yaml, parse_setup_config_locator};
 use bosn_service::{
     Client as ServiceClient, DoctorReport as ServiceDoctorReport, JobLogPage as ServiceJobLogPage,
     JobStatus as ServiceJobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE, ManifestAppTaskJobRequest,
-    ManifestEnsureJobRequest, RegistryResourcePage as ServiceRegistryResourcePage,
-    SetupAdoptRequest, SetupAppTaskJobRequest, SetupDoneResult as ServiceSetupDoneResult,
-    SetupEnsureEventPage as ServiceSetupEnsureEventPage, SetupEnsureJobRequest,
-    SetupGcApplyResult as ServiceSetupGcApplyResult,
+    ManifestConvergeJobRequest, ManifestEnsureJobRequest,
+    RegistryResourcePage as ServiceRegistryResourcePage, SetupAdoptRequest, SetupAppTaskJobRequest,
+    SetupDoneResult as ServiceSetupDoneResult, SetupEnsureEventPage as ServiceSetupEnsureEventPage,
+    SetupEnsureJobRequest, SetupGcApplyResult as ServiceSetupGcApplyResult,
     SetupGcPreviewPage as ServiceSetupGcPreviewPage, SetupPreparePolicy, SetupPrepareRequest,
     SetupReconcileMissingRepairResult as ServiceSetupReconcileMissingRepairResult,
     SetupReconcilePreviewPage as ServiceSetupReconcilePreviewPage,
@@ -431,6 +431,34 @@ impl Client {
                     workspace,
                     config: config_locator,
                     policy,
+                    deadline: Duration::from_millis(deadline_ms),
+                    output_limit: output_limit as usize,
+                },
+            )
+            .map_err(service_error)
+        })
+    }
+    /// Submit deterministic convergence of every stack declared in a legacy
+    /// manifest. The legacy TOML schema has no dependency relation, so the
+    /// daemon uses its canonical lexical stack order and accepts no root or
+    /// Docker selector from Python.
+    #[pyo3(signature = (workspace, manifest, *, deadline_ms, output_limit))]
+    fn submit_manifest_converge(
+        &self,
+        workspace: PathBuf,
+        manifest: String,
+        deadline_ms: u64,
+        output_limit: u32,
+        py: Python<'_>,
+    ) -> PyResult<u64> {
+        validate_manifest_converge_input(&workspace, &manifest, deadline_ms, output_limit)?;
+        let state_dir = self.state_dir.clone();
+        py.detach(move || {
+            submit_manifest_converge(
+                &state_dir,
+                ManifestConvergeJobRequest {
+                    workspace,
+                    manifest,
                     deadline: Duration::from_millis(deadline_ms),
                     output_limit: output_limit as usize,
                 },
@@ -1427,6 +1455,20 @@ fn submit_manifest_ensure(
             .await
     })
 }
+fn submit_manifest_converge(
+    state_dir: &Path,
+    request: ManifestConvergeJobRequest,
+) -> Result<u64, bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async {
+        ServiceClient::for_state(state_dir)?
+            .submit_manifest_converge(request)
+            .await
+    })
+}
 fn submit_manifest_app_task(
     state_dir: &Path,
     request: ManifestAppTaskJobRequest,
@@ -1603,6 +1645,18 @@ fn validate_manifest_ensure_input(
         ));
     }
     Ok(())
+}
+
+fn validate_manifest_converge_input(
+    workspace: &Path,
+    manifest: &str,
+    deadline_ms: u64,
+    output_limit: u32,
+) -> PyResult<()> {
+    // Keep the shared workspace/path/budget grammar precisely aligned with
+    // named ensure. `all` is only an internal syntactic stand-in; no stack
+    // selector crosses this Python API.
+    validate_manifest_ensure_input(workspace, manifest, "all", deadline_ms, output_limit)
 }
 
 fn validate_manifest_task_name(task_name: &str) -> PyResult<()> {

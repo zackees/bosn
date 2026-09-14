@@ -802,6 +802,83 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
             _remove_exact_managed_volume(name, content)
 
 
+def test_native_python_client_converges_all_manifest_stacks_in_order(tmp_path: Path) -> None:
+    """One installed-wheel job safely converges every declared stack.
+
+    The legacy TOML shape deliberately has no dependency edge. This proof uses
+    two independently valid pinned Linux stacks and verifies the all-stack
+    client surface, durable records, deterministic progress logs, and real
+    managed containers without adding a caller-selected Docker control.
+    """
+
+    image_id = _pinned_image_id(PINNED_MANIFEST_MYSQL)
+    state_dir = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    unique = f"manifest-converge-{os.getpid()}-{time.time_ns()}"
+    (workspace / "bosn.toml").write_text(
+        "[stack.zebra]\n"
+        f"image = '{PINNED_MANIFEST_MYSQL}'\n"
+        "[stack.zebra.env]\n"
+        "MYSQL_ALLOW_EMPTY_PASSWORD = 'yes'\n"
+        f"BOSN_CONVERGE_PROOF = '{unique}-z'\n"
+        "[stack.alpha]\n"
+        f"image = '{PINNED_MANIFEST_MYSQL}'\n"
+        "[stack.alpha.env]\n"
+        "MYSQL_ALLOW_EMPTY_PASSWORD = 'yes'\n"
+        f"BOSN_CONVERGE_PROOF = '{unique}-a'\n",
+        encoding="utf-8",
+    )
+    client = bosn.Client(state_dir)
+    for field in ("stack", "root", "depends_on", "docker_args", "image"):
+        with pytest.raises(TypeError):
+            client.submit_manifest_converge(
+                workspace,
+                "bosn.toml",
+                deadline_ms=90_000,
+                output_limit=1_048_576,
+                **{field: "unsafe"},
+            )
+
+    managed_containers: list[tuple[str, str]] = []
+    try:
+        with _production_daemon(state_dir) as (_, daemon):
+            _wait_for_daemon(client, daemon)
+            job = client.submit_manifest_converge(
+                workspace,
+                "bosn.toml",
+                deadline_ms=90_000,
+                output_limit=1_048_576,
+            )
+            logs = _wait_for_success(client, job)
+            assert "[manifest-converge] ensuring stack alpha (1/2)" in logs
+            assert "[manifest-converge] ensuring stack zebra (2/2)" in logs
+            resources = client.registry_resources(limit=16).records
+            containers = [
+                record
+                for record in resources
+                if record.kind == "container" and record.state == "active"
+            ]
+            assert [record.stack for record in containers] == ["alpha", "zebra"]
+            for record in containers:
+                assert record.generation.startswith("sha256:")
+                content = record.generation.removeprefix("sha256:")
+                name = f"bosn-setup-{content}"
+                managed_containers.append((name, content))
+                observed = _inspect_container(name)
+                assert observed is not None
+                assert observed[1]
+                assert observed[2] == image_id
+                assert observed[3][CONTENT_LABEL] == content
+            assert _read_manifest_success_events(state_dir) == [
+                ("manifest.ensure.succeeded", f"job_id={job}"),
+                ("manifest.ensure.succeeded", f"job_id={job}"),
+            ]
+    finally:
+        for name, content in reversed(managed_containers):
+            _remove_exact_managed_container(name, content)
+
+
 def test_native_manifest_task_inherits_declared_workspace_binds_and_workdir(
     tmp_path: Path,
 ) -> None:

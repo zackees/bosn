@@ -16,11 +16,11 @@
 
 use crate::{
     Client, DoctorReport, Error, JobLogPage, JobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE,
-    ManifestAppTaskJobRequest, ManifestEnsureJobRequest, RegistryResourcePage, SetupAdoptRequest,
-    SetupAdoptResult, SetupAppTaskJobRequest, SetupDoneResult, SetupEnsureEventPage,
-    SetupEnsureJobRequest, SetupGcApplyResult, SetupGcPreviewPage, SetupPreparePolicy,
-    SetupPrepareRequest, SetupReconcileMissingRepairResult, SetupReconcilePreviewPage,
-    SetupRetiredStopResult, SetupTaskJobRequest, Status,
+    ManifestAppTaskJobRequest, ManifestConvergeJobRequest, ManifestEnsureJobRequest,
+    RegistryResourcePage, SetupAdoptRequest, SetupAdoptResult, SetupAppTaskJobRequest,
+    SetupDoneResult, SetupEnsureEventPage, SetupEnsureJobRequest, SetupGcApplyResult,
+    SetupGcPreviewPage, SetupPreparePolicy, SetupPrepareRequest, SetupReconcileMissingRepairResult,
+    SetupReconcilePreviewPage, SetupRetiredStopResult, SetupTaskJobRequest, Status,
 };
 use bosn_core::parse_and_plan_compose_yaml;
 use bosn_setup::{
@@ -151,6 +151,10 @@ trait Backend {
     /// foreign or mismatched candidate rather than replacing it.
     fn submit_setup_ensure(&mut self, request: SetupEnsureJobRequest) -> Result<u64, Error>;
     fn submit_manifest_ensure(&mut self, request: ManifestEnsureJobRequest) -> Result<u64, Error>;
+    fn submit_manifest_converge(
+        &mut self,
+        request: ManifestConvergeJobRequest,
+    ) -> Result<u64, Error>;
     fn submit_manifest_app_task(
         &mut self,
         request: ManifestAppTaskJobRequest,
@@ -267,6 +271,13 @@ impl Backend for DaemonBackend<'_> {
     fn submit_manifest_ensure(&mut self, request: ManifestEnsureJobRequest) -> Result<u64, Error> {
         self.runtime
             .run(self.client.submit_manifest_ensure(request))
+    }
+    fn submit_manifest_converge(
+        &mut self,
+        request: ManifestConvergeJobRequest,
+    ) -> Result<u64, Error> {
+        self.runtime
+            .run(self.client.submit_manifest_converge(request))
     }
     fn submit_manifest_app_task(
         &mut self,
@@ -526,6 +537,12 @@ fn tools_list() -> Value {
                 "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}
             },
             {
+                "name": "bosn_manifest_converge",
+                "description": "Submit one bounded daemon-owned convergence of every stack in a workspace-contained legacy Bosn TOML manifest. The current manifest schema has no dependency edges or root selector, so the daemon snapshots the declared stack names and ensures them in deterministic lexical order, one at a time. Each member keeps the normal typed image/build, volumes, workspace mounts/workdir, tmpfs, bounded guest, registry, and rollover safeguards; a later failure leaves earlier successful member records durable. Callers cannot select stack order, Docker arguments, mounts, images, or commands.",
+                "inputSchema": manifest_converge_schema(),
+                "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}
+            },
+            {
                 "name": "bosn_manifest_app_task",
                 "description": "Submit one named task declared by an already ensured supported manifest stack. The daemon re-reads the manifest and proves exact running ownership before fixed exec; commands, containers, Docker arguments, mounts, and environment controls are refused. Cancellation may leave remote completion unknown.",
                 "inputSchema": manifest_app_task_schema(),
@@ -606,6 +623,14 @@ fn manifest_ensure_schema() -> Value {
         "workspace":{"type":"string","minLength":1,"maxLength":MAX_MCP_SETUP_STRING_BYTES},
         "manifest":{"type":"string","minLength":1,"maxLength":4096,"description":"Safe relative TOML path beneath workspace; URLs and absolute paths are refused."},
         "stack":{"type":"string","minLength":1,"maxLength":128},
+        "deadline_ms":{"type":"integer","minimum":1,"maximum":300000},
+        "output_limit":{"type":"integer","minimum":1,"maximum":8388608}
+    }})
+}
+fn manifest_converge_schema() -> Value {
+    json!({"type":"object","additionalProperties":false,"required":["workspace","manifest","deadline_ms","output_limit"],"properties":{
+        "workspace":{"type":"string","minLength":1,"maxLength":MAX_MCP_SETUP_STRING_BYTES},
+        "manifest":{"type":"string","minLength":1,"maxLength":4096,"description":"Safe relative TOML path beneath workspace; URLs, dependency selectors, and absolute paths are refused."},
         "deadline_ms":{"type":"integer","minimum":1,"maximum":300000},
         "output_limit":{"type":"integer","minimum":1,"maximum":8388608}
     }})
@@ -864,6 +889,14 @@ fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
                 .map(|job_id| json!({"action":"manifest_ensure","submitted":true,"job_id":job_id}))
                 .map_err(|_| ToolFailure::Daemon)
         }),
+        "bosn_manifest_converge" => manifest_converge_request(arguments).and_then(|request| {
+            backend
+                .submit_manifest_converge(request)
+                .map(
+                    |job_id| json!({"action":"manifest_converge","submitted":true,"job_id":job_id}),
+                )
+                .map_err(|_| ToolFailure::Daemon)
+        }),
         "bosn_manifest_app_task" => manifest_app_task_request(arguments).and_then(|request| {
             backend
                 .submit_manifest_app_task(request)
@@ -1076,6 +1109,35 @@ fn manifest_ensure_request(
         workspace: PathBuf::from(required_setup_string(arguments, "workspace")?),
         manifest,
         stack,
+        deadline: std::time::Duration::from_millis(required_bounded_u64(
+            arguments,
+            "deadline_ms",
+            300_000,
+        )?),
+        output_limit: required_bounded_u64(arguments, "output_limit", 8 * 1024 * 1024)? as usize,
+    })
+}
+fn manifest_converge_request(
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<ManifestConvergeJobRequest, ToolFailure> {
+    only_arguments(
+        arguments,
+        &["workspace", "manifest", "deadline_ms", "output_limit"],
+    )?;
+    let manifest = required_setup_string(arguments, "manifest")?;
+    if manifest.starts_with('/')
+        || manifest.contains('\\')
+        || manifest
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(ToolFailure::Invalid(
+            "manifest must be a safe workspace-relative path",
+        ));
+    }
+    Ok(ManifestConvergeJobRequest {
+        workspace: PathBuf::from(required_setup_string(arguments, "workspace")?),
+        manifest,
         deadline: std::time::Duration::from_millis(required_bounded_u64(
             arguments,
             "deadline_ms",
@@ -1550,6 +1612,7 @@ mod tests {
         setup_prepare_calls: Vec<SetupPrepareRequest>,
         setup_ensure_calls: Vec<SetupEnsureJobRequest>,
         manifest_ensure_calls: Vec<ManifestEnsureJobRequest>,
+        manifest_converge_calls: Vec<ManifestConvergeJobRequest>,
         manifest_app_task_calls: Vec<ManifestAppTaskJobRequest>,
         setup_task_calls: Vec<SetupTaskJobRequest>,
         setup_app_task_calls: Vec<SetupAppTaskJobRequest>,
@@ -1746,6 +1809,13 @@ mod tests {
             self.manifest_ensure_calls.push(request);
             Ok(45)
         }
+        fn submit_manifest_converge(
+            &mut self,
+            request: ManifestConvergeJobRequest,
+        ) -> Result<u64, Error> {
+            self.manifest_converge_calls.push(request);
+            Ok(47)
+        }
         fn submit_manifest_app_task(
             &mut self,
             request: ManifestAppTaskJobRequest,
@@ -1868,6 +1938,7 @@ mod tests {
                 "bosn_setup_prepare",
                 "bosn_setup_ensure",
                 "bosn_manifest_ensure",
+                "bosn_manifest_converge",
                 "bosn_manifest_app_task",
                 "bosn_setup_task",
                 "bosn_setup_app_task"
@@ -2263,6 +2334,29 @@ mod tests {
         assert_eq!(call.manifest, "bosn.toml");
         assert_eq!(call.stack, "app");
         assert_eq!(call.task_name, "check");
+    }
+
+    #[test]
+    fn manifest_converge_submits_only_whole_manifest_selectors() {
+        let mut backend = FakeBackend::default();
+        let replies = exchange(
+            concat!(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"bosn_manifest_converge","arguments":{"workspace":"/workspace","manifest":"bosn.toml","deadline_ms":1000,"output_limit":1024}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"bosn_manifest_converge","arguments":{"workspace":"/workspace","manifest":"bosn.toml","deadline_ms":1000,"output_limit":1024,"stack":"app"}}}"#,
+                "\n",
+            ),
+            &mut backend,
+        );
+        assert_eq!(replies[1]["result"]["isError"], false);
+        assert_eq!(replies[1]["result"]["structuredContent"]["job_id"], 47);
+        assert_eq!(replies[2]["result"]["isError"], true);
+        assert_eq!(backend.manifest_converge_calls.len(), 1);
+        let call = &backend.manifest_converge_calls[0];
+        assert_eq!(call.manifest, "bosn.toml");
+        assert_eq!(call.workspace, PathBuf::from("/workspace"));
     }
 
     #[test]

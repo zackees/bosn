@@ -14,8 +14,9 @@ use std::{
 
 use bosn_core::{parse_and_plan_compose_yaml, parse_setup_config_locator};
 use bosn_service::{
-    Client, JobLogPage, JobStatus, ManifestAppTaskJobRequest, ManifestEnsureJobRequest,
-    SetupEnsureJobRequest, SetupPreparePolicy, SetupPrepareRequest, SetupTaskJobRequest,
+    Client, JobLogPage, JobStatus, ManifestAppTaskJobRequest, ManifestConvergeJobRequest,
+    ManifestEnsureJobRequest, SetupEnsureJobRequest, SetupPreparePolicy, SetupPrepareRequest,
+    SetupTaskJobRequest,
 };
 use bosn_setup::{
     SetupAcquirePolicy, SetupPlan, SetupPlanAppSource, SetupPlanRequest, SetupSourceKind,
@@ -59,8 +60,70 @@ fn main() {
 fn run_manifest(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
     match arguments.next().as_deref() {
         Some(command) if command == "ensure" => run_manifest_ensure(arguments),
+        Some(command) if command == "converge" => run_manifest_converge(arguments),
         Some(command) if command == "app-task" => run_manifest_app_task(arguments),
         _ => usage(),
+    }
+}
+
+/// Converge every declared manifest stack in the daemon's deterministic
+/// lexical order. This accepts no dependency, root, Docker, or stack selector
+/// because the legacy TOML schema does not represent dependency edges.
+fn run_manifest_converge(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
+    let mut state_dir = None;
+    let mut workspace = None;
+    let mut manifest = None;
+    let mut deadline_ms = None;
+    let mut output_limit = None;
+    let mut json_output = false;
+    while let Some(argument) = arguments.next() {
+        match argument.to_string_lossy().as_ref() {
+            "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
+            "--workspace" => {
+                set_once_parsed(&mut workspace, arguments.next(), parse_setup_request_text)
+            }
+            "--manifest" => set_once_parsed(&mut manifest, arguments.next(), parse_manifest_path),
+            "--deadline-ms" => set_once_parsed(&mut deadline_ms, arguments.next(), |value| {
+                let value = parse_u64(value)?;
+                (1..=SETUP_PREPARE_MAX_DEADLINE_MS)
+                    .contains(&value)
+                    .then_some(value)
+                    .ok_or(())
+            }),
+            "--output-limit" => set_once_parsed(&mut output_limit, arguments.next(), |value| {
+                let value = parse_usize(value)?;
+                (1..=SETUP_PREPARE_MAX_OUTPUT_LIMIT)
+                    .contains(&value)
+                    .then_some(value)
+                    .ok_or(())
+            }),
+            "--json" if !json_output => {
+                json_output = true;
+                Ok(())
+            }
+            _ => Err(()),
+        }
+        .unwrap_or_else(|_| usage());
+    }
+    let request = ManifestConvergeJobRequest {
+        workspace: PathBuf::from(workspace.unwrap_or_else(|| usage())),
+        manifest: manifest.unwrap_or_else(|| usage()),
+        deadline: Duration::from_millis(deadline_ms.unwrap_or_else(|| usage())),
+        output_limit: output_limit.unwrap_or_else(|| usage()),
+    };
+    let state_dir = state_dir.unwrap_or_else(|| usage());
+    let runtime = RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|_| usage());
+    let client = Client::for_state(state_dir).unwrap_or_else(|_| usage());
+    match runtime.run(client.submit_manifest_converge(request)) {
+        Ok(job_id) if json_output => println!(
+            "{}",
+            json!({"action":"manifest_converge","submitted":true,"job_id":job_id})
+        ),
+        Ok(job_id) => println!("manifest converge submitted: {job_id}"),
+        Err(_) => usage(),
     }
 }
 
@@ -1878,6 +1941,9 @@ fn usage() -> ! {
     );
     eprintln!(
         "   or: bosn manifest app-task --state-dir STATE_DIR --workspace WORKSPACE --manifest RELATIVE_TOML --stack NAME --task NAME --deadline-ms 1..=300000 --output-limit 1..=8388608 [--json]"
+    );
+    eprintln!(
+        "   or: bosn manifest converge --state-dir STATE_DIR --workspace WORKSPACE --manifest RELATIVE_TOML --deadline-ms 1..=300000 --output-limit 1..=8388608 [--json]"
     );
     eprintln!(
         "   or: bosn setup ensure --state-dir STATE_DIR --workspace WORKSPACE --config LOCATOR (--refresh | --offline) --deadline-ms 1..=300000 --output-limit 1..=8388608 [--json]"

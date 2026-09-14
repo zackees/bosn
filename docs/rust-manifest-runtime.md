@@ -17,6 +17,28 @@ workspace, a safe workspace-relative manifest path, declared stack name,
 deadline, and output budget. It cannot supply an image, container identifier,
 labels, Docker arguments, mounts, environment, command, or state path.
 
+`bosn manifest converge` is the corresponding whole-document operation:
+
+```text
+bosn manifest converge --state-dir STATE --workspace WORKSPACE \
+  --manifest bosn.toml --deadline-ms 300000 --output-limit 8388608
+```
+
+It is also available as `Client.submit_manifest_converge(...)` and the
+`bosn_manifest_converge` MCP tool. The existing TOML manifest schema has no
+dependency/root relation: `family` is a volume identity hint, and unknown
+`depends_on`/`dependencies` fields are parse errors. Therefore this operation
+accepts no root, dependency, or ordering selector. It validates the document,
+snapshots its declared stack names, then ensures them in deterministic lexical
+order through one daemon job. The daemon is globally single-flight, so a
+batch's volume and guest setup cannot race another engine lifecycle job. Every
+member uses the same typed image/Dockerfile, bind/workdir, volume, tmpfs,
+guest, ownership, and registry path as `manifest ensure`. A member is recorded
+and its own generation rollover committed before the next member starts. If a
+later member fails or the batch is cancelled, the job stops and prior proven
+member records remain durable; Bosn does not claim an atomic multi-container
+rollback it cannot safely prove.
+
 `bosn manifest app-task` now runs one named `[task.NAME]` declaration inside
 an already ensured instance of that same supported stack:
 
@@ -72,7 +94,7 @@ changed.
 | `workdir` | Supported only when its normalized absolute container path is covered by a declared workspace bind. It is translated to the typed workspace-relative form, becomes the persistent container workdir, and is therefore inherited by declared `manifest app-task` exec. Image-only workdirs are refused. |
 | image tags or unpinned image references | Refused |
 | generic `run`, shell, arbitrary Docker arguments | Not exposed |
-| multi-stack orchestration | Refused; submit one named stack only |
+| all-stack orchestration | Supported by `manifest converge`: every declared stack in lexical order, one at a time, with per-stack durable records and partial-success semantics. The TOML model has no dependencies/root selector; dependency spellings fail closed rather than being guessed. |
 | replacement/rollover | Supported for this accepted subset; a new immutable generation is ensured first, then only the same-workspace/stack prior manifest container is registry-retired |
 
 `manifest app-task` deliberately refuses a macOS guest. Legacy guest work is
@@ -98,7 +120,7 @@ same mount sources again immediately before its engine operation.
 This does not claim completion of manifest migration. Future slices must add
 explicit volume release/GC application, broader Dockerfile forms (alternate
 Dockerfile paths plus selected symlink and empty-directory representation),
-multi-stack dependency ordering, guest SSH/SCP task lifecycle, declarative tasks,
+dependency syntax/ordering (if the legacy TOML schema gains an explicit relation), guest SSH/SCP task lifecycle, declarative tasks,
 autostart/recovery, and generation reconciliation. Each must
 remain daemon-owned and registry-backed rather than reintroducing raw Docker or
 Python business logic.
