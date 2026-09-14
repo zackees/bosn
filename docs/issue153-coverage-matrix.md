@@ -64,4 +64,13 @@ Bosn also deliberately refuses, rather than approximates:
 
 ## Baseline record
 
-[`performance-baseline.json`](performance-baseline.json) is the historical Phase 0 comparison record. Its source commit reported medians/ranges, not raw samples; its `raw_samples_ms` values are intentionally `null`. The native collector and its non-Docker/Docker opt-in modes are documented in [migration-rust.md](migration-rust.md#performance-comparison-baseline). Build/package cost still needs a comparable recorded measurement, and no performance regression conclusion follows from the historical record alone.
+[`performance-baseline.json`](performance-baseline.json) preserves the historical
+Phase 0 comparison record and one separately labelled current-native local run.
+The historical source reported medians/ranges, not raw samples, so its
+`raw_samples_ms` values are intentionally `null`; the current run preserves its
+raw native samples plus explicitly warm-cache build and wheel-package
+observations. The native collector and its non-Docker/Docker opt-in modes are
+documented in [migration-rust.md](migration-rust.md#performance-comparison-baseline).
+The two records do not share sufficiently controlled host/toolchain/cache
+conditions for a regression conclusion; a clean, comparable package study and
+the opt-in Docker reuse measurement remain future evidence.
