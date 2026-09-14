@@ -1241,6 +1241,33 @@ impl<'a> Immediate<'a> {
         self.append_event(at, event_kind, "retired_manifest_warm_spec_volume")?;
         Ok(true)
     }
+    /// Recheck and remove one exact durable manifest-volume candidate after a
+    /// caller has separately proved the fixed Docker ownership contract.
+    pub fn finalize_manifest_volume_release_candidate(
+        &mut self,
+        workspace: &str,
+        id: &str,
+        name: &str,
+        generation: &str,
+        at: f64,
+        event_kind: &str,
+    ) -> Result<bool, Error> {
+        if !manifest_volume_release_candidate_exists(
+            &mut self.transaction,
+            workspace,
+            id,
+            name,
+            generation,
+        )? {
+            return Ok(false);
+        }
+        self.transaction.execute(
+            "DELETE FROM resources WHERE id=?",
+            &[Value::Text(id.into())],
+        )?;
+        self.append_event(at, event_kind, "explicit_durable_manifest_volume_release")?;
+        Ok(true)
+    }
     pub fn put_lease(&mut self, v: &Lease) -> Result<(), Error> {
         self.transaction.execute("INSERT INTO leases(id,resource_id,pid,proc_start,acquired_at,heartbeat_at,ttl_seconds) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET resource_id=excluded.resource_id,pid=excluded.pid,proc_start=excluded.proc_start,acquired_at=excluded.acquired_at,heartbeat_at=excluded.heartbeat_at,ttl_seconds=excluded.ttl_seconds", &[Value::Text(v.id.clone()),Value::Text(v.resource_id.clone()),Value::Integer(i64::from(v.pid)),optional_value(v.proc_start),Value::Real(v.acquired_at),Value::Real(v.heartbeat_at),Value::Real(v.ttl_seconds)])?;
         Ok(())
@@ -1688,6 +1715,17 @@ impl Registry {
     ) -> Result<ManifestVolumeGcPreview, Error> {
         manifest_volume_gc_preview(&self.connection, workspace, offset, limit)
     }
+    /// Preview only explicitly releasable durable manifest volumes.  This is
+    /// deliberately separate from automatic GC, which must never include
+    /// stack/machine or pinned rows.
+    pub fn manifest_volume_release_preview(
+        &self,
+        workspace: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Page<ManifestVolumeGcCandidate>, Error> {
+        manifest_volume_release_preview(&self.connection, workspace, offset, limit)
+    }
     /// Read only the durable setup-container facts for one exact workspace.
     /// This is deliberately narrower than the general diagnostics page: a
     /// reconciler must never discover ownership from Docker names or labels.
@@ -1737,6 +1775,28 @@ impl Registry {
         generation: &str,
     ) -> Result<Option<ManifestVolumeGcCandidate>, Error> {
         if !manifest_volume_gc_candidate_exists(
+            &mut self.connection,
+            workspace,
+            id,
+            name,
+            generation,
+        )? {
+            return Ok(None);
+        }
+        Ok(Some(ManifestVolumeGcCandidate {
+            id: id.into(),
+            name: name.into(),
+            generation: generation.into(),
+        }))
+    }
+    pub fn manifest_volume_release_candidate(
+        &mut self,
+        workspace: &str,
+        id: &str,
+        name: &str,
+        generation: &str,
+    ) -> Result<Option<ManifestVolumeGcCandidate>, Error> {
+        if !manifest_volume_release_candidate_exists(
             &mut self.connection,
             workspace,
             id,
@@ -2340,6 +2400,71 @@ fn manifest_volume_gc_candidate_exists(
     let rows = connection.setup_gc_query(
         "SELECT 1 FROM resources AS r WHERE r.id=? AND r.name=? AND r.generation=? AND r.kind='volume' AND r.workspace=? AND r.state='retired' AND r.scope='spec' AND r.retention='warm' AND r.id GLOB 'manifest-volume:*' AND r.name GLOB 'bosn-v-spec-*' AND EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id AND u.workspace=? AND u.stack=r.stack AND u.generation=r.generation AND u.state='retired') AND NOT EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id AND (u.workspace<>? OR u.stack<>r.stack OR u.generation<>r.generation OR u.state<>'retired')) AND NOT EXISTS (SELECT 1 FROM leases AS l WHERE l.resource_id=r.id) AND NOT EXISTS (SELECT 1 FROM execution_sessions AS s WHERE s.container_id=r.id OR s.container_id=r.name) AND NOT EXISTS (SELECT 1 FROM volume_creation_intents AS v WHERE v.name=r.name) LIMIT 1",
         &[Value::Text(id.into()), Value::Text(name.into()), Value::Text(generation.into()), Value::Text(workspace.into()), Value::Text(workspace.into()), Value::Text(workspace.into())],
+    )?;
+    Ok(!rows.is_empty())
+}
+
+/// Explicit release is the only path which can remove durable manifest data.
+/// It still requires one unambiguous active local ownership/use relationship:
+/// a shared, retired, leased, session-owned, or in-progress volume is not a
+/// release candidate.  The service re-runs this predicate immediately before
+/// each fixed Docker inspection and finalization.
+fn manifest_volume_release_preview(
+    connection: &Connection,
+    workspace: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<Page<ManifestVolumeGcCandidate>, Error> {
+    let predicate = "r.kind='volume' AND r.workspace=? AND r.state='active' AND (r.scope IN ('stack','machine') OR r.retention='pinned') AND r.id GLOB 'manifest-volume:*' AND r.name GLOB 'bosn-v-*' AND EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id AND u.workspace=? AND u.stack=r.stack AND u.generation=r.generation AND u.state='active') AND NOT EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id AND (u.workspace<>? OR u.stack<>r.stack OR u.generation<>r.generation OR u.state<>'active')) AND NOT EXISTS (SELECT 1 FROM leases AS l WHERE l.resource_id=r.id) AND NOT EXISTS (SELECT 1 FROM execution_sessions AS s WHERE s.container_id=r.id OR s.container_id=r.name) AND NOT EXISTS (SELECT 1 FROM volume_creation_intents AS v WHERE v.name=r.name)";
+    let limit = limit.clamp(1, MAX_PAGE_SIZE);
+    let query_limit = limit.checked_add(1).ok_or(Error::BadRow("page limit"))?;
+    let rows = connection.query(
+        &format!("SELECT r.id,r.name,r.generation FROM resources AS r WHERE {predicate} ORDER BY r.id LIMIT ? OFFSET ?"),
+        &[
+            Value::Text(workspace.into()),
+            Value::Text(workspace.into()),
+            Value::Text(workspace.into()),
+            Value::Integer(i64::try_from(query_limit).map_err(|_| Error::BadRow("page limit"))?),
+            Value::Integer(i64::try_from(offset).map_err(|_| Error::BadRow("page offset"))?),
+        ],
+        QueryLimits { max_rows: query_limit, max_bytes: 1_048_576 },
+    )?;
+    let more = rows.len() > limit;
+    Ok(Page {
+        items: rows
+            .into_iter()
+            .take(limit)
+            .map(|r| {
+                Ok(ManifestVolumeGcCandidate {
+                    id: text(&r, 0)?,
+                    name: text(&r, 1)?,
+                    generation: text(&r, 2)?,
+                })
+            })
+            .collect::<Result<_, Error>>()?,
+        next_offset: more
+            .then(|| {
+                offset
+                    .checked_add(limit)
+                    .ok_or(Error::BadRow("page offset"))
+            })
+            .transpose()?,
+    })
+}
+
+fn manifest_volume_release_candidate_exists(
+    connection: &mut impl SetupGcQuery,
+    workspace: &str,
+    id: &str,
+    name: &str,
+    generation: &str,
+) -> Result<bool, Error> {
+    let rows = connection.setup_gc_query(
+        "SELECT 1 FROM resources AS r WHERE r.id=? AND r.name=? AND r.generation=? AND r.kind='volume' AND r.workspace=? AND r.state='active' AND (r.scope IN ('stack','machine') OR r.retention='pinned') AND r.id GLOB 'manifest-volume:*' AND r.name GLOB 'bosn-v-*' AND EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id AND u.workspace=? AND u.stack=r.stack AND u.generation=r.generation AND u.state='active') AND NOT EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id AND (u.workspace<>? OR u.stack<>r.stack OR u.generation<>r.generation OR u.state<>'active')) AND NOT EXISTS (SELECT 1 FROM leases AS l WHERE l.resource_id=r.id) AND NOT EXISTS (SELECT 1 FROM execution_sessions AS s WHERE s.container_id=r.id OR s.container_id=r.name) AND NOT EXISTS (SELECT 1 FROM volume_creation_intents AS v WHERE v.name=r.name) LIMIT 1",
+        &[
+            Value::Text(id.into()), Value::Text(name.into()), Value::Text(generation.into()),
+            Value::Text(workspace.into()), Value::Text(workspace.into()), Value::Text(workspace.into()),
+        ],
     )?;
     Ok(!rows.is_empty())
 }

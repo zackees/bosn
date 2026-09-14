@@ -66,7 +66,92 @@ fn run_manifest(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
         Some(command) if command == "converge" => run_manifest_converge(arguments),
         Some(command) if command == "app-task" => run_manifest_app_task(arguments),
         Some(command) if command == "volume-gc" => run_manifest_volume_gc(arguments),
+        Some(command) if command == "volume-release" => run_manifest_volume_release(arguments),
         _ => usage(),
+    }
+}
+
+fn run_manifest_volume_release(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
+    let Some(verb) = arguments.next() else {
+        usage();
+    };
+    if verb.as_os_str() == std::ffi::OsStr::new("preview") {
+        let (state_dir, workspace, after, limit, json_output) =
+            parse_gc_preview_arguments(arguments).unwrap_or_else(|_| usage());
+        let result = Client::for_state(state_dir).ok().and_then(|client| {
+            RuntimeBuilder::current_thread()
+                .enable_all()
+                .build()
+                .ok()
+                .and_then(|runtime| {
+                    runtime
+                        .run(client.manifest_volume_release_preview(workspace, after, limit))
+                        .ok()
+                })
+        });
+        match result {
+            Some(page) => println!(
+                "{}",
+                json!({"action":"manifest_volume_release_preview","preview_only":true,"next":page.next,"candidates":page.candidates.into_iter().map(|v|json!({"id":v.id,"name":v.name,"generation":v.generation,"token":v.token,"reason":v.reason})).collect::<Vec<_>>() })
+            ),
+            None => gc_failure(json_output),
+        }
+    } else if verb.as_os_str() == std::ffi::OsStr::new("apply") {
+        let mut state_dir = None;
+        let mut workspace = None;
+        let mut token = None;
+        let mut apply = false;
+        let mut yes = false;
+        let mut json_output = false;
+        while let Some(argument) = arguments.next() {
+            match argument.to_string_lossy().as_ref() {
+                "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
+                "--workspace" => set_once_parsed(&mut workspace, arguments.next(), parse_state_dir),
+                "--candidate" => set_once_parsed(&mut token, arguments.next(), |v| {
+                    v.to_str().map(str::to_owned).ok_or(())
+                }),
+                "--apply" if !apply => {
+                    apply = true;
+                    Ok(())
+                }
+                "--yes" if !yes => {
+                    yes = true;
+                    Ok(())
+                }
+                "--json" if !json_output => {
+                    json_output = true;
+                    Ok(())
+                }
+                _ => Err(()),
+            }
+            .unwrap_or_else(|_| usage());
+        }
+        let (Some(state_dir), Some(workspace), Some(token)) = (state_dir, workspace, token) else {
+            usage();
+        };
+        if !apply || !yes {
+            usage();
+        }
+        let result = Client::for_state(state_dir).ok().and_then(|client| {
+            RuntimeBuilder::current_thread()
+                .enable_all()
+                .build()
+                .ok()
+                .and_then(|runtime| {
+                    runtime
+                        .run(client.manifest_volume_release_apply(workspace, &token, true))
+                        .ok()
+                })
+        });
+        match result {
+            Some(value) => println!(
+                "{}",
+                json!({"action":"manifest_volume_release_apply","removed":value.removed,"reconciled_missing":value.reconciled_missing})
+            ),
+            None => gc_failure(json_output),
+        }
+    } else {
+        usage();
     }
 }
 
@@ -2156,6 +2241,9 @@ fn usage() -> ! {
     );
     eprintln!(
         "   or: bosn manifest volume-gc preview --state-dir STATE_DIR --workspace WORKSPACE [--after CURSOR] [--limit 1..=64] [--json]\n   or: bosn manifest volume-gc apply --state-dir STATE_DIR --workspace WORKSPACE --candidate TOKEN --apply --yes [--json]"
+    );
+    eprintln!(
+        "   or: bosn manifest volume-release preview --state-dir STATE_DIR --workspace WORKSPACE [--after CURSOR] [--limit 1..=64] [--json]\n   or: bosn manifest volume-release apply --state-dir STATE_DIR --workspace WORKSPACE --candidate TOKEN --apply --yes [--json]"
     );
     std::process::exit(2)
 }

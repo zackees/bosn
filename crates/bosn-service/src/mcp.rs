@@ -124,6 +124,12 @@ trait Backend {
         after: u64,
         limit: u32,
     ) -> Result<ManifestVolumeGcPreviewPage, Error>;
+    fn manifest_volume_release_preview(
+        &mut self,
+        workspace: PathBuf,
+        after: u64,
+        limit: u32,
+    ) -> Result<ManifestVolumeGcPreviewPage, Error>;
     fn setup_reconcile_preview(
         &mut self,
         workspace: PathBuf,
@@ -141,6 +147,11 @@ trait Backend {
         token: String,
     ) -> Result<SetupGcApplyResult, Error>;
     fn manifest_volume_gc_apply(
+        &mut self,
+        workspace: PathBuf,
+        token: String,
+    ) -> Result<ManifestVolumeGcApplyResult, Error>;
+    fn manifest_volume_release_apply(
         &mut self,
         workspace: PathBuf,
         token: String,
@@ -235,6 +246,17 @@ impl Backend for DaemonBackend<'_> {
                 .manifest_volume_gc_preview(workspace, after, limit),
         )
     }
+    fn manifest_volume_release_preview(
+        &mut self,
+        workspace: PathBuf,
+        after: u64,
+        limit: u32,
+    ) -> Result<ManifestVolumeGcPreviewPage, Error> {
+        self.runtime.run(
+            self.client
+                .manifest_volume_release_preview(workspace, after, limit),
+        )
+    }
     fn setup_reconcile_preview(
         &mut self,
         workspace: PathBuf,
@@ -270,6 +292,16 @@ impl Backend for DaemonBackend<'_> {
         self.runtime.run(
             self.client
                 .manifest_volume_gc_apply(workspace, &token, true),
+        )
+    }
+    fn manifest_volume_release_apply(
+        &mut self,
+        workspace: PathBuf,
+        token: String,
+    ) -> Result<ManifestVolumeGcApplyResult, Error> {
+        self.runtime.run(
+            self.client
+                .manifest_volume_release_apply(workspace, &token, true),
         )
     }
     fn setup_stop_retired(
@@ -493,6 +525,8 @@ fn tools_list() -> Value {
             },
             {"name":"bosn_manifest_volume_gc_preview","description":"Preview only retired disposable native-manifest volumes in one workspace. Only warm spec-scoped volume generations can appear; machine, stack, and pinned data are protected. Never writes SQLite or calls Docker.","inputSchema":setup_gc_preview_schema(),"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
             {"name":"bosn_manifest_volume_gc_apply","description":"DESTRUCTIVE: remove exactly one preview-token-bound retired warm spec native-manifest volume after the daemon rechecks registry ownership, exact Docker labels, and empty Docker attachment state. Explicit confirmation required.","inputSchema":setup_gc_apply_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}},
+            {"name":"bosn_manifest_volume_release_preview","description":"Preview durable native-manifest volumes that normal GC protects: stack/machine scope or pinned retention. It never writes state or calls Docker; apply requires one returned opaque token.","inputSchema":setup_gc_preview_schema(),"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
+            {"name":"bosn_manifest_volume_release_apply","description":"DESTRUCTIVE: explicitly release exactly one preview-token-bound durable manifest volume. The daemon rechecks registry uses, leases, sessions, intents, exact Docker labels, and attachments immediately before fixed-name removal. Explicit confirmation required.","inputSchema":setup_gc_apply_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}},
             {"name":"bosn_setup_reconcile_preview","description":"Read-only compare of durable Bosn setup-container ownership with fixed Docker inspection for one workspace. It never repairs, writes SQLite, creates/starts/stops/removes Docker resources, or accepts engine controls.","inputSchema":setup_gc_preview_schema(),"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
             {"name":"bosn_setup_reconcile_repair_missing","description":"STATE CHANGE: retire exactly one preview-token-bound active managed setup app only after the daemon rechecks ownership/use protection and fixed Docker inspection still proves it missing. It never starts, creates, stops, removes, or otherwise mutates Docker.","inputSchema":setup_gc_apply_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
             {
@@ -756,230 +790,245 @@ fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
         Some(Value::Object(arguments)) => arguments,
         Some(_) => return tool_error("tool arguments must be an object"),
     };
-    let result = match name {
-        "bosn_compose_plan" => compose_plan_request(arguments).and_then(|document| {
-            parse_and_plan_compose_yaml(&document)
-                .map(compose_plan_json)
-                .map_err(|_| {
-                    ToolFailure::Invalid("Bosn Compose document is invalid or unsupported")
-                })
-        }),
-        "bosn_status" => {
-            if !arguments.is_empty() {
-                return tool_error("bosn_status accepts no arguments");
-            }
-            backend
-                .status()
-                .map(status_json)
-                .map_err(|_| ToolFailure::Daemon)
-        }
-        "bosn_doctor" => {
-            if !arguments.is_empty() {
-                return tool_error("bosn_doctor accepts no arguments");
-            }
-            backend
-                .doctor()
-                .map(doctor_json)
-                .map_err(|_| ToolFailure::Daemon)
-        }
-        "bosn_registry_resources" => {
-            registry_page_arguments(arguments).and_then(|(after, limit)| {
-                backend
-                    .registry_resources(after, limit)
-                    .map(resource_page_json)
-                    .map_err(|_| ToolFailure::Daemon)
-            })
-        }
-        "bosn_setup_ensure_events" => {
-            registry_page_arguments(arguments).and_then(|(after, limit)| {
-                backend
-                    .setup_ensure_events(after, limit)
-                    .map(setup_ensure_event_page_json)
-                    .map_err(|_| ToolFailure::Daemon)
-            })
-        }
-        "bosn_setup_gc_preview" => {
-            setup_gc_preview_arguments(arguments).and_then(|(workspace, after, limit)| {
-                backend
-                    .setup_gc_preview(workspace, after, limit)
-                    .map(setup_gc_preview_json)
-                    .map_err(|_| ToolFailure::Daemon)
-            })
-        }
-        "bosn_manifest_volume_gc_preview" => {
-            setup_gc_preview_arguments(arguments).and_then(|(workspace, after, limit)| {
-                backend
-                    .manifest_volume_gc_preview(workspace, after, limit)
-                    .map(manifest_volume_gc_preview_json)
-                    .map_err(|_| ToolFailure::Daemon)
-            })
-        }
-        "bosn_manifest_volume_gc_apply" => {
-            setup_gc_apply_arguments(arguments).and_then(|(workspace, token)| {
-                backend
-                    .manifest_volume_gc_apply(workspace, token)
-                    .map(manifest_volume_gc_apply_json)
-                    .map_err(|_| ToolFailure::Daemon)
-            })
-        }
-        "bosn_setup_reconcile_preview" => {
-            setup_gc_preview_arguments(arguments).and_then(|(workspace, after, limit)| {
-                backend
-                    .setup_reconcile_preview(workspace, after, limit)
-                    .map(setup_reconcile_preview_json)
-                    .map_err(|_| ToolFailure::Daemon)
-            })
-        }
-        "bosn_setup_reconcile_repair_missing" => {
-            setup_gc_apply_arguments(arguments).and_then(|(workspace, token)| {
-                backend
-                    .setup_reconcile_repair_missing(workspace, token)
-                    .map(setup_reconcile_repair_missing_json)
-                    .map_err(|_| ToolFailure::Daemon)
-            })
-        }
-        "bosn_setup_gc_apply" => {
-            setup_gc_apply_arguments(arguments).and_then(|(workspace, token)| {
-                backend
-                    .setup_gc_apply(workspace, token)
-                    .map(setup_gc_apply_json)
-                    .map_err(|_| ToolFailure::Daemon)
-            })
-        }
-        "bosn_setup_stop_retired" => {
-            setup_gc_apply_arguments(arguments).and_then(|(workspace, token)| {
-                backend
-                    .setup_stop_retired(workspace, token)
-                    .map(setup_stop_retired_json)
-                    .map_err(|_| ToolFailure::Daemon)
-            })
-        }
-        "bosn_setup_done" => setup_done_arguments(arguments).and_then(|workspace| {
-            backend
-                .setup_done(workspace)
-                .map(setup_done_json)
-                .map_err(|_| ToolFailure::Daemon)
-        }),
-        "bosn_setup_adopt" => setup_adopt_arguments(arguments).and_then(|request| {
-            backend
-                .setup_adopt(request)
-                .map(|value| json!({"action":"setup_adopt","adopted":value.adopted}))
-                .map_err(|_| ToolFailure::Daemon)
-        }),
-        "bosn_job_status" => job_id(arguments).and_then(|id| {
-            only_arguments(arguments, &["job_id"])?;
-            backend
-                .job_status(id)
-                .map(job_json)
-                .map_err(|_| ToolFailure::Daemon)
-        }),
-        "bosn_job_logs" => {
-            if let Err(error) = only_arguments(arguments, &["job_id", "after", "limit"]) {
-                return tool_error(error.message());
-            }
-            let id = job_id(arguments);
-            let after = optional_u64(arguments, "after", 0);
-            let limit = optional_u64(arguments, "limit", u64::from(MAX_MCP_LOG_RECORDS)).and_then(
-                |value| {
-                    (value > 0 && value <= u64::from(MAX_MCP_LOG_RECORDS))
-                        .then_some(value as u32)
-                        .ok_or(ToolFailure::Invalid("limit must be within 1..=64"))
-                },
-            );
-            match (id, after, limit) {
-                (Ok(id), Ok(after), Ok(limit)) => backend
-                    .job_logs(id, after, limit)
-                    .map(log_page_json)
-                    .map_err(|_| ToolFailure::Daemon),
-                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
-            }
-        }
-        "bosn_job_cancel" => job_id(arguments).and_then(|id| {
-            only_arguments(arguments, &["job_id"])?;
-            backend
-                .cancel_job(id)
-                .map(|()| json!({"job_id": id, "cancel_requested": true}))
-                .map_err(|_| ToolFailure::Daemon)
-        }),
-        "bosn_setup_plan" => setup_plan_request(arguments).and_then(|request| {
-            // The client/server invocation, not an untrusted MCP tool call,
-            // owns state selection.  This prevents a model from directing the
-            // server to create or inspect arbitrary state roots.
-            backend
-                .setup_plan(request.workspace, request.locator, request.policy)
-                .map(setup_plan_json)
-                .map_err(|_| ToolFailure::Setup)
-        }),
-        "bosn_setup_prepare" => setup_prepare_request(arguments).and_then(|request| {
-            backend
-                .submit_setup_prepare(request)
-                .map(|job_id| {
-                    json!({
-                        "action": "setup_prepare",
-                        "submitted": true,
-                        "job_id": job_id,
+    let result =
+        match name {
+            "bosn_compose_plan" => compose_plan_request(arguments).and_then(|document| {
+                parse_and_plan_compose_yaml(&document)
+                    .map(compose_plan_json)
+                    .map_err(|_| {
+                        ToolFailure::Invalid("Bosn Compose document is invalid or unsupported")
                     })
+            }),
+            "bosn_status" => {
+                if !arguments.is_empty() {
+                    return tool_error("bosn_status accepts no arguments");
+                }
+                backend
+                    .status()
+                    .map(status_json)
+                    .map_err(|_| ToolFailure::Daemon)
+            }
+            "bosn_doctor" => {
+                if !arguments.is_empty() {
+                    return tool_error("bosn_doctor accepts no arguments");
+                }
+                backend
+                    .doctor()
+                    .map(doctor_json)
+                    .map_err(|_| ToolFailure::Daemon)
+            }
+            "bosn_registry_resources" => {
+                registry_page_arguments(arguments).and_then(|(after, limit)| {
+                    backend
+                        .registry_resources(after, limit)
+                        .map(resource_page_json)
+                        .map_err(|_| ToolFailure::Daemon)
                 })
-                .map_err(|_| ToolFailure::Daemon)
-        }),
-        "bosn_setup_ensure" => setup_ensure_request(arguments).and_then(|request| {
-            backend
-                .submit_setup_ensure(request)
-                .map(|job_id| {
-                    json!({
-                        "action": "setup_ensure",
-                        "submitted": true,
-                        "job_id": job_id,
+            }
+            "bosn_setup_ensure_events" => {
+                registry_page_arguments(arguments).and_then(|(after, limit)| {
+                    backend
+                        .setup_ensure_events(after, limit)
+                        .map(setup_ensure_event_page_json)
+                        .map_err(|_| ToolFailure::Daemon)
+                })
+            }
+            "bosn_setup_gc_preview" => {
+                setup_gc_preview_arguments(arguments).and_then(|(workspace, after, limit)| {
+                    backend
+                        .setup_gc_preview(workspace, after, limit)
+                        .map(setup_gc_preview_json)
+                        .map_err(|_| ToolFailure::Daemon)
+                })
+            }
+            "bosn_manifest_volume_gc_preview" => {
+                setup_gc_preview_arguments(arguments).and_then(|(workspace, after, limit)| {
+                    backend
+                        .manifest_volume_gc_preview(workspace, after, limit)
+                        .map(manifest_volume_gc_preview_json)
+                        .map_err(|_| ToolFailure::Daemon)
+                })
+            }
+            "bosn_manifest_volume_gc_apply" => {
+                setup_gc_apply_arguments(arguments).and_then(|(workspace, token)| {
+                    backend
+                        .manifest_volume_gc_apply(workspace, token)
+                        .map(manifest_volume_gc_apply_json)
+                        .map_err(|_| ToolFailure::Daemon)
+                })
+            }
+            "bosn_manifest_volume_release_preview" => setup_gc_preview_arguments(arguments)
+                .and_then(|(workspace, after, limit)| {
+                    backend
+                        .manifest_volume_release_preview(workspace, after, limit)
+                        .map(manifest_volume_gc_preview_json)
+                        .map_err(|_| ToolFailure::Daemon)
+                }),
+            "bosn_manifest_volume_release_apply" => {
+                setup_gc_apply_arguments(arguments).and_then(|(workspace, token)| {
+                    backend
+                        .manifest_volume_release_apply(workspace, token)
+                        .map(manifest_volume_gc_apply_json)
+                        .map_err(|_| ToolFailure::Daemon)
+                })
+            }
+            "bosn_setup_reconcile_preview" => {
+                setup_gc_preview_arguments(arguments).and_then(|(workspace, after, limit)| {
+                    backend
+                        .setup_reconcile_preview(workspace, after, limit)
+                        .map(setup_reconcile_preview_json)
+                        .map_err(|_| ToolFailure::Daemon)
+                })
+            }
+            "bosn_setup_reconcile_repair_missing" => {
+                setup_gc_apply_arguments(arguments).and_then(|(workspace, token)| {
+                    backend
+                        .setup_reconcile_repair_missing(workspace, token)
+                        .map(setup_reconcile_repair_missing_json)
+                        .map_err(|_| ToolFailure::Daemon)
+                })
+            }
+            "bosn_setup_gc_apply" => {
+                setup_gc_apply_arguments(arguments).and_then(|(workspace, token)| {
+                    backend
+                        .setup_gc_apply(workspace, token)
+                        .map(setup_gc_apply_json)
+                        .map_err(|_| ToolFailure::Daemon)
+                })
+            }
+            "bosn_setup_stop_retired" => {
+                setup_gc_apply_arguments(arguments).and_then(|(workspace, token)| {
+                    backend
+                        .setup_stop_retired(workspace, token)
+                        .map(setup_stop_retired_json)
+                        .map_err(|_| ToolFailure::Daemon)
+                })
+            }
+            "bosn_setup_done" => setup_done_arguments(arguments).and_then(|workspace| {
+                backend
+                    .setup_done(workspace)
+                    .map(setup_done_json)
+                    .map_err(|_| ToolFailure::Daemon)
+            }),
+            "bosn_setup_adopt" => setup_adopt_arguments(arguments).and_then(|request| {
+                backend
+                    .setup_adopt(request)
+                    .map(|value| json!({"action":"setup_adopt","adopted":value.adopted}))
+                    .map_err(|_| ToolFailure::Daemon)
+            }),
+            "bosn_job_status" => job_id(arguments).and_then(|id| {
+                only_arguments(arguments, &["job_id"])?;
+                backend
+                    .job_status(id)
+                    .map(job_json)
+                    .map_err(|_| ToolFailure::Daemon)
+            }),
+            "bosn_job_logs" => {
+                if let Err(error) = only_arguments(arguments, &["job_id", "after", "limit"]) {
+                    return tool_error(error.message());
+                }
+                let id = job_id(arguments);
+                let after = optional_u64(arguments, "after", 0);
+                let limit = optional_u64(arguments, "limit", u64::from(MAX_MCP_LOG_RECORDS))
+                    .and_then(|value| {
+                        (value > 0 && value <= u64::from(MAX_MCP_LOG_RECORDS))
+                            .then_some(value as u32)
+                            .ok_or(ToolFailure::Invalid("limit must be within 1..=64"))
+                    });
+                match (id, after, limit) {
+                    (Ok(id), Ok(after), Ok(limit)) => backend
+                        .job_logs(id, after, limit)
+                        .map(log_page_json)
+                        .map_err(|_| ToolFailure::Daemon),
+                    (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+                }
+            }
+            "bosn_job_cancel" => job_id(arguments).and_then(|id| {
+                only_arguments(arguments, &["job_id"])?;
+                backend
+                    .cancel_job(id)
+                    .map(|()| json!({"job_id": id, "cancel_requested": true}))
+                    .map_err(|_| ToolFailure::Daemon)
+            }),
+            "bosn_setup_plan" => setup_plan_request(arguments).and_then(|request| {
+                // The client/server invocation, not an untrusted MCP tool call,
+                // owns state selection.  This prevents a model from directing the
+                // server to create or inspect arbitrary state roots.
+                backend
+                    .setup_plan(request.workspace, request.locator, request.policy)
+                    .map(setup_plan_json)
+                    .map_err(|_| ToolFailure::Setup)
+            }),
+            "bosn_setup_prepare" => setup_prepare_request(arguments).and_then(|request| {
+                backend
+                    .submit_setup_prepare(request)
+                    .map(|job_id| {
+                        json!({
+                            "action": "setup_prepare",
+                            "submitted": true,
+                            "job_id": job_id,
+                        })
                     })
-                })
-                .map_err(|_| ToolFailure::Daemon)
-        }),
-        "bosn_manifest_ensure" => manifest_ensure_request(arguments).and_then(|request| {
-            backend
+                    .map_err(|_| ToolFailure::Daemon)
+            }),
+            "bosn_setup_ensure" => setup_ensure_request(arguments).and_then(|request| {
+                backend
+                    .submit_setup_ensure(request)
+                    .map(|job_id| {
+                        json!({
+                            "action": "setup_ensure",
+                            "submitted": true,
+                            "job_id": job_id,
+                        })
+                    })
+                    .map_err(|_| ToolFailure::Daemon)
+            }),
+            "bosn_manifest_ensure" => manifest_ensure_request(arguments).and_then(|request| {
+                backend
                 .submit_manifest_ensure(request)
                 .map(|job_id| json!({"action":"manifest_ensure","submitted":true,"job_id":job_id}))
                 .map_err(|_| ToolFailure::Daemon)
-        }),
-        "bosn_manifest_converge" => manifest_converge_request(arguments).and_then(|request| {
-            backend
+            }),
+            "bosn_manifest_converge" => manifest_converge_request(arguments).and_then(|request| {
+                backend
                 .submit_manifest_converge(request)
                 .map(
                     |job_id| json!({"action":"manifest_converge","submitted":true,"job_id":job_id}),
                 )
                 .map_err(|_| ToolFailure::Daemon)
-        }),
-        "bosn_manifest_app_task" => manifest_app_task_request(arguments).and_then(|request| {
-            backend
+            }),
+            "bosn_manifest_app_task" => manifest_app_task_request(arguments).and_then(|request| {
+                backend
                 .submit_manifest_app_task(request)
                 .map(
                     |job_id| json!({"action":"manifest_app_task","submitted":true,"job_id":job_id}),
                 )
                 .map_err(|_| ToolFailure::Daemon)
-        }),
-        "bosn_setup_task" => setup_task_request(arguments).and_then(|request| {
-            backend
-                .submit_setup_task(request)
-                .map(|job_id| {
-                    json!({
-                        "action": "setup_task",
-                        "submitted": true,
-                        "job_id": job_id,
+            }),
+            "bosn_setup_task" => setup_task_request(arguments).and_then(|request| {
+                backend
+                    .submit_setup_task(request)
+                    .map(|job_id| {
+                        json!({
+                            "action": "setup_task",
+                            "submitted": true,
+                            "job_id": job_id,
+                        })
                     })
-                })
-                .map_err(|_| ToolFailure::Daemon)
-        }),
-        "bosn_setup_app_task" => setup_app_task_request(arguments).and_then(|request| {
-            backend
-                .submit_setup_app_task(request)
-                .map(|job_id| {
-                    json!({
-                        "action": "setup_app_task", "submitted": true, "job_id": job_id,
+                    .map_err(|_| ToolFailure::Daemon)
+            }),
+            "bosn_setup_app_task" => setup_app_task_request(arguments).and_then(|request| {
+                backend
+                    .submit_setup_app_task(request)
+                    .map(|job_id| {
+                        json!({
+                            "action": "setup_app_task", "submitted": true, "job_id": job_id,
+                        })
                     })
-                })
-                .map_err(|_| ToolFailure::Daemon)
-        }),
-        _ => return tool_error("unknown Bosn MCP tool"),
-    };
+                    .map_err(|_| ToolFailure::Daemon)
+            }),
+            _ => return tool_error("unknown Bosn MCP tool"),
+        };
     match result {
         Ok(value) => tool_success(value),
         Err(ToolFailure::Invalid(message)) => tool_error(message),
@@ -1774,6 +1823,17 @@ mod tests {
                 counts: crate::ManifestVolumeGcPreviewCounts::default(),
             })
         }
+        fn manifest_volume_release_preview(
+            &mut self,
+            workspace: PathBuf,
+            after: u64,
+            limit: u32,
+        ) -> Result<ManifestVolumeGcPreviewPage, Error> {
+            let mut value = self.manifest_volume_gc_preview(workspace, after, limit)?;
+            value.candidates[0].token = "mvr1-7465737400".into();
+            value.candidates[0].reason = "explicit_durable_manifest_volume_release".into();
+            Ok(value)
+        }
         fn setup_reconcile_preview(
             &mut self,
             _workspace: PathBuf,
@@ -1824,6 +1884,13 @@ mod tests {
                 removed: true,
                 reconciled_missing: false,
             })
+        }
+        fn manifest_volume_release_apply(
+            &mut self,
+            workspace: PathBuf,
+            token: String,
+        ) -> Result<ManifestVolumeGcApplyResult, Error> {
+            self.manifest_volume_gc_apply(workspace, token)
         }
         fn setup_stop_retired(
             &mut self,
@@ -2013,6 +2080,8 @@ mod tests {
                 "bosn_setup_gc_preview",
                 "bosn_manifest_volume_gc_preview",
                 "bosn_manifest_volume_gc_apply",
+                "bosn_manifest_volume_release_preview",
+                "bosn_manifest_volume_release_apply",
                 "bosn_setup_reconcile_preview",
                 "bosn_setup_reconcile_repair_missing",
                 "bosn_setup_gc_apply",
@@ -2282,6 +2351,31 @@ mod tests {
         );
         assert_eq!(rejected["isError"], true);
         assert_eq!(backend.daemon_reads, before);
+    }
+
+    #[test]
+    fn durable_volume_release_requires_a_preview_token_and_confirmation() {
+        let mut backend = FakeBackend::default();
+        let preview = call_tool(
+            json!({"name":"bosn_manifest_volume_release_preview","arguments":{"workspace":"/private/work","limit":1}}),
+            &mut backend,
+        );
+        assert_eq!(preview["isError"], false);
+        assert_eq!(
+            preview["structuredContent"]["candidates"][0]["token"],
+            "mvr1-7465737400"
+        );
+        let rejected = call_tool(
+            json!({"name":"bosn_manifest_volume_release_apply","arguments":{"workspace":"/private/work","candidate_token":"mvr1-00","confirm":false}}),
+            &mut backend,
+        );
+        assert_eq!(rejected["isError"], true);
+        let applied = call_tool(
+            json!({"name":"bosn_manifest_volume_release_apply","arguments":{"workspace":"/private/work","candidate_token":"mvr1-00","confirm":true}}),
+            &mut backend,
+        );
+        assert_eq!(applied["isError"], false);
+        assert_eq!(applied["structuredContent"]["removed"], true);
     }
 
     #[test]
