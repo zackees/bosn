@@ -184,8 +184,7 @@ def wait_for_daemon(
     else:
         stdout, stderr = daemon.communicate()
         daemon_detail = (
-            f"exited={daemon.returncode}, stdout={stdout[-2048:]!r}, "
-            f"stderr={stderr[-2048:]!r}"
+            f"exited={daemon.returncode}, stdout={stdout[-2048:]!r}, stderr={stderr[-2048:]!r}"
         )
     socket_candidate = state / "bosn-rs.sock"
     fail(
