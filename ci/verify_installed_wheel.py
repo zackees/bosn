@@ -21,10 +21,9 @@ import sysconfig
 import tempfile
 import textwrap
 import time
-import venv
 import zipfile
 from pathlib import Path
-from typing import NoReturn
+from typing import BinaryIO, NoReturn
 
 RETIRED_LIFECYCLE_MODULES = (
     "daemon",
@@ -44,6 +43,7 @@ RETIRED_LIFECYCLE_MODULES = (
 # occupied forever when a child process or its local IPC transport wedges.
 CLI_TIMEOUT_SECONDS = 10
 INSTALL_TIMEOUT_SECONDS = 120
+REAP_TIMEOUT_SECONDS = 10
 
 
 def fail(message: str) -> NoReturn:
@@ -64,20 +64,37 @@ def tail(value: str | bytes | None, limit: int = 2048) -> str:
     return value[-limit:]
 
 
-def daemon_detail(daemon: subprocess.Popen[str] | None) -> str:
+def read_output(stream: BinaryIO | None) -> str:
+    """Read a temporary binary stream without relying on a child pipe closing."""
+
+    # ``TemporaryFile`` is intentionally passed directly to child processes.
+    # On Windows a spawned descendant may retain a pipe handle after the
+    # daemon parent exits, which makes ``communicate()`` wait forever.  A
+    # regular file lets us inspect diagnostics without that lifecycle edge.
+    if stream is None:
+        return ""
+    stream.seek(0)
+    value = stream.read()
+    return value.decode(errors="replace") if isinstance(value, bytes) else str(value)
+
+
+def daemon_detail(
+    daemon: subprocess.Popen[bytes] | None,
+    daemon_log: BinaryIO | None = None,
+) -> str:
     if daemon is None:
         return "not started"
     if daemon.poll() is None:
-        return "still running"
-    stdout, stderr = daemon.communicate()
-    return f"exited={daemon.returncode}, stdout={tail(stdout)!r}, stderr={tail(stderr)!r}"
+        return f"still running; log={tail(read_output(daemon_log))!r}"
+    return f"exited={daemon.returncode}; log={tail(read_output(daemon_log))!r}"
 
 
 def timeout_detail(
     error: subprocess.TimeoutExpired,
     *,
     state: Path | None = None,
-    daemon: subprocess.Popen[str] | None = None,
+    daemon: subprocess.Popen[bytes] | None = None,
+    daemon_log: BinaryIO | None = None,
 ) -> str:
     detail = (
         f"command={error.cmd!r}; timeout={error.timeout}s; "
@@ -90,7 +107,7 @@ def timeout_detail(
             f"socket_candidate_length={len(os.fsencode(socket_candidate))}"
         )
     if daemon is not None:
-        detail += f"; daemon={daemon_detail(daemon)}"
+        detail += f"; daemon={daemon_detail(daemon, daemon_log)}"
     return detail
 
 
@@ -183,30 +200,75 @@ def child_environment(scripts: Path) -> dict[str, str]:
     return environment
 
 
+def bootstrap_environment() -> dict[str, str]:
+    """Keep venv and uv isolated from a caller's Python environment too."""
+
+    environment = dict(os.environ)
+    for key in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "CONDA_PREFIX"):
+        environment.pop(key, None)
+    environment["PYTHONNOUSERSITE"] = "1"
+    return environment
+
+
 def run(
     command: list[str],
     *,
     cwd: Path,
     env: dict[str, str],
     check: bool = True,
+    timeout: int = CLI_TIMEOUT_SECONDS,
     state: Path | None = None,
-    daemon: subprocess.Popen[str] | None = None,
+    daemon: subprocess.Popen[bytes] | None = None,
+    daemon_log: BinaryIO | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    try:
-        return subprocess.run(
+    # Do not use PIPE here.  A process which launches another process can
+    # leave a pipe write handle alive on Windows after its own exit, defeating
+    # subprocess.run(timeout=...) during its implicit communicate() cleanup.
+    # File-backed output gives the same diagnostics while wait() remains
+    # bounded by the direct child alone.
+    with tempfile.TemporaryFile(mode="w+b") as stdout, tempfile.TemporaryFile(mode="w+b") as stderr:
+        process = subprocess.Popen(
             command,
             cwd=cwd,
             env=env,
-            check=check,
-            text=True,
-            capture_output=True,
-            timeout=CLI_TIMEOUT_SECONDS,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
         )
-    except subprocess.TimeoutExpired as error:
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                # A process may win the race between wait's timeout and kill.
+                pass
+            try:
+                process.wait(timeout=REAP_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                fail(
+                    "installed-wheel command could not be reaped: "
+                    f"command={command!r}; timeout={timeout}s; "
+                    f"stdout={tail(read_output(stdout))!r}; stderr={tail(read_output(stderr))!r}; "
+                    f"daemon={daemon_detail(daemon, daemon_log)}"
+                )
+            error = subprocess.TimeoutExpired(
+                command, timeout, read_output(stdout), read_output(stderr)
+            )
+            fail(
+                "installed-wheel command timed out: "
+                f"{timeout_detail(error, state=state, daemon=daemon, daemon_log=daemon_log)}"
+            )
+        output = read_output(stdout)
+        error_output = read_output(stderr)
+    completed = subprocess.CompletedProcess(command, returncode, output, error_output)
+    if check and returncode != 0:
         fail(
-            "installed-wheel command timed out: "
-            f"{timeout_detail(error, state=state, daemon=daemon)}"
+            "installed-wheel command failed: "
+            f"command={command!r}; exit={returncode}; "
+            f"stdout={tail(output)!r}; stderr={tail(error_output)!r}"
         )
+    return completed
 
 
 def json_output(
@@ -215,9 +277,17 @@ def json_output(
     cwd: Path,
     env: dict[str, str],
     state: Path | None = None,
-    daemon: subprocess.Popen[str] | None = None,
+    daemon: subprocess.Popen[bytes] | None = None,
+    daemon_log: BinaryIO | None = None,
 ) -> dict[str, object]:
-    result = run(command, cwd=cwd, env=env, state=state, daemon=daemon)
+    result = run(
+        command,
+        cwd=cwd,
+        env=env,
+        state=state,
+        daemon=daemon,
+        daemon_log=daemon_log,
+    )
     try:
         value = json.loads(result.stdout)
     except json.JSONDecodeError as error:
@@ -233,14 +303,17 @@ def wait_for_daemon(
     *,
     cwd: Path,
     env: dict[str, str],
-    daemon: subprocess.Popen[str],
+    daemon: subprocess.Popen[bytes],
+    daemon_log: BinaryIO,
 ) -> None:
     deadline = time.monotonic() + 10
     last_status = "no status request was attempted"
     while time.monotonic() < deadline:
         if daemon.poll() is not None:
-            stdout, stderr = daemon.communicate()
-            fail(f"installed daemon exited early ({daemon.returncode}): {stdout}\n{stderr}")
+            fail(
+                f"installed daemon exited early ({daemon.returncode}): "
+                f"{daemon_detail(daemon, daemon_log)}"
+            )
         try:
             status = run(
                 [str(cli), "daemon", "status", "--state-dir", str(state), "--json"],
@@ -249,6 +322,7 @@ def wait_for_daemon(
                 check=False,
                 state=state,
                 daemon=daemon,
+                daemon_log=daemon_log,
             )
         except AssertionError as error:
             fail(f"installed daemon readiness probe failed: {error}")
@@ -261,7 +335,7 @@ def wait_for_daemon(
             if value.get("action") == "daemon_status" and value.get("daemon") == "online":
                 return
         time.sleep(0.05)
-    detail = daemon_detail(daemon)
+    detail = daemon_detail(daemon, daemon_log)
     socket_candidate = state / "bosn-rs.sock"
     fail(
         "installed daemon did not become ready; "
@@ -291,22 +365,22 @@ def verify_installed_wheel(wheel: Path) -> None:
         state = root / "state"
         workdir.mkdir()
         phase("create isolated virtual environment")
-        venv.EnvBuilder(with_pip=True).create(environment)
+        run(
+            [sys.executable, "-m", "venv", str(environment)],
+            cwd=root,
+            env=bootstrap_environment(),
+            timeout=INSTALL_TIMEOUT_SECONDS,
+        )
         python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
         scripts = environment / ("Scripts" if os.name == "nt" else "bin")
-        phase("install wheel")
-        try:
-            subprocess.run(
-                [uv, "pip", "install", "--python", str(python), "--no-deps", str(wheel)],
-                check=True,
-                text=True,
-                capture_output=True,
-                timeout=INSTALL_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired as error:
-            fail(f"installed-wheel dependency installation timed out: {timeout_detail(error)}")
-
         env = child_environment(scripts)
+        phase("install wheel")
+        run(
+            [uv, "pip", "install", "--python", str(python), "--no-deps", str(wheel)],
+            cwd=root,
+            env=env,
+            timeout=INSTALL_TIMEOUT_SECONDS,
+        )
         phase("import installed extension")
         imported = run(
             [
@@ -366,51 +440,76 @@ def verify_installed_wheel(wheel: Path) -> None:
             fail("doctor initialized daemon state")
 
         phase("start daemon")
-        daemon = subprocess.Popen(
-            [str(cli), "daemon", "serve", "--state-dir", str(state)],
-            cwd=workdir,
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        try:
-            phase("wait for daemon readiness")
-            wait_for_daemon(cli, state, cwd=workdir, env=env, daemon=daemon)
-            phase("verify online doctor")
-            doctor = json_output(
-                [str(cli), "doctor", "--state-dir", str(state), "--json"],
+        # Keep daemon diagnostics in a real file rather than a PIPE.  See
+        # ``run``: inherited Windows pipe handles can otherwise make the
+        # verifier's final communicate() wait unbounded.
+        with tempfile.TemporaryFile(mode="w+b") as daemon_log:
+            daemon = subprocess.Popen(
+                [str(cli), "daemon", "serve", "--state-dir", str(state)],
                 cwd=workdir,
                 env=env,
-                state=state,
-                daemon=daemon,
+                stdin=subprocess.DEVNULL,
+                stdout=daemon_log,
+                stderr=subprocess.STDOUT,
             )
-            if doctor.get("action") != "doctor" or doctor.get("daemon") != "ready":
-                fail(f"doctor did not inspect the installed daemon: {doctor}")
-            phase("stop daemon")
-            stopped = json_output(
-                [str(cli), "daemon", "stop", "--state-dir", str(state), "--json"],
-                cwd=workdir,
-                env=env,
-                state=state,
-                daemon=daemon,
-            )
-            if stopped != {"action": "daemon_stop", "stopped": True}:
-                fail(f"installed daemon did not stop cleanly: {stopped}")
-            if daemon.wait(timeout=10) != 0:
-                stdout, stderr = daemon.communicate()
-                fail(f"installed daemon failed while stopping: {stdout}\n{stderr}")
-        finally:
-            if daemon.poll() is None:
-                phase("force-reap daemon")
-                daemon.kill()
+            try:
+                phase("wait for daemon readiness")
+                wait_for_daemon(
+                    cli,
+                    state,
+                    cwd=workdir,
+                    env=env,
+                    daemon=daemon,
+                    daemon_log=daemon_log,
+                )
+                phase("verify online doctor")
+                doctor = json_output(
+                    [str(cli), "doctor", "--state-dir", str(state), "--json"],
+                    cwd=workdir,
+                    env=env,
+                    state=state,
+                    daemon=daemon,
+                    daemon_log=daemon_log,
+                )
+                if doctor.get("action") != "doctor" or doctor.get("daemon") != "ready":
+                    fail(f"doctor did not inspect the installed daemon: {doctor}")
+                phase("stop daemon")
+                stopped = json_output(
+                    [str(cli), "daemon", "stop", "--state-dir", str(state), "--json"],
+                    cwd=workdir,
+                    env=env,
+                    state=state,
+                    daemon=daemon,
+                    daemon_log=daemon_log,
+                )
+                if stopped != {"action": "daemon_stop", "stopped": True}:
+                    fail(f"installed daemon did not stop cleanly: {stopped}")
                 try:
-                    daemon.wait(timeout=CLI_TIMEOUT_SECONDS)
-                except subprocess.TimeoutExpired as error:
+                    daemon_exit = daemon.wait(timeout=REAP_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired:
                     fail(
-                        "installed daemon could not be reaped: "
-                        f"{timeout_detail(error, state=state, daemon=daemon)}"
+                        "installed daemon did not exit after a successful stop request: "
+                        f"{daemon_detail(daemon, daemon_log)}"
                     )
+                if daemon_exit != 0:
+                    fail(
+                        "installed daemon failed while stopping: "
+                        f"{daemon_detail(daemon, daemon_log)}"
+                    )
+            finally:
+                if daemon.poll() is None:
+                    phase("force-reap daemon")
+                    try:
+                        daemon.kill()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        daemon.wait(timeout=REAP_TIMEOUT_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        fail(
+                            "installed daemon could not be reaped: "
+                            f"{daemon_detail(daemon, daemon_log)}"
+                        )
         phase("complete")
 
 
