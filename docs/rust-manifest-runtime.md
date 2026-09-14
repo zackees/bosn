@@ -17,6 +17,22 @@ workspace, a safe workspace-relative manifest path, declared stack name,
 deadline, and output budget. It cannot supply an image, container identifier,
 labels, Docker arguments, mounts, environment, command, or state path.
 
+`bosn manifest app-task` now runs one named `[task.NAME]` declaration inside
+an already ensured instance of that same supported stack:
+
+```text
+bosn manifest app-task --state-dir STATE --workspace WORKSPACE \
+  --manifest bosn.toml --stack app --task check --deadline-ms 300000 --output-limit 8388608
+```
+
+It is also exposed as `Client.submit_manifest_app_task(...)` and the
+`bosn_manifest_app_task` MCP tool. The task must belong to the selected stack.
+The daemon re-reads and validates the manifest, verifies the immutable image,
+inspect-proves the exact deterministic managed container is running, then uses
+only `docker container exec NAME sh -lc DECLARED_COMMAND`. Cancellation,
+deadline, and transport uncertainty retain a durable execution-session row and
+`manifest.app-task.uncertain` event so GC and recovery protect that container.
+
 ## Implemented behavior
 
 The daemon canonicalizes the workspace and manifest, requires the latter to
@@ -41,6 +57,7 @@ changed.
 | Standard Linux stack with `image = name@sha256:<64 lowercase hex>` | Supported |
 | `[stack.NAME.env]` scalar environment | Supported after bounded validation |
 | One explicitly named stack | Supported |
+| Named `[task.NAME]` for that stack in an already ensured container | Supported; fixed daemon-owned exec only |
 | Dockerfile/build context | Refused |
 | macOS guest / guest fields | Refused |
 | volumes, tmpfs | Refused |

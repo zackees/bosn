@@ -1,7 +1,7 @@
 //! Small, authenticated Rust daemon foundation. Product protobuf remains private.
 
 use bosn_core::{
-    ManifestRoots, ResourceKind, ResourceState, Retention, Scope, SetupApp, SetupSource,
+    ManifestRoots, ResourceKind, ResourceState, Retention, Scope, SetupApp, SetupSource, SetupTask,
     parse_manifest_toml,
 };
 use bosn_engine::{DockerDoctorReport, DockerDoctorState, DockerEngine, EngineEvent, RunOptions};
@@ -153,6 +153,18 @@ pub struct ManifestEnsureJobRequest {
     pub deadline: Duration,
     pub output_limit: usize,
 }
+/// One bounded execution of a task already declared by an ensured, supported
+/// manifest stack.  This deliberately carries selectors only: the daemon
+/// re-reads the manifest and derives the command, image, and container name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManifestAppTaskJobRequest {
+    pub workspace: PathBuf,
+    pub manifest: String,
+    pub stack: String,
+    pub task_name: String,
+    pub deadline: Duration,
+    pub output_limit: usize,
+}
 /// Explicit, confirmed restoration of a lost local registry record for an
 /// already-existing Bosn-managed setup application. It has no engine targets:
 /// plan, image identity, deterministic name, and labels are all re-derived.
@@ -247,6 +259,29 @@ pub trait ManifestEnsureExecutor: Send + Sync {
         cancellation: &'a async_engine::CancellationToken,
         logs: &'a async_engine::Sender<String>,
     ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>>;
+}
+/// Semantic boundary for a named task in an already ensured manifest stack.
+/// There are intentionally no raw command, container, or engine controls.
+pub trait ManifestAppTaskExecutor: Send + Sync {
+    fn execute<'a>(
+        &'a self,
+        request: ManifestAppTaskJobRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a async_engine::Sender<String>,
+        session: &'a dyn ManifestAppTaskSessionRecorder,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
+}
+/// Durable, conservative ownership evidence for a manifest app task. The
+/// identity is the registry-matching deterministic managed container name.
+pub trait ManifestAppTaskSessionRecorder: Send + Sync {
+    fn begin<'a>(
+        &'a self,
+        managed_container_identity: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+    fn finish<'a>(
+        &'a self,
+        outcome: &'static str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 }
 pub trait SetupAdoptExecutor: Send + Sync {
     fn execute<'a>(
@@ -664,6 +699,157 @@ impl ManifestEnsureExecutor for DockerManifestEnsureExecutor {
     }
 }
 
+/// Docker-backed execution of one declared task in an already ensured
+/// manifest stack.  It deliberately re-derives the complete accepted stack
+/// plan and image receipt, then performs an inspect-only ownership proof
+/// immediately before the one fixed `container exec` operation.
+#[derive(Clone)]
+pub struct DockerManifestAppTaskExecutor {
+    engine: DockerEngine,
+}
+impl DockerManifestAppTaskExecutor {
+    fn new() -> Self {
+        Self {
+            engine: DockerEngine::docker(),
+        }
+    }
+}
+impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
+    fn execute<'a>(
+        &'a self,
+        request: ManifestAppTaskJobRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a async_engine::Sender<String>,
+        session: &'a dyn ManifestAppTaskSessionRecorder,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let quarter = request.output_limit / 4;
+            let exec_output = request.output_limit.saturating_sub(quarter * 3);
+            if quarter == 0 || exec_output == 0 {
+                return Err(
+                    "manifest app task output budget cannot fund validation and execution".into(),
+                );
+            }
+            let deadline = async_engine::Deadline::after(request.deadline);
+            let (plan, _) = async_engine::cancellable(
+                cancellation,
+                async_engine::timeout_at(deadline, manifest_stack_task_setup_plan(&request)),
+            )
+            .await
+            .map_err(|_| "manifest app task cancelled before ownership inspection".to_owned())?
+            .map_err(|_| "manifest app task planning exceeded its deadline".to_owned())??;
+            let (events, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
+            let forwarded_logs = logs.clone();
+            let forwarder = async_engine::launch(async move {
+                while let Some(event) = receiver.recv().await {
+                    forward_engine_event(&forwarded_logs, event).await?;
+                }
+                Ok::<(), String>(())
+            });
+            let result = async {
+                let remaining = deadline.remaining();
+                if cancellation.is_cancelled() || remaining.is_zero() {
+                    return Err("manifest app task ended before image verification".into());
+                }
+                logs.send("[manifest-app-task] verifying immutable application image".into())
+                    .await
+                    .map_err(|_| "manifest app task log consumer closed".to_owned())?;
+                let prepared = prepare_setup_image(
+                    &self.engine,
+                    &plan,
+                    RunOptions::streaming(remaining, quarter),
+                    cancellation,
+                    &events,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                let remaining = deadline.remaining();
+                if cancellation.is_cancelled() || remaining.is_zero() {
+                    return Err("manifest app task ended before ownership inspection".into());
+                }
+                logs.send("[manifest-app-task] proving exact managed application ownership".into())
+                    .await
+                    .map_err(|_| "manifest app task log consumer closed".to_owned())?;
+                let observed = adopt_setup_app(
+                    &self.engine,
+                    CoreSetupEnsureRequest {
+                        plan: &plan,
+                        workspace_root: request.workspace.clone(),
+                        prepared_image: &prepared,
+                        options: RunOptions::streaming(remaining, quarter),
+                        cancellation,
+                        events: &events,
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                if !observed.running {
+                    return Err(
+                        "manifest app task requires the exact managed application to be running"
+                            .into(),
+                    );
+                }
+                if cancellation.is_cancelled() || deadline.remaining().is_zero() {
+                    return Err(
+                        "manifest app task ended before exec; remote command was not started"
+                            .into(),
+                    );
+                }
+                logs.send(format!(
+                    "[manifest-app-task] running declared task {}",
+                    request.task_name
+                ))
+                .await
+                .map_err(|_| "manifest app task log consumer closed".to_owned())?;
+                session
+                    .begin(manifest_app_task_session_container_identity(&observed))
+                    .await
+                    .map_err(|_| "manifest app task ownership recording unavailable".to_owned())?;
+                let result = execute_setup_app_task(
+                    &self.engine,
+                    SetupAppTaskRequest {
+                        plan: &plan,
+                        workspace_root: request.workspace.clone(),
+                        task_name: request.task_name.clone(),
+                        prepared_image: &prepared,
+                        options: RunOptions::streaming(deadline.remaining(), exec_output),
+                        cancellation,
+                        events: &events,
+                    },
+                )
+                .await;
+                let outcome = match &result {
+                    Ok(_) => "succeeded",
+                    Err(bosn_setup::SetupTaskError::TaskFailed { .. }) => "failed",
+                    Err(_) => "uncertain",
+                };
+                session
+                    .finish(outcome)
+                    .await
+                    .map_err(|_| "manifest app task completion recording unavailable".to_owned())?;
+                match result {
+                    Ok(value) => Ok(format!(
+                        "completed declared manifest task {} in managed container {} with image {}",
+                        value.task_name, observed.container_name, value.image_identity
+                    )),
+                    Err(bosn_setup::SetupTaskError::Cancelled)
+                    | Err(bosn_setup::SetupTaskError::Deadline) => Err(
+                        "manifest app task exec client ended; remote command completion is unknown"
+                            .into(),
+                    ),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+            .await;
+            drop(events);
+            forwarder
+                .await
+                .map_err(|_| "manifest app task log forwarder stopped".to_owned())??;
+            result
+        })
+    }
+}
+
 /// Translate the strictly supported manifest runtime subset to the existing
 /// typed setup receipt. This is intentionally a refusal boundary, not a
 /// lossy migration: fields which would need more lifecycle semantics are
@@ -671,17 +857,42 @@ impl ManifestEnsureExecutor for DockerManifestEnsureExecutor {
 async fn manifest_stack_setup_plan(
     request: &ManifestEnsureJobRequest,
 ) -> Result<(SetupPlan, String), String> {
-    let workspace = fs::canonical_context_path(&request.workspace)
+    manifest_stack_plan(&request.workspace, &request.manifest, &request.stack, None).await
+}
+
+async fn manifest_stack_task_setup_plan(
+    request: &ManifestAppTaskJobRequest,
+) -> Result<(SetupPlan, String), String> {
+    manifest_stack_plan(
+        &request.workspace,
+        &request.manifest,
+        &request.stack,
+        Some(&request.task_name),
+    )
+    .await
+}
+
+/// Re-read and validate one exact manifest snapshot before every engine
+/// operation.  A selected task is injected only after it is proven to belong
+/// to the selected stack; this remains a finite translation to the existing
+/// typed setup primitives, not a generic manifest runner.
+async fn manifest_stack_plan(
+    request_workspace: &Path,
+    request_manifest: &str,
+    request_stack: &str,
+    task_name: Option<&str>,
+) -> Result<(SetupPlan, String), String> {
+    let workspace = fs::canonical_context_path(request_workspace)
         .map_err(|_| "manifest workspace cannot be canonicalized".to_owned())?;
     let metadata = fs::context_path_metadata_no_follow(&workspace)
         .map_err(|_| "manifest workspace is not a directory".to_owned())?;
     if metadata.kind != fs::ContextPathKind::Directory {
         return Err("manifest workspace is not a directory".into());
     }
-    if !safe_manifest_relative_path(&request.manifest) {
+    if !safe_manifest_relative_path(request_manifest) {
         return Err("manifest path must be a safe workspace-relative path".into());
     }
-    let manifest_path = workspace.join(&request.manifest);
+    let manifest_path = workspace.join(request_manifest);
     let manifest_path = fs::canonical_context_path(&manifest_path)
         .map_err(|_| "manifest file cannot be canonicalized".to_owned())?;
     if !manifest_path.starts_with(&workspace) {
@@ -701,7 +912,7 @@ async fn manifest_stack_setup_plan(
     )
     .map_err(|_| "manifest is invalid".to_owned())?;
     let stack = manifest
-        .stack(&request.stack)
+        .stack(request_stack)
         .map_err(|_| "selected manifest stack does not exist".to_owned())?;
     if stack.dockerfile.is_some()
         || stack.kind.is_some()
@@ -754,6 +965,27 @@ async fn manifest_stack_setup_plan(
         .strip_prefix("sha256:")
         .ok_or_else(|| "manifest generation is invalid".to_owned())?
         .to_owned();
+    let mut tasks = BTreeMap::new();
+    if let Some(task_name) = task_name {
+        let task = manifest
+            .task(task_name)
+            .map_err(|_| "selected manifest task does not exist".to_owned())?;
+        if task.stack != stack.name {
+            return Err("selected manifest task does not belong to selected stack".into());
+        }
+        if task.cmd.len() > 16 * 1024 || task.cmd.contains('\0') {
+            return Err("selected manifest task command is unsafe".into());
+        }
+        tasks.insert(
+            task.name.clone(),
+            SetupTask {
+                command: task.cmd.clone(),
+                workdir: None,
+                environment: BTreeMap::new(),
+            },
+        );
+    }
+    let task_names = tasks.keys().cloned().collect();
     let app = SetupApp {
         source: SetupSource::PinnedImage(image.clone()),
         environment: stack.env.clone(),
@@ -768,9 +1000,9 @@ async fn manifest_stack_setup_plan(
             schema_version: bosn_core::SETUP_DOCUMENT_VERSION,
             workspace_root: workspace,
             asset_root: None,
-            task_names: Vec::new(),
+            task_names,
             app,
-            tasks: BTreeMap::new(),
+            tasks,
             app_source: SetupPlanAppSource::PinnedImage { image },
         },
         generation,
@@ -2520,6 +2752,46 @@ impl Client {
             _ => Err(Error::Protocol("unexpected manifest ensure response")),
         }
     }
+    /// Submit one named task for an already ensured supported manifest stack.
+    /// The task name is the only executable selector; manifest command and
+    /// managed container identity are re-derived by the daemon.
+    pub async fn submit_manifest_app_task(
+        &self,
+        request: ManifestAppTaskJobRequest,
+    ) -> Result<u64, Error> {
+        let workspace = request
+            .workspace
+            .to_str()
+            .ok_or(Error::Protocol("manifest workspace is not UTF-8"))?
+            .to_owned();
+        let deadline_ms = u64::try_from(request.deadline.as_millis())
+            .map_err(|_| Error::Protocol("manifest deadline too large"))?;
+        let output_limit = u32::try_from(request.output_limit)
+            .map_err(|_| Error::Protocol("manifest output limit too large"))?;
+        validate_manifest_app_task_wire(
+            &workspace,
+            &request.manifest,
+            &request.stack,
+            &request.task_name,
+            deadline_ms,
+            output_limit,
+        )?;
+        match self
+            .call(Request {
+                workspace,
+                stack: request.stack,
+                setup_config: request.manifest,
+                setup_task_name: request.task_name,
+                setup_deadline_ms: deadline_ms,
+                setup_output_limit: output_limit,
+                ..Request::operation(23)
+            })
+            .await?
+        {
+            Reply::Job(id) => Ok(id),
+            _ => Err(Error::Protocol("unexpected manifest app task response")),
+        }
+    }
     async fn call(&self, request: Request) -> Result<Reply, Error> {
         // Resolve on every call: a Client may have been constructed while a
         // fresh daemon was still creating its registry, before an inode-based
@@ -2553,6 +2825,7 @@ pub struct Service {
     setup_app_task_executor: Arc<dyn SetupAppTaskExecutor>,
     setup_ensure_executor: Arc<dyn SetupEnsureExecutor>,
     manifest_ensure_executor: Arc<dyn ManifestEnsureExecutor>,
+    manifest_app_task_executor: Arc<dyn ManifestAppTaskExecutor>,
     setup_adopt_executor: Arc<dyn SetupAdoptExecutor>,
     doctor_executor: Arc<dyn DoctorExecutor>,
     setup_reconcile_executor: Arc<dyn SetupReconcileExecutor>,
@@ -2656,7 +2929,17 @@ enum DbCommand {
         container_id: String,
         reply: async_engine::OneshotSender<Result<(), Error>>,
     },
+    BeginManifestAppTaskSession {
+        job_id: u64,
+        container_id: String,
+        reply: async_engine::OneshotSender<Result<(), Error>>,
+    },
     FinishSetupAppTaskSession {
+        job_id: u64,
+        outcome: &'static str,
+        reply: async_engine::OneshotSender<Result<(), Error>>,
+    },
+    FinishManifestAppTaskSession {
         job_id: u64,
         outcome: &'static str,
         reply: async_engine::OneshotSender<Result<(), Error>>,
@@ -2708,6 +2991,10 @@ enum JobCommand {
         request: ManifestEnsureJobRequest,
         reply: async_engine::OneshotSender<Result<u64, Error>>,
     },
+    SubmitManifestAppTask {
+        request: ManifestAppTaskJobRequest,
+        reply: async_engine::OneshotSender<Result<u64, Error>>,
+    },
     /// The job actor, rather than an executor task, owns the transition from
     /// a cancellable running job to a durably recorded successful ensure.
     /// It deliberately awaits the registry transaction before it processes a
@@ -2741,6 +3028,7 @@ enum SetupJobKind {
     AppTask,
     Ensure,
     ManifestEnsure,
+    ManifestAppTask,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2807,6 +3095,7 @@ enum SetupJobRequest {
     AppTask(SetupAppTaskJobRequest),
     Ensure(SetupEnsureJobRequest),
     ManifestEnsure(ManifestEnsureJobRequest),
+    ManifestAppTask(ManifestAppTaskJobRequest),
 }
 
 #[derive(Clone)]
@@ -2816,6 +3105,7 @@ struct SetupExecutors {
     app_task: Arc<dyn SetupAppTaskExecutor>,
     ensure: Arc<dyn SetupEnsureExecutor>,
     manifest_ensure: Arc<dyn ManifestEnsureExecutor>,
+    manifest_app_task: Arc<dyn ManifestAppTaskExecutor>,
 }
 impl JobActor {
     async fn submit(&self, workspace: String, stack: String, digest: String) -> Result<u64, Error> {
@@ -2899,6 +3189,17 @@ impl JobActor {
         let (reply, wait) = async_engine::oneshot_channel();
         self.sender
             .send(JobCommand::SubmitManifestEnsure { request, reply })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
+    async fn submit_manifest_app_task(
+        &self,
+        request: ManifestAppTaskJobRequest,
+    ) -> Result<u64, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(JobCommand::SubmitManifestAppTask { request, reply })
             .await
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
@@ -3165,6 +3466,35 @@ async fn job_actor(
                     registry.clone(),
                 );
             }
+            JobCommand::SubmitManifestAppTask { request, reply } => {
+                let digest = manifest_app_task_digest(&request);
+                let workspace = request.workspace.to_string_lossy().into_owned();
+                let job_stack = format!("manifest-app-task:{}", request.stack);
+                let result = jobs
+                    .submit(&workspace, &job_stack, &digest)
+                    .map(|submission| match submission {
+                        Submission::Started(id) | Submission::Queued(id) => {
+                            requests.insert(id, SetupJobRequest::ManifestAppTask(request));
+                            id
+                        }
+                        Submission::Joined(id) => id,
+                        Submission::Superseded { replacement, .. } => {
+                            requests.insert(replacement, SetupJobRequest::ManifestAppTask(request));
+                            replacement
+                        }
+                    })
+                    .map_err(|_| Error::Protocol("manifest app task job admission"));
+                let _ = reply.send(result);
+                launch_started_setup_jobs(
+                    &mut jobs,
+                    &mut requests,
+                    &mut cancellations,
+                    &mut tasks,
+                    &executors,
+                    sender.clone(),
+                    registry.clone(),
+                );
+            }
             JobCommand::PersistSetupEnsure {
                 id,
                 execution,
@@ -3269,6 +3599,7 @@ async fn job_actor(
                             SetupJobKind::AppTask => "setup app task",
                             SetupJobKind::Ensure => "setup ensure",
                             SetupJobKind::ManifestEnsure => "manifest ensure",
+                            SetupJobKind::ManifestAppTask => "manifest app task",
                         };
                         let _ = jobs.log(id, format!("{operation} failed: {error}"));
                         let _ = jobs.settle_with_error(id, false, Some(error));
@@ -3362,6 +3693,11 @@ fn launch_started_setup_jobs(
         let app_task_executor = Arc::clone(&executors.app_task);
         let ensure_executor = Arc::clone(&executors.ensure);
         let manifest_ensure_executor = Arc::clone(&executors.manifest_ensure);
+        let manifest_app_task_executor = Arc::clone(&executors.manifest_app_task);
+        let manifest_session_recorder = ActorManifestAppTaskSessionRecorder {
+            actor: registry.clone(),
+            job_id: id,
+        };
         tasks.spawn(async move {
             let (logs, mut log_receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
             let log_sender = task_sender.clone();
@@ -3447,6 +3783,12 @@ fn launch_started_setup_jobs(
                         Err(error) => Some((SetupJobKind::ManifestEnsure, Err(error))),
                     }
                 }
+                SetupJobRequest::ManifestAppTask(request) => Some((
+                    SetupJobKind::ManifestAppTask,
+                    manifest_app_task_executor
+                        .execute(request, &token, &logs, &manifest_session_recorder)
+                        .await,
+                )),
             };
             drop(logs);
             let _ = forwarder.await;
@@ -3484,6 +3826,36 @@ impl SetupAppTaskSessionRecorder for ActorSetupAppTaskSessionRecorder {
         Box::pin(async move {
             self.actor
                 .finish_setup_app_task_session(self.job_id, outcome)
+                .await
+                .map_err(|_| "registry session finish failed".into())
+        })
+    }
+}
+
+#[derive(Clone)]
+struct ActorManifestAppTaskSessionRecorder {
+    actor: RegistryActor,
+    job_id: u64,
+}
+impl ManifestAppTaskSessionRecorder for ActorManifestAppTaskSessionRecorder {
+    fn begin<'a>(
+        &'a self,
+        managed_container_identity: String,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.actor
+                .begin_manifest_app_task_session(self.job_id, managed_container_identity)
+                .await
+                .map_err(|_| "registry session start failed".into())
+        })
+    }
+    fn finish<'a>(
+        &'a self,
+        outcome: &'static str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.actor
+                .finish_manifest_app_task_session(self.job_id, outcome)
                 .await
                 .map_err(|_| "registry session finish failed".into())
         })
@@ -3618,12 +3990,37 @@ fn manifest_ensure_digest(request: &ManifestEnsureJobRequest) -> String {
         kernal_api::hash::blake3_bytes(&material).to_hex()
     )
 }
+fn manifest_app_task_digest(request: &ManifestAppTaskJobRequest) -> String {
+    let mut material = Vec::new();
+    let workspace = request.workspace.to_string_lossy();
+    let deadline = request.deadline.as_millis().to_le_bytes();
+    let output_limit = (request.output_limit as u64).to_le_bytes();
+    for part in [
+        b"bosn.manifest-app-task.v1".as_slice(),
+        workspace.as_bytes(),
+        request.manifest.as_bytes(),
+        request.stack.as_bytes(),
+        request.task_name.as_bytes(),
+        &deadline,
+        &output_limit,
+    ] {
+        material.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        material.extend_from_slice(part);
+    }
+    format!(
+        "manifest:{}",
+        kernal_api::hash::blake3_bytes(&material).to_hex()
+    )
+}
 
 /// Select the durable registry key from a receipt that has already passed
 /// `adopt_setup_app`'s complete ownership validation. Docker's opaque ID is
 /// useful in the operation receipt, but registry resource ownership and GC
 /// use the exact content-addressed managed name.
 fn setup_app_task_session_container_identity(observed: &SetupEnsureResult) -> String {
+    observed.container_name.clone()
+}
+fn manifest_app_task_session_container_identity(observed: &SetupEnsureResult) -> String {
     observed.container_name.clone()
 }
 
@@ -3652,6 +4049,38 @@ impl RegistryActor {
         let (reply, wait) = async_engine::oneshot_channel();
         self.sender
             .send(DbCommand::FinishSetupAppTaskSession {
+                job_id,
+                outcome,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
+    async fn begin_manifest_app_task_session(
+        &self,
+        job_id: u64,
+        managed_container_identity: String,
+    ) -> Result<(), Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::BeginManifestAppTaskSession {
+                job_id,
+                container_id: managed_container_identity,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
+    async fn finish_manifest_app_task_session(
+        &self,
+        job_id: u64,
+        outcome: &'static str,
+    ) -> Result<(), Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::FinishManifestAppTaskSession {
                 job_id,
                 outcome,
                 reply,
@@ -4419,6 +4848,47 @@ async fn registry_actor(
                     }
                 }
             }
+            DbCommand::BeginManifestAppTaskSession {
+                job_id,
+                container_id,
+                reply,
+            } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result =
+                        record_manifest_app_task_session(&mut registry, job_id, &container_id);
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
+            DbCommand::FinishManifestAppTaskSession {
+                job_id,
+                outcome,
+                reply,
+            } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = finish_manifest_app_task_session(&mut registry, job_id, outcome);
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
             DbCommand::Stop(reply) => {
                 let _ = reply.send(());
                 return;
@@ -4429,6 +4899,9 @@ async fn registry_actor(
 
 fn setup_app_task_session_id(job_id: u64) -> String {
     format!("setup-app-task:{job_id}")
+}
+fn manifest_app_task_session_id(job_id: u64) -> String {
+    format!("manifest-app-task:{job_id}")
 }
 
 fn record_setup_app_task_session(
@@ -4470,6 +4943,50 @@ fn finish_setup_app_task_session(
     } else {
         transaction.delete_execution_session(&setup_app_task_session_id(job_id))?;
         transaction.append_event(now, "setup.app-task.finished", outcome)?;
+    }
+    transaction.commit()
+}
+
+fn record_manifest_app_task_session(
+    registry: &mut Registry,
+    job_id: u64,
+    container_id: &str,
+) -> Result<(), bosn_registry::Error> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
+        .as_secs_f64();
+    let mut transaction = registry.begin_immediate()?;
+    transaction.put_execution_session(&ExecutionSession {
+        id: manifest_app_task_session_id(job_id),
+        container_id: container_id.into(),
+        engine_binary: "docker".into(),
+        client_pid: std::process::id(),
+        client_start: None,
+        lease_ids: Vec::new(),
+    })?;
+    transaction.append_event(now, "manifest.app-task.started", "owned_declared_task")?;
+    transaction.commit()
+}
+fn finish_manifest_app_task_session(
+    registry: &mut Registry,
+    job_id: u64,
+    outcome: &str,
+) -> Result<(), bosn_registry::Error> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
+        .as_secs_f64();
+    let mut transaction = registry.begin_immediate()?;
+    if outcome == "uncertain" {
+        transaction.append_event(
+            now,
+            "manifest.app-task.uncertain",
+            "remote_completion_unknown",
+        )?;
+    } else {
+        transaction.delete_execution_session(&manifest_app_task_session_id(job_id))?;
+        transaction.append_event(now, "manifest.app-task.finished", outcome)?;
     }
     transaction.commit()
 }
@@ -4725,6 +5242,7 @@ impl Service {
             setup_app_task_executor: Arc::new(DockerSetupAppTaskExecutor::new(state_dir.clone())),
             setup_ensure_executor: Arc::new(DockerSetupEnsureExecutor::new(state_dir.clone())),
             manifest_ensure_executor: Arc::new(DockerManifestEnsureExecutor::new()),
+            manifest_app_task_executor: Arc::new(DockerManifestAppTaskExecutor::new()),
             setup_adopt_executor: Arc::new(DockerSetupAdoptExecutor::new(state_dir.clone())),
             doctor_executor: Arc::new(DockerDoctorExecutor::new()),
             setup_reconcile_executor: Arc::new(DockerSetupReconcileExecutor::new()),
@@ -4763,6 +5281,14 @@ impl Service {
         executor: Arc<dyn ManifestEnsureExecutor>,
     ) -> Self {
         self.manifest_ensure_executor = executor;
+        self
+    }
+    /// Substitute the complete semantic manifest app-task executor for tests.
+    pub fn with_manifest_app_task_executor(
+        mut self,
+        executor: Arc<dyn ManifestAppTaskExecutor>,
+    ) -> Self {
+        self.manifest_app_task_executor = executor;
         self
     }
     pub fn with_setup_adopt_executor(mut self, executor: Arc<dyn SetupAdoptExecutor>) -> Self {
@@ -4823,6 +5349,7 @@ impl Service {
                 app_task: Arc::clone(&self.setup_app_task_executor),
                 ensure: Arc::clone(&self.setup_ensure_executor),
                 manifest_ensure: Arc::clone(&self.manifest_ensure_executor),
+                manifest_app_task: Arc::clone(&self.manifest_app_task_executor),
             },
             job_sender.clone(),
             actor.clone(),
@@ -5513,6 +6040,33 @@ async fn handle(
                     ..Default::default()
                 },
             },
+            23 => match validate_manifest_app_task_request_wire(&r) {
+                Ok(()) => match jobs
+                    .submit_manifest_app_task(ManifestAppTaskJobRequest {
+                        workspace: PathBuf::from(r.workspace),
+                        manifest: r.setup_config,
+                        stack: r.stack,
+                        task_name: r.setup_task_name,
+                        deadline: Duration::from_millis(r.setup_deadline_ms),
+                        output_limit: r.setup_output_limit as usize,
+                    })
+                    .await
+                {
+                    Ok(job_id) => ReplyWire {
+                        code: 40,
+                        job_id,
+                        ..Default::default()
+                    },
+                    Err(_) => ReplyWire {
+                        code: 3,
+                        ..Default::default()
+                    },
+                },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
             11 => match validate_registry_diagnostics_request_wire(&r) {
                 Ok(()) => match actor
                     .resources(r.diagnostic_after, r.diagnostic_limit)
@@ -6043,6 +6597,49 @@ fn validate_manifest_ensure_request_wire(request: &Request) -> Result<(), Error>
     }
     Ok(())
 }
+fn validate_manifest_app_task_wire(
+    workspace: &str,
+    manifest: &str,
+    stack: &str,
+    task_name: &str,
+    deadline_ms: u64,
+    output_limit: u32,
+) -> Result<(), Error> {
+    validate_manifest_ensure_wire(workspace, manifest, stack, deadline_ms, output_limit)?;
+    validate_setup_task_wire(
+        workspace,
+        manifest,
+        SetupPreparePolicy::Refresh,
+        task_name,
+        deadline_ms,
+        output_limit,
+    )
+}
+fn validate_manifest_app_task_request_wire(request: &Request) -> Result<(), Error> {
+    validate_manifest_app_task_wire(
+        &request.workspace,
+        &request.setup_config,
+        &request.stack,
+        &request.setup_task_name,
+        request.setup_deadline_ms,
+        request.setup_output_limit,
+    )?;
+    if !request.digest.is_empty()
+        || request.job_id != 0
+        || request.log_after != 0
+        || request.log_limit != 0
+        || request.setup_policy != 0
+        || request.diagnostic_after != 0
+        || request.diagnostic_limit != 0
+        || !request.gc_candidate_token.is_empty()
+        || request.gc_confirm
+        || request.setup_done_confirm
+        || request.setup_adopt_confirm
+    {
+        return Err(Error::Protocol("nonsemantic manifest app task fields"));
+    }
+    Ok(())
+}
 
 /// The operation reuses the compact private protobuf envelope, but accepts no
 /// legacy job or task fields. Rejecting rather than ignoring these values
@@ -6550,6 +7147,36 @@ mod tests {
     }
 
     #[test]
+    fn manifest_app_task_wire_accepts_only_declared_task_selectors() {
+        let valid = || Request {
+            workspace: "/workspace".into(),
+            setup_config: "bosn.toml".into(),
+            stack: "app_one".into(),
+            setup_task_name: "check-1".into(),
+            setup_deadline_ms: 1,
+            setup_output_limit: 1,
+            ..Request::operation(23)
+        };
+        assert!(validate_manifest_app_task_request_wire(&valid()).is_ok());
+        for invalid in [
+            Request {
+                setup_config: "../bosn.toml".into(),
+                ..valid()
+            },
+            Request {
+                setup_policy: 1,
+                ..valid()
+            },
+            Request {
+                setup_task_name: "shell; id".into(),
+                ..valid()
+            },
+        ] {
+            assert!(validate_manifest_app_task_request_wire(&invalid).is_err());
+        }
+    }
+
+    #[test]
     fn manifest_stack_plan_derives_generation_and_refuses_unsupported_fields() {
         let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
         let workspace = temporary.path().join("workspace");
@@ -6589,6 +7216,43 @@ mod tests {
                     deadline: Duration::from_secs(1),
                     output_limit: 64,
                 }))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn manifest_app_task_plan_retains_only_a_task_from_its_selected_stack() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let image = format!("example.invalid/app@sha256:{}", "a".repeat(64));
+        std::fs::write(workspace.join("bosn.toml"), format!(
+            "[stack.app]\nimage='{image}'\n[stack.other]\nimage='{image}'\n[task.check]\nstack='app'\ncmd='printf ok'\n[task.foreign]\nstack='other'\ncmd='printf no'\n"
+        )).unwrap();
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let request = ManifestAppTaskJobRequest {
+            workspace: workspace.clone(),
+            manifest: "bosn.toml".into(),
+            stack: "app".into(),
+            task_name: "check".into(),
+            deadline: Duration::from_secs(1),
+            output_limit: 64,
+        };
+        let (plan, _) = runtime
+            .run(manifest_stack_task_setup_plan(&request))
+            .unwrap();
+        assert_eq!(plan.task_names, ["check"]);
+        assert_eq!(plan.tasks["check"].command, "printf ok");
+        let foreign = ManifestAppTaskJobRequest {
+            task_name: "foreign".into(),
+            ..request
+        };
+        assert!(
+            runtime
+                .run(manifest_stack_task_setup_plan(&foreign))
                 .is_err()
         );
     }
@@ -7064,6 +7728,36 @@ mod tests {
                     .map_err(|_| "fake log consumer closed".to_owned())?;
                 session.finish("succeeded").await?;
                 Ok("fake app task complete".into())
+            })
+        }
+    }
+
+    struct FakeManifestAppTaskExecutor {
+        observed: Mutex<Vec<ManifestAppTaskJobRequest>>,
+    }
+    impl FakeManifestAppTaskExecutor {
+        fn new() -> Self {
+            Self {
+                observed: Mutex::new(Vec::new()),
+            }
+        }
+    }
+    impl ManifestAppTaskExecutor for FakeManifestAppTaskExecutor {
+        fn execute<'a>(
+            &'a self,
+            request: ManifestAppTaskJobRequest,
+            _cancellation: &'a async_engine::CancellationToken,
+            logs: &'a async_engine::Sender<String>,
+            session: &'a dyn ManifestAppTaskSessionRecorder,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.observed.lock().unwrap().push(request.clone());
+                session.begin("bosn-setup-manifest-identity".into()).await?;
+                logs.send("[fake] manifest declared task executed".into())
+                    .await
+                    .map_err(|_| "fake log consumer closed".to_owned())?;
+                session.finish("succeeded").await?;
+                Ok("fake manifest app task complete".into())
             })
         }
     }
@@ -7551,6 +8245,57 @@ mod tests {
     }
 
     #[test]
+    fn manifest_app_task_is_prompt_typed_and_clears_its_durable_session() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let fake = Arc::new(FakeManifestAppTaskExecutor::new());
+        RuntimeBuilder::multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let server = async_engine::launch(
+                    Service::new(state.clone())
+                        .with_manifest_app_task_executor(fake.clone())
+                        .serve(),
+                );
+                let client = wait_for_client(&state).await;
+                let request = ManifestAppTaskJobRequest {
+                    workspace,
+                    manifest: "bosn.toml".into(),
+                    stack: "app".into(),
+                    task_name: "check".into(),
+                    deadline: Duration::from_secs(2),
+                    output_limit: 4096,
+                };
+                let first = client
+                    .submit_manifest_app_task(request.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    first,
+                    client.submit_manifest_app_task(request).await.unwrap()
+                );
+                wait_for_job_state(&client, first, "Succeeded").await;
+                assert_eq!(fake.observed.lock().unwrap().len(), 1);
+                assert_eq!(client.status().await.unwrap().sessions, 0);
+                assert!(
+                    client
+                        .job_logs(first, 0, 8)
+                        .await
+                        .unwrap()
+                        .records
+                        .iter()
+                        .any(|record| record.line.contains("manifest app task"))
+                );
+                client.shutdown().await.unwrap();
+                stopped(server).await;
+            });
+    }
+
+    #[test]
     fn uncertain_app_task_uses_verified_managed_receipt_identity_to_protect_gc() {
         let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
         let state = temporary.path().join("state");
@@ -7620,6 +8365,68 @@ mod tests {
         let eligible = registry.setup_gc_preview("/workspace", 0, 16).unwrap();
         assert_eq!(eligible.candidates.items.len(), 1);
         assert_eq!(eligible.candidates.items[0].id, resource_id);
+    }
+
+    #[test]
+    fn uncertain_manifest_app_task_session_protects_matching_manifest_container() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let database = temporary.path().join("registry.sqlite3");
+        let mut registry =
+            Registry::create_writer(&database, "11111111-2222-4333-8444-555555555555").unwrap();
+        let generation = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let name = "bosn-setup-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let id = "setup-container:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut transaction = registry.begin_immediate().unwrap();
+        transaction
+            .put_resource(&Resource {
+                id: id.into(),
+                kind: ResourceKind::Container,
+                name: name.into(),
+                stack: "setup".into(),
+                generation: generation.into(),
+                scope: Scope::Machine,
+                workspace: "/workspace".into(),
+                created_at: 1.0,
+                last_used: 1.0,
+                state: ResourceState::Retired,
+                retention: Retention::Pinned,
+            })
+            .unwrap();
+        transaction
+            .put_resource_use(&ResourceUse {
+                resource_id: id.into(),
+                workspace: "/workspace".into(),
+                stack: "setup".into(),
+                generation: generation.into(),
+                last_used: 1.0,
+                state: ResourceState::Retired,
+            })
+            .unwrap();
+        transaction.commit().unwrap();
+        record_manifest_app_task_session(&mut registry, 8, name).unwrap();
+        finish_manifest_app_task_session(&mut registry, 8, "uncertain").unwrap();
+        assert_eq!(
+            registry.execution_sessions(0, 1).unwrap().items[0].container_id,
+            name
+        );
+        assert!(
+            registry
+                .setup_gc_preview("/workspace", 0, 16)
+                .unwrap()
+                .candidates
+                .items
+                .is_empty()
+        );
+        finish_manifest_app_task_session(&mut registry, 8, "failed").unwrap();
+        assert_eq!(
+            registry
+                .setup_gc_preview("/workspace", 0, 16)
+                .unwrap()
+                .candidates
+                .items
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -8731,6 +9538,7 @@ mod tests {
                         app_task: Arc::new(FakeSetupAppTaskExecutor::new()),
                         ensure: fake,
                         manifest_ensure: Arc::new(DockerManifestEnsureExecutor::new()),
+                        manifest_app_task: Arc::new(DockerManifestAppTaskExecutor::new()),
                     },
                     job_sender.clone(),
                     registry_handle.clone(),
