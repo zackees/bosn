@@ -1580,6 +1580,28 @@ fn creates_stable_id_and_excludes_a_second_writer_while_readers_work() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn writer_fence_is_shared_with_a_symlinked_database_alias() {
+    let (directory, path) = database_path();
+    let registry = Registry::create_writer(&path, "11111111-2222-4333-8444-555555555555").unwrap();
+    let alias = directory.path().join("registry-alias.sqlite3");
+    std::os::unix::fs::symlink(&path, &alias).unwrap();
+
+    assert!(matches!(
+        Registry::open_writer(&alias),
+        Err(Error::WriterAlreadyHeld(ref reported)) if reported == &alias
+    ));
+    drop(registry);
+    assert_eq!(
+        Registry::open_writer(&alias)
+            .unwrap()
+            .registry_id()
+            .unwrap(),
+        "11111111-2222-4333-8444-555555555555"
+    );
+}
+
 #[test]
 fn resource_identity_conflict_preserves_dependents_and_delete_cascades() {
     let (_directory, path) = database_path();

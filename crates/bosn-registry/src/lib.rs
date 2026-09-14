@@ -1461,6 +1461,47 @@ fn optional_value(value: Option<f64>) -> Value {
     value.map_or(Value::Null, Value::Real)
 }
 
+/// The daemon writer fence must not lock the SQLite database itself: macOS
+/// treats that advisory lock as contention with SQLite's internal locks.  A
+/// private sibling retains the one-writer fence without participating in the
+/// database engine's locking protocol.  Canonicalizing the existing database
+/// first ensures relative and parent-directory aliases select that same
+/// sibling lock.
+fn writer_lock_path(database: &Path) -> Result<PathBuf, Error> {
+    let database = std::fs::canonicalize(database)?;
+    let name = database.file_name().ok_or_else(|| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "registry database has no file name",
+        ))
+    })?;
+    let mut lock_name = name.to_os_string();
+    lock_name.push(".writer.lock");
+    Ok(database.with_file_name(lock_name))
+}
+
+fn acquire_writer_lock(database: &Path) -> Result<kernal_api::platform::fs::OwnedFileLock, Error> {
+    let lock_path = writer_lock_path(database)?;
+    let file = fs::open_lock_file(&lock_path)?;
+    fs::try_lock_exclusive_owned(file).map_err(|error| {
+        if fs::is_lock_conflict(&error) {
+            Error::WriterAlreadyHeld(database.to_path_buf())
+        } else {
+            Error::Io(error)
+        }
+    })
+}
+
+fn verify_database_identity(
+    path: &Path,
+    expected: Option<kernal_api::platform::fs::FileIdentity>,
+) -> Result<(), Error> {
+    if fs::path_identity(path)? != expected {
+        return Err(Error::ReplacedPath(path.to_path_buf()));
+    }
+    Ok(())
+}
+
 impl Registry {
     /// Opens a fully initialized v5 registry for its sole writer.  The lock is
     /// held for the Registry lifetime, including any caller-held immediate tx.
@@ -1472,25 +1513,13 @@ impl Registry {
         let probe =
             Connection::open_read_only_with_busy_timeout(path, std::time::Duration::from_secs(5))?;
         Self::validate(&probe, path)?;
-        // Lock the database inode itself.  A sibling lock name would allow
-        // relative/symlink aliases to acquire separate locks.
-        let file = fs::open_lock_file(path)?;
-        let writer = fs::try_lock_exclusive_owned(file).map_err(|e| {
-            if fs::is_lock_conflict(&e) {
-                Error::WriterAlreadyHeld(path.to_path_buf())
-            } else {
-                Error::Io(e)
-            }
-        })?;
-        if fs::path_identity(path)? != fs::file_identity(writer.file())? {
-            return Err(Error::ReplacedPath(path.to_path_buf()));
-        }
+        let identity = fs::path_identity(path)?;
+        let writer = acquire_writer_lock(path)?;
+        verify_database_identity(path, identity)?;
         let connection =
             Connection::open_with_busy_timeout(path, std::time::Duration::from_secs(5))?;
         Self::validate(&connection, path)?;
-        if fs::path_identity(path)? != fs::file_identity(writer.file())? {
-            return Err(Error::ReplacedPath(path.to_path_buf()));
-        }
+        verify_database_identity(path, identity)?;
         Ok(Self {
             connection,
             _writer: writer,
@@ -1509,26 +1538,16 @@ impl Registry {
         if meta(&probe, RECONCILIATION_REQUIRED)?.as_deref() != Some("true") {
             return Err(Error::ReconciliationNotRequired);
         }
-        let file = fs::open_lock_file(path)?;
-        let writer = fs::try_lock_exclusive_owned(file).map_err(|e| {
-            if fs::is_lock_conflict(&e) {
-                Error::WriterAlreadyHeld(path.to_path_buf())
-            } else {
-                Error::Io(e)
-            }
-        })?;
-        if fs::path_identity(path)? != fs::file_identity(writer.file())? {
-            return Err(Error::ReplacedPath(path.to_path_buf()));
-        }
+        let identity = fs::path_identity(path)?;
+        let writer = acquire_writer_lock(path)?;
+        verify_database_identity(path, identity)?;
         let connection =
             Connection::open_with_busy_timeout(path, std::time::Duration::from_secs(5))?;
         Self::validate_for_reconciliation(&connection, path)?;
         if meta(&connection, RECONCILIATION_REQUIRED)?.as_deref() != Some("true") {
             return Err(Error::ReconciliationNotRequired);
         }
-        if fs::path_identity(path)? != fs::file_identity(writer.file())? {
-            return Err(Error::ReplacedPath(path.to_path_buf()));
-        }
+        verify_database_identity(path, identity)?;
         Ok(Self {
             connection,
             _writer: writer,
@@ -1543,11 +1562,11 @@ impl Registry {
             return Err(Error::BadRow("registry_id"));
         }
         let path = path.as_ref();
-        let file = fs::create_private_file(path)?;
-        let writer = fs::try_lock_exclusive_owned(file).map_err(Error::Io)?;
-        if fs::path_identity(path)? != fs::file_identity(writer.file())? {
-            return Err(Error::ReplacedPath(path.to_path_buf()));
-        }
+        let database = fs::create_private_file(path)?;
+        let identity = fs::file_identity(&database)?;
+        drop(database);
+        let writer = acquire_writer_lock(path)?;
+        verify_database_identity(path, identity)?;
         let mut connection =
             Connection::open_with_busy_timeout(path, std::time::Duration::from_secs(5))?;
         let mut transaction = connection.begin_immediate()?;
@@ -1564,9 +1583,7 @@ impl Registry {
             ],
         )?;
         transaction.commit()?;
-        if fs::path_identity(path)? != fs::file_identity(writer.file())? {
-            return Err(Error::ReplacedPath(path.to_path_buf()));
-        }
+        verify_database_identity(path, identity)?;
         Ok(Self {
             connection,
             _writer: writer,
