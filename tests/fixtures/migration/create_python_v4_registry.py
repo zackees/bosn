@@ -18,6 +18,10 @@ WORKSPACE_A = "/synthetic/workspace-a"
 WORKSPACE_B = "/synthetic/workspace-b"
 GENERATION_OLD = "sha256:" + "a" * 64
 GENERATION_CURRENT = "sha256:" + "b" * 64
+# Deliberately impossible normal user-process owner. The native importer must
+# prove the fixture's retained lease/session is no longer live before it can
+# create a reconciliation-gated destination.
+EXITED_OWNER_PID = 2_147_483_647
 
 SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -146,11 +150,26 @@ def create(destination: Path) -> None:
         )
         connection.execute(
             "INSERT INTO leases VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("lease-active", "image-shared", 4242, 123.5, 1100.0, 1102.0, 900.0),
+            (
+                "lease-active",
+                "image-shared",
+                EXITED_OWNER_PID,
+                123.5,
+                1100.0,
+                1102.0,
+                900.0,
+            ),
         )
         connection.execute(
             "INSERT INTO execution_sessions VALUES (?, ?, ?, ?, ?, ?)",
-            ("session-build-01", "container-engine-abc", "docker", 4242, 123.5, '["lease-active"]'),
+            (
+                "session-build-01",
+                "container-engine-abc",
+                "docker",
+                EXITED_OWNER_PID,
+                123.5,
+                '["lease-active"]',
+            ),
         )
         connection.execute(
             "INSERT INTO volume_creation_intents VALUES (?, ?, ?, ?, ?, ?)",

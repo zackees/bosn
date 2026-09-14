@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -77,3 +78,79 @@ def test_python_v4_registry_fixture_covers_import_relationships(tmp_path: Path) 
             )
         assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_native_cli_imports_the_complete_v4_fixture_without_changing_source(
+    tmp_path: Path,
+) -> None:
+    """Exercise the actual offline product command, not a test-only SQLite path."""
+    legacy = tmp_path / "legacy"
+    destination = tmp_path / "native"
+    legacy.mkdir(mode=0o700)
+    destination.mkdir(mode=0o700)
+    os.chmod(legacy, 0o700)
+    os.chmod(destination, 0o700)
+    source = legacy / "registry.sqlite3"
+    subprocess.run([sys.executable, str(FIXTURE), str(source)], check=True)
+    marker = legacy / "rust-cutover-v1.json"
+    marker.write_text(
+        '{"protocol":1,"registry_id":"11111111-2222-4333-8444-555555555555"}',
+        encoding="utf-8",
+    )
+    os.chmod(marker, 0o600)
+    source_before = source.read_bytes()
+    command = [
+        "soldr",
+        "cargo",
+        "run",
+        "-j1",
+        "-p",
+        "bosn-service",
+        "--bin",
+        "bosn",
+        "--locked",
+        "--",
+        "registry",
+        "import-v4",
+        "--legacy-state-dir",
+        str(legacy),
+        "--state-dir",
+        str(destination),
+        "--yes",
+        "--json",
+    ]
+    completed = subprocess.run(command, check=True, text=True, capture_output=True)
+    receipt = json.loads(completed.stdout.splitlines()[-1])
+    assert receipt == {
+        "action": "registry_import_v4",
+        "reconciliation_required": True,
+        "registry_id": "11111111-2222-4333-8444-555555555555",
+        "source_preserved": True,
+        "table_counts": {
+            "events": 1,
+            "execution_sessions": 1,
+            "generations": 2,
+            "leases": 1,
+            "meta": 2,
+            "resource_uses": 3,
+            "resources": 3,
+            "volume_creation_intents": 1,
+        },
+    }
+    assert source.read_bytes() == source_before
+    with sqlite3.connect(destination / "registry.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone() == ("5",)
+        assert connection.execute(
+            "SELECT value FROM meta WHERE key='migration.reconciliation_required'"
+        ).fetchone() == ("true",)
+        assert connection.execute(
+            "SELECT id,name,retention FROM resources WHERE id='volume-pinned'"
+        ).fetchone() == ("volume-pinned", "bosn-synthetic-guest-disk", "pinned")
+    repeated = subprocess.run(command, text=True, capture_output=True)
+    assert repeated.returncode != 0
+    assert json.loads(repeated.stdout) == {
+        "action": "registry_import_v4",
+        "error": "cutover refused",
+    }
