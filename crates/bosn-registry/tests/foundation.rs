@@ -633,6 +633,13 @@ fn manifest_generation_rollover_is_workspace_stack_scoped_and_keeps_sessions_pro
             "sha256:new",
         ),
         (
+            "manifest-guest:app:old",
+            "bosn-setup-guest-old",
+            workspace_a,
+            "app",
+            "sha256:old-guest",
+        ),
+        (
             "manifest-container:app:other-workspace",
             "bosn-setup-other-workspace",
             workspace_b,
@@ -687,6 +694,15 @@ fn manifest_generation_rollover_is_workspace_stack_scoped_and_keeps_sessions_pro
         lease_ids: vec![],
     })
     .unwrap();
+    tx.put_execution_session(&ExecutionSession {
+        id: "uncertain-manifest-guest".into(),
+        container_id: "bosn-setup-guest-old".into(),
+        engine_binary: "docker".into(),
+        client_pid: 2,
+        client_start: None,
+        lease_ids: vec![],
+    })
+    .unwrap();
     tx.retire_prior_manifest_container_generations(workspace_a, "app", "sha256:new")
         .unwrap();
     tx.commit().unwrap();
@@ -700,6 +716,7 @@ fn manifest_generation_rollover_is_workspace_stack_scoped_and_keeps_sessions_pro
             .state
     };
     assert_eq!(state("manifest-container:app:old"), ResourceState::Retired);
+    assert_eq!(state("manifest-guest:app:old"), ResourceState::Retired);
     assert_eq!(state("manifest-container:app:new"), ResourceState::Active);
     assert_eq!(
         state("manifest-container:app:other-workspace"),
@@ -720,10 +737,10 @@ fn manifest_generation_rollover_is_workspace_stack_scoped_and_keeps_sessions_pro
     );
     // A rollover is registry-only. The uncertain task session survives and
     // keeps the retired generation out of conservative GC until cleared.
-    assert_eq!(registry.status().unwrap().sessions, 1);
+    assert_eq!(registry.status().unwrap().sessions, 2);
     let protected = registry.setup_gc_preview(workspace_a, 0, 16).unwrap();
     assert!(protected.candidates.items.is_empty());
-    assert_eq!(protected.counts.protected_session, 1);
+    assert_eq!(protected.counts.protected_session, 2);
 }
 
 #[test]

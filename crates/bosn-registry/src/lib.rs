@@ -1065,7 +1065,7 @@ impl<'a> Immediate<'a> {
              AND resource_id IN ( \
                 SELECT id FROM resources \
                 WHERE kind=? AND stack=? AND workspace=? AND generation<>? \
-                  AND state=? AND id GLOB 'manifest-container:*' \
+                  AND state=? AND (id GLOB 'manifest-container:*' OR id GLOB 'manifest-guest:*') \
                   AND NOT EXISTS ( \
                     SELECT 1 FROM resource_uses AS other \
                     WHERE other.resource_id=resources.id AND other.state=? \
@@ -1091,7 +1091,7 @@ impl<'a> Immediate<'a> {
         self.transaction.execute(
             "UPDATE resources SET state=? \
              WHERE kind=? AND stack=? AND workspace=? AND generation<>? \
-               AND state=? AND id GLOB 'manifest-container:*' \
+               AND state=? AND (id GLOB 'manifest-container:*' OR id GLOB 'manifest-guest:*') \
                AND NOT EXISTS ( \
                  SELECT 1 FROM resource_uses AS other \
                  WHERE other.resource_id=resources.id AND other.state=? \
@@ -1896,7 +1896,7 @@ fn setup_gc_preview(
         WHERE r.kind='container' AND r.workspace=? \
           AND r.state='retired' AND r.scope='machine' \
           AND ((r.stack='setup' AND r.id GLOB 'setup-container:*') \
-               OR r.id GLOB 'manifest-container:*') \
+               OR r.id GLOB 'manifest-container:*' OR r.id GLOB 'manifest-guest:*') \
           AND r.name GLOB 'bosn-setup-*' \
           AND EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id \
              AND u.workspace=? AND u.stack=r.stack AND u.state='retired') \
@@ -1961,7 +1961,7 @@ fn setup_gc_preview(
         }
     };
     let managed = "r.scope='machine' AND r.name GLOB 'bosn-setup-*' AND \
-        ((r.stack='setup' AND r.id GLOB 'setup-container:*') OR r.id GLOB 'manifest-container:*')";
+        ((r.stack='setup' AND r.id GLOB 'setup-container:*') OR r.id GLOB 'manifest-container:*' OR r.id GLOB 'manifest-guest:*')";
     let counts = SetupGcPreviewCounts {
         protected_not_retired: count(&format!("{managed} AND r.state<>'retired'"))?,
         protected_ambiguous_use: count(&format!(
@@ -2010,7 +2010,7 @@ fn setup_gc_candidate_exists(
          AND r.kind='container' AND r.workspace=? \
          AND r.state='retired' AND r.scope='machine' \
          AND ((r.stack='setup' AND r.id GLOB 'setup-container:*') \
-              OR r.id GLOB 'manifest-container:*') \
+              OR r.id GLOB 'manifest-container:*' OR r.id GLOB 'manifest-guest:*') \
          AND r.name GLOB 'bosn-setup-*' \
          AND EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id \
             AND u.workspace=? AND u.stack=r.stack AND u.state='retired') \

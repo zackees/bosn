@@ -65,7 +65,7 @@ changed.
 | One explicitly named stack | Supported |
 | Named `[task.NAME]` for that stack in an already ensured container | Supported; fixed daemon-owned exec only |
 | `dockerfile = 'Dockerfile'` build context | Supported for the selected workspace-root Dockerfile. The daemon collects the finite Docker-selected `COPY`/`ADD` context through `kernal-api`, refuses selected symlinks, special files, empty selected directories, traversal, unbounded assets, alternate Dockerfile locations, and a simultaneous `image`. It copies exact observed regular-file bytes to an owner-private content-addressed setup asset tree before the typed build primitive invokes Docker; Docker never receives the workspace as its build context. Every external Dockerfile image must itself be digest-pinned. |
-| macOS guest / guest fields | Refused |
+| `kind = 'macos-x64-guest'` with explicit license acknowledgement | Supported only for `dockurr/macos` and Docker Hub aliases (`docker.io`, `index.docker.io`, `registry-1.docker.io`) pinned by a lowercase 64-hex `sha256` digest, with exactly `[stack.NAME.volumes.storage]` declared as `scope = 'machine'`, `destination = '/storage'`, and `retention = 'pinned'`. This prevents an ephemeral VM disk and prevents the fixed KVM/tun create shape from executing a manifest-selected privileged image. On Linux, kernal-api must report both `/dev/kvm` and `/dev/net/tun`. Bosn emits only the fixed dockurr KVM/tun/NET_ADMIN, loopback SSH/web-port, 120-second stop timeout, and sizing shape; it never accepts raw privilege/device/port arguments. The durable container resource uses the `manifest-guest:` namespace and rolls over conservatively like a manifest container. |
 | named `[stack.NAME.volumes]` | Supported for typed Bosn-managed named volumes. The daemon derives the engine name from the declared logical name, scope, canonical workspace, and (for `spec`) generation; callers cannot supply a Docker volume name or mount string. It writes a durable creation intent before `docker volume create`, requires exact ownership labels before reuse, then atomically records the resource and consumes the intent after container ensure. `spec` rolls with generation; `stack` survives generations within its workspace; `machine` follows the declared `family` or stack. Normal rollover and GC never delete volume data in this slice; retention is recorded for later explicit lifecycle work. |
 | `tmpfs` | Supported only as an array of normalized legacy strings: `/target`, `/target:ro`, `/target:rw`, with an optional one `size=POSITIVE{b,k,m,g}` option (for example `/run/cache:rw,size=64m`). The daemon parses those into typed target/mode/size values before its engine seam, incorporates the declaration into the runtime generation, and emits only its own finite `--tmpfs` form. Repeated modes/sizes and all other options (`noexec`, `mode`, `uid`, etc.) are refused rather than passed through. tmpfs is disposable container state; a generation rollover creates a new empty tmpfs. |
 | `[stack.NAME.mounts]` workspace bind mounts | Supported for existing paths that canonicalize beneath the selected workspace. Sources may be legacy absolute paths only when they resolve beneath that workspace; traversal, source symlinks, escapes, duplicate targets, reserved targets, and unrepresentable Docker paths are refused. `readonly` is retained. |
@@ -74,6 +74,14 @@ changed.
 | generic `run`, shell, arbitrary Docker arguments | Not exposed |
 | multi-stack orchestration | Refused; submit one named stack only |
 | replacement/rollover | Supported for this accepted subset; a new immutable generation is ensured first, then only the same-workspace/stack prior manifest container is registry-retired |
+
+`manifest app-task` deliberately refuses a macOS guest. Legacy guest work is
+transported through SSH/SCP rather than `docker exec`; native Bosn does not yet
+have a typed SSH/SCP task primitive with equivalent cancellation and durable
+uncertainty semantics. Likewise guest `workdir` is refused rather than being
+mistaken for the Linux-container workdir. This keeps the implemented guest
+slice real (the actual KVM VM lifecycle and durable accounting), without
+pretending the Linux app-task transport reaches inside the VM.
 
 The deterministic engine container is still checked against its exact derived
 image and labels before reuse. An occupied mismatched candidate fails closed.
@@ -90,7 +98,7 @@ same mount sources again immediately before its engine operation.
 This does not claim completion of manifest migration. Future slices must add
 explicit volume release/GC application, broader Dockerfile forms (alternate
 Dockerfile paths plus selected symlink and empty-directory representation),
-multi-stack dependency ordering, guest lifecycle, declarative tasks,
+multi-stack dependency ordering, guest SSH/SCP task lifecycle, declarative tasks,
 autostart/recovery, and generation reconciliation. Each must
 remain daemon-owned and registry-backed rather than reintroducing raw Docker or
 Python business logic.

@@ -20,9 +20,10 @@ use bosn_setup::PreparedImageKind;
 use bosn_setup::{
     ManifestBuildFile, PreparedImage, SetupAcquirePolicy, SetupAppTaskRequest, SetupAssetStore,
     SetupEnsureEngine, SetupEnsureRequest as CoreSetupEnsureRequest, SetupEnsureResult,
-    SetupImageEngine, SetupNamedVolume, SetupPlan, SetupPlanAppSource, SetupPlanRequest,
-    SetupTaskRequest, SetupTmpfs, SetupTmpfsSize, SetupTmpfsSizeUnit, adopt_setup_app,
-    ensure_setup_app, execute_setup_app_task, execute_setup_task, plan_setup, prepare_setup_image,
+    SetupImageEngine, SetupMacosGuest, SetupNamedVolume, SetupPlan, SetupPlanAppSource,
+    SetupPlanRequest, SetupTaskRequest, SetupTmpfs, SetupTmpfsSize, SetupTmpfsSizeUnit,
+    adopt_setup_app, ensure_setup_app, execute_setup_app_task, execute_setup_task, plan_setup,
+    prepare_setup_image,
 };
 use jobs::{Jobs, Submission};
 use kernal_api::{
@@ -32,7 +33,7 @@ use kernal_api::{
     },
     hash::Sha256Hasher,
     platform::{
-        fs,
+        fs, host,
         ipc::{self, AsyncListener, AsyncStream, Endpoint, EndpointAddressCandidates},
     },
 };
@@ -689,6 +690,7 @@ impl ManifestEnsureExecutor for DockerManifestEnsureExecutor {
                 plan,
                 generation,
                 volumes,
+                is_guest,
             } = runtime;
             let (events, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
             let forwarded_logs = logs.clone();
@@ -722,11 +724,22 @@ impl ManifestEnsureExecutor for DockerManifestEnsureExecutor {
             let workspace = plan.workspace_root.to_string_lossy().into_owned();
             Ok(SetupEnsureExecution {
                 receipt: format!(
-                    "ensured manifest stack {} as {}",
-                    request.stack, result.ensured.container_name
+                    "ensured manifest {} {} as {}",
+                    if is_guest { "guest" } else { "stack" },
+                    request.stack,
+                    result.ensured.container_name
                 ),
                 resource: SetupEnsureResource {
-                    id: format!("manifest-container:{}:{}", request.stack, generation),
+                    id: format!(
+                        "{}:{}:{}",
+                        if is_guest {
+                            "manifest-guest"
+                        } else {
+                            "manifest-container"
+                        },
+                        request.stack,
+                        generation
+                    ),
                     name: result.ensured.container_name,
                     stack: request.stack.clone(),
                     generation: generation.clone(),
@@ -991,9 +1004,8 @@ async fn manifest_stack_plan(
     let stack = manifest
         .stack(request_stack)
         .map_err(|_| "selected manifest stack does not exist".to_owned())?;
-    if stack.kind.is_some() || stack.guest.is_some() {
-        return Err("selected manifest stack uses an unsupported runtime field".into());
-    }
+    let macos_guest =
+        derive_manifest_macos_guest(stack, task_name, &observe_manifest_guest_host_capability())?;
     if stack.env.len() > bosn_core::MAX_ENVIRONMENT_ENTRIES
         || stack.env.iter().any(|(key, value)| {
             key.is_empty()
@@ -1065,6 +1077,7 @@ async fn manifest_stack_plan(
         workdir.as_deref(),
         &stack.volumes,
         &tmpfs,
+        macos_guest.as_ref(),
     );
     let content_sha256 = generation
         .strip_prefix("sha256:")
@@ -1122,6 +1135,15 @@ async fn manifest_stack_plan(
     let task_names = tasks.keys().cloned().collect();
     let workspace_string = workspace.to_string_lossy().into_owned();
     let volumes = manifest_named_volumes(stack, &workspace_string, &generation)?;
+    let mut macos_guest = macos_guest;
+    if let Some(guest) = &mut macos_guest {
+        guest.storage_volume = volumes
+            .iter()
+            .find(|volume| volume.target == "/storage")
+            .expect("validated macOS guest storage volume is materialized")
+            .name
+            .clone();
+    }
     let app = SetupApp {
         source,
         environment: stack.env.clone(),
@@ -1149,9 +1171,11 @@ async fn manifest_stack_plan(
                 })
                 .collect(),
             tmpfs,
+            macos_guest,
         },
         generation,
         volumes,
+        is_guest: stack.kind.as_deref() == Some("macos-x64-guest"),
     })
 }
 
@@ -1160,6 +1184,128 @@ struct ManifestRuntimePlan {
     plan: SetupPlan,
     generation: String,
     volumes: Vec<ManifestVolumeResource>,
+    is_guest: bool,
+}
+
+/// Read-only guest host facts composed from kernal-api's existing host and
+/// filesystem facades. Bosn owns the product policy over those facts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManifestGuestHostCapability {
+    os: &'static str,
+    kvm_available: bool,
+    tun_available: bool,
+}
+
+fn observe_manifest_guest_host_capability() -> ManifestGuestHostCapability {
+    let os = host::process_target().os;
+    let device_available = |path: &str| {
+        fs::context_path_metadata_no_follow(Path::new(path))
+            .is_ok_and(|metadata| metadata.kind == fs::ContextPathKind::Other)
+    };
+    ManifestGuestHostCapability {
+        os,
+        kvm_available: os == "linux" && device_available("/dev/kvm"),
+        tun_available: os == "linux" && device_available("/dev/net/tun"),
+    }
+}
+
+/// Translate the one legacy guest kind into the finite setup representation.
+/// Host observation remains separate from product policy so tests can prove
+/// the refusal/default rules without a KVM host.
+fn derive_manifest_macos_guest(
+    stack: &bosn_core::manifest::Stack,
+    task_name: Option<&str>,
+    capability: &ManifestGuestHostCapability,
+) -> Result<Option<SetupMacosGuest>, String> {
+    let (kind, guest) = (&stack.kind, &stack.guest);
+    if kind.is_none() && guest.is_none() {
+        return Ok(None);
+    }
+    let (Some(kind), Some(guest)) = (kind.as_deref(), guest) else {
+        return Err("selected manifest stack uses an unsupported runtime field".into());
+    };
+    if kind != "macos-x64-guest" {
+        return Err("selected manifest stack uses an unsupported runtime field".into());
+    }
+    if !stack
+        .image
+        .as_deref()
+        .is_some_and(valid_manifest_macos_guest_image)
+    {
+        return Err(
+            "macOS guest must use dockurr/macos (or a Docker Hub registry alias) pinned by sha256 digest"
+                .into(),
+        );
+    }
+    if stack.dockerfile.is_some() {
+        return Err(
+            "macOS guest stack must use an immutable guest image, not Dockerfile build".into(),
+        );
+    }
+    if stack.workdir.is_some() {
+        return Err(
+            "macOS guest workdir requires the native SSH task transport, which is not implemented"
+                .into(),
+        );
+    }
+    if task_name.is_some() {
+        return Err(
+            "macOS guest tasks require the native SSH task transport, which is not implemented"
+                .into(),
+        );
+    }
+    validate_manifest_macos_guest_storage(stack)?;
+    if [
+        guest.version.as_str(),
+        guest.ram_size.as_str(),
+        guest.disk_size.as_str(),
+    ]
+    .into_iter()
+    .any(|value| value.is_empty() || value.len() > 128 || value.contains(['\0', '\n', '\r', '=']))
+    {
+        return Err("macOS guest sizing fields are unsafe".into());
+    }
+    if capability.os != "linux" || !capability.kvm_available || !capability.tun_available {
+        return Err("macOS guest requires a Linux host with /dev/kvm and /dev/net/tun available to the Bosn daemon".into());
+    }
+    // The legacy runtime used a CPU-vendor probe only to choose a default and
+    // took the one-core path on AMD. Without a dedicated kernel CPU-vendor
+    // capability, one core is the safe portable default; explicit manifests
+    // retain their declared finite CPU count.
+    let cpu_cores = guest.cpu_cores.unwrap_or(1);
+    let cpu_cores = u16::try_from(cpu_cores)
+        .map_err(|_| "macOS guest cpu_cores exceeds native limit".to_owned())?;
+    Ok(Some(SetupMacosGuest {
+        ssh_port: u16::try_from(guest.ssh_port)
+            .map_err(|_| "macOS guest ssh port is invalid".to_owned())?,
+        web_port: u16::try_from(guest.web_port)
+            .map_err(|_| "macOS guest web port is invalid".to_owned())?,
+        version: guest.version.clone(),
+        ram_size: guest.ram_size.clone(),
+        disk_size: guest.disk_size.clone(),
+        cpu_cores,
+        storage_volume: String::new(),
+        storage_scope: Scope::Machine,
+        storage_retention: Retention::Pinned,
+    }))
+}
+
+fn validate_manifest_macos_guest_storage(stack: &bosn_core::manifest::Stack) -> Result<(), String> {
+    let storage = stack
+        .volumes
+        .iter()
+        .filter(|volume| volume.mount_at() == "/storage")
+        .collect::<Vec<_>>();
+    let [storage] = storage.as_slice() else {
+        return Err("macOS guest requires exactly one declared durable `storage` volume mounted at /storage".into());
+    };
+    if storage.name != "storage"
+        || storage.scope != Scope::Machine
+        || storage.retention != Retention::Pinned
+    {
+        return Err("macOS guest storage must be named `storage` with scope = `machine`, destination = `/storage`, and retention = `pinned`".into());
+    }
+    Ok(())
 }
 
 /// One immutable, already-selected Docker build context.  It carries bytes
@@ -1562,6 +1708,7 @@ fn manifest_runtime_generation(
     workdir: Option<&str>,
     volumes: &[bosn_core::manifest::Volume],
     tmpfs: &[SetupTmpfs],
+    macos_guest: Option<&SetupMacosGuest>,
 ) -> String {
     let mut hasher = Sha256Hasher::new();
     manifest_generation_field(&mut hasher, b"bosn-manifest-runtime-v1");
@@ -1607,6 +1754,18 @@ fn manifest_runtime_generation(
             manifest_generation_field(&mut hasher, b"no-size");
         }
     }
+    match macos_guest {
+        None => manifest_generation_field(&mut hasher, b"macos-guest:none"),
+        Some(guest) => {
+            manifest_generation_field(&mut hasher, b"macos-guest:v1");
+            manifest_generation_field(&mut hasher, &guest.ssh_port.to_be_bytes());
+            manifest_generation_field(&mut hasher, &guest.web_port.to_be_bytes());
+            manifest_generation_field(&mut hasher, guest.version.as_bytes());
+            manifest_generation_field(&mut hasher, guest.ram_size.as_bytes());
+            manifest_generation_field(&mut hasher, guest.disk_size.as_bytes());
+            manifest_generation_field(&mut hasher, &guest.cpu_cores.to_be_bytes());
+        }
+    }
     format!("sha256:{}", hasher.finalize())
 }
 
@@ -1639,6 +1798,34 @@ fn valid_manifest_pinned_image(value: &str) -> bool {
         && digest
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Permit only Docker Hub spellings for dockurr's macOS entrypoint image. An
+/// explicit final-component tag remains acceptable because the sha256 digest
+/// is the identity; a registry port is not mistaken for a tag.
+fn valid_manifest_macos_guest_image(value: &str) -> bool {
+    if !valid_manifest_pinned_image(value) {
+        return false;
+    }
+    let (name, _) = value
+        .rsplit_once("@sha256:")
+        .expect("validated pinned guest image has digest");
+    let repository = if let Some((prefix, final_component)) = name.rsplit_once('/') {
+        if let Some((repository, _tag)) = final_component.split_once(':') {
+            format!("{prefix}/{repository}")
+        } else {
+            name.to_owned()
+        }
+    } else {
+        name.to_owned()
+    };
+    matches!(
+        repository.as_str(),
+        "dockurr/macos"
+            | "docker.io/dockurr/macos"
+            | "index.docker.io/dockurr/macos"
+            | "registry-1.docker.io/dockurr/macos"
+    )
 }
 
 /// Docker-backed restoration. Preparation is deliberately retained because it
@@ -6437,12 +6624,18 @@ async fn stop_setup_retired_candidate(
     if inspect_setup_gc_container(&engine, &candidate).await? != Some(true) {
         return Err(Error::Protocol("setup retired stop candidate changed"));
     }
+    // A macOS guest contains a live VM disk. Its typed create shape installs
+    // a 120-second stop timeout so QEMU can flush; preserving that timeout
+    // here prevents the explicit retired-stop operation from silently
+    // degrading into the normal short-lived setup-app policy.
+    let (stop_seconds, stop_deadline) = if candidate.id.starts_with("manifest-guest:") {
+        ("120", Duration::from_secs(150))
+    } else {
+        ("1", SETUP_GC_ENGINE_DEADLINE)
+    };
     let stopped = engine
-        .with_args(["container", "stop", "--time", "1", &candidate.name])
-        .capture_async(RunOptions::bounded(
-            SETUP_GC_ENGINE_DEADLINE,
-            SETUP_GC_ENGINE_OUTPUT,
-        ))
+        .with_args(["container", "stop", "--time", stop_seconds, &candidate.name])
+        .capture_async(RunOptions::bounded(stop_deadline, SETUP_GC_ENGINE_OUTPUT))
         .await
         .map_err(|_| Error::Protocol("setup retired stop failed"))?;
     if !stopped.ok() {
@@ -7976,6 +8169,84 @@ mod tests {
     }
 
     #[test]
+    fn manifest_macos_guest_preflight_uses_kernel_os_facades_and_conservative_default() {
+        let manifest = parse_manifest_toml(
+            "[stack.mac]\nkind = 'macos-x64-guest'\nacknowledge_macos_license = true\nimage = 'dockurr/macos@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n[stack.mac.volumes.storage]\nscope = 'machine'\ndestination = '/storage'\nretention = 'pinned'\n",
+            ManifestRoots::new("test", "/workspace", "/workspace"),
+        )
+        .unwrap();
+        let stack = manifest.stack("mac").unwrap();
+        let unsupported = ManifestGuestHostCapability {
+            os: "macos",
+            kvm_available: false,
+            tun_available: false,
+        };
+        assert!(derive_manifest_macos_guest(stack, None, &unsupported).is_err());
+        let capable = ManifestGuestHostCapability {
+            os: "linux",
+            kvm_available: true,
+            tun_available: true,
+        };
+        assert_eq!(
+            derive_manifest_macos_guest(stack, None, &capable)
+                .unwrap()
+                .unwrap()
+                .cpu_cores,
+            1
+        );
+        assert!(
+            derive_manifest_macos_guest(stack, Some("test"), &capable)
+                .unwrap_err()
+                .contains("SSH task transport")
+        );
+    }
+
+    #[test]
+    fn manifest_macos_guest_accepts_only_dockurr_digest_and_exact_storage_contract() {
+        let capable = ManifestGuestHostCapability {
+            os: "linux",
+            kvm_available: true,
+            tun_available: true,
+        };
+        let manifest = |body: &str| {
+            parse_manifest_toml(body, ManifestRoots::new("test", "/workspace", "/workspace"))
+                .unwrap()
+        };
+        for image in [
+            "dockurr/macos@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "docker.io/dockurr/macos:latest@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "index.docker.io/dockurr/macos@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "registry-1.docker.io/dockurr/macos@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(valid_manifest_macos_guest_image(image), "{image}");
+        }
+        for image in [
+            "registry.example/dockurr/macos@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "docker.io/evil/macos@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "dockurr/macos@sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ] {
+            assert!(!valid_manifest_macos_guest_image(image), "{image}");
+        }
+
+        let valid = manifest(
+            "[stack.mac]\nkind = 'macos-x64-guest'\nacknowledge_macos_license = true\nimage = 'dockurr/macos@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n[stack.mac.volumes.storage]\nscope = 'machine'\ndestination = '/storage'\nretention = 'pinned'\n",
+        );
+        assert!(derive_manifest_macos_guest(valid.stack("mac").unwrap(), None, &capable).is_ok());
+
+        for body in [
+            "[stack.mac]\nkind = 'macos-x64-guest'\nacknowledge_macos_license = true\nimage = 'example.invalid/macos@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n[stack.mac.volumes.storage]\nscope = 'machine'\ndestination = '/storage'\nretention = 'pinned'\n",
+            "[stack.mac]\nkind = 'macos-x64-guest'\nacknowledge_macos_license = true\nimage = 'dockurr/macos@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n",
+            "[stack.mac]\nkind = 'macos-x64-guest'\nacknowledge_macos_license = true\nimage = 'dockurr/macos@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n[stack.mac.volumes.disk]\nscope = 'machine'\ndestination = '/storage'\nretention = 'pinned'\n",
+            "[stack.mac]\nkind = 'macos-x64-guest'\nacknowledge_macos_license = true\nimage = 'dockurr/macos@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n[stack.mac.volumes.storage]\nscope = 'stack'\ndestination = '/storage'\nretention = 'pinned'\n",
+        ] {
+            let invalid = manifest(body);
+            assert!(
+                derive_manifest_macos_guest(invalid.stack("mac").unwrap(), None, &capable).is_err()
+            );
+        }
+    }
+
+    #[test]
     fn manifest_dockerfile_plan_materializes_one_selected_context_and_rolls_generation() {
         let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
         let state = temporary.path().join("state");
@@ -9393,6 +9664,7 @@ mod tests {
             app_source: bosn_setup::SetupPlanAppSource::PinnedImage { image },
             named_volumes: Vec::new(),
             tmpfs: Vec::new(),
+            macos_guest: None,
         }
     }
     fn command_result(exit_code: i32, stdout: impl Into<Vec<u8>>) -> bosn_engine::CommandResult {
