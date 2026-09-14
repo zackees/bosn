@@ -481,6 +481,12 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
         f"BOSN_MANIFEST_PROOF = '{unique}'\n",
         encoding="utf-8",
     )
+    with manifest.open("a", encoding="utf-8") as handle:
+        handle.write(
+            "[task.prove]\n"
+            "stack = 'linux'\n"
+            f"cmd = \"test \\\"$BOSN_MANIFEST_PROOF\\\" = '{unique}'\"\n"
+        )
     unsupported = workspace / "unsupported.toml"
     unsupported.write_text(
         f"[stack.rejected]\nimage = '{PINNED_MANIFEST_MYSQL}'\nworkdir = '/'\n",
@@ -623,6 +629,33 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
                 ("manifest.ensure.succeeded", f"job_id={first_job}"),
                 ("manifest.ensure.succeeded", f"job_id={second_job}"),
             ]
+            # Manifest app-task accepts only the declared task selector. The
+            # command above is persisted in bosn.toml and proves `exec` sees
+            # the app's declared environment; callers cannot inject a command
+            # or target a container directly.
+            for field in ("command", "container", "docker_args", "image", "mounts"):
+                with pytest.raises(TypeError):
+                    client.submit_manifest_app_task(
+                        workspace,
+                        "bosn.toml",
+                        "linux",
+                        "prove",
+                        deadline_ms=90_000,
+                        output_limit=1_048_576,
+                        **{field: "unsafe"},
+                    )
+            task_job = client.submit_manifest_app_task(
+                workspace,
+                "bosn.toml",
+                "linux",
+                "prove",
+                deadline_ms=90_000,
+                output_limit=1_048_576,
+            )
+            task_logs = _wait_for_success(client, task_job)
+            assert "[manifest-app-task] proving exact managed application ownership" in task_logs
+            assert "[manifest-app-task] running declared task prove" in task_logs
+            assert client.status().sessions == 0
     finally:
         if container_name is not None and content_sha256 is not None:
             _remove_exact_managed_container(container_name, content_sha256)

@@ -6,10 +6,11 @@
 use bosn_core::{parse_and_plan_compose_yaml, parse_setup_config_locator};
 use bosn_service::{
     Client as ServiceClient, DoctorReport as ServiceDoctorReport, JobLogPage as ServiceJobLogPage,
-    JobStatus as ServiceJobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE, ManifestEnsureJobRequest,
-    RegistryResourcePage as ServiceRegistryResourcePage, SetupAdoptRequest, SetupAppTaskJobRequest,
-    SetupDoneResult as ServiceSetupDoneResult, SetupEnsureEventPage as ServiceSetupEnsureEventPage,
-    SetupEnsureJobRequest, SetupGcApplyResult as ServiceSetupGcApplyResult,
+    JobStatus as ServiceJobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE, ManifestAppTaskJobRequest,
+    ManifestEnsureJobRequest, RegistryResourcePage as ServiceRegistryResourcePage,
+    SetupAdoptRequest, SetupAppTaskJobRequest, SetupDoneResult as ServiceSetupDoneResult,
+    SetupEnsureEventPage as ServiceSetupEnsureEventPage, SetupEnsureJobRequest,
+    SetupGcApplyResult as ServiceSetupGcApplyResult,
     SetupGcPreviewPage as ServiceSetupGcPreviewPage, SetupPreparePolicy, SetupPrepareRequest,
     SetupReconcileMissingRepairResult as ServiceSetupReconcileMissingRepairResult,
     SetupReconcilePreviewPage as ServiceSetupReconcilePreviewPage,
@@ -460,6 +461,39 @@ impl Client {
                     workspace,
                     manifest,
                     stack,
+                    deadline: Duration::from_millis(deadline_ms),
+                    output_limit: output_limit as usize,
+                },
+            )
+            .map_err(service_error)
+        })
+    }
+    /// Submit one named task inside an already ensured supported manifest
+    /// stack. The daemon re-reads the declaration and accepts no command or
+    /// container selector from Python.
+    #[pyo3(signature = (workspace, manifest, stack, task_name, *, deadline_ms, output_limit))]
+    #[allow(clippy::too_many_arguments)]
+    fn submit_manifest_app_task(
+        &self,
+        workspace: PathBuf,
+        manifest: String,
+        stack: String,
+        task_name: String,
+        deadline_ms: u64,
+        output_limit: u32,
+        py: Python<'_>,
+    ) -> PyResult<u64> {
+        validate_manifest_ensure_input(&workspace, &manifest, &stack, deadline_ms, output_limit)?;
+        validate_manifest_task_name(&task_name)?;
+        let state_dir = self.state_dir.clone();
+        py.detach(move || {
+            submit_manifest_app_task(
+                &state_dir,
+                ManifestAppTaskJobRequest {
+                    workspace,
+                    manifest,
+                    stack,
+                    task_name,
                     deadline: Duration::from_millis(deadline_ms),
                     output_limit: output_limit as usize,
                 },
@@ -1393,6 +1427,20 @@ fn submit_manifest_ensure(
             .await
     })
 }
+fn submit_manifest_app_task(
+    state_dir: &Path,
+    request: ManifestAppTaskJobRequest,
+) -> Result<u64, bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async {
+        ServiceClient::for_state(state_dir)?
+            .submit_manifest_app_task(request)
+            .await
+    })
+}
 
 fn job_status(state_dir: &Path, job_id: u64) -> Result<ServiceJobStatus, bosn_service::Error> {
     let runtime = RuntimeBuilder::multi_thread()
@@ -1553,6 +1601,19 @@ fn validate_manifest_ensure_input(
         return Err(PyValueError::new_err(
             "output_limit must be between 1 and 8388608",
         ));
+    }
+    Ok(())
+}
+
+fn validate_manifest_task_name(task_name: &str) -> PyResult<()> {
+    if task_name.is_empty()
+        || task_name.len() > 64
+        || !task_name.as_bytes()[0].is_ascii_alphanumeric()
+        || !task_name.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphanumeric() || byte == b'_' || (byte == b'-' && index > 0)
+        })
+    {
+        return Err(PyValueError::new_err("task_name is invalid"));
     }
     Ok(())
 }

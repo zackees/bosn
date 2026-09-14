@@ -16,11 +16,11 @@
 
 use crate::{
     Client, DoctorReport, Error, JobLogPage, JobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE,
-    ManifestEnsureJobRequest, RegistryResourcePage, SetupAdoptRequest, SetupAdoptResult,
-    SetupAppTaskJobRequest, SetupDoneResult, SetupEnsureEventPage, SetupEnsureJobRequest,
-    SetupGcApplyResult, SetupGcPreviewPage, SetupPreparePolicy, SetupPrepareRequest,
-    SetupReconcileMissingRepairResult, SetupReconcilePreviewPage, SetupRetiredStopResult,
-    SetupTaskJobRequest, Status,
+    ManifestAppTaskJobRequest, ManifestEnsureJobRequest, RegistryResourcePage, SetupAdoptRequest,
+    SetupAdoptResult, SetupAppTaskJobRequest, SetupDoneResult, SetupEnsureEventPage,
+    SetupEnsureJobRequest, SetupGcApplyResult, SetupGcPreviewPage, SetupPreparePolicy,
+    SetupPrepareRequest, SetupReconcileMissingRepairResult, SetupReconcilePreviewPage,
+    SetupRetiredStopResult, SetupTaskJobRequest, Status,
 };
 use bosn_core::parse_and_plan_compose_yaml;
 use bosn_setup::{
@@ -151,6 +151,10 @@ trait Backend {
     /// foreign or mismatched candidate rather than replacing it.
     fn submit_setup_ensure(&mut self, request: SetupEnsureJobRequest) -> Result<u64, Error>;
     fn submit_manifest_ensure(&mut self, request: ManifestEnsureJobRequest) -> Result<u64, Error>;
+    fn submit_manifest_app_task(
+        &mut self,
+        request: ManifestAppTaskJobRequest,
+    ) -> Result<u64, Error>;
     /// Submit one complete setup plan, image-preparation, and declared-task
     /// job.  The named task is the only executable selection exposed to MCP;
     /// the daemon derives all task details from the validated setup document.
@@ -263,6 +267,13 @@ impl Backend for DaemonBackend<'_> {
     fn submit_manifest_ensure(&mut self, request: ManifestEnsureJobRequest) -> Result<u64, Error> {
         self.runtime
             .run(self.client.submit_manifest_ensure(request))
+    }
+    fn submit_manifest_app_task(
+        &mut self,
+        request: ManifestAppTaskJobRequest,
+    ) -> Result<u64, Error> {
+        self.runtime
+            .run(self.client.submit_manifest_app_task(request))
     }
     fn submit_setup_task(&mut self, request: SetupTaskJobRequest) -> Result<u64, Error> {
         self.runtime.run(self.client.submit_setup_task(request))
@@ -515,6 +526,12 @@ fn tools_list() -> Value {
                 "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}
             },
             {
+                "name": "bosn_manifest_app_task",
+                "description": "Submit one named task declared by an already ensured supported manifest stack. The daemon re-reads the manifest and proves exact running ownership before fixed exec; commands, containers, Docker arguments, mounts, and environment controls are refused. Cancellation may leave remote completion unknown.",
+                "inputSchema": manifest_app_task_schema(),
+                "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}
+            },
+            {
                 "name": "bosn_setup_task",
                 "description": "Submit one bounded daemon-owned setup plan, image-preparation, and declared-task job. Returns promptly with a durable job ID; poll the existing job tools for outcome and logs. It accepts only a named task declared in the setup document, never task commands or engine controls.",
                 "inputSchema": setup_task_schema(),
@@ -589,6 +606,16 @@ fn manifest_ensure_schema() -> Value {
         "workspace":{"type":"string","minLength":1,"maxLength":MAX_MCP_SETUP_STRING_BYTES},
         "manifest":{"type":"string","minLength":1,"maxLength":4096,"description":"Safe relative TOML path beneath workspace; URLs and absolute paths are refused."},
         "stack":{"type":"string","minLength":1,"maxLength":128},
+        "deadline_ms":{"type":"integer","minimum":1,"maximum":300000},
+        "output_limit":{"type":"integer","minimum":1,"maximum":8388608}
+    }})
+}
+fn manifest_app_task_schema() -> Value {
+    json!({"type":"object","additionalProperties":false,"required":["workspace","manifest","stack","task_name","deadline_ms","output_limit"],"properties":{
+        "workspace":{"type":"string","minLength":1,"maxLength":MAX_MCP_SETUP_STRING_BYTES},
+        "manifest":{"type":"string","minLength":1,"maxLength":4096,"description":"Safe relative TOML path beneath workspace; URLs and absolute paths are refused."},
+        "stack":{"type":"string","minLength":1,"maxLength":128},
+        "task_name":{"type":"string","minLength":1,"maxLength":64,"description":"A declared task belonging to the selected stack."},
         "deadline_ms":{"type":"integer","minimum":1,"maximum":300000},
         "output_limit":{"type":"integer","minimum":1,"maximum":8388608}
     }})
@@ -837,6 +864,14 @@ fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
                 .map(|job_id| json!({"action":"manifest_ensure","submitted":true,"job_id":job_id}))
                 .map_err(|_| ToolFailure::Daemon)
         }),
+        "bosn_manifest_app_task" => manifest_app_task_request(arguments).and_then(|request| {
+            backend
+                .submit_manifest_app_task(request)
+                .map(
+                    |job_id| json!({"action":"manifest_app_task","submitted":true,"job_id":job_id}),
+                )
+                .map_err(|_| ToolFailure::Daemon)
+        }),
         "bosn_setup_task" => setup_task_request(arguments).and_then(|request| {
             backend
                 .submit_setup_task(request)
@@ -1047,6 +1082,35 @@ fn manifest_ensure_request(
             300_000,
         )?),
         output_limit: required_bounded_u64(arguments, "output_limit", 8 * 1024 * 1024)? as usize,
+    })
+}
+fn manifest_app_task_request(
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<ManifestAppTaskJobRequest, ToolFailure> {
+    only_arguments(
+        arguments,
+        &[
+            "workspace",
+            "manifest",
+            "stack",
+            "task_name",
+            "deadline_ms",
+            "output_limit",
+        ],
+    )?;
+    let base = manifest_ensure_request(&{
+        let mut copied = arguments.clone();
+        copied.remove("task_name");
+        copied
+    })?;
+    let task_name = required_setup_task_name(arguments)?;
+    Ok(ManifestAppTaskJobRequest {
+        workspace: base.workspace,
+        manifest: base.manifest,
+        stack: base.stack,
+        task_name,
+        deadline: base.deadline,
+        output_limit: base.output_limit,
     })
 }
 
@@ -1486,6 +1550,7 @@ mod tests {
         setup_prepare_calls: Vec<SetupPrepareRequest>,
         setup_ensure_calls: Vec<SetupEnsureJobRequest>,
         manifest_ensure_calls: Vec<ManifestEnsureJobRequest>,
+        manifest_app_task_calls: Vec<ManifestAppTaskJobRequest>,
         setup_task_calls: Vec<SetupTaskJobRequest>,
         setup_app_task_calls: Vec<SetupAppTaskJobRequest>,
         daemon_reads: u32,
@@ -1681,6 +1746,13 @@ mod tests {
             self.manifest_ensure_calls.push(request);
             Ok(45)
         }
+        fn submit_manifest_app_task(
+            &mut self,
+            request: ManifestAppTaskJobRequest,
+        ) -> Result<u64, Error> {
+            self.manifest_app_task_calls.push(request);
+            Ok(46)
+        }
         fn submit_setup_task(&mut self, request: SetupTaskJobRequest) -> Result<u64, Error> {
             if self.setup_task_error {
                 return Err(Error::Protocol(
@@ -1793,6 +1865,7 @@ mod tests {
                 "bosn_setup_prepare",
                 "bosn_setup_ensure",
                 "bosn_manifest_ensure",
+                "bosn_manifest_app_task",
                 "bosn_setup_task",
                 "bosn_setup_app_task"
             ]
@@ -1821,6 +1894,14 @@ mod tests {
             .unwrap();
         assert_eq!(manifest["annotations"]["readOnlyHint"], false);
         assert_eq!(manifest["inputSchema"]["additionalProperties"], false);
+        let manifest_task = replies[1]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "bosn_manifest_app_task")
+            .unwrap();
+        assert_eq!(manifest_task["annotations"]["readOnlyHint"], false);
+        assert_eq!(manifest_task["inputSchema"]["additionalProperties"], false);
         let preview = replies[1]["result"]["tools"]
             .as_array()
             .unwrap()
@@ -2155,6 +2236,30 @@ mod tests {
         assert_eq!(backend.cancelled, [9]);
         assert_eq!(replies[1]["result"]["isError"], false);
         assert_eq!(replies[2]["result"]["isError"], true);
+    }
+
+    #[test]
+    fn manifest_app_task_submits_only_declared_semantic_inputs() {
+        let mut backend = FakeBackend::default();
+        let replies = exchange(
+            concat!(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"bosn_manifest_app_task","arguments":{"workspace":"/workspace","manifest":"bosn.toml","stack":"app","task_name":"check","deadline_ms":1000,"output_limit":1024}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"bosn_manifest_app_task","arguments":{"workspace":"/workspace","manifest":"bosn.toml","stack":"app","task_name":"check","deadline_ms":1000,"output_limit":1024,"command":"id"}}}"#,
+                "\n",
+            ),
+            &mut backend,
+        );
+        assert_eq!(replies[1]["result"]["isError"], false);
+        assert_eq!(replies[1]["result"]["structuredContent"]["job_id"], 46);
+        assert_eq!(replies[2]["result"]["isError"], true);
+        assert_eq!(backend.manifest_app_task_calls.len(), 1);
+        let call = &backend.manifest_app_task_calls[0];
+        assert_eq!(call.manifest, "bosn.toml");
+        assert_eq!(call.stack, "app");
+        assert_eq!(call.task_name, "check");
     }
 
     #[test]
