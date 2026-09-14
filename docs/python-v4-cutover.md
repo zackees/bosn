@@ -54,13 +54,39 @@ labels remain durable facts. No Docker resource is looked up by name, adopted,
 started, stopped, changed, or removed during this operation.
 
 The imported registry has `migration.reconciliation_required=true`. Normal
-native daemon startup and writer opening refuse this gate. A future explicit
-engine-reconciliation workflow must compare exact durable IDs/provenance before
-any lifecycle action. Do not clear that meta key manually and do not interpret
-a successful import as proof that Docker's current state is safe to mutate.
+native daemon startup and writer opening refuse this gate. Complete the cutover
+only with the separate, offline command (the destination daemon must remain
+stopped):
 
-The operation is deliberately unavailable through the daemon, Python client,
-and MCP server: all of those are daemon control surfaces, whereas import must
-run while the destination daemon is offline. Python installations receive the
-same package-owned `bosn` executable, so this command is available without a
-second Python lifecycle implementation.
+```sh
+bosn registry reconcile-v4 preview --state-dir /absolute/path/to/new-native-state --json
+bosn registry reconcile-v4 apply --state-dir /absolute/path/to/new-native-state --apply --yes --json
+```
+
+`preview` is inspection-only. `apply` repeats the entire inspection while it
+holds the gated database-inode writer lock; a successful preview is not an
+authorization to skip that second proof. For every active imported resource,
+Bosn asks Docker only to inspect the exact durable `(kind, name)` row. It
+requires a nonempty observed engine identity, exact object name, a complete
+Bosn label set, the imported registry ID, and exact kind/stack/generation/
+scope/workspace/retention provenance. Docker names are targets from the
+registry, never discovery or ownership evidence. Builder rows are refused
+because Docker cannot provide the required label/identity proof through this
+boundary.
+
+The operation refuses missing objects, malformed/foreign/ambiguous labels,
+ambiguous or inactive uses, any remaining lease or execution session, and any
+volume-creation intent. It does not create, adopt, start, stop, delete, or
+remove an engine resource. In particular, pinned and shared volumes are
+inspected and retained; they are never a cleanup candidate. When—and only
+when—every active row proves safe, one SQLite immediate transaction appends a
+durable verification event for each observed immutable engine identity, records
+inactive rows as retained, and removes the gate. A refusal leaves the gate
+unchanged. Do not clear that meta key manually and do not interpret a
+successful import as proof that Docker's current state is safe to mutate.
+
+The import and reconciliation operations are deliberately unavailable through
+the daemon, Python client, and MCP server: those are daemon control surfaces,
+whereas the gate itself requires the destination daemon to be offline. Python
+installations receive the same package-owned `bosn` executable, so these
+commands are available without a second Python lifecycle implementation.
