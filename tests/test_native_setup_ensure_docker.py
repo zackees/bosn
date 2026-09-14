@@ -842,6 +842,7 @@ def test_native_default_manifest_stack_autostarts_after_daemon_restart(tmp_path:
             )
             content_sha256 = container.generation.removeprefix("sha256:")
             container_name = container.name
+            assert container_name is not None
             observed = _inspect_container(container_name)
             assert observed is not None and observed[1]
             assert observed[2] == image_id

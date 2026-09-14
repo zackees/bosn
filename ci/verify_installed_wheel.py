@@ -72,9 +72,7 @@ def assert_platform_wheel_contents(wheel: Path) -> None:
     with zipfile.ZipFile(wheel) as archive:
         names = archive.namelist()
     retired = [
-        f"bosn/{module}.py"
-        for module in RETIRED_LIFECYCLE_MODULES
-        if f"bosn/{module}.py" in names
+        f"bosn/{module}.py" for module in RETIRED_LIFECYCLE_MODULES if f"bosn/{module}.py" in names
     ]
     if retired:
         fail(f"wheel includes retired Python lifecycle modules: {retired}")
