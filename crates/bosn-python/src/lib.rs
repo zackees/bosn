@@ -8,6 +8,8 @@ use bosn_service::{
     Client as ServiceClient, DoctorReport as ServiceDoctorReport, JobLogPage as ServiceJobLogPage,
     JobStatus as ServiceJobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE, ManifestAppTaskJobRequest,
     ManifestConvergeJobRequest, ManifestEnsureJobRequest,
+    ManifestVolumeGcApplyResult as ServiceManifestVolumeGcApplyResult,
+    ManifestVolumeGcPreviewPage as ServiceManifestVolumeGcPreviewPage,
     RegistryResourcePage as ServiceRegistryResourcePage, SetupAdoptRequest, SetupAppTaskJobRequest,
     SetupDoneResult as ServiceSetupDoneResult, SetupEnsureEventPage as ServiceSetupEnsureEventPage,
     SetupEnsureJobRequest, SetupGcApplyResult as ServiceSetupGcApplyResult,
@@ -136,6 +138,22 @@ impl Client {
                 .map_err(service_error)
         })
     }
+    #[pyo3(signature = (workspace, *, after = 0, limit = 64))]
+    fn manifest_volume_gc_preview(
+        &self,
+        workspace: PathBuf,
+        after: u64,
+        limit: u32,
+        py: Python<'_>,
+    ) -> PyResult<ManifestVolumeGcPreviewPage> {
+        validate_registry_page(after, limit)?;
+        let state_dir = self.state_dir.clone();
+        py.detach(move || {
+            manifest_volume_gc_preview(&state_dir, workspace, after, limit)
+                .map(ManifestVolumeGcPreviewPage::from)
+                .map_err(service_error)
+        })
+    }
     /// Read-only fixed Docker/registry drift preview. No repair, lifecycle,
     /// raw Docker arguments, or registry write is reachable from Python.
     #[pyo3(signature = (workspace, *, after = 0, limit = 64))]
@@ -197,6 +215,26 @@ impl Client {
         py.detach(move || {
             setup_gc_apply(&state_dir, workspace, candidate_token)
                 .map(SetupGcApplyResult::from)
+                .map_err(service_error)
+        })
+    }
+    #[pyo3(signature = (workspace, candidate_token, *, confirm))]
+    fn manifest_volume_gc_apply(
+        &self,
+        workspace: PathBuf,
+        candidate_token: String,
+        confirm: bool,
+        py: Python<'_>,
+    ) -> PyResult<ManifestVolumeGcApplyResult> {
+        if !confirm {
+            return Err(PyValueError::new_err(
+                "manifest_volume_gc_apply requires confirm=True",
+            ));
+        }
+        let state_dir = self.state_dir.clone();
+        py.detach(move || {
+            manifest_volume_gc_apply(&state_dir, workspace, candidate_token)
+                .map(ManifestVolumeGcApplyResult::from)
                 .map_err(service_error)
         })
     }
@@ -883,6 +921,116 @@ impl From<ServiceSetupGcPreviewPage> for SetupGcPreviewPage {
 
 #[derive(Debug)]
 #[pyclass(module = "bosn._native", frozen)]
+pub struct ManifestVolumeGcCandidate {
+    #[pyo3(get)]
+    id: String,
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    generation: String,
+    #[pyo3(get)]
+    token: String,
+    #[pyo3(get)]
+    reason: String,
+}
+#[derive(Clone, Debug)]
+#[pyclass(module = "bosn._native", frozen, skip_from_py_object)]
+pub struct ManifestVolumeGcPreviewCounts {
+    #[pyo3(get)]
+    protected_not_retired: u64,
+    #[pyo3(get)]
+    protected_policy: u64,
+    #[pyo3(get)]
+    protected_ambiguous_use: u64,
+    #[pyo3(get)]
+    protected_lease: u64,
+    #[pyo3(get)]
+    protected_session: u64,
+    #[pyo3(get)]
+    protected_intent: u64,
+    #[pyo3(get)]
+    excluded_unmanaged: u64,
+}
+#[derive(Debug)]
+#[pyclass(module = "bosn._native", frozen)]
+pub struct ManifestVolumeGcPreviewPage {
+    #[pyo3(get)]
+    next: Option<u64>,
+    #[pyo3(get)]
+    counts: ManifestVolumeGcPreviewCounts,
+    candidates: Vec<ManifestVolumeGcCandidate>,
+}
+#[pymethods]
+impl ManifestVolumeGcPreviewPage {
+    #[getter]
+    fn candidates(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        Ok(PyTuple::new(
+            py,
+            self.candidates
+                .iter()
+                .map(|v| {
+                    Py::new(
+                        py,
+                        ManifestVolumeGcCandidate {
+                            id: v.id.clone(),
+                            name: v.name.clone(),
+                            generation: v.generation.clone(),
+                            token: v.token.clone(),
+                            reason: v.reason.clone(),
+                        },
+                    )
+                })
+                .collect::<PyResult<Vec<_>>>()?,
+        )?
+        .unbind())
+    }
+}
+impl From<ServiceManifestVolumeGcPreviewPage> for ManifestVolumeGcPreviewPage {
+    fn from(v: ServiceManifestVolumeGcPreviewPage) -> Self {
+        Self {
+            next: v.next,
+            candidates: v
+                .candidates
+                .into_iter()
+                .map(|c| ManifestVolumeGcCandidate {
+                    id: c.id,
+                    name: c.name,
+                    generation: c.generation,
+                    token: c.token,
+                    reason: c.reason,
+                })
+                .collect(),
+            counts: ManifestVolumeGcPreviewCounts {
+                protected_not_retired: v.counts.protected_not_retired,
+                protected_policy: v.counts.protected_policy,
+                protected_ambiguous_use: v.counts.protected_ambiguous_use,
+                protected_lease: v.counts.protected_lease,
+                protected_session: v.counts.protected_session,
+                protected_intent: v.counts.protected_intent,
+                excluded_unmanaged: v.counts.excluded_unmanaged,
+            },
+        }
+    }
+}
+#[derive(Debug)]
+#[pyclass(module = "bosn._native", frozen)]
+pub struct ManifestVolumeGcApplyResult {
+    #[pyo3(get)]
+    removed: bool,
+    #[pyo3(get)]
+    reconciled_missing: bool,
+}
+impl From<ServiceManifestVolumeGcApplyResult> for ManifestVolumeGcApplyResult {
+    fn from(v: ServiceManifestVolumeGcApplyResult) -> Self {
+        Self {
+            removed: v.removed,
+            reconciled_missing: v.reconciled_missing,
+        }
+    }
+}
+
+#[derive(Debug)]
+#[pyclass(module = "bosn._native", frozen)]
 pub struct SetupReconcileRecord {
     #[pyo3(get)]
     id: String,
@@ -1293,6 +1441,22 @@ fn setup_gc_preview(
             .await
     })
 }
+fn manifest_volume_gc_preview(
+    state_dir: &Path,
+    workspace: PathBuf,
+    after: u64,
+    limit: u32,
+) -> Result<ServiceManifestVolumeGcPreviewPage, bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async {
+        ServiceClient::for_state(state_dir)?
+            .manifest_volume_gc_preview(workspace, after, limit)
+            .await
+    })
+}
 fn setup_reconcile_preview(
     state_dir: &Path,
     workspace: PathBuf,
@@ -1336,6 +1500,21 @@ fn setup_gc_apply(
     runtime.run(async {
         ServiceClient::for_state(state_dir)?
             .setup_gc_apply(workspace, &candidate_token, true)
+            .await
+    })
+}
+fn manifest_volume_gc_apply(
+    state_dir: &Path,
+    workspace: PathBuf,
+    candidate_token: String,
+) -> Result<ServiceManifestVolumeGcApplyResult, bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async {
+        ServiceClient::for_state(state_dir)?
+            .manifest_volume_gc_apply(workspace, &candidate_token, true)
             .await
     })
 }
@@ -1805,6 +1984,10 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SetupGcCandidate>()?;
     module.add_class::<SetupGcPreviewCounts>()?;
     module.add_class::<SetupGcPreviewPage>()?;
+    module.add_class::<ManifestVolumeGcCandidate>()?;
+    module.add_class::<ManifestVolumeGcPreviewCounts>()?;
+    module.add_class::<ManifestVolumeGcPreviewPage>()?;
+    module.add_class::<ManifestVolumeGcApplyResult>()?;
     module.add_class::<SetupReconcileRecord>()?;
     module.add_class::<SetupReconcilePreviewPage>()?;
     module.add_class::<SetupReconcileMissingRepairResult>()?;

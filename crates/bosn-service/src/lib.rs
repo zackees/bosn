@@ -15,8 +15,8 @@ use bosn_generation::{
     stack_generation_async, stack_generation_from_context,
 };
 use bosn_registry::{
-    Event, ExecutionSession, Registry, RegistryStatus, Resource, ResourceUse, SetupDone,
-    SetupGcPreview, VolumeCreationIntent,
+    Event, ExecutionSession, ManifestVolumeGcPreview, Registry, RegistryStatus, Resource,
+    ResourceUse, SetupDone, SetupGcPreview, VolumeCreationIntent,
 };
 #[cfg(test)]
 use bosn_setup::PreparedImageKind;
@@ -2946,6 +2946,35 @@ pub struct SetupGcPreviewPage {
     pub candidates: Vec<SetupGcCandidateDiagnostic>,
     pub counts: SetupGcPreviewCounts,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManifestVolumeGcCandidateDiagnostic {
+    pub id: String,
+    pub name: String,
+    pub generation: String,
+    pub token: String,
+    pub reason: String,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManifestVolumeGcPreviewCounts {
+    pub protected_not_retired: u64,
+    pub protected_policy: u64,
+    pub protected_ambiguous_use: u64,
+    pub protected_lease: u64,
+    pub protected_session: u64,
+    pub protected_intent: u64,
+    pub excluded_unmanaged: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManifestVolumeGcPreviewPage {
+    pub next: Option<u64>,
+    pub candidates: Vec<ManifestVolumeGcCandidateDiagnostic>,
+    pub counts: ManifestVolumeGcPreviewCounts,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManifestVolumeGcApplyResult {
+    pub removed: bool,
+    pub reconciled_missing: bool,
+}
 
 /// A bounded, read-only comparison between one durable managed-container
 /// record and Docker. It intentionally contains no workspace, URL, engine
@@ -3053,6 +3082,35 @@ fn setup_gc_preview_diagnostic(value: SetupGcPreview) -> SetupGcPreviewPage {
     }
 }
 
+fn manifest_volume_gc_preview_diagnostic(
+    value: ManifestVolumeGcPreview,
+) -> ManifestVolumeGcPreviewPage {
+    ManifestVolumeGcPreviewPage {
+        next: value.candidates.next_offset.map(|v| v as u64),
+        candidates: value
+            .candidates
+            .items
+            .into_iter()
+            .map(|v| ManifestVolumeGcCandidateDiagnostic {
+                token: manifest_volume_gc_token(&v),
+                id: v.id,
+                name: v.name,
+                generation: v.generation,
+                reason: "retired_manifest_warm_spec_volume".into(),
+            })
+            .collect(),
+        counts: ManifestVolumeGcPreviewCounts {
+            protected_not_retired: value.counts.protected_not_retired,
+            protected_policy: value.counts.protected_policy,
+            protected_ambiguous_use: value.counts.protected_ambiguous_use,
+            protected_lease: value.counts.protected_lease,
+            protected_session: value.counts.protected_session,
+            protected_intent: value.counts.protected_intent,
+            excluded_unmanaged: value.counts.excluded_unmanaged,
+        },
+    }
+}
+
 fn setup_gc_token(candidate: &bosn_registry::SetupGcCandidate) -> String {
     // Hex makes a delimiter-free opaque transport value without adding a
     // parser-sensitive dependency. It is an identity binding, not a secret:
@@ -3064,6 +3122,18 @@ fn setup_gc_token(candidate: &bosn_registry::SetupGcCandidate) -> String {
         bytes.push(0);
     }
     let mut token = String::from("sgc1-");
+    for byte in bytes {
+        token.push_str(&format!("{byte:02x}"));
+    }
+    token
+}
+fn manifest_volume_gc_token(candidate: &bosn_registry::ManifestVolumeGcCandidate) -> String {
+    let mut bytes = Vec::new();
+    for value in [&candidate.id, &candidate.name, &candidate.generation] {
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(0);
+    }
+    let mut token = String::from("mvg1-");
     for byte in bytes {
         token.push_str(&format!("{byte:02x}"));
     }
@@ -3122,6 +3192,13 @@ fn parse_setup_gc_token(token: &str) -> Result<(String, String, String), Error> 
         return Err(Error::Protocol("invalid setup gc candidate"));
     }
     Ok(result)
+}
+fn parse_manifest_volume_gc_token(token: &str) -> Result<(String, String, String), Error> {
+    let encoded = token
+        .strip_prefix("mvg1-")
+        .ok_or(Error::Protocol("invalid manifest volume gc candidate"))?;
+    parse_setup_gc_token(&format!("sgc1-{encoded}"))
+        .map_err(|_| Error::Protocol("invalid manifest volume gc candidate"))
 }
 
 fn parse_setup_reconcile_missing_token(token: &str) -> Result<(String, String, String), Error> {
@@ -3267,6 +3344,10 @@ fn validate_setup_gc_preview_request_wire(request: &Request) -> Result<(), Error
     }
     Ok(())
 }
+fn validate_manifest_volume_gc_preview_request_wire(request: &Request) -> Result<(), Error> {
+    validate_setup_gc_preview_request_wire(request)
+        .map_err(|_| Error::Protocol("nonsemantic manifest volume gc preview fields"))
+}
 
 fn validate_setup_reconcile_preview_request_wire(request: &Request) -> Result<(), Error> {
     validate_setup_gc_preview_request_wire(request)
@@ -3358,6 +3439,48 @@ fn validate_setup_gc_apply_request_wire(request: &Request) -> Result<(), Error> 
         || request.setup_adopt_confirm
     {
         return Err(Error::Protocol("nonsemantic setup gc apply fields"));
+    }
+    Ok(())
+}
+fn validate_manifest_volume_gc_apply_input(
+    workspace: &str,
+    token: &str,
+    confirm: bool,
+) -> Result<(), Error> {
+    if workspace.is_empty()
+        || workspace.len() > 8 * 1024
+        || workspace.bytes().any(|b| b == 0)
+        || !confirm
+    {
+        return Err(Error::Protocol("invalid manifest volume gc apply request"));
+    }
+    let _ = parse_manifest_volume_gc_token(token)?;
+    Ok(())
+}
+fn validate_manifest_volume_gc_apply_request_wire(request: &Request) -> Result<(), Error> {
+    validate_manifest_volume_gc_apply_input(
+        &request.workspace,
+        &request.gc_candidate_token,
+        request.gc_confirm,
+    )?;
+    if !request.stack.is_empty()
+        || !request.digest.is_empty()
+        || request.job_id != 0
+        || request.log_after != 0
+        || request.log_limit != 0
+        || !request.setup_config.is_empty()
+        || request.setup_policy != 0
+        || request.setup_deadline_ms != 0
+        || request.setup_output_limit != 0
+        || !request.setup_task_name.is_empty()
+        || request.diagnostic_after != 0
+        || request.diagnostic_limit != 0
+        || request.setup_done_confirm
+        || request.setup_adopt_confirm
+    {
+        return Err(Error::Protocol(
+            "nonsemantic manifest volume gc apply fields",
+        ));
     }
     Ok(())
 }
@@ -3580,6 +3703,36 @@ impl Client {
             _ => Err(Error::Protocol("unexpected setup gc preview response")),
         }
     }
+    /// Preview only retired disposable native-manifest volumes. Stack,
+    /// machine, and pinned data are excluded by policy.
+    pub async fn manifest_volume_gc_preview(
+        &self,
+        workspace: impl AsRef<Path>,
+        after: u64,
+        limit: u32,
+    ) -> Result<ManifestVolumeGcPreviewPage, Error> {
+        validate_registry_page(after, limit)?;
+        let workspace = workspace.as_ref().to_string_lossy().into_owned();
+        if workspace.is_empty() || workspace.len() > 8 * 1024 || workspace.bytes().any(|b| b == 0) {
+            return Err(Error::Protocol(
+                "invalid manifest volume gc preview workspace",
+            ));
+        }
+        match self
+            .call(Request {
+                workspace,
+                diagnostic_after: after,
+                diagnostic_limit: limit,
+                ..Request::operation(31)
+            })
+            .await?
+        {
+            Reply::ManifestVolumeGcPreview(v) => Ok(v),
+            _ => Err(Error::Protocol(
+                "unexpected manifest volume gc preview response",
+            )),
+        }
+    }
     /// Compare durable Bosn-managed setup container facts with fixed Docker
     /// inspection. This is read-only: it never creates, opens, writes, or
     /// migrates a registry and has no repair/apply operation.
@@ -3660,6 +3813,31 @@ impl Client {
         {
             Reply::SetupGcApply(value) => Ok(value),
             _ => Err(Error::Protocol("unexpected setup gc apply response")),
+        }
+    }
+    /// Remove exactly one preview-token-bound disposable manifest volume after
+    /// registry, labels, and attachment revalidation by the daemon.
+    pub async fn manifest_volume_gc_apply(
+        &self,
+        workspace: impl AsRef<Path>,
+        candidate_token: &str,
+        confirm: bool,
+    ) -> Result<ManifestVolumeGcApplyResult, Error> {
+        let workspace = workspace.as_ref().to_string_lossy().into_owned();
+        validate_manifest_volume_gc_apply_input(&workspace, candidate_token, confirm)?;
+        match self
+            .call(Request {
+                workspace,
+                gc_candidate_token: candidate_token.into(),
+                gc_confirm: true,
+                ..Request::operation(32)
+            })
+            .await?
+        {
+            Reply::ManifestVolumeGcApply(v) => Ok(v),
+            _ => Err(Error::Protocol(
+                "unexpected manifest volume gc apply response",
+            )),
         }
     }
     /// Stop exactly one opaque retired candidate returned by GC preview. The
@@ -4128,6 +4306,12 @@ enum DbCommand {
         limit: u32,
         reply: async_engine::OneshotSender<Result<SetupGcPreviewPage, Error>>,
     },
+    ManifestVolumeGcPreview {
+        workspace: String,
+        after: u64,
+        limit: u32,
+        reply: async_engine::OneshotSender<Result<ManifestVolumeGcPreviewPage, Error>>,
+    },
     SetupReconcilePreview {
         workspace: String,
         after: u64,
@@ -4157,6 +4341,23 @@ enum DbCommand {
         reply: async_engine::OneshotSender<Result<Option<bosn_registry::SetupGcCandidate>, Error>>,
     },
     FinalizeSetupGc {
+        workspace: String,
+        id: String,
+        name: String,
+        generation: String,
+        missing: bool,
+        reply: async_engine::OneshotSender<Result<bool, Error>>,
+    },
+    ManifestVolumeGcCandidate {
+        workspace: String,
+        id: String,
+        name: String,
+        generation: String,
+        reply: async_engine::OneshotSender<
+            Result<Option<bosn_registry::ManifestVolumeGcCandidate>, Error>,
+        >,
+    },
+    FinalizeManifestVolumeGc {
         workspace: String,
         id: String,
         name: String,
@@ -5897,6 +6098,25 @@ impl RegistryActor {
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
     }
+    async fn manifest_volume_gc_preview(
+        &self,
+        workspace: String,
+        after: u64,
+        limit: u32,
+    ) -> Result<ManifestVolumeGcPreviewPage, Error> {
+        validate_registry_page(after, limit)?;
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::ManifestVolumeGcPreview {
+                workspace,
+                after,
+                limit,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
     async fn setup_reconcile_preview(
         &self,
         workspace: String,
@@ -5970,6 +6190,48 @@ impl RegistryActor {
                 id,
                 name,
                 generation,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
+    async fn manifest_volume_gc_candidate(
+        &self,
+        workspace: String,
+        id: String,
+        name: String,
+        generation: String,
+    ) -> Result<Option<bosn_registry::ManifestVolumeGcCandidate>, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::ManifestVolumeGcCandidate {
+                workspace,
+                id,
+                name,
+                generation,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
+    async fn finalize_manifest_volume_gc(
+        &self,
+        workspace: String,
+        id: String,
+        name: String,
+        generation: String,
+        missing: bool,
+    ) -> Result<bool, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::FinalizeManifestVolumeGc {
+                workspace,
+                id,
+                name,
+                generation,
+                missing,
                 reply,
             })
             .await
@@ -6236,6 +6498,32 @@ async fn registry_actor(
                     }
                 }
             }
+            DbCommand::ManifestVolumeGcPreview {
+                workspace,
+                after,
+                limit,
+                reply,
+            } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = usize::try_from(after)
+                        .map_err(|_| bosn_registry::Error::BadRow("page offset"))
+                        .and_then(|after| {
+                            registry.manifest_volume_gc_preview(&workspace, after, limit as usize)
+                        })
+                        .map(manifest_volume_gc_preview_diagnostic);
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
             DbCommand::SetupReconcilePreview {
                 workspace,
                 after,
@@ -6382,6 +6670,29 @@ async fn registry_actor(
                     }
                 }
             }
+            DbCommand::ManifestVolumeGcCandidate {
+                workspace,
+                id,
+                name,
+                generation,
+                reply,
+            } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result =
+                        registry.manifest_volume_gc_candidate(&workspace, &id, &name, &generation);
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
             DbCommand::FinalizeSetupGc {
                 workspace,
                 id,
@@ -6412,6 +6723,51 @@ async fn registry_actor(
                         )?;
                         // Dropping an uncommitted immediate transaction rolls it
                         // back; no stale-preview event is persisted.
+                        if removed {
+                            transaction.commit()?;
+                        }
+                        Ok(removed)
+                    })();
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
+            DbCommand::FinalizeManifestVolumeGc {
+                workspace,
+                id,
+                name,
+                generation,
+                missing,
+                reply,
+            } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = (|| {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
+                            .as_secs_f64();
+                        let mut transaction = registry.begin_immediate()?;
+                        let removed = transaction.finalize_manifest_volume_gc_candidate(
+                            &workspace,
+                            &id,
+                            &name,
+                            &generation,
+                            now,
+                            if missing {
+                                "manifest.volume_gc.reconciled_missing"
+                            } else {
+                                "manifest.volume_gc.removed"
+                            },
+                        )?;
                         if removed {
                             transaction.commit()?;
                         }
@@ -7014,6 +7370,15 @@ fn record_manifest_ensure(
         &execution.resource.stack,
         &execution.resource.generation,
     )?;
+    transaction.retire_prior_manifest_warm_spec_volume_generations(
+        &execution.resource.workspace,
+        &execution.resource.stack,
+        &execution
+            .volumes
+            .iter()
+            .map(|volume| volume.name.clone())
+            .collect::<Vec<_>>(),
+    )?;
     transaction.append_event(
         now,
         "manifest.recovery.contract",
@@ -7585,6 +7950,154 @@ async fn apply_setup_gc_candidate(
         })
         .ok_or(Error::Protocol(
             "setup gc registry finalization failed after container removal",
+        ))
+}
+
+/// Fixed inspection of a daemon-derived volume. Docker has no volume
+/// attachment field, so the caller separately uses an exact `ps --filter
+/// volume=NAME` query; any attached container (Bosn or foreign) protects it.
+async fn inspect_manifest_volume_gc(
+    engine: &DockerEngine,
+    candidate: &bosn_registry::ManifestVolumeGcCandidate,
+) -> Result<Option<bool>, Error> {
+    let format = "{{.Name}}\t{{index .Labels \"com.zackees.bosn.setup-managed\"}}\t{{index .Labels \"com.zackees.bosn.setup-content-sha256\"}}\t{{index .Labels \"com.zackees.bosn.setup-container\"}}";
+    let result = engine
+        .with_args(["volume", "inspect", "--format", format, &candidate.name])
+        .capture_async(RunOptions::bounded(
+            SETUP_GC_ENGINE_DEADLINE,
+            SETUP_GC_ENGINE_OUTPUT,
+        ))
+        .await
+        .map_err(|_| Error::Protocol("manifest volume gc inspection failed"))?;
+    if result.exit_code == 1 {
+        return Ok(None);
+    }
+    if !result.ok() {
+        return Err(Error::Protocol("manifest volume gc inspection failed"));
+    }
+    let text = std::str::from_utf8(&result.stdout)
+        .map_err(|_| Error::Protocol("manifest volume gc inspection invalid"))?;
+    let fields: Vec<_> = text.trim_end_matches(['\r', '\n']).split('\t').collect();
+    let content = candidate
+        .generation
+        .strip_prefix("sha256:")
+        .ok_or(Error::Protocol(
+            "manifest volume gc candidate identity invalid",
+        ))?;
+    if fields.len() != 4
+        || fields[0] != candidate.name
+        || fields[1] != "v1"
+        || fields[2] != content
+        || fields[3] != candidate.name
+    {
+        return Err(Error::Protocol("manifest volume gc ownership mismatch"));
+    }
+    let attached = engine
+        .with_args([
+            "container",
+            "ls",
+            "-a",
+            "--filter",
+            &format!("volume={}", candidate.name),
+            "--format",
+            "{{.ID}}",
+        ])
+        .capture_async(RunOptions::bounded(
+            SETUP_GC_ENGINE_DEADLINE,
+            SETUP_GC_ENGINE_OUTPUT,
+        ))
+        .await
+        .map_err(|_| Error::Protocol("manifest volume gc attachment inspection failed"))?;
+    if !attached.ok() {
+        return Err(Error::Protocol(
+            "manifest volume gc attachment inspection failed",
+        ));
+    }
+    Ok(Some(!attached.stdout.iter().all(u8::is_ascii_whitespace)))
+}
+
+async fn apply_manifest_volume_gc_candidate(
+    actor: &RegistryActor,
+    workspace: String,
+    token: String,
+) -> Result<ManifestVolumeGcApplyResult, Error> {
+    let (id, name, generation) = parse_manifest_volume_gc_token(&token)?;
+    let candidate = actor
+        .manifest_volume_gc_candidate(workspace.clone(), id, name, generation)
+        .await?
+        .ok_or(Error::Protocol(
+            "manifest volume gc preview is stale or protected",
+        ))?;
+    let engine = DockerEngine::docker();
+    let first = inspect_manifest_volume_gc(&engine, &candidate).await?;
+    if first.is_none() {
+        let finalized = actor
+            .finalize_manifest_volume_gc(
+                workspace,
+                candidate.id,
+                candidate.name,
+                candidate.generation,
+                true,
+            )
+            .await?;
+        return finalized
+            .then_some(ManifestVolumeGcApplyResult {
+                removed: false,
+                reconciled_missing: true,
+            })
+            .ok_or(Error::Protocol("manifest volume gc preview became stale"));
+    }
+    if first != Some(false) {
+        return Err(Error::Protocol("manifest volume gc candidate is attached"));
+    }
+    let second = inspect_manifest_volume_gc(&engine, &candidate).await?;
+    if second.is_none() {
+        let finalized = actor
+            .finalize_manifest_volume_gc(
+                workspace,
+                candidate.id,
+                candidate.name,
+                candidate.generation,
+                true,
+            )
+            .await?;
+        return finalized
+            .then_some(ManifestVolumeGcApplyResult {
+                removed: false,
+                reconciled_missing: true,
+            })
+            .ok_or(Error::Protocol("manifest volume gc preview became stale"));
+    }
+    if second != Some(false) {
+        return Err(Error::Protocol("manifest volume gc candidate is attached"));
+    }
+    let removed = engine
+        .with_args(["volume", "rm", &candidate.name])
+        .capture_async(RunOptions::bounded(
+            SETUP_GC_ENGINE_DEADLINE,
+            SETUP_GC_ENGINE_OUTPUT,
+        ))
+        .await
+        .map_err(|_| Error::Protocol("manifest volume gc removal failed"))?;
+    if !removed.ok() {
+        return Err(Error::Protocol("manifest volume gc removal failed"));
+    }
+    let finalized = actor
+        .finalize_manifest_volume_gc(
+            workspace,
+            candidate.id,
+            candidate.name,
+            candidate.generation,
+            false,
+        )
+        .await?;
+    finalized
+        .then_some(ManifestVolumeGcApplyResult {
+            removed: true,
+            reconciled_missing: false,
+        })
+        .ok_or(Error::Protocol(
+            "manifest volume gc registry finalization failed after volume removal",
         ))
 }
 
@@ -8352,6 +8865,63 @@ async fn handle(
                     ..Default::default()
                 },
             },
+            31 => match validate_manifest_volume_gc_preview_request_wire(&r) {
+                Ok(()) => match actor
+                    .manifest_volume_gc_preview(r.workspace, r.diagnostic_after, r.diagnostic_limit)
+                    .await
+                {
+                    Ok(page) => ReplyWire {
+                        code: 180,
+                        diagnostic_next: page.next.unwrap_or(0),
+                        diagnostic_has_next: page.next.is_some(),
+                        manifest_volume_gc_candidates: page
+                            .candidates
+                            .into_iter()
+                            .map(ManifestVolumeGcCandidateWire::from)
+                            .collect(),
+                        volume_gc_protected_not_retired: page.counts.protected_not_retired,
+                        volume_gc_protected_policy: page.counts.protected_policy,
+                        volume_gc_protected_ambiguous_use: page.counts.protected_ambiguous_use,
+                        volume_gc_protected_lease: page.counts.protected_lease,
+                        volume_gc_protected_session: page.counts.protected_session,
+                        volume_gc_protected_intent: page.counts.protected_intent,
+                        volume_gc_excluded_unmanaged: page.counts.excluded_unmanaged,
+                        ..Default::default()
+                    },
+                    Err(_) => ReplyWire {
+                        code: 3,
+                        ..Default::default()
+                    },
+                },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
+            32 => match validate_manifest_volume_gc_apply_request_wire(&r) {
+                Ok(()) => match apply_manifest_volume_gc_candidate(
+                    &actor,
+                    r.workspace,
+                    r.gc_candidate_token,
+                )
+                .await
+                {
+                    Ok(result) => ReplyWire {
+                        code: 190,
+                        volume_gc_removed: result.removed,
+                        volume_gc_reconciled_missing: result.reconciled_missing,
+                        ..Default::default()
+                    },
+                    Err(_) => ReplyWire {
+                        code: 3,
+                        ..Default::default()
+                    },
+                },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
             _ => ReplyWire {
                 code: 2,
                 ..Default::default()
@@ -8828,6 +9398,26 @@ struct ReplyWire {
     setup_reconcile_repaired: bool,
     #[prost(bool, tag = "39")]
     setup_reconcile_already_repaired: bool,
+    #[prost(message, repeated, tag = "40")]
+    manifest_volume_gc_candidates: Vec<ManifestVolumeGcCandidateWire>,
+    #[prost(uint64, tag = "41")]
+    volume_gc_protected_not_retired: u64,
+    #[prost(uint64, tag = "42")]
+    volume_gc_protected_policy: u64,
+    #[prost(uint64, tag = "43")]
+    volume_gc_protected_ambiguous_use: u64,
+    #[prost(uint64, tag = "44")]
+    volume_gc_protected_lease: u64,
+    #[prost(uint64, tag = "45")]
+    volume_gc_protected_session: u64,
+    #[prost(uint64, tag = "46")]
+    volume_gc_protected_intent: u64,
+    #[prost(uint64, tag = "47")]
+    volume_gc_excluded_unmanaged: u64,
+    #[prost(bool, tag = "48")]
+    volume_gc_removed: bool,
+    #[prost(bool, tag = "49")]
+    volume_gc_reconciled_missing: bool,
 }
 #[derive(Message)]
 struct LogRecordWire {
@@ -8923,6 +9513,41 @@ impl From<SetupGcCandidateWire> for SetupGcCandidateDiagnostic {
     }
 }
 #[derive(Message)]
+struct ManifestVolumeGcCandidateWire {
+    #[prost(string, tag = "1")]
+    id: String,
+    #[prost(string, tag = "2")]
+    name: String,
+    #[prost(string, tag = "3")]
+    generation: String,
+    #[prost(string, tag = "4")]
+    reason: String,
+    #[prost(string, tag = "5")]
+    token: String,
+}
+impl From<ManifestVolumeGcCandidateDiagnostic> for ManifestVolumeGcCandidateWire {
+    fn from(v: ManifestVolumeGcCandidateDiagnostic) -> Self {
+        Self {
+            id: v.id,
+            name: v.name,
+            generation: v.generation,
+            reason: v.reason,
+            token: v.token,
+        }
+    }
+}
+impl From<ManifestVolumeGcCandidateWire> for ManifestVolumeGcCandidateDiagnostic {
+    fn from(v: ManifestVolumeGcCandidateWire) -> Self {
+        Self {
+            id: v.id,
+            name: v.name,
+            generation: v.generation,
+            reason: v.reason,
+            token: v.token,
+        }
+    }
+}
+#[derive(Message)]
 struct SetupEnsureEventWire {
     #[prost(uint64, tag = "1")]
     cursor: u64,
@@ -9006,6 +9631,8 @@ enum Reply {
     Doctor(DoctorReport),
     SetupReconcilePreview(SetupReconcilePreviewPage),
     SetupReconcileMissingRepair(SetupReconcileMissingRepairResult),
+    ManifestVolumeGcPreview(ManifestVolumeGcPreviewPage),
+    ManifestVolumeGcApply(ManifestVolumeGcApplyResult),
 }
 fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
     match v.code {
@@ -9096,6 +9723,29 @@ fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
                 already_repaired: v.setup_reconcile_already_repaired,
             },
         )),
+        180 => Ok(Reply::ManifestVolumeGcPreview(
+            ManifestVolumeGcPreviewPage {
+                next: v.diagnostic_has_next.then_some(v.diagnostic_next),
+                candidates: v
+                    .manifest_volume_gc_candidates
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+                counts: ManifestVolumeGcPreviewCounts {
+                    protected_not_retired: v.volume_gc_protected_not_retired,
+                    protected_policy: v.volume_gc_protected_policy,
+                    protected_ambiguous_use: v.volume_gc_protected_ambiguous_use,
+                    protected_lease: v.volume_gc_protected_lease,
+                    protected_session: v.volume_gc_protected_session,
+                    protected_intent: v.volume_gc_protected_intent,
+                    excluded_unmanaged: v.volume_gc_excluded_unmanaged,
+                },
+            },
+        )),
+        190 => Ok(Reply::ManifestVolumeGcApply(ManifestVolumeGcApplyResult {
+            removed: v.volume_gc_removed,
+            reconciled_missing: v.volume_gc_reconciled_missing,
+        })),
         1 => Err(Error::Protocol("unsupported protocol")),
         2 => Err(Error::Protocol("unknown operation")),
         _ => Err(Error::Protocol("daemon error")),
@@ -9218,6 +9868,23 @@ mod tests {
         );
         assert!(parse_setup_gc_token(&(token + "00")).is_err());
         assert!(validate_setup_gc_apply_input("/work", "sgc1-00", false).is_err());
+    }
+
+    #[test]
+    fn manifest_volume_gc_token_is_exact_and_cannot_be_used_as_setup_token() {
+        let candidate = bosn_registry::ManifestVolumeGcCandidate {
+            id: "manifest-volume:abc".into(),
+            name: "bosn-v-spec-abc".into(),
+            generation: "sha256:abc".into(),
+        };
+        let token = manifest_volume_gc_token(&candidate);
+        assert_eq!(
+            parse_manifest_volume_gc_token(&token).unwrap(),
+            (candidate.id, candidate.name, candidate.generation)
+        );
+        assert!(parse_manifest_volume_gc_token(&(token.clone() + "00")).is_err());
+        assert!(parse_setup_gc_token(&token).is_err());
+        assert!(validate_manifest_volume_gc_apply_input("/work", &token, false).is_err());
     }
 
     #[test]
