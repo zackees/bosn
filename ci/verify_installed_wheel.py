@@ -401,12 +401,39 @@ def wait_for_daemon(
     )
 
 
-def verify_installed_wheel(wheel: Path) -> None:
-    phase("inspect wheel archive")
-    assert_platform_wheel_contents(wheel)
+def install_command(installer: str, *, python: Path, wheel: Path) -> list[str]:
+    """Build the wheel install command for the selected installer.
+
+    ``uv`` is the normal path.  ``pip`` exists for the macOS Recovery guest
+    (issue #252), which has neither uv nor network: the running interpreter's
+    own pip installs into the venv offline, so the wheel in the payload is the
+    only thing that can be installed.
+    """
+
+    if installer == "pip":
+        # ``--python`` is a global pip option and must precede the ``install``
+        # subcommand; placed after it, pip exits with "The --python option must
+        # be placed before the pip subcommand name".
+        return [
+            sys.executable,
+            "-m",
+            "pip",
+            "--python",
+            str(python),
+            "install",
+            "--no-index",
+            "--no-deps",
+            str(wheel),
+        ]
     uv = shutil.which("uv")
     if uv is None:
         fail("uv is required to install the wheel")
+    return [uv, "pip", "install", "--python", str(python), "--no-deps", str(wheel)]
+
+
+def verify_installed_wheel(wheel: Path, installer: str = "uv") -> None:
+    phase("inspect wheel archive")
+    assert_platform_wheel_contents(wheel)
 
     with tempfile.TemporaryDirectory(
         prefix=smoke_temporary_prefix(), dir=smoke_temporary_directory()
@@ -421,8 +448,13 @@ def verify_installed_wheel(wheel: Path) -> None:
         state = root / "state"
         workdir.mkdir()
         phase("create isolated virtual environment")
+        # pip mode installs with the outer interpreter's pip, so the venv does
+        # not need ensurepip (Recovery has no network for a bootstrap either).
+        venv_command = [sys.executable, "-m", "venv", str(environment)]
+        if installer == "pip":
+            venv_command.append("--without-pip")
         run(
-            [sys.executable, "-m", "venv", str(environment)],
+            venv_command,
             cwd=root,
             env=bootstrap_environment(),
             timeout=INSTALL_TIMEOUT_SECONDS,
@@ -432,7 +464,7 @@ def verify_installed_wheel(wheel: Path) -> None:
         env = child_environment(scripts)
         phase("install wheel")
         run(
-            [uv, "pip", "install", "--python", str(python), "--no-deps", str(wheel)],
+            install_command(installer, python=python, wheel=wheel),
             cwd=root,
             env=env,
             timeout=INSTALL_TIMEOUT_SECONDS,
@@ -548,8 +580,14 @@ def main() -> None:
     parser.add_argument(
         "wheel", help="wheel path, or a shell-style path relative to the current directory"
     )
+    parser.add_argument(
+        "--installer",
+        choices=("uv", "pip"),
+        default="uv",
+        help="uv (default) or the running interpreter's pip, offline (Recovery guest)",
+    )
     arguments = parser.parse_args()
-    verify_installed_wheel(wheel_from_argument(arguments.wheel))
+    verify_installed_wheel(wheel_from_argument(arguments.wheel), installer=arguments.installer)
 
 
 if __name__ == "__main__":

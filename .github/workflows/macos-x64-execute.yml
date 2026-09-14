@@ -1,0 +1,163 @@
+name: macOS x64 execute
+
+# Advisory execution of the Linux-built Intel macOS wheel (issue #252, Part 2).
+#
+# CI builds both Darwin wheels on Linux through Soldr and proves them
+# statically; nothing there runs a Mach-O.  This lane boots a macOS Recovery
+# guest (zackees/docker-mac-x64: OSX-KVM under QEMU/KVM on an ubuntu runner —
+# no hosted macOS runner, which ci/lint_no_macos_runners.py still enforces),
+# installs the x86_64 wheel into a relocatable CPython 3.10 shipped in the
+# payload, and runs the same ci/verify_installed_wheel.py the Linux and
+# Windows lanes run.  aarch64-apple-darwin has no execution path anywhere in
+# the fleet (no arm64 macOS guest exists on Linux); it stays compile-only.
+#
+# Advisory: nightly + manual, never a required check, never a release gate.
+# Promotion is a separate decision after a green track record
+# (docs/macos-guest.md, "Executing the wheel").
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      run-timeout:
+        description: "Seconds the guest may take to report (default 1500)"
+        required: false
+        type: string
+
+# One live run per workflow per ref: a new push to a branch or PR cancels the
+# superseded run instead of queuing behind it in the shared account-wide runner
+# pool. Runs on main get a unique group, so they are never cancelled or coalesced.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build-x64-wheel:
+    name: Build x86_64 Darwin wheel on Linux (Soldr)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      # Same pinned Soldr contract as the CI darwin-cross-wheel lane.
+      - name: Set up Soldr Darwin target
+        uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
+        with:
+          cache: false
+          cross-targets: x86_64-apple-darwin
+
+      - name: Export Soldr target environment
+        run: soldr prepare --target x86_64-apple-darwin --github-env "$GITHUB_ENV"
+
+      - name: Install Rust standard library for Darwin target
+        run: rustup target add x86_64-apple-darwin --toolchain 1.95.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Build Darwin wheel on Linux
+        env:
+          BOSN_WHEEL_TARGET: x86_64-apple-darwin
+          PYO3_CROSS_PYTHON_VERSION: "3.10"
+          MACOSX_DEPLOYMENT_TARGET: "10.12"
+        run: uv build --wheel --out-dir dist
+
+      - name: Verify Darwin wheel statically on Linux
+        run: python ci/verify_cross_wheel.py "dist/bosn-*.whl" --target x86_64-apple-darwin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bosn-wheel-x86_64-apple-darwin-execute
+          path: dist/bosn-*.whl
+          if-no-files-found: error
+          retention-days: 3
+
+  execute-in-recovery:
+    name: Install and smoke-test the wheel in a macOS Recovery guest
+    needs: build-x64-wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bosn-wheel-x86_64-apple-darwin-execute
+          path: dist
+
+      # Pinned CPython 3.10 for x86_64 macOS (sha256-checked) with its one
+      # Recovery-incompatible dylib reference patched; see ci/recovery_payload.py.
+      - name: Stage the guest payload
+        run: |
+          python3 ci/recovery_payload.py --wheel "dist/bosn-*.whl" --out payload
+          mkdir -p share
+          tar -czf share/payload.tar.gz -C payload .
+          ls -lh share/payload.tar.gz
+
+      # Everything after the fetch runs inside macOS Recovery as root, bash 3.2.
+      # Nothing may abort on a smoke failure: the rc and log must reach
+      # /tmp/w/out so the runner can decide, and a missing interpreter is
+      # reported as rc 91 rather than as silence.
+      - name: Boot macOS Recovery and run the installed-wheel smoke
+        id: macos
+        uses: zackees/docker-mac-x64@f173a047ba7fbe1db7d8162ff3ac8e276f50b153
+        with:
+          share-dir: share
+          collect: /tmp/w/out
+          ram: "8"
+          run-timeout: ${{ inputs.run-timeout || '1500' }}
+          run: |
+            set -x
+            mkdir -p /tmp/w/out && cd /tmp/w
+            curl -s -o payload.tar.gz http://10.0.2.2:8000/payload.tar.gz
+            mkdir -p payload && tar -xzf payload.tar.gz -C payload
+            cd payload
+            if ! ./python/bin/python3 -VV > /tmp/w/out/python.txt 2>&1; then
+              cat /tmp/w/out/python.txt
+              echo 91 > /tmp/w/out/wheel.rc
+              echo "guest script complete (no interpreter)"
+              exit 0
+            fi
+            cat /tmp/w/out/python.txt
+            ./python/bin/python3 verify_installed_wheel.py --installer pip bosn-*.whl \
+              > /tmp/w/out/wheel.log 2>&1
+            echo $? > /tmp/w/out/wheel.rc
+            tail -40 /tmp/w/out/wheel.log
+            echo "guest script complete"
+
+      - name: Verdict — full pass, or exactly the documented waived phases
+        run: >-
+          python3 ci/recovery_wheel_result.py
+          --collected "${{ steps.macos.outputs.workdir }}/collected"
+          --summary-file "$GITHUB_STEP_SUMMARY"
+
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-x64-execute-results
+          path: ${{ steps.macos.outputs.workdir }}/collected/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-x64-execute-guest-screens
+          path: ${{ steps.macos.outputs.workdir }}/results/*.ppm
+          if-no-files-found: warn

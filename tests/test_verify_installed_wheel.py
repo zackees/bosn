@@ -40,6 +40,27 @@ def test_windows_pyd_rejects_non_abi3_wheel_tag(
         verifier.assert_platform_wheel_contents(wheel)
 
 
+def test_pip_installer_is_offline_and_targets_the_venv_interpreter(tmp_path: Path) -> None:
+    """The Recovery guest has no uv and no network; pip must install from the payload only."""
+
+    python = tmp_path / "environment" / "bin" / "python"
+    wheel = tmp_path / "bosn-0.1.3-cp310-abi3-macosx_10_12_x86_64.whl"
+    command = verifier.install_command("pip", python=python, wheel=wheel)
+    assert command[:3] == [sys.executable, "-m", "pip"]
+    assert "--no-index" in command and "--no-deps" in command
+    assert command[command.index("--python") + 1] == str(python)
+    # --python is a global option: it must come before the install subcommand,
+    # or pip refuses it.
+    assert command.index("--python") < command.index("install")
+    assert command[-1] == str(wheel)
+
+
+def test_uv_installer_requires_uv_on_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(verifier.shutil, "which", lambda _name: None)
+    with pytest.raises(AssertionError, match="uv is required"):
+        verifier.install_command("uv", python=tmp_path / "python", wheel=tmp_path / "w.whl")
+
+
 @pytest.mark.parametrize(
     ("os_name", "expected_extension"),
     [("nt", "_native.pyd"), ("posix", "_native.abi3.so")],

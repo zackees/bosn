@@ -130,10 +130,50 @@ Mach-O extension and bundled CLI before publishing the artifact.  The PyO3
 module is `abi3-py310`, so release wheels are `cp310-abi3` rather than
 cp311-only artifacts and support CPython 3.10 and newer.
 
-The x86_64 guest mechanism remains the only sanctioned path to execute a
-Darwin artifact from Linux.  It is not part of the per-PR wheel build, and
-there is no fleet-wide arm64 execution path.  See issue #252 for the advisory
-Recovery-guest execution follow-up.
+### Executing the wheel: the advisory Recovery lane
+
+Linux cannot run a Mach-O, and no fake smoke test stands in for one.  The
+only sanctioned way to *execute* a Darwin artifact from CI is an x86_64 macOS
+guest on a Linux runner, and `.github/workflows/macos-x64-execute.yml` does
+exactly that (issue #252, Part 2):
+
+1. `build-x64-wheel` rebuilds the `cp310-abi3-macosx_10_12_x86_64` wheel with
+   the same pinned Soldr contract as CI and verifies it statically.
+2. `ci/recovery_payload.py` stages one tarball: the wheel, this repo's
+   `ci/verify_installed_wheel.py`, and a relocatable CPython **3.10.18**
+   (python-build-standalone 20250612, sha256-pinned) whose `libpython` has one
+   `LC_LOAD_DYLIB` repointed from `/usr/lib/libpanel.5.4.dylib` — absent in
+   Recovery — to `libSystem` (`ci/patch_recovery_python.py`, the technique
+   mimalloc-pprof proved on 3.12).  3.10 is deliberate: the wheel is exercised
+   on the oldest interpreter its abi3 tag claims.
+3. `zackees/docker-mac-x64` (pinned sha) boots a macOS **Recovery** guest
+   (OSX-KVM under QEMU/KVM) on `ubuntu-latest`.  No macOS runner is involved;
+   `ci/lint_no_macos_runners.py` still refuses one.  The guest fetches the
+   payload over the action's local HTTP share, creates a venv, installs the
+   wheel offline with `--installer pip`, and runs the full verifier — import,
+   `bosn --version`, offline `doctor`, daemon start/readiness/stop — writing
+   its exit code and log to the collected directory.
+4. `ci/recovery_wheel_result.py` decides on the runner.  Waivers are an
+   **exact set** (`WAIVED_PHASES`, empty until a Recovery run proves a phase
+   cannot run there, each with a written reason): a failure in a waived phase
+   passes and says so; any other failure is red; a pass while a waiver is on
+   file is red because the waiver is stale.  Nothing is skipped silently.
+
+**Status: advisory.**  It runs nightly and on `workflow_dispatch`, is not a
+required check, and does not gate a release.  Promotion to a release gate is
+a separate decision after a green track record, taken in the issue that
+records the runs.  Recovery is a cut-down userland (no dyld shared cache, no
+Xcode CLT, ramdisk `/tmp`); a phase that only fails there is an environment
+fact to waive with a reason, not a product defect.
+
+**arm64 has no execution path anywhere in the fleet.**  There is no arm64
+macOS guest that runs on Linux, and no repository executes an
+`aarch64-apple-darwin` artifact in CI; that wheel stays compile-plus-static-
+verification only, like every sibling repository's.
+
+Bosn's own `macos-x64-guest` stack kind (this document) remains the dev-box
+path for a *full* macOS userland; it is not used by CI because its runtime
+accepts only `dockurr/macos` pinned by digest, not a CI-baked image.
 
 ```bash
 # Linux stack — soldr carries its own macOS SDK and LLVM, so no Mac is involved
