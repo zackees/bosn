@@ -1,0 +1,123 @@
+{
+  "run": {
+    "id": 34876130390,
+    "name": "CI",
+    "created_at": "2026-09-14T17:40:01Z",
+    "run_started_at": "2026-09-14T17:40:01Z",
+    "updated_at": "2026-09-14T17:45:19Z",
+    "status": "completed",
+    "conclusion": "success",
+    "event": "push",
+    "head_branch": "main",
+    "head_sha": "f1c397072bf3bdb64f8c4ae57e5be3950befa848",
+    "html_url": "https://github.com/zackees/bosn/actions/runs/34876130390",
+    "run_attempt": 1
+  },
+  "jobs": [
+    {
+      "id": 104083658013,
+      "name": "Native wheel (ubuntu-latest)",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-09-14T17:40:02Z",
+      "started_at": "2026-09-14T17:40:04Z",
+      "completed_at": "2026-09-14T17:42:20Z",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "runner_name": "GitHub Actions 1001207431",
+      "html_url": "https://github.com/zackees/bosn/actions/runs/34876130390/job/104083658013",
+      "run_attempt": 1
+    },
+    {
+      "id": 104083658203,
+      "name": "CI policy (no hosted macOS runners)",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-09-14T17:40:02Z",
+      "started_at": "2026-09-14T17:40:04Z",
+      "completed_at": "2026-09-14T17:40:12Z",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "runner_name": "GitHub Actions 1001207433",
+      "html_url": "https://github.com/zackees/bosn/actions/runs/34876130390/job/104083658203",
+      "run_attempt": 1
+    },
+    {
+      "id": 104083658242,
+      "name": "Darwin wheel (x86_64-apple-darwin, Linux-hosted Soldr)",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-09-14T17:40:02Z",
+      "started_at": "2026-09-14T17:40:05Z",
+      "completed_at": "2026-09-14T17:44:33Z",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "runner_name": "GitHub Actions 1001207432",
+      "html_url": "https://github.com/zackees/bosn/actions/runs/34876130390/job/104083658242",
+      "run_attempt": 1
+    },
+    {
+      "id": 104083658284,
+      "name": "Native wheel (windows-latest)",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-09-14T17:40:02Z",
+      "started_at": "2026-09-14T17:40:05Z",
+      "completed_at": "2026-09-14T17:45:18Z",
+      "labels": [
+        "windows-latest"
+      ],
+      "runner_name": "GitHub Actions 1001207434",
+      "html_url": "https://github.com/zackees/bosn/actions/runs/34876130390/job/104083658284",
+      "run_attempt": 1
+    },
+    {
+      "id": 104083658324,
+      "name": "Rust workspace (locked tests)",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-09-14T17:40:02Z",
+      "started_at": "2026-09-14T17:40:05Z",
+      "completed_at": "2026-09-14T17:41:20Z",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "runner_name": "GitHub Actions 1001207435",
+      "html_url": "https://github.com/zackees/bosn/actions/runs/34876130390/job/104083658324",
+      "run_attempt": 1
+    },
+    {
+      "id": 104083658357,
+      "name": "Darwin wheel (aarch64-apple-darwin, Linux-hosted Soldr)",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-09-14T17:40:02Z",
+      "started_at": "2026-09-14T17:40:05Z",
+      "completed_at": "2026-09-14T17:44:30Z",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "runner_name": "GitHub Actions 1001207436",
+      "html_url": "https://github.com/zackees/bosn/actions/runs/34876130390/job/104083658357",
+      "run_attempt": 1
+    },
+    {
+      "id": 104083658386,
+      "name": "Linux (lint + unit + docker)",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-09-14T17:40:02Z",
+      "started_at": "2026-09-14T17:40:05Z",
+      "completed_at": "2026-09-14T17:44:16Z",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "runner_name": "GitHub Actions 1001207437",
+      "html_url": "https://github.com/zackees/bosn/actions/runs/34876130390/job/104083658386",
+      "run_attempt": 1
+    }
+  ]
+}
