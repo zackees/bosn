@@ -40,9 +40,58 @@ RETIRED_LIFECYCLE_MODULES = (
     "guest",
 )
 
+# The smoke lane must fail diagnostically rather than leave a platform runner
+# occupied forever when a child process or its local IPC transport wedges.
+CLI_TIMEOUT_SECONDS = 10
+INSTALL_TIMEOUT_SECONDS = 120
+
 
 def fail(message: str) -> NoReturn:
     raise AssertionError(message)
+
+
+def phase(name: str) -> None:
+    """Emit an immediate, compact CI progress marker."""
+
+    print(f"[wheel-smoke] {name}", flush=True)
+
+
+def tail(value: str | bytes | None, limit: int = 2048) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        value = value.decode(errors="replace")
+    return value[-limit:]
+
+
+def daemon_detail(daemon: subprocess.Popen[str] | None) -> str:
+    if daemon is None:
+        return "not started"
+    if daemon.poll() is None:
+        return "still running"
+    stdout, stderr = daemon.communicate()
+    return f"exited={daemon.returncode}, stdout={tail(stdout)!r}, stderr={tail(stderr)!r}"
+
+
+def timeout_detail(
+    error: subprocess.TimeoutExpired,
+    *,
+    state: Path | None = None,
+    daemon: subprocess.Popen[str] | None = None,
+) -> str:
+    detail = (
+        f"command={error.cmd!r}; timeout={error.timeout}s; "
+        f"stdout={tail(error.output)!r}; stderr={tail(error.stderr)!r}"
+    )
+    if state is not None:
+        socket_candidate = state / "bosn-rs.sock"
+        detail += (
+            f"; state={state}; state_exists={state.exists()}; "
+            f"socket_candidate_length={len(os.fsencode(socket_candidate))}"
+        )
+    if daemon is not None:
+        detail += f"; daemon={daemon_detail(daemon)}"
+    return detail
 
 
 def platform_executable_suffix() -> str:
@@ -134,12 +183,41 @@ def child_environment(scripts: Path) -> dict[str, str]:
     return environment
 
 
-def run(command: list[str], *, cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, cwd=cwd, env=env, check=True, text=True, capture_output=True)
+def run(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    check: bool = True,
+    state: Path | None = None,
+    daemon: subprocess.Popen[str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            check=check,
+            text=True,
+            capture_output=True,
+            timeout=CLI_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        fail(
+            "installed-wheel command timed out: "
+            f"{timeout_detail(error, state=state, daemon=daemon)}"
+        )
 
 
-def json_output(command: list[str], *, cwd: Path, env: dict[str, str]) -> dict[str, object]:
-    result = run(command, cwd=cwd, env=env)
+def json_output(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    state: Path | None = None,
+    daemon: subprocess.Popen[str] | None = None,
+) -> dict[str, object]:
+    result = run(command, cwd=cwd, env=env, state=state, daemon=daemon)
     try:
         value = json.loads(result.stdout)
     except json.JSONDecodeError as error:
@@ -163,13 +241,17 @@ def wait_for_daemon(
         if daemon.poll() is not None:
             stdout, stderr = daemon.communicate()
             fail(f"installed daemon exited early ({daemon.returncode}): {stdout}\n{stderr}")
-        status = subprocess.run(
-            [str(cli), "daemon", "status", "--state-dir", str(state), "--json"],
-            cwd=cwd,
-            env=env,
-            text=True,
-            capture_output=True,
-        )
+        try:
+            status = run(
+                [str(cli), "daemon", "status", "--state-dir", str(state), "--json"],
+                cwd=cwd,
+                env=env,
+                check=False,
+                state=state,
+                daemon=daemon,
+            )
+        except AssertionError as error:
+            fail(f"installed daemon readiness probe failed: {error}")
         last_status = (
             f"exit={status.returncode}, stdout={status.stdout[-512:]!r}, "
             f"stderr={status.stderr[-512:]!r}"
@@ -179,23 +261,18 @@ def wait_for_daemon(
             if value.get("action") == "daemon_status" and value.get("daemon") == "online":
                 return
         time.sleep(0.05)
-    if daemon.poll() is None:
-        daemon_detail = "still running"
-    else:
-        stdout, stderr = daemon.communicate()
-        daemon_detail = (
-            f"exited={daemon.returncode}, stdout={stdout[-2048:]!r}, stderr={stderr[-2048:]!r}"
-        )
+    detail = daemon_detail(daemon)
     socket_candidate = state / "bosn-rs.sock"
     fail(
         "installed daemon did not become ready; "
-        f"daemon={daemon_detail}; "
+        f"daemon={detail}; "
         f"socket_candidate_length={len(os.fsencode(socket_candidate))}; "
         f"last_status={last_status}"
     )
 
 
 def verify_installed_wheel(wheel: Path) -> None:
+    phase("inspect wheel archive")
     assert_platform_wheel_contents(wheel)
     uv = shutil.which("uv")
     if uv is None:
@@ -213,14 +290,24 @@ def verify_installed_wheel(wheel: Path) -> None:
         # filesystem socket endpoint.
         state = root / "state"
         workdir.mkdir()
+        phase("create isolated virtual environment")
         venv.EnvBuilder(with_pip=True).create(environment)
         python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
         scripts = environment / ("Scripts" if os.name == "nt" else "bin")
-        subprocess.run(
-            [uv, "pip", "install", "--python", str(python), "--no-deps", str(wheel)], check=True
-        )
+        phase("install wheel")
+        try:
+            subprocess.run(
+                [uv, "pip", "install", "--python", str(python), "--no-deps", str(wheel)],
+                check=True,
+                text=True,
+                capture_output=True,
+                timeout=INSTALL_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            fail(f"installed-wheel dependency installation timed out: {timeout_detail(error)}")
 
         env = child_environment(scripts)
+        phase("import installed extension")
         imported = run(
             [
                 str(python),
@@ -261,10 +348,12 @@ def verify_installed_wheel(wheel: Path) -> None:
             fail(f"Python and native versions differ: {versions}")
 
         cli = scripts / f"bosn{platform_executable_suffix()}"
+        phase("verify installed CLI version")
         version = run([str(cli), "--version"], cwd=workdir, env=env)
         if version.stdout != f"bosn {versions['package_version']}\n":
             fail(f"installed CLI reported an unexpected version: {version.stdout!r}")
 
+        phase("verify offline doctor")
         offline_doctor = json_output(
             [str(cli), "doctor", "--state-dir", str(state), "--json"], cwd=workdir, env=env
         )
@@ -276,6 +365,7 @@ def verify_installed_wheel(wheel: Path) -> None:
         if state.exists():
             fail("doctor initialized daemon state")
 
+        phase("start daemon")
         daemon = subprocess.Popen(
             [str(cli), "daemon", "serve", "--state-dir", str(state)],
             cwd=workdir,
@@ -285,16 +375,25 @@ def verify_installed_wheel(wheel: Path) -> None:
             stderr=subprocess.PIPE,
         )
         try:
+            phase("wait for daemon readiness")
             wait_for_daemon(cli, state, cwd=workdir, env=env, daemon=daemon)
+            phase("verify online doctor")
             doctor = json_output(
-                [str(cli), "doctor", "--state-dir", str(state), "--json"], cwd=workdir, env=env
+                [str(cli), "doctor", "--state-dir", str(state), "--json"],
+                cwd=workdir,
+                env=env,
+                state=state,
+                daemon=daemon,
             )
             if doctor.get("action") != "doctor" or doctor.get("daemon") != "ready":
                 fail(f"doctor did not inspect the installed daemon: {doctor}")
+            phase("stop daemon")
             stopped = json_output(
                 [str(cli), "daemon", "stop", "--state-dir", str(state), "--json"],
                 cwd=workdir,
                 env=env,
+                state=state,
+                daemon=daemon,
             )
             if stopped != {"action": "daemon_stop", "stopped": True}:
                 fail(f"installed daemon did not stop cleanly: {stopped}")
@@ -303,8 +402,16 @@ def verify_installed_wheel(wheel: Path) -> None:
                 fail(f"installed daemon failed while stopping: {stdout}\n{stderr}")
         finally:
             if daemon.poll() is None:
+                phase("force-reap daemon")
                 daemon.kill()
-                daemon.wait(timeout=10)
+                try:
+                    daemon.wait(timeout=CLI_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired as error:
+                    fail(
+                        "installed daemon could not be reaped: "
+                        f"{timeout_detail(error, state=state, daemon=daemon)}"
+                    )
+        phase("complete")
 
 
 def main() -> None:
