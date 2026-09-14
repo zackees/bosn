@@ -1,773 +1,82 @@
-# Rust migration contract (Phase 0 working inventory)
+# Rust migration status
 
-This is the authoritative migration inventory for issue #153.  It describes the
-implemented Python behavior at this checkout, not a promise of Python API compatibility.
-The Rust port preserves state and safety semantics; it may deliberately replace command and
-daemon protocol syntax. Measurements below provide a reproducible starting point; they
-are not performance promises or evidence that the Rust migration is implemented.
+Bosn is being migrated under [issue #153](https://github.com/zackees/bosn/issues/153).
+The application domain, daemon protocol, SQLite state registry, Docker engine
+seam, native CLI, PyO3 binding, MCP server, and URL setup path are Rust code.
+`kernal-api` is the OS boundary and is pinned by reviewed revision until its
+required publishing workflow is available.
 
-## Phase checklist
+## Python lifecycle retirement
 
-- [x] Inventory current Python CLI, Compose, guest, state, and consumer-facing behavior.
-- [x] Characterize a portable synthetic Python-v4 registry fixture and its relations.
-- [x] Specify proposed typed client/config/protobuf boundaries and kernal-api ownership.
-- [ ] Record reviewed consumer inventory beyond this repository.
-- [x] Measure startup, idle RSS, status, ensure-reuse, and build/package cost.
-- [ ] Review the matrix and classify any behavior intentionally removed before Rust coding.
-
-## Landed implementation checkpoints
-
-- [Bosn #154](https://github.com/zackees/bosn/pull/154): Python state fixture and
-  runtime baseline. The broader Docker baseline failure is recorded below.
-- [kernal-api #192](https://github.com/zackees/kernal-api/pull/192): optional
-  SQLite facade. Exact registry publication and native platform proof remain open.
-- [Bosn #155](https://github.com/zackees/bosn/pull/155): pure Rust ownership,
-  per-holder lease observations, retention/idle-stop decisions and ordering.
-  Thirteen Rust tests pass; this does not implement persistent registry access,
-  daemon mutation, or the client front ends. See `docs/rust-domain.md`.
-- [Bosn #159](https://github.com/zackees/bosn/pull/159), merge `39e9253`:
-  guarded Python-v4 import preparation. Import activation and engine
-  reconciliation remain pending.
-- [kernal-api #207](https://github.com/zackees/kernal-api/pull/207), merge
-  `ed197c5`: owner-private bounded file reads used by the guarded import path.
-  This does not complete cutover or activation.
-
-No implementation phase is marked complete solely because one checkpoint landed.
-
-### Rust Docker transport checkpoint (issue #153)
-
-`bosn-engine` provides a local Docker-CLI transport over the pinned public
-`kernal-api` process/session facade. It has bounded separated diagnostic capture,
-tagged streaming output, explicit deadline/cancellation and direct-client reaping.
-It accepts trusted, product-selected Docker argv/environment and is not an operation
-authorization boundary or sandbox; it is deliberately not exposed through daemon IPC.
-Killing a local `docker exec` client is not evidence that its remote command stopped;
-future job cancellation must validate Bosn ownership of the remote container before
-reporting it stopped. Health-monitor probing, interactive inherited-TTY execution,
-container lifecycle/build/pull/create/start/remove policy, and that remote cancellation
-protocol remain subsequent engine work, rather than silently claimed by this transport.
-The transport acceptance tests were added RED first (missing crate import), then GREEN:
-native synthetic-child tests cover stream separation, ordinary exit 130, spawn versus
-deadline classification, oversized output without a newline, pre-exit streaming,
-cancellation, and native post-cancellation identity observation proving client reaping.
-
-### Declared setup-task primitive
-
-`bosn-setup` can now execute exactly one named task retained in a validated
-`SetupPlan` after a matching `PreparedImage` receipt is supplied.  It verifies
-the canonical workspace, prepared image identity, task name, plan receipt,
-document-derived environment merge, workspace-relative workdir, and declared
-existing workspace mounts before reaching the engine.  Its testable command is
-the finite `SetupTaskCommand::Run` semantic shape; the `DockerEngine` adapter
-may emit only `docker run --rm` with document-derived bind mounts, environment,
-workdir, the observed image identity, and `sh -lc` with the declared task text.
-The primitive is submitted through typed daemon IPC and the bounded native,
-Python, and MCP job-submission surfaces. It deliberately still has no registry
-persistence or broader container lifecycle wiring.
-
-An opt-in live-Docker acceptance test proves the production daemon's complete
-plan, image-prepare, and named-task pipeline from one self-contained TOML:
+The legacy Python implementation was removed in the Phase 7 consumer-migration
+slice. The following former production modules are no longer present in the
+wheel or source tree:
 
 ```text
-soldr cargo test -j1 -p bosn-service --test setup_task_docker --locked -- --ignored --exact live_docker_setup_task_runs_only_the_declared_one_file_task
+accounting autostart cli clock compose config converge daemon docker_cli engine
+frontdoor gc gitstate guest ipc jobs labels legacy manifest migration_lock
+options paths recovery registry resources retention shims
 ```
 
-It uses the exact pre-pulled Alpine digest named in the test, checks bounded
-stdout/stderr job logs and the document-derived mount/workdir/environment
-artifact, then verifies the ephemeral task container is already gone (`--rm`).
-It restarts the daemon, removes the source TOML, and repeats the named task
-from the verified offline receipt. The request surface deliberately contains
-only workspace, config, policy, task name, deadline, and output budget; it
-cannot carry a command, image, mount, environment, workdir, container name, or
-raw Docker argument. The test performs no Docker cleanup: each short-lived
-task container removes itself, and it never deletes images or persistent apps.
+They formerly implemented Python-owned Docker process execution, lifecycle
+decisions, daemon state, and `sqlite3` registry access. Keeping them importable
+would leave two writers and two Docker control planes, so no compatibility shim
+is provided. The old Python-only test suite, compose/front-door documentation,
+and historical Soldr manifest have been removed with those APIs.
 
-### Setup-app ensure core primitive
-
-`bosn-setup::ensure_setup_app` is the next deliberately narrow core primitive
-for one-file Docker Linux apps. It derives a deterministic managed container
-name and ownership labels solely from the validated setup-plan content hash,
-then performs only inspect, create-if-absent, and start-if-stopped through the
-finite `SetupEnsureCommand` protocol. Create receives only the validated
-document's image receipt, mounts, environment, workdir, and optional declared
-`app.command` (as `sh -lc`). An existing candidate must exactly prove the
-expected image and Bosn labels or is refused before mutation. It is exposed
-through typed daemon jobs and the bounded native CLI, Python, and MCP
-submission surfaces. After a successful ensure, the daemon's sole registry
-writer atomically upserts the managed container and a separate machine-scoped
-`Image` resource with one `ResourceUse` each. The image's logical identity and
-registry generation are the inspected canonical Docker image ID; mutable
-document references and tags are never used as registry identity. Failed or
-cancelled ensures persist neither fact, and repeat ensures are idempotent. It
-never deletes, replaces, stops, adopts, or garbage-collects a container.
-
-When a successful ensure records a different content generation for the same
-canonical workspace and `setup` stack, that same writer transaction marks the
-previous Bosn `setup-container:*` resource and its matching `ResourceUse` row
-`retired`. This is accounting only: the old Docker container is neither stopped
-nor removed. The transition is exact-workspace/exact-stack and container-only;
-it does not affect another workspace or stack, and it never retires an image
-because one inspected image identity may be shared. A failed, cancelled, or
-conflicted transaction leaves the prior generation active.
-
-The same writer keeps a compact, durable audit trail in the existing registry
-`events` table: `setup.ensure.submitted`, then exactly one terminal
-`succeeded`, `failed`, `cancelled`, or (for a pending replacement)
-`superseded` event. Submission details contain only the numeric in-memory job
-ID, policy, and locator *kind* (`https`, `http`, `file`, or `path`); terminal details
-contain only that ID and outcome. They never store a setup URL, query string,
-workspace path, engine output, Docker receipt, or container/image identifier.
-The successful terminal event is appended in the same SQLite transaction as
-both resource facts and use rows, so a failed transaction cannot claim a
-successful ensure. Job status/log retention remains deliberately in-memory;
-the event history is the durable summary across daemon restarts.
-
-### Read-only registry diagnostics
-
-The native daemon exposes bounded, authenticated read-only diagnostics without
-turning the SQLite file into a public API. `bosn registry resources` returns
-managed-resource summaries/details (ID, kind, name, stack, generation, state,
-retention, timestamps) and deliberately omits workspace and scope bindings.
-`bosn registry setup-ensure-events` returns newest-first, cursor-paginated
-`setup.ensure.*` plus native `manifest.recovery.*` lifecycle outcomes. Both accept `--after` and `--limit 1..=64` and
-require an already-running daemon; they never create, migrate, or open a
-registry from the CLI process. Equivalent APIs are
-`bosn.Client.registry_resources()` and `bosn.Client.setup_ensure_events()` in
-Python, and the read-only MCP tools `bosn_registry_resources` and
-`bosn_setup_ensure_events`. MCP state selection remains fixed at server start;
-the tools accept no state/file path, Docker, workspace, or raw SQL controls.
-Malformed page arguments are rejected before daemon IPC.
-
-### Bounded daemon doctor
-
-`bosn doctor --state-dir STATE --json` performs a fixed, daemon-owned
-read-only health check. The already-running daemon runs SQLite's integrity
-check through its sole writer and one fixed `docker version` probe through the
-`kernal-api` process facade. Its stable result has `daemon`, `registry`, and
-`engine` states plus client/server version strings only when the engine is
-reachable. Engine stderr, Docker endpoints, paths, environment, process
-errors, and arbitrary output are never returned. The complete diagnostic has
-a fixed two-second budget: 500 ms for SQLite and 1.5 seconds/512 bytes for
-Docker; callers cannot override any of those bounds or supply Docker
-arguments. A missing daemon reports the typed
-`"unavailable"` state without the CLI or client creating/migrating a registry.
-
-The equivalent read-only APIs are `bosn.Client.doctor()` in Python and the
-no-argument MCP tool `bosn_doctor`; both require the daemon selected when the
-client/server was created and accept no state path or diagnostic controls.
-
-### Setup reconciliation preview
-
-`bosn setup reconcile preview --state-dir STATE --workspace WORKSPACE`, Python
-`Client.setup_reconcile_preview(workspace)`, and MCP
-`bosn_setup_reconcile_preview` compare only durable managed setup-container
-records with one fixed, bounded `docker container inspect` per record. Results
-are `matching_running`, `matching_stopped`, `missing`, `name_mismatch`,
-`label_mismatch`, `image_mismatch`, `inspect_error`, or `unknown`; `unknown` is conservative
-and never becomes a repair/GC candidate.
-The check requires exact deterministic name, all Bosn ownership labels, and a
-recorded Docker image identity. It returns neither workspace paths nor raw
-engine output. A record that is `missing` and has exactly one active local
-`setup` use, with no foreign use, lease, or execution session, includes an
-opaque repair token. Only that token may be applied through `bosn setup
-reconcile repair-missing --state-dir STATE --workspace WORKSPACE --candidate
-TOKEN --apply --yes`, Python
-`Client.setup_reconcile_repair_missing(workspace, token, confirm=True)`, or
-MCP `bosn_setup_reconcile_repair_missing` with `confirm: true`. The daemon
-rereads every registry predicate, performs only fixed exact Docker inspection,
-and requires the container to remain absent before one immediate transaction
-retires exactly that resource/use and appends a redacted reconciliation event.
-It never creates, starts, stops, removes, or otherwise mutates Docker; a later
-semantic ensure is responsible for recreating an app. Repeating the exact
-already-repaired token is a no-write success; any mismatch, lease/session,
-foreign use, or changed observation refuses.
-
-### Setup GC preview and narrowly confirmed apply
-
-`bosn gc preview --state-dir STATE --workspace WORKSPACE --json`, Python
-`Client.setup_gc_preview(workspace)`, and read-only MCP
-`bosn_setup_gc_preview` expose only a bounded registry preview. They never
-call Docker or write SQLite. A candidate must be a retired Bosn-owned setup container with an
-unambiguous retired use and no lease or execution session; foreign, active,
-adopted/done, incomplete, or otherwise ambiguous ownership is protected.
-Preview returns an opaque candidate token. Destructive apply is available only
-as `bosn gc apply --state-dir STATE --workspace WORKSPACE --candidate TOKEN
---apply --yes`, Python `Client.setup_gc_apply(workspace, token,
-confirm=True)`, or MCP `bosn_setup_gc_apply` with `confirm: true`. It accepts
-no Docker identifier, raw arguments, selectors, image, or prune option. The
-daemon rereads registry protections before inspection and again in its final
-SQLite transaction; Docker is inspected twice and must be stopped with all
-three Bosn setup ownership labels matching the exact candidate. Only then does
-it run `docker container rm` for that exact known name. It never removes
-images, volumes, active containers, or ambiguous/foreign records. If the exact
-container is already absent, apply conservatively removes only its still-valid
-retired registry record and records `setup.gc.reconciled_missing`; this is
-idempotent reconciliation, not an engine deletion claim.
-
-When a retired generation is still running, it can first be stopped without
-removal using `bosn setup stop-retired --state-dir STATE --workspace WORKSPACE
---candidate TOKEN --apply --yes`, Python
-`Client.setup_stop_retired(workspace, token, confirm=True)`, or MCP
-`bosn_setup_stop_retired` with `confirm: true`. It accepts the same opaque
-preview token only, rechecks all registry protections and exact ownership
-labels, performs only fixed `docker container stop NAME`, reinspects the
-stopped state, and records a compact event. An already stopped exact candidate
-is idempotent and remains eligible for the separate GC apply operation.
-
-The opt-in live acceptance proof creates two setup generations, applies only
-the preview token for the stopped retired generation, verifies that the current
-container and image remain, checks the durable GC event, and cleans exact
-ownership-verified test containers:
+The retained `bosn` package is deliberately small:
 
 ```text
-soldr cargo test -j1 -p bosn-service --test setup_ensure_docker --locked -- --ignored --exact live_docker_setup_gc_apply_removes_only_retired_generation
+bosn/__init__.py    native API re-exports
+bosn/__main__.py    native CLI entry point
+bosn/native_cli.py  package-local executable launcher
+bosn/_native.*      Rust PyO3 extension (wheel artifact)
 ```
 
-### Explicit setup completion
+`native_cli.py` may only execute the version-matched packaged Rust binary. The
+PEP 517 backend may run Cargo while building a wheel. Neither is a Bosn
+lifecycle implementation. The package has no runtime Python dependencies.
 
-`bosn setup done --state-dir STATE --workspace WORKSPACE --yes`, Python
-`Client.setup_done(workspace, confirm=True)`, and MCP `bosn_setup_done` with
-`confirm: true` record that one canonical workspace's active `setup` uses are
-done. This is a daemon-owned SQLite transaction only: it never invokes Docker,
-stops/removes a container, touches leases/sessions, or changes another
-workspace or stack. A machine resource becomes done only when it has no active
-uses anywhere, preserving shared/foreign ownership. Repeating completion is a
-no-op; a subsequent successful setup ensure reactivates its current resource
-and use. The sole event detail is the fixed redacted
-`workspace_setup_completed` marker, not a workspace path.
+## Native operation boundary
 
-An opt-in live proof exercises the production daemon and kernal-api Docker
-transport end to end, including daemon restart and matching-container reuse:
+Only the Rust daemon creates, starts, executes in, retires, or garbage-collects
+Docker resources and only its registry actor writes SQLite. CLI, Python, and
+MCP calls are authenticated typed requests to that daemon. Local parsing/planning
+is inert and is revalidated by the daemon before a mutation.
 
-```text
-cargo test -p bosn-service --test setup_ensure_docker -- --ignored --exact live_docker_setup_ensure_creates_and_reuses_one_managed_app
-```
+The supported native surface includes bounded status/doctor and job observation,
+setup plan/prepare/ensure/task/app-task, manifest ensure/converge/app-task,
+managed named volumes, workspace bind mounts/workdirs, tmpfs, Dockerfile and
+pinned-image sources, constrained macOS guest lifecycle, URL configuration, and
+Hermes-compatible stdio MCP. See [rust-manifest-runtime.md](rust-manifest-runtime.md)
+and [rust-registry.md](rust-registry.md) for exact support/refusal matrices.
 
-The companion one-file acceptance proof uses an inline Dockerfile carried only
-by the setup TOML. It verifies Bosn's content-addressed private build assets,
-the generated `bosn-setup:<content-sha256>` image, and ownership-safe reuse
-from a fresh daemon without writing the selected workspace:
+## Deliberate remaining release work
 
-```text
-cargo test -p bosn-service --test setup_ensure_docker -- --ignored --exact live_docker_setup_ensure_builds_and_reuses_inline_app
-```
+Issue #153 is not complete merely because the Python source is gone. Remaining
+work includes final feature-parity audit for all legacy lifecycle cases,
+documented offline import/cutover of a real Python-v4 registry, verified
+downstream consumer migrations (Soldr, clud, and kernal-api), exact published
+`kernal-api` and Python artifacts, and supported-platform wheel/runtime/GitHub
+Actions evidence. Existing Docker state must remain protected during that
+cutover; removing compatibility code does not authorize deleting data.
 
-Both require a usable Docker daemon and the exact pre-pulled Alpine digest
-named by the test. The inline proof does not need a separately authored
-Dockerfile, script, or build context. Each test creates one uniquely
-content-addressed app and its drop guard removes only that exact app after
-re-checking all ownership labels; neither uses Docker prune, a selector-based
-cleanup, or image deletion.
+## Verification
 
-## Current surface and characterization references
-
-### Main CLI (`bosn`)
-
-| Capability / verb | Contract to retain or intentionally decide | Characterization references |
-| --- | --- | --- |
-| `run`, `shell`, `ensure` | converge persistent stack, execute command / interactive shell, retain content-keyed resources | `tests/test_converge.py`, `tests/test_cli_verbs.py`, `tests/test_scenario_docker.py` |
-| `tasks` | list stacks/tasks/digests/readiness without mutating | `tests/test_cli_verbs.py`, `tests/test_manifest.py` |
-| `jobs`, `attach`, `cancel` | bounded daemon job list, streamed observation, cancellation | `tests/test_jobs.py`, `tests/test_cli_jobs.py`, `tests/test_daemon_jobs.py`, `tests/test_jobs_docker.py` |
-| `status`, `doctor` | bounded diagnostic status and Docker reachability/clock reporting | `tests/test_cli_verbs.py`, `tests/test_doctor_integrity.py`, `tests/test_engine.py` |
-| `gc`, `done` | dry-run default; collection only after ownership/lease/final recheck; mark workspace completed | `tests/test_gc.py`, `tests/test_retention.py`, `tests/test_accounting.py`, `tests/test_accounting_pressure.py` |
-| `adopt` (including `--legacy`, transfer) | label-based lost-registry recovery and explicit legacy/volume migration | `tests/test_recovery.py`, `tests/test_legacy.py`, `tests/test_resources.py`, `tests/test_cli_verbs.py` |
-| `reconcile-volume`, `release-volume` | preview-first repair/release of a declared volume; `--apply --yes`; pinned/attached/foreign protection | `tests/test_recovery.py`, `tests/test_cli_verbs.py`, `tests/test_converge.py` |
-| `daemon-stop`, hidden `__daemon`, login autostart | authenticated singleton, idle retirement, maintenance, graceful stop and platform launchers | `tests/test_daemon.py`, `tests/test_autostart.py`, `tests/test_platform_native.py` |
-| `init` | Compose-to-`bosn.toml`, refuse overwrite | `tests/test_docker_cli.py`, `tests/test_cli_verbs.py` |
-| global options | engine/state/manifest selection, JSON envelopes, unified policy precedence | `tests/test_options.py`, `tests/test_config.py`, `tests/test_cli_smoke.py` |
-
-The installed `bosn` package exposes a deliberately narrow native Python API:
-`Client(state_dir).status()` and
-`Client(state_dir).plan_setup(workspace, config_locator, *, policy)` and the
-daemon-backed `Client(state_dir).submit_setup_prepare(workspace, config_locator,
-*, policy, deadline_ms, output_limit)` and
-`Client(state_dir).submit_setup_task(workspace, config_locator, *, policy,
-task_name, deadline_ms, output_limit)` and
-`Client(state_dir).submit_setup_ensure(workspace, config_locator, *, policy,
-deadline_ms, output_limit)`. All return a durable job ID promptly; the task
-method can select only a declared task by its bounded semantic name, while the
-ensure method can only request the daemon-owned ownership-safe application
-ensure pipeline.
-`job_status(id)`, `job_logs(id, *, after=0, limit=64)`, and `cancel_job(id)`
-are typed IPC-only observation controls. The Python boundary has no Docker
-command, container, mount, environment, work-directory, or task-execution
-parameters. The setup planner requires either `"online_refresh"` or
-`"offline_cache_only"`;
-it releases the GIL while calling the Rust `bosn-setup` pipeline and returns a
-frozen receipt (`SetupPlan`) with source kind, content hash, schema, canonical
-workspace, optional private asset root, ordered task names, source shape, and
-`applied == false`.  It does not write the selected workspace, contact Docker
-or the Bosn daemon, or apply the document.  Other Python internal modules are
-not a compatibility contract.
-
-The production extension is deliberately built with PyO3's
-`extension-module` feature, so ordinary `soldr cargo test -p bosn --lib --locked`
-does not embed or link CPython. The fake-daemon Python boundary integration is
-available explicitly for development with an absolute interpreter and its
-library directory on the loader path:
+The retirement slice is checked by:
 
 ```bash
+uv run pytest tests/test_python_native_boundary.py tests/test_native.py -q
+uv run ruff check src tests ci
+uv run pyright
 PYTHON_BIN="$PWD/.venv/bin/python"
 PYTHON_LIB="$("$PYTHON_BIN" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
 PYO3_PYTHON="$PYTHON_BIN" LD_LIBRARY_PATH="$PYTHON_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-  soldr cargo test -p bosn --lib --locked --no-default-features --features embedded-python-tests
+  soldr cargo test -j1 -p bosn --lib --locked --no-default-features --features embedded-python-tests
 ```
 
-Installed-extension behavior is covered separately through
-`uv run maturin develop --locked && uv run pytest tests/test_native.py`.
-
-### Live Python native setup-ensure acceptance
-
-### Safe registry-loss adoption
-
-`bosn setup adopt --yes --state-dir STATE --workspace WORKSPACE --config LOCATOR
---refresh --deadline-ms 30000 --output-limit 1048576` is the explicit recovery
-path when a local registry was lost but the deterministic Bosn-managed setup
-container remains. The daemon re-plans and prepares only to obtain the verified
-image identity, then inspects exactly the derived container name. It requires
-all three Bosn labels, exact content-derived name, and exact inspected image
-identity. It records container/image resources and uses atomically with a
-redacted `setup.ensure.adopted` event. It never accepts Docker arguments,
-container or image selectors, and it never starts, stops, removes, replaces,
-or adopts a foreign/incomplete candidate. The same confirmed operation is
-available as `Client.setup_adopt(..., confirm=True)` and MCP
-`bosn_setup_adopt`.
-
-The opt-in Docker registry-loss proof is:
-
-```text
-soldr cargo test -j1 -p bosn-service --test setup_ensure_docker --locked -- --ignored --exact live_docker_setup_adopt_restores_lost_registry_without_touching_app
-```
-
-The following opt-in acceptance starts the package-local production daemon and
-uses only `bosn.Client` from the installed PyO3 extension to plan, submit,
-poll status/logs, and reuse a one-file pinned-image setup app after a daemon
-restart. Docker is used only to verify the app and to perform exact
-ownership-label cleanup. It needs a reachable local Docker daemon and the
-pre-pulled pinned Alpine digest named by the test:
-
-```bash
-BOSN_RUN_LIVE_DOCKER=1 uv run pytest tests/test_native_setup_ensure_docker.py -q
-```
-
-The test is excluded unless `BOSN_RUN_LIVE_DOCKER=1` is explicit. It also
-proves the Python binding rejects `docker_args`, `command`, and `mounts` as
-unknown submission fields; these controls are not part of the Python API.
-
-### Installed native CLI wheel
-
-The distribution's `bosn` console entry point is a small Python launcher that
-executes the version-matched Rust `bosn-native` target packaged inside the
-installed wheel. It resolves the executable relative to the installed `bosn`
-package, never by searching `PATH`, so it cannot select a source checkout or a
-different Bosn installation. The launcher exposes only the native CLI; the
-legacy Python lifecycle front doors are not installed as console scripts.
-
-Maturin 1.15's PyO3 bridge builds the extension but does not package a binary
-target from the same mixed project. `bosn_build_backend` is therefore the
-PEP 517 backend: it compiles the shared `bosn-native` target first, stages it
-in Maturin's `platlib` wheel data, and requests an audited platform wheel. On
-Linux it additionally stages the exact OpenSSL runtime objects needed by that
-standalone executable, while the launcher supplies only the package-local
-library directories at exec time. This is a build-time packaging concern, not
-a second daemon implementation.
-
-Run the hermetic artifact proof with:
+The wheel proof builds and installs a fresh artifact without the checkout:
 
 ```bash
 uv run pytest tests/test_native_wheel.py -q
 ```
-
-It builds the wheel through PEP 517, installs it in a fresh virtual environment,
-clears checkout and host-library paths, verifies `import bosn`, package-local
-native-executable discovery, `bosn --version`, and `bosn daemon --help`. The
-release matrix still needs equivalent macOS and Windows runtime-dependency
-proofs before cross-platform publication is declared complete.
-
-### Native setup submission CLI
-
-`bosn setup prepare` submits a durable, daemon-owned image-preparation job and
-returns immediately; it never launches the daemon or invokes Docker itself.
-Every input is explicit and bounded:
-
-```text
-bosn setup prepare --state-dir STATE --workspace WORKSPACE --config LOCATOR \
-  (--refresh | --offline) --deadline-ms 1..=300000 \
-  --output-limit 1..=8388608 [--json]
-```
-
-The receipt is `action: setup_prepare`, `submitted: true`, and a `job_id`
-(the JSON form uses the same fields). Existing daemon jobs, including setup
-preparation, can be observed or cancelled without launching a daemon or
-invoking Docker:
-
-```text
-bosn job status --state-dir STATE --job-id ID [--json]
-bosn job logs --state-dir STATE --job-id ID [--after CURSOR] [--limit 1..=256] [--json]
-bosn job cancel --state-dir STATE --job-id ID [--json]
-```
-
-`bosn setup task` submits the complete daemon-owned plan, image-preparation,
-and one declared-task pipeline. It returns immediately with `action:
-setup_task`, `submitted: true`, and a `job_id`; use the same job observation
-commands for progress and cancellation:
-
-```text
-bosn setup task --state-dir STATE --workspace WORKSPACE --config LOCATOR \
-  (--refresh | --offline) --task NAME --deadline-ms 1..=300000 \
-  --output-limit 1..=8388608 [--json]
-```
-
-The command submits only a named task declared in the validated setup document.
-It never starts a daemon or invokes Docker itself, and it accepts no task
-command, container, mount, environment, working-directory, per-request state
-override, or other engine controls.
-
-`bosn setup app-task` is a separate Phase-3 runtime slice: it runs one named,
-declared task inside an already ensured setup application rather than creating
-the ephemeral `docker run --rm` task container used by `bosn setup task`.
-The daemon re-plans the document, verifies its image receipt, and performs a
-fresh exact ownership inspection of the content-addressed app name and Bosn
-labels before its only execution shape, `docker container exec NAME sh -lc
-DECLARED_COMMAND`. It records a live `execution_sessions` row with a redacted
-lifecycle event before exec. A known normal exit (success or nonzero task
-exit) removes that row transactionally. Cancellation, deadline, output, or
-transport uncertainty leaves the row and records `remote_completion_unknown`,
-so restart recovery and GC continue to protect the exact app until a future
-ownership-aware reconciliation establishes a terminal state.
-
-```text
-bosn setup app-task --state-dir STATE --workspace WORKSPACE --config LOCATOR \
-  (--refresh | --offline) --task NAME --deadline-ms 1..=300000 \
-  --output-limit 1..=8388608 [--json]
-```
-
-Native Python exposes the same typed operation as
-`Client.submit_setup_app_task(...)`, and MCP exposes `bosn_setup_app_task`
-with the same six semantic inputs and non-destructive job-submission
-annotation. It accepts no container ID/name, command, Docker argument, mount,
-environment, or guest/Compose control. It does not create, start, stop,
-replace, or remove an app; a missing, foreign, mismatched, or stopped app is
-refused before exec. Cancelling or timing out
-the local Docker exec client never claims that the remote in-container command
-stopped; its completion is reported as unknown. That uncertainty is durably
-keyed by the ownership-verified, content-addressed managed container name (not
-Docker's opaque container ID), so setup GC protects the exact retired resource
-until a known terminal outcome is recorded. Multi-service Compose, guest,
-and generic shell execution remain outside this slice.
-
-`bosn setup ensure` submits the complete daemon-owned plan, image-preparation,
-and ownership-safe application ensure pipeline. It returns promptly with
-`action: setup_ensure`, `submitted: true`, and a `job_id`:
-
-```text
-bosn setup ensure --state-dir STATE --workspace WORKSPACE --config LOCATOR \
-  (--refresh | --offline) --deadline-ms 1..=300000 \
-  --output-limit 1..=8388608 [--json]
-```
-
-The daemon may create an absent application or start a matching stopped one.
-It refuses foreign, incomplete, or mismatched candidates. It does not replace,
-delete, adopt, or garbage-collect an existing application. The native command
-never starts a daemon or invokes Docker directly, and exposes no container,
-image, command, mount, label, environment, work-directory, network,
-privilege, task, state-override, or raw engine arguments.
-
-The installed Python extension exposes the same semantic submission through
-`Client(state_dir).submit_setup_ensure(workspace, config_locator, *, policy,
-deadline_ms, output_limit)`. It validates all five inputs before IPC, returns
-only the durable job ID, and has no application, image, command, mount,
-environment, work-directory, label, network, task, or raw engine controls.
-
-Log replies include `retained_from`, `next`, and `gap`, so callers can retain
-their cursor and detect bounded-log eviction. The command surface is limited
-to typed IPC observation; it provides no daemon start, Docker, registry, or
-raw process controls.
-
-### `bosn-docker` / `bosn-compose`
-
-| Category | Existing capability | Characterization references |
-| --- | --- | --- |
-| Governed | `init`; Compose `up`, `down`, `logs`, `ps`, `build`, `run`, `exec`, `config` with overlay labels, registry reconciliation, client-owned compose leases | `tests/test_frontdoor.py`, `tests/test_docker_cli.py`, `tests/test_compose.py`, `tests/test_compose_e2e_docker.py` |
-| Accepted Compose flags | global `-f`/`--file`; `up -d`/`--detach`, `up --wait`; `down -v`/`--volumes`, `down --remove-orphans` | `tests/test_frontdoor.py`, `tests/test_docker_cli.py` |
-| Forwarded only | `version`, `info`, `login`, `logout` | `tests/test_frontdoor.py`, `tests/test_docker_cli.py` |
-| Refusal boundary | all other Docker verbs and undeclared Compose flags/subcommands fail closed with a remedy; no raw resource mutation passthrough | `tests/test_frontdoor.py`, `tests/test_docker_cli.py`, generated `docs/docker-support.md` |
-| Compose syntax subset | services/images/build, profiles, dependencies, healthchecks, environment, workdir, ports, named volumes/networks, tmpfs, anchors/merge; unsupported keys fail explicitly | `tests/test_compose.py`, `tests/test_gen_docker_support.py` |
-
-The Rust front door must retain this explicit supported/refused catalog until a reviewed
-replacement catalog says otherwise.  It must not infer support from Docker's broader CLI.
-
-### macOS x86-64 guest stacks
-
-| Capability | Contract | Characterization references |
-| --- | --- | --- |
-| Manifest kind | `macos-x64-guest`, explicit Apple-license acknowledgement, guest sizing/ports/readiness/payload fields; guest data volume can be pinned | `tests/test_guest.py`, `tests/test_manifest.py` |
-| Safe preflight | Linux only; require `/dev/kvm` and `/dev/net/tun`; conservative AMD one-core default | `tests/test_guest.py`, `tests/test_converge.py` |
-| Lifecycle | create with KVM/tun/NET_ADMIN and SSH port; no bind mounts; wait for SSH with guest logs on failure | `tests/test_guest.py`, `tests/test_converge.py` |
-| Execution | optional payload copied with `scp` each task, SSH command/shell, real exit propagation and ambiguous-255 event | `tests/test_guest.py`, `tests/test_cli_verbs.py`, `tests/test_converge.py` |
-| Explicit gap | live `dockurr/macos` / KVM proof is not in CI; unit tests prove only manifest/preflight/argv/transport behavior | `docs/macos-guest.md`, `tests/test_guest.py` |
-
-### Domain capabilities and consumers
-
-| Area | Existing contract | References |
-| --- | --- | --- |
-| Manifest and identity | TOML stacks/tasks; Dockerfile/COPY/dockerignore digest; build args/external image identity; scopes, mounts, tmpfs, env/workdir | `src/bosn/manifest.py`, `tests/test_manifest.py`, `tests/test_converge.py` |
-| Engine lifecycle | Docker CLI build/pull/create/start/exec/remove; generation rollover and final inspection/recheck | `src/bosn/engine.py`, `src/bosn/converge.py`, `tests/test_engine_docker.py`, `tests/test_converge_docker.py` |
-| Ownership/recovery | complete label set plus registry UUID is the only ownership proof; unknown/incomplete/foreign are protected; explicit adoption | `src/bosn/labels.py`, `src/bosn/recovery.py`, `tests/test_labels.py`, `tests/test_recovery_docker.py` |
-| Accounting/retention | managed/foreign/uncertain accounting, warm expiry/supersession/pressure, shared consumers, pinned volumes | `src/bosn/accounting.py`, `src/bosn/retention.py`, `tests/test_accounting_docker.py`, `tests/test_retention.py` |
-| IPC/daemon | loopback authenticated JSON requests, streaming heartbeat, bounded jobs and restart recovery | `src/bosn/ipc.py`, `src/bosn/daemon.py`, `tests/test_daemon.py`, `tests/test_daemon_jobs.py` |
-| Git completion | derive finished workspaces from Git state conservatively | `src/bosn/gitstate.py`, `tests/test_gitstate.py` |
-| Integration consumer | Soldr manifest/workflow guidance | `docs/soldr-integration.md`, `examples/soldr.toml`, `tests/test_shims.py` |
-
-## Downstream migration inventory (read-only discovery, 2026-09-13)
-
-These are identified consumers, not completed consumer migrations. Sibling
-checkouts were inspected without modification; implementation stays in this
-repository until a reviewed downstream change is ready.
-
-| Consumer | Verified integration | Required release proof |
-| --- | --- | --- |
-| Soldr (`942f4acf`) | `bosn.toml` declares cook/seed/warm stacks, shared cache volumes, workspace mounts and tasks; `ci/bosn_workspace_test.py` handles bootstrap-to-source handoff | Load/migrate the real manifest, preserve cache scopes and readonly mounts, execute the workspace task; retain `tests/test_perf_local.py` handoff/cleanup tests |
-| clud (`bce6aee2`) | `bosn.toml`, `bosn/Dockerfile`, bundled `clud-bosn` and `clud-preloop` skills, `crates/clud-bin/src/skills_tests.rs` | Update install/command examples and support/refusal claims, preserve manifest tasks and volume scopes, run bundled-skill tests and a representative task |
-| kernal-api (`fcfc2ed`) | `bosn.toml` and `docker/bosn.Dockerfile` | Migrate manifest and prove its declared task through the installed Rust CLI |
-| Hermes | New consumer, not an existing Bosn integration found in the inspected checkout | Pin client version; prove MCP initialization, tool discovery, setup, run, logs and cancellation |
-
-The clud skill currently describes an older Compose subset and rejects `up -d`,
-unlike the current Bosn implementation; migrate from the source-tested catalog
-above rather than preserving those stale claims. This targeted inventory is not
-a claim to have found every external user or to have validated downstream tasks.
-
-## Python v4 registry contract
-
-The registry is file-backed system/resource state, not a crawler index.  It opens WAL,
-enables foreign keys, uses a five-second busy timeout, serializes its writer, and permits
-independent read-only opens that never create or migrate state.  Lifecycle decisions use
-`BEGIN IMMEDIATE` through the final engine mutation/recheck.
-
-| Table | Key / relationships | Invariants to import |
-| --- | --- | --- |
-| `meta` | `schema_version`, stable `registry_id` UUID | accept v4 only for direct import; reject newer safely |
-| `resources` | resource id; engine kind/name identity | retention is `warm` or `pinned`; engine identity reconciles in place |
-| `resource_uses` | `(resource, workspace, stack, generation)` | every consumer matters before shared resource retirement |
-| `leases` | resource FK, PID/start identity and heartbeat/TTL | live/uncertain owner blocks destructive actions; FK cascades with resource |
-| `execution_sessions` | container, engine, client process, JSON lease IDs | durable execution ownership participates in restart recovery |
-| `volume_creation_intents` | volume name, serialized complete labels and manifest identity | intent exists before creation and enables repair, never name-based guessing |
-| `generations` | `(workspace, stack, digest)` | superseded timestamp is distinct from current generation |
-| `events` | ordered autoincrement event log | preserve compatible history or explicitly map it during import |
-
-Fixture: `tests/fixtures/migration/create_python_v4_registry.py DESTINATION` creates a
-single checkpointed SQLite file using only stdlib `sqlite3`; it is synthetic and contains no
-credentials. `tests/test_migration_fixture.py` proves all eight tables and includes a stable
-registry UUID, complete Bosn labels, two consumers of one image, a pinned volume, active
-lease/session, creation intent, generation rollover, and an event. Rust import tests should
-copy/create this fixture then assert their import result, rather than importing Python code.
-
-## Proposed Rust boundary (not implemented)
-
-The supported Python distribution continues to import as `bosn`, but exposes a deliberate
-typed client rather than current internals:
-
-```text
-Client::plan_config(SetupRequest) -> Plan
-Client::apply_config(ApplyRequest) -> JobId | ApplyResult
-Client::ensure(StackSelector) -> JobId | EnsureResult
-Client::run(RunRequest) -> JobId
-Client::status(StatusRequest) -> Status
-Client::jobs(JobCursor) -> Page<Job>
-Client::logs(JobId, LogCursor) -> Page<LogEvent>
-Client::cancel(JobId) -> CancelResult
-Client::done(WorkspaceSelector), gc(GcRequest), adopt(AdoptRequest),
-reconcile_volume(ReconcileVolumeRequest), release_volume(ReleaseVolumeRequest)
-```
-
-`SetupDocumentV1` is a versioned local-path/HTTPS input with source provenance, explicit
-workspace, inline Dockerfile or pinned image, optional bounded inline companion files,
-stacks/tasks/mounts/env/workdir, and policy overrides limited to app scope.  Parsing and
-planning are inert; apply validates again in the daemon.  Remote cache stores resolved URL,
-content hash, schema version and selected workspace; path traversal, unpinned assets,
-unsupported schemes and oversized inputs are rejected/redacted.
-
-### Remote one-file setup acceptance
-
-`bosn setup plan --config https://…` uses the bounded, verified TLS client exposed by
-`kernal-api`; Bosn does not add an insecure-test or certificate-bypass API. A local public
-test CA is supplied only through `SSL_CERT_FILE` to a native CLI child in the black-box
-acceptance below. It proves that one HTTPS TOML is cached with redacted requested/resolved
-URL provenance and content receipt, an explicit offline request does not fetch a changed
-remote representation, and the same cached receipt works after the server has stopped:
-
-```bash
-soldr cargo test -j1 -p bosn-service --test setup_remote_https --locked
-```
-
-The matching daemon apply proof is opt-in because it creates a short-lived Docker container;
-it serves a self-contained pinned-image TOML only at HTTPS, ensures it through the production
-daemon, then stops the server and proves a new daemon reuses the verified cache offline:
-
-```bash
-soldr cargo test -j1 -p bosn-service --test setup_ensure_docker --locked \
-  -- --ignored --exact live_docker_setup_ensure_fetches_one_https_document_then_reuses_it_offline
-```
-
-It requires a running local Docker daemon and the documented pinned Alpine image. The test
-does not pull mutable images and its cleanup removes only the exact container after rechecking
-all Bosn ownership labels.
-
-The replacement internal protocol is Bosn-owned versioned protobuf over kernal-api local
-authenticated transport, not MCP JSON:
-
-```proto
-message Envelope { uint32 protocol_version = 1; string request_id = 2; oneof body {
-  Request request = 3; Progress progress = 4; Result result = 5; Error error = 6;
-}}
-message Request { oneof operation { PlanConfig plan_config = 1; ApplyConfig apply_config = 2;
-  Ensure ensure = 3; Run run = 4; Status status = 5; Jobs jobs = 6; Logs logs = 7;
-  Cancel cancel = 8; Gc gc = 9; Adopt adopt = 10; ReconcileVolume reconcile_volume = 11;
-  ReleaseVolume release_volume = 12; Done done = 13; }}
-```
-
-Frames, cursors, logs and deadlines are bounded; all results use stable machine error codes.
-MCP remains its own JSON-RPC stdio boundary, maps semantic tools to this client, writes only
-protocol to stdout, and does not make disconnect imply cancellation.
-
-## Ownership mapping to `kernal-api`
-
-Read-only inspection of sibling `../kernal-api` (current checkout, no edits) confirms the
-architecture reserves generic process, filesystem/locking, hashing, HTTP, IPC and autostart
-mechanisms for kernal-api, while applications own their policy/protocols.  No public SQLite
-facility was found.  On 2026-09-13, GitHub's `releases/latest` endpoint returned 404 and its
-tags listing was empty; `soldr cargo info kernal-api` also found no crates.io package.  Thus an
-exact published kernal-api dependency remains a Phase 1 release gate, not an assumed version.
-Bosn must not directly depend on kernel private backend crates.
-
-The SQLite prerequisite subsequently landed in
-[kernal-api PR #192](https://github.com/zackees/kernal-api/pull/192), merge
-`10e558a9f2eb51c2989c89d05b13cf7636bd374e`. Its opt-in facade supplies
-WAL/read-only connections, bounded prepared-query results, immediate transactions,
-integrity/checkpoint and non-overwriting consistent backup through private bundled
-SQLite. Thirteen SQLite tests, the facade-policy test, targeted Clippy and two
-dependency-boundary unit tests passed locally after integration with upstream.
-This is source readiness, not evidence of a published crate or native Windows/macOS
-validation; those Phase 1/platform gates remain open.
-`soldr cargo package --locked --features sqlite` also passed verification of the
-extracted registry package at that merge (47.55 seconds on this host). This checks
-the packaged SQLite feature graph, not every optional kernel feature or publication.
-
-### Python-v4 offline-import quiescence gate (2026-09-13)
-
-The v4 importer remains pending, but its cooperative Python bridge is implemented
-in this checkout. A safe importer must prove that the legacy Python daemon cannot
-write the source for the complete snapshot/import interval; a caller-supplied
-`quiesced: bool`, PID file, or one-time ping is not such proof.
-
-The Python daemon cannot be guarded by acquiring its SQLite file lock: it does not
-participate in `kernal-api`'s advisory file-lock protocol.  Its actual singleton is
-the deterministic loopback TCP endpoint calculated by `bosn.daemon.port_for` (with
-an explicit `BOSN_PORT` override).  However, `Daemon.__init__` opens
-`registry.sqlite3` before `serve_forever` binds that endpoint, while `shutdown()`
-closes the server endpoint before it has necessarily closed the registry (background
-work can defer registry close).  Consequently, either a free port or even a held
-port alone is insufficient evidence that no Python writer remains.
-
-The pinned public kernel API has SQLite backup/checkpoint and process-identity
-facades, plus local-IPC listeners, but no public loopback-TCP endpoint ownership.
-Bosn therefore uses a cooperative bridge rather than claiming to reserve the old
-TCP singleton: every writable bridge-capable Python `Registry` holds a shared lock
-on `registry.migration.lock` from before marker recheck through successful SQLite
-close (including deferred daemon close); Rust's public kernel filesystem facade
-takes the same lock exclusively. A real cross-language subprocess test proves the
-POSIX `flock` interaction. On Windows the Python bridge calls `LockFileEx` on the
-same single byte at offset `1 << 62` that kernal-api uses, rather than assuming a
-default third-party lock convention is compatible.
-
-The authenticated `migration-cutover` daemon verb closes mutation/stream admission,
-refuses active requests/jobs/execution ownership, requests daemon shutdown, and
-publishes the private create-new `rust-cutover-v1.json` marker with the source
-registry UUID. Existing bridge holders must close before Rust can obtain exclusive
-ownership; every later writable Python registry rechecks that marker under its
-shared lock and refuses to open. A malformed, unreadable, dangling, or conflicting
-marker fails closed and is never replaced. The marker is deliberate state-directory
-metadata, not a write to the source SQLite database.
-
-This only fences upgraded cooperative binaries. An older Python release cannot be
-inferred absent from a missing port or state file; activation must authenticate its
-shutdown and verify its exact process identity exited before starting the bridge
-release, otherwise import is refused. That old-release activation/proof consumer is
-not implemented yet, and neither is the importer; no current command represents a
-validated import authorization. The eventual importer must validate the marker/proof,
-retain exclusive ownership through SQLite's non-overwriting consistent backup and
-destination transaction, reject live or unclassifiable lease/session ownership, and
-leave the destination reconciliation-required.
-
-| Concern | Owner | Required migration rule |
-| --- | --- | --- |
-| SQLite connection/transactions/read-only/WAL/busy/integrity backup | kernal-api facade (new opt-in capability) | Bosn owns SQL/schema/migration/import policy; facade owns backend dependency and lifecycle primitives |
-| Docker/git/ssh/scp launch, process identity, cancellation, groups | kernal-api | Bosn supplies command semantics and lifecycle policy |
-| Paths, atomic files, locks, hashing, tree walk | kernal-api | Bosn retains Dockerignore/COPY/context/workspace identity semantics |
-| Authenticated local transport, frames, process singleton/autostart | kernal-api | Bosn owns protobuf messages, authorization, daemon/job policy |
-| HTTP TLS/download/cache primitives | kernal-api | Bosn owns setup-document scheme/origin/digest/cache-update policy |
-| registry, labels, manifests, Compose/guest, GC, adoption, API/MCP | Bosn | never move product policy into kernal-api |
-
-## README discrepancies found
-
-The README status says Compose is only `up/down/logs/ps`, but implementation additionally
-accepts `build/run/exec/config` (`src/bosn/frontdoor.py`, `tests/test_frontdoor.py`).  It also
-says the manifest has no `env` or `workdir` key, while `src/bosn/manifest.py` parses both and
-tests cover them in `tests/test_manifest.py`.  The migration documentation treats source and
-tests as authoritative until README is corrected in a separately reviewed documentation pass.
-
-## Phase-0 evidence commands
-
-### Python baseline (2026-09-13)
-
-`uv run pytest -q -m 'not docker'` at the Python baseline completed with **1219
-passed, 9 skipped, 37 deselected** in 125.30 seconds. The new portable-fixture test
-passes separately. No Python production behavior changes in this milestone.
-
-The broader baseline `uv run pytest -q -m docker` completed with **36 passed,
-1 failed** in 1135.75 seconds on this host. The failing test is
-`tests/test_compose_e2e_docker.py::test_compose_lifecycle_through_the_real_front_door`:
-the Compose `run web echo ...` step returned 1 after reporting that the existing
-volume did not match the configuration and attempting to recreate a network with
-active endpoints. The current overlay stamps `created` with the current time on
-every invocation (`src/bosn/docker_cli.py`); label stability across repeated Compose
-verbs needs explicit characterization during the Rust port. This is an observed
-Python-baseline failure, not a passed migration gate or a proven root-cause claim.
-
-Run `uv run python ci/migration_baseline.py --docker --samples 7` to repeat the
-measurements. The runner creates an isolated state directory, starts/stops its own
-daemon, builds a synthetic Alpine stack, and removes only resources whose complete
-labels prove ownership by that run's registry UUID. Docker mode mutates only these
-synthetic resources. The base Alpine image and BuildKit cache are not pruned.
-
-Observed on Linux 6.18.48 x86-64, glibc 2.42, Python 3.13.15, Docker 29.7.2:
-
-| Measurement | Result |
-| --- | --- |
-| `python -m bosn --version` startup (7 samples) | median 169.03 ms; range 144.80–269.73 ms |
-| CLI status, empty registry/running daemon (7 samples) | median 141.22 ms; range 127.22–149.52 ms |
-| Daemon resident memory after status | 30,848 KiB |
-| Initial synthetic ensure/build (1 sample) | 2,155.91 ms |
-| Ensure reuse (7 samples) | median 708.71 ms; range 523.79–1,322.81 ms |
-| `uv build --wheel` (1 sample, warm dependencies) | 388.16 ms |
-
-This is a shared development host with concurrent workloads; caches were not
-cleared. Repeat on the same host/workload and include raw samples for final Rust
-comparisons. The wheel figure measures packaging, not a clean toolchain/dependency
-build. Native target and packaged-artifact comparisons remain Phase 7 work.
-
-### Fixture validation
-
-The fixture was added RED first: `uv run pytest tests/test_migration_fixture.py -q` failed
-because the fixture generator did not exist.  GREEN verification and lint commands/results
-belong with this change's final review run:
-
-```bash
-uv run pytest tests/test_migration_fixture.py -q
-uv run ruff check tests/test_migration_fixture.py tests/fixtures/migration/create_python_v4_registry.py
-uv run pyright tests/test_migration_fixture.py tests/fixtures/migration/create_python_v4_registry.py
-```
-# Rust migration
-
-See [Rust generation identity](rust-generation.md) for the bounded collector
-and immutable generation API migration status.

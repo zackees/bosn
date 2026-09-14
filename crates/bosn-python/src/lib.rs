@@ -1978,6 +1978,7 @@ mod tests {
                         generation: "sha256:python-test".into(),
                         workspace: request.workspace.to_string_lossy().into_owned(),
                     },
+                    volumes: Vec::new(),
                 })
             })
         }

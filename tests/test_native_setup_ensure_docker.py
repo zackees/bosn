@@ -21,9 +21,7 @@ import pytest
 import bosn
 from bosn.native_cli import _configure_native_library_path, native_executable
 
-PINNED_ALPINE = (
-    "alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b"
-)
+PINNED_ALPINE = "alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b"
 # The legacy-manifest runtime intentionally derives no application command.
 # Unlike Alpine's interactive shell default, MySQL's image-declared server is
 # long-running, so it proves the daemon has actually started a standard Linux
@@ -65,9 +63,7 @@ def _docker(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
 def _pinned_image_id(image: str = PINNED_ALPINE) -> str:
     result = _docker("image", "inspect", "--format", "{{.Id}}", image, check=False)
     if result.returncode:
-        pytest.skip(
-            "live Docker proof needs the pre-pulled pinned image " + image
-        )
+        pytest.skip("live Docker proof needs the pre-pulled pinned image " + image)
     image_id = result.stdout.strip()
     assert image_id, "pinned Alpine image did not expose an image identity"
     return image_id
@@ -242,8 +238,7 @@ def _read_manifest_success_events(state_dir: Path) -> list[tuple[str, str]]:
     connection = sqlite3.connect(database, uri=True)
     try:
         return connection.execute(
-            "SELECT kind, detail FROM events WHERE kind = 'manifest.ensure.succeeded' "
-            "ORDER BY id"
+            "SELECT kind, detail FROM events WHERE kind = 'manifest.ensure.succeeded' ORDER BY id"
         ).fetchall()
     finally:
         connection.close()
@@ -263,10 +258,7 @@ def test_native_python_client_ensures_and_reuses_one_managed_app(tmp_path: Path)
     config = config_dir / "setup.toml"
     unique = f"python-native-{os.getpid()}-{time.time_ns()}"
     config.write_text(
-        "version = 1\n"
-        "[app]\n"
-        f"image = '{PINNED_ALPINE}'\n"
-        f"command = 'exec sleep 120 # {unique}'\n"
+        f"version = 1\n[app]\nimage = '{PINNED_ALPINE}'\ncommand = 'exec sleep 120 # {unique}'\n"
     )
 
     client = bosn.Client(state_dir)
@@ -503,13 +495,13 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
             "[task.seed-volume]\n"
             "stack = 'linux'\n"
             f"cmd = \"mkdir -p /var/lib/bosn-proof && printf %s '{unique}' "
-            "> /var/lib/bosn-proof/marker\"\n"
+            '> /var/lib/bosn-proof/marker"\n'
             "[task.prove-volume]\n"
             "stack = 'linux'\n"
-            f"cmd = \"test \\\"$(cat /var/lib/bosn-proof/marker)\\\" = '{unique}'\"\n"
+            f'cmd = "test \\"$(cat /var/lib/bosn-proof/marker)\\" = \'{unique}\'"\n'
             "[task.prove]\n"
             "stack = 'linux'\n"
-            f"cmd = \"test \\\"$BOSN_MANIFEST_PROOF\\\" = '{unique}'\"\n"
+            f'cmd = "test \\"$BOSN_MANIFEST_PROOF\\" = \'{unique}\'"\n'
         )
     unsupported = workspace / "unsupported.toml"
     unsupported.write_text(
@@ -589,13 +581,16 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
             assert volume_resource.retention == "pinned"
             volume_content = volume_resource.generation.removeprefix("sha256:")
             managed_volumes.append((volume_resource.name, volume_content))
-            assert _docker(
-                "volume",
-                "inspect",
-                "--format",
-                f'{{{{index .Labels "{CONTENT_LABEL}"}}}}',
-                volume_resource.name,
-            ).stdout.strip() == volume_content
+            assert (
+                _docker(
+                    "volume",
+                    "inspect",
+                    "--format",
+                    f'{{{{index .Labels "{CONTENT_LABEL}"}}}}',
+                    volume_resource.name,
+                ).stdout.strip()
+                == volume_content
+            )
             assert (
                 image_resource.id,
                 image_resource.name,
@@ -678,13 +673,16 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
             second = _inspect_container(container_name)
             assert second is not None
             assert second[0] == first_id
-            assert _docker(
-                "volume",
-                "inspect",
-                "--format",
-                f'{{{{index .Labels "{CONTENT_LABEL}"}}}}',
-                volume_resource.name,
-            ).stdout.strip() == volume_content
+            assert (
+                _docker(
+                    "volume",
+                    "inspect",
+                    "--format",
+                    f'{{{{index .Labels "{CONTENT_LABEL}"}}}}',
+                    volume_resource.name,
+                ).stdout.strip()
+                == volume_content
+            )
 
             # A changed accepted declaration derives a new manifest generation.
             # The daemon creates/starts the new exact app first, atomically
@@ -703,10 +701,10 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
                 "retention = 'pinned'\n"
                 "[task.prove-volume]\n"
                 "stack = 'linux'\n"
-                f"cmd = \"test \\\"$(cat /var/lib/bosn-proof/marker)\\\" = '{unique}'\"\n"
+                f'cmd = "test \\"$(cat /var/lib/bosn-proof/marker)\\" = \'{unique}\'"\n'
                 "[task.prove]\n"
                 "stack = 'linux'\n"
-                f"cmd = \"test \\\"$BOSN_MANIFEST_PROOF\\\" = '{rollover_unique}'\"\n",
+                f'cmd = "test \\"$BOSN_MANIFEST_PROOF\\" = \'{rollover_unique}\'"\n',
                 encoding="utf-8",
             )
             rollover_job = client.submit_manifest_ensure(
@@ -719,9 +717,7 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
             assert isinstance(_wait_for_success(client, rollover_job), tuple)
             rollover_resources = client.registry_resources(limit=16).records
             retired = next(
-                record
-                for record in rollover_resources
-                if record.id == container_resource.id
+                record for record in rollover_resources if record.id == container_resource.id
             )
             new_container = next(
                 record
@@ -917,7 +913,7 @@ def test_native_manifest_task_inherits_declared_workspace_binds_and_workdir(
         "[task.prove]\n"
         "stack = 'linux'\n"
         "cmd = '''test \"$(pwd)\" = /workspace/writable && "
-        f"test \"$(cat /workspace/readonly/proof.txt)\" = {unique} && "
+        f'test "$(cat /workspace/readonly/proof.txt)" = {unique} && '
         "! touch /workspace/readonly/must-remain-readonly && "
         "touch app-task-ran.txt'''\n",
         encoding="utf-8",
@@ -943,13 +939,16 @@ def test_native_manifest_task_inherits_declared_workspace_binds_and_workdir(
             )
             content_sha256 = container.generation.removeprefix("sha256:")
             container_name = f"bosn-setup-{content_sha256}"
-            assert _docker(
-                "container",
-                "inspect",
-                "--format",
-                "{{.Config.WorkingDir}}",
-                container_name,
-            ).stdout.strip() == "/workspace/writable"
+            assert (
+                _docker(
+                    "container",
+                    "inspect",
+                    "--format",
+                    "{{.Config.WorkingDir}}",
+                    container_name,
+                ).stdout.strip()
+                == "/workspace/writable"
+            )
             observed = _inspect_container(container_name)
             assert observed is not None
             assert observed[2] == image_id
@@ -1004,7 +1003,7 @@ def test_native_manifest_dockerfile_context_is_private_content_addressed_and_rol
     dockerfile.write_text(
         f"FROM {PINNED_ALPINE}\n"
         "COPY payload.txt /payload.txt\n"
-        "CMD [\"sh\", \"-c\", \"while true; do sleep 30; done\"]\n",
+        'CMD ["sh", "-c", "while true; do sleep 30; done"]\n',
         encoding="utf-8",
     )
     payload.write_text("one\n", encoding="utf-8")
@@ -1084,7 +1083,7 @@ def test_native_manifest_dockerfile_context_is_private_content_addressed_and_rol
                 f"FROM {PINNED_ALPINE}\n"
                 "LABEL bosn.manifest-rollover=three\n"
                 "COPY payload.txt /payload.txt\n"
-                "CMD [\"sh\", \"-c\", \"while true; do sleep 30; done\"]\n",
+                'CMD ["sh", "-c", "while true; do sleep 30; done"]\n',
                 encoding="utf-8",
             )
             _wait_for_success(

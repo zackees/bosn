@@ -20,9 +20,7 @@ def test_native_extension_is_reexported_by_python_package(tmp_path: Path) -> Non
     assert bosn.native_version() == bosn.__version__
     assert bosn.protocol_version() == 1
 
-    compose_plan = bosn.plan_compose_yaml(
-        "services:\n  api:\n    image: alpine:3.21\n"
-    )
+    compose_plan = bosn.plan_compose_yaml("services:\n  api:\n    image: alpine:3.21\n")
     assert compose_plan.applied is False
     assert compose_plan.version == 1
     assert compose_plan.digest.startswith("sha256:")
