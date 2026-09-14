@@ -128,6 +128,31 @@ soldr cargo build -p bosn-service --bin bosn --locked
 python ci/native_performance_baseline.py --binary target/debug/bosn --samples 7
 ```
 
+The checked-in artifact also includes one explicitly labelled
+`current_native_local_run`. It preserves raw native samples and the separate
+warm-cache build and wheel-package wall-clock observations that were available
+on its recorded host. It is useful as a rerunnable starting point, but it must
+not be read as a Rust-versus-Python speedup: its host/toolchain/cache state is
+not the historical Python run's state, the package timing is a single sample,
+and neither run is a release threshold. To replace or extend it, collect a
+fresh native binary and write the complete collector JSON, revision, host
+summary, cache state, and any package timing into
+`docs/performance-baseline.json`; retain unavailable metrics as explicit
+`unsupported` values rather than fabricating comparisons.
+
+For a separately timed package observation, build to a new empty output
+directory after the native collector has run:
+
+```bash
+/usr/bin/time -f 'wheel_elapsed_seconds=%e' \
+  uv build --wheel --out-dir /tmp/bosn-wheel-baseline
+```
+
+The result is only comparable to another run that records the same dependency,
+target, and cache conditions. A clean package/build study should use an
+isolated disposable target and dependency cache, and record those locations as
+cache state rather than treating it as a continuation of the historical data.
+
 The output is a stable JSON document containing native CLI startup, idle daemon
 RSS (or an explicit platform/unsupported record), daemon status latency, and an
 explicit setup-ensure-reuse record. It contains no command lines, paths,
