@@ -12,11 +12,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use bosn_core::{parse_and_plan_compose_yaml, parse_setup_config_locator};
+use bosn_core::{ResourceKind, parse_and_plan_compose_yaml, parse_setup_config_locator};
+use bosn_engine::{DockerEngine, RunOptions};
 use bosn_service::{
     Client, JobLogPage, JobStatus, ManifestAppTaskJobRequest, ManifestConvergeJobRequest,
-    ManifestEnsureJobRequest, SetupEnsureJobRequest, SetupPreparePolicy, SetupPrepareRequest,
-    SetupTaskJobRequest,
+    ManifestEnsureJobRequest, PythonV4ObservedResource, PythonV4ReconcileExecutor,
+    SetupEnsureJobRequest, SetupPreparePolicy, SetupPrepareRequest, SetupTaskJobRequest,
+    apply_python_v4_reconciliation, preview_python_v4_reconciliation,
 };
 use bosn_setup::{
     SetupAcquirePolicy, SetupPlan, SetupPlanAppSource, SetupPlanRequest, SetupSourceKind,
@@ -681,6 +683,10 @@ fn run_registry(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
         run_registry_import_v4(arguments);
         return;
     }
+    if command.as_os_str() == std::ffi::OsStr::new("reconcile-v4") {
+        run_registry_reconcile_v4(arguments);
+        return;
+    }
     let invocation = match command.to_string_lossy().as_ref() {
         "resources" => {
             parse_registry_arguments(arguments).map(|(state_dir, after, limit, json)| {
@@ -820,6 +826,143 @@ fn registry_import_failure(json_output: bool) -> ! {
         eprintln!("bosn registry import-v4: cutover refused");
     }
     std::process::exit(1)
+}
+
+/// Offline bridge completion. The imported gate prevents daemon startup and
+/// normal writers; this command owns the database-inode writer lock, performs
+/// fixed exact-name inspection, and never sends Docker a lifecycle verb.
+fn run_registry_reconcile_v4(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
+    let Some(verb) = arguments.next() else {
+        usage();
+    };
+    let mut state_dir = None;
+    let mut apply = false;
+    let mut yes = false;
+    let mut json_output = false;
+    while let Some(argument) = arguments.next() {
+        match argument.to_string_lossy().as_ref() {
+            "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
+            "--apply" if !apply => {
+                apply = true;
+                Ok(())
+            }
+            "--yes" if !yes => {
+                yes = true;
+                Ok(())
+            }
+            "--json" if !json_output => {
+                json_output = true;
+                Ok(())
+            }
+            _ => Err(()),
+        }
+        .unwrap_or_else(|_| registry_reconcile_failure(json_output));
+    }
+    let Some(state_dir) = state_dir else {
+        registry_reconcile_failure(json_output);
+    };
+    let is_apply = verb.as_os_str() == std::ffi::OsStr::new("apply");
+    if !(verb.as_os_str() == std::ffi::OsStr::new("preview") || is_apply)
+        || (is_apply && (!apply || !yes))
+        || (!is_apply && (apply || yes))
+    {
+        registry_reconcile_failure(json_output);
+    }
+    let executor = OfflinePythonV4Docker {
+        engine: DockerEngine::docker(),
+    };
+    let path = state_dir.join("registry.sqlite3");
+    let result = if is_apply {
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_secs_f64())
+            .ok_or(());
+        at.and_then(|at| apply_python_v4_reconciliation(&path, &executor, at).map_err(|_| ()))
+    } else {
+        preview_python_v4_reconciliation(&path, &executor).map_err(|_| ())
+    };
+    match result {
+        Ok(report) => {
+            println!(
+                "{}",
+                json!({
+                    "action": if is_apply { "registry_reconcile_v4_apply" } else { "registry_reconcile_v4_preview" },
+                    "preview_only": !is_apply,
+                    "verified": report.verified,
+                    "refusals": report.refusals,
+                    "reconciliation_cleared": is_apply && report.ready(),
+                })
+            );
+            if is_apply && !report.ready() {
+                std::process::exit(1);
+            }
+        }
+        Err(()) => registry_reconcile_failure(json_output),
+    }
+}
+
+fn registry_reconcile_failure(json_output: bool) -> ! {
+    if json_output {
+        println!(
+            "{}",
+            json!({"action":"registry_reconcile_v4","error":"reconciliation refused"})
+        );
+    } else {
+        eprintln!("bosn registry reconcile-v4: reconciliation refused");
+    }
+    std::process::exit(1)
+}
+
+struct OfflinePythonV4Docker {
+    engine: DockerEngine,
+}
+impl PythonV4ReconcileExecutor for OfflinePythonV4Docker {
+    fn inspect(
+        &self,
+        kind: ResourceKind,
+        name: &str,
+    ) -> Result<Option<PythonV4ObservedResource>, String> {
+        let format = match kind {
+            ResourceKind::Container => "{{.Id}}\t{{.Name}}\t{{json .Config.Labels}}",
+            ResourceKind::Volume => "{{.Name}}\t{{.Name}}\t{{json .Labels}}",
+            ResourceKind::Image => "{{.Id}}\t{{.Id}}\t{{json .Config.Labels}}",
+            ResourceKind::Network => "{{.Id}}\t{{.Name}}\t{{json .Labels}}",
+            ResourceKind::Builder => return Ok(None),
+        };
+        let object = match kind {
+            ResourceKind::Image => "image",
+            ResourceKind::Volume => "volume",
+            ResourceKind::Network => "network",
+            _ => "container",
+        };
+        let result = self
+            .engine
+            .with_args([object, "inspect", "--format", format, name])
+            .capture(RunOptions::bounded(Duration::from_secs(3), 16 * 1024))
+            .map_err(|_| "inspect failed".to_owned())?;
+        if result.exit_code == 1 {
+            return Ok(None);
+        }
+        if !result.ok() {
+            return Err("inspect failed".into());
+        }
+        let text = std::str::from_utf8(&result.stdout).map_err(|_| "invalid inspect".to_owned())?;
+        let fields: Vec<_> = text
+            .trim_end_matches(['\r', '\n'])
+            .splitn(3, '\t')
+            .collect();
+        if fields.len() != 3 || fields[0].is_empty() || fields[1].is_empty() {
+            return Err("invalid inspect".into());
+        }
+        let labels =
+            serde_json::from_str(fields[2]).map_err(|_| "invalid inspect labels".to_owned())?;
+        Ok(Some(PythonV4ObservedResource {
+            engine_id: fields[0].into(),
+            name: fields[1].into(),
+            labels,
+        }))
+    }
 }
 
 enum RegistryInvocation {
@@ -2198,6 +2341,9 @@ fn usage() -> ! {
     eprintln!("   or: bosn daemon stop --state-dir STATE_DIR [--json]");
     eprintln!(
         "   or: bosn registry import-v4 --legacy-state-dir LEGACY_STATE_DIR --state-dir NEW_STATE_DIR --yes [--json]"
+    );
+    eprintln!(
+        "   or: bosn registry reconcile-v4 preview --state-dir STATE_DIR [--json]\n   or: bosn registry reconcile-v4 apply --state-dir STATE_DIR --apply --yes [--json]"
     );
     eprintln!("   or: bosn compose plan --file COMPOSE_YAML [--json]");
     eprintln!(

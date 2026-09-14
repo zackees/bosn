@@ -77,6 +77,7 @@ pub enum Error {
     SourceOwnershipUnknown(u32),
     ImportTargetExists(PathBuf),
     ReconciliationRequired,
+    ReconciliationNotRequired,
     InsecureDirectory(PathBuf),
 }
 impl From<SqlError> for Error {
@@ -268,6 +269,15 @@ pub struct ImportReport {
     pub registry_id: String,
     pub table_counts: BTreeMap<String, usize>,
     pub reconciliation_required: bool,
+}
+
+/// One engine identity observed by the offline Python-v4 reconciler.  The
+/// registry does not invent these facts: callers may complete the migration
+/// only after they have inspected the exact durable resource name and labels.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReconciliationProof {
+    pub resource_id: String,
+    pub engine_id: String,
 }
 
 const CUTOVER_MARKER: &str = "rust-cutover-v1.json";
@@ -817,6 +827,100 @@ pub struct Immediate<'a> {
     transaction: Transaction<'a>,
 }
 impl<'a> Immediate<'a> {
+    /// Atomically records the complete offline verification set and removes
+    /// the import gate.  It repeats the durable safety predicates while the
+    /// immediate transaction is held: a caller cannot clear the gate from a
+    /// stale preview or while legacy liveness/session/creation-intent facts
+    /// remain.  This transition intentionally never changes a resource, use,
+    /// lease, session, or volume intent.
+    pub fn complete_python_v4_reconciliation(
+        &mut self,
+        proofs: &[ReconciliationProof],
+        at: f64,
+    ) -> Result<(), Error> {
+        if !at.is_finite() {
+            return Err(Error::BadRow("reconciliation time"));
+        }
+        let gate = self.transaction.query(
+            "SELECT value FROM meta WHERE key=?",
+            &[Value::Text(RECONCILIATION_REQUIRED.into())],
+            QueryLimits {
+                max_rows: 2,
+                max_bytes: 64,
+            },
+        )?;
+        if !matches!(gate.as_slice(), [row] if matches!(row.get(0), Some(Value::Text(value)) if value == "true"))
+        {
+            return Err(Error::ReconciliationNotRequired);
+        }
+        let active = self.transaction.query(
+            "SELECT id FROM resources WHERE state='active' ORDER BY id",
+            &[],
+            QueryLimits {
+                max_rows: 10_000,
+                max_bytes: 1_048_576,
+            },
+        )?;
+        let actual: BTreeSet<String> = active
+            .iter()
+            .map(|row| text(row, 0))
+            .collect::<Result<_, _>>()?;
+        let supplied: BTreeSet<String> = proofs
+            .iter()
+            .map(|proof| proof.resource_id.clone())
+            .collect();
+        if actual != supplied
+            || proofs.len() != supplied.len()
+            || proofs
+                .iter()
+                .any(|proof| proof.engine_id.is_empty() || proof.engine_id.len() > 1024)
+        {
+            return Err(Error::BadRow("reconciliation proof set"));
+        }
+        for table in ["leases", "execution_sessions", "volume_creation_intents"] {
+            let rows = self.transaction.query(
+                &format!("SELECT 1 FROM {table} LIMIT 1"),
+                &[],
+                QueryLimits {
+                    max_rows: 1,
+                    max_bytes: 64,
+                },
+            )?;
+            if !rows.is_empty() {
+                return Err(Error::BadRow("reconciliation blocker"));
+            }
+        }
+        for proof in proofs {
+            let detail =
+                serde_json::json!({"resource_id": proof.resource_id, "engine_id": proof.engine_id})
+                    .to_string();
+            self.append_event(at, "migration.reconcile.verified", &detail)?;
+        }
+        let inactive = self.transaction.query(
+            "SELECT id FROM resources WHERE state<>'active' ORDER BY id",
+            &[],
+            QueryLimits {
+                max_rows: 10_000,
+                max_bytes: 1_048_576,
+            },
+        )?;
+        for row in inactive {
+            let detail =
+                serde_json::json!({"resource_id": text(&row, 0)?, "outcome": "inactive_retained"})
+                    .to_string();
+            self.append_event(at, "migration.reconcile.explicit", &detail)?;
+        }
+        self.append_event(
+            at,
+            "migration.reconcile.completed",
+            "all_active_resources_verified",
+        )?;
+        self.transaction.execute(
+            "DELETE FROM meta WHERE key=?",
+            &[Value::Text(RECONCILIATION_REQUIRED.into())],
+        )?;
+        Ok(())
+    }
     /// Mark active setup ownership in one exact canonical workspace as done.
     ///
     /// This is intentionally a narrow product transition rather than a
@@ -1392,6 +1496,44 @@ impl Registry {
             _writer: writer,
         })
     }
+    /// Opens the one deliberately offline writer permitted to inspect and
+    /// complete an imported Python-v4 registry.  Normal writers must keep
+    /// refusing the gate; this method still takes the database-inode lock and
+    /// requires the gate to be present, so it cannot be used as a generic
+    /// escape hatch for ordinary registry mutation.
+    pub fn open_reconciliation_writer(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let path = path.as_ref();
+        let probe =
+            Connection::open_read_only_with_busy_timeout(path, std::time::Duration::from_secs(5))?;
+        Self::validate_for_reconciliation(&probe, path)?;
+        if meta(&probe, RECONCILIATION_REQUIRED)?.as_deref() != Some("true") {
+            return Err(Error::ReconciliationNotRequired);
+        }
+        let file = fs::open_lock_file(path)?;
+        let writer = fs::try_lock_exclusive_owned(file).map_err(|e| {
+            if fs::is_lock_conflict(&e) {
+                Error::WriterAlreadyHeld(path.to_path_buf())
+            } else {
+                Error::Io(e)
+            }
+        })?;
+        if fs::path_identity(path)? != fs::file_identity(writer.file())? {
+            return Err(Error::ReplacedPath(path.to_path_buf()));
+        }
+        let connection =
+            Connection::open_with_busy_timeout(path, std::time::Duration::from_secs(5))?;
+        Self::validate_for_reconciliation(&connection, path)?;
+        if meta(&connection, RECONCILIATION_REQUIRED)?.as_deref() != Some("true") {
+            return Err(Error::ReconciliationNotRequired);
+        }
+        if fs::path_identity(path)? != fs::file_identity(writer.file())? {
+            return Err(Error::ReplacedPath(path.to_path_buf()));
+        }
+        Ok(Self {
+            connection,
+            _writer: writer,
+        })
+    }
     /// Atomically reserves a new database path, initializes v5, and retains
     /// writer exclusion. The caller supplies the secure UUID because the
     /// kernel random facade is async and this synchronous registry must not
@@ -1445,6 +1587,16 @@ impl Registry {
         Ok(self.connection.integrity_check()?)
     }
     fn validate(connection: &Connection, path: &Path) -> Result<(), Error> {
+        Self::validate_inner(connection, path, false)
+    }
+    fn validate_for_reconciliation(connection: &Connection, path: &Path) -> Result<(), Error> {
+        Self::validate_inner(connection, path, true)
+    }
+    fn validate_inner(
+        connection: &Connection,
+        path: &Path,
+        allow_reconciliation: bool,
+    ) -> Result<(), Error> {
         let version = meta(connection, "schema_version")?
             .ok_or_else(|| Error::Uninitialized(path.to_path_buf()))?;
         let version: u32 = version
@@ -1457,7 +1609,9 @@ impl Registry {
             return Err(Error::UnsupportedSchema(version));
         }
         let registry_id = meta(connection, "registry_id")?.ok_or(Error::BadRow("registry_id"))?;
-        if meta(connection, RECONCILIATION_REQUIRED)?.as_deref() == Some("true") {
+        if !allow_reconciliation
+            && meta(connection, RECONCILIATION_REQUIRED)?.as_deref() == Some("true")
+        {
             return Err(Error::ReconciliationRequired);
         }
         if !is_uuid(&registry_id) {
