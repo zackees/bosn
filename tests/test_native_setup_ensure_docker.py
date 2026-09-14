@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import time
 from collections.abc import Iterator
@@ -22,6 +23,13 @@ from bosn.native_cli import _configure_native_library_path, native_executable
 
 PINNED_ALPINE = (
     "alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b"
+)
+# The legacy-manifest runtime intentionally derives no application command.
+# Unlike Alpine's interactive shell default, MySQL's image-declared server is
+# long-running, so it proves the daemon has actually started a standard Linux
+# application without adding a command escape hatch to the manifest surface.
+PINNED_MANIFEST_MYSQL = (
+    "mysql@sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b"
 )
 MANAGED_LABEL = "com.zackees.bosn.setup-managed"
 CONTENT_LABEL = "com.zackees.bosn.setup-content-sha256"
@@ -54,11 +62,11 @@ def _docker(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _pinned_image_id() -> str:
-    result = _docker("image", "inspect", "--format", "{{.Id}}", PINNED_ALPINE, check=False)
+def _pinned_image_id(image: str = PINNED_ALPINE) -> str:
+    result = _docker("image", "inspect", "--format", "{{.Id}}", image, check=False)
     if result.returncode:
         pytest.skip(
-            "live Docker proof needs the pre-pulled pinned Alpine image " + PINNED_ALPINE
+            "live Docker proof needs the pre-pulled pinned image " + image
         )
     image_id = result.stdout.strip()
     assert image_id, "pinned Alpine image did not expose an image identity"
@@ -77,6 +85,14 @@ def _inspect_container(name: str) -> tuple[str, bool, str, dict[str, str]] | Non
         record["Image"],
         record["Config"].get("Labels") or {},
     )
+
+
+def _container_environment(name: str) -> set[str]:
+    result = _docker("container", "inspect", "--format", "{{json .Config.Env}}", name)
+    values = json.loads(result.stdout)
+    assert isinstance(values, list)
+    assert all(isinstance(value, str) for value in values)
+    return set(values)
 
 
 @contextmanager
@@ -158,6 +174,22 @@ def _wait_for_success(client: bosn.Client, job_id: int) -> tuple[str, ...]:
     raise AssertionError(f"setup ensure did not finish; logs={lines}")
 
 
+def _wait_for_failure(client: bosn.Client, job_id: int) -> str:
+    """Wait only for the expected pre-engine refusal path."""
+
+    deadline = time.monotonic() + JOB_DEADLINE_SECONDS
+    while time.monotonic() < deadline:
+        status = client.job_status(job_id)
+        assert status.id == job_id
+        if status.state == "Failed":
+            assert status.error
+            return status.error
+        if status.state in {"Succeeded", "Cancelled", "Superseded"}:
+            raise AssertionError(f"manifest refusal ended {status.state}: {status.error}")
+        time.sleep(0.05)
+    raise AssertionError("manifest refusal did not finish")
+
+
 def _remove_exact_managed_container(name: str, content_sha256: str) -> None:
     observed = _inspect_container(name)
     if observed is None:
@@ -168,6 +200,40 @@ def _remove_exact_managed_container(name: str, content_sha256: str) -> None:
     assert labels.get(NAME_LABEL) == name, "cleanup refused another container name"
     _docker("container", "rm", "--force", name)
     assert _inspect_container(name) is None
+
+
+def _read_exact_resource_uses(state_dir: Path) -> set[tuple[str, str, str, str, str]]:
+    """Read only the durable use facts after the daemon committed the job.
+
+    Resource-use diagnostics do not yet have a public Python accessor.  This
+    verifier opens the daemon-created SQLite file read-only and queries no
+    mutable operation, keeping all lifecycle calls on the public Client.
+    """
+
+    database = (state_dir / "registry.sqlite3").resolve().as_uri() + "?mode=ro"
+    connection = sqlite3.connect(database, uri=True)
+    try:
+        return set(
+            connection.execute(
+                "SELECT resource_id, workspace, stack, generation, state FROM resource_uses"
+            ).fetchall()
+        )
+    finally:
+        connection.close()
+
+
+def _read_manifest_success_events(state_dir: Path) -> list[tuple[str, str]]:
+    """Read the manifest-specific durable audit facts without mutating state."""
+
+    database = (state_dir / "registry.sqlite3").resolve().as_uri() + "?mode=ro"
+    connection = sqlite3.connect(database, uri=True)
+    try:
+        return connection.execute(
+            "SELECT kind, detail FROM events WHERE kind = 'manifest.ensure.succeeded' "
+            "ORDER BY id"
+        ).fetchall()
+    finally:
+        connection.close()
 
 
 def test_native_python_client_ensures_and_reuses_one_managed_app(tmp_path: Path) -> None:
@@ -388,6 +454,178 @@ def test_native_python_client_ensures_supported_compose_yaml_source(tmp_path: Pa
         assert not any(workspace.iterdir()), "ensure wrote into the selected workspace"
     finally:
         _remove_exact_managed_container(container_name, plan.content_sha256)
+
+
+def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) -> None:
+    """A manifest stack becomes one verified, daemon-owned Linux application.
+
+    This covers the Rust manifest bridge's supported runtime subset through
+    the installed PyO3 Client.  It deliberately has no raw image, container,
+    Docker, or command argument: image and environment are declaration data
+    in the workspace-contained ``bosn.toml`` only.
+    """
+
+    image_id = _pinned_image_id(PINNED_MANIFEST_MYSQL)
+    assert bosn.Client.__module__ == "bosn._native"
+
+    state_dir = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    unique = f"python-manifest-{os.getpid()}-{time.time_ns()}"
+    manifest = workspace / "bosn.toml"
+    manifest.write_text(
+        "[stack.linux]\n"
+        f"image = '{PINNED_MANIFEST_MYSQL}'\n"
+        "[stack.linux.env]\n"
+        "MYSQL_ALLOW_EMPTY_PASSWORD = 'yes'\n"
+        f"BOSN_MANIFEST_PROOF = '{unique}'\n",
+        encoding="utf-8",
+    )
+    unsupported = workspace / "unsupported.toml"
+    unsupported.write_text(
+        f"[stack.rejected]\nimage = '{PINNED_MANIFEST_MYSQL}'\nworkdir = '/'\n",
+        encoding="utf-8",
+    )
+
+    client = bosn.Client(state_dir)
+    # The native boundary exposes exactly the semantic selectors and bounds.
+    # It must not become a raw Docker/create or command execution endpoint.
+    for field in ("image", "container", "docker_args", "command", "mounts"):
+        with pytest.raises(TypeError):
+            client.submit_manifest_ensure(
+                workspace,
+                "bosn.toml",
+                "linux",
+                deadline_ms=90_000,
+                output_limit=1_048_576,
+                **{field: "unsafe"},
+            )
+    with pytest.raises(ValueError, match="safe workspace-relative path"):
+        client.submit_manifest_ensure(
+            workspace,
+            "../bosn.toml",
+            "linux",
+            deadline_ms=90_000,
+            output_limit=1_048_576,
+        )
+
+    container_name: str | None = None
+    content_sha256: str | None = None
+    try:
+        with _production_daemon(state_dir) as (_, daemon):
+            _wait_for_daemon(client, daemon)
+
+            # An accepted TOML field can still be refused by this deliberately
+            # narrow runtime slice before it reaches Docker.
+            rejected = client.submit_manifest_ensure(
+                workspace,
+                "unsupported.toml",
+                "rejected",
+                deadline_ms=90_000,
+                output_limit=1_048_576,
+            )
+            assert "unsupported runtime field" in _wait_for_failure(client, rejected)
+
+            first_job = client.submit_manifest_ensure(
+                workspace,
+                "bosn.toml",
+                "linux",
+                deadline_ms=90_000,
+                output_limit=1_048_576,
+            )
+            first_logs = _wait_for_success(client, first_job)
+            assert "[manifest] preparing immutable application image" in first_logs
+
+            resources = client.registry_resources(limit=16).records
+            assert len(resources) == 2
+            container_resource = next(record for record in resources if record.kind == "container")
+            image_resource = next(record for record in resources if record.kind == "image")
+            assert container_resource.stack == "linux"
+            assert container_resource.generation.startswith("sha256:")
+            assert container_resource.state == "active"
+            assert container_resource.retention == "pinned"
+            content_sha256 = container_resource.generation.removeprefix("sha256:")
+            assert len(content_sha256) == 64
+            container_name = f"bosn-setup-{content_sha256}"
+            assert container_resource.id == (
+                f"manifest-container:linux:{container_resource.generation}"
+            )
+            assert container_resource.name == container_name
+            assert (
+                image_resource.id,
+                image_resource.name,
+                image_resource.stack,
+                image_resource.generation,
+                image_resource.state,
+                image_resource.retention,
+            ) == (
+                f"manifest-image:{image_id}",
+                f"manifest-image:{image_id}",
+                "linux",
+                image_id,
+                "active",
+                "pinned",
+            )
+
+            first = _inspect_container(container_name)
+            assert first is not None
+            first_id, first_running, first_image, first_labels = first
+            assert first_running
+            assert first_image == image_id
+            assert first_labels[MANAGED_LABEL] == "v1"
+            assert first_labels[CONTENT_LABEL] == content_sha256
+            assert first_labels[NAME_LABEL] == container_name
+            assert {
+                "MYSQL_ALLOW_EMPTY_PASSWORD=yes",
+                f"BOSN_MANIFEST_PROOF={unique}",
+            } <= _container_environment(container_name)
+
+            expected_uses = {
+                (
+                    container_resource.id,
+                    str(workspace.resolve()),
+                    "linux",
+                    container_resource.generation,
+                    "active",
+                ),
+                (
+                    image_resource.id,
+                    str(workspace.resolve()),
+                    "linux",
+                    image_id,
+                    "active",
+                ),
+            }
+            # The durable resources, resource uses, and terminal success event
+            # are all committed before the daemon reports the job as succeeded.
+            assert _read_exact_resource_uses(state_dir) == expected_uses
+            assert _read_manifest_success_events(state_dir) == [
+                ("manifest.ensure.succeeded", f"job_id={first_job}")
+            ]
+
+            second_job = client.submit_manifest_ensure(
+                workspace,
+                "bosn.toml",
+                "linux",
+                deadline_ms=90_000,
+                output_limit=1_048_576,
+            )
+            assert isinstance(_wait_for_success(client, second_job), tuple)
+            second = _inspect_container(container_name)
+            assert second is not None
+            second_id, second_running, second_image, second_labels = second
+            assert second_id == first_id, "manifest ensure replaced its matching app"
+            assert second_running
+            assert second_image == first_image
+            assert second_labels == first_labels
+            assert _read_exact_resource_uses(state_dir) == expected_uses
+            assert _read_manifest_success_events(state_dir) == [
+                ("manifest.ensure.succeeded", f"job_id={first_job}"),
+                ("manifest.ensure.succeeded", f"job_id={second_job}"),
+            ]
+    finally:
+        if container_name is not None and content_sha256 is not None:
+            _remove_exact_managed_container(container_name, content_sha256)
 
 
 def test_native_python_client_runs_declared_task_inside_ensured_managed_app(
