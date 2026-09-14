@@ -16,8 +16,8 @@ use bosn_setup::{
     PreparedImage, SetupAcquirePolicy, SetupAppTaskRequest, SetupEnsureEngine,
     SetupEnsureRequest as CoreSetupEnsureRequest, SetupEnsureResult, SetupImageEngine,
     SetupNamedVolume, SetupPlan, SetupPlanAppSource, SetupPlanRequest, SetupTaskRequest,
-    adopt_setup_app, ensure_setup_app, execute_setup_app_task, execute_setup_task, plan_setup,
-    prepare_setup_image,
+    SetupTmpfs, SetupTmpfsSize, SetupTmpfsSizeUnit, adopt_setup_app, ensure_setup_app,
+    execute_setup_app_task, execute_setup_task, plan_setup, prepare_setup_image,
 };
 use jobs::{Jobs, Submission};
 use kernal_api::{
@@ -951,11 +951,7 @@ async fn manifest_stack_plan(
     let stack = manifest
         .stack(request_stack)
         .map_err(|_| "selected manifest stack does not exist".to_owned())?;
-    if stack.dockerfile.is_some()
-        || stack.kind.is_some()
-        || stack.guest.is_some()
-        || !stack.tmpfs.is_empty()
-    {
+    if stack.dockerfile.is_some() || stack.kind.is_some() || stack.guest.is_some() {
         return Err("selected manifest stack uses an unsupported runtime field".into());
     }
     let image = stack
@@ -995,6 +991,7 @@ async fn manifest_stack_plan(
         .rsplit_once("@sha256:")
         .map(|(_, value)| format!("sha256:{value}"))
         .expect("validated pinned image has digest");
+    let tmpfs = manifest_tmpfs(stack)?;
     let base_generation = stack_generation_async(
         &manifest,
         stack,
@@ -1017,6 +1014,7 @@ async fn manifest_stack_plan(
         &mounts,
         workdir.as_deref(),
         &stack.volumes,
+        &tmpfs,
     );
     let content_sha256 = generation
         .strip_prefix("sha256:")
@@ -1071,6 +1069,7 @@ async fn manifest_stack_plan(
                     labels: volume.labels.clone(),
                 })
                 .collect(),
+            tmpfs,
         },
         generation,
         volumes,
@@ -1134,6 +1133,91 @@ fn manifest_named_volumes(
             })
         })
         .collect()
+}
+
+/// Translate the limited legacy `tmpfs = ["/target[:ro|rw[,size=N{b|k|m|g}]]"]`
+/// shape to typed setup data.  Legacy fields such as `noexec`, `mode`, or an
+/// unknown size unit fail closed instead of becoming Docker option strings.
+fn manifest_tmpfs(stack: &bosn_core::manifest::Stack) -> Result<Vec<SetupTmpfs>, String> {
+    let mut targets = std::collections::BTreeSet::new();
+    stack
+        .tmpfs
+        .iter()
+        .map(|tmpfs| {
+            if !normalized_container_path(&tmpfs.destination)
+                || !targets.insert(tmpfs.destination.clone())
+            {
+                return Err("manifest tmpfs target is unsafe or duplicated".into());
+            }
+            let (_, raw_options) = tmpfs
+                .value
+                .split_once(':')
+                .map(|(destination, options)| (destination, Some(options)))
+                .unwrap_or((tmpfs.value.as_str(), None));
+            let mut readonly = false;
+            let mut mode_seen = false;
+            let mut size = None;
+            if let Some(raw_options) = raw_options {
+                for option in raw_options.split(',') {
+                    match option {
+                        "ro" => {
+                            if mode_seen {
+                                return Err("manifest tmpfs mode is repeated".into());
+                            }
+                            readonly = true;
+                            mode_seen = true;
+                        }
+                        "rw" => {
+                            if mode_seen {
+                                return Err("manifest tmpfs mode is repeated".into());
+                            }
+                            readonly = false;
+                            mode_seen = true;
+                        }
+                        value if value.starts_with("size=") => {
+                            if size.is_some() {
+                                return Err("manifest tmpfs size is repeated".into());
+                            }
+                            size = Some(parse_manifest_tmpfs_size(&value[5..])?);
+                        }
+                        _ => return Err("manifest tmpfs uses an unsupported option".into()),
+                    }
+                }
+            }
+            Ok(SetupTmpfs {
+                target: tmpfs.destination.clone(),
+                readonly,
+                size,
+            })
+        })
+        .collect()
+}
+
+fn parse_manifest_tmpfs_size(value: &str) -> Result<SetupTmpfsSize, String> {
+    let (digits, unit) = value.strip_suffix('b').map_or_else(
+        || value.split_at(value.len().saturating_sub(1)),
+        |digits| (digits, "b"),
+    );
+    let (digits, unit) = if matches!(unit, "k" | "m" | "g") {
+        (digits, unit)
+    } else if value.ends_with('b') {
+        (digits, "b")
+    } else {
+        return Err("manifest tmpfs size has an unsupported unit".into());
+    };
+    let value = digits
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "manifest tmpfs size is invalid".to_owned())?;
+    let unit = match unit {
+        "b" => SetupTmpfsSizeUnit::Bytes,
+        "k" => SetupTmpfsSizeUnit::Kibibytes,
+        "m" => SetupTmpfsSizeUnit::Mebibytes,
+        "g" => SetupTmpfsSizeUnit::Gibibytes,
+        _ => unreachable!("unit was validated above"),
+    };
+    Ok(SetupTmpfsSize { value, unit })
 }
 
 /// Convert one legacy manifest bind into the narrower workspace-relative setup
@@ -1293,6 +1377,7 @@ fn manifest_runtime_generation(
     mounts: &[bosn_core::WorkspaceMount],
     workdir: Option<&str>,
     volumes: &[bosn_core::manifest::Volume],
+    tmpfs: &[SetupTmpfs],
 ) -> String {
     let mut hasher = Sha256Hasher::new();
     manifest_generation_field(&mut hasher, b"bosn-manifest-runtime-v1");
@@ -1316,6 +1401,27 @@ fn manifest_runtime_generation(
                 Retention::Pinned => b"pinned",
             },
         );
+    }
+    manifest_generation_field(&mut hasher, &(tmpfs.len() as u64).to_be_bytes());
+    let mut tmpfs = tmpfs.to_vec();
+    tmpfs.sort_by(|left, right| left.target.cmp(&right.target));
+    for tmpfs in tmpfs {
+        manifest_generation_field(&mut hasher, tmpfs.target.as_bytes());
+        manifest_generation_field(&mut hasher, if tmpfs.readonly { b"ro" } else { b"rw" });
+        if let Some(size) = tmpfs.size {
+            manifest_generation_field(&mut hasher, &size.value.to_be_bytes());
+            manifest_generation_field(
+                &mut hasher,
+                match size.unit {
+                    SetupTmpfsSizeUnit::Bytes => b"b",
+                    SetupTmpfsSizeUnit::Kibibytes => b"k",
+                    SetupTmpfsSizeUnit::Mebibytes => b"m",
+                    SetupTmpfsSizeUnit::Gibibytes => b"g",
+                },
+            );
+        } else {
+            manifest_generation_field(&mut hasher, b"no-size");
+        }
     }
     format!("sha256:{}", hasher.finalize())
 }
@@ -7755,6 +7861,64 @@ mod tests {
     }
 
     #[test]
+    fn manifest_stack_plan_derives_only_typed_tmpfs_and_rolls_generation() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let image = format!("example.invalid/app@sha256:{}", "a".repeat(64));
+        let request = || ManifestEnsureJobRequest {
+            workspace: workspace.clone(),
+            manifest: "bosn.toml".into(),
+            stack: "app".into(),
+            deadline: Duration::from_secs(1),
+            output_limit: 64,
+        };
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        std::fs::write(
+            workspace.join("bosn.toml"),
+            format!("[stack.app]\nimage = '{image}'\ntmpfs = ['/run/cache:ro,size=64m']\n"),
+        )
+        .unwrap();
+        let first = runtime.run(manifest_stack_setup_plan(&request())).unwrap();
+        assert_eq!(first.plan.tmpfs.len(), 1);
+        assert_eq!(first.plan.tmpfs[0].target, "/run/cache");
+        assert!(first.plan.tmpfs[0].readonly);
+        assert_eq!(
+            first.plan.tmpfs[0].size,
+            Some(SetupTmpfsSize {
+                value: 64,
+                unit: SetupTmpfsSizeUnit::Mebibytes,
+            })
+        );
+        std::fs::write(
+            workspace.join("bosn.toml"),
+            format!("[stack.app]\nimage = '{image}'\ntmpfs = ['/run/cache:rw,size=64m']\n"),
+        )
+        .unwrap();
+        let changed = runtime.run(manifest_stack_setup_plan(&request())).unwrap();
+        assert_ne!(first.generation, changed.generation);
+
+        for declaration in [
+            "['/run/cache:ro,rw']",
+            "['/run/cache:size=64m,size=32m']",
+            "['/run/cache:noexec']",
+            "['/run/cache:size=0m']",
+            "['/run/cache:size=1t']",
+            "['/one', '/one/']",
+        ] {
+            std::fs::write(
+                workspace.join("bosn.toml"),
+                format!("[stack.app]\nimage = '{image}'\ntmpfs = {declaration}\n"),
+            )
+            .unwrap();
+            assert!(runtime.run(manifest_stack_setup_plan(&request())).is_err());
+        }
+    }
+
+    #[test]
     fn manifest_stack_plan_translates_workspace_binds_and_workdir_into_setup_shape() {
         let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
         let workspace = temporary.path().join("workspace");
@@ -8873,6 +9037,7 @@ mod tests {
             tasks: BTreeMap::new(),
             app_source: bosn_setup::SetupPlanAppSource::PinnedImage { image },
             named_volumes: Vec::new(),
+            tmpfs: Vec::new(),
         }
     }
     fn command_result(exit_code: i32, stdout: impl Into<Vec<u8>>) -> bosn_engine::CommandResult {

@@ -486,6 +486,7 @@ mod tests {
                 image: image.into(),
             },
             named_volumes: Vec::new(),
+            tmpfs: Vec::new(),
         }
     }
 
@@ -527,6 +528,7 @@ mod tests {
                     dockerfile_path: root.join("Dockerfile"),
                 },
                 named_volumes: Vec::new(),
+                tmpfs: Vec::new(),
             },
         )
     }

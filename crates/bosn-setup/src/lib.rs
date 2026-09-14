@@ -32,8 +32,8 @@ pub use materialize::{
 
 mod plan;
 pub use plan::{
-    SetupNamedVolume, SetupPlan, SetupPlanAppSource, SetupPlanError, SetupPlanRequest, plan_setup,
-    plan_setup_with_transport,
+    SetupNamedVolume, SetupPlan, SetupPlanAppSource, SetupPlanError, SetupPlanRequest, SetupTmpfs,
+    SetupTmpfsSize, SetupTmpfsSizeUnit, plan_setup, plan_setup_with_transport,
 };
 
 mod prepare;
@@ -46,7 +46,7 @@ mod ensure;
 pub use ensure::{
     SetupEnsureCommand, SetupEnsureEngine, SetupEnsureError, SetupEnsureMount,
     SetupEnsureObservedContainer, SetupEnsureRequest, SetupEnsureResponse, SetupEnsureResult,
-    adopt_setup_app, ensure_setup_app,
+    SetupEnsureTmpfs, adopt_setup_app, ensure_setup_app,
 };
 
 mod task;

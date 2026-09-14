@@ -893,6 +893,103 @@ def test_native_manifest_task_inherits_declared_workspace_binds_and_workdir(
             _remove_exact_managed_container(container_name, content_sha256)
 
 
+def test_native_manifest_tmpfs_is_typed_and_empty_after_generation_rollover(
+    tmp_path: Path,
+) -> None:
+    """Fresh native wheel: tmpfs reaches Docker but never survives a rollover."""
+
+    _pinned_image_id(PINNED_MANIFEST_MYSQL)
+    state_dir = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manifest = workspace / "bosn.toml"
+    containers: list[tuple[str, str]] = []
+
+    def write_manifest(marker: str, task_name: str, command: str) -> None:
+        manifest.write_text(
+            "[stack.linux]\n"
+            f"image = '{PINNED_MANIFEST_MYSQL}'\n"
+            "tmpfs = ['/run/bosn-tmpfs:rw,size=1m']\n"
+            "[stack.linux.env]\n"
+            "MYSQL_ALLOW_EMPTY_PASSWORD = 'yes'\n"
+            f"BOSN_TMPFS_GENERATION = '{marker}'\n"
+            f"[task.{task_name}]\n"
+            "stack = 'linux'\n"
+            f"cmd = '{command}'\n",
+            encoding="utf-8",
+        )
+
+    try:
+        write_manifest("one", "seed", "test -d /run/bosn-tmpfs && touch /run/bosn-tmpfs/proof")
+        client = bosn.Client(state_dir)
+        with _production_daemon(state_dir) as (_, daemon):
+            _wait_for_daemon(client, daemon)
+            _wait_for_success(
+                client,
+                client.submit_manifest_ensure(
+                    workspace, "bosn.toml", "linux", deadline_ms=90_000, output_limit=1_048_576
+                ),
+            )
+            first = next(
+                record
+                for record in client.registry_resources(limit=16).records
+                if record.kind == "container"
+            )
+            first_content = first.generation.removeprefix("sha256:")
+            first_name = f"bosn-setup-{first_content}"
+            containers.append((first_name, first_content))
+            host_tmpfs = json.loads(
+                _docker(
+                    "container", "inspect", "--format", "{{json .HostConfig.Tmpfs}}", first_name
+                ).stdout
+            )
+            assert "/run/bosn-tmpfs" in host_tmpfs
+            _wait_for_success(
+                client,
+                client.submit_manifest_app_task(
+                    workspace,
+                    "bosn.toml",
+                    "linux",
+                    "seed",
+                    deadline_ms=90_000,
+                    output_limit=1_048_576,
+                ),
+            )
+
+            write_manifest(
+                "two", "verify", "test -d /run/bosn-tmpfs && ! test -e /run/bosn-tmpfs/proof"
+            )
+            _wait_for_success(
+                client,
+                client.submit_manifest_ensure(
+                    workspace, "bosn.toml", "linux", deadline_ms=90_000, output_limit=1_048_576
+                ),
+            )
+            current = next(
+                record
+                for record in client.registry_resources(limit=16).records
+                if record.kind == "container" and record.state == "active"
+            )
+            current_content = current.generation.removeprefix("sha256:")
+            current_name = f"bosn-setup-{current_content}"
+            assert current_name != first_name
+            containers.append((current_name, current_content))
+            _wait_for_success(
+                client,
+                client.submit_manifest_app_task(
+                    workspace,
+                    "bosn.toml",
+                    "linux",
+                    "verify",
+                    deadline_ms=90_000,
+                    output_limit=1_048_576,
+                ),
+            )
+    finally:
+        for name, content in reversed(containers):
+            _remove_exact_managed_container(name, content)
+
+
 def test_native_python_client_runs_declared_task_inside_ensured_managed_app(
     tmp_path: Path,
 ) -> None:
