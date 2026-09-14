@@ -24,7 +24,10 @@ jobs:
         with:
           enable-cache: true
       - name: Refuse native macOS runner labels
-        run: uv run python ci/lint_no_macos_runners.py
+        # This policy needs only PyYAML.  Keep it independent from the Rust
+        # extension build so it can fail immediately before build capacity is
+        # spent on any wheel lane.
+        run: uv run --no-project --with pyyaml==6.0.2 python ci/lint_no_macos_runners.py
 
   rust:
     name: Rust workspace (locked tests)
