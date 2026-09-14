@@ -22,7 +22,10 @@ use bosn_setup::{
     SetupAcquirePolicy, SetupPlan, SetupPlanAppSource, SetupPlanRequest, SetupSourceKind,
     plan_setup,
 };
-use kernal_api::async_engine::RuntimeBuilder;
+use kernal_api::{
+    async_engine::RuntimeBuilder,
+    platform::{fs, ipc},
+};
 use serde_json::json;
 
 const SETUP_PREPARE_MAX_DEADLINE_MS: u64 = 5 * 60 * 1_000;
@@ -589,6 +592,10 @@ fn run_registry(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
     let Some(command) = arguments.next() else {
         usage();
     };
+    if command.as_os_str() == std::ffi::OsStr::new("import-v4") {
+        run_registry_import_v4(arguments);
+        return;
+    }
     let invocation = match command.to_string_lossy().as_ref() {
         "resources" => {
             parse_registry_arguments(arguments).map(|(state_dir, after, limit, json)| {
@@ -635,6 +642,99 @@ fn run_registry(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
             }
         }
     }
+}
+
+/// Explicit, offline-only Python-v4 registry cutover.  This is deliberately
+/// not an RPC: a normal daemon must not be running while its destination
+/// database is being published, and the importer keeps the old source intact
+/// for reconciliation rather than attempting an engine adoption by name.
+fn run_registry_import_v4(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
+    let mut legacy_state_dir = None;
+    let mut state_dir = None;
+    let mut yes = false;
+    let mut json_output = false;
+    while let Some(argument) = arguments.next() {
+        match argument.to_string_lossy().as_ref() {
+            "--legacy-state-dir" => {
+                set_once_parsed(&mut legacy_state_dir, arguments.next(), parse_state_dir)
+            }
+            "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
+            "--yes" if !yes => {
+                yes = true;
+                Ok(())
+            }
+            "--json" if !json_output => {
+                json_output = true;
+                Ok(())
+            }
+            _ => Err(()),
+        }
+        .unwrap_or_else(|_| registry_import_failure(json_output));
+    }
+    let (Some(legacy_state_dir), Some(state_dir)) = (legacy_state_dir, state_dir) else {
+        registry_import_failure(json_output);
+    };
+    if !yes {
+        registry_import_failure(json_output);
+    }
+
+    // Check before destination hardening, so an accidental same-directory
+    // invocation cannot even change source directory metadata.  Recheck after
+    // creation as a defense against aliases which only resolve once the
+    // destination exists.
+    let legacy_identity = fs::path_identity(&legacy_state_dir)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| registry_import_failure(json_output));
+    if fs::path_identity(&state_dir).ok().flatten() == Some(legacy_identity) {
+        registry_import_failure(json_output);
+    }
+    if !ipc::owner_private_directory(&legacy_state_dir)
+        .ok()
+        .unwrap_or(false)
+    {
+        registry_import_failure(json_output);
+    }
+    if ipc::ensure_owner_private_directory(&state_dir).is_err()
+        || fs::path_identity(&state_dir).ok().flatten() == Some(legacy_identity)
+    {
+        registry_import_failure(json_output);
+    }
+
+    let source = legacy_state_dir.join("registry.sqlite3");
+    let destination = state_dir.join("registry.sqlite3");
+    match bosn_registry::import_python_v4(&legacy_state_dir, &source, &destination) {
+        Ok(report) => {
+            let counts = report
+                .table_counts
+                .into_iter()
+                .map(|(key, value)| (key, json!(value)))
+                .collect::<serde_json::Map<String, serde_json::Value>>();
+            println!(
+                "{}",
+                json!({
+                    "action": "registry_import_v4",
+                    "registry_id": report.registry_id,
+                    "reconciliation_required": report.reconciliation_required,
+                    "table_counts": counts,
+                    "source_preserved": true,
+                })
+            );
+        }
+        Err(_) => registry_import_failure(json_output),
+    }
+}
+
+fn registry_import_failure(json_output: bool) -> ! {
+    if json_output {
+        println!(
+            "{}",
+            json!({"action":"registry_import_v4","error":"cutover refused"})
+        );
+    } else {
+        eprintln!("bosn registry import-v4: cutover refused");
+    }
+    std::process::exit(1)
 }
 
 enum RegistryInvocation {
@@ -2011,6 +2111,9 @@ fn usage() -> ! {
     eprintln!("   or: bosn daemon serve --state-dir STATE_DIR");
     eprintln!("   or: bosn daemon status --state-dir STATE_DIR [--json]");
     eprintln!("   or: bosn daemon stop --state-dir STATE_DIR [--json]");
+    eprintln!(
+        "   or: bosn registry import-v4 --legacy-state-dir LEGACY_STATE_DIR --state-dir NEW_STATE_DIR --yes [--json]"
+    );
     eprintln!("   or: bosn compose plan --file COMPOSE_YAML [--json]");
     eprintln!(
         "   or: bosn setup plan --state-dir STATE_DIR --workspace WORKSPACE --config LOCATOR (--refresh | --offline) [--json]"

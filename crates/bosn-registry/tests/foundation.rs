@@ -270,6 +270,158 @@ fn bridge_migration_guard_excludes_a_second_rust_importer() {
     acquire_legacy_migration_guard(directory.path()).unwrap();
 }
 
+#[test]
+fn v4_import_refuses_unknown_or_newer_schema_without_publishing_destination() {
+    let (directory, source, registry_id) = valid_v4_source();
+    let destination = directory.path().join("destination.sqlite3");
+    let connection = kernal_api::sqlite::Connection::open(&source).unwrap();
+    connection
+        .execute("CREATE TABLE future_python_state (key TEXT)", &[])
+        .unwrap();
+    drop(connection);
+    let source_before_refusal = std::fs::read(&source).unwrap();
+    assert!(matches!(
+        import_python_v4(directory.path(), &source, &destination),
+        Err(Error::InvalidSchema)
+    ));
+    assert!(!destination.exists());
+    assert_eq!(std::fs::read(&source).unwrap(), source_before_refusal);
+    let connection = kernal_api::sqlite::Connection::open(&source).unwrap();
+    connection
+        .execute("DROP TABLE future_python_state", &[])
+        .unwrap();
+    connection
+        .execute("UPDATE meta SET value='5' WHERE key='schema_version'", &[])
+        .unwrap();
+    assert!(matches!(
+        import_python_v4(directory.path(), &source, &destination),
+        Err(Error::UnsupportedSchema(5))
+    ));
+    assert!(!destination.exists());
+    assert_eq!(registry_id, "11111111-2222-4333-8444-555555555555");
+}
+
+#[test]
+fn v4_import_refuses_live_ownership_and_preserves_pinned_volume_identity() {
+    let (directory, source, _registry_id) = valid_v4_source();
+    let destination = directory.path().join("destination.sqlite3");
+    let connection = kernal_api::sqlite::Connection::open(&source).unwrap();
+    connection.execute("INSERT INTO resources VALUES ('pinned-volume','volume','bosn-v4-data','stack','sha256:fixture','machine','/work',1,2,'active','pinned')", &[]).unwrap();
+    connection.execute("INSERT INTO resource_uses VALUES ('pinned-volume','/work','stack','sha256:fixture',2,'active')", &[]).unwrap();
+    connection
+        .execute(
+            "INSERT INTO leases VALUES ('live-lease','pinned-volume',?,NULL,1,2,30)",
+            &[kernal_api::sqlite::Value::Integer(i64::from(
+                std::process::id(),
+            ))],
+        )
+        .unwrap();
+    connection.execute("INSERT INTO execution_sessions VALUES ('live-session','container','docker',?,NULL,'[\"live-lease\"]')", &[kernal_api::sqlite::Value::Integer(i64::from(std::process::id()))]).unwrap();
+    assert!(matches!(
+        import_python_v4(directory.path(), &source, &destination),
+        Err(Error::SourceOwnershipLive(pid)) if pid == std::process::id()
+    ));
+    assert!(!destination.exists());
+    connection
+        .execute("DELETE FROM execution_sessions", &[])
+        .unwrap();
+    connection.execute("DELETE FROM leases", &[]).unwrap();
+    drop(connection);
+    import_python_v4(directory.path(), &source, &destination).unwrap();
+    let imported = kernal_api::sqlite::Connection::open_read_only(&destination).unwrap();
+    assert_eq!(
+        imported
+            .query(
+                "SELECT id,name,retention FROM resources WHERE id='pinned-volume'",
+                &[],
+                Default::default(),
+            )
+            .unwrap()[0]
+            .get(0),
+        Some(&kernal_api::sqlite::Value::Text("pinned-volume".into()))
+    );
+    assert_eq!(
+        imported
+            .query(
+                "SELECT id,name,retention FROM resources WHERE id='pinned-volume'",
+                &[],
+                Default::default(),
+            )
+            .unwrap()[0]
+            .get(1),
+        Some(&kernal_api::sqlite::Value::Text("bosn-v4-data".into()))
+    );
+    assert_eq!(
+        imported
+            .query(
+                "SELECT id,name,retention FROM resources WHERE id='pinned-volume'",
+                &[],
+                Default::default(),
+            )
+            .unwrap()[0]
+            .get(2),
+        Some(&kernal_api::sqlite::Value::Text("pinned".into()))
+    );
+    assert!(matches!(
+        import_python_v4(directory.path(), &source, &destination),
+        Err(Error::ImportTargetExists(_))
+    ));
+}
+
+#[test]
+fn v4_import_refuses_orphaned_session_leases_and_in_place_destination() {
+    let (directory, source, _registry_id) = valid_v4_source();
+    let destination = directory.path().join("destination.sqlite3");
+    let connection = kernal_api::sqlite::Connection::open(&source).unwrap();
+    connection.execute("INSERT INTO execution_sessions VALUES ('session','container','docker',2147483647,NULL,'[\"missing-lease\"]')", &[]).unwrap();
+    assert!(matches!(
+        import_python_v4(directory.path(), &source, &destination),
+        Err(Error::InvalidSchema)
+    ));
+    assert!(!destination.exists());
+    connection
+        .execute("DELETE FROM execution_sessions", &[])
+        .unwrap();
+    drop(connection);
+    assert!(matches!(
+        import_python_v4(directory.path(), &source, &source),
+        Err(Error::SourceDestinationAliased(path)) if path == source
+    ));
+}
+
+fn valid_v4_source() -> (
+    kernal_api::platform::fs::TemporaryDirectory,
+    std::path::PathBuf,
+    &'static str,
+) {
+    let (directory, source) = database_path();
+    let registry_id = "11111111-2222-4333-8444-555555555555";
+    let marker = directory.path().join("rust-cutover-v1.json");
+    let mut marker_file = kernal_api::platform::fs::create_private_file(&marker).unwrap();
+    marker_file
+        .write_all(format!(r#"{{"protocol":1,"registry_id":"{registry_id}"}}"#).as_bytes())
+        .unwrap();
+    marker_file.sync_all().unwrap();
+    drop(marker_file);
+    drop(kernal_api::platform::fs::create_private_file(&source).unwrap());
+    let connection = kernal_api::sqlite::Connection::open(&source).unwrap();
+    for statement in Registry::schema_sql()
+        .split(';')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        connection.execute(statement, &[]).unwrap();
+    }
+    connection
+        .execute(
+            "INSERT INTO meta VALUES ('schema_version','4'),('registry_id',?)",
+            &[kernal_api::sqlite::Value::Text(registry_id.into())],
+        )
+        .unwrap();
+    drop(connection);
+    (directory, source, registry_id)
+}
+
 fn database_path() -> (
     kernal_api::platform::fs::TemporaryDirectory,
     std::path::PathBuf,

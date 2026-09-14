@@ -5,7 +5,7 @@
 //! quiesced import/reconciliation milestone lands.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -72,6 +72,7 @@ pub enum Error {
     ReservedMeta(&'static str),
     InvalidCutoverMarker,
     CutoverRegistryMismatch,
+    SourceDestinationAliased(PathBuf),
     SourceOwnershipLive(u32),
     SourceOwnershipUnknown(u32),
     ImportTargetExists(PathBuf),
@@ -305,6 +306,18 @@ fn import_python_v4_inner(
     if expected_identity.is_none() || source_identity != expected_identity {
         return Err(Error::InvalidSchema);
     }
+    // An importer is a copy/cutover operation, never an in-place schema
+    // mutation.  Refuse spelling aliases of the source before opening SQLite
+    // so a caller cannot turn a failed or interrupted import into source
+    // damage by choosing the source as its target.
+    let destination_identity = match fs::path_identity(destination) {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(Error::Io(error)),
+    };
+    if destination_identity == expected_identity {
+        return Err(Error::SourceDestinationAliased(destination.into()));
+    }
     let marker = fs::read_private_regular_file_bounded(&state_dir.join(CUTOVER_MARKER), 4096)
         .map_err(Error::Io)?;
     let marker: serde_json::Value =
@@ -515,6 +528,23 @@ impl ImportRows {
         })
     }
     fn validate_owners(&self) -> Result<(), Error> {
+        // `lease_ids` is JSON rather than a SQLite foreign key in v4.  Do not
+        // promote an orphaned session into the native registry: it would make
+        // a later reconciliation reason about an ownership relationship that
+        // never existed durably in the source.
+        let known_leases = self
+            .leases
+            .iter()
+            .map(|lease| lease.id.as_str())
+            .collect::<BTreeSet<_>>();
+        for session in &self.sessions {
+            let mut seen = BTreeSet::new();
+            for lease_id in &session.lease_ids {
+                if !seen.insert(lease_id.as_str()) || !known_leases.contains(lease_id.as_str()) {
+                    return Err(Error::InvalidSchema);
+                }
+            }
+        }
         for pid in self
             .leases
             .iter()
@@ -706,6 +736,21 @@ fn validate_v4_schema(c: &Connection) -> Result<(), Error> {
         ),
         ("events", &["id", "at", "kind", "detail"][..]),
     ];
+    // v4 is deliberately a closed import contract.  An extra application
+    // table can encode lifecycle state this importer does not understand;
+    // accepting it and calling the result a complete cutover would be lossy.
+    // SQLite owns `sqlite_sequence` for the AUTOINCREMENT events table.
+    let expected_tables = expected
+        .iter()
+        .map(|(name, _)| *name)
+        .chain(std::iter::once("sqlite_sequence"))
+        .collect::<BTreeSet<_>>();
+    if tables
+        .iter()
+        .any(|found| !expected_tables.contains(found.as_str()))
+    {
+        return Err(Error::InvalidSchema);
+    }
     for (table, columns) in expected {
         if !tables.iter().any(|found| found == table) {
             return Err(Error::InvalidSchema);
