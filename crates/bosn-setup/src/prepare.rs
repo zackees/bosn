@@ -485,6 +485,7 @@ mod tests {
             app_source: SetupPlanAppSource::PinnedImage {
                 image: image.into(),
             },
+            named_volumes: Vec::new(),
         }
     }
 
@@ -525,6 +526,7 @@ mod tests {
                 app_source: SetupPlanAppSource::InlineDockerfile {
                     dockerfile_path: root.join("Dockerfile"),
                 },
+                named_volumes: Vec::new(),
             },
         )
     }

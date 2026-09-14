@@ -8,15 +8,16 @@ use bosn_engine::{DockerDoctorReport, DockerDoctorState, DockerEngine, EngineEve
 use bosn_generation::{ExternalImageIdentity, collector::CollectorLimits, stack_generation_async};
 use bosn_registry::{
     Event, ExecutionSession, Registry, RegistryStatus, Resource, ResourceUse, SetupDone,
-    SetupGcPreview,
+    SetupGcPreview, VolumeCreationIntent,
 };
 #[cfg(test)]
 use bosn_setup::PreparedImageKind;
 use bosn_setup::{
     PreparedImage, SetupAcquirePolicy, SetupAppTaskRequest, SetupEnsureEngine,
-    SetupEnsureRequest as CoreSetupEnsureRequest, SetupEnsureResult, SetupImageEngine, SetupPlan,
-    SetupPlanAppSource, SetupPlanRequest, SetupTaskRequest, adopt_setup_app, ensure_setup_app,
-    execute_setup_app_task, execute_setup_task, plan_setup, prepare_setup_image,
+    SetupEnsureRequest as CoreSetupEnsureRequest, SetupEnsureResult, SetupImageEngine,
+    SetupNamedVolume, SetupPlan, SetupPlanAppSource, SetupPlanRequest, SetupTaskRequest,
+    adopt_setup_app, ensure_setup_app, execute_setup_app_task, execute_setup_task, plan_setup,
+    prepare_setup_image,
 };
 use jobs::{Jobs, Submission};
 use kernal_api::{
@@ -259,6 +260,7 @@ pub trait ManifestEnsureExecutor: Send + Sync {
         request: ManifestEnsureJobRequest,
         cancellation: &'a async_engine::CancellationToken,
         logs: &'a async_engine::Sender<String>,
+        registry: &'a RegistryActor,
     ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>>;
 }
 /// Semantic boundary for a named task in an already ensured manifest stack.
@@ -405,6 +407,24 @@ pub struct SetupEnsureExecution {
     /// The image fact verified during the same successful ensure pipeline.
     /// This is executor output, never an RPC-controlled image selector.
     pub image: SetupEnsureImageResource,
+    /// Manifest-derived named volumes proven/created before the container.
+    /// Generic setup-document ensures always leave this empty.
+    pub volumes: Vec<ManifestVolumeResource>,
+}
+
+/// Exact durable facts for a manifest-owned named volume.  These are executor
+/// output from a parsed declaration, never RPC-provided Docker controls.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManifestVolumeResource {
+    pub id: String,
+    pub name: String,
+    pub stack: String,
+    pub generation: String,
+    pub scope: Scope,
+    pub workspace: String,
+    pub retention: Retention,
+    pub target: String,
+    pub labels: BTreeMap<String, String>,
 }
 
 /// Logical identity facts for a daemon-owned setup container. The registry
@@ -603,6 +623,7 @@ impl SetupEnsureExecutor for DockerSetupEnsureExecutor {
                     &prepared,
                     &plan.workspace_root.to_string_lossy(),
                 ),
+                volumes: Vec::new(),
             })
         })
     }
@@ -629,6 +650,7 @@ impl ManifestEnsureExecutor for DockerManifestEnsureExecutor {
         request: ManifestEnsureJobRequest,
         cancellation: &'a async_engine::CancellationToken,
         logs: &'a async_engine::Sender<String>,
+        registry: &'a RegistryActor,
     ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>> {
         Box::pin(async move {
             let prepare_output = request.output_limit / 2;
@@ -639,13 +661,25 @@ impl ManifestEnsureExecutor for DockerManifestEnsureExecutor {
                 );
             }
             let deadline = async_engine::Deadline::after(request.deadline);
-            let (plan, generation) = async_engine::cancellable(
+            let runtime = async_engine::cancellable(
                 cancellation,
                 async_engine::timeout_at(deadline, manifest_stack_setup_plan(&request)),
             )
             .await
             .map_err(|_| "manifest ensure cancelled".to_owned())?
             .map_err(|_| "manifest ensure planning exceeded its deadline".to_owned())??;
+            // Persist the exact volume contract before Docker can create a
+            // volume. A crash after creation therefore leaves a narrow,
+            // labelled intent that the next ensure can prove and recover.
+            registry
+                .put_manifest_volume_intents(runtime.volumes.clone())
+                .await
+                .map_err(|error| format!("manifest volume intent unavailable: {error}"))?;
+            let ManifestRuntimePlan {
+                plan,
+                generation,
+                volumes,
+            } = runtime;
             let (events, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
             let forwarded_logs = logs.clone();
             let forwarder = async_engine::launch(async move {
@@ -695,6 +729,7 @@ impl ManifestEnsureExecutor for DockerManifestEnsureExecutor {
                     generation: result.prepared.observed_identity,
                     workspace,
                 },
+                volumes,
             })
         })
     }
@@ -732,13 +767,14 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                 );
             }
             let deadline = async_engine::Deadline::after(request.deadline);
-            let (plan, _) = async_engine::cancellable(
+            let runtime = async_engine::cancellable(
                 cancellation,
                 async_engine::timeout_at(deadline, manifest_stack_task_setup_plan(&request)),
             )
             .await
             .map_err(|_| "manifest app task cancelled before ownership inspection".to_owned())?
             .map_err(|_| "manifest app task planning exceeded its deadline".to_owned())??;
+            let plan = runtime.plan;
             let (events, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
             let forwarded_logs = logs.clone();
             let forwarder = async_engine::launch(async move {
@@ -857,13 +893,13 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
 /// rejected before Docker is contacted.
 async fn manifest_stack_setup_plan(
     request: &ManifestEnsureJobRequest,
-) -> Result<(SetupPlan, String), String> {
+) -> Result<ManifestRuntimePlan, String> {
     manifest_stack_plan(&request.workspace, &request.manifest, &request.stack, None).await
 }
 
 async fn manifest_stack_task_setup_plan(
     request: &ManifestAppTaskJobRequest,
-) -> Result<(SetupPlan, String), String> {
+) -> Result<ManifestRuntimePlan, String> {
     manifest_stack_plan(
         &request.workspace,
         &request.manifest,
@@ -882,7 +918,7 @@ async fn manifest_stack_plan(
     request_manifest: &str,
     request_stack: &str,
     task_name: Option<&str>,
-) -> Result<(SetupPlan, String), String> {
+) -> Result<ManifestRuntimePlan, String> {
     let workspace = fs::canonical_context_path(request_workspace)
         .map_err(|_| "manifest workspace cannot be canonicalized".to_owned())?;
     let metadata = fs::context_path_metadata_no_follow(&workspace)
@@ -918,9 +954,7 @@ async fn manifest_stack_plan(
     if stack.dockerfile.is_some()
         || stack.kind.is_some()
         || stack.guest.is_some()
-        || !stack.volumes.is_empty()
         || !stack.tmpfs.is_empty()
-        || stack.family.is_some()
     {
         return Err("selected manifest stack uses an unsupported runtime field".into());
     }
@@ -978,7 +1012,12 @@ async fn manifest_stack_plan(
     // content identity because legacy `docker exec` supplied it per task.
     // Native setup creates a persistent container with its workdir and binds,
     // so roll it whenever that effective lifecycle shape changes.
-    let generation = manifest_runtime_generation(&base_generation, &mounts, workdir.as_deref());
+    let generation = manifest_runtime_generation(
+        &base_generation,
+        &mounts,
+        workdir.as_deref(),
+        &stack.volumes,
+    );
     let content_sha256 = generation
         .strip_prefix("sha256:")
         .ok_or_else(|| "manifest generation is invalid".to_owned())?
@@ -1004,6 +1043,8 @@ async fn manifest_stack_plan(
         );
     }
     let task_names = tasks.keys().cloned().collect();
+    let workspace_string = workspace.to_string_lossy().into_owned();
+    let volumes = manifest_named_volumes(stack, &workspace_string, &generation)?;
     let app = SetupApp {
         source: SetupSource::PinnedImage(image.clone()),
         environment: stack.env.clone(),
@@ -1011,8 +1052,8 @@ async fn manifest_stack_plan(
         command: None,
         mounts,
     };
-    Ok((
-        SetupPlan {
+    Ok(ManifestRuntimePlan {
+        plan: SetupPlan {
             source_kind: bosn_setup::SetupSourceKind::LocalFile,
             content_sha256,
             schema_version: bosn_core::SETUP_DOCUMENT_VERSION,
@@ -1022,9 +1063,77 @@ async fn manifest_stack_plan(
             app,
             tasks,
             app_source: SetupPlanAppSource::PinnedImage { image },
+            named_volumes: volumes
+                .iter()
+                .map(|volume| SetupNamedVolume {
+                    name: volume.name.clone(),
+                    target: volume.target.clone(),
+                    labels: volume.labels.clone(),
+                })
+                .collect(),
         },
         generation,
-    ))
+        volumes,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct ManifestRuntimePlan {
+    plan: SetupPlan,
+    generation: String,
+    volumes: Vec<ManifestVolumeResource>,
+}
+
+fn manifest_named_volumes(
+    stack: &bosn_core::manifest::Stack,
+    workspace: &str,
+    generation: &str,
+) -> Result<Vec<ManifestVolumeResource>, String> {
+    let mut targets = std::collections::BTreeSet::new();
+    stack
+        .volumes
+        .iter()
+        .map(|volume| {
+            let target = volume.mount_at();
+            if !normalized_container_path(&target) || !targets.insert(target.clone()) {
+                return Err("manifest volume target is unsafe or duplicated".into());
+            }
+            let scope_key = match volume.scope {
+                Scope::Spec => format!("{workspace}\0{generation}"),
+                Scope::Stack => workspace.into(),
+                Scope::Machine => stack.family.clone().unwrap_or_else(|| stack.name.clone()),
+            };
+            let mut hasher = Sha256Hasher::new();
+            manifest_generation_field(&mut hasher, b"bosn-manifest-volume-v1");
+            manifest_generation_field(&mut hasher, stack.name.as_bytes());
+            manifest_generation_field(&mut hasher, volume.name.as_bytes());
+            manifest_generation_field(&mut hasher, scope_key.as_bytes());
+            let identity = hasher.finalize().to_string();
+            let name = format!("bosn-v-{}-{}", volume.scope.as_str(), &identity[..24]);
+            let labels = BTreeMap::from([
+                ("com.zackees.bosn.setup-managed".into(), "v1".into()),
+                (
+                    "com.zackees.bosn.setup-content-sha256".into(),
+                    identity.clone(),
+                ),
+                ("com.zackees.bosn.setup-container".into(), name.clone()),
+            ]);
+            Ok(ManifestVolumeResource {
+                id: format!("manifest-volume:{name}"),
+                name,
+                stack: stack.name.clone(),
+                // Stack/machine volumes retain this stable identity across a
+                // container generation rollover; spec identity includes the
+                // parent generation in `scope_key` above.
+                generation: format!("sha256:{identity}"),
+                scope: volume.scope,
+                workspace: workspace.into(),
+                retention: volume.retention,
+                target,
+                labels,
+            })
+        })
+        .collect()
 }
 
 /// Convert one legacy manifest bind into the narrower workspace-relative setup
@@ -1183,6 +1292,7 @@ fn manifest_runtime_generation(
     base_generation: &str,
     mounts: &[bosn_core::WorkspaceMount],
     workdir: Option<&str>,
+    volumes: &[bosn_core::manifest::Volume],
 ) -> String {
     let mut hasher = Sha256Hasher::new();
     manifest_generation_field(&mut hasher, b"bosn-manifest-runtime-v1");
@@ -1194,6 +1304,19 @@ fn manifest_runtime_generation(
         manifest_generation_field(&mut hasher, if mount.readonly { b"1" } else { b"0" });
     }
     manifest_generation_field(&mut hasher, workdir.unwrap_or("").as_bytes());
+    manifest_generation_field(&mut hasher, &(volumes.len() as u64).to_be_bytes());
+    for volume in volumes {
+        manifest_generation_field(&mut hasher, volume.name.as_bytes());
+        manifest_generation_field(&mut hasher, volume.scope.as_str().as_bytes());
+        manifest_generation_field(&mut hasher, volume.mount_at().as_bytes());
+        manifest_generation_field(
+            &mut hasher,
+            match volume.retention {
+                Retention::Warm => b"warm",
+                Retention::Pinned => b"pinned",
+            },
+        );
+    }
     format!("sha256:{}", hasher.finalize())
 }
 
@@ -1339,6 +1462,7 @@ impl SetupAdoptExecutor for DockerSetupAdoptExecutor {
                     &prepared,
                     &plan.workspace_root.to_string_lossy(),
                 ),
+                volumes: Vec::new(),
             })
         })
     }
@@ -3030,7 +3154,7 @@ struct SetupEnsureRecordGate {
     release: async_engine::Receiver<()>,
 }
 #[derive(Clone)]
-struct RegistryActor {
+pub struct RegistryActor {
     sender: async_engine::Sender<DbCommand>,
 }
 enum DbCommand {
@@ -3111,6 +3235,10 @@ enum DbCommand {
     RecordManifestEnsure {
         job_id: u64,
         execution: Box<SetupEnsureExecution>,
+        reply: async_engine::OneshotSender<Result<(), Error>>,
+    },
+    PutManifestVolumeIntents {
+        volumes: Vec<ManifestVolumeResource>,
         reply: async_engine::OneshotSender<Result<(), Error>>,
     },
     RecordSetupAdoption {
@@ -3891,6 +4019,7 @@ fn launch_started_setup_jobs(
             actor: registry.clone(),
             job_id: id,
         };
+        let manifest_registry = registry.clone();
         tasks.spawn(async move {
             let (logs, mut log_receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
             let log_sender = task_sender.clone();
@@ -3946,7 +4075,7 @@ fn launch_started_setup_jobs(
                 }
                 SetupJobRequest::ManifestEnsure(request) => {
                     let result = manifest_ensure_executor
-                        .execute(request, &token, &logs)
+                        .execute(request, &token, &logs, &manifest_registry)
                         .await;
                     match result {
                         Ok(execution) => {
@@ -4218,6 +4347,20 @@ fn manifest_app_task_session_container_identity(observed: &SetupEnsureResult) ->
 }
 
 impl RegistryActor {
+    async fn put_manifest_volume_intents(
+        &self,
+        volumes: Vec<ManifestVolumeResource>,
+    ) -> Result<(), Error> {
+        if volumes.is_empty() {
+            return Ok(());
+        }
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::PutManifestVolumeIntents { volumes, reply })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
     async fn begin_setup_app_task_session(
         &self,
         job_id: u64,
@@ -4984,6 +5127,22 @@ async fn registry_actor(
                     }
                 }
             }
+            DbCommand::PutManifestVolumeIntents { volumes, reply } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = put_manifest_volume_intents(&mut registry, &volumes);
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
             DbCommand::RecordSetupAdoption { execution, reply } => {
                 let worker = async_engine::launch_blocking(move || {
                     let result = record_setup_adoption(&mut registry, &execution);
@@ -5315,6 +5474,34 @@ fn record_manifest_ensure(
             state: ResourceState::Active,
         })?;
     }
+    // The engine volume was created/reused only after its exact contract was
+    // durably intended.  Record the resource and consume that intent in the
+    // same transaction as container success; normal generation rollover never
+    // deletes or retires volume data.
+    for volume in &execution.volumes {
+        transaction.put_resource(&Resource {
+            id: volume.id.clone(),
+            kind: ResourceKind::Volume,
+            name: volume.name.clone(),
+            stack: volume.stack.clone(),
+            generation: volume.generation.clone(),
+            scope: volume.scope,
+            workspace: volume.workspace.clone(),
+            created_at: now,
+            last_used: now,
+            state: ResourceState::Active,
+            retention: volume.retention,
+        })?;
+        transaction.put_resource_use(&ResourceUse {
+            resource_id: volume.id.clone(),
+            workspace: volume.workspace.clone(),
+            stack: volume.stack.clone(),
+            generation: volume.generation.clone(),
+            last_used: now,
+            state: ResourceState::Active,
+        })?;
+        transaction.delete_volume_creation_intent(&volume.name)?;
+    }
     // This follows both upserts so an image/container identity conflict drops
     // the transaction with the preceding generation still active. The
     // registry primitive is manifest-namespace-only and never changes setup
@@ -5329,6 +5516,24 @@ fn record_manifest_ensure(
         "manifest.ensure.succeeded",
         &format!("job_id={job_id}"),
     )?;
+    transaction.commit()
+}
+
+fn put_manifest_volume_intents(
+    registry: &mut Registry,
+    volumes: &[ManifestVolumeResource],
+) -> Result<(), bosn_registry::Error> {
+    let mut transaction = registry.begin_immediate()?;
+    for volume in volumes {
+        transaction.put_volume_creation_intent(&VolumeCreationIntent {
+            name: volume.name.clone(),
+            labels: volume.labels.clone(),
+            stack: volume.stack.clone(),
+            generation: volume.generation.clone(),
+            scope: volume.scope,
+            workspace: volume.workspace.clone(),
+        })?;
+    }
     transaction.commit()
 }
 
@@ -7302,6 +7507,7 @@ mod tests {
                 generation: image_identity.into(),
                 workspace: workspace.into(),
             },
+            volumes: Vec::new(),
         }
     }
 
@@ -7327,6 +7533,30 @@ mod tests {
                 generation: image_identity.into(),
                 workspace: workspace.into(),
             },
+            volumes: Vec::new(),
+        }
+    }
+
+    fn manifest_volume_resource(workspace: &str, stack: &str) -> ManifestVolumeResource {
+        let name = "bosn-v-stack-aaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
+        ManifestVolumeResource {
+            id: format!("manifest-volume:{name}"),
+            name: name.clone(),
+            stack: stack.into(),
+            generation: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .into(),
+            scope: Scope::Stack,
+            workspace: workspace.into(),
+            retention: Retention::Pinned,
+            target: "/var/lib/app".into(),
+            labels: BTreeMap::from([
+                ("com.zackees.bosn.setup-managed".into(), "v1".into()),
+                (
+                    "com.zackees.bosn.setup-content-sha256".into(),
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                ),
+                ("com.zackees.bosn.setup-container".into(), name),
+            ]),
         }
     }
 
@@ -7420,7 +7650,9 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let (plan, generation) = runtime
+        let ManifestRuntimePlan {
+            plan, generation, ..
+        } = runtime
             .run(manifest_stack_setup_plan(&ManifestEnsureJobRequest {
                 workspace: workspace.clone(),
                 manifest: "bosn.toml".into(),
@@ -7447,6 +7679,79 @@ mod tests {
                 }))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn manifest_stack_plan_derives_typed_scoped_named_volumes() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let image = format!("example.invalid/app@sha256:{}", "a".repeat(64));
+        std::fs::write(
+            workspace.join("bosn.toml"),
+            format!(
+                "[stack.app]\nimage = '{image}'\nfamily = 'shared-cache'\n[stack.app.volumes.cache]\nscope = 'stack'\ndestination = '/var/cache/app'\nretention = 'pinned'\n[stack.app.volumes.scratch]\nscope = 'spec'\n"
+            ),
+        ).unwrap();
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime
+            .run(manifest_stack_setup_plan(&ManifestEnsureJobRequest {
+                workspace: workspace.clone(),
+                manifest: "bosn.toml".into(),
+                stack: "app".into(),
+                deadline: Duration::from_secs(1),
+                output_limit: 64,
+            }))
+            .unwrap();
+        assert_eq!(result.plan.named_volumes.len(), 2);
+        assert_eq!(result.volumes.len(), 2);
+        assert!(result.plan.named_volumes.iter().all(|volume| {
+            volume.name.starts_with("bosn-v-")
+                && volume
+                    .labels
+                    .get("com.zackees.bosn.setup-content-sha256")
+                    .is_some_and(|identity| identity.len() == 64)
+        }));
+        let cache = result
+            .volumes
+            .iter()
+            .find(|volume| volume.retention == Retention::Pinned)
+            .unwrap();
+        assert_eq!(cache.scope, Scope::Stack);
+        assert_eq!(cache.workspace, workspace.to_string_lossy());
+
+        std::fs::write(
+            workspace.join("bosn.toml"),
+            format!(
+                "[stack.app]\nimage = '{image}'\n[stack.app.env]\nMODE = 'changed'\n[stack.app.volumes.cache]\nscope = 'stack'\ndestination = '/var/cache/app'\nretention = 'pinned'\n[stack.app.volumes.scratch]\nscope = 'spec'\n"
+            ),
+        )
+        .unwrap();
+        let changed = runtime
+            .run(manifest_stack_setup_plan(&ManifestEnsureJobRequest {
+                workspace,
+                manifest: "bosn.toml".into(),
+                stack: "app".into(),
+                deadline: Duration::from_secs(1),
+                output_limit: 64,
+            }))
+            .unwrap();
+        assert_ne!(changed.generation, result.generation);
+        let original_stack = result
+            .volumes
+            .iter()
+            .find(|volume| volume.scope == Scope::Stack)
+            .unwrap();
+        let changed_stack = changed
+            .volumes
+            .iter()
+            .find(|volume| volume.scope == Scope::Stack)
+            .unwrap();
+        assert_eq!(changed_stack.name, original_stack.name);
+        assert_eq!(changed_stack.generation, original_stack.generation);
     }
 
     #[test]
@@ -7477,7 +7782,11 @@ mod tests {
             .build()
             .unwrap();
         write("/repo/project", true);
-        let (first, first_generation) = runtime.run(manifest_stack_setup_plan(&request())).unwrap();
+        let ManifestRuntimePlan {
+            plan: first,
+            generation: first_generation,
+            ..
+        } = runtime.run(manifest_stack_setup_plan(&request())).unwrap();
         assert_eq!(first.app.workdir.as_deref(), Some("project"));
         assert_eq!(
             first.app.mounts,
@@ -7495,13 +7804,20 @@ mod tests {
             ]
         );
         write("/repo/project", false);
-        let (second, second_generation) =
-            runtime.run(manifest_stack_setup_plan(&request())).unwrap();
+        let ManifestRuntimePlan {
+            plan: second,
+            generation: second_generation,
+            ..
+        } = runtime.run(manifest_stack_setup_plan(&request())).unwrap();
         assert_eq!(second.app.workdir.as_deref(), Some("project"));
         assert_ne!(first_generation, second_generation);
         assert_ne!(first.content_sha256, second.content_sha256);
         write("/repo", false);
-        let (third, third_generation) = runtime.run(manifest_stack_setup_plan(&request())).unwrap();
+        let ManifestRuntimePlan {
+            plan: third,
+            generation: third_generation,
+            ..
+        } = runtime.run(manifest_stack_setup_plan(&request())).unwrap();
         assert_eq!(third.app.workdir.as_deref(), Some("."));
         assert_ne!(second_generation, third_generation);
         assert_ne!(second.content_sha256, third.content_sha256);
@@ -7593,7 +7909,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let (plan, _) = runtime
+        let ManifestRuntimePlan { plan, .. } = runtime
             .run(manifest_stack_task_setup_plan(&ManifestAppTaskJobRequest {
                 workspace,
                 manifest: "bosn.toml".into(),
@@ -7629,7 +7945,7 @@ mod tests {
             deadline: Duration::from_secs(1),
             output_limit: 64,
         };
-        let (plan, _) = runtime
+        let ManifestRuntimePlan { plan, .. } = runtime
             .run(manifest_stack_task_setup_plan(&request))
             .unwrap();
         assert_eq!(plan.task_names, ["check"]);
@@ -7842,6 +8158,53 @@ mod tests {
                 .count(),
             1,
             "the failed operation cannot leave a terminal success event"
+        );
+    }
+
+    #[test]
+    fn manifest_volume_intent_precedes_engine_work_and_is_consumed_with_success() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let mut registry = Registry::create_writer(
+            temporary.path().join("registry.sqlite3"),
+            "11111111-2222-4333-8444-555555555555",
+        )
+        .unwrap();
+        let workspace = "/canonical/manifest";
+        let volume = manifest_volume_resource(workspace, "app");
+
+        put_manifest_volume_intents(&mut registry, std::slice::from_ref(&volume)).unwrap();
+        let intents = registry.volume_creation_intents(0, 8).unwrap().items;
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].name, volume.name);
+        assert_eq!(intents[0].labels, volume.labels);
+
+        let mut execution =
+            manifest_ensure_execution(workspace, "app", "generation", "sha256:image");
+        execution.volumes.push(volume.clone());
+        record_manifest_ensure(&mut registry, 1, &execution).unwrap();
+
+        assert!(
+            registry
+                .volume_creation_intents(0, 8)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        let resources = registry.resources(0, 8).unwrap().items;
+        let recorded = resources
+            .iter()
+            .find(|resource| resource.id == volume.id)
+            .unwrap();
+        assert_eq!(recorded.kind, ResourceKind::Volume);
+        assert_eq!(recorded.name, volume.name);
+        assert_eq!(recorded.state, ResourceState::Active);
+        assert!(
+            registry
+                .resource_uses(0, 8)
+                .unwrap()
+                .items
+                .iter()
+                .any(|use_record| use_record.resource_id == volume.id)
         );
     }
 
@@ -8380,6 +8743,7 @@ mod tests {
                         generation: "sha256:fake".into(),
                         workspace: request.workspace.to_string_lossy().into_owned(),
                     },
+                    volumes: Vec::new(),
                 })
             })
         }
@@ -8395,6 +8759,7 @@ mod tests {
             request: ManifestEnsureJobRequest,
             _cancellation: &'a async_engine::CancellationToken,
             logs: &'a async_engine::Sender<String>,
+            _registry: &'a RegistryActor,
         ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>>
         {
             Box::pin(async move {
@@ -8424,6 +8789,7 @@ mod tests {
                         generation: format!("sha256:{generation}"),
                         workspace,
                     },
+                    volumes: Vec::new(),
                 })
             })
         }
@@ -8506,6 +8872,7 @@ mod tests {
             },
             tasks: BTreeMap::new(),
             app_source: bosn_setup::SetupPlanAppSource::PinnedImage { image },
+            named_volumes: Vec::new(),
         }
     }
     fn command_result(exit_code: i32, stdout: impl Into<Vec<u8>>) -> bosn_engine::CommandResult {
@@ -9436,6 +9803,7 @@ mod tests {
                 generation: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
                 workspace: workspace.into(),
             },
+            volumes: Vec::new(),
         };
         assert!(matches!(
             record_setup_ensure(&mut registry, 7, &execution),

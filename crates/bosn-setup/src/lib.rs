@@ -32,7 +32,7 @@ pub use materialize::{
 
 mod plan;
 pub use plan::{
-    SetupPlan, SetupPlanAppSource, SetupPlanError, SetupPlanRequest, plan_setup,
+    SetupNamedVolume, SetupPlan, SetupPlanAppSource, SetupPlanError, SetupPlanRequest, plan_setup,
     plan_setup_with_transport,
 };
 

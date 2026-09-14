@@ -1802,6 +1802,7 @@ mod tests {
                 app_source: SetupPlanAppSource::PinnedImage {
                     image: "registry.example/demo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
                 },
+                named_volumes: Vec::new(),
             })
         }
     }

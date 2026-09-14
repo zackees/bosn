@@ -34,6 +34,15 @@ pub struct SetupEnsureMount {
     pub readonly: bool,
 }
 
+/// A validated named Docker volume attachment.  This is a finite typed value,
+/// never a caller-provided `--mount` string.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupEnsureVolume {
+    pub name: String,
+    pub target: String,
+    pub labels: BTreeMap<String, String>,
+}
+
 /// A finite semantic engine command used by [`ensure_setup_app`].
 ///
 /// The operation deliberately has no generic Docker argument, network,
@@ -41,6 +50,12 @@ pub struct SetupEnsureMount {
 /// are derived from the validated plan and matching image receipt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SetupEnsureCommand {
+    VolumeInspect {
+        volume_name: String,
+    },
+    VolumeCreate {
+        volume: SetupEnsureVolume,
+    },
     Inspect {
         container_name: String,
     },
@@ -48,6 +63,7 @@ pub enum SetupEnsureCommand {
         container_name: String,
         image_identity: String,
         mounts: Vec<SetupEnsureMount>,
+        volumes: Vec<SetupEnsureVolume>,
         environment: BTreeMap<String, String>,
         workdir: Option<String>,
         command: Option<String>,
@@ -61,6 +77,24 @@ pub enum SetupEnsureCommand {
 impl SetupEnsureCommand {
     fn docker_args(&self) -> Vec<String> {
         match self {
+            Self::VolumeInspect { volume_name } => vec![
+                "volume".into(),
+                "inspect".into(),
+                "--format".into(),
+                format!(
+                    "{{{{index .Labels \"{LABEL_MANAGED}\"}}}}\t{{{{index .Labels \"{LABEL_CONTENT_SHA256}\"}}}}\t{{{{index .Labels \"{LABEL_CONTAINER_NAME}\"}}}}"
+                ),
+                volume_name.clone(),
+            ],
+            Self::VolumeCreate { volume } => {
+                let mut args = vec!["volume".into(), "create".into()];
+                for (key, value) in &volume.labels {
+                    args.push("--label".into());
+                    args.push(format!("{key}={value}"));
+                }
+                args.push(volume.name.clone());
+                args
+            }
             Self::Inspect { container_name } => vec![
                 "container".into(),
                 "inspect".into(),
@@ -74,6 +108,7 @@ impl SetupEnsureCommand {
                 container_name,
                 image_identity,
                 mounts,
+                volumes,
                 environment,
                 workdir,
                 command,
@@ -100,6 +135,13 @@ impl SetupEnsureCommand {
                     }
                     args.push("--mount".into());
                     args.push(value);
+                }
+                for volume in volumes {
+                    args.push("--mount".into());
+                    args.push(format!(
+                        "type=volume,src={},dst={}",
+                        volume.name, volume.target
+                    ));
                 }
                 for (key, value) in environment {
                     args.push("--env".into());
@@ -356,6 +398,68 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
         });
     }
 
+    // The daemon wrote durable volume intents before this primitive was
+    // invoked. A matching existing container already proves that its mounts
+    // were created from this immutable plan, so do not mutate or re-inspect
+    // volumes on its reuse path. For a new container, create/reuse every exact
+    // labelled volume before the container itself, leaving only recoverable
+    // intent-backed volume state if an attempt is interrupted.
+    for volume in &derived.volumes {
+        let response = invoke(
+            engine,
+            SetupEnsureCommand::VolumeInspect {
+                volume_name: volume.name.clone(),
+            },
+            &deadline,
+            &mut remaining_output,
+            &request,
+        )
+        .await?;
+        let SetupEnsureResponse::Command(result) = response else {
+            return Err(SetupEnsureError::EngineProtocol(
+                "volume inspection returned container response",
+            ));
+        };
+        consume_output(&result, &mut remaining_output, request.options.output_limit)?;
+        if result.ok() {
+            let observed = std::str::from_utf8(&result.stdout).unwrap_or("").trim();
+            let expected = [
+                volume.labels.get(LABEL_MANAGED).map_or("", String::as_str),
+                volume
+                    .labels
+                    .get(LABEL_CONTENT_SHA256)
+                    .map_or("", String::as_str),
+                volume
+                    .labels
+                    .get(LABEL_CONTAINER_NAME)
+                    .map_or("", String::as_str),
+            ]
+            .join("\t");
+            if observed != expected {
+                return Err(SetupEnsureError::OwnershipMismatch);
+            }
+        } else if result.exit_code == 1 {
+            let response = invoke(
+                engine,
+                SetupEnsureCommand::VolumeCreate {
+                    volume: volume.clone(),
+                },
+                &deadline,
+                &mut remaining_output,
+                &request,
+            )
+            .await?;
+            require_action_success(
+                "volume create",
+                response,
+                &mut remaining_output,
+                request.options.output_limit,
+            )?;
+        } else {
+            return Err(action_failed("volume inspect", &result));
+        }
+    }
+
     let response = invoke(
         engine,
         derived.create_command(),
@@ -543,6 +647,7 @@ struct DerivedEnsure {
     workdir: Option<String>,
     command: Option<String>,
     labels: BTreeMap<String, String>,
+    volumes: Vec<SetupEnsureVolume>,
 }
 
 impl DerivedEnsure {
@@ -551,6 +656,7 @@ impl DerivedEnsure {
             container_name: self.container_name.clone(),
             image_identity: self.image_identity.clone(),
             mounts: self.mounts.clone(),
+            volumes: self.volumes.clone(),
             environment: self.environment.clone(),
             workdir: self.workdir.clone(),
             command: self.command.clone(),
@@ -594,6 +700,7 @@ fn derive_command(request: &SetupEnsureRequest<'_>) -> Result<DerivedEnsure, Set
         ),
         (LABEL_CONTAINER_NAME.into(), container_name.clone()),
     ]);
+    let volumes = derive_volumes(request.plan)?;
     Ok(DerivedEnsure {
         container_name,
         image_identity: request.prepared_image.observed_identity.clone(),
@@ -602,6 +709,7 @@ fn derive_command(request: &SetupEnsureRequest<'_>) -> Result<DerivedEnsure, Set
         workdir,
         command,
         labels,
+        volumes,
     })
 }
 
@@ -638,7 +746,53 @@ fn validate_plan_shape(plan: &SetupPlan) -> Result<(), SetupEnsureError> {
         validate_workspace_relative(Some(&mount.source))?;
         validate_container_path(&mount.target)?;
     }
+    let mut targets = BTreeSet::new();
+    for volume in &plan.named_volumes {
+        if !valid_volume_name(&volume.name)
+            || validate_container_path(&volume.target).is_err()
+            || !targets.insert(volume.target.clone())
+            || volume.labels.get(LABEL_MANAGED) != Some(&MANAGED_VALUE.into())
+            || !valid_hash(
+                volume
+                    .labels
+                    .get(LABEL_CONTENT_SHA256)
+                    .map_or("", String::as_str),
+            )
+            || volume.labels.get(LABEL_CONTAINER_NAME) != Some(&volume.name)
+        {
+            return Err(SetupEnsureError::InvalidRequest(
+                "named volume receipt was modified",
+            ));
+        }
+    }
     Ok(())
+}
+
+fn derive_volumes(plan: &SetupPlan) -> Result<Vec<SetupEnsureVolume>, SetupEnsureError> {
+    let bind_targets: BTreeSet<_> = plan.app.mounts.iter().map(|mount| &mount.target).collect();
+    plan.named_volumes
+        .iter()
+        .map(|volume| {
+            if bind_targets.contains(&volume.target) || !valid_volume_name(&volume.name) {
+                return Err(SetupEnsureError::InvalidRequest(
+                    "duplicate or unsafe named volume target",
+                ));
+            }
+            Ok(SetupEnsureVolume {
+                name: volume.name.clone(),
+                target: volume.target.clone(),
+                labels: volume.labels.clone(),
+            })
+        })
+        .collect()
+}
+
+fn valid_volume_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 fn validate_prepared_image(
@@ -1112,6 +1266,7 @@ mod tests {
             },
             tasks: BTreeMap::new(),
             app_source: SetupPlanAppSource::PinnedImage { image },
+            named_volumes: Vec::new(),
         }
     }
 
@@ -1296,6 +1451,21 @@ mod tests {
     }
 
     #[test]
+    fn volume_inspect_format_uses_actual_tabs_that_match_the_label_receipt() {
+        let volume_name = format!("bosn-v-stack-{HASH}");
+        let command = SetupEnsureCommand::VolumeInspect {
+            volume_name: volume_name.clone(),
+        };
+        let args = command.docker_args();
+        assert_eq!(args[0], "volume");
+        assert_eq!(args[1], "inspect");
+        assert_eq!(args[2], "--format");
+        assert!(args[3].contains('\t'));
+        assert!(!args[3].contains("\\\\t"));
+        assert_eq!(args[4], volume_name);
+    }
+
+    #[test]
     fn absent_container_is_created_then_started_with_only_plan_data() {
         let temporary = tempfile::tempdir().unwrap();
         let workspace = temporary.path().join("workspace");
@@ -1439,6 +1609,44 @@ mod tests {
         assert!(!receipt.created && !receipt.started);
         assert!(matches!(
             running.calls.lock().unwrap().as_slice(),
+            [SetupEnsureCommand::Inspect { .. }]
+        ));
+    }
+
+    #[test]
+    fn matching_container_reuse_does_not_reinspect_or_mutate_declared_volumes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(workspace.join("src")).unwrap();
+        let mut plan = plan(&workspace);
+        let volume_name = format!("bosn-v-stack-{HASH}");
+        plan.named_volumes.push(crate::SetupNamedVolume {
+            name: volume_name.clone(),
+            target: "/var/lib/app".into(),
+            labels: BTreeMap::from([
+                (LABEL_MANAGED.into(), MANAGED_VALUE.into()),
+                (LABEL_CONTENT_SHA256.into(), HASH.into()),
+                (LABEL_CONTAINER_NAME.into(), volume_name),
+            ]),
+        });
+        let image = prepared(&plan);
+        let cancellation = CancellationSource::new();
+        let engine = FakeEngine::with_results([inspection(&plan, true)]);
+
+        let receipt = run(
+            &engine,
+            &plan,
+            &workspace,
+            &image,
+            &cancellation.token(),
+            RunOptions::streaming(Duration::from_secs(2), 4096),
+        )
+        .unwrap();
+
+        assert!(!receipt.created && !receipt.started);
+        assert!(matches!(
+            engine.calls.lock().unwrap().as_slice(),
             [SetupEnsureCommand::Inspect { .. }]
         ));
     }
