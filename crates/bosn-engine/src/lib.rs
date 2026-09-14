@@ -1,4 +1,4 @@
-//! Docker CLI transport for Bosn's future engine domain.
+//! Docker and narrowly typed SSH client transports for Bosn's engine domain.
 //!
 //! This is a local Docker CLI transport, not a daemon IPC service or an
 //! authorization boundary. Callers provide trusted Docker argv/environment;
@@ -18,6 +18,98 @@ use kernal_api::{
 };
 
 const SESSION_POLL: Duration = Duration::from_millis(20);
+
+/// One SSH invocation whose network endpoint and authentication shape are
+/// deliberately finite.  It exists for the macOS guest transport; it is not
+/// a general remote-command API.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuestSshCommand {
+    /// The account selected by the manifest-derived guest receipt.
+    pub user: String,
+    /// The published loopback SSH port selected by that receipt.
+    pub port: u16,
+    /// An existing private key beneath daemon-owned state.  No ambient agent,
+    /// password prompt, user SSH config, or caller-selected credential is used.
+    pub identity_file: PathBuf,
+    /// The already-declared manifest task command.
+    pub command: String,
+}
+
+impl GuestSshCommand {
+    fn args(&self) -> Vec<OsString> {
+        // `-F /dev/null` is intentional: host-wide and per-user SSH config
+        // could otherwise redirect this bounded loopback operation through a
+        // ProxyCommand, alternate identity, or arbitrary host alias.
+        [
+            "-F",
+            "/dev/null",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "PasswordAuthentication=no",
+            "-o",
+            "KbdInteractiveAuthentication=no",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "GlobalKnownHostsFile=/dev/null",
+            "-o",
+            "LogLevel=ERROR",
+            "-i",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .chain(std::iter::once(self.identity_file.clone().into_os_string()))
+        .chain(
+            ["-p"].into_iter().map(OsString::from).chain(
+                [
+                    self.port.to_string(),
+                    format!("{}@127.0.0.1", self.user),
+                    self.command.clone(),
+                ]
+                .into_iter()
+                .map(OsString::from),
+            ),
+        )
+        .collect()
+    }
+}
+
+/// The locally installed OpenSSH client, restricted to [`GuestSshCommand`].
+/// It has no raw argv, host, port, or credential configuration surface.
+#[derive(Clone, Debug)]
+pub struct GuestSshEngine {
+    binary: PathBuf,
+}
+
+impl GuestSshEngine {
+    #[must_use]
+    pub fn system() -> Self {
+        Self {
+            binary: "ssh".into(),
+        }
+    }
+
+    /// Stream a declared guest task. Killing the local client cannot prove
+    /// that its remote command stopped; callers retain that uncertainty.
+    pub async fn stream(
+        &self,
+        command: &GuestSshCommand,
+        options: RunOptions,
+        cancellation: Option<&CancellationToken>,
+        events: &async_engine::Sender<EngineEvent>,
+    ) -> Result<CommandResult, CommandError> {
+        // The shared bounded process machinery is intentionally reused here;
+        // its caller cannot reach `DockerEngine::with_args` because this
+        // conversion stays inside the typed SSH adapter.
+        let transport = DockerEngine::from_parts(&self.binary, command.args());
+        transport.stream(options, cancellation, events).await
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandResult {
@@ -599,7 +691,30 @@ fn map_bounded(error: BoundedProcessError) -> CommandError {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandError, CommandResult, DockerDoctorState, doctor_report};
+    use super::{CommandError, CommandResult, DockerDoctorState, GuestSshCommand, doctor_report};
+    use std::path::PathBuf;
+
+    #[test]
+    fn guest_ssh_command_ignores_ambient_config_and_fixes_loopback_target() {
+        let command = GuestSshCommand {
+            user: "runner".into(),
+            port: 2222,
+            identity_file: PathBuf::from("/state/guest-ssh/key"),
+            command: "echo declared".into(),
+        };
+        let args = command
+            .args()
+            .into_iter()
+            .map(|value| value.into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert!(args.windows(2).any(|pair| pair == ["-F", "/dev/null"]));
+        assert!(args.windows(2).any(|pair| pair == ["-p", "2222"]));
+        assert!(args.contains(&"runner@127.0.0.1".into()));
+        assert!(args.contains(&"BatchMode=yes".into()));
+        assert!(args.contains(&"IdentitiesOnly=yes".into()));
+        assert_eq!(args.last().unwrap(), "echo declared");
+        assert!(!args.iter().any(|value| value.contains("ProxyCommand")));
+    }
 
     #[test]
     fn error_display_claims_reaping_only_after_confirmed_cleanup() {

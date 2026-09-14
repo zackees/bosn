@@ -50,10 +50,19 @@ bosn manifest app-task --state-dir STATE --workspace WORKSPACE \
 It is also exposed as `Client.submit_manifest_app_task(...)` and the
 `bosn_manifest_app_task` MCP tool. The task must belong to the selected stack.
 The daemon re-reads and validates the manifest, verifies the immutable image,
-inspect-proves the exact deterministic managed container is running, then uses
-only `docker container exec NAME sh -lc DECLARED_COMMAND`. Cancellation,
-deadline, and transport uncertainty retain a durable execution-session row and
-`manifest.app-task.uncertain` event so GC and recovery protect that container.
+and inspect-proves the exact deterministic managed container is running. Linux
+stacks then use only `docker container exec NAME sh -lc DECLARED_COMMAND`.
+Cancellation, deadline, and transport uncertainty retain a durable
+execution-session row and `manifest.app-task.uncertain` event so GC and
+recovery protect that container.
+
+For an accepted macOS guest, the same operation first proves the dockurr
+container exact/running, then performs a bounded SSH `true` readiness probe
+and runs only the re-derived `[task.NAME].cmd` over SSH. The SSH adapter fixes
+the host to `127.0.0.1`, uses only the manifest-derived published SSH port and
+validated username, ignores ambient SSH configuration (`-F /dev/null`), and
+uses batch, key-only authentication. It cannot accept a caller host, port,
+username, command, arguments, SSH options, credential path, or SCP input.
 
 ## Implemented behavior
 
@@ -87,23 +96,32 @@ changed.
 | One explicitly named stack | Supported |
 | Named `[task.NAME]` for that stack in an already ensured container | Supported; fixed daemon-owned exec only |
 | `dockerfile = 'Dockerfile'` build context | Supported for the selected workspace-root Dockerfile. The daemon collects the finite Docker-selected `COPY`/`ADD` context through `kernal-api`, refuses selected symlinks, special files, empty selected directories, traversal, unbounded assets, alternate Dockerfile locations, and a simultaneous `image`. It copies exact observed regular-file bytes to an owner-private content-addressed setup asset tree before the typed build primitive invokes Docker; Docker never receives the workspace as its build context. Every external Dockerfile image must itself be digest-pinned. |
-| `kind = 'macos-x64-guest'` with explicit license acknowledgement | Supported only for `dockurr/macos` and Docker Hub aliases (`docker.io`, `index.docker.io`, `registry-1.docker.io`) pinned by a lowercase 64-hex `sha256` digest, with exactly `[stack.NAME.volumes.storage]` declared as `scope = 'machine'`, `destination = '/storage'`, and `retention = 'pinned'`. This prevents an ephemeral VM disk and prevents the fixed KVM/tun create shape from executing a manifest-selected privileged image. On Linux, kernal-api must report both `/dev/kvm` and `/dev/net/tun`. Bosn emits only the fixed dockurr KVM/tun/NET_ADMIN, loopback SSH/web-port, 120-second stop timeout, and sizing shape; it never accepts raw privilege/device/port arguments. The durable container resource uses the `manifest-guest:` namespace and rolls over conservatively like a manifest container. |
+| `kind = 'macos-x64-guest'` with explicit license acknowledgement | Supported only for `dockurr/macos` and Docker Hub aliases (`docker.io`, `index.docker.io`, `registry-1.docker.io`) pinned by a lowercase 64-hex `sha256` digest, with exactly `[stack.NAME.volumes.storage]` declared as `scope = 'machine'`, `destination = '/storage'`, and `retention = 'pinned'`. This prevents an ephemeral VM disk and prevents the fixed KVM/tun create shape from executing a manifest-selected privileged image. On Linux, kernal-api must report both `/dev/kvm` and `/dev/net/tun`. Bosn emits only the fixed dockurr KVM/tun/NET_ADMIN, loopback SSH/web-port, 120-second stop timeout, and sizing shape; it never accepts raw privilege/device/port arguments. The durable container resource uses the `manifest-guest:` namespace and rolls over conservatively like a manifest container. Guest SSH is fixed to `127.0.0.1`; non-loopback `guest.ssh_host` declarations are refused. |
 | named `[stack.NAME.volumes]` | Supported for typed Bosn-managed named volumes. The daemon derives the engine name from the declared logical name, scope, canonical workspace, and (for `spec`) generation; callers cannot supply a Docker volume name or mount string. It writes a durable creation intent before `docker volume create`, requires exact ownership labels before reuse, then atomically records the resource and consumes the intent after container ensure. `spec` rolls with generation; `stack` survives generations within its workspace; `machine` follows the declared `family` or stack. Normal rollover and GC never delete volume data in this slice; retention is recorded for later explicit lifecycle work. |
 | `tmpfs` | Supported only as an array of normalized legacy strings: `/target`, `/target:ro`, `/target:rw`, with an optional one `size=POSITIVE{b,k,m,g}` option (for example `/run/cache:rw,size=64m`). The daemon parses those into typed target/mode/size values before its engine seam, incorporates the declaration into the runtime generation, and emits only its own finite `--tmpfs` form. Repeated modes/sizes and all other options (`noexec`, `mode`, `uid`, etc.) are refused rather than passed through. tmpfs is disposable container state; a generation rollover creates a new empty tmpfs. |
 | `[stack.NAME.mounts]` workspace bind mounts | Supported for existing paths that canonicalize beneath the selected workspace. Sources may be legacy absolute paths only when they resolve beneath that workspace; traversal, source symlinks, escapes, duplicate targets, reserved targets, and unrepresentable Docker paths are refused. `readonly` is retained. |
-| `workdir` | Supported only when its normalized absolute container path is covered by a declared workspace bind. It is translated to the typed workspace-relative form, becomes the persistent container workdir, and is therefore inherited by declared `manifest app-task` exec. Image-only workdirs are refused. |
+| `workdir` | Linux: supported only when its normalized absolute container path is covered by a declared workspace bind; it is translated to the typed workspace-relative form and inherited by declared `manifest app-task` exec. Guest: a normalized absolute VM path is supported only for typed SSH app tasks and is safely shell-quoted before the declared command. |
 | image tags or unpinned image references | Refused |
 | generic `run`, shell, arbitrary Docker arguments | Not exposed |
 | all-stack orchestration | Supported by `manifest converge`: every declared stack in lexical order, one at a time, with per-stack durable records and partial-success semantics. The TOML model has no dependencies/root selector; dependency spellings fail closed rather than being guessed. |
 | replacement/rollover | Supported for this accepted subset; a new immutable generation is ensured first, then only the same-workspace/stack prior manifest container is registry-retired |
 
-`manifest app-task` deliberately refuses a macOS guest. Legacy guest work is
-transported through SSH/SCP rather than `docker exec`; native Bosn does not yet
-have a typed SSH/SCP task primitive with equivalent cancellation and durable
-uncertainty semantics. Likewise guest `workdir` is refused rather than being
-mistaken for the Linux-container workdir. This keeps the implemented guest
-slice real (the actual KVM VM lifecycle and durable accounting), without
-pretending the Linux app-task transport reaches inside the VM.
+Guest task authentication is daemon-owned but not auto-provisioned: before the
+first guest task, install one private key at `STATE_DIR/guest-ssh/id_ed25519`
+with no group/world permissions, and install its public key for the declared
+guest user during the guest's one-time manual bootstrap. The daemon refuses
+missing, non-regular, symlinked, or overly permissive identity files. This
+avoids passwords, SSH agents, user config, and manifest-selected secret paths.
+`guest.payload` remains refused for native guest tasks: the old Python behavior
+used SCP, and a bounded typed SCP source, destination, and completion model has
+not yet been implemented. The native task path will never silently skip a
+declared payload.
+
+SSH exit status 255 and local client cancellation/deadline/output failures
+after task launch are recorded as uncertain because they cannot prove whether
+the VM command completed. Ordinary nonzero SSH exit statuses are recorded as
+known task failures. A failed readiness probe happens before a task session is
+created, because the declared task has not started.
 
 The deterministic engine container is still checked against its exact derived
 image and labels before reuse. An occupied mismatched candidate fails closed.
