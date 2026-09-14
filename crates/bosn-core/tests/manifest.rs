@@ -13,12 +13,16 @@ fn roots_are_three_distinct_opaque_inputs() {
 }
 
 #[test]
-fn repository_and_soldr_fixtures_parse_without_path_observation() {
+fn repository_and_workspace_mount_fixtures_parse_without_path_observation() {
     let bosn = parse_manifest_toml(include_str!("../../../bosn.toml"), roots()).unwrap();
     assert_eq!(bosn.default_stack().unwrap().name, "test");
-    let soldr = parse_manifest_toml(include_str!("../../../examples/soldr.toml"), roots()).unwrap();
+    let mounted = parse_manifest_toml(
+        "[stack.perf]\nimage='example.invalid/perf@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\nworkdir='/repo'\n[stack.perf.mounts.repo]\nsource='.'\ndestination='/repo'\nreadonly=true",
+        roots(),
+    )
+    .unwrap();
     assert_eq!(
-        soldr.stack("perf").unwrap().workdir.as_deref(),
+        mounted.stack("perf").unwrap().workdir.as_deref(),
         Some("/repo")
     );
 }

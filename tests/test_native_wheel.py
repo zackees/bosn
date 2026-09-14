@@ -5,11 +5,25 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
+RETIRED_LIFECYCLE_MODULES = (
+    "daemon",
+    "engine",
+    "registry",
+    "converge",
+    "gc",
+    "resources",
+    "recovery",
+    "docker_cli",
+    "compose",
+    "manifest",
+    "guest",
+)
 
 
 @pytest.mark.slow
@@ -32,6 +46,9 @@ def test_clean_wheel_install_has_native_cli_without_source_checkout(tmp_path: Pa
         cwd=ROOT,
     )
     (wheel,) = wheels.glob("bosn-*.whl")
+    with zipfile.ZipFile(wheel) as archive:
+        names = set(archive.namelist())
+    assert all(f"bosn/{module}.py" not in names for module in RETIRED_LIFECYCLE_MODULES)
 
     environment = tmp_path / "environment"
     subprocess.run([sys.executable, "-m", "venv", str(environment)], check=True)
@@ -51,6 +68,9 @@ def test_clean_wheel_install_has_native_cli_without_source_checkout(tmp_path: Pa
             str(python),
             "-c",
             "import bosn; from bosn.native_cli import native_executable; "
+            "import importlib.util; "
+            "assert importlib.util.find_spec('bosn.daemon') is None; "
+            "assert importlib.util.find_spec('bosn.registry') is None; "
             "print(bosn.__version__, bosn.native_version()); print(native_executable())",
         ],
         check=True,

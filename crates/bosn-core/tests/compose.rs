@@ -5,8 +5,7 @@ use bosn_core::{
 
 const PINNED_IMAGE: &str = "registry.example/team/demo@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-// Characterization of src/bosn/compose.py::test_realistic_multi_service_file_parses_end_to_end.
-// The Rust foundation deliberately gives the accepted values a typed, inert plan instead of
+// The Rust foundation deliberately gives the accepted Compose values a typed, inert plan instead of
 // forwarding YAML to Docker.
 const REPRESENTED_SUBSET: &str = r#"
 name: demo

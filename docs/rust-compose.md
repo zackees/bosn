@@ -1,39 +1,37 @@
 # Rust Compose planning boundary
 
-`bosn_core::compose` is the first Rust implementation slice for the Compose behavior
-currently implemented in `src/bosn/compose.py`. It is deliberately a pure parser and
+`bosn_core::compose` is the Rust Compose planning boundary. It is deliberately a pure parser and
 planner. It accepts YAML text, produces Bosn-owned typed values plus canonical JSON and a
 `sha256:` plan digest, and has no filesystem, environment, Docker, daemon, registry, or
 process API.
 
-This means it is not a replacement for `bosn-docker compose` yet. In particular, it does
+This means it is not a generic Compose runner. In particular, it does
 not execute Compose, generate an overlay, acquire leases, reconcile resources, inspect build
 contexts, interpolate variables, or treat its digest as a final build-generation digest.
 Those effects remain future daemon-owned work; callers must not bridge this gap by forwarding
 raw YAML or Docker arguments.
 
-## Characterized source mapping
+## Typed source mapping
 
-The parser is based on the actual Python model and tests rather than Docker Compose's much
+The parser intentionally supports a bounded typed subset rather than Docker Compose's much
 larger schema:
 
-| Python source behavior | Rust planning representation |
+| Accepted input behavior | Rust planning representation |
 | --- | --- |
 | top-level `name`, `version`, `services`, `volumes`, `networks`; `x-*` extensions and YAML `<<:` merge keys | typed `ComposeDocument`; extensions are ignored after merge resolution |
 | image/build services, profiles, named/bind/tmpfs mounts, named networks | typed `ServiceSpec`, `BuildSpec`, `MountSpec`, normalized lexical relative paths |
 | environment, ports, dependencies, healthchecks, labels, command, entrypoint, restart, container name | typed fields in `ServiceSpec`; list ordering remains meaningful |
 | top-level volume/network driver, options, labels, external/name/internal fields | typed `ResourceSpec` |
 | unknown keys are fail-closed with dotted paths | `ComposeError { code, path, message, remedy }` |
-| Python's content digest includes an on-disk Dockerfile/context closure | not ported here: the Rust plan digest is only canonical represented YAML semantics |
+| Build-context closure is not part of this plan digest | the digest is only canonical represented YAML semantics |
 
-The tests characterize Python's realistic multi-service fixture and merge-key behavior. Maps
+The tests cover a realistic multi-service fixture and merge-key behavior. Maps
 are normalized with ordered maps; cosmetic mapping order and YAML formatting produce the same
 plan/digest, while ordered command/mount/etc. lists remain ordered.
 
 ## Intentional initial refusals
 
-Python's current parser admits a few shapes because its old Docker front door passes them
-through without a typed model. Rust must not silently do that. This foundation therefore
+Some Compose shapes cannot be represented by the typed model. This foundation therefore
 rejects values that it cannot represent faithfully, including `deploy`, secrets/configs,
 build args and other build-object options, anonymous mounts, untyped mount options, inherited
 environment-list entries, non-name-only per-service network options, undeclared named
