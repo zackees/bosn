@@ -610,6 +610,152 @@ fn setup_gc_preview_only_returns_unambiguously_retired_managed_containers() {
 }
 
 #[test]
+fn manifest_volume_gc_only_allows_retired_warm_spec_native_volumes() {
+    let (_directory, path) = database_path();
+    let mut registry =
+        Registry::create_writer(&path, "11111111-2222-4333-8444-555555555555").unwrap();
+    let mut tx = registry.begin_immediate().unwrap();
+    for (id, name, scope, retention) in [
+        (
+            "manifest-volume:eligible",
+            "bosn-v-spec-eligible",
+            Scope::Spec,
+            Retention::Warm,
+        ),
+        (
+            "manifest-volume:pinned",
+            "bosn-v-spec-pinned",
+            Scope::Spec,
+            Retention::Pinned,
+        ),
+        (
+            "manifest-volume:machine",
+            "bosn-v-machine-machine",
+            Scope::Machine,
+            Retention::Warm,
+        ),
+    ] {
+        tx.put_resource(&Resource {
+            id: id.into(),
+            kind: ResourceKind::Volume,
+            name: name.into(),
+            stack: "app".into(),
+            generation: "sha256:old".into(),
+            scope,
+            workspace: "/work".into(),
+            created_at: 1.0,
+            last_used: 1.0,
+            state: ResourceState::Retired,
+            retention,
+        })
+        .unwrap();
+        tx.put_resource_use(&ResourceUse {
+            resource_id: id.into(),
+            workspace: "/work".into(),
+            stack: "app".into(),
+            generation: "sha256:old".into(),
+            last_used: 1.0,
+            state: ResourceState::Retired,
+        })
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    let preview = registry.manifest_volume_gc_preview("/work", 0, 16).unwrap();
+    assert_eq!(
+        preview
+            .candidates
+            .items
+            .iter()
+            .map(|v| v.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["manifest-volume:eligible"]
+    );
+    assert_eq!(preview.counts.protected_policy, 2);
+    let candidate = preview.candidates.items[0].clone();
+    let mut tx = registry.begin_immediate().unwrap();
+    assert!(
+        tx.finalize_manifest_volume_gc_candidate(
+            "/work",
+            &candidate.id,
+            &candidate.name,
+            &candidate.generation,
+            2.0,
+            "manifest.volume_gc.removed"
+        )
+        .unwrap()
+    );
+    tx.commit().unwrap();
+    assert!(
+        registry
+            .resource_by_kind_name(ResourceKind::Volume, &candidate.name)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn manifest_volume_rollover_retires_only_warm_spec_data() {
+    let (_directory, path) = database_path();
+    let mut registry =
+        Registry::create_writer(&path, "11111111-2222-4333-8444-555555555555").unwrap();
+    let mut tx = registry.begin_immediate().unwrap();
+    for (id, scope, retention) in [
+        ("manifest-volume:spec", Scope::Spec, Retention::Warm),
+        ("manifest-volume:pinned", Scope::Spec, Retention::Pinned),
+        ("manifest-volume:stack", Scope::Stack, Retention::Warm),
+    ] {
+        tx.put_resource(&Resource {
+            id: id.into(),
+            kind: ResourceKind::Volume,
+            name: format!("bosn-v-{}-{id}", scope.as_str()),
+            stack: "app".into(),
+            generation: "sha256:old".into(),
+            scope,
+            workspace: "/work".into(),
+            created_at: 1.0,
+            last_used: 1.0,
+            state: ResourceState::Active,
+            retention,
+        })
+        .unwrap();
+        tx.put_resource_use(&ResourceUse {
+            resource_id: id.into(),
+            workspace: "/work".into(),
+            stack: "app".into(),
+            generation: "sha256:old".into(),
+            last_used: 1.0,
+            state: ResourceState::Active,
+        })
+        .unwrap();
+    }
+    tx.retire_prior_manifest_warm_spec_volume_generations("/work", "app", &[])
+        .unwrap();
+    tx.commit().unwrap();
+    let rows = registry.resources(0, 16).unwrap().items;
+    assert_eq!(
+        rows.iter()
+            .find(|r| r.id == "manifest-volume:spec")
+            .unwrap()
+            .state,
+        ResourceState::Retired
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|r| r.id == "manifest-volume:pinned")
+            .unwrap()
+            .state,
+        ResourceState::Active
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|r| r.id == "manifest-volume:stack")
+            .unwrap()
+            .state,
+        ResourceState::Active
+    );
+}
+
+#[test]
 fn manifest_generation_rollover_is_workspace_stack_scoped_and_keeps_sessions_protected() {
     let (_directory, path) = database_path();
     let mut registry =

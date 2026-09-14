@@ -17,9 +17,10 @@
 use crate::{
     Client, DoctorReport, Error, JobLogPage, JobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE,
     ManifestAppTaskJobRequest, ManifestConvergeJobRequest, ManifestEnsureJobRequest,
-    RegistryResourcePage, SetupAdoptRequest, SetupAdoptResult, SetupAppTaskJobRequest,
-    SetupDoneResult, SetupEnsureEventPage, SetupEnsureJobRequest, SetupGcApplyResult,
-    SetupGcPreviewPage, SetupPreparePolicy, SetupPrepareRequest, SetupReconcileMissingRepairResult,
+    ManifestVolumeGcApplyResult, ManifestVolumeGcPreviewPage, RegistryResourcePage,
+    SetupAdoptRequest, SetupAdoptResult, SetupAppTaskJobRequest, SetupDoneResult,
+    SetupEnsureEventPage, SetupEnsureJobRequest, SetupGcApplyResult, SetupGcPreviewPage,
+    SetupPreparePolicy, SetupPrepareRequest, SetupReconcileMissingRepairResult,
     SetupReconcilePreviewPage, SetupRetiredStopResult, SetupTaskJobRequest, Status,
 };
 use bosn_core::parse_and_plan_compose_yaml;
@@ -117,6 +118,12 @@ trait Backend {
         after: u64,
         limit: u32,
     ) -> Result<SetupGcPreviewPage, Error>;
+    fn manifest_volume_gc_preview(
+        &mut self,
+        workspace: PathBuf,
+        after: u64,
+        limit: u32,
+    ) -> Result<ManifestVolumeGcPreviewPage, Error>;
     fn setup_reconcile_preview(
         &mut self,
         workspace: PathBuf,
@@ -133,6 +140,11 @@ trait Backend {
         workspace: PathBuf,
         token: String,
     ) -> Result<SetupGcApplyResult, Error>;
+    fn manifest_volume_gc_apply(
+        &mut self,
+        workspace: PathBuf,
+        token: String,
+    ) -> Result<ManifestVolumeGcApplyResult, Error>;
     fn setup_stop_retired(
         &mut self,
         workspace: PathBuf,
@@ -212,6 +224,17 @@ impl Backend for DaemonBackend<'_> {
         self.runtime
             .run(self.client.setup_gc_preview(workspace, after, limit))
     }
+    fn manifest_volume_gc_preview(
+        &mut self,
+        workspace: PathBuf,
+        after: u64,
+        limit: u32,
+    ) -> Result<ManifestVolumeGcPreviewPage, Error> {
+        self.runtime.run(
+            self.client
+                .manifest_volume_gc_preview(workspace, after, limit),
+        )
+    }
     fn setup_reconcile_preview(
         &mut self,
         workspace: PathBuf,
@@ -238,6 +261,16 @@ impl Backend for DaemonBackend<'_> {
     ) -> Result<SetupGcApplyResult, Error> {
         self.runtime
             .run(self.client.setup_gc_apply(workspace, &token, true))
+    }
+    fn manifest_volume_gc_apply(
+        &mut self,
+        workspace: PathBuf,
+        token: String,
+    ) -> Result<ManifestVolumeGcApplyResult, Error> {
+        self.runtime.run(
+            self.client
+                .manifest_volume_gc_apply(workspace, &token, true),
+        )
     }
     fn setup_stop_retired(
         &mut self,
@@ -458,6 +491,8 @@ fn tools_list() -> Value {
                 "inputSchema": setup_gc_preview_schema(),
                 "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
             },
+            {"name":"bosn_manifest_volume_gc_preview","description":"Preview only retired disposable native-manifest volumes in one workspace. Only warm spec-scoped volume generations can appear; machine, stack, and pinned data are protected. Never writes SQLite or calls Docker.","inputSchema":setup_gc_preview_schema(),"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
+            {"name":"bosn_manifest_volume_gc_apply","description":"DESTRUCTIVE: remove exactly one preview-token-bound retired warm spec native-manifest volume after the daemon rechecks registry ownership, exact Docker labels, and empty Docker attachment state. Explicit confirmation required.","inputSchema":setup_gc_apply_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}},
             {"name":"bosn_setup_reconcile_preview","description":"Read-only compare of durable Bosn setup-container ownership with fixed Docker inspection for one workspace. It never repairs, writes SQLite, creates/starts/stops/removes Docker resources, or accepts engine controls.","inputSchema":setup_gc_preview_schema(),"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
             {"name":"bosn_setup_reconcile_repair_missing","description":"STATE CHANGE: retire exactly one preview-token-bound active managed setup app only after the daemon rechecks ownership/use protection and fixed Docker inspection still proves it missing. It never starts, creates, stops, removes, or otherwise mutates Docker.","inputSchema":setup_gc_apply_schema(),"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},
             {
@@ -768,6 +803,22 @@ fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
                 backend
                     .setup_gc_preview(workspace, after, limit)
                     .map(setup_gc_preview_json)
+                    .map_err(|_| ToolFailure::Daemon)
+            })
+        }
+        "bosn_manifest_volume_gc_preview" => {
+            setup_gc_preview_arguments(arguments).and_then(|(workspace, after, limit)| {
+                backend
+                    .manifest_volume_gc_preview(workspace, after, limit)
+                    .map(manifest_volume_gc_preview_json)
+                    .map_err(|_| ToolFailure::Daemon)
+            })
+        }
+        "bosn_manifest_volume_gc_apply" => {
+            setup_gc_apply_arguments(arguments).and_then(|(workspace, token)| {
+                backend
+                    .manifest_volume_gc_apply(workspace, token)
+                    .map(manifest_volume_gc_apply_json)
                     .map_err(|_| ToolFailure::Daemon)
             })
         }
@@ -1503,6 +1554,12 @@ fn setup_reconcile_repair_missing_json(result: SetupReconcileMissingRepairResult
 fn setup_gc_apply_json(result: SetupGcApplyResult) -> Value {
     json!({"removed":result.removed,"reconciled_missing":result.reconciled_missing})
 }
+fn manifest_volume_gc_preview_json(page: ManifestVolumeGcPreviewPage) -> Value {
+    json!({"preview_only":true,"next":page.next,"candidates":page.candidates.into_iter().map(|v| json!({"id":v.id,"name":v.name,"generation":v.generation,"token":v.token,"reason":v.reason})).collect::<Vec<_>>(),"counts":{"protected_not_retired":page.counts.protected_not_retired,"protected_policy":page.counts.protected_policy,"protected_ambiguous_use":page.counts.protected_ambiguous_use,"protected_lease":page.counts.protected_lease,"protected_session":page.counts.protected_session,"protected_intent":page.counts.protected_intent,"excluded_unmanaged":page.counts.excluded_unmanaged}})
+}
+fn manifest_volume_gc_apply_json(result: ManifestVolumeGcApplyResult) -> Value {
+    json!({"removed":result.removed,"reconciled_missing":result.reconciled_missing})
+}
 fn setup_stop_retired_json(result: SetupRetiredStopResult) -> Value {
     json!({"stopped": result.stopped, "already_stopped": result.already_stopped})
 }
@@ -1698,6 +1755,25 @@ mod tests {
                 counts: crate::SetupGcPreviewCounts::default(),
             })
         }
+        fn manifest_volume_gc_preview(
+            &mut self,
+            _workspace: PathBuf,
+            after: u64,
+            _limit: u32,
+        ) -> Result<ManifestVolumeGcPreviewPage, Error> {
+            self.daemon_reads += 1;
+            Ok(ManifestVolumeGcPreviewPage {
+                next: (after == 0).then_some(1),
+                candidates: vec![crate::ManifestVolumeGcCandidateDiagnostic {
+                    id: "manifest-volume:old".into(),
+                    name: "bosn-v-spec-old".into(),
+                    generation: "sha256:old".into(),
+                    token: "mvg1-7465737400".into(),
+                    reason: "retired_manifest_warm_spec_volume".into(),
+                }],
+                counts: crate::ManifestVolumeGcPreviewCounts::default(),
+            })
+        }
         fn setup_reconcile_preview(
             &mut self,
             _workspace: PathBuf,
@@ -1734,6 +1810,17 @@ mod tests {
         ) -> Result<SetupGcApplyResult, Error> {
             self.daemon_reads += 1;
             Ok(SetupGcApplyResult {
+                removed: true,
+                reconciled_missing: false,
+            })
+        }
+        fn manifest_volume_gc_apply(
+            &mut self,
+            _workspace: PathBuf,
+            _token: String,
+        ) -> Result<ManifestVolumeGcApplyResult, Error> {
+            self.daemon_reads += 1;
+            Ok(ManifestVolumeGcApplyResult {
                 removed: true,
                 reconciled_missing: false,
             })
@@ -1924,6 +2011,8 @@ mod tests {
                 "bosn_registry_resources",
                 "bosn_setup_ensure_events",
                 "bosn_setup_gc_preview",
+                "bosn_manifest_volume_gc_preview",
+                "bosn_manifest_volume_gc_apply",
                 "bosn_setup_reconcile_preview",
                 "bosn_setup_reconcile_repair_missing",
                 "bosn_setup_gc_apply",

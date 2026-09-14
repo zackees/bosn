@@ -175,6 +175,30 @@ pub struct SetupGcPreview {
     pub candidates: Page<SetupGcCandidate>,
     pub counts: SetupGcPreviewCounts,
 }
+/// A deliberately conservative candidate for one native manifest volume.
+/// This is an ownership fact only; callers must still prove the exact Docker
+/// labels and an empty attachment set before removal.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ManifestVolumeGcCandidate {
+    pub id: String,
+    pub name: String,
+    pub generation: String,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManifestVolumeGcPreviewCounts {
+    pub protected_not_retired: u64,
+    pub protected_policy: u64,
+    pub protected_ambiguous_use: u64,
+    pub protected_lease: u64,
+    pub protected_session: u64,
+    pub protected_intent: u64,
+    pub excluded_unmanaged: u64,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct ManifestVolumeGcPreview {
+    pub candidates: Page<ManifestVolumeGcCandidate>,
+    pub counts: ManifestVolumeGcPreviewCounts,
+}
 /// The durable effect of explicitly completing one setup workspace.  Counts
 /// are registry rows only; this operation never observes or changes an engine.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1111,6 +1135,67 @@ impl<'a> Immediate<'a> {
         )?;
         Ok(())
     }
+    /// Retire only superseded disposable manifest volume ownership.  Durable
+    /// `stack`/`machine` scope and `pinned` retention are intentionally never
+    /// transitioned here: their removal needs a separate explicit release
+    /// contract.  This method has no engine effect.
+    pub fn retire_prior_manifest_warm_spec_volume_generations(
+        &mut self,
+        workspace: &str,
+        stack: &str,
+        keep_names: &[String],
+    ) -> Result<(), Error> {
+        let retired = ResourceState::Retired.as_str();
+        let active = ResourceState::Active.as_str();
+        let volume = ResourceKind::Volume.as_str();
+        self.transaction.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS bosn_manifest_volume_keep (name TEXT PRIMARY KEY)",
+            &[],
+        )?;
+        self.transaction
+            .execute("DELETE FROM bosn_manifest_volume_keep", &[])?;
+        for name in keep_names {
+            self.transaction.execute(
+                "INSERT INTO bosn_manifest_volume_keep(name) VALUES(?)",
+                &[Value::Text(name.clone())],
+            )?;
+        }
+        self.transaction.execute(
+            "UPDATE resource_uses SET state=? WHERE workspace=? AND stack=? AND state=? AND resource_id IN (SELECT id FROM resources WHERE kind=? AND stack=? AND workspace=? AND state=? AND scope='spec' AND retention='warm' AND id GLOB 'manifest-volume:*' AND name NOT IN (SELECT name FROM bosn_manifest_volume_keep) AND NOT EXISTS (SELECT 1 FROM resource_uses AS other WHERE other.resource_id=resources.id AND other.state=? AND (other.workspace<>? OR other.stack<>?)))",
+            &[Value::Text(retired.into()), Value::Text(workspace.into()), Value::Text(stack.into()), Value::Text(active.into()), Value::Text(volume.into()), Value::Text(stack.into()), Value::Text(workspace.into()), Value::Text(active.into()), Value::Text(active.into()), Value::Text(workspace.into()), Value::Text(stack.into())],
+        )?;
+        self.transaction.execute(
+            "UPDATE resources SET state=? WHERE kind=? AND stack=? AND workspace=? AND state=? AND scope='spec' AND retention='warm' AND id GLOB 'manifest-volume:*' AND name NOT IN (SELECT name FROM bosn_manifest_volume_keep) AND NOT EXISTS (SELECT 1 FROM resource_uses AS other WHERE other.resource_id=resources.id AND other.state=? AND (other.workspace<>? OR other.stack<>?))",
+            &[Value::Text(retired.into()), Value::Text(volume.into()), Value::Text(stack.into()), Value::Text(workspace.into()), Value::Text(active.into()), Value::Text(active.into()), Value::Text(workspace.into()), Value::Text(stack.into())],
+        )?;
+        Ok(())
+    }
+    /// Recheck and remove one exact disposable manifest-volume candidate.
+    pub fn finalize_manifest_volume_gc_candidate(
+        &mut self,
+        workspace: &str,
+        id: &str,
+        name: &str,
+        generation: &str,
+        at: f64,
+        event_kind: &str,
+    ) -> Result<bool, Error> {
+        if !manifest_volume_gc_candidate_exists(
+            &mut self.transaction,
+            workspace,
+            id,
+            name,
+            generation,
+        )? {
+            return Ok(false);
+        }
+        self.transaction.execute(
+            "DELETE FROM resources WHERE id=?",
+            &[Value::Text(id.into())],
+        )?;
+        self.append_event(at, event_kind, "retired_manifest_warm_spec_volume")?;
+        Ok(true)
+    }
     pub fn put_lease(&mut self, v: &Lease) -> Result<(), Error> {
         self.transaction.execute("INSERT INTO leases(id,resource_id,pid,proc_start,acquired_at,heartbeat_at,ttl_seconds) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET resource_id=excluded.resource_id,pid=excluded.pid,proc_start=excluded.proc_start,acquired_at=excluded.acquired_at,heartbeat_at=excluded.heartbeat_at,ttl_seconds=excluded.ttl_seconds", &[Value::Text(v.id.clone()),Value::Text(v.resource_id.clone()),Value::Integer(i64::from(v.pid)),optional_value(v.proc_start),Value::Real(v.acquired_at),Value::Real(v.heartbeat_at),Value::Real(v.ttl_seconds)])?;
         Ok(())
@@ -1550,6 +1635,14 @@ impl Registry {
     ) -> Result<SetupGcPreview, Error> {
         setup_gc_preview(&self.connection, workspace, offset, limit)
     }
+    pub fn manifest_volume_gc_preview(
+        &self,
+        workspace: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<ManifestVolumeGcPreview, Error> {
+        manifest_volume_gc_preview(&self.connection, workspace, offset, limit)
+    }
     /// Read only the durable setup-container facts for one exact workspace.
     /// This is deliberately narrower than the general diagnostics page: a
     /// reconciler must never discover ownership from Docker names or labels.
@@ -1590,6 +1683,28 @@ impl Registry {
         generation: &str,
     ) -> Result<Option<SetupGcCandidate>, Error> {
         setup_gc_candidate(&mut self.connection, workspace, id, name, generation)
+    }
+    pub fn manifest_volume_gc_candidate(
+        &mut self,
+        workspace: &str,
+        id: &str,
+        name: &str,
+        generation: &str,
+    ) -> Result<Option<ManifestVolumeGcCandidate>, Error> {
+        if !manifest_volume_gc_candidate_exists(
+            &mut self.connection,
+            workspace,
+            id,
+            name,
+            generation,
+        )? {
+            return Ok(None);
+        }
+        Ok(Some(ManifestVolumeGcCandidate {
+            id: id.into(),
+            name: name.into(),
+            generation: generation.into(),
+        }))
     }
     /// Re-read one exact active managed setup container eligible for the
     /// missing-container repair path.  This is a registry-only authorization
@@ -1727,7 +1842,7 @@ impl Registry {
     pub fn setup_ensure_events(&self, offset: usize, limit: usize) -> Result<Page<Event>, Error> {
         page(
             &self.connection,
-            "SELECT id,at,kind,detail FROM events WHERE kind LIKE 'setup.ensure.%' OR kind LIKE 'manifest.recovery.%' ORDER BY id DESC LIMIT ? OFFSET ?",
+            "SELECT id,at,kind,detail FROM events WHERE kind LIKE 'setup.ensure.%' OR kind LIKE 'manifest.recovery.%' OR kind LIKE 'manifest.volume_gc.%' ORDER BY id DESC LIMIT ? OFFSET ?",
             offset,
             limit,
             event,
@@ -1804,6 +1919,14 @@ impl ReadOnlyRegistry {
         limit: usize,
     ) -> Result<SetupGcPreview, Error> {
         setup_gc_preview(&self.connection, workspace, offset, limit)
+    }
+    pub fn manifest_volume_gc_preview(
+        &self,
+        workspace: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<ManifestVolumeGcPreview, Error> {
+        manifest_volume_gc_preview(&self.connection, workspace, offset, limit)
     }
     pub fn resource_uses(&self, offset: usize, limit: usize) -> Result<Page<ResourceUse>, Error> {
         page(
@@ -2076,6 +2199,85 @@ fn setup_gc_candidate_exists(
             Value::Text(workspace.into()),
             Value::Text(workspace.into()),
         ],
+    )?;
+    Ok(!rows.is_empty())
+}
+
+fn manifest_volume_gc_preview(
+    connection: &Connection,
+    workspace: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<ManifestVolumeGcPreview, Error> {
+    // Only a superseded, disposable native manifest volume can be previewed.
+    // In particular machine/stack scope and pinned data never enter this set.
+    let predicate = "r.kind='volume' AND r.workspace=? AND r.state='retired' AND r.scope='spec' AND r.retention='warm' AND r.id GLOB 'manifest-volume:*' AND r.name GLOB 'bosn-v-spec-*' AND EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id AND u.workspace=? AND u.stack=r.stack AND u.generation=r.generation AND u.state='retired') AND NOT EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id AND (u.workspace<>? OR u.stack<>r.stack OR u.generation<>r.generation OR u.state<>'retired')) AND NOT EXISTS (SELECT 1 FROM leases AS l WHERE l.resource_id=r.id) AND NOT EXISTS (SELECT 1 FROM execution_sessions AS s WHERE s.container_id=r.id OR s.container_id=r.name) AND NOT EXISTS (SELECT 1 FROM volume_creation_intents AS v WHERE v.name=r.name)";
+    let limit = limit.clamp(1, MAX_PAGE_SIZE);
+    let query_limit = limit.checked_add(1).ok_or(Error::BadRow("page limit"))?;
+    let rows = connection.query(&format!("SELECT r.id,r.name,r.generation FROM resources AS r WHERE {predicate} ORDER BY r.id LIMIT ? OFFSET ?"), &[Value::Text(workspace.into()), Value::Text(workspace.into()), Value::Text(workspace.into()), Value::Integer(i64::try_from(query_limit).map_err(|_| Error::BadRow("page limit"))?), Value::Integer(i64::try_from(offset).map_err(|_| Error::BadRow("page offset"))?)], QueryLimits { max_rows: query_limit, max_bytes: 1_048_576 })?;
+    let more = rows.len() > limit;
+    let candidates = Page {
+        items: rows
+            .into_iter()
+            .take(limit)
+            .map(|r| {
+                Ok(ManifestVolumeGcCandidate {
+                    id: text(&r, 0)?,
+                    name: text(&r, 1)?,
+                    generation: text(&r, 2)?,
+                })
+            })
+            .collect::<Result<_, Error>>()?,
+        next_offset: more
+            .then(|| {
+                offset
+                    .checked_add(limit)
+                    .ok_or(Error::BadRow("page offset"))
+            })
+            .transpose()?,
+    };
+    let count = |predicate: &str| -> Result<u64, Error> {
+        let row = connection.query(&format!("SELECT COUNT(*) FROM resources AS r WHERE r.kind='volume' AND r.workspace=? AND {predicate}"), &[Value::Text(workspace.into())], QueryLimits { max_rows: 1, max_bytes: 1024 })?;
+        match row.first().and_then(|r| r.get(0)) {
+            Some(Value::Integer(v)) if *v >= 0 => Ok(*v as u64),
+            _ => Err(Error::BadRow("manifest volume gc count")),
+        }
+    };
+    let managed = "r.id GLOB 'manifest-volume:*' AND r.name GLOB 'bosn-v-*'";
+    Ok(ManifestVolumeGcPreview {
+        candidates,
+        counts: ManifestVolumeGcPreviewCounts {
+            protected_not_retired: count(&format!("{managed} AND r.state<>'retired'"))?,
+            protected_policy: count(&format!(
+                "{managed} AND r.state='retired' AND (r.scope<>'spec' OR r.retention<>'warm')"
+            ))?,
+            protected_ambiguous_use: count(&format!(
+                "{managed} AND r.state='retired' AND (NOT EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id AND u.workspace=r.workspace AND u.stack=r.stack AND u.generation=r.generation AND u.state='retired') OR EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id AND (u.workspace<>r.workspace OR u.stack<>r.stack OR u.generation<>r.generation OR u.state<>'retired')) )"
+            ))?,
+            protected_lease: count(&format!(
+                "{managed} AND r.state='retired' AND EXISTS (SELECT 1 FROM leases AS l WHERE l.resource_id=r.id)"
+            ))?,
+            protected_session: count(&format!(
+                "{managed} AND r.state='retired' AND EXISTS (SELECT 1 FROM execution_sessions AS s WHERE s.container_id=r.id OR s.container_id=r.name)"
+            ))?,
+            protected_intent: count(&format!(
+                "{managed} AND r.state='retired' AND EXISTS (SELECT 1 FROM volume_creation_intents AS v WHERE v.name=r.name)"
+            ))?,
+            excluded_unmanaged: count(&format!("NOT ({managed})"))?,
+        },
+    })
+}
+
+fn manifest_volume_gc_candidate_exists(
+    connection: &mut impl SetupGcQuery,
+    workspace: &str,
+    id: &str,
+    name: &str,
+    generation: &str,
+) -> Result<bool, Error> {
+    let rows = connection.setup_gc_query(
+        "SELECT 1 FROM resources AS r WHERE r.id=? AND r.name=? AND r.generation=? AND r.kind='volume' AND r.workspace=? AND r.state='retired' AND r.scope='spec' AND r.retention='warm' AND r.id GLOB 'manifest-volume:*' AND r.name GLOB 'bosn-v-spec-*' AND EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id AND u.workspace=? AND u.stack=r.stack AND u.generation=r.generation AND u.state='retired') AND NOT EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id AND (u.workspace<>? OR u.stack<>r.stack OR u.generation<>r.generation OR u.state<>'retired')) AND NOT EXISTS (SELECT 1 FROM leases AS l WHERE l.resource_id=r.id) AND NOT EXISTS (SELECT 1 FROM execution_sessions AS s WHERE s.container_id=r.id OR s.container_id=r.name) AND NOT EXISTS (SELECT 1 FROM volume_creation_intents AS v WHERE v.name=r.name) LIMIT 1",
+        &[Value::Text(id.into()), Value::Text(name.into()), Value::Text(generation.into()), Value::Text(workspace.into()), Value::Text(workspace.into()), Value::Text(workspace.into())],
     )?;
     Ok(!rows.is_empty())
 }
