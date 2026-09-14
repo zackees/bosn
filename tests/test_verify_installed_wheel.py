@@ -38,3 +38,17 @@ def test_windows_pyd_rejects_non_abi3_wheel_tag(
 
     with pytest.raises(AssertionError, match="cp310-abi3"):
         verifier.assert_platform_wheel_contents(wheel)
+
+
+@pytest.mark.parametrize(
+    ("os_name", "expected_extension"),
+    [("nt", "_native.pyd"), ("posix", "_native.abi3.so")],
+)
+def test_inline_smoke_script_uses_the_platform_extension_contract(
+    monkeypatch: pytest.MonkeyPatch, os_name: str, expected_extension: str
+) -> None:
+    monkeypatch.setattr(verifier.os, "name", os_name)
+
+    script = verifier.installed_extension_smoke_script()
+
+    assert f'assert origin.name == "{expected_extension}"' in script
