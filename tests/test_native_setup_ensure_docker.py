@@ -798,6 +798,73 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
             _remove_exact_managed_volume(name, content)
 
 
+def test_native_default_manifest_stack_autostarts_after_daemon_restart(tmp_path: Path) -> None:
+    """A fresh installed wheel restarts only a selected manifest app.
+
+    The daemon is deliberately stopped before Docker is asked to stop the
+    already-proven exact container. Starting a new bundled daemon must use the
+    durable default-stack intent and exact source/registry/label/image proof;
+    this test never asks the public API to start a raw container.
+    """
+
+    image_id = _pinned_image_id(PINNED_MANIFEST_MYSQL)
+    state_dir = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    unique = f"manifest-autostart-{os.getpid()}-{time.time_ns()}"
+    (workspace / "bosn.toml").write_text(
+        "[stack.app]\n"
+        f"image = '{PINNED_MANIFEST_MYSQL}'\n"
+        "default = true\n"
+        "[stack.app.env]\n"
+        "MYSQL_ALLOW_EMPTY_PASSWORD = 'yes'\n"
+        f"BOSN_AUTOSTART_PROOF = '{unique}'\n",
+        encoding="utf-8",
+    )
+    client = bosn.Client(state_dir)
+    container_name: str | None = None
+    content_sha256: str | None = None
+    try:
+        with _production_daemon(state_dir) as (_, daemon):
+            _wait_for_daemon(client, daemon)
+            job = client.submit_manifest_ensure(
+                workspace,
+                "bosn.toml",
+                "app",
+                deadline_ms=90_000,
+                output_limit=1_048_576,
+            )
+            _wait_for_success(client, job)
+            container = next(
+                record
+                for record in client.registry_resources(limit=16).records
+                if record.kind == "container" and record.stack == "app"
+            )
+            content_sha256 = container.generation.removeprefix("sha256:")
+            container_name = container.name
+            observed = _inspect_container(container_name)
+            assert observed is not None and observed[1]
+            assert observed[2] == image_id
+
+        assert container_name is not None and content_sha256 is not None
+        _docker("container", "stop", container_name)
+        stopped = _inspect_container(container_name)
+        assert stopped is not None and not stopped[1]
+
+        with _production_daemon(state_dir) as (_, daemon):
+            _wait_for_daemon(client, daemon)
+            restarted = _inspect_container(container_name)
+            assert restarted is not None and restarted[1]
+            assert restarted[2] == image_id
+            assert any(
+                event.kind == "manifest.recovery.started"
+                for event in client.setup_ensure_events(limit=64).records
+            )
+    finally:
+        if container_name is not None and content_sha256 is not None:
+            _remove_exact_managed_container(container_name, content_sha256)
+
+
 def test_native_python_client_converges_all_manifest_stacks_in_order(tmp_path: Path) -> None:
     """One installed-wheel job safely converges every declared stack.
 

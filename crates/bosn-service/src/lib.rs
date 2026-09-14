@@ -3680,9 +3680,10 @@ impl Client {
             _ => Err(Error::Protocol("unexpected registry resources response")),
         }
     }
-    /// Read a bounded, newest-first page of credential-safe setup ensure
-    /// history from the already-running daemon. This has no registry write
-    /// path and never initializes state in the client process.
+    /// Read a bounded, newest-first page of credential-safe setup ensure and
+    /// native-manifest lifecycle history from the already-running daemon.
+    /// This has no registry write path and never initializes state in the
+    /// client process.
     pub async fn setup_ensure_events(
         &self,
         after: u64,
@@ -10921,16 +10922,16 @@ mod tests {
                         generation: plan.generation.clone(),
                         workspace: plan.plan.workspace_root.to_string_lossy().into_owned(),
                     },
-                image: SetupEnsureImageResource {
-                    id: "manifest-image:sha256:recovery-test".into(),
-                    name: "manifest-image:sha256:recovery-test".into(),
-                    stack: "app".into(),
-                    generation: "sha256:recovery-test".into(),
-                    workspace: plan.plan.workspace_root.to_string_lossy().into_owned(),
-                },
-                volumes: Vec::new(),
-                manifest_autostart: true,
-            };
+                    image: SetupEnsureImageResource {
+                        id: "manifest-image:sha256:recovery-test".into(),
+                        name: "manifest-image:sha256:recovery-test".into(),
+                        stack: "app".into(),
+                        generation: "sha256:recovery-test".into(),
+                        workspace: plan.plan.workspace_root.to_string_lossy().into_owned(),
+                    },
+                    volumes: Vec::new(),
+                    manifest_autostart: true,
+                };
                 let contract = manifest_recovery_contract(&request, &execution, 1).unwrap();
                 let mut registry = Registry::create_writer(
                     state.join("registry.sqlite3"),

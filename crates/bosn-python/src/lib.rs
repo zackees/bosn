@@ -102,8 +102,9 @@ impl Client {
         })
     }
 
-    /// Read a bounded newest-first page of credential-safe setup ensure event
-    /// history from the already-running daemon. It never initializes state.
+    /// Read a bounded newest-first page of credential-safe setup ensure and
+    /// native-manifest lifecycle event history from the already-running
+    /// daemon. It never initializes state.
     #[pyo3(signature = (*, after = 0, limit = 64))]
     fn setup_ensure_events(
         &self,

@@ -1337,18 +1337,25 @@ fn read_only_setup_ensure_events_are_filtered_newest_first_and_do_not_write() {
         .unwrap();
     tx.append_event(3.0, "setup.ensure.succeeded", "job_id=1 outcome=succeeded")
         .unwrap();
+    tx.append_event(
+        4.0,
+        "manifest.autostart.disabled",
+        "daemon_written_exact_intent",
+    )
+    .unwrap();
     tx.commit().unwrap();
     let before = std::fs::metadata(&path).unwrap().len();
     let readonly = Registry::open_read_only(&path).unwrap();
     let page = readonly.setup_ensure_events(0, 1).unwrap();
     assert_eq!(page.items.len(), 1);
-    assert_eq!(page.items[0].kind, "setup.ensure.succeeded");
+    assert_eq!(page.items[0].kind, "manifest.autostart.disabled");
     assert_eq!(page.next_offset, Some(1));
     let next = readonly
         .setup_ensure_events(page.next_offset.unwrap(), 64)
         .unwrap();
-    assert_eq!(next.items.len(), 1);
-    assert_eq!(next.items[0].kind, "setup.ensure.submitted");
+    assert_eq!(next.items.len(), 2);
+    assert_eq!(next.items[0].kind, "setup.ensure.succeeded");
+    assert_eq!(next.items[1].kind, "setup.ensure.submitted");
     assert!(next.next_offset.is_none());
     drop(readonly);
     assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
