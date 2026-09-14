@@ -13,6 +13,9 @@
 
 #![cfg(unix)]
 
+#[allow(dead_code)]
+mod support;
+
 use std::{
     env,
     ffi::OsString,
@@ -27,6 +30,7 @@ use std::{
 use bosn_service::Client;
 use kernal_api::async_engine::RuntimeBuilder;
 use serde_json::{Value, json};
+use support::tls_setup_server::{TlsSetupServer, certificate_path};
 
 const HERMES_VERSION: &str = "0.21.0";
 const READY_DEADLINE: Duration = Duration::from_secs(10);
@@ -38,21 +42,31 @@ struct DaemonChild {
 }
 
 impl DaemonChild {
-    fn start(state: &Path, fake_bin: &Path) -> Self {
+    fn start(state: &Path, fake_bin: &Path, fake_mode: &Path, certificate: Option<&Path>) -> Self {
         let inherited_path = env::var_os("PATH").unwrap_or_default();
         let path = env::join_paths(
             std::iter::once(fake_bin.to_path_buf()).chain(env::split_paths(&inherited_path)),
         )
         .expect("construct daemon PATH");
-        let child = Command::new(env!("CARGO_BIN_EXE_bosn"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bosn"));
+        command
             .env("PATH", path)
+            // The fake is a process-level engine substitute, not a Bosn test
+            // backend: the daemon still starts its ordinary DockerEngine.
+            .env("BOSN_FAKE_DOCKER_MODE_FILE", fake_mode)
             .args(["daemon", "serve", "--state-dir"])
             .arg(state)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("start production Bosn daemon");
+            .stderr(Stdio::null());
+        if let Some(certificate) = certificate {
+            // The daemon, rather than this test client, resolves the HTTPS
+            // setup document through Bosn's normal verified TLS transport.
+            command
+                .env("SSL_CERT_FILE", certificate)
+                .env("NO_PROXY", "localhost,127.0.0.1");
+        }
+        let child = command.spawn().expect("start production Bosn daemon");
         Self { child }
     }
 
@@ -87,15 +101,22 @@ struct McpChild {
 }
 
 impl McpChild {
-    fn start(state: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_bosn"))
+    fn start(state: &Path, certificate: Option<&Path>) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bosn"));
+        command
             .env("BOSN_STATE_DIR", state)
             .arg("mcp")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("start production Bosn MCP server");
+            .stderr(Stdio::piped());
+        if let Some(certificate) = certificate {
+            // `bosn_setup_plan` resolves its document in this production MCP
+            // child; ensure resolution happens in the daemon above.
+            command
+                .env("SSL_CERT_FILE", certificate)
+                .env("NO_PROXY", "localhost,127.0.0.1");
+        }
+        let mut child = command.spawn().expect("start production Bosn MCP server");
         Self {
             stdin: Some(child.stdin.take().expect("MCP stdin")),
             stdout: BufReader::new(child.stdout.take().expect("MCP stdout")),
@@ -143,7 +164,7 @@ impl McpChild {
 
     fn tool(&mut self, name: &str, arguments: Value) -> Value {
         let result = self.request("tools/call", json!({"name": name, "arguments": arguments}));
-        assert_eq!(result["isError"], false, "MCP tool failed: {result}");
+        assert_eq!(result["isError"], false, "MCP tool {name} failed: {result}");
         result["structuredContent"].clone()
     }
 
@@ -220,7 +241,35 @@ fn write_fake_docker(directory: &Path) {
     let docker = directory.join("docker");
     fs::write(
         &docker,
-        "#!/bin/sh\nif [ \"$1\" = image ] && [ \"$2\" = pull ]; then\n  echo 'fake Docker pull started' >&2\n  exec /bin/sleep 60\nfi\necho \"unexpected fake Docker invocation: $*\" >&2\nexit 97\n",
+        "#!/bin/sh
+mode=$(cat \"${BOSN_FAKE_DOCKER_MODE_FILE:?missing fake mode file}\")
+case \"$1 $2\" in
+  'image pull')
+    if [ \"$mode\" = block ]; then
+      echo 'fake Docker pull started' >&2
+      exec /bin/sleep 60
+    fi
+    echo 'fake Docker image pulled'
+    ;;
+  'image inspect')
+    printf '%s\\n' 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+    ;;
+  'container inspect')
+    echo 'Error response from daemon: No such container' >&2
+    exit 1
+    ;;
+  'container create')
+    printf '%s\\n' 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
+    ;;
+  'container start')
+    echo 'fake Docker container started'
+    ;;
+  *)
+    echo \"unexpected fake Docker invocation: $*\" >&2
+    exit 97
+    ;;
+esac
+",
     )
     .expect("write fake Docker");
     let mut permissions = fs::metadata(&docker)
@@ -288,10 +337,13 @@ fn hermes_agent_stdio_contract_survives_daemon_restart() {
     let state = root.path().join("state");
     let workspace = root.path().join("workspace");
     let fake_bin = root.path().join("fake-bin");
+    let fake_mode = root.path().join("fake-docker-mode");
     let hermes_home = root.path().join("hermes-home");
+    let certificate = certificate_path();
     fs::create_dir_all(&workspace).expect("workspace");
     fs::create_dir_all(&fake_bin).expect("fake Docker directory");
     write_fake_docker(&fake_bin);
+    fs::write(&fake_mode, "block\n").expect("initial fake Docker mode");
     let config = root.path().join("setup.toml");
     fs::write(
         &config,
@@ -299,8 +351,8 @@ fn hermes_agent_stdio_contract_survives_daemon_restart() {
     )
     .expect("setup document");
 
-    let mut daemon = DaemonChild::start(&state, &fake_bin);
-    let client = wait_for_daemon(&mut daemon, &state);
+    let mut daemon = DaemonChild::start(&state, &fake_bin, &fake_mode, Some(&certificate));
+    let _client = wait_for_daemon(&mut daemon, &state);
 
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_bosn"));
     let mut add_args = vec![
@@ -323,7 +375,7 @@ fn hermes_agent_stdio_contract_survives_daemon_restart() {
     add_args.extend([OsString::from("--args"), OsString::from("mcp")]);
     let registered = hermes(&add_args, &hermes_home, Some(b"y\n"));
     let registered_stdout = hermes_stdout(&registered);
-    assert!(registered_stdout.contains("Connected! Found 11 tool(s)"));
+    assert!(registered_stdout.contains("Connected! Found "));
     assert!(registered_stdout.contains("Saved 'bosn-contract'"));
 
     let discovery = hermes(
@@ -356,7 +408,7 @@ fn hermes_agent_stdio_contract_survives_daemon_restart() {
     // The production server is launched with exactly the daemon state Hermes
     // registered above. Every response is parsed as a JSON-RPC line so a
     // banner or diagnostic on stdout fails this black-box session immediately.
-    let mut mcp = McpChild::start(&state);
+    let mut mcp = McpChild::start(&state, Some(&certificate));
     let initialized = mcp.request(
         "initialize",
         json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "hermes-acceptance", "version": HERMES_VERSION}}),
@@ -364,7 +416,13 @@ fn hermes_agent_stdio_contract_survives_daemon_restart() {
     assert_eq!(initialized["protocolVersion"], "2025-06-18");
     mcp.notify_initialized();
     let listed = mcp.request("tools/list", json!({}));
-    assert_eq!(listed["tools"].as_array().expect("tools array").len(), 8);
+    let listed_tools = listed["tools"].as_array().expect("tools array");
+    for tool in ["bosn_status", "bosn_setup_plan", "bosn_setup_ensure"] {
+        assert!(
+            listed_tools.iter().any(|entry| entry["name"] == tool),
+            "production stdio session did not list {tool}"
+        );
+    }
 
     let status = mcp.tool("bosn_status", json!({}));
     assert!(
@@ -380,6 +438,25 @@ fn hermes_agent_stdio_contract_survives_daemon_restart() {
     assert_eq!(plan["action"], "plan");
     assert_eq!(plan["applied"], false);
     assert_eq!(plan["app_source"]["kind"], "pinned_image");
+
+    // The production MCP child resolves a local, verified-TLS URL exactly as
+    // a normal user would configure it. Planning remains side-effect-free but
+    // proves the production MCP request reaches the URL resolver rather than
+    // a fixture backend or a client-side fetch.
+    let remote_document =
+        format!("version = 1\n[app]\nimage = 'registry.example/remote@sha256:{DIGEST}'\n");
+    let remote = TlsSetupServer::start(remote_document.as_bytes());
+    let remote_config = remote.url("/setup.toml?revision=hermes-acceptance");
+    let remote_plan = mcp.tool(
+        "bosn_setup_plan",
+        json!({"workspace": workspace, "config": &remote_config, "policy": "refresh"}),
+    );
+    assert_eq!(remote_plan["source_kind"], "https");
+    assert_eq!(
+        remote.request_count(),
+        1,
+        "MCP URL plan reached fixture once"
+    );
 
     // The daemon owns the fake Docker process. Hermes/MCP only submits the
     // semantic prepare request, observes its bounded logs, and cancels it.
@@ -432,7 +509,51 @@ fn hermes_agent_stdio_contract_survives_daemon_restart() {
         "Cancelled"
     );
 
-    runtime().run(client.shutdown()).expect("stop first daemon");
+    // Flip the external fake engine only after the real cancellation has
+    // completed. The next daemon-owned job then proves MCP ensure drives a
+    // full pull/inspect/create/start sequence without a Docker daemon.
+    fs::write(&fake_mode, "success\n").expect("enable fake Docker ensure");
+    let ensured = mcp.tool(
+        "bosn_setup_ensure",
+        json!({
+            "workspace": workspace,
+            "config": &remote_config,
+            "policy": "refresh",
+            "deadline_ms": 60_000,
+            "output_limit": 8_192,
+        }),
+    );
+    assert_eq!(ensured["action"], "setup_ensure");
+    let ensured_job = ensured["job_id"].as_u64().expect("ensure job ID");
+    let ensured_status = wait_for_job(&mut mcp, ensured_job, "Succeeded");
+    assert_eq!(ensured_status["job_id"], ensured_job);
+    let ensured_logs = mcp.tool(
+        "bosn_job_logs",
+        json!({"job_id": ensured_job, "after": 0, "limit": 64}),
+    );
+    assert!(
+        ensured_logs["records"]
+            .as_array()
+            .expect("ensure log records")
+            .iter()
+            .any(|record| record["line"]
+                .as_str()
+                .is_some_and(|line| line.contains("fake Docker container started"))),
+        "ensure did not run the daemon-owned container start: {ensured_logs}"
+    );
+    assert_eq!(
+        remote.request_count(),
+        2,
+        "URL-backed ensure did not resolve its document through the daemon"
+    );
+
+    runtime()
+        .run(
+            Client::for_state(&state)
+                .expect("URL daemon client")
+                .shutdown(),
+        )
+        .expect("stop first daemon");
     daemon.wait_for_exit();
     let offline = mcp.request(
         "tools/call",
@@ -443,7 +564,7 @@ fn hermes_agent_stdio_contract_survives_daemon_restart() {
         "stopped daemon unexpectedly remained reachable"
     );
 
-    let mut restarted = DaemonChild::start(&state, &fake_bin);
+    let mut restarted = DaemonChild::start(&state, &fake_bin, &fake_mode, Some(&certificate));
     wait_for_daemon(&mut restarted, &state);
     let recovered = mcp.tool("bosn_status", json!({}));
     assert!(

@@ -207,8 +207,13 @@ Bosn pins its current MCP-client acceptance contract to **Hermes Agent
 `mcp test` commands against the production `bosn mcp` executable, which proves
 the `initialize`/`tools/list` lifecycle and discovery of the registered Bosn tools.
 It then uses a separate production stdio session with the same registered
-command and state root to prove semantic planning, prepare submission, bounded
-log polling, cancellation, stdout-only JSON-RPC, and a live daemon restart.
+command and state root to prove local-file and verified local-HTTPS config
+resolution, semantic planning, prepare submission, bounded log polling,
+cancellation, a successful daemon-owned ensure/pull/inspect/create/start
+sequence, stdout-only JSON-RPC, and a live daemon restart. The local HTTPS
+fixture is trusted only by the isolated Bosn daemon and production stdio child
+through `SSL_CERT_FILE`; Hermes still registers and discovers the ordinary
+Bosn stdio executable.
 The semantic half is a standards-client black-box rather than a Hermes CLI
 call because Hermes intentionally has no command for invoking one MCP tool
 without launching an inference-backed agent (and therefore requiring model
@@ -225,10 +230,12 @@ BOSN_HERMES_ACCEPTANCE=1 soldr cargo test -j1 -p bosn-service --test hermes_mcp 
 ```
 
 The test makes a fresh `HERMES_HOME`, state directory, workspace, and a
-short-lived fake `docker` executable. It never talks to a real Docker daemon;
-the fake process only holds a daemon-owned setup-prepare job long enough to
-prove safe cancellation. It requires Unix process permissions for that fake
-executable. Hermes intentionally forwards only explicitly registered stdio
+short-lived fake `docker` executable and a local verified-TLS config server.
+It never talks to a real Docker daemon: the fake first holds a daemon-owned
+setup-prepare job long enough to prove safe cancellation, then supplies the
+fixed responses required for one daemon-owned ensure job to pull, inspect,
+create, and start its managed app. It requires Unix process permissions for
+that fake executable. Hermes intentionally forwards only explicitly registered stdio
 environment variables, so a Nix-built Bosn binary that dynamically links
 OpenSSL must register its `LD_LIBRARY_PATH` as the test does; release wheels
 and normally installed native binaries should not need that workaround.
