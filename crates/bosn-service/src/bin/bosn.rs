@@ -1090,10 +1090,13 @@ fn run_daemon(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
     };
     match invocation {
         DaemonInvocation::Serve { state_dir } => {
-            if runtime
-                .run(bosn_service::Service::new(state_dir).serve())
-                .is_err()
-            {
+            if let Err(error) = runtime.run(bosn_service::Service::new(state_dir).serve()) {
+                // The normal command surface intentionally avoids exposing
+                // state paths or backend details.  CI can opt in when a
+                // platform-specific launch failure needs its typed cause.
+                if std::env::var_os("BOSN_DAEMON_DIAGNOSTICS").is_some() {
+                    eprintln!("bosn daemon serve diagnostic: {error:?}");
+                }
                 daemon_failure("serve", false);
             }
             println!("daemon stopped");

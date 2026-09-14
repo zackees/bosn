@@ -222,6 +222,11 @@ def verify_installed_wheel(wheel: Path) -> None:
         )
 
         env = child_environment(scripts)
+        # Preserve the normal CLI's deliberately generic errors, while
+        # allowing the macOS native-wheel lane to surface a typed startup
+        # failure if the platform has one.
+        if sys.platform == "darwin":
+            env["BOSN_DAEMON_DIAGNOSTICS"] = "1"
         imported = run(
             [
                 str(python),
