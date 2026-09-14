@@ -91,6 +91,22 @@ GitHub Actions runs that proof on Python 3.11 for Linux, macOS, and Windows.
 Those native-wheel lanes do not need Docker; the separate Linux lane remains
 the Docker integration test.
 
+The Linux Rust CI lane also validates the reviewed `kernal-api` revision and
+the locked Cargo resolution before running every ordinary Rust test. The PyO3
+crate is tested with its explicit embedded-Python test feature, since the wheel
+feature correctly leaves CPython symbols for the installed interpreter:
+
+```bash
+python ci/verify_kernel_boundary.py
+cargo metadata --locked --format-version 1 --no-deps
+cargo test --workspace --exclude bosn --locked
+PYO3_PYTHON="$(command -v python)" \
+  cargo test -p bosn --lib --locked --no-default-features --features embedded-python-tests
+```
+
+Ignored Docker and Hermes acceptance tests remain opt-in; the Rust CI lane does
+not silently enable their engine, image, or pinned-agent prerequisites.
+
 ## Performance comparison baseline
 
 The durable Phase-0 historical comparison record is
