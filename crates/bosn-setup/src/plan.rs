@@ -42,6 +42,16 @@ pub enum SetupPlanAppSource {
     InlineDockerfile { dockerfile_path: PathBuf },
 }
 
+/// A daemon-derived named Docker volume mount. This is intentionally absent
+/// from setup documents: callers can only reach it through a validated
+/// manifest declaration and never supply Docker mount syntax.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupNamedVolume {
+    pub name: String,
+    pub target: String,
+    pub labels: BTreeMap<String, String>,
+}
+
 /// Typed receipt of a setup plan.  The source bytes have been validated and
 /// cached according to the request, while Docker and the Bosn daemon remain
 /// untouched.
@@ -71,6 +81,9 @@ pub struct SetupPlan {
     pub tasks: BTreeMap<String, SetupTask>,
     /// The bounded app-source shape, without exposing Dockerfile contents.
     pub app_source: SetupPlanAppSource,
+    /// Named volumes derived by the manifest runtime. Ordinary setup documents
+    /// leave this empty.
+    pub named_volumes: Vec<SetupNamedVolume>,
 }
 
 /// Planning stops before side effects outside Bosn-owned cache/asset state.
@@ -155,5 +168,6 @@ pub async fn plan_setup_with_transport<T: SetupRemoteTransport>(
         app: materialized.app().clone(),
         tasks: materialized.tasks().clone(),
         app_source,
+        named_volumes: Vec::new(),
     })
 }

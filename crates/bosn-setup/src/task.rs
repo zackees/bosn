@@ -895,6 +895,7 @@ mod tests {
             },
             tasks: BTreeMap::from([("check".into(), task)]),
             app_source: SetupPlanAppSource::PinnedImage { image },
+            named_volumes: Vec::new(),
         }
     }
 

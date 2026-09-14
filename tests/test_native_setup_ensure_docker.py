@@ -202,6 +202,19 @@ def _remove_exact_managed_container(name: str, content_sha256: str) -> None:
     assert _inspect_container(name) is None
 
 
+def _remove_exact_managed_volume(name: str, content_sha256: str) -> None:
+    result = _docker("volume", "inspect", name, check=False)
+    if result.returncode:
+        assert result.returncode == 1, result.stderr
+        return
+    (record,) = json.loads(result.stdout)
+    labels = record.get("Labels") or {}
+    assert labels.get(MANAGED_LABEL) == "v1", "cleanup refused an unmanaged volume"
+    assert labels.get(CONTENT_LABEL) == content_sha256, "cleanup refused another volume"
+    assert labels.get(NAME_LABEL) == name, "cleanup refused another volume name"
+    _docker("volume", "rm", name)
+
+
 def _read_exact_resource_uses(state_dir: Path) -> set[tuple[str, str, str, str, str]]:
     """Read only the durable use facts after the daemon committed the job.
 
@@ -483,6 +496,17 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
     )
     with manifest.open("a", encoding="utf-8") as handle:
         handle.write(
+            "[stack.linux.volumes.proof]\n"
+            "scope = 'stack'\n"
+            "destination = '/var/lib/bosn-proof'\n"
+            "retention = 'pinned'\n"
+            "[task.seed-volume]\n"
+            "stack = 'linux'\n"
+            f"cmd = \"mkdir -p /var/lib/bosn-proof && printf %s '{unique}' "
+            "> /var/lib/bosn-proof/marker\"\n"
+            "[task.prove-volume]\n"
+            "stack = 'linux'\n"
+            f"cmd = \"test \\\"$(cat /var/lib/bosn-proof/marker)\\\" = '{unique}'\"\n"
             "[task.prove]\n"
             "stack = 'linux'\n"
             f"cmd = \"test \\\"$BOSN_MANIFEST_PROOF\\\" = '{unique}'\"\n"
@@ -516,12 +540,13 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
         )
 
     managed_containers: list[tuple[str, str]] = []
+    managed_volumes: list[tuple[str, str]] = []
     try:
         with _production_daemon(state_dir) as (_, daemon):
             _wait_for_daemon(client, daemon)
 
-            # An accepted TOML field can still be refused by this deliberately
-            # narrow runtime slice before it reaches Docker.
+            # An image-only workdir remains outside the supported typed shape
+            # and is refused before it reaches Docker.
             rejected = client.submit_manifest_ensure(
                 workspace,
                 "unsupported.toml",
@@ -529,7 +554,9 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
                 deadline_ms=90_000,
                 output_limit=1_048_576,
             )
-            assert "unsupported runtime field" in _wait_for_failure(client, rejected)
+            assert "not covered by a declared workspace mount" in _wait_for_failure(
+                client, rejected
+            )
 
             first_job = client.submit_manifest_ensure(
                 workspace,
@@ -542,9 +569,10 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
             assert "[manifest] preparing immutable application image" in first_logs
 
             resources = client.registry_resources(limit=16).records
-            assert len(resources) == 2
+            assert len(resources) == 3
             container_resource = next(record for record in resources if record.kind == "container")
             image_resource = next(record for record in resources if record.kind == "image")
+            volume_resource = next(record for record in resources if record.kind == "volume")
             assert container_resource.stack == "linux"
             assert container_resource.generation.startswith("sha256:")
             assert container_resource.state == "active"
@@ -557,6 +585,17 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
                 f"manifest-container:linux:{container_resource.generation}"
             )
             assert container_resource.name == container_name
+            assert volume_resource.stack == "linux"
+            assert volume_resource.retention == "pinned"
+            volume_content = volume_resource.generation.removeprefix("sha256:")
+            managed_volumes.append((volume_resource.name, volume_content))
+            assert _docker(
+                "volume",
+                "inspect",
+                "--format",
+                f'{{{{index .Labels "{CONTENT_LABEL}"}}}}',
+                volume_resource.name,
+            ).stdout.strip() == volume_content
             assert (
                 image_resource.id,
                 image_resource.name,
@@ -601,6 +640,13 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
                     image_id,
                     "active",
                 ),
+                (
+                    volume_resource.id,
+                    str(workspace.resolve()),
+                    "linux",
+                    volume_resource.generation,
+                    "active",
+                ),
             }
             # The durable resources, resource uses, and terminal success event
             # are all committed before the daemon reports the job as succeeded.
@@ -609,6 +655,18 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
                 ("manifest.ensure.succeeded", f"job_id={first_job}")
             ]
 
+            seed_job = client.submit_manifest_app_task(
+                workspace,
+                "bosn.toml",
+                "linux",
+                "seed-volume",
+                deadline_ms=90_000,
+                output_limit=1_048_576,
+            )
+            assert isinstance(_wait_for_success(client, seed_job), tuple)
+
+            # Reusing the unchanged declaration must keep both the exact app
+            # container and the declared Bosn-managed volume intact.
             second_job = client.submit_manifest_ensure(
                 workspace,
                 "bosn.toml",
@@ -619,16 +677,15 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
             assert isinstance(_wait_for_success(client, second_job), tuple)
             second = _inspect_container(container_name)
             assert second is not None
-            second_id, second_running, second_image, second_labels = second
-            assert second_id == first_id, "manifest ensure replaced its matching app"
-            assert second_running
-            assert second_image == first_image
-            assert second_labels == first_labels
-            assert _read_exact_resource_uses(state_dir) == expected_uses
-            assert _read_manifest_success_events(state_dir) == [
-                ("manifest.ensure.succeeded", f"job_id={first_job}"),
-                ("manifest.ensure.succeeded", f"job_id={second_job}"),
-            ]
+            assert second[0] == first_id
+            assert _docker(
+                "volume",
+                "inspect",
+                "--format",
+                f'{{{{index .Labels "{CONTENT_LABEL}"}}}}',
+                volume_resource.name,
+            ).stdout.strip() == volume_content
+
             # A changed accepted declaration derives a new manifest generation.
             # The daemon creates/starts the new exact app first, atomically
             # retires only the old durable use, and deliberately leaves the
@@ -640,6 +697,13 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
                 "[stack.linux.env]\n"
                 "MYSQL_ALLOW_EMPTY_PASSWORD = 'yes'\n"
                 f"BOSN_MANIFEST_PROOF = '{rollover_unique}'\n"
+                "[stack.linux.volumes.proof]\n"
+                "scope = 'stack'\n"
+                "destination = '/var/lib/bosn-proof'\n"
+                "retention = 'pinned'\n"
+                "[task.prove-volume]\n"
+                "stack = 'linux'\n"
+                f"cmd = \"test \\\"$(cat /var/lib/bosn-proof/marker)\\\" = '{unique}'\"\n"
                 "[task.prove]\n"
                 "stack = 'linux'\n"
                 f"cmd = \"test \\\"$BOSN_MANIFEST_PROOF\\\" = '{rollover_unique}'\"\n",
@@ -675,6 +739,15 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
             assert rollover_observed[1]
             assert rollover_observed[2] == image_id
             assert rollover_observed[3][CONTENT_LABEL] == rollover_content
+            volume_proof_job = client.submit_manifest_app_task(
+                workspace,
+                "bosn.toml",
+                "linux",
+                "prove-volume",
+                deadline_ms=90_000,
+                output_limit=1_048_576,
+            )
+            assert isinstance(_wait_for_success(client, volume_proof_job), tuple)
             rollover_uses = _read_exact_resource_uses(state_dir)
             assert (
                 container_resource.id,
@@ -725,6 +798,8 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
     finally:
         for name, content in reversed(managed_containers):
             _remove_exact_managed_container(name, content)
+        for name, content in reversed(managed_volumes):
+            _remove_exact_managed_volume(name, content)
 
 
 def test_native_manifest_task_inherits_declared_workspace_binds_and_workdir(

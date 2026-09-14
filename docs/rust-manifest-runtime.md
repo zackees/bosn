@@ -65,7 +65,8 @@ changed.
 | Named `[task.NAME]` for that stack in an already ensured container | Supported; fixed daemon-owned exec only |
 | Dockerfile/build context | Refused |
 | macOS guest / guest fields | Refused |
-| volumes, tmpfs | Refused |
+| named `[stack.NAME.volumes]` | Supported for typed Bosn-managed named volumes. The daemon derives the engine name from the declared logical name, scope, canonical workspace, and (for `spec`) generation; callers cannot supply a Docker volume name or mount string. It writes a durable creation intent before `docker volume create`, requires exact ownership labels before reuse, then atomically records the resource and consumes the intent after container ensure. `spec` rolls with generation; `stack` survives generations within its workspace; `machine` follows the declared `family` or stack. Normal rollover and GC never delete volume data in this slice; retention is recorded for later explicit lifecycle work. |
+| tmpfs | Refused |
 | `[stack.NAME.mounts]` workspace bind mounts | Supported for existing paths that canonicalize beneath the selected workspace. Sources may be legacy absolute paths only when they resolve beneath that workspace; traversal, source symlinks, escapes, duplicate targets, reserved targets, and unrepresentable Docker paths are refused. `readonly` is retained. |
 | `workdir` | Supported only when its normalized absolute container path is covered by a declared workspace bind. It is translated to the typed workspace-relative form, becomes the persistent container workdir, and is therefore inherited by declared `manifest app-task` exec. Image-only workdirs are refused. |
 | image tags or unpinned image references | Refused |
@@ -85,7 +86,7 @@ same mount sources again immediately before its engine operation.
 ## Remaining work
 
 This does not claim completion of manifest migration. Future slices must add
-explicit lifecycle designs for managed volumes, build materialization,
+explicit volume release/GC application, build materialization,
 multi-stack dependency ordering, guest lifecycle, declarative tasks,
 autostart/recovery, and generation reconciliation. Each must
 remain daemon-owned and registry-backed rather than reintroducing raw Docker or
