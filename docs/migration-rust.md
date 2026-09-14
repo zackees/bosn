@@ -450,7 +450,10 @@ environment, or guest/Compose control. It does not create, start, stop,
 replace, or remove an app; a missing, foreign, mismatched, or stopped app is
 refused before exec. Cancelling or timing out
 the local Docker exec client never claims that the remote in-container command
-stopped; its completion is reported as unknown. Multi-service Compose, guest,
+stopped; its completion is reported as unknown. That uncertainty is durably
+keyed by the ownership-verified, content-addressed managed container name (not
+Docker's opaque container ID), so setup GC protects the exact retired resource
+until a known terminal outcome is recorded. Multi-service Compose, guest,
 and generic shell execution remain outside this slice.
 
 `bosn setup ensure` submits the complete daemon-owned plan, image-preparation,
