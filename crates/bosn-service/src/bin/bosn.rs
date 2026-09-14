@@ -14,8 +14,8 @@ use std::{
 
 use bosn_core::{parse_and_plan_compose_yaml, parse_setup_config_locator};
 use bosn_service::{
-    Client, JobLogPage, JobStatus, SetupEnsureJobRequest, SetupPreparePolicy, SetupPrepareRequest,
-    SetupTaskJobRequest,
+    Client, JobLogPage, JobStatus, ManifestEnsureJobRequest, SetupEnsureJobRequest,
+    SetupPreparePolicy, SetupPrepareRequest, SetupTaskJobRequest,
 };
 use bosn_setup::{
     SetupAcquirePolicy, SetupPlan, SetupPlanAppSource, SetupPlanRequest, SetupSourceKind,
@@ -47,11 +47,80 @@ fn main() {
         "daemon" => run_daemon(arguments),
         "doctor" => run_doctor(arguments),
         "compose" => run_compose(arguments),
+        "manifest" => run_manifest(arguments),
         "setup" => run_setup(arguments),
         "job" => run_job(arguments),
         "registry" => run_registry(arguments),
         "gc" => run_gc(arguments),
         _ => usage(),
+    }
+}
+
+fn run_manifest(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
+    match arguments.next().as_deref() {
+        Some(command) if command == "ensure" => run_manifest_ensure(arguments),
+        _ => usage(),
+    }
+}
+
+fn run_manifest_ensure(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
+    let mut state_dir = None;
+    let mut workspace = None;
+    let mut manifest = None;
+    let mut stack = None;
+    let mut deadline_ms = None;
+    let mut output_limit = None;
+    let mut json_output = false;
+    while let Some(argument) = arguments.next() {
+        match argument.to_string_lossy().as_ref() {
+            "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
+            "--workspace" => {
+                set_once_parsed(&mut workspace, arguments.next(), parse_setup_request_text)
+            }
+            "--manifest" => set_once_parsed(&mut manifest, arguments.next(), parse_manifest_path),
+            "--stack" => set_once_parsed(&mut stack, arguments.next(), parse_setup_task_name),
+            "--deadline-ms" => set_once_parsed(&mut deadline_ms, arguments.next(), |value| {
+                let value = parse_u64(value)?;
+                (1..=SETUP_PREPARE_MAX_DEADLINE_MS)
+                    .contains(&value)
+                    .then_some(value)
+                    .ok_or(())
+            }),
+            "--output-limit" => set_once_parsed(&mut output_limit, arguments.next(), |value| {
+                let value = parse_usize(value)?;
+                (1..=SETUP_PREPARE_MAX_OUTPUT_LIMIT)
+                    .contains(&value)
+                    .then_some(value)
+                    .ok_or(())
+            }),
+            "--json" if !json_output => {
+                json_output = true;
+                Ok(())
+            }
+            _ => Err(()),
+        }
+        .unwrap_or_else(|_| usage());
+    }
+    let request = ManifestEnsureJobRequest {
+        workspace: PathBuf::from(workspace.unwrap_or_else(|| usage())),
+        manifest: manifest.unwrap_or_else(|| usage()),
+        stack: stack.unwrap_or_else(|| usage()),
+        deadline: Duration::from_millis(deadline_ms.unwrap_or_else(|| usage())),
+        output_limit: output_limit.unwrap_or_else(|| usage()),
+    };
+    let state_dir = state_dir.unwrap_or_else(|| usage());
+    let runtime = RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|_| usage());
+    let client = Client::for_state(state_dir).unwrap_or_else(|_| usage());
+    match runtime.run(client.submit_manifest_ensure(request)) {
+        Ok(job_id) if json_output => println!(
+            "{}",
+            json!({"action":"manifest_ensure","submitted":true,"job_id":job_id})
+        ),
+        Ok(job_id) => println!("manifest ensure submitted: {job_id}"),
+        Err(_) => usage(),
     }
 }
 
@@ -1640,6 +1709,17 @@ fn parse_setup_config(value: std::ffi::OsString) -> Result<String, ()> {
     let value = parse_setup_request_text(value)?;
     parse_setup_config_locator(&value).map_err(|_| ())?;
     Ok(value)
+}
+
+fn parse_manifest_path(value: std::ffi::OsString) -> Result<String, ()> {
+    let value = parse_setup_request_text(value)?;
+    (!value.starts_with('/')
+        && !value.contains('\\')
+        && !value
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == ".."))
+    .then_some(value)
+    .ok_or(())
 }
 
 fn parse_setup_task_name(value: std::ffi::OsString) -> Result<String, ()> {

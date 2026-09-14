@@ -16,10 +16,11 @@
 
 use crate::{
     Client, DoctorReport, Error, JobLogPage, JobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE,
-    RegistryResourcePage, SetupAdoptRequest, SetupAdoptResult, SetupAppTaskJobRequest,
-    SetupDoneResult, SetupEnsureEventPage, SetupEnsureJobRequest, SetupGcApplyResult,
-    SetupGcPreviewPage, SetupPreparePolicy, SetupPrepareRequest, SetupReconcileMissingRepairResult,
-    SetupReconcilePreviewPage, SetupRetiredStopResult, SetupTaskJobRequest, Status,
+    ManifestEnsureJobRequest, RegistryResourcePage, SetupAdoptRequest, SetupAdoptResult,
+    SetupAppTaskJobRequest, SetupDoneResult, SetupEnsureEventPage, SetupEnsureJobRequest,
+    SetupGcApplyResult, SetupGcPreviewPage, SetupPreparePolicy, SetupPrepareRequest,
+    SetupReconcileMissingRepairResult, SetupReconcilePreviewPage, SetupRetiredStopResult,
+    SetupTaskJobRequest, Status,
 };
 use bosn_core::parse_and_plan_compose_yaml;
 use bosn_setup::{
@@ -149,6 +150,7 @@ trait Backend {
     /// every lifecycle detail from the validated setup document and refuses a
     /// foreign or mismatched candidate rather than replacing it.
     fn submit_setup_ensure(&mut self, request: SetupEnsureJobRequest) -> Result<u64, Error>;
+    fn submit_manifest_ensure(&mut self, request: ManifestEnsureJobRequest) -> Result<u64, Error>;
     /// Submit one complete setup plan, image-preparation, and declared-task
     /// job.  The named task is the only executable selection exposed to MCP;
     /// the daemon derives all task details from the validated setup document.
@@ -257,6 +259,10 @@ impl Backend for DaemonBackend<'_> {
     }
     fn submit_setup_ensure(&mut self, request: SetupEnsureJobRequest) -> Result<u64, Error> {
         self.runtime.run(self.client.submit_setup_ensure(request))
+    }
+    fn submit_manifest_ensure(&mut self, request: ManifestEnsureJobRequest) -> Result<u64, Error> {
+        self.runtime
+            .run(self.client.submit_manifest_ensure(request))
     }
     fn submit_setup_task(&mut self, request: SetupTaskJobRequest) -> Result<u64, Error> {
         self.runtime.run(self.client.submit_setup_task(request))
@@ -503,6 +509,12 @@ fn tools_list() -> Value {
                 "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}
             },
             {
+                "name": "bosn_manifest_ensure",
+                "description": "Submit a bounded daemon-owned ensure of one explicitly named legacy Bosn manifest stack. The first runtime slice accepts only a workspace-contained local TOML manifest, immutable external image, and declared environment; builds, guests, volumes, mounts, tmpfs, workdirs, replacement, and arbitrary Docker controls are refused.",
+                "inputSchema": manifest_ensure_schema(),
+                "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}
+            },
+            {
                 "name": "bosn_setup_task",
                 "description": "Submit one bounded daemon-owned setup plan, image-preparation, and declared-task job. Returns promptly with a durable job ID; poll the existing job tools for outcome and logs. It accepts only a named task declared in the setup document, never task commands or engine controls.",
                 "inputSchema": setup_task_schema(),
@@ -570,6 +582,16 @@ fn setup_ensure_schema() -> Value {
             "output_limit": {"type": "integer", "minimum": 1, "maximum": 8388608}
         }
     })
+}
+
+fn manifest_ensure_schema() -> Value {
+    json!({"type":"object","additionalProperties":false,"required":["workspace","manifest","stack","deadline_ms","output_limit"],"properties":{
+        "workspace":{"type":"string","minLength":1,"maxLength":MAX_MCP_SETUP_STRING_BYTES},
+        "manifest":{"type":"string","minLength":1,"maxLength":4096,"description":"Safe relative TOML path beneath workspace; URLs and absolute paths are refused."},
+        "stack":{"type":"string","minLength":1,"maxLength":128},
+        "deadline_ms":{"type":"integer","minimum":1,"maximum":300000},
+        "output_limit":{"type":"integer","minimum":1,"maximum":8388608}
+    }})
 }
 
 fn setup_task_schema() -> Value {
@@ -809,6 +831,12 @@ fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
                 })
                 .map_err(|_| ToolFailure::Daemon)
         }),
+        "bosn_manifest_ensure" => manifest_ensure_request(arguments).and_then(|request| {
+            backend
+                .submit_manifest_ensure(request)
+                .map(|job_id| json!({"action":"manifest_ensure","submitted":true,"job_id":job_id}))
+                .map_err(|_| ToolFailure::Daemon)
+        }),
         "bosn_setup_task" => setup_task_request(arguments).and_then(|request| {
             backend
                 .submit_setup_task(request)
@@ -974,6 +1002,51 @@ fn setup_ensure_request(
         policy: input.policy,
         deadline: std::time::Duration::from_millis(input.deadline_ms),
         output_limit: input.output_limit,
+    })
+}
+
+fn manifest_ensure_request(
+    arguments: &serde_json::Map<String, Value>,
+) -> Result<ManifestEnsureJobRequest, ToolFailure> {
+    only_arguments(
+        arguments,
+        &[
+            "workspace",
+            "manifest",
+            "stack",
+            "deadline_ms",
+            "output_limit",
+        ],
+    )?;
+    let manifest = required_setup_string(arguments, "manifest")?;
+    if manifest.starts_with('/')
+        || manifest.contains('\\')
+        || manifest
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(ToolFailure::Invalid(
+            "manifest must be a safe workspace-relative path",
+        ));
+    }
+    let stack = required_setup_string(arguments, "stack")?;
+    if stack.len() > 128
+        || !stack
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return Err(ToolFailure::Invalid("manifest stack is invalid"));
+    }
+    Ok(ManifestEnsureJobRequest {
+        workspace: PathBuf::from(required_setup_string(arguments, "workspace")?),
+        manifest,
+        stack,
+        deadline: std::time::Duration::from_millis(required_bounded_u64(
+            arguments,
+            "deadline_ms",
+            300_000,
+        )?),
+        output_limit: required_bounded_u64(arguments, "output_limit", 8 * 1024 * 1024)? as usize,
     })
 }
 
@@ -1412,6 +1485,7 @@ mod tests {
         setup_calls: Vec<(PathBuf, String, SetupAcquirePolicy)>,
         setup_prepare_calls: Vec<SetupPrepareRequest>,
         setup_ensure_calls: Vec<SetupEnsureJobRequest>,
+        manifest_ensure_calls: Vec<ManifestEnsureJobRequest>,
         setup_task_calls: Vec<SetupTaskJobRequest>,
         setup_app_task_calls: Vec<SetupAppTaskJobRequest>,
         daemon_reads: u32,
@@ -1600,6 +1674,13 @@ mod tests {
             self.setup_ensure_calls.push(request);
             Ok(44)
         }
+        fn submit_manifest_ensure(
+            &mut self,
+            request: ManifestEnsureJobRequest,
+        ) -> Result<u64, Error> {
+            self.manifest_ensure_calls.push(request);
+            Ok(45)
+        }
         fn submit_setup_task(&mut self, request: SetupTaskJobRequest) -> Result<u64, Error> {
             if self.setup_task_error {
                 return Err(Error::Protocol(
@@ -1711,6 +1792,7 @@ mod tests {
                 "bosn_compose_plan",
                 "bosn_setup_prepare",
                 "bosn_setup_ensure",
+                "bosn_manifest_ensure",
                 "bosn_setup_task",
                 "bosn_setup_app_task"
             ]
@@ -1731,6 +1813,14 @@ mod tests {
         assert_eq!(doctor["annotations"]["readOnlyHint"], true);
         assert_eq!(doctor["inputSchema"]["additionalProperties"], false);
         assert_eq!(resources["inputSchema"]["additionalProperties"], false);
+        let manifest = replies[1]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "bosn_manifest_ensure")
+            .unwrap();
+        assert_eq!(manifest["annotations"]["readOnlyHint"], false);
+        assert_eq!(manifest["inputSchema"]["additionalProperties"], false);
         let preview = replies[1]["result"]["tools"]
             .as_array()
             .unwrap()
