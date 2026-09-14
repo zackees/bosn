@@ -5067,9 +5067,11 @@ fn record_setup_ensure(
     transaction.commit()
 }
 
-/// Persist one successful manifest-runtime ensure atomically. Unlike setup
-/// documents, this first manifest slice explicitly refuses replacement and
-/// rollover, so it never retires a prior generation as a side effect.
+/// Persist one successful manifest-runtime ensure atomically. A succeeding
+/// generation is recorded before only the previous manifest container use for
+/// this exact workspace/stack is retired. This is durable lifecycle accounting
+/// only: it never stops/deletes a container or image, and a failed upsert rolls
+/// the whole transition back without retiring the prior generation.
 fn record_manifest_ensure(
     registry: &mut Registry,
     job_id: u64,
@@ -5120,6 +5122,15 @@ fn record_manifest_ensure(
             state: ResourceState::Active,
         })?;
     }
+    // This follows both upserts so an image/container identity conflict drops
+    // the transaction with the preceding generation still active. The
+    // registry primitive is manifest-namespace-only and never changes setup
+    // resources, images, other stacks, or other workspaces.
+    transaction.retire_prior_manifest_container_generations(
+        &execution.resource.workspace,
+        &execution.resource.stack,
+        &execution.resource.generation,
+    )?;
     transaction.append_event(
         now,
         "manifest.ensure.succeeded",
@@ -7101,6 +7112,31 @@ mod tests {
         }
     }
 
+    fn manifest_ensure_execution(
+        workspace: &str,
+        stack: &str,
+        generation: &str,
+        image_identity: &str,
+    ) -> SetupEnsureExecution {
+        SetupEnsureExecution {
+            receipt: format!("ensured manifest {stack} {generation}"),
+            resource: SetupEnsureResource {
+                id: format!("manifest-container:{stack}:{generation}"),
+                name: format!("bosn-setup-{generation}"),
+                stack: stack.into(),
+                generation: format!("sha256:{generation}"),
+                workspace: workspace.into(),
+            },
+            image: SetupEnsureImageResource {
+                id: format!("manifest-image:{image_identity}"),
+                name: format!("manifest-image:{image_identity}"),
+                stack: stack.into(),
+                generation: image_identity.into(),
+                workspace: workspace.into(),
+            },
+        }
+    }
+
     #[test]
     fn setup_gc_token_is_exact_and_rejects_tampering() {
         let candidate = bosn_registry::SetupGcCandidate {
@@ -7300,6 +7336,161 @@ mod tests {
                 client.shutdown().await.unwrap();
                 stopped(server).await;
             });
+    }
+
+    #[test]
+    fn manifest_ensure_rollover_is_same_stack_only_and_same_generation_reuses_identity() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace_a = temporary.path().join("workspace-a");
+        let workspace_b = temporary.path().join("workspace-b");
+        std::fs::create_dir(&workspace_a).unwrap();
+        std::fs::create_dir(&workspace_b).unwrap();
+        let fake = Arc::new(FakeManifestEnsureExecutor::default());
+        RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let server = async_engine::launch(
+                    Service::new(state.clone())
+                        .with_manifest_ensure_executor(fake.clone())
+                        .serve(),
+                );
+                let client = wait_for_client(&state).await;
+                let request =
+                    |workspace: PathBuf, manifest: &str, stack: &str| ManifestEnsureJobRequest {
+                        workspace,
+                        manifest: manifest.into(),
+                        stack: stack.into(),
+                        deadline: Duration::from_secs(2),
+                        output_limit: 4096,
+                    };
+                let old = client
+                    .submit_manifest_ensure(request(workspace_a.clone(), "old.toml", "app"))
+                    .await
+                    .unwrap();
+                wait_for_job_state(&client, old, "Succeeded").await;
+                // A completed same-generation request is a new durable job,
+                // but reuses exactly its existing managed identity.
+                let old_again = client
+                    .submit_manifest_ensure(request(workspace_a.clone(), "old.toml", "app"))
+                    .await
+                    .unwrap();
+                wait_for_job_state(&client, old_again, "Succeeded").await;
+                let other_workspace = client
+                    .submit_manifest_ensure(request(workspace_b.clone(), "workspace-b.toml", "app"))
+                    .await
+                    .unwrap();
+                wait_for_job_state(&client, other_workspace, "Succeeded").await;
+                let other_stack = client
+                    .submit_manifest_ensure(request(
+                        workspace_a.clone(),
+                        "other-stack.toml",
+                        "other",
+                    ))
+                    .await
+                    .unwrap();
+                wait_for_job_state(&client, other_stack, "Succeeded").await;
+                let new = client
+                    .submit_manifest_ensure(request(workspace_a.clone(), "new.toml", "app"))
+                    .await
+                    .unwrap();
+                wait_for_job_state(&client, new, "Succeeded").await;
+
+                let registry = Registry::open_read_only(state.join("registry.sqlite3")).unwrap();
+                let resources = registry.resources(0, 32).unwrap().items;
+                let find = |id: &str| resources.iter().find(|resource| resource.id == id).unwrap();
+                assert_eq!(
+                    find("manifest-container:app:old").state,
+                    ResourceState::Retired
+                );
+                assert_eq!(
+                    find("manifest-container:app:new").state,
+                    ResourceState::Active
+                );
+                assert_eq!(
+                    find("manifest-container:app:workspace-b").state,
+                    ResourceState::Active,
+                    "other workspace must not be retired"
+                );
+                assert_eq!(
+                    find("manifest-container:other:other-stack").state,
+                    ResourceState::Active,
+                    "other stack must not be retired"
+                );
+                assert_eq!(fake.calls.lock().unwrap().len(), 5);
+                client.shutdown().await.unwrap();
+                stopped(server).await;
+            });
+    }
+
+    #[test]
+    fn manifest_rollover_is_atomic_when_current_image_identity_conflicts() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let mut registry = Registry::create_writer(
+            temporary.path().join("registry.sqlite3"),
+            "11111111-2222-4333-8444-555555555555",
+        )
+        .unwrap();
+        let workspace = "/canonical/manifest";
+        record_manifest_ensure(
+            &mut registry,
+            1,
+            &manifest_ensure_execution(workspace, "app", "old", "sha256:old-image"),
+        )
+        .unwrap();
+        let mut transaction = registry.begin_immediate().unwrap();
+        transaction
+            .put_resource(&Resource {
+                id: "foreign-image".into(),
+                kind: ResourceKind::Image,
+                name: "manifest-image:sha256:new-image".into(),
+                stack: "foreign".into(),
+                generation: "sha256:foreign".into(),
+                scope: Scope::Machine,
+                workspace: workspace.into(),
+                created_at: 1.0,
+                last_used: 1.0,
+                state: ResourceState::Active,
+                retention: Retention::Pinned,
+            })
+            .unwrap();
+        transaction.commit().unwrap();
+        assert!(matches!(
+            record_manifest_ensure(
+                &mut registry,
+                2,
+                &manifest_ensure_execution(workspace, "app", "new", "sha256:new-image"),
+            ),
+            Err(bosn_registry::Error::ResourceIdentityConflict)
+        ));
+        let resources = registry.resources(0, 16).unwrap().items;
+        assert_eq!(
+            resources
+                .iter()
+                .find(|resource| resource.id == "manifest-container:app:old")
+                .unwrap()
+                .state,
+            ResourceState::Active,
+            "a failed new record cannot retire the previous generation"
+        );
+        assert!(
+            resources
+                .iter()
+                .all(|resource| resource.id != "manifest-container:app:new")
+        );
+        assert_eq!(
+            registry
+                .events(0, 16)
+                .unwrap()
+                .items
+                .iter()
+                .filter(|event| event.kind == "manifest.ensure.succeeded")
+                .count(),
+            1,
+            "the failed operation cannot leave a terminal success event"
+        );
     }
 
     #[test]
@@ -7860,20 +8051,25 @@ mod tests {
                     .map_err(|_| "fake manifest log consumer closed".to_owned())?;
                 self.calls.lock().unwrap().push(request.clone());
                 let workspace = request.workspace.to_string_lossy().into_owned();
+                let generation = request
+                    .manifest
+                    .strip_suffix(".toml")
+                    .unwrap_or(&request.manifest)
+                    .to_owned();
                 Ok(SetupEnsureExecution {
                     receipt: "fake manifest ensured".into(),
                     resource: SetupEnsureResource {
-                        id: "manifest-container:app:sha256:fake".into(),
-                        name: "bosn-setup-fake".into(),
+                        id: format!("manifest-container:{}:{generation}", request.stack),
+                        name: format!("bosn-setup-{generation}"),
                         stack: request.stack.clone(),
-                        generation: "sha256:fake".into(),
+                        generation: format!("sha256:{generation}"),
                         workspace: workspace.clone(),
                     },
                     image: SetupEnsureImageResource {
-                        id: "manifest-image:sha256:fake".into(),
-                        name: "manifest-image:sha256:fake".into(),
+                        id: format!("manifest-image:sha256:{generation}"),
+                        name: format!("manifest-image:sha256:{generation}"),
                         stack: request.stack,
-                        generation: "sha256:fake".into(),
+                        generation: format!("sha256:{generation}"),
                         workspace,
                     },
                 })
@@ -8375,14 +8571,14 @@ mod tests {
             Registry::create_writer(&database, "11111111-2222-4333-8444-555555555555").unwrap();
         let generation = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let name = "bosn-setup-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let id = "setup-container:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let id = "manifest-container:app:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let mut transaction = registry.begin_immediate().unwrap();
         transaction
             .put_resource(&Resource {
                 id: id.into(),
                 kind: ResourceKind::Container,
                 name: name.into(),
-                stack: "setup".into(),
+                stack: "app".into(),
                 generation: generation.into(),
                 scope: Scope::Machine,
                 workspace: "/workspace".into(),
@@ -8396,7 +8592,7 @@ mod tests {
             .put_resource_use(&ResourceUse {
                 resource_id: id.into(),
                 workspace: "/workspace".into(),
-                stack: "setup".into(),
+                stack: "app".into(),
                 generation: generation.into(),
                 last_used: 1.0,
                 state: ResourceState::Retired,

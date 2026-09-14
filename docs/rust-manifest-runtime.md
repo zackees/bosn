@@ -43,7 +43,12 @@ with `bosn-generation::stack_generation_async`, prepares/pulls the declared
 immutable image, then uses the existing finite typed ensure primitive to
 inspect/create/start only the deterministic Bosn-owned container. The daemon
 atomically records its container, inspected image, resource uses, and a
-`manifest.ensure.succeeded` event through the sole registry actor.
+`manifest.ensure.succeeded` event through the sole registry actor. A successful
+new generation records its facts before retiring the prior manifest-container
+resource/use for that same canonical workspace and stack in the same SQLite
+transaction. Retirement never stops or removes Docker containers, images, or
+volumes; conservative GC still requires its exact ownership, stopped-state,
+lease, and execution-session checks.
 
 Cancelling or exceeding the fixed budget cancels/reaps the direct Docker client
 and leaves no success record. The durable job ID is observed with the ordinary
@@ -66,7 +71,7 @@ changed.
 | image tags or unpinned image references | Refused |
 | generic `run`, shell, arbitrary Docker arguments | Not exposed |
 | multi-stack orchestration | Refused; submit one named stack only |
-| replacement/rollover | Refused; success never retires, stops, deletes, or replaces a prior generation |
+| replacement/rollover | Supported for this accepted subset; a new immutable generation is ensured first, then only the same-workspace/stack prior manifest container is registry-retired |
 
 The deterministic engine container is still checked against its exact derived
 image and labels before reuse. An occupied mismatched candidate fails closed.
@@ -76,6 +81,6 @@ image and labels before reuse. An occupied mismatched candidate fails closed.
 This does not claim completion of manifest migration. Future slices must add
 explicit lifecycle designs for bind mounts/workdir, managed volumes, build
 materialization, multi-stack dependency ordering, guest lifecycle, declarative
-tasks, autostart/recovery, and generation replacement/reconciliation. Each must
+tasks, autostart/recovery, and generation reconciliation. Each must
 remain daemon-owned and registry-backed rather than reintroducing raw Docker or
 Python business logic.

@@ -610,6 +610,123 @@ fn setup_gc_preview_only_returns_unambiguously_retired_managed_containers() {
 }
 
 #[test]
+fn manifest_generation_rollover_is_workspace_stack_scoped_and_keeps_sessions_protected() {
+    let (_directory, path) = database_path();
+    let mut registry =
+        Registry::create_writer(&path, "11111111-2222-4333-8444-555555555555").unwrap();
+    let workspace_a = "/canonical/manifest-a";
+    let workspace_b = "/canonical/manifest-b";
+    let mut tx = registry.begin_immediate().unwrap();
+    for (id, name, workspace, stack, generation) in [
+        (
+            "manifest-container:app:old",
+            "bosn-setup-old",
+            workspace_a,
+            "app",
+            "sha256:old",
+        ),
+        (
+            "manifest-container:app:new",
+            "bosn-setup-new",
+            workspace_a,
+            "app",
+            "sha256:new",
+        ),
+        (
+            "manifest-container:app:other-workspace",
+            "bosn-setup-other-workspace",
+            workspace_b,
+            "app",
+            "sha256:other-workspace",
+        ),
+        (
+            "manifest-container:other:other-stack",
+            "bosn-setup-other-stack",
+            workspace_a,
+            "other",
+            "sha256:other-stack",
+        ),
+        (
+            "setup-container:setup",
+            "bosn-setup-setup",
+            workspace_a,
+            "setup",
+            "sha256:setup",
+        ),
+    ] {
+        tx.put_resource(&Resource {
+            id: id.into(),
+            kind: ResourceKind::Container,
+            name: name.into(),
+            stack: stack.into(),
+            generation: generation.into(),
+            scope: Scope::Machine,
+            workspace: workspace.into(),
+            created_at: 1.0,
+            last_used: 1.0,
+            state: ResourceState::Active,
+            retention: Retention::Pinned,
+        })
+        .unwrap();
+        tx.put_resource_use(&ResourceUse {
+            resource_id: id.into(),
+            workspace: workspace.into(),
+            stack: stack.into(),
+            generation: generation.into(),
+            last_used: 1.0,
+            state: ResourceState::Active,
+        })
+        .unwrap();
+    }
+    tx.put_execution_session(&ExecutionSession {
+        id: "uncertain-manifest-task".into(),
+        container_id: "bosn-setup-old".into(),
+        engine_binary: "docker".into(),
+        client_pid: 1,
+        client_start: None,
+        lease_ids: vec![],
+    })
+    .unwrap();
+    tx.retire_prior_manifest_container_generations(workspace_a, "app", "sha256:new")
+        .unwrap();
+    tx.commit().unwrap();
+
+    let resources = registry.resources(0, 16).unwrap().items;
+    let state = |id: &str| {
+        resources
+            .iter()
+            .find(|resource| resource.id == id)
+            .unwrap()
+            .state
+    };
+    assert_eq!(state("manifest-container:app:old"), ResourceState::Retired);
+    assert_eq!(state("manifest-container:app:new"), ResourceState::Active);
+    assert_eq!(
+        state("manifest-container:app:other-workspace"),
+        ResourceState::Active
+    );
+    assert_eq!(
+        state("manifest-container:other:other-stack"),
+        ResourceState::Active
+    );
+    assert_eq!(state("setup-container:setup"), ResourceState::Active);
+    let uses = registry.resource_uses(0, 16).unwrap().items;
+    assert_eq!(
+        uses.iter()
+            .find(|use_| use_.resource_id == "manifest-container:app:old")
+            .unwrap()
+            .state,
+        ResourceState::Retired
+    );
+    // A rollover is registry-only. The uncertain task session survives and
+    // keeps the retired generation out of conservative GC until cleared.
+    assert_eq!(registry.status().unwrap().sessions, 1);
+    let protected = registry.setup_gc_preview(workspace_a, 0, 16).unwrap();
+    assert!(protected.candidates.items.is_empty());
+    assert_eq!(protected.counts.protected_session, 1);
+}
+
+#[test]
 fn setup_done_is_workspace_isolated_idempotent_and_preserves_shared_resources() {
     let (_directory, path) = database_path();
     let mut registry =

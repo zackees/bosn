@@ -1033,6 +1033,84 @@ impl<'a> Immediate<'a> {
         )?;
         Ok(())
     }
+    /// Retire superseded native-manifest application-container ownership for
+    /// one exact workspace/stack generation boundary.
+    ///
+    /// This has the same deliberately narrow, registry-only semantics as the
+    /// setup-document rollover above, but it is kept in a separate namespace
+    /// so a manifest stack can never retire a setup document (or vice versa).
+    /// The caller must have durably upserted the succeeding container and
+    /// image first in this immediate transaction. Images are intentionally not
+    /// retired: an inspected immutable image can be shared by stacks and
+    /// workspaces. Execution sessions remain attached to their retired
+    /// container record and consequently continue to protect it from the
+    /// conservative GC predicate.
+    pub fn retire_prior_manifest_container_generations(
+        &mut self,
+        workspace: &str,
+        stack: &str,
+        generation: &str,
+    ) -> Result<(), Error> {
+        let retired = ResourceState::Retired.as_str();
+        let active = ResourceState::Active.as_str();
+        let container = ResourceKind::Container.as_str();
+
+        // Do not modify a machine-scoped resource if it has an active use
+        // outside this exact manifest stack. The `manifest-container:`
+        // namespace is written solely by the native manifest executor; it
+        // prevents this transition from becoming a generic container API.
+        self.transaction.execute(
+            "UPDATE resource_uses SET state=? \
+             WHERE workspace=? AND stack=? AND generation<>? AND state=? \
+             AND resource_id IN ( \
+                SELECT id FROM resources \
+                WHERE kind=? AND stack=? AND workspace=? AND generation<>? \
+                  AND state=? AND id GLOB 'manifest-container:*' \
+                  AND NOT EXISTS ( \
+                    SELECT 1 FROM resource_uses AS other \
+                    WHERE other.resource_id=resources.id AND other.state=? \
+                      AND (other.workspace<>? OR other.stack<>?) \
+                  ) \
+             )",
+            &[
+                Value::Text(retired.into()),
+                Value::Text(workspace.into()),
+                Value::Text(stack.into()),
+                Value::Text(generation.into()),
+                Value::Text(active.into()),
+                Value::Text(container.into()),
+                Value::Text(stack.into()),
+                Value::Text(workspace.into()),
+                Value::Text(generation.into()),
+                Value::Text(active.into()),
+                Value::Text(active.into()),
+                Value::Text(workspace.into()),
+                Value::Text(stack.into()),
+            ],
+        )?;
+        self.transaction.execute(
+            "UPDATE resources SET state=? \
+             WHERE kind=? AND stack=? AND workspace=? AND generation<>? \
+               AND state=? AND id GLOB 'manifest-container:*' \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM resource_uses AS other \
+                 WHERE other.resource_id=resources.id AND other.state=? \
+                   AND (other.workspace<>? OR other.stack<>?) \
+               )",
+            &[
+                Value::Text(retired.into()),
+                Value::Text(container.into()),
+                Value::Text(stack.into()),
+                Value::Text(workspace.into()),
+                Value::Text(generation.into()),
+                Value::Text(active.into()),
+                Value::Text(active.into()),
+                Value::Text(workspace.into()),
+                Value::Text(stack.into()),
+            ],
+        )?;
+        Ok(())
+    }
     pub fn put_lease(&mut self, v: &Lease) -> Result<(), Error> {
         self.transaction.execute("INSERT INTO leases(id,resource_id,pid,proc_start,acquired_at,heartbeat_at,ttl_seconds) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET resource_id=excluded.resource_id,pid=excluded.pid,proc_start=excluded.proc_start,acquired_at=excluded.acquired_at,heartbeat_at=excluded.heartbeat_at,ttl_seconds=excluded.ttl_seconds", &[Value::Text(v.id.clone()),Value::Text(v.resource_id.clone()),Value::Integer(i64::from(v.pid)),optional_value(v.proc_start),Value::Real(v.acquired_at),Value::Real(v.heartbeat_at),Value::Real(v.ttl_seconds)])?;
         Ok(())
@@ -1807,19 +1885,23 @@ fn setup_gc_preview(
     offset: usize,
     limit: usize,
 ) -> Result<SetupGcPreview, Error> {
-    // A managed setup container has both the product-owned logical namespace
-    // and the engine-name convention written by record_setup_ensure. Requiring
-    // the matching retired use row avoids acting on partially imported or
-    // otherwise incomplete ownership state. Any active/done/adopted use,
-    // foreign scope, lease, or session protects the record.
+    // A managed Bosn app container has both a product-owned logical namespace
+    // and the engine-name convention written by the typed setup/manifest
+    // ensure paths. Requiring the matching retired use row avoids acting on
+    // partially imported or otherwise incomplete ownership state. Any
+    // active/done/adopted use, foreign scope, lease, or session protects the
+    // record. Manifest containers deliberately use a separate namespace, so
+    // this remains an explicit finite set rather than a generic GC selector.
     let candidate_sql = "SELECT r.id,r.name,r.generation FROM resources AS r \
-        WHERE r.kind='container' AND r.stack='setup' AND r.workspace=? \
+        WHERE r.kind='container' AND r.workspace=? \
           AND r.state='retired' AND r.scope='machine' \
-          AND r.id GLOB 'setup-container:*' AND r.name GLOB 'bosn-setup-*' \
+          AND ((r.stack='setup' AND r.id GLOB 'setup-container:*') \
+               OR r.id GLOB 'manifest-container:*') \
+          AND r.name GLOB 'bosn-setup-*' \
           AND EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id \
-             AND u.workspace=? AND u.stack='setup' AND u.state='retired') \
+             AND u.workspace=? AND u.stack=r.stack AND u.state='retired') \
           AND NOT EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id \
-             AND (u.workspace<>? OR u.stack<>'setup' OR u.state<>'retired')) \
+             AND (u.workspace<>? OR u.stack<>r.stack OR u.state<>'retired')) \
           AND NOT EXISTS (SELECT 1 FROM leases AS l WHERE l.resource_id=r.id) \
           AND NOT EXISTS (SELECT 1 FROM execution_sessions AS s \
              WHERE s.container_id=r.id OR s.container_id=r.name) \
@@ -1863,7 +1945,7 @@ fn setup_gc_preview(
     };
     let count = |predicate: &str| -> Result<u64, Error> {
         let sql = format!(
-            "SELECT COUNT(*) FROM resources AS r WHERE r.kind='container' AND r.stack='setup' AND r.workspace=? AND {predicate}"
+            "SELECT COUNT(*) FROM resources AS r WHERE r.kind='container' AND r.workspace=? AND {predicate}"
         );
         let row = connection.query(
             &sql,
@@ -1878,12 +1960,12 @@ fn setup_gc_preview(
             _ => Err(Error::BadRow("setup gc count")),
         }
     };
-    let managed =
-        "r.scope='machine' AND r.id GLOB 'setup-container:*' AND r.name GLOB 'bosn-setup-*'";
+    let managed = "r.scope='machine' AND r.name GLOB 'bosn-setup-*' AND \
+        ((r.stack='setup' AND r.id GLOB 'setup-container:*') OR r.id GLOB 'manifest-container:*')";
     let counts = SetupGcPreviewCounts {
         protected_not_retired: count(&format!("{managed} AND r.state<>'retired'"))?,
         protected_ambiguous_use: count(&format!(
-            "{managed} AND r.state='retired' AND (NOT EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id AND u.workspace=r.workspace AND u.stack='setup' AND u.state='retired') OR EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id AND (u.workspace<>r.workspace OR u.stack<>'setup' OR u.state<>'retired')) )"
+            "{managed} AND r.state='retired' AND (NOT EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id AND u.workspace=r.workspace AND u.stack=r.stack AND u.state='retired') OR EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id AND (u.workspace<>r.workspace OR u.stack<>r.stack OR u.state<>'retired')) )"
         ))?,
         protected_lease: count(&format!(
             "{managed} AND r.state='retired' AND EXISTS (SELECT 1 FROM leases AS l WHERE l.resource_id=r.id)"
@@ -1913,9 +1995,9 @@ fn setup_gc_candidate(
     }))
 }
 
-/// The exact predicate shared by preview revalidation and finalization.  Keep
+/// The exact predicate shared by preview revalidation and finalization. Keep
 /// this deliberately explicit: a newly-created lease/session or a use from a
-/// different workspace makes a formerly eligible candidate ineligible.
+/// different workspace/stack makes a formerly eligible candidate ineligible.
 fn setup_gc_candidate_exists(
     connection: &mut impl SetupGcQuery,
     workspace: &str,
@@ -1925,13 +2007,15 @@ fn setup_gc_candidate_exists(
 ) -> Result<bool, Error> {
     let rows = connection.setup_gc_query(
         "SELECT 1 FROM resources AS r WHERE r.id=? AND r.name=? AND r.generation=? \
-         AND r.kind='container' AND r.stack='setup' AND r.workspace=? \
+         AND r.kind='container' AND r.workspace=? \
          AND r.state='retired' AND r.scope='machine' \
-         AND r.id GLOB 'setup-container:*' AND r.name GLOB 'bosn-setup-*' \
+         AND ((r.stack='setup' AND r.id GLOB 'setup-container:*') \
+              OR r.id GLOB 'manifest-container:*') \
+         AND r.name GLOB 'bosn-setup-*' \
          AND EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id \
-            AND u.workspace=? AND u.stack='setup' AND u.state='retired') \
+            AND u.workspace=? AND u.stack=r.stack AND u.state='retired') \
          AND NOT EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id \
-            AND (u.workspace<>? OR u.stack<>'setup' OR u.state<>'retired')) \
+            AND (u.workspace<>? OR u.stack<>r.stack OR u.state<>'retired')) \
          AND NOT EXISTS (SELECT 1 FROM leases AS l WHERE l.resource_id=r.id) \
          AND NOT EXISTS (SELECT 1 FROM execution_sessions AS s \
             WHERE s.container_id=r.id OR s.container_id=r.name) LIMIT 1",
