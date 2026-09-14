@@ -68,6 +68,19 @@ def smoke_temporary_directory() -> str | None:
     return "/tmp" if sys.platform == "darwin" else None
 
 
+def smoke_temporary_prefix() -> str:
+    """Reserve the shortest practical state-root spelling on macOS.
+
+    Darwin's filesystem local-socket transport has a much smaller endpoint
+    budget than Linux.  The installed-wheel test intentionally keeps its
+    working directory outside the checkout, but the daemon state need not be
+    nested there.  A short private temporary root leaves room for the socket
+    file and for platform/library path normalization.
+    """
+
+    return "b-" if sys.platform == "darwin" else "bosn-wheel-smoke-"
+
+
 def wheel_from_argument(argument: str) -> Path:
     candidates = (
         sorted(Path().glob(argument))
@@ -166,10 +179,18 @@ def wait_for_daemon(
             if value.get("action") == "daemon_status" and value.get("daemon") == "online":
                 return
         time.sleep(0.05)
+    if daemon.poll() is None:
+        daemon_detail = "still running"
+    else:
+        stdout, stderr = daemon.communicate()
+        daemon_detail = (
+            f"exited={daemon.returncode}, stdout={stdout[-2048:]!r}, "
+            f"stderr={stderr[-2048:]!r}"
+        )
     socket_candidate = state / "bosn-rs.sock"
     fail(
         "installed daemon did not become ready; "
-        f"daemon_running={daemon.poll() is None}; "
+        f"daemon={daemon_detail}; "
         f"socket_candidate_length={len(os.fsencode(socket_candidate))}; "
         f"last_status={last_status}"
     )
@@ -182,11 +203,16 @@ def verify_installed_wheel(wheel: Path) -> None:
         fail("uv is required to install the wheel")
 
     with tempfile.TemporaryDirectory(
-        prefix="bosn-wheel-smoke-", dir=smoke_temporary_directory()
+        prefix=smoke_temporary_prefix(), dir=smoke_temporary_directory()
     ) as temporary:
         root = Path(temporary)
         environment = root / "environment"
         workdir = root / "outside-checkout"
+        # Keep the daemon state in the temporary root itself.  ``workdir`` is
+        # still outside the checkout, so this remains an installed-wheel test
+        # rather than a source-tree import, while macOS gets a safely short
+        # filesystem socket endpoint.
+        state = root / "state"
         workdir.mkdir()
         venv.EnvBuilder(with_pip=True).create(environment)
         python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
@@ -240,7 +266,6 @@ def verify_installed_wheel(wheel: Path) -> None:
         if version.stdout != f"bosn {versions['package_version']}\n":
             fail(f"installed CLI reported an unexpected version: {version.stdout!r}")
 
-        state = workdir / "state"
         offline_doctor = json_output(
             [str(cli), "doctor", "--state-dir", str(state), "--json"], cwd=workdir, env=env
         )
