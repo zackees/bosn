@@ -161,6 +161,18 @@ pub struct ManifestEnsureJobRequest {
     pub deadline: Duration,
     pub output_limit: usize,
 }
+/// One bounded daemon-owned convergence of every stack declared by one
+/// legacy Bosn manifest. The request deliberately has no root/dependency or
+/// Docker selectors: the current TOML schema has no dependency relation, so
+/// the daemon reads one validated snapshot and applies all stack names in
+/// their canonical lexical order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManifestConvergeJobRequest {
+    pub workspace: PathBuf,
+    pub manifest: String,
+    pub deadline: Duration,
+    pub output_limit: usize,
+}
 /// One bounded execution of a task already declared by an ensured, supported
 /// manifest stack.  This deliberately carries selectors only: the daemon
 /// re-reads the manifest and derives the command, image, and container name.
@@ -972,35 +984,7 @@ async fn manifest_stack_plan(
     task_name: Option<&str>,
     state_dir: Option<&Path>,
 ) -> Result<ManifestRuntimePlan, String> {
-    let workspace = fs::canonical_context_path(request_workspace)
-        .map_err(|_| "manifest workspace cannot be canonicalized".to_owned())?;
-    let metadata = fs::context_path_metadata_no_follow(&workspace)
-        .map_err(|_| "manifest workspace is not a directory".to_owned())?;
-    if metadata.kind != fs::ContextPathKind::Directory {
-        return Err("manifest workspace is not a directory".into());
-    }
-    if !safe_manifest_relative_path(request_manifest) {
-        return Err("manifest path must be a safe workspace-relative path".into());
-    }
-    let manifest_path = workspace.join(request_manifest);
-    let manifest_path = fs::canonical_context_path(&manifest_path)
-        .map_err(|_| "manifest file cannot be canonicalized".to_owned())?;
-    if !manifest_path.starts_with(&workspace) {
-        return Err("manifest path escapes selected workspace".into());
-    }
-    let bytes = fs::read_context_regular_file_bounded(&manifest_path, 1024 * 1024)
-        .map_err(|_| "manifest file is not a bounded regular UTF-8 file".to_owned())?;
-    let source =
-        std::str::from_utf8(&bytes.bytes).map_err(|_| "manifest file is not UTF-8".to_owned())?;
-    let manifest = parse_manifest_toml(
-        source,
-        ManifestRoots::new(
-            "workspace manifest",
-            workspace.to_string_lossy(),
-            workspace.to_string_lossy(),
-        ),
-    )
-    .map_err(|_| "manifest is invalid".to_owned())?;
+    let (workspace, manifest) = load_native_manifest(request_workspace, request_manifest)?;
     let stack = manifest
         .stack(request_stack)
         .map_err(|_| "selected manifest stack does not exist".to_owned())?;
@@ -1179,6 +1163,64 @@ async fn manifest_stack_plan(
     })
 }
 
+/// Open a bounded local manifest exactly once for a native operation. The
+/// parser rejects unknown stack fields, including dependency spellings; the
+/// caller can therefore safely use its BTreeMap order as the only topology
+/// currently represented by the legacy schema.
+fn load_native_manifest(
+    request_workspace: &Path,
+    request_manifest: &str,
+) -> Result<(PathBuf, bosn_core::Manifest), String> {
+    let workspace = fs::canonical_context_path(request_workspace)
+        .map_err(|_| "manifest workspace cannot be canonicalized".to_owned())?;
+    let metadata = fs::context_path_metadata_no_follow(&workspace)
+        .map_err(|_| "manifest workspace is not a directory".to_owned())?;
+    if metadata.kind != fs::ContextPathKind::Directory {
+        return Err("manifest workspace is not a directory".into());
+    }
+    if !safe_manifest_relative_path(request_manifest) {
+        return Err("manifest path must be a safe workspace-relative path".into());
+    }
+    let manifest_path = workspace.join(request_manifest);
+    let manifest_path = fs::canonical_context_path(&manifest_path)
+        .map_err(|_| "manifest file cannot be canonicalized".to_owned())?;
+    if !manifest_path.starts_with(&workspace) {
+        return Err("manifest path escapes selected workspace".into());
+    }
+    let bytes = fs::read_context_regular_file_bounded(&manifest_path, 1024 * 1024)
+        .map_err(|_| "manifest file is not a bounded regular UTF-8 file".to_owned())?;
+    let source =
+        std::str::from_utf8(&bytes.bytes).map_err(|_| "manifest file is not UTF-8".to_owned())?;
+    let manifest = parse_manifest_toml(
+        source,
+        ManifestRoots::new(
+            "workspace manifest",
+            workspace.to_string_lossy(),
+            workspace.to_string_lossy(),
+        ),
+    )
+    .map_err(|_| "manifest is invalid".to_owned())?;
+    Ok((workspace, manifest))
+}
+
+/// The current legacy TOML model has no dependency edge or root selector.
+/// `BTreeMap` preserves its one unambiguous total order, so an all-stack
+/// operation is deterministic across parsers and hosts. Unknown dependency
+/// keys fail in `parse_manifest_toml` before this function is reached.
+fn manifest_converge_stack_order(manifest: &bosn_core::Manifest) -> Vec<String> {
+    manifest.stacks.keys().cloned().collect()
+}
+
+fn manifest_converge_stack_names(
+    request: &ManifestConvergeJobRequest,
+) -> Result<Vec<String>, String> {
+    let (_, manifest) = load_native_manifest(&request.workspace, &request.manifest)?;
+    let names = manifest_converge_stack_order(&manifest);
+    if names.is_empty() {
+        return Err("manifest declares no stacks".into());
+    }
+    Ok(names)
+}
 #[derive(Clone, Debug)]
 struct ManifestRuntimePlan {
     plan: SetupPlan,
@@ -3546,6 +3588,37 @@ impl Client {
             _ => Err(Error::Protocol("unexpected manifest ensure response")),
         }
     }
+    /// Submit one deterministic convergence of every stack in a manifest.
+    /// The daemon re-reads the manifest before any engine work; callers cannot
+    /// select an ordering, dependency, Docker target, or lifecycle option.
+    pub async fn submit_manifest_converge(
+        &self,
+        request: ManifestConvergeJobRequest,
+    ) -> Result<u64, Error> {
+        let workspace = request
+            .workspace
+            .to_str()
+            .ok_or(Error::Protocol("manifest workspace is not UTF-8"))?
+            .to_owned();
+        let deadline_ms = u64::try_from(request.deadline.as_millis())
+            .map_err(|_| Error::Protocol("manifest deadline too large"))?;
+        let output_limit = u32::try_from(request.output_limit)
+            .map_err(|_| Error::Protocol("manifest output limit too large"))?;
+        validate_manifest_converge_wire(&workspace, &request.manifest, deadline_ms, output_limit)?;
+        match self
+            .call(Request {
+                workspace,
+                setup_config: request.manifest,
+                setup_deadline_ms: deadline_ms,
+                setup_output_limit: output_limit,
+                ..Request::operation(24)
+            })
+            .await?
+        {
+            Reply::Job(id) => Ok(id),
+            _ => Err(Error::Protocol("unexpected manifest converge response")),
+        }
+    }
     /// Submit one named task for an already ensured supported manifest stack.
     /// The task name is the only executable selector; manifest command and
     /// managed container identity are re-derived by the daemon.
@@ -3789,6 +3862,10 @@ enum JobCommand {
         request: ManifestEnsureJobRequest,
         reply: async_engine::OneshotSender<Result<u64, Error>>,
     },
+    SubmitManifestConverge {
+        request: ManifestConvergeJobRequest,
+        reply: async_engine::OneshotSender<Result<u64, Error>>,
+    },
     SubmitManifestAppTask {
         request: ManifestAppTaskJobRequest,
         reply: async_engine::OneshotSender<Result<u64, Error>>,
@@ -3803,6 +3880,15 @@ enum JobCommand {
         reply: async_engine::OneshotSender<Result<(), String>>,
     },
     PersistManifestEnsure {
+        id: u64,
+        execution: SetupEnsureExecution,
+        reply: async_engine::OneshotSender<Result<(), String>>,
+    },
+    /// Record one completed member of an all-stack convergence while keeping
+    /// the parent job running for later members. This preserves each stack's
+    /// normal atomic record-then-rollover transition and makes partial batch
+    /// success durable if a later stack fails or is cancelled.
+    PersistManifestConvergeStack {
         id: u64,
         execution: SetupEnsureExecution,
         reply: async_engine::OneshotSender<Result<(), String>>,
@@ -3826,6 +3912,7 @@ enum SetupJobKind {
     AppTask,
     Ensure,
     ManifestEnsure,
+    ManifestConverge,
     ManifestAppTask,
 }
 
@@ -3893,6 +3980,7 @@ enum SetupJobRequest {
     AppTask(SetupAppTaskJobRequest),
     Ensure(SetupEnsureJobRequest),
     ManifestEnsure(ManifestEnsureJobRequest),
+    ManifestConverge(ManifestConvergeJobRequest),
     ManifestAppTask(ManifestAppTaskJobRequest),
 }
 
@@ -3987,6 +4075,17 @@ impl JobActor {
         let (reply, wait) = async_engine::oneshot_channel();
         self.sender
             .send(JobCommand::SubmitManifestEnsure { request, reply })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
+    async fn submit_manifest_converge(
+        &self,
+        request: ManifestConvergeJobRequest,
+    ) -> Result<u64, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(JobCommand::SubmitManifestConverge { request, reply })
             .await
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
@@ -4264,6 +4363,39 @@ async fn job_actor(
                     registry.clone(),
                 );
             }
+            JobCommand::SubmitManifestConverge { request, reply } => {
+                let digest = manifest_converge_digest(&request);
+                let workspace = request.workspace.to_string_lossy().into_owned();
+                // Jobs are globally single-flight today. Giving a topology its
+                // own coalescing key makes same-manifest submissions join while
+                // preserving the existing per-stack API and ordering all
+                // member volume/guest work through one parent job.
+                let result = jobs
+                    .submit(&workspace, "manifest-converge", &digest)
+                    .map(|submission| match submission {
+                        Submission::Started(id) | Submission::Queued(id) => {
+                            requests.insert(id, SetupJobRequest::ManifestConverge(request));
+                            id
+                        }
+                        Submission::Joined(id) => id,
+                        Submission::Superseded { replacement, .. } => {
+                            requests
+                                .insert(replacement, SetupJobRequest::ManifestConverge(request));
+                            replacement
+                        }
+                    })
+                    .map_err(|_| Error::Protocol("manifest converge job admission"));
+                let _ = reply.send(result);
+                launch_started_setup_jobs(
+                    &mut jobs,
+                    &mut requests,
+                    &mut cancellations,
+                    &mut tasks,
+                    &executors,
+                    sender.clone(),
+                    registry.clone(),
+                );
+            }
             JobCommand::SubmitManifestAppTask { request, reply } => {
                 let digest = manifest_app_task_digest(&request);
                 let workspace = request.workspace.to_string_lossy().into_owned();
@@ -4349,6 +4481,26 @@ async fn job_actor(
                 };
                 let _ = reply.send(result);
             }
+            JobCommand::PersistManifestConvergeStack {
+                id,
+                execution,
+                reply,
+            } => {
+                let result = if jobs
+                    .job(id)
+                    .is_ok_and(|job| job.state == jobs::JobState::Running)
+                {
+                    registry
+                        .record_manifest_ensure(id, execution)
+                        .await
+                        .map_err(|error| {
+                            format!("manifest converge registry recording failed: {error}")
+                        })
+                } else {
+                    Err("manifest converge cancelled".into())
+                };
+                let _ = reply.send(result);
+            }
             JobCommand::Log { id, line } => {
                 // A full log record is never permitted to block daemon IPC;
                 // bounded engine output instead applies back-pressure upstream.
@@ -4397,6 +4549,7 @@ async fn job_actor(
                             SetupJobKind::AppTask => "setup app task",
                             SetupJobKind::Ensure => "setup ensure",
                             SetupJobKind::ManifestEnsure => "manifest ensure",
+                            SetupJobKind::ManifestConverge => "manifest converge",
                             SetupJobKind::ManifestAppTask => "manifest app task",
                         };
                         let _ = jobs.log(id, format!("{operation} failed: {error}"));
@@ -4582,6 +4735,19 @@ fn launch_started_setup_jobs(
                         Err(error) => Some((SetupJobKind::ManifestEnsure, Err(error))),
                     }
                 }
+                SetupJobRequest::ManifestConverge(request) => Some((
+                    SetupJobKind::ManifestConverge,
+                    execute_manifest_converge(
+                        id,
+                        request,
+                        manifest_ensure_executor.as_ref(),
+                        &token,
+                        &logs,
+                        &manifest_registry,
+                        &task_sender,
+                    )
+                    .await,
+                )),
                 SetupJobRequest::ManifestAppTask(request) => Some((
                     SetupJobKind::ManifestAppTask,
                     manifest_app_task_executor
@@ -4598,6 +4764,82 @@ fn launch_started_setup_jobs(
             }
         });
     }
+}
+
+/// Execute the complete deterministic all-stack operation in the one daemon
+/// job slot. Each member retains the existing manifest ensure executor and
+/// its registry-backed volume intent/engine proof. A successful member is
+/// recorded before the next starts, so later failure/cancellation never
+/// erases a real earlier convergence.
+async fn execute_manifest_converge(
+    id: u64,
+    request: ManifestConvergeJobRequest,
+    executor: &dyn ManifestEnsureExecutor,
+    cancellation: &async_engine::CancellationToken,
+    logs: &async_engine::Sender<String>,
+    registry: &RegistryActor,
+    job_sender: &async_engine::Sender<JobCommand>,
+) -> Result<String, String> {
+    let deadline = async_engine::Deadline::after(request.deadline);
+    let stacks = async_engine::cancellable(
+        cancellation,
+        async_engine::timeout_at(deadline, async { manifest_converge_stack_names(&request) }),
+    )
+    .await
+    .map_err(|_| "manifest converge cancelled before topology planning".to_owned())?
+    .map_err(|_| "manifest converge planning exceeded its deadline".to_owned())??;
+    let stack_count = stacks.len();
+    let minimum = stack_count.saturating_mul(2);
+    if request.output_limit < minimum {
+        return Err("manifest converge output budget cannot fund every stack".into());
+    }
+    let output_per_stack = request.output_limit / stack_count;
+    let output_remainder = request.output_limit % stack_count;
+    for (index, stack) in stacks.iter().enumerate() {
+        let remaining = deadline.remaining();
+        if cancellation.is_cancelled() || remaining.is_zero() {
+            return Err("manifest converge ended before the next stack".into());
+        }
+        let output_limit = output_per_stack + usize::from(index < output_remainder);
+        logs.send(format!(
+            "[manifest-converge] ensuring stack {stack} ({}/{stack_count})",
+            index + 1
+        ))
+        .await
+        .map_err(|_| "manifest converge log consumer closed".to_owned())?;
+        let execution = executor
+            .execute(
+                ManifestEnsureJobRequest {
+                    workspace: request.workspace.clone(),
+                    manifest: request.manifest.clone(),
+                    stack: stack.clone(),
+                    deadline: remaining,
+                    output_limit,
+                },
+                cancellation,
+                logs,
+                registry,
+            )
+            .await
+            .map_err(|error| format!("manifest converge stopped at stack {stack}: {error}"))?;
+        let receipt = execution.receipt.clone();
+        let (reply, wait) = async_engine::oneshot_channel();
+        job_sender
+            .send(JobCommand::PersistManifestConvergeStack {
+                id,
+                execution,
+                reply,
+            })
+            .await
+            .map_err(|_| "manifest converge registry actor stopped".to_owned())?;
+        wait.await
+            .map_err(|_| "manifest converge registry actor stopped".to_owned())?
+            .map_err(|error| format!("manifest converge stopped at stack {stack}: {error}"))?;
+        logs.send(format!("[manifest-converge] {receipt}"))
+            .await
+            .map_err(|_| "manifest converge log consumer closed".to_owned())?;
+    }
+    Ok(format!("converged {stack_count} manifest stack(s)"))
 }
 
 #[derive(Clone)]
@@ -4786,6 +5028,26 @@ fn manifest_ensure_digest(request: &ManifestEnsureJobRequest) -> String {
     }
     format!(
         "manifest:{}",
+        kernal_api::hash::blake3_bytes(&material).to_hex()
+    )
+}
+fn manifest_converge_digest(request: &ManifestConvergeJobRequest) -> String {
+    let mut material = Vec::new();
+    let workspace = request.workspace.to_string_lossy();
+    let deadline = request.deadline.as_millis().to_le_bytes();
+    let output_limit = (request.output_limit as u64).to_le_bytes();
+    for part in [
+        b"bosn.manifest-converge.v1".as_slice(),
+        workspace.as_bytes(),
+        request.manifest.as_bytes(),
+        &deadline,
+        &output_limit,
+    ] {
+        material.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        material.extend_from_slice(part);
+    }
+    format!(
+        "manifest-converge:{}",
         kernal_api::hash::blake3_bytes(&material).to_hex()
     )
 }
@@ -6936,6 +7198,31 @@ async fn handle(
                     ..Default::default()
                 },
             },
+            24 => match validate_manifest_converge_request_wire(&r) {
+                Ok(()) => match jobs
+                    .submit_manifest_converge(ManifestConvergeJobRequest {
+                        workspace: PathBuf::from(r.workspace),
+                        manifest: r.setup_config,
+                        deadline: Duration::from_millis(r.setup_deadline_ms),
+                        output_limit: r.setup_output_limit as usize,
+                    })
+                    .await
+                {
+                    Ok(job_id) => ReplyWire {
+                        code: 40,
+                        job_id,
+                        ..Default::default()
+                    },
+                    Err(_) => ReplyWire {
+                        code: 3,
+                        ..Default::default()
+                    },
+                },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
             23 => match validate_manifest_app_task_request_wire(&r) {
                 Ok(()) => match jobs
                     .submit_manifest_app_task(ManifestAppTaskJobRequest {
@@ -7468,6 +7755,25 @@ fn validate_manifest_ensure_wire(
     Ok(())
 }
 
+fn validate_manifest_converge_wire(
+    workspace: &str,
+    manifest: &str,
+    deadline_ms: u64,
+    output_limit: u32,
+) -> Result<(), Error> {
+    validate_setup_prepare_wire(
+        workspace,
+        manifest,
+        SetupPreparePolicy::Refresh,
+        deadline_ms,
+        output_limit,
+    )?;
+    if !safe_manifest_relative_path(manifest) {
+        return Err(Error::Protocol("invalid manifest converge selector"));
+    }
+    Ok(())
+}
+
 fn validate_manifest_ensure_request_wire(request: &Request) -> Result<(), Error> {
     validate_manifest_ensure_wire(
         &request.workspace,
@@ -7490,6 +7796,32 @@ fn validate_manifest_ensure_request_wire(request: &Request) -> Result<(), Error>
         || request.setup_adopt_confirm
     {
         return Err(Error::Protocol("nonsemantic manifest ensure fields"));
+    }
+    Ok(())
+}
+
+fn validate_manifest_converge_request_wire(request: &Request) -> Result<(), Error> {
+    validate_manifest_converge_wire(
+        &request.workspace,
+        &request.setup_config,
+        request.setup_deadline_ms,
+        request.setup_output_limit,
+    )?;
+    if !request.stack.is_empty()
+        || !request.digest.is_empty()
+        || request.job_id != 0
+        || request.log_after != 0
+        || request.log_limit != 0
+        || request.setup_policy != 0
+        || !request.setup_task_name.is_empty()
+        || request.diagnostic_after != 0
+        || request.diagnostic_limit != 0
+        || !request.gc_candidate_token.is_empty()
+        || request.gc_confirm
+        || request.setup_done_confirm
+        || request.setup_adopt_confirm
+    {
+        return Err(Error::Protocol("nonsemantic manifest converge fields"));
     }
     Ok(())
 }
@@ -8797,6 +9129,136 @@ mod tests {
     }
 
     #[test]
+    fn manifest_converge_orders_all_stacks_and_records_each_before_completion() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let image = format!("example.invalid/app@sha256:{}", "a".repeat(64));
+        std::fs::write(
+            workspace.join("bosn.toml"),
+            format!("[stack.zebra]\nimage = '{image}'\n[stack.alpha]\nimage = '{image}'\n"),
+        )
+        .unwrap();
+        let fake = Arc::new(FakeManifestEnsureExecutor::default());
+        RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let server = async_engine::launch(
+                    Service::new(state.clone())
+                        .with_manifest_ensure_executor(fake.clone())
+                        .serve(),
+                );
+                let client = wait_for_client(&state).await;
+                let job = client
+                    .submit_manifest_converge(ManifestConvergeJobRequest {
+                        workspace: workspace.clone(),
+                        manifest: "bosn.toml".into(),
+                        deadline: Duration::from_secs(2),
+                        output_limit: 4096,
+                    })
+                    .await
+                    .unwrap();
+                wait_for_job_state(&client, job, "Succeeded").await;
+                assert_eq!(
+                    fake.calls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|request| request.stack.as_str())
+                        .collect::<Vec<_>>(),
+                    ["alpha", "zebra"]
+                );
+                let registry = Registry::open_read_only(state.join("registry.sqlite3")).unwrap();
+                let resources = registry.resources(0, 16).unwrap().items;
+                assert!(resources.iter().any(|resource| resource.stack == "alpha"));
+                assert!(resources.iter().any(|resource| resource.stack == "zebra"));
+                let logs = client.job_logs(job, 0, 64).await.unwrap();
+                assert!(
+                    logs.records
+                        .iter()
+                        .any(|record| record.line.contains("stack alpha (1/2)"))
+                );
+                client.shutdown().await.unwrap();
+                stopped(server).await;
+            });
+    }
+
+    #[test]
+    fn manifest_converge_order_is_schema_determined_and_dependency_spellings_fail_closed() {
+        let roots = ManifestRoots::new("test", "/material", "/workspace");
+        let manifest = parse_manifest_toml(
+            "[stack.z]\nimage='example@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n[stack.a]\nimage='example@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n",
+            roots.clone(),
+        )
+        .unwrap();
+        assert_eq!(manifest_converge_stack_order(&manifest), ["a", "z"]);
+        assert!(parse_manifest_toml(
+            "[stack.app]\nimage='example@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\ndepends_on=['db']\n",
+            roots,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn manifest_converge_stops_at_failure_and_keeps_prior_stack_registry_facts() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let image = format!("example.invalid/app@sha256:{}", "a".repeat(64));
+        std::fs::write(
+            workspace.join("bosn.toml"),
+            format!("[stack.alpha]\nimage = '{image}'\n[stack.broken]\nimage = '{image}'\n[stack.later]\nimage = '{image}'\n"),
+        )
+        .unwrap();
+        let fake = Arc::new(FakeManifestEnsureExecutor {
+            calls: Mutex::new(Vec::new()),
+            fail_stack: Mutex::new(Some("broken".into())),
+        });
+        RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let server = async_engine::launch(
+                    Service::new(state.clone())
+                        .with_manifest_ensure_executor(fake.clone())
+                        .serve(),
+                );
+                let client = wait_for_client(&state).await;
+                let job = client
+                    .submit_manifest_converge(ManifestConvergeJobRequest {
+                        workspace: workspace.clone(),
+                        manifest: "bosn.toml".into(),
+                        deadline: Duration::from_secs(2),
+                        output_limit: 4096,
+                    })
+                    .await
+                    .unwrap();
+                wait_for_job_state(&client, job, "Failed").await;
+                assert_eq!(
+                    fake.calls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|request| request.stack.as_str())
+                        .collect::<Vec<_>>(),
+                    ["alpha", "broken"]
+                );
+                let registry = Registry::open_read_only(state.join("registry.sqlite3")).unwrap();
+                let resources = registry.resources(0, 16).unwrap().items;
+                assert!(resources.iter().any(|resource| resource.stack == "alpha"));
+                assert!(!resources.iter().any(|resource| resource.stack == "broken"));
+                assert!(!resources.iter().any(|resource| resource.stack == "later"));
+                client.shutdown().await.unwrap();
+                stopped(server).await;
+            });
+    }
+
+    #[test]
     fn manifest_ensure_rollover_is_same_stack_only_and_same_generation_reuses_identity() {
         let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
         let state = temporary.path().join("state");
@@ -9542,6 +10004,7 @@ mod tests {
     #[derive(Default)]
     struct FakeManifestEnsureExecutor {
         calls: Mutex<Vec<ManifestEnsureJobRequest>>,
+        fail_stack: Mutex<Option<String>>,
     }
     impl ManifestEnsureExecutor for FakeManifestEnsureExecutor {
         fn execute<'a>(
@@ -9557,6 +10020,15 @@ mod tests {
                     .await
                     .map_err(|_| "fake manifest log consumer closed".to_owned())?;
                 self.calls.lock().unwrap().push(request.clone());
+                if self
+                    .fail_stack
+                    .lock()
+                    .unwrap()
+                    .as_deref()
+                    .is_some_and(|stack| stack == request.stack)
+                {
+                    return Err("injected manifest stack failure".into());
+                }
                 let workspace = request.workspace.to_string_lossy().into_owned();
                 let generation = request
                     .manifest
@@ -9567,14 +10039,14 @@ mod tests {
                     receipt: "fake manifest ensured".into(),
                     resource: SetupEnsureResource {
                         id: format!("manifest-container:{}:{generation}", request.stack),
-                        name: format!("bosn-setup-{generation}"),
+                        name: format!("bosn-setup-{}-{generation}", request.stack),
                         stack: request.stack.clone(),
                         generation: format!("sha256:{generation}"),
                         workspace: workspace.clone(),
                     },
                     image: SetupEnsureImageResource {
-                        id: format!("manifest-image:sha256:{generation}"),
-                        name: format!("manifest-image:sha256:{generation}"),
+                        id: format!("manifest-image:{}:sha256:{generation}", request.stack),
+                        name: format!("manifest-image:{}:sha256:{generation}", request.stack),
                         stack: request.stack,
                         generation: format!("sha256:{generation}"),
                         workspace,
