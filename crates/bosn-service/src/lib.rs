@@ -10,8 +10,8 @@ use bosn_registry::{
 use bosn_setup::PreparedImageKind;
 use bosn_setup::{
     PreparedImage, SetupAcquirePolicy, SetupAppTaskRequest, SetupEnsureEngine,
-    SetupEnsureRequest as CoreSetupEnsureRequest, SetupImageEngine, SetupPlan, SetupPlanRequest,
-    SetupTaskRequest, adopt_setup_app, ensure_setup_app, execute_setup_app_task,
+    SetupEnsureRequest as CoreSetupEnsureRequest, SetupEnsureResult, SetupImageEngine, SetupPlan,
+    SetupPlanRequest, SetupTaskRequest, adopt_setup_app, ensure_setup_app, execute_setup_app_task,
     execute_setup_task, plan_setup, prepare_setup_image,
 };
 use jobs::{Jobs, Submission};
@@ -193,11 +193,14 @@ pub trait SetupAppTaskExecutor: Send + Sync {
 
 /// Daemon-owned durable ownership evidence for a live setup-app task. The
 /// executor cannot open SQLite itself; it must bracket the fixed exec through
-/// this actor-owned recorder. A recorder failure fails closed before exec.
+/// this actor-owned recorder. Its identity is Bosn's verified deterministic
+/// managed name, rather than Docker's opaque ID, so registry GC can protect
+/// the exact resource after an uncertain local client outcome. A recorder
+/// failure fails closed before exec.
 pub trait SetupAppTaskSessionRecorder: Send + Sync {
     fn begin<'a>(
         &'a self,
-        container_id: String,
+        managed_container_identity: String,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
     fn finish<'a>(
         &'a self,
@@ -1037,7 +1040,7 @@ impl SetupAppTaskExecutor for DockerSetupAppTaskExecutor {
             .await
             .map_err(|_| "setup app task log consumer closed".to_owned())?;
             session
-                .begin(observed.container_id.clone())
+                .begin(setup_app_task_session_container_identity(&observed))
                 .await
                 .map_err(|_| "setup app task ownership recording unavailable".to_owned())?;
             let result = execute_setup_app_task(
@@ -3052,11 +3055,11 @@ struct ActorSetupAppTaskSessionRecorder {
 impl SetupAppTaskSessionRecorder for ActorSetupAppTaskSessionRecorder {
     fn begin<'a>(
         &'a self,
-        container_id: String,
+        managed_container_identity: String,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
             self.actor
-                .begin_setup_app_task_session(self.job_id, container_id)
+                .begin_setup_app_task_session(self.job_id, managed_container_identity)
                 .await
                 .map_err(|_| "registry session start failed".into())
         })
@@ -3180,17 +3183,26 @@ fn setup_ensure_digest(request: &SetupEnsureJobRequest) -> String {
         kernal_api::hash::blake3_bytes(&material).to_hex()
     )
 }
+
+/// Select the durable registry key from a receipt that has already passed
+/// `adopt_setup_app`'s complete ownership validation. Docker's opaque ID is
+/// useful in the operation receipt, but registry resource ownership and GC
+/// use the exact content-addressed managed name.
+fn setup_app_task_session_container_identity(observed: &SetupEnsureResult) -> String {
+    observed.container_name.clone()
+}
+
 impl RegistryActor {
     async fn begin_setup_app_task_session(
         &self,
         job_id: u64,
-        container_id: String,
+        managed_container_identity: String,
     ) -> Result<(), Error> {
         let (reply, wait) = async_engine::oneshot_channel();
         self.sender
             .send(DbCommand::BeginSetupAppTaskSession {
                 job_id,
-                container_id,
+                container_id: managed_container_identity,
                 reply,
             })
             .await
@@ -6762,7 +6774,7 @@ mod tests {
     }
 
     #[test]
-    fn uncertain_app_task_completion_keeps_session_and_protects_gc_until_known_terminal() {
+    fn uncertain_app_task_uses_verified_managed_receipt_identity_to_protect_gc() {
         let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
         let state = temporary.path().join("state");
         std::fs::create_dir(&state).unwrap();
@@ -6770,15 +6782,16 @@ mod tests {
         let mut registry =
             Registry::create_writer(&database, "11111111-2222-4333-8444-555555555555").unwrap();
         let mut transaction = registry.begin_immediate().unwrap();
-        let resource_id = "setup-container:uncertain";
-        let container_name = "bosn-setup-uncertain";
+        let generation = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let resource_id = format!("setup-container:{generation}");
+        let container_name = format!("bosn-setup-{generation}");
         transaction
             .put_resource(&Resource {
-                id: resource_id.into(),
+                id: resource_id.clone(),
                 kind: ResourceKind::Container,
-                name: container_name.into(),
+                name: container_name.clone(),
                 stack: "setup".into(),
-                generation: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                generation: format!("sha256:{generation}"),
                 scope: Scope::Machine,
                 workspace: "/workspace".into(),
                 created_at: 1.0,
@@ -6789,19 +6802,38 @@ mod tests {
             .unwrap();
         transaction
             .put_resource_use(&ResourceUse {
-                resource_id: resource_id.into(),
+                resource_id: resource_id.clone(),
                 workspace: "/workspace".into(),
                 stack: "setup".into(),
-                generation: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                generation: format!("sha256:{generation}"),
                 last_used: 1.0,
                 state: ResourceState::Retired,
             })
             .unwrap();
         transaction.commit().unwrap();
 
-        record_setup_app_task_session(&mut registry, 7, container_name).unwrap();
+        // This has the actual receipt shape returned by the ownership-safe
+        // Docker inspection: its opaque Docker ID must never be used as the
+        // durable registry/GC key.
+        let observed = SetupEnsureResult {
+            container_name: container_name.clone(),
+            container_id: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
+            image_identity:
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            created: false,
+            started: false,
+            running: true,
+        };
+        let managed_identity = setup_app_task_session_container_identity(&observed);
+        assert_eq!(managed_identity, container_name);
+        assert_ne!(managed_identity, observed.container_id);
+        record_setup_app_task_session(&mut registry, 7, &managed_identity).unwrap();
         finish_setup_app_task_session(&mut registry, 7, "uncertain").unwrap();
         assert_eq!(registry.status().unwrap().sessions, 1);
+        assert_eq!(
+            registry.execution_sessions(0, 1).unwrap().items[0].container_id,
+            container_name
+        );
         let protected = registry.setup_gc_preview("/workspace", 0, 16).unwrap();
         assert!(protected.candidates.items.is_empty());
         assert_eq!(protected.counts.protected_session, 1);
