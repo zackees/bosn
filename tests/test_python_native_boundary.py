@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import importlib.util
-import tomllib
 from pathlib import Path
+
+import tomllib
 
 import bosn
 
@@ -66,3 +67,4 @@ def test_distribution_has_no_python_runtime_lifecycle_dependencies() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     assert project["project"]["dependencies"] == []
     assert project["project"]["scripts"] == {"bosn": "bosn.native_cli:main"}
+    assert project["project"]["requires-python"] == ">=3.10"

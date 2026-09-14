@@ -118,6 +118,23 @@ volume attached to any container. It never accepts a Docker volume name or Docke
 This removes almost all of the guest's setup burden. Cross-compile on Linux; ship only
 prebuilt binaries into the guest.
 
+For distributable Python wheels, Bosn uses this same boundary in CI.  Both
+`x86_64-apple-darwin` and `aarch64-apple-darwin` wheels build on
+`ubuntu-latest` through `zackees/setup-soldr` pinned at
+`bb28e96d2dc32c058242f56722297caf1efcbd90`, followed by
+`soldr prepare --target <triple> --github-env "$GITHUB_ENV"`.  Soldr provides
+LLVM 21.1.5 and its managed Apple SDK 14.5; no hosted macOS runner, Xcode,
+zig, or osxcross is involved.  The wheel backend sets the documented floors:
+macOS 10.12 for x86_64 and 11.0 for arm64.  Linux statically checks each
+Mach-O extension and bundled CLI before publishing the artifact.  The PyO3
+module is `abi3-py310`, so release wheels are `cp310-abi3` rather than
+cp311-only artifacts and support CPython 3.10 and newer.
+
+The x86_64 guest mechanism remains the only sanctioned path to execute a
+Darwin artifact from Linux.  It is not part of the per-PR wheel build, and
+there is no fleet-wide arm64 execution path.  See issue #252 for the advisory
+Recovery-guest execution follow-up.
+
 ```bash
 # Linux stack — soldr carries its own macOS SDK and LLVM, so no Mac is involved
 soldr cargo nextest archive --target x86_64-apple-darwin --all-features \

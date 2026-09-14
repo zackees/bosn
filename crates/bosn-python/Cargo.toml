@@ -16,7 +16,10 @@ name = "bosn-native"
 path = "../bosn-service/src/bin/bosn.rs"
 
 [features]
-default = ["extension-module"]
+# One stable CPython ABI floor across Linux, Windows, and both Darwin wheels.
+# Do not remove this to make a host-specific cp311 wheel: #252's Linux-hosted
+# cross release contract is explicitly abi3-py310.
+default = ["extension-module", "pyo3/abi3-py310"]
 # Maturin builds the production wheel as an extension module, which correctly
 # leaves CPython symbols for the host interpreter to provide.
 extension-module = ["pyo3/extension-module"]

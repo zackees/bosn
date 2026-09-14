@@ -7,12 +7,15 @@ native CLI first, then let maturin include that artifact in the wheel.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from os import chmod
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
+from os import chmod, environ
 from os import name as os_name
 from pathlib import Path
 from re import compile as compile_regex
 from shutil import copy2, rmtree
+from struct import unpack_from
 from subprocess import run
 from sys import platform
 from typing import Any
@@ -20,43 +23,128 @@ from typing import Any
 import maturin
 
 _ROOT = Path(__file__).resolve().parent
-_NATIVE_CLI = (
-    _ROOT / "target" / "release" / ("bosn-native.exe" if os_name == "nt" else "bosn-native")
-)
 _WHEEL_NATIVE_DIRECTORY = _ROOT / "target" / "bosn-wheel-data" / "platlib" / "bosn" / "_bin"
 _WHEEL_DATA = _ROOT / "target" / "bosn-wheel-data"
 _LINUX_OPENSSL = compile_regex(r"^(lib(?:ssl|crypto)\.so\.\d+) => (\S+)")
+_MACHO_64_MAGIC = 0xFEEDFACF
+
+
+@dataclass(frozen=True)
+class _DarwinTarget:
+    triple: str
+    cputype: int
+    deployment_target: str
+
+
+# A target is an explicit release contract, not an arbitrary Cargo string.  In
+# particular, accepting an unknown target would let the backend put a host ELF
+# executable into a wheel with a Darwin filename (the false-green #252 exists
+# to prevent).  Add a target here together with its static verifier contract.
+_DARWIN_TARGETS = {
+    "x86_64-apple-darwin": _DarwinTarget("x86_64-apple-darwin", 0x01000007, "10.12"),
+    "aarch64-apple-darwin": _DarwinTarget("aarch64-apple-darwin", 0x0100000C, "11.0"),
+}
+
+
+def _wheel_target() -> _DarwinTarget | None:
+    requested = environ.get("BOSN_WHEEL_TARGET")
+    if not requested:
+        return None
+    try:
+        return _DARWIN_TARGETS[requested]
+    except KeyError as error:
+        allowed = ", ".join(sorted(_DARWIN_TARGETS))
+        raise RuntimeError(
+            f"BOSN_WHEEL_TARGET={requested!r} is not a supported Bosn wheel target; "
+            f"allowed values: {allowed}"
+        ) from error
+
+
+def _native_cli(target: _DarwinTarget | None) -> Path:
+    name = "bosn-native.exe" if target is None and os_name == "nt" else "bosn-native"
+    directory = _ROOT / "target"
+    if target is not None:
+        directory /= target.triple
+    return directory / "release" / name
+
+
+def _assert_target_magic(binary: Path, target: _DarwinTarget | None) -> None:
+    """Refuse a wheel whose staged CLI is not the requested native format."""
+
+    if target is None:
+        return
+    data = binary.read_bytes()
+    if len(data) < 16:
+        raise RuntimeError(f"cross-built CLI is too short to be Mach-O: {binary}")
+    magic, cputype, _cpusubtype, filetype = unpack_from("<IiiI", data)
+    if magic != _MACHO_64_MAGIC or cputype != target.cputype or filetype != 2:
+        raise RuntimeError(
+            f"cross-built CLI does not match {target.triple}: "
+            f"magic={magic:#x}, cputype={cputype:#x}, filetype={filetype}; "
+            "refusing to stage a host or wrong-architecture executable"
+        )
+
+
+@contextmanager
+def _cross_pyo3_environment(target: _DarwinTarget | None) -> Iterator[None]:
+    """Make both the pre-built CLI and maturin's cdylib use the same target."""
+
+    if target is None:
+        yield
+        return
+    old_version = environ.get("PYO3_CROSS_PYTHON_VERSION")
+    old_deployment = environ.get("MACOSX_DEPLOYMENT_TARGET")
+    # Maturin sets this for its own cargo call in some modes, but the CLI is a
+    # separate build.  Set it here for both calls and restore the caller's env.
+    environ["PYO3_CROSS_PYTHON_VERSION"] = "3.10"
+    environ.setdefault("MACOSX_DEPLOYMENT_TARGET", target.deployment_target)
+    try:
+        yield
+    finally:
+        if old_version is None:
+            environ.pop("PYO3_CROSS_PYTHON_VERSION", None)
+        else:
+            environ["PYO3_CROSS_PYTHON_VERSION"] = old_version
+        if old_deployment is None:
+            environ.pop("MACOSX_DEPLOYMENT_TARGET", None)
+        else:
+            environ["MACOSX_DEPLOYMENT_TARGET"] = old_deployment
 
 
 def _build_native_cli() -> None:
-    run(
-        [
-            "cargo",
-            "build",
-            "--release",
-            "--locked",
-            "--package",
-            "bosn",
-            "--bin",
-            "bosn-native",
-        ],
-        cwd=_ROOT,
-        check=True,
-    )
+    target = _wheel_target()
+    command = [
+        "cargo",
+        "build",
+        "--release",
+        "--locked",
+        "--package",
+        "bosn",
+        "--bin",
+        "bosn-native",
+    ]
+    if target is not None:
+        command.extend(["--target", target.triple])
+    with _cross_pyo3_environment(target):
+        run(command, cwd=_ROOT, check=True)
+    native_cli = _native_cli(target)
+    _assert_target_magic(native_cli, target)
     rmtree(_WHEEL_DATA, ignore_errors=True)
-    destination = _WHEEL_NATIVE_DIRECTORY / _NATIVE_CLI.name
+    destination = _WHEEL_NATIVE_DIRECTORY / native_cli.name
     destination.parent.mkdir(parents=True, exist_ok=True)
-    copy2(_NATIVE_CLI, destination)
-    chmod(destination, _NATIVE_CLI.stat().st_mode)
-    _copy_linux_openssl(destination.parent)
+    copy2(native_cli, destination)
+    chmod(destination, native_cli.stat().st_mode)
+    _copy_linux_openssl(destination.parent, native_cli, target)
 
 
-def _copy_linux_openssl(destination: Path) -> None:
+def _copy_linux_openssl(destination: Path, native_cli: Path, target: _DarwinTarget | None) -> None:
     """Keep the standalone Linux executable independent of host OpenSSL."""
 
-    if not platform.startswith("linux"):
+    # Sidecars belong to the output target, never to the Linux builder.  The
+    # Darwin branch must remain empty even though this backend runs on Linux.
+    if target is not None or not platform.startswith("linux"):
         return
-    output = run(["ldd", _NATIVE_CLI], capture_output=True, check=True, text=True).stdout
+    output = run(["ldd", native_cli], capture_output=True, check=True, text=True).stdout
     copied = set()
     for line in output.splitlines():
         match = _LINUX_OPENSSL.match(line.strip())
@@ -80,6 +168,14 @@ def _wheel_config(config_settings: Mapping[str, Any] | None) -> dict[str, Any]:
         arguments = list(arguments)
     if "--compatibility" not in arguments and "--manylinux" not in arguments:
         arguments.extend(["--compatibility", "pypi"])
+    target = _wheel_target()
+    if target is not None:
+        # Maturin receives an explicit target too; otherwise it may compile the
+        # extension for the Linux builder while the backend stages a Mach-O CLI.
+        if "--target" not in arguments:
+            arguments.extend(["--target", target.triple])
+        if "--interpreter" not in arguments and "-i" not in arguments:
+            arguments.extend(["--interpreter", "python3.11"])
     settings["maturin.build-args"] = arguments
     return settings
 
@@ -89,8 +185,12 @@ def build_wheel(
     config_settings: Mapping[str, Any] | None = None,
     metadata_directory: str | None = None,
 ) -> str:
-    _build_native_cli()
-    return maturin.build_wheel(wheel_directory, _wheel_config(config_settings), metadata_directory)
+    target = _wheel_target()
+    with _cross_pyo3_environment(target):
+        _build_native_cli()
+        return maturin.build_wheel(
+            wheel_directory, _wheel_config(config_settings), metadata_directory
+        )
 
 
 def build_editable(
@@ -98,6 +198,9 @@ def build_editable(
     config_settings: Mapping[str, Any] | None = None,
     metadata_directory: str | None = None,
 ) -> str:
+    target = _wheel_target()
+    if target is not None:
+        raise RuntimeError("cross-target editable wheels are unsupported; build a wheel instead")
     _build_native_cli()
     return maturin.build_editable(
         wheel_directory, _wheel_config(config_settings), metadata_directory

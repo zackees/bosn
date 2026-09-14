@@ -23,6 +23,8 @@ bosn --version
 ```
 
 Platform wheels contain the matching `bosn-native` binary and Python extension.
+The extension uses PyO3's `abi3-py310` ABI, so Bosn supports CPython 3.10 and
+newer with one platform wheel rather than publishing cp311-only artifacts.
 The Python launcher resolves that binary from its installed package directory;
 it never selects a `bosn` executable from `PATH`.
 

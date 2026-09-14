@@ -66,6 +66,16 @@ downstream consumer migrations (Soldr, clud, and kernal-api), exact published
 Actions evidence. Existing Docker state must remain protected during that
 cutover; removing compatibility code does not authorize deleting data.
 
+macOS artifact builds no longer consume hosted Mac capacity: the two Darwin
+wheel targets are cross-built on Linux with Soldr's pinned LLVM 21.1.5 and
+Apple SDK 14.5, then checked as Mach-O artifacts on Linux.  Release is gated
+on those jobs, `ci/verify_release_dependencies.py` proving exact published
+`kernal-api 0.1.0`, and closure of the downstream-consumer items above.  A
+real x86_64 macOS guest execution lane is advisory follow-up work; arm64 has
+no Linux-hosted execution mechanism.  The package native module is
+`abi3-py310`: all platform wheels carry `cp310-abi3` tags and package metadata
+permits CPython 3.10+, rather than releasing cp311-only Darwin wheels.
+
 ## Verification
 
 The retirement slice is checked by:
@@ -92,9 +102,12 @@ uv run pytest tests/test_native_wheel.py -q
 python ci/verify_installed_wheel.py 'dist/bosn-*.whl'
 ```
 
-GitHub Actions runs that proof on Python 3.11 for Linux, macOS, and Windows.
-Those native-wheel lanes do not need Docker; the separate Linux lane remains
-the Docker integration test.
+GitHub Actions runs the installed-wheel proof on Python 3.11 for Linux and
+Windows.  Both Darwin wheels are instead built on Linux by Soldr and checked
+with `ci/verify_cross_wheel.py`: `cp310-abi3` tags/version, Mach-O architecture/filetype,
+deployment floor, system dylibs, native CLI version string, and absence of
+ELF/OpenSSL contamination.  Those native-wheel lanes do not need Docker; the
+separate Linux lane remains the Docker integration test.
 
 The Linux Rust CI lane also validates the reviewed `kernal-api` revision and
 the locked Cargo resolution before running every ordinary Rust test. The PyO3
