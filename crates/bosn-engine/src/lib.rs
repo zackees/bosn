@@ -35,6 +35,22 @@ pub struct GuestSshCommand {
     pub command: String,
 }
 
+/// One SCP upload to the fixed loopback macOS guest. Like
+/// [`GuestSshCommand`], this deliberately has no raw argv or endpoint surface.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuestScpCommand {
+    /// The manifest-derived guest account.
+    pub user: String,
+    /// The manifest-derived published loopback SSH port.
+    pub port: u16,
+    /// The daemon-owned guest private key.
+    pub identity_file: PathBuf,
+    /// One already-validated regular file beneath the canonical workspace.
+    pub source: PathBuf,
+    /// One already-normalized guest path.
+    pub destination: String,
+}
+
 impl GuestSshCommand {
     fn args(&self) -> Vec<OsString> {
         // `-F /dev/null` is intentional: host-wide and per-user SSH config
@@ -79,6 +95,48 @@ impl GuestSshCommand {
     }
 }
 
+impl GuestScpCommand {
+    fn args(&self) -> Vec<OsString> {
+        // Keep this synchronized with GuestSshCommand: SCP must not consult
+        // ambient SSH configuration, credentials, agents, or known-host state.
+        [
+            "-F",
+            "/dev/null",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "PasswordAuthentication=no",
+            "-o",
+            "KbdInteractiveAuthentication=no",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "GlobalKnownHostsFile=/dev/null",
+            "-o",
+            "LogLevel=ERROR",
+            "-i",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .chain(std::iter::once(self.identity_file.clone().into_os_string()))
+        .chain(["-P"].into_iter().map(OsString::from))
+        .chain(
+            [
+                self.port.to_string(),
+                self.source.to_string_lossy().into_owned(),
+                format!("{}@127.0.0.1:{}", self.user, self.destination),
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .collect()
+    }
+}
+
 /// The locally installed OpenSSH client, restricted to [`GuestSshCommand`].
 /// It has no raw argv, host, port, or credential configuration surface.
 #[derive(Clone, Debug)]
@@ -106,6 +164,36 @@ impl GuestSshEngine {
         // The shared bounded process machinery is intentionally reused here;
         // its caller cannot reach `DockerEngine::with_args` because this
         // conversion stays inside the typed SSH adapter.
+        let transport = DockerEngine::from_parts(&self.binary, command.args());
+        transport.stream(options, cancellation, events).await
+    }
+}
+
+/// The locally installed OpenSSH SCP client, restricted to
+/// [`GuestScpCommand`].
+#[derive(Clone, Debug)]
+pub struct GuestScpEngine {
+    binary: PathBuf,
+}
+
+impl GuestScpEngine {
+    #[must_use]
+    pub fn system() -> Self {
+        Self {
+            binary: "scp".into(),
+        }
+    }
+
+    /// Stream one bounded manifest payload upload. A failed upload prevents
+    /// the subsequent task from starting, so callers need not retain task
+    /// completion uncertainty for this operation.
+    pub async fn stream(
+        &self,
+        command: &GuestScpCommand,
+        options: RunOptions,
+        cancellation: Option<&CancellationToken>,
+        events: &async_engine::Sender<EngineEvent>,
+    ) -> Result<CommandResult, CommandError> {
         let transport = DockerEngine::from_parts(&self.binary, command.args());
         transport.stream(options, cancellation, events).await
     }
@@ -691,7 +779,10 @@ fn map_bounded(error: BoundedProcessError) -> CommandError {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandError, CommandResult, DockerDoctorState, GuestSshCommand, doctor_report};
+    use super::{
+        CommandError, CommandResult, DockerDoctorState, GuestScpCommand, GuestSshCommand,
+        doctor_report,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -713,6 +804,28 @@ mod tests {
         assert!(args.contains(&"BatchMode=yes".into()));
         assert!(args.contains(&"IdentitiesOnly=yes".into()));
         assert_eq!(args.last().unwrap(), "echo declared");
+        assert!(!args.iter().any(|value| value.contains("ProxyCommand")));
+    }
+
+    #[test]
+    fn guest_scp_command_is_fixed_to_loopback_and_uses_scp_port_spelling() {
+        let command = GuestScpCommand {
+            user: "runner".into(),
+            port: 2222,
+            identity_file: PathBuf::from("/state/guest-ssh/key"),
+            source: PathBuf::from("/workspace/out/archive.tar.zst"),
+            destination: "~/archive.tar.zst".into(),
+        };
+        let args = command
+            .args()
+            .into_iter()
+            .map(|value| value.into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert!(args.windows(2).any(|pair| pair == ["-F", "/dev/null"]));
+        assert!(args.windows(2).any(|pair| pair == ["-P", "2222"]));
+        assert!(args.contains(&"/workspace/out/archive.tar.zst".into()));
+        assert_eq!(args.last().unwrap(), "runner@127.0.0.1:~/archive.tar.zst");
+        assert!(args.contains(&"IdentitiesOnly=yes".into()));
         assert!(!args.iter().any(|value| value.contains("ProxyCommand")));
     }
 
