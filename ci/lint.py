@@ -16,6 +16,7 @@ CHECKS: list[list[str]] = [
     # KeyboardInterrupt sibling handler, which is the actual defect.
     [sys.executable, str(ROOT / "ci" / "lint_kbi.py")],
     [sys.executable, str(ROOT / "ci" / "lint_no_macos_runners.py")],
+    [sys.executable, str(ROOT / "ci" / "lint_no_vcpkg_bootstrap.py")],
 ]
 
 
