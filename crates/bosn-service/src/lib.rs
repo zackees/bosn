@@ -415,6 +415,13 @@ struct ManifestRecoveryContract {
     manifest: String,
     image_identity: String,
     guest: bool,
+    /// Immutable per-success identity. A later successful ensure gets a new
+    /// intent even if its generation is unchanged, so a prior policy-off or
+    /// drift disable cannot accidentally suppress the renewed declaration.
+    intent_id: String,
+    /// Derived from the manifest's existing default-stack semantics by the
+    /// executor that performed this successful ensure.
+    autostart: bool,
 }
 
 /// Fixed engine seam for native manifest restart recovery. It exposes only
@@ -572,6 +579,11 @@ pub struct SetupEnsureExecution {
     /// Manifest-derived named volumes proven/created before the container.
     /// Generic setup-document ensures always leave this empty.
     pub volumes: Vec<ManifestVolumeResource>,
+    /// Native-manifest execution only: whether the exact successfully
+    /// materialized stack was the manifest's selected default stack. This is
+    /// an executor fact rather than an RPC option, so a client cannot turn a
+    /// managed object into a daemon-start candidate.
+    pub manifest_autostart: bool,
 }
 
 /// Exact durable facts for a manifest-owned named volume.  These are executor
@@ -786,6 +798,7 @@ impl SetupEnsureExecutor for DockerSetupEnsureExecutor {
                     &plan.workspace_root.to_string_lossy(),
                 ),
                 volumes: Vec::new(),
+                manifest_autostart: false,
             })
         })
     }
@@ -847,6 +860,7 @@ impl ManifestEnsureExecutor for DockerManifestEnsureExecutor {
                 generation,
                 volumes,
                 is_guest,
+                autostart,
                 ..
             } = runtime;
             let (events, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
@@ -910,6 +924,7 @@ impl ManifestEnsureExecutor for DockerManifestEnsureExecutor {
                     workspace,
                 },
                 volumes,
+                manifest_autostart: autostart,
             })
         })
     }
@@ -1337,6 +1352,14 @@ async fn manifest_stack_plan(
     let stack = manifest
         .stack(request_stack)
         .map_err(|_| "selected manifest stack does not exist".to_owned())?;
+    // `default` is the only existing manifest declaration that selects an
+    // application at document scope. Reuse that established selection rule
+    // for daemon-start intent: exactly one explicit default wins, and a
+    // one-stack manifest is implicitly selected. A non-default stack can
+    // still be explicitly ensured and run; it is simply not a startup target.
+    let autostart = manifest
+        .default_stack()
+        .is_ok_and(|default| default.name == stack.name);
     let macos_guest =
         derive_manifest_macos_guest(stack, &observe_manifest_guest_host_capability())?;
     if stack.env.len() > bosn_core::MAX_ENVIRONMENT_ENTRIES
@@ -1537,6 +1560,7 @@ async fn manifest_stack_plan(
         generation,
         volumes,
         is_guest: stack.kind.as_deref() == Some("macos-x64-guest"),
+        autostart,
         guest_task,
     })
 }
@@ -1605,6 +1629,9 @@ struct ManifestRuntimePlan {
     generation: String,
     volumes: Vec<ManifestVolumeResource>,
     is_guest: bool,
+    /// Derived only from the parsed document's existing default-stack
+    /// selection semantics; never caller-provided.
+    autostart: bool,
     /// Remote-only details retained outside `SetupPlan`: the setup container
     /// receipt must stay free of a Linux-container workdir for a VM guest.
     guest_task: Option<ManifestGuestTask>,
@@ -2383,6 +2410,7 @@ impl SetupAdoptExecutor for DockerSetupAdoptExecutor {
                     &plan.workspace_root.to_string_lossy(),
                 ),
                 volumes: Vec::new(),
+                manifest_autostart: false,
             })
         })
     }
@@ -4398,6 +4426,10 @@ enum DbCommand {
     ManifestRecoveryContracts {
         reply: async_engine::OneshotSender<Result<Vec<String>, Error>>,
     },
+    ManifestAutostartIntentDisabled {
+        detail: String,
+        reply: async_engine::OneshotSender<Result<bool, Error>>,
+    },
     ManifestRecoveryAuthorized {
         contract: ManifestRecoveryContract,
         reply: async_engine::OneshotSender<Result<bool, Error>>,
@@ -5328,7 +5360,7 @@ fn launch_started_setup_jobs(
                         .await;
                     match result {
                         Ok(execution) => {
-                            let contract = manifest_recovery_contract(&request, &execution);
+                            let contract = manifest_recovery_contract(&request, &execution, id);
                             let (reply, wait) = async_engine::oneshot_channel();
                             let persisted = match contract {
                                 Err(error) => Err(error),
@@ -5445,7 +5477,7 @@ async fn execute_manifest_converge(
             .execute(ensure_request.clone(), cancellation, logs, registry)
             .await
             .map_err(|error| format!("manifest converge stopped at stack {stack}: {error}"))?;
-        let contract = manifest_recovery_contract(&ensure_request, &execution)
+        let contract = manifest_recovery_contract(&ensure_request, &execution, id)
             .map_err(|error| format!("manifest converge stopped at stack {stack}: {error}"))?;
         let receipt = execution.receipt.clone();
         let (reply, wait) = async_engine::oneshot_channel();
@@ -5703,6 +5735,7 @@ fn manifest_app_task_digest(request: &ManifestAppTaskJobRequest) -> String {
 fn manifest_recovery_contract(
     request: &ManifestEnsureJobRequest,
     execution: &SetupEnsureExecution,
+    job_id: u64,
 ) -> Result<ManifestRecoveryContract, String> {
     let resource = &execution.resource;
     if !safe_manifest_relative_path(&request.manifest)
@@ -5723,12 +5756,14 @@ fn manifest_recovery_contract(
         manifest: request.manifest.clone(),
         image_identity: execution.image.generation.clone(),
         guest: resource.id.starts_with("manifest-guest:"),
+        intent_id: format!("job-{job_id}"),
+        autostart: execution.manifest_autostart,
     })
 }
 
 fn manifest_recovery_contract_json(contract: &ManifestRecoveryContract) -> String {
     serde_json::json!({
-        "v": 1,
+        "v": 2,
         "resource_id": contract.resource_id,
         "name": contract.name,
         "workspace": contract.workspace,
@@ -5737,6 +5772,23 @@ fn manifest_recovery_contract_json(contract: &ManifestRecoveryContract) -> Strin
         "manifest": contract.manifest,
         "image_identity": contract.image_identity,
         "guest": contract.guest,
+        "intent_id": contract.intent_id,
+        "autostart": contract.autostart,
+    })
+    .to_string()
+}
+
+/// Exact durable veto key for one immutable successful desired-state record.
+/// It is deliberately generated only from daemon-written contract fields and
+/// queried with SQLite equality, not a prefix/substring match. This leaves
+/// v5 registry schema stable while making a source/policy veto survive daemon
+/// restarts. A subsequent successful ensure carries a new `intent_id`.
+fn manifest_autostart_intent_detail(contract: &ManifestRecoveryContract) -> String {
+    serde_json::json!({
+        "v": 1,
+        "resource_id": contract.resource_id,
+        "generation": contract.generation,
+        "intent_id": contract.intent_id,
     })
     .to_string()
 }
@@ -5745,7 +5797,7 @@ fn parse_manifest_recovery_contract(detail: &str) -> Option<ManifestRecoveryCont
     let value: serde_json::Value = serde_json::from_str(detail).ok()?;
     let object = value.as_object()?;
     let field = |name: &str| object.get(name)?.as_str().map(str::to_owned);
-    if object.get("v")?.as_u64()? != 1 {
+    if object.get("v")?.as_u64()? != 2 {
         return None;
     }
     let contract = ManifestRecoveryContract {
@@ -5757,12 +5809,19 @@ fn parse_manifest_recovery_contract(detail: &str) -> Option<ManifestRecoveryCont
         manifest: field("manifest")?,
         image_identity: field("image_identity")?,
         guest: object.get("guest")?.as_bool()?,
+        intent_id: field("intent_id")?,
+        autostart: object.get("autostart")?.as_bool()?,
     };
     (contract.resource_id.len() <= 512
         && contract.name.len() <= 512
         && contract.workspace.len() <= 4096
         && contract.stack.len() <= 256
         && contract.image_identity.len() <= 1024
+        && contract.intent_id.len() <= 64
+        && contract.intent_id.starts_with("job-")
+        && contract.intent_id[4..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
         && safe_manifest_relative_path(&contract.manifest)
         && contract.generation.starts_with("sha256:")
         && ((contract.guest && contract.resource_id.starts_with("manifest-guest:"))
@@ -5819,6 +5878,20 @@ async fn recover_manifest_startup(
         if !seen.insert(contract.resource_id.clone()) {
             continue;
         }
+        // A prior source/policy veto is durable and exact to this successful
+        // intent. Do not repeatedly reopen a removed workspace or recreate
+        // engine pressure on every daemon launch. Fresh successful ensure is
+        // the only path that creates a new intent.
+        if !contract.autostart {
+            continue;
+        }
+        if actor.manifest_autostart_intent_disabled(&contract).await? {
+            events.push((
+                "manifest.autostart.already_disabled".into(),
+                manifest_autostart_intent_detail(&contract),
+            ));
+            continue;
+        }
         if deadline.remaining().is_zero() {
             events.push(("manifest.recovery.deadline".into(), "bounded".into()));
             break;
@@ -5838,11 +5911,27 @@ async fn recover_manifest_startup(
         {
             Ok(Ok(runtime))
                 if runtime.generation == contract.generation
-                    && runtime.is_guest == contract.guest =>
+                    && runtime.is_guest == contract.guest
+                    && runtime.autostart =>
             {
                 runtime
             }
+            Ok(Ok(runtime)) if !runtime.autostart => {
+                events.push((
+                    "manifest.autostart.disabled".into(),
+                    manifest_autostart_intent_detail(&contract),
+                ));
+                events.push((
+                    "manifest.recovery.refused_policy".into(),
+                    "default_stack_changed".into(),
+                ));
+                continue;
+            }
             Ok(Ok(_)) => {
+                events.push((
+                    "manifest.autostart.disabled".into(),
+                    manifest_autostart_intent_detail(&contract),
+                ));
                 events.push((
                     "manifest.recovery.refused_source".into(),
                     "generation_mismatch".into(),
@@ -5850,6 +5939,10 @@ async fn recover_manifest_startup(
                 continue;
             }
             Ok(Err(_)) => {
+                events.push((
+                    "manifest.autostart.disabled".into(),
+                    manifest_autostart_intent_detail(&contract),
+                ));
                 events.push((
                     "manifest.recovery.refused_source".into(),
                     "unavailable_or_invalid".into(),
@@ -6348,6 +6441,20 @@ impl RegistryActor {
         let (reply, wait) = async_engine::oneshot_channel();
         self.sender
             .send(DbCommand::ManifestRecoveryContracts { reply })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
+    async fn manifest_autostart_intent_disabled(
+        &self,
+        contract: &ManifestRecoveryContract,
+    ) -> Result<bool, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::ManifestAutostartIntentDisabled {
+                detail: manifest_autostart_intent_detail(contract),
+                reply,
+            })
             .await
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
@@ -6952,6 +7059,22 @@ async fn registry_actor(
                     }
                 }
             }
+            DbCommand::ManifestAutostartIntentDisabled { detail, reply } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = registry.manifest_autostart_intent_disabled(&detail);
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
             DbCommand::ManifestRecoveryAuthorized { contract, reply } => {
                 let worker = async_engine::launch_blocking(move || {
                     let result = registry.manifest_recovery_container_active(
@@ -6960,6 +7083,7 @@ async fn registry_actor(
                         &contract.stack,
                         &contract.generation,
                         &contract.workspace,
+                        &manifest_autostart_intent_detail(&contract),
                     );
                     (registry, result)
                 });
@@ -7386,6 +7510,15 @@ fn record_manifest_ensure(
     )?;
     transaction.append_event(
         now,
+        if contract.autostart {
+            "manifest.autostart.intent_recorded"
+        } else {
+            "manifest.autostart.not_selected"
+        },
+        &manifest_autostart_intent_detail(contract),
+    )?;
+    transaction.append_event(
+        now,
         "manifest.ensure.succeeded",
         &format!("job_id={job_id}"),
     )?;
@@ -7529,7 +7662,10 @@ fn append_manifest_recovery_events(
         .as_secs_f64();
     let mut transaction = registry.begin_immediate()?;
     for (kind, detail) in events {
-        if !kind.starts_with("manifest.recovery.") || kind.len() > 128 || detail.len() > 1024 {
+        if !(kind.starts_with("manifest.recovery.") || kind.starts_with("manifest.autostart."))
+            || kind.len() > 128
+            || detail.len() > 1024
+        {
             return Err(bosn_registry::Error::BadRow("manifest recovery event"));
         }
         transaction.append_event(now, kind, detail)?;
@@ -9787,6 +9923,7 @@ mod tests {
                 workspace: workspace.into(),
             },
             volumes: Vec::new(),
+            manifest_autostart: false,
         }
     }
 
@@ -9813,6 +9950,7 @@ mod tests {
                 workspace: workspace.into(),
             },
             volumes: Vec::new(),
+            manifest_autostart: false,
         }
     }
 
@@ -9828,6 +9966,8 @@ mod tests {
             manifest: "bosn.toml".into(),
             image_identity: execution.image.generation.clone(),
             guest: false,
+            intent_id: "job-1".into(),
+            autostart: true,
         }
     }
 
@@ -9990,6 +10130,37 @@ mod tests {
                 }))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn manifest_startup_selection_uses_only_existing_default_stack_semantics() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let image = format!("example.invalid/app@sha256:{}", "a".repeat(64));
+        std::fs::write(
+            workspace.join("bosn.toml"),
+            format!(
+                "[stack.web]\nimage = '{image}'\ndefault = true\n[stack.worker]\nimage = '{image}'\n"
+            ),
+        )
+        .unwrap();
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for (stack, expected) in [("web", true), ("worker", false)] {
+            let plan = runtime
+                .run(manifest_stack_setup_plan(&ManifestEnsureJobRequest {
+                    workspace: workspace.clone(),
+                    manifest: "bosn.toml".into(),
+                    stack: stack.into(),
+                    deadline: Duration::from_secs(1),
+                    output_limit: 64,
+                }))
+                .unwrap();
+            assert_eq!(plan.autostart, expected, "{stack}");
+        }
     }
 
     #[test]
@@ -10634,7 +10805,7 @@ mod tests {
         let image = format!("example.invalid/app@sha256:{}", "a".repeat(64));
         std::fs::write(
             workspace.join("bosn.toml"),
-            format!("[stack.app]\nimage = '{image}'\n"),
+            format!("[stack.app]\nimage = '{image}'\ndefault = true\n"),
         )
         .unwrap();
         let runtime = RuntimeBuilder::current_thread()
@@ -10669,8 +10840,9 @@ mod tests {
                     workspace: plan.plan.workspace_root.to_string_lossy().into_owned(),
                 },
                 volumes: Vec::new(),
+                manifest_autostart: true,
             };
-            let contract = manifest_recovery_contract(&request, &execution).unwrap();
+            let contract = manifest_recovery_contract(&request, &execution, 1).unwrap();
             let mut registry = Registry::create_writer(
                 state.join("registry.sqlite3"),
                 "11111111-2222-4333-8444-555555555555",
@@ -10722,7 +10894,7 @@ mod tests {
         let image = format!("example.invalid/app@sha256:{}", "a".repeat(64));
         std::fs::write(
             workspace.join("bosn.toml"),
-            format!("[stack.app]\nimage = '{image}'\n"),
+            format!("[stack.app]\nimage = '{image}'\ndefault = true\n"),
         )
         .unwrap();
         RuntimeBuilder::current_thread()
@@ -10749,16 +10921,17 @@ mod tests {
                         generation: plan.generation.clone(),
                         workspace: plan.plan.workspace_root.to_string_lossy().into_owned(),
                     },
-                    image: SetupEnsureImageResource {
-                        id: "manifest-image:sha256:recovery-test".into(),
-                        name: "manifest-image:sha256:recovery-test".into(),
-                        stack: "app".into(),
-                        generation: "sha256:recovery-test".into(),
-                        workspace: plan.plan.workspace_root.to_string_lossy().into_owned(),
-                    },
-                    volumes: Vec::new(),
-                };
-                let contract = manifest_recovery_contract(&request, &execution).unwrap();
+                image: SetupEnsureImageResource {
+                    id: "manifest-image:sha256:recovery-test".into(),
+                    name: "manifest-image:sha256:recovery-test".into(),
+                    stack: "app".into(),
+                    generation: "sha256:recovery-test".into(),
+                    workspace: plan.plan.workspace_root.to_string_lossy().into_owned(),
+                },
+                volumes: Vec::new(),
+                manifest_autostart: true,
+            };
+                let contract = manifest_recovery_contract(&request, &execution, 1).unwrap();
                 let mut registry = Registry::create_writer(
                     state.join("registry.sqlite3"),
                     "11111111-2222-4333-8444-555555555555",
@@ -10771,7 +10944,7 @@ mod tests {
                 // the old container, let alone starting it.
                 std::fs::write(
                     workspace.join("bosn.toml"),
-                    format!("[stack.app]\nimage = '{image}'\n[stack.app.env]\nCHANGED = 'yes'\n"),
+                    format!("[stack.app]\nimage = '{image}'\ndefault = true\n[stack.app.env]\nCHANGED = 'yes'\n"),
                 )
                 .unwrap();
                 let fake = Arc::new(FakeManifestRecoveryExecutor {
@@ -10781,7 +10954,7 @@ mod tests {
                         image_identity: contract.image_identity.clone(),
                         managed: "v1".into(),
                         content: content.into(),
-                        container: name,
+                        container: name.clone(),
                     })),
                     starts: AtomicUsize::new(0),
                 });
@@ -10804,6 +10977,49 @@ mod tests {
                         .items
                         .iter()
                         .any(|event| event.kind == "manifest.recovery.refused_source")
+                );
+                assert!(
+                    events
+                        .items
+                        .iter()
+                        .any(|event| event.kind == "manifest.autostart.disabled")
+                );
+                // The durable veto is consulted before source proof on the
+                // next daemon start. A changed/missing worktree therefore
+                // cannot keep generating engine inspection attempts.
+                let vetoed = Arc::new(FakeManifestRecoveryExecutor {
+                    observed: Mutex::new(Some(SetupReconcileObserved {
+                        name: format!("/{name}"),
+                        running: false,
+                        image_identity: contract.image_identity.clone(),
+                        managed: "v1".into(),
+                        content: contract
+                            .generation
+                            .strip_prefix("sha256:")
+                            .unwrap()
+                            .into(),
+                        container: name.clone(),
+                    })),
+                    starts: AtomicUsize::new(0),
+                });
+                let server = async_engine::launch(
+                    Service::new(state.clone())
+                        .with_manifest_recovery_executor(vetoed.clone())
+                        .serve(),
+                );
+                let client = wait_for_client(&state).await;
+                assert_eq!(vetoed.starts.load(Ordering::SeqCst), 0);
+                client.shutdown().await.unwrap();
+                stopped(server).await;
+                let events = Registry::open_read_only(state.join("registry.sqlite3"))
+                    .unwrap()
+                    .setup_ensure_events(0, 32)
+                    .unwrap();
+                assert!(
+                    events
+                        .items
+                        .iter()
+                        .any(|event| event.kind == "manifest.autostart.already_disabled")
                 );
             });
     }
@@ -11170,6 +11386,7 @@ mod tests {
                     &contract.stack,
                     &contract.generation,
                     &contract.workspace,
+                    &manifest_autostart_intent_detail(&contract),
                 )
                 .unwrap()
         };
@@ -11748,6 +11965,7 @@ mod tests {
                         workspace: request.workspace.to_string_lossy().into_owned(),
                     },
                     volumes: Vec::new(),
+                    manifest_autostart: false,
                 })
             })
         }
@@ -11804,6 +12022,7 @@ mod tests {
                         workspace,
                     },
                     volumes: Vec::new(),
+                    manifest_autostart: false,
                 })
             })
         }
@@ -13054,6 +13273,7 @@ mod tests {
                 workspace: workspace.into(),
             },
             volumes: Vec::new(),
+            manifest_autostart: false,
         };
         assert!(matches!(
             record_setup_ensure(&mut registry, 7, &execution),
