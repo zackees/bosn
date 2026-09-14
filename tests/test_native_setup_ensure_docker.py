@@ -727,6 +727,97 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
             _remove_exact_managed_container(name, content)
 
 
+def test_native_manifest_task_inherits_declared_workspace_binds_and_workdir(
+    tmp_path: Path,
+) -> None:
+    """Manifest binds/workdir remain declaration data through managed exec.
+
+    The workdir is selected only by the manifest and reaches the persistent
+    app at container creation.  The named task has no mount, workdir, or raw
+    Docker input, yet observes both a writable workspace bind and a separate
+    readonly bind.  This is intentionally opt-in because it needs the pinned
+    MySQL image and a live local Docker daemon.
+    """
+
+    image_id = _pinned_image_id(PINNED_MANIFEST_MYSQL)
+    state_dir = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    writable = workspace / "writable"
+    readonly = workspace / "readonly"
+    writable.mkdir(parents=True)
+    readonly.mkdir()
+    unique = f"manifest-bind-{os.getpid()}-{time.time_ns()}"
+    (readonly / "proof.txt").write_text(unique + "\n", encoding="utf-8")
+    manifest = workspace / "bosn.toml"
+    manifest.write_text(
+        "[stack.linux]\n"
+        f"image = '{PINNED_MANIFEST_MYSQL}'\n"
+        "workdir = '/workspace/writable'\n"
+        "[stack.linux.env]\n"
+        "MYSQL_ALLOW_EMPTY_PASSWORD = 'yes'\n"
+        "[stack.linux.mounts.writable]\n"
+        "source = 'writable'\n"
+        "destination = '/workspace/writable'\n"
+        "[stack.linux.mounts.readonly]\n"
+        "source = 'readonly'\n"
+        "destination = '/workspace/readonly'\n"
+        "readonly = true\n"
+        "[task.prove]\n"
+        "stack = 'linux'\n"
+        "cmd = '''test \"$(pwd)\" = /workspace/writable && "
+        f"test \"$(cat /workspace/readonly/proof.txt)\" = {unique} && "
+        "! touch /workspace/readonly/must-remain-readonly && "
+        "touch app-task-ran.txt'''\n",
+        encoding="utf-8",
+    )
+    container_name: str | None = None
+    content_sha256: str | None = None
+    try:
+        client = bosn.Client(state_dir)
+        with _production_daemon(state_dir) as (_, daemon):
+            _wait_for_daemon(client, daemon)
+            ensure_job = client.submit_manifest_ensure(
+                workspace,
+                "bosn.toml",
+                "linux",
+                deadline_ms=90_000,
+                output_limit=1_048_576,
+            )
+            assert isinstance(_wait_for_success(client, ensure_job), tuple)
+            container = next(
+                record
+                for record in client.registry_resources(limit=16).records
+                if record.kind == "container"
+            )
+            content_sha256 = container.generation.removeprefix("sha256:")
+            container_name = f"bosn-setup-{content_sha256}"
+            assert _docker(
+                "container",
+                "inspect",
+                "--format",
+                "{{.Config.WorkingDir}}",
+                container_name,
+            ).stdout.strip() == "/workspace/writable"
+            observed = _inspect_container(container_name)
+            assert observed is not None
+            assert observed[2] == image_id
+
+            task_job = client.submit_manifest_app_task(
+                workspace,
+                "bosn.toml",
+                "linux",
+                "prove",
+                deadline_ms=90_000,
+                output_limit=1_048_576,
+            )
+            assert isinstance(_wait_for_success(client, task_job), tuple)
+            assert (writable / "app-task-ran.txt").is_file()
+            assert not (readonly / "must-remain-readonly").exists()
+    finally:
+        if container_name is not None and content_sha256 is not None:
+            _remove_exact_managed_container(container_name, content_sha256)
+
+
 def test_native_python_client_runs_declared_task_inside_ensured_managed_app(
     tmp_path: Path,
 ) -> None:

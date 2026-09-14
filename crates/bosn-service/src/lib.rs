@@ -24,6 +24,7 @@ use kernal_api::{
     daemon_frame_v1::{
         DaemonFrame, DaemonFrameCodec, DaemonFrameDecode, DaemonFrameKind, DaemonPayloadEncoding,
     },
+    hash::Sha256Hasher,
     platform::{
         fs,
         ipc::{self, AsyncListener, AsyncStream, Endpoint, EndpointAddressCandidates},
@@ -918,9 +919,7 @@ async fn manifest_stack_plan(
         || stack.kind.is_some()
         || stack.guest.is_some()
         || !stack.volumes.is_empty()
-        || !stack.mounts.is_empty()
         || !stack.tmpfs.is_empty()
-        || stack.workdir.is_some()
         || stack.family.is_some()
     {
         return Err("selected manifest stack uses an unsupported runtime field".into());
@@ -944,11 +943,25 @@ async fn manifest_stack_plan(
     {
         return Err("selected manifest stack has unsafe environment data".into());
     }
+    // The legacy manifest preserves bind-source spelling because it is also
+    // used by the old Python executor.  The native runtime does not pass that
+    // spelling to Docker.  It resolves it beneath this exact canonical
+    // workspace and converts it into the typed setup representation first.
+    let mounts = stack
+        .mounts
+        .iter()
+        .map(|mount| manifest_workspace_mount(&workspace, mount))
+        .collect::<Result<Vec<_>, _>>()?;
+    let workdir = stack
+        .workdir
+        .as_deref()
+        .map(|value| manifest_workdir_to_workspace_relative(&workspace, value, &mounts))
+        .transpose()?;
     let digest = image
         .rsplit_once("@sha256:")
         .map(|(_, value)| format!("sha256:{value}"))
         .expect("validated pinned image has digest");
-    let generation = stack_generation_async(
+    let base_generation = stack_generation_async(
         &manifest,
         stack,
         &workspace,
@@ -961,6 +974,11 @@ async fn manifest_stack_plan(
     )
     .await
     .map_err(|_| "manifest generation could not be derived".to_owned())?;
+    // `bosn-generation` deliberately excludes workdir from the historical
+    // content identity because legacy `docker exec` supplied it per task.
+    // Native setup creates a persistent container with its workdir and binds,
+    // so roll it whenever that effective lifecycle shape changes.
+    let generation = manifest_runtime_generation(&base_generation, &mounts, workdir.as_deref());
     let content_sha256 = generation
         .strip_prefix("sha256:")
         .ok_or_else(|| "manifest generation is invalid".to_owned())?
@@ -989,9 +1007,9 @@ async fn manifest_stack_plan(
     let app = SetupApp {
         source: SetupSource::PinnedImage(image.clone()),
         environment: stack.env.clone(),
-        workdir: None,
+        workdir,
         command: None,
-        mounts: Vec::new(),
+        mounts,
     };
     Ok((
         SetupPlan {
@@ -1007,6 +1025,181 @@ async fn manifest_stack_plan(
         },
         generation,
     ))
+}
+
+/// Convert one legacy manifest bind into the narrower workspace-relative setup
+/// bind.  Absolute legacy sources are accepted only when their canonical path
+/// is inside the selected workspace; callers never get to name a host path at
+/// the typed engine boundary.
+fn manifest_workspace_mount(
+    workspace: &Path,
+    mount: &bosn_core::manifest::Mount,
+) -> Result<bosn_core::WorkspaceMount, String> {
+    let source = manifest_workspace_member(workspace, &mount.source)?;
+    if !normalized_container_path(&mount.destination) {
+        return Err("manifest mount target is not a normalized absolute path".into());
+    }
+    Ok(bosn_core::WorkspaceMount {
+        source,
+        target: mount.destination.clone(),
+        readonly: mount.readonly,
+    })
+}
+
+/// Resolve a legacy source without allowing an absolute path, `..`, or a
+/// symlink to redirect the bind outside the selected canonical workspace.
+/// The output is canonical workspace-relative spelling suitable for
+/// `WorkspaceMount`, not the original caller/manifest spelling.
+fn manifest_workspace_member(workspace: &Path, source: &str) -> Result<String, String> {
+    if source.is_empty()
+        || source.len() > 4096
+        || source.contains(['\0', '\\'])
+        || is_windows_absolute_path(source)
+    {
+        return Err("manifest mount source is unsafe".into());
+    }
+    let raw = Path::new(source);
+    let candidate = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        if source
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+            && source != "."
+        {
+            return Err("manifest mount source is not a normalized workspace path".into());
+        }
+        workspace.join(raw)
+    };
+    let metadata = fs::context_path_metadata_no_follow(&candidate)
+        .map_err(|_| "declared manifest mount source does not exist".to_owned())?;
+    if metadata.kind == fs::ContextPathKind::Symlink {
+        return Err("declared manifest mount source is a symlink".into());
+    }
+    let canonical = fs::canonical_context_path(&candidate)
+        .map_err(|_| "declared manifest mount source cannot be canonicalized".to_owned())?;
+    let relative = canonical
+        .strip_prefix(workspace)
+        .map_err(|_| "declared manifest mount source escapes workspace".to_owned())?;
+    if relative.as_os_str().is_empty() {
+        return Ok(".".into());
+    }
+    let relative = relative
+        .to_str()
+        .ok_or_else(|| "declared manifest mount source is not UTF-8".to_owned())?;
+    if relative.is_empty()
+        || relative.contains(['\0', '\\', ','])
+        || relative
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err("declared manifest mount source is unsafe".into());
+    }
+    Ok(relative.into())
+}
+
+/// A manifest workdir is an absolute in-container path.  The setup primitive
+/// deliberately stores only workspace-relative workdirs, so translate it
+/// through the most-specific declared bind and reject image-only workdirs.
+fn manifest_workdir_to_workspace_relative(
+    workspace: &Path,
+    workdir: &str,
+    mounts: &[bosn_core::WorkspaceMount],
+) -> Result<String, String> {
+    if !normalized_container_path(workdir) {
+        return Err("manifest workdir is not a normalized absolute path".into());
+    }
+    let selected = mounts
+        .iter()
+        .filter(|mount| container_prefix(workdir, &mount.target))
+        .max_by_key(|mount| mount.target.len())
+        .ok_or_else(|| {
+            "manifest workdir is not covered by a declared workspace mount".to_owned()
+        })?;
+    let suffix = container_relative_suffix(workdir, &selected.target)
+        .expect("container_prefix selected the manifest workdir mount");
+    let relative = if selected.source == "." {
+        if suffix.is_empty() {
+            ".".into()
+        } else {
+            suffix.into()
+        }
+    } else if suffix.is_empty() {
+        selected.source.clone()
+    } else {
+        format!("{}/{suffix}", selected.source)
+    };
+    // A bind of a regular file cannot meaningfully be an application working
+    // directory. Check it here and the typed setup primitive will canonicalize
+    // the same source again immediately before ensure/task application.
+    let source = workspace.join(&selected.source);
+    let metadata = fs::context_path_metadata_no_follow(&source)
+        .map_err(|_| "manifest workdir mount source no longer exists".to_owned())?;
+    if metadata.kind != fs::ContextPathKind::Directory {
+        return Err("manifest workdir must map through a directory bind mount".into());
+    }
+    Ok(relative)
+}
+
+fn normalized_container_path(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 4096
+        && !value.contains(['\0', '\\', ','])
+        && value.starts_with('/')
+        && (value == "/"
+            || !value[1..]
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == ".."))
+}
+
+fn container_prefix(path: &str, prefix: &str) -> bool {
+    prefix == "/"
+        || path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn container_relative_suffix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    if prefix == "/" {
+        return Some(path.strip_prefix('/').unwrap_or(path));
+    }
+    if path == prefix {
+        Some("")
+    } else {
+        path.strip_prefix(prefix)?.strip_prefix('/')
+    }
+}
+
+fn is_windows_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\')
+}
+
+fn manifest_runtime_generation(
+    base_generation: &str,
+    mounts: &[bosn_core::WorkspaceMount],
+    workdir: Option<&str>,
+) -> String {
+    let mut hasher = Sha256Hasher::new();
+    manifest_generation_field(&mut hasher, b"bosn-manifest-runtime-v1");
+    manifest_generation_field(&mut hasher, base_generation.as_bytes());
+    manifest_generation_field(&mut hasher, &(mounts.len() as u64).to_be_bytes());
+    for mount in mounts {
+        manifest_generation_field(&mut hasher, mount.source.as_bytes());
+        manifest_generation_field(&mut hasher, mount.target.as_bytes());
+        manifest_generation_field(&mut hasher, if mount.readonly { b"1" } else { b"0" });
+    }
+    manifest_generation_field(&mut hasher, workdir.unwrap_or("").as_bytes());
+    format!("sha256:{}", hasher.finalize())
+}
+
+fn manifest_generation_field(hasher: &mut Sha256Hasher, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
 }
 
 fn safe_manifest_relative_path(value: &str) -> bool {
@@ -7254,6 +7447,165 @@ mod tests {
                 }))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn manifest_stack_plan_translates_workspace_binds_and_workdir_into_setup_shape() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(workspace.join("project")).unwrap();
+        let image = format!("example.invalid/app@sha256:{}", "a".repeat(64));
+        let write = |workdir: &str, readonly: bool| {
+            std::fs::write(
+                workspace.join("bosn.toml"),
+                format!(
+                    "[stack.app]\nimage = '{image}'\nworkdir = '{workdir}'\n[stack.app.mounts.repo]\nsource = '.'\ndestination = '/repo'\nreadonly = {readonly}\n[stack.app.mounts.project]\nsource = 'project'\ndestination = '/repo/project'\n"
+                ),
+            )
+            .unwrap();
+        };
+        let request = || ManifestEnsureJobRequest {
+            workspace: workspace.clone(),
+            manifest: "bosn.toml".into(),
+            stack: "app".into(),
+            deadline: Duration::from_secs(1),
+            output_limit: 64,
+        };
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        write("/repo/project", true);
+        let (first, first_generation) = runtime.run(manifest_stack_setup_plan(&request())).unwrap();
+        assert_eq!(first.app.workdir.as_deref(), Some("project"));
+        assert_eq!(
+            first.app.mounts,
+            vec![
+                bosn_core::WorkspaceMount {
+                    source: "project".into(),
+                    target: "/repo/project".into(),
+                    readonly: false,
+                },
+                bosn_core::WorkspaceMount {
+                    source: ".".into(),
+                    target: "/repo".into(),
+                    readonly: true,
+                },
+            ]
+        );
+        write("/repo/project", false);
+        let (second, second_generation) =
+            runtime.run(manifest_stack_setup_plan(&request())).unwrap();
+        assert_eq!(second.app.workdir.as_deref(), Some("project"));
+        assert_ne!(first_generation, second_generation);
+        assert_ne!(first.content_sha256, second.content_sha256);
+        write("/repo", false);
+        let (third, third_generation) = runtime.run(manifest_stack_setup_plan(&request())).unwrap();
+        assert_eq!(third.app.workdir.as_deref(), Some("."));
+        assert_ne!(second_generation, third_generation);
+        assert_ne!(second.content_sha256, third.content_sha256);
+    }
+
+    #[test]
+    fn manifest_stack_plan_refuses_mount_sources_outside_the_selected_workspace() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let image = format!("example.invalid/app@sha256:{}", "a".repeat(64));
+        std::fs::write(
+            workspace.join("bosn.toml"),
+            format!(
+                "[stack.app]\nimage = '{image}'\n[stack.app.mounts.bad]\nsource = '{}'\ndestination = '/repo'\n",
+                outside.display()
+            ),
+        )
+        .unwrap();
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert!(
+            runtime
+                .run(manifest_stack_setup_plan(&ManifestEnsureJobRequest {
+                    workspace,
+                    manifest: "bosn.toml".into(),
+                    stack: "app".into(),
+                    deadline: Duration::from_secs(1),
+                    output_limit: 64,
+                }))
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_stack_plan_refuses_a_symlink_mount_source_even_when_it_names_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(workspace.join("real")).unwrap();
+        symlink(workspace.join("real"), workspace.join("link")).unwrap();
+        let image = format!("example.invalid/app@sha256:{}", "a".repeat(64));
+        std::fs::write(
+            workspace.join("bosn.toml"),
+            format!(
+                "[stack.app]\nimage = '{image}'\n[stack.app.mounts.link]\nsource = 'link'\ndestination = '/repo'\n"
+            ),
+        )
+        .unwrap();
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert!(
+            runtime
+                .run(manifest_stack_setup_plan(&ManifestEnsureJobRequest {
+                    workspace,
+                    manifest: "bosn.toml".into(),
+                    stack: "app".into(),
+                    deadline: Duration::from_secs(1),
+                    output_limit: 64,
+                }))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn manifest_stack_task_plan_reuses_declared_binds_and_container_workdir() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(workspace.join("project")).unwrap();
+        let image = format!("example.invalid/app@sha256:{}", "a".repeat(64));
+        std::fs::write(
+            workspace.join("bosn.toml"),
+            format!(
+                "[stack.app]\nimage = '{image}'\nworkdir = '/repo/project'\n[stack.app.mounts.repo]\nsource = '.'\ndestination = '/repo'\n[task.check]\nstack = 'app'\ncmd = 'pwd'\n"
+            ),
+        )
+        .unwrap();
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (plan, _) = runtime
+            .run(manifest_stack_task_setup_plan(&ManifestAppTaskJobRequest {
+                workspace,
+                manifest: "bosn.toml".into(),
+                stack: "app".into(),
+                task_name: "check".into(),
+                deadline: Duration::from_secs(1),
+                output_limit: 64,
+            }))
+            .unwrap();
+        assert_eq!(plan.app.workdir.as_deref(), Some("project"));
+        assert_eq!(plan.app.mounts[0].target, "/repo");
+        assert_eq!(plan.tasks["check"].command, "pwd");
     }
 
     #[test]
