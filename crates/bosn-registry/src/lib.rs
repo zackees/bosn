@@ -1806,6 +1806,20 @@ impl Registry {
         )?;
         rows.into_iter().map(|row| text(&row, 0)).collect()
     }
+    /// Exact durable veto lookup for one daemon-written native-manifest
+    /// desired-state record. The caller supplies a canonical, bounded detail
+    /// key and this intentionally does no JSON/prefix interpretation.
+    pub fn manifest_autostart_intent_disabled(&self, detail: &str) -> Result<bool, Error> {
+        let rows = self.connection.query(
+            "SELECT 1 FROM events WHERE kind='manifest.autostart.disabled' AND detail=? LIMIT 1",
+            &[Value::Text(detail.into())],
+            QueryLimits {
+                max_rows: 1,
+                max_bytes: 64,
+            },
+        )?;
+        Ok(!rows.is_empty())
+    }
     /// Exact, registry-only authorization for restart recovery of one native
     /// manifest container.  This discovers nothing from Docker: the service
     /// supplies a previously daemon-written contract and must independently
@@ -1817,6 +1831,7 @@ impl Registry {
         stack: &str,
         generation: &str,
         workspace: &str,
+        disabled_intent_detail: &str,
     ) -> Result<bool, Error> {
         let rows = self.connection.query(
             "SELECT 1 FROM resources AS r WHERE r.id=? AND r.name=? AND r.stack=? AND r.generation=? AND r.workspace=? \
@@ -1824,12 +1839,14 @@ impl Registry {
                AND (r.id GLOB 'manifest-container:*' OR r.id GLOB 'manifest-guest:*') \
                AND EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id AND u.workspace=? AND u.stack=? AND u.generation=? AND u.state='active') \
                AND NOT EXISTS (SELECT 1 FROM volume_creation_intents AS v WHERE v.workspace=? AND v.stack=?) \
-               AND NOT EXISTS (SELECT 1 FROM execution_sessions AS s WHERE s.container_id=r.id OR s.container_id=r.name) LIMIT 1",
+               AND NOT EXISTS (SELECT 1 FROM execution_sessions AS s WHERE s.container_id=r.id OR s.container_id=r.name) \
+               AND NOT EXISTS (SELECT 1 FROM events AS e WHERE e.kind='manifest.autostart.disabled' AND e.detail=?) LIMIT 1",
             &[
                 Value::Text(id.into()), Value::Text(name.into()), Value::Text(stack.into()),
                 Value::Text(generation.into()), Value::Text(workspace.into()),
                 Value::Text(workspace.into()), Value::Text(stack.into()), Value::Text(generation.into()),
                 Value::Text(workspace.into()), Value::Text(stack.into()),
+                Value::Text(disabled_intent_detail.into()),
             ],
             QueryLimits { max_rows: 1, max_bytes: 128 },
         )?;
@@ -1842,7 +1859,7 @@ impl Registry {
     pub fn setup_ensure_events(&self, offset: usize, limit: usize) -> Result<Page<Event>, Error> {
         page(
             &self.connection,
-            "SELECT id,at,kind,detail FROM events WHERE kind LIKE 'setup.ensure.%' OR kind LIKE 'manifest.recovery.%' OR kind LIKE 'manifest.volume_gc.%' ORDER BY id DESC LIMIT ? OFFSET ?",
+            "SELECT id,at,kind,detail FROM events WHERE kind LIKE 'setup.ensure.%' OR kind LIKE 'manifest.recovery.%' OR kind LIKE 'manifest.autostart.%' OR kind LIKE 'manifest.volume_gc.%' ORDER BY id DESC LIMIT ? OFFSET ?",
             offset,
             limit,
             event,
@@ -1994,7 +2011,7 @@ impl ReadOnlyRegistry {
     pub fn setup_ensure_events(&self, offset: usize, limit: usize) -> Result<Page<Event>, Error> {
         page(
             &self.connection,
-            "SELECT id,at,kind,detail FROM events WHERE kind LIKE 'setup.ensure.%' OR kind LIKE 'manifest.recovery.%' ORDER BY id DESC LIMIT ? OFFSET ?",
+            "SELECT id,at,kind,detail FROM events WHERE kind LIKE 'setup.ensure.%' OR kind LIKE 'manifest.recovery.%' OR kind LIKE 'manifest.autostart.%' ORDER BY id DESC LIMIT ? OFFSET ?",
             offset,
             limit,
             event,

@@ -138,9 +138,21 @@ same mount sources again immediately before its engine operation.
 After a successful native `manifest ensure` or `manifest converge` member, the
 same registry transaction records a bounded daemon-written recovery contract:
 the canonical workspace, safe relative manifest spelling, stack, runtime
-generation, deterministic container name, observed image identity, and guest
-kind. On its next start, before accepting requests, the daemon reads only those
-contracts (never a Docker listing), deduplicates them by resource ID, and:
+generation, deterministic container name, observed image identity, guest kind,
+and immutable successful-ensure intent ID.
+
+The legacy TOML schema has no `autostart` field. Native Bosn therefore does not
+invent a client flag or reinterpret an arbitrary stack as background work. Its
+only startup selection is the existing document-level `default` rule: the one
+`default = true` stack, or the implicit sole stack in a one-stack document.
+Other stacks can be explicitly ensured and have tasks run, but never become
+daemon-start candidates. The selected/default decision is captured only after
+that stack's ensure succeeds. A later successful selected ensure gets a new
+intent ID even if its generation is unchanged.
+
+On its next start, before accepting requests, the daemon reads only those
+contracts (never a Docker listing), deduplicates them by resource ID, and for a
+selected contract:
 
 1. re-reads and re-derives the current manifest stack, including Dockerfile
    context, mounts, volumes, tmpfs, and guest checks;
@@ -152,13 +164,18 @@ contracts (never a Docker listing), deduplicates them by resource ID, and:
 4. starts only a stopped matching container, then re-inspects it to prove it
    is running.
 
-Missing manifests, changed sources, unavailable Dockerfile context, stale or
-retired registry facts, uncertain app-task sessions, pending volume intents,
-missing containers, malformed contracts, label/image/name drift, engine errors,
-and the fixed 20-second startup recovery deadline all fail closed. They neither
-adopt, create, delete, stop, or replace an engine object. Recovery outcomes are
-durably appended as bounded `manifest.recovery.*` events and are observable via
-the existing authenticated `bosn registry setup-ensure-events` CLI/Python/MCP
+Missing manifests, changed sources, unavailable Dockerfile context, a stack
+that is no longer the default, stale or retired registry facts, uncertain
+app-task sessions, pending volume intents, missing containers, malformed
+contracts, label/image/name drift, engine errors, and the fixed 20-second
+startup recovery deadline all fail closed. Source drift/removal or policy-off
+records a durable exact `manifest.autostart.disabled` veto for that successful
+intent; later daemon starts consult it before even reopening the old source. It
+is never cleared implicitly: a new successful selected ensure is the deliberate
+re-enable path. They neither adopt, create, delete, stop, or replace an engine
+object. Recovery outcomes and intent/veto facts are durably appended as bounded
+`manifest.recovery.*` / `manifest.autostart.*` events and are observable via the
+existing authenticated `bosn registry setup-ensure-events` CLI/Python/MCP
 diagnostic page. Dockerfile materialization during source proof remains inside
 owner-private Bosn state; a missing source is never replaced from the cache.
 
@@ -168,6 +185,7 @@ This does not claim completion of manifest migration. Future slices must add
 explicit durable volume release for stack/machine/pinned data, broader Dockerfile forms (alternate
 Dockerfile paths plus selected symlink and empty-directory representation),
 dependency syntax/ordering (if the legacy TOML schema gains an explicit relation), guest SSH/SCP task lifecycle, declarative tasks,
-broader autostart policy, and generation reconciliation. Each must
+an explicit manifest autostart field if a policy beyond default-stack selection
+is required, and generation reconciliation. Each must
 remain daemon-owned and registry-backed rather than reintroducing raw Docker or
 Python business logic.
