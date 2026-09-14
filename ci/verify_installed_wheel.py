@@ -198,6 +198,38 @@ def assert_platform_wheel_contents(wheel: Path) -> None:
         fail(f"wheel is missing this platform executable {executable!r}: {names}")
 
 
+def installed_extension_smoke_script() -> str:
+    """Return the isolated interpreter probe for the native extension."""
+
+    expected_extension = "_native" + platform_extension_suffix()
+    return textwrap.dedent(
+        """
+        import importlib.util
+        import json
+        import os
+        import pathlib
+        import sys
+
+        import bosn
+        from bosn.native_cli import native_executable
+
+        origin = pathlib.Path(importlib.util.find_spec("bosn._native").origin)
+        executable = native_executable()
+        assert pathlib.Path(bosn.__file__).resolve().is_relative_to(
+            pathlib.Path(sys.prefix).resolve()
+        )
+        assert origin.name == "__BOSN_EXPECTED_EXTENSION__"
+        assert executable.is_file()
+        assert executable.name == "bosn-native" + (".exe" if os.name == "nt" else "")
+        versions = {
+            "package_version": bosn.__version__,
+            "native_version": bosn.native_version(),
+        }
+        print(json.dumps(versions))
+        """
+    ).replace("__BOSN_EXPECTED_EXTENSION__", expected_extension)
+
+
 def child_environment(scripts: Path) -> dict[str, str]:
     """Remove checkout/toolchain imports while retaining OS runtime programs."""
 
@@ -410,32 +442,7 @@ def verify_installed_wheel(wheel: Path) -> None:
             [
                 str(python),
                 "-c",
-                textwrap.dedent(
-                    """
-                    import importlib.util
-                    import json
-                    import os
-                    import pathlib
-                    import sys
-
-                    import bosn
-                    from bosn.native_cli import native_executable
-
-                    origin = pathlib.Path(importlib.util.find_spec("bosn._native").origin)
-                    executable = native_executable()
-                    assert pathlib.Path(bosn.__file__).resolve().is_relative_to(
-                        pathlib.Path(sys.prefix).resolve()
-                    )
-                    assert origin.name == "_native.abi3" + (".pyd" if os.name == "nt" else ".so")
-                    assert executable.is_file()
-                    assert executable.name == "bosn-native" + (".exe" if os.name == "nt" else "")
-                    versions = {
-                        "package_version": bosn.__version__,
-                        "native_version": bosn.native_version(),
-                    }
-                    print(json.dumps(versions))
-                    """
-                ),
+                installed_extension_smoke_script(),
             ],
             cwd=workdir,
             env=env,
