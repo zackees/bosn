@@ -80,3 +80,41 @@ The wheel proof builds and installs a fresh artifact without the checkout:
 ```bash
 uv run pytest tests/test_native_wheel.py -q
 ```
+
+## Performance comparison baseline
+
+The durable Phase-0 historical comparison record is
+[`performance-baseline.json`](performance-baseline.json). It points to the exact
+pre-migration revision and retains only the values that revision actually
+reported. In particular, its `raw_samples_ms` fields are `null`: the historical
+commit recorded medians and ranges, not the individual samples. That absence is
+intentional rather than reconstructed data.
+
+To collect the equivalent native surface from a locally built binary:
+
+```bash
+soldr cargo build -p bosn-service --bin bosn --locked
+python ci/native_performance_baseline.py --binary target/debug/bosn --samples 7
+```
+
+The output is a stable JSON document containing native CLI startup, idle daemon
+RSS (or an explicit platform/unsupported record), daemon status latency, and an
+explicit setup-ensure-reuse record. It contains no command lines, paths,
+environment values, or child output. Measurements are wall-clock samples on a
+shared host; caches are not cleared, so compare like-for-like runs rather than
+treating them as a release threshold.
+
+The real Docker reuse probe is deliberately opt-in:
+
+```bash
+python ci/native_performance_baseline.py --binary target/debug/bosn --docker --samples 7
+```
+
+It uses the pinned Alpine image already documented by the native live-Docker
+test, creates a unique disposable setup application, measures completed reuse
+jobs rather than mere submission, and removes only the exact container after
+all of its expected ownership labels match. It never prunes Docker caches or
+uses a label selector to clean up. Without `--docker`, the same JSON schema
+emits `setup_ensure_reuse_latency` as `unsupported` with
+`requires_docker_opt_in`; this makes non-Docker local comparison safe and
+unambiguous.

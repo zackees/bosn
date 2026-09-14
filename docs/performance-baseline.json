@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "purpose": "Issue #153 Phase-0 historical comparison baseline; not a performance promise or release threshold.",
+  "source": {
+    "revision": "a56b72a8d6c42ac7c9e482682f284ce65e83d8c4",
+    "subject": "test(migration): characterize Python state and runtime baseline (#153)",
+    "evidence_path": "docs/migration-rust.md",
+    "evidence_lines_at_source": "169-195"
+  },
+  "host": {
+    "system": "Linux 6.18.48",
+    "architecture": "x86-64",
+    "libc": "glibc 2.42",
+    "python": "3.13.15",
+    "docker": "29.7.2"
+  },
+  "measurement_caveats": [
+    "Observed on a shared development host with concurrent workloads.",
+    "Caches were not cleared.",
+    "Wall-clock figures are comparison starting points, not performance promises.",
+    "The historical wheel figure measures packaging with warm dependencies, not a clean toolchain or dependency build.",
+    "Historical raw per-sample arrays were not recorded; this artifact does not invent them."
+  ],
+  "historical_python_v4": {
+    "native_cli_startup": {
+      "command": "python -m bosn --version",
+      "sample_count": 7,
+      "reported_median_ms": 169.03,
+      "reported_range_ms": [144.8, 269.73],
+      "raw_samples_ms": null
+    },
+    "daemon_status_latency": {
+      "command": "CLI status against an empty registry and running daemon",
+      "sample_count": 7,
+      "reported_median_ms": 141.22,
+      "reported_range_ms": [127.22, 149.52],
+      "raw_samples_ms": null
+    },
+    "idle_daemon_rss": {
+      "unit": "KiB",
+      "reported_value": 30848
+    },
+    "setup_ensure_reuse_latency": {
+      "sample_count": 7,
+      "reported_median_ms": 708.71,
+      "reported_range_ms": [523.79, 1322.81],
+      "raw_samples_ms": null
+    },
+    "additional_historical_values_not_compared_by_native_runner": {
+      "initial_synthetic_ensure_build_ms": 2155.91,
+      "wheel_build_ms": 388.16
+    }
+  }
+}
