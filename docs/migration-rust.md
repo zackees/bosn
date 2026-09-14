@@ -129,7 +129,7 @@ turning the SQLite file into a public API. `bosn registry resources` returns
 managed-resource summaries/details (ID, kind, name, stack, generation, state,
 retention, timestamps) and deliberately omits workspace and scope bindings.
 `bosn registry setup-ensure-events` returns newest-first, cursor-paginated
-`setup.ensure.*` events only. Both accept `--after` and `--limit 1..=64` and
+`setup.ensure.*` plus native `manifest.recovery.*` lifecycle outcomes. Both accept `--after` and `--limit 1..=64` and
 require an already-running daemon; they never create, migrate, or open a
 registry from the CLI process. Equivalent APIs are
 `bosn.Client.registry_resources()` and `bosn.Client.setup_ensure_events()` in

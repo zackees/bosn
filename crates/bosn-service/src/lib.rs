@@ -63,6 +63,11 @@ const SETUP_PREPARE_EVENT_QUEUE: usize = 16;
 const DOCTOR_REGISTRY_DEADLINE: Duration = Duration::from_millis(500);
 const DOCTOR_ENGINE_DEADLINE: Duration = Duration::from_millis(1500);
 const DOCTOR_ENGINE_OUTPUT: usize = 512;
+/// Restart recovery is deliberately bounded and only covers records created
+/// by this native manifest runtime.  It never scans Docker for candidates.
+const MANIFEST_RECOVERY_MAX_CONTRACTS: usize = 64;
+const MANIFEST_RECOVERY_ENGINE_DEADLINE: Duration = Duration::from_secs(3);
+const MANIFEST_RECOVERY_TOTAL_DEADLINE: Duration = Duration::from_secs(20);
 /// A diagnostic page is deliberately small enough to fit comfortably in the
 /// authenticated IPC frame and every public front end.
 pub const MAX_REGISTRY_DIAGNOSTIC_PAGE: u32 = 64;
@@ -360,6 +365,111 @@ pub struct SetupReconcileObserved {
     pub managed: String,
     pub content: String,
     pub container: String,
+}
+
+/// Immutable restart authorization persisted only after a native manifest
+/// ensure has both proved the engine object and committed its registry facts.
+/// It is audit-log encoded to preserve compatibility with existing v5 state;
+/// malformed/old entries are never recovery authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManifestRecoveryContract {
+    resource_id: String,
+    name: String,
+    workspace: String,
+    stack: String,
+    generation: String,
+    manifest: String,
+    image_identity: String,
+    guest: bool,
+}
+
+/// Fixed engine seam for native manifest restart recovery. It exposes only
+/// inspect and start of a deterministic registry-owned name; no caller can
+/// inject Docker arguments, labels, images, or source paths.
+pub trait ManifestRecoveryExecutor: Send + Sync {
+    fn inspect<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<SetupReconcileObserved>, String>> + Send + 'a>>;
+    fn start<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+}
+
+#[derive(Clone)]
+pub struct DockerManifestRecoveryExecutor {
+    engine: DockerEngine,
+}
+impl DockerManifestRecoveryExecutor {
+    fn new() -> Self {
+        Self {
+            engine: DockerEngine::docker(),
+        }
+    }
+}
+impl ManifestRecoveryExecutor for DockerManifestRecoveryExecutor {
+    fn inspect<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<SetupReconcileObserved>, String>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            const FORMAT: &str = "{{.Name}}\t{{.State.Running}}\t{{.Image}}\t{{index .Config.Labels \"com.zackees.bosn.setup-managed\"}}\t{{index .Config.Labels \"com.zackees.bosn.setup-content-sha256\"}}\t{{index .Config.Labels \"com.zackees.bosn.setup-container\"}}";
+            let result = self
+                .engine
+                .with_args(["container", "inspect", "--format", FORMAT, name])
+                .capture_async(RunOptions::bounded(
+                    MANIFEST_RECOVERY_ENGINE_DEADLINE,
+                    4 * 1024,
+                ))
+                .await
+                .map_err(|_| "manifest recovery inspect failed".to_owned())?;
+            if result.exit_code == 1 {
+                return Ok(None);
+            }
+            if !result.ok() {
+                return Err("manifest recovery inspect failed".into());
+            }
+            let text = std::str::from_utf8(&result.stdout)
+                .map_err(|_| "manifest recovery inspect failed".to_owned())?;
+            let values: Vec<_> = text.trim_end_matches(['\r', '\n']).split('\t').collect();
+            if values.len() != 6
+                || !matches!(values[1], "true" | "false")
+                || values.iter().any(|value| value.len() > 1024)
+            {
+                return Err("manifest recovery inspect failed".into());
+            }
+            Ok(Some(SetupReconcileObserved {
+                name: values[0].into(),
+                running: values[1] == "true",
+                image_identity: values[2].into(),
+                managed: values[3].into(),
+                content: values[4].into(),
+                container: values[5].into(),
+            }))
+        })
+    }
+    fn start<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let result = self
+                .engine
+                .with_args(["container", "start", name])
+                .capture_async(RunOptions::bounded(
+                    MANIFEST_RECOVERY_ENGINE_DEADLINE,
+                    4 * 1024,
+                ))
+                .await
+                .map_err(|_| "manifest recovery start failed".to_owned())?;
+            result
+                .ok()
+                .then_some(())
+                .ok_or_else(|| "manifest recovery start failed".into())
+        })
+    }
 }
 #[derive(Clone)]
 pub struct DockerSetupReconcileExecutor {
@@ -3696,6 +3806,7 @@ pub struct Service {
     setup_adopt_executor: Arc<dyn SetupAdoptExecutor>,
     doctor_executor: Arc<dyn DoctorExecutor>,
     setup_reconcile_executor: Arc<dyn SetupReconcileExecutor>,
+    manifest_recovery_executor: Arc<dyn ManifestRecoveryExecutor>,
 }
 
 #[cfg(test)]
@@ -3777,6 +3888,10 @@ enum DbCommand {
         events: Vec<SetupEnsureEvent>,
         reply: async_engine::OneshotSender<Result<(), Error>>,
     },
+    AppendManifestRecoveryEvents {
+        events: Vec<(String, String)>,
+        reply: async_engine::OneshotSender<Result<(), Error>>,
+    },
     RecordSetupEnsure {
         job_id: u64,
         execution: Box<SetupEnsureExecution>,
@@ -3785,7 +3900,15 @@ enum DbCommand {
     RecordManifestEnsure {
         job_id: u64,
         execution: Box<SetupEnsureExecution>,
+        contract: ManifestRecoveryContract,
         reply: async_engine::OneshotSender<Result<(), Error>>,
+    },
+    ManifestRecoveryContracts {
+        reply: async_engine::OneshotSender<Result<Vec<String>, Error>>,
+    },
+    ManifestRecoveryAuthorized {
+        contract: ManifestRecoveryContract,
+        reply: async_engine::OneshotSender<Result<bool, Error>>,
     },
     PutManifestVolumeIntents {
         volumes: Vec<ManifestVolumeResource>,
@@ -3882,6 +4005,7 @@ enum JobCommand {
     PersistManifestEnsure {
         id: u64,
         execution: SetupEnsureExecution,
+        contract: ManifestRecoveryContract,
         reply: async_engine::OneshotSender<Result<(), String>>,
     },
     /// Record one completed member of an all-stack convergence while keeping
@@ -3891,6 +4015,7 @@ enum JobCommand {
     PersistManifestConvergeStack {
         id: u64,
         execution: SetupEnsureExecution,
+        contract: ManifestRecoveryContract,
         reply: async_engine::OneshotSender<Result<(), String>>,
     },
     Log {
@@ -4458,6 +4583,7 @@ async fn job_actor(
             JobCommand::PersistManifestEnsure {
                 id,
                 execution,
+                contract,
                 reply,
             } => {
                 let result = if jobs
@@ -4466,7 +4592,7 @@ async fn job_actor(
                 {
                     let receipt = execution.receipt.clone();
                     registry
-                        .record_manifest_ensure(id, execution)
+                        .record_manifest_ensure(id, execution, contract)
                         .await
                         .map_err(|error| {
                             format!("manifest ensure registry recording failed: {error}")
@@ -4484,6 +4610,7 @@ async fn job_actor(
             JobCommand::PersistManifestConvergeStack {
                 id,
                 execution,
+                contract,
                 reply,
             } => {
                 let result = if jobs
@@ -4491,7 +4618,7 @@ async fn job_actor(
                     .is_ok_and(|job| job.state == jobs::JobState::Running)
                 {
                     registry
-                        .record_manifest_ensure(id, execution)
+                        .record_manifest_ensure(id, execution, contract)
                         .await
                         .map_err(|error| {
                             format!("manifest converge registry recording failed: {error}")
@@ -4705,26 +4832,34 @@ fn launch_started_setup_jobs(
                 }
                 SetupJobRequest::ManifestEnsure(request) => {
                     let result = manifest_ensure_executor
-                        .execute(request, &token, &logs, &manifest_registry)
+                        .execute(request.clone(), &token, &logs, &manifest_registry)
                         .await;
                     match result {
                         Ok(execution) => {
+                            let contract = manifest_recovery_contract(&request, &execution);
                             let (reply, wait) = async_engine::oneshot_channel();
-                            let persisted = if task_sender
-                                .send(JobCommand::PersistManifestEnsure {
-                                    id,
-                                    execution,
-                                    reply,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                Err("manifest ensure registry actor stopped".to_owned())
-                            } else {
-                                match wait.await {
-                                    Ok(result) => result,
-                                    Err(_) => {
+                            let persisted = match contract {
+                                Err(error) => Err(error),
+                                Ok(contract) => {
+                                    if task_sender
+                                        .send(JobCommand::PersistManifestEnsure {
+                                            id,
+                                            execution,
+                                            contract,
+                                            reply,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
                                         Err("manifest ensure registry actor stopped".to_owned())
+                                    } else {
+                                        match wait.await {
+                                            Ok(result) => result,
+                                            Err(_) => {
+                                                Err("manifest ensure registry actor stopped"
+                                                    .to_owned())
+                                            }
+                                        }
                                     }
                                 }
                             };
@@ -4807,20 +4942,18 @@ async fn execute_manifest_converge(
         ))
         .await
         .map_err(|_| "manifest converge log consumer closed".to_owned())?;
+        let ensure_request = ManifestEnsureJobRequest {
+            workspace: request.workspace.clone(),
+            manifest: request.manifest.clone(),
+            stack: stack.clone(),
+            deadline: remaining,
+            output_limit,
+        };
         let execution = executor
-            .execute(
-                ManifestEnsureJobRequest {
-                    workspace: request.workspace.clone(),
-                    manifest: request.manifest.clone(),
-                    stack: stack.clone(),
-                    deadline: remaining,
-                    output_limit,
-                },
-                cancellation,
-                logs,
-                registry,
-            )
+            .execute(ensure_request.clone(), cancellation, logs, registry)
             .await
+            .map_err(|error| format!("manifest converge stopped at stack {stack}: {error}"))?;
+        let contract = manifest_recovery_contract(&ensure_request, &execution)
             .map_err(|error| format!("manifest converge stopped at stack {stack}: {error}"))?;
         let receipt = execution.receipt.clone();
         let (reply, wait) = async_engine::oneshot_channel();
@@ -4828,6 +4961,7 @@ async fn execute_manifest_converge(
             .send(JobCommand::PersistManifestConvergeStack {
                 id,
                 execution,
+                contract,
                 reply,
             })
             .await
@@ -5072,6 +5206,241 @@ fn manifest_app_task_digest(request: &ManifestAppTaskJobRequest) -> String {
         "manifest:{}",
         kernal_api::hash::blake3_bytes(&material).to_hex()
     )
+}
+
+fn manifest_recovery_contract(
+    request: &ManifestEnsureJobRequest,
+    execution: &SetupEnsureExecution,
+) -> Result<ManifestRecoveryContract, String> {
+    let resource = &execution.resource;
+    if !safe_manifest_relative_path(&request.manifest)
+        || resource.stack != request.stack
+        || !resource.generation.starts_with("sha256:")
+        || !matches!(resource.id.as_str(), value if value.starts_with("manifest-container:") || value.starts_with("manifest-guest:"))
+        || execution.image.generation.is_empty()
+        || execution.image.generation.len() > 1024
+    {
+        return Err("manifest recovery contract cannot be derived".into());
+    }
+    Ok(ManifestRecoveryContract {
+        resource_id: resource.id.clone(),
+        name: resource.name.clone(),
+        workspace: resource.workspace.clone(),
+        stack: resource.stack.clone(),
+        generation: resource.generation.clone(),
+        manifest: request.manifest.clone(),
+        image_identity: execution.image.generation.clone(),
+        guest: resource.id.starts_with("manifest-guest:"),
+    })
+}
+
+fn manifest_recovery_contract_json(contract: &ManifestRecoveryContract) -> String {
+    serde_json::json!({
+        "v": 1,
+        "resource_id": contract.resource_id,
+        "name": contract.name,
+        "workspace": contract.workspace,
+        "stack": contract.stack,
+        "generation": contract.generation,
+        "manifest": contract.manifest,
+        "image_identity": contract.image_identity,
+        "guest": contract.guest,
+    })
+    .to_string()
+}
+
+fn parse_manifest_recovery_contract(detail: &str) -> Option<ManifestRecoveryContract> {
+    let value: serde_json::Value = serde_json::from_str(detail).ok()?;
+    let object = value.as_object()?;
+    let field = |name: &str| object.get(name)?.as_str().map(str::to_owned);
+    if object.get("v")?.as_u64()? != 1 {
+        return None;
+    }
+    let contract = ManifestRecoveryContract {
+        resource_id: field("resource_id")?,
+        name: field("name")?,
+        workspace: field("workspace")?,
+        stack: field("stack")?,
+        generation: field("generation")?,
+        manifest: field("manifest")?,
+        image_identity: field("image_identity")?,
+        guest: object.get("guest")?.as_bool()?,
+    };
+    (contract.resource_id.len() <= 512
+        && contract.name.len() <= 512
+        && contract.workspace.len() <= 4096
+        && contract.stack.len() <= 256
+        && contract.image_identity.len() <= 1024
+        && safe_manifest_relative_path(&contract.manifest)
+        && contract.generation.starts_with("sha256:")
+        && ((contract.guest && contract.resource_id.starts_with("manifest-guest:"))
+            || (!contract.guest && contract.resource_id.starts_with("manifest-container:"))))
+    .then_some(contract)
+}
+
+fn classify_manifest_recovery_observation(
+    contract: &ManifestRecoveryContract,
+    observed: &SetupReconcileObserved,
+) -> Option<&'static str> {
+    let content = contract.generation.strip_prefix("sha256:")?;
+    if observed.name != format!("/{}", contract.name) {
+        return None;
+    }
+    if observed.managed != "v1"
+        || observed.content != content
+        || observed.container != contract.name
+        || observed.image_identity != contract.image_identity
+    {
+        return None;
+    }
+    Some(if observed.running {
+        "running"
+    } else {
+        "stopped"
+    })
+}
+
+/// Daemon-start restart policy for native manifest containers. A contract is
+/// only an initial pointer: every candidate is re-derived from the current
+/// bounded manifest, authorized from active registry rows (which also reject
+/// dangling volume intents and uncertain task sessions), then inspected for
+/// exact identity before a fixed `container start`. We intentionally do not
+/// create a missing object, repair registry state, search Docker, or continue
+/// when a source path/build context is gone or changed.
+async fn recover_manifest_startup(
+    actor: &RegistryActor,
+    state_dir: &Path,
+    executor: &dyn ManifestRecoveryExecutor,
+) -> Result<(), Error> {
+    let details = actor.manifest_recovery_contracts().await?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut events = Vec::new();
+    let deadline = async_engine::Deadline::after(MANIFEST_RECOVERY_TOTAL_DEADLINE);
+    for detail in details {
+        let Some(contract) = parse_manifest_recovery_contract(&detail) else {
+            events.push((
+                "manifest.recovery.refused_contract".into(),
+                "malformed".into(),
+            ));
+            continue;
+        };
+        if !seen.insert(contract.resource_id.clone()) {
+            continue;
+        }
+        if deadline.remaining().is_zero() {
+            events.push(("manifest.recovery.deadline".into(), "bounded".into()));
+            break;
+        }
+        let request = ManifestEnsureJobRequest {
+            workspace: PathBuf::from(&contract.workspace),
+            manifest: contract.manifest.clone(),
+            stack: contract.stack.clone(),
+            deadline: deadline.remaining(),
+            output_limit: 4096,
+        };
+        let runtime = match async_engine::timeout_at(
+            deadline,
+            manifest_stack_setup_plan_at(&request, Some(state_dir)),
+        )
+        .await
+        {
+            Ok(Ok(runtime))
+                if runtime.generation == contract.generation
+                    && runtime.is_guest == contract.guest =>
+            {
+                runtime
+            }
+            Ok(Ok(_)) => {
+                events.push((
+                    "manifest.recovery.refused_source".into(),
+                    "generation_mismatch".into(),
+                ));
+                continue;
+            }
+            Ok(Err(_)) => {
+                events.push((
+                    "manifest.recovery.refused_source".into(),
+                    "unavailable_or_invalid".into(),
+                ));
+                continue;
+            }
+            Err(_) => {
+                events.push(("manifest.recovery.deadline".into(), "source_proof".into()));
+                break;
+            }
+        };
+        // `runtime` is deliberately retained through this check: successful
+        // source proof must precede any registry/engine authority.
+        let _ = runtime;
+        if !actor.manifest_recovery_authorized(contract.clone()).await? {
+            events.push((
+                "manifest.recovery.refused_registry".into(),
+                "inactive_session_or_volume_intent".into(),
+            ));
+            continue;
+        }
+        let inspected =
+            match async_engine::timeout_at(deadline, executor.inspect(&contract.name)).await {
+                Ok(Ok(Some(observed))) => observed,
+                Ok(Ok(None)) => {
+                    events.push((
+                        "manifest.recovery.missing".into(),
+                        "exact_container_absent".into(),
+                    ));
+                    continue;
+                }
+                Ok(Err(_)) => {
+                    events.push(("manifest.recovery.inspect_error".into(), "bounded".into()));
+                    continue;
+                }
+                Err(_) => {
+                    events.push(("manifest.recovery.deadline".into(), "inspect".into()));
+                    break;
+                }
+            };
+        match classify_manifest_recovery_observation(&contract, &inspected) {
+            Some("running") => {
+                events.push(("manifest.recovery.already_running".into(), "exact".into()))
+            }
+            Some("stopped") => {
+                match async_engine::timeout_at(deadline, executor.start(&contract.name)).await {
+                    Ok(Ok(())) => {
+                        match async_engine::timeout_at(deadline, executor.inspect(&contract.name))
+                            .await
+                        {
+                            Ok(Ok(Some(observed)))
+                                if classify_manifest_recovery_observation(&contract, &observed)
+                                    == Some("running") =>
+                            {
+                                events.push(("manifest.recovery.started".into(), "exact".into()));
+                            }
+                            Ok(Ok(_)) => events.push((
+                                "manifest.recovery.start_unconfirmed".into(),
+                                "post_start_mismatch".into(),
+                            )),
+                            Ok(Err(_)) => events.push((
+                                "manifest.recovery.start_unconfirmed".into(),
+                                "post_start_inspect_error".into(),
+                            )),
+                            Err(_) => events.push((
+                                "manifest.recovery.deadline".into(),
+                                "post_start_inspect".into(),
+                            )),
+                        }
+                    }
+                    Ok(Err(_)) => {
+                        events.push(("manifest.recovery.start_error".into(), "bounded".into()))
+                    }
+                    Err(_) => events.push(("manifest.recovery.deadline".into(), "start".into())),
+                }
+            }
+            _ => events.push((
+                "manifest.recovery.refused_engine".into(),
+                "identity_mismatch".into(),
+            )),
+        }
+    }
+    actor.append_manifest_recovery_events(events).await
 }
 
 /// Select the durable registry key from a receipt that has already passed
@@ -5374,6 +5743,20 @@ impl RegistryActor {
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
     }
+    async fn append_manifest_recovery_events(
+        &self,
+        events: Vec<(String, String)>,
+    ) -> Result<(), Error> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::AppendManifestRecoveryEvents { events, reply })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
     async fn record_setup_ensure(
         &self,
         job_id: u64,
@@ -5394,14 +5777,35 @@ impl RegistryActor {
         &self,
         job_id: u64,
         execution: SetupEnsureExecution,
+        contract: ManifestRecoveryContract,
     ) -> Result<(), Error> {
         let (reply, wait) = async_engine::oneshot_channel();
         self.sender
             .send(DbCommand::RecordManifestEnsure {
                 job_id,
                 execution: Box::new(execution),
+                contract,
                 reply,
             })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
+    async fn manifest_recovery_contracts(&self) -> Result<Vec<String>, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::ManifestRecoveryContracts { reply })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
+    async fn manifest_recovery_authorized(
+        &self,
+        contract: ManifestRecoveryContract,
+    ) -> Result<bool, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::ManifestRecoveryAuthorized { contract, reply })
             .await
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
@@ -5819,6 +6223,22 @@ async fn registry_actor(
                     }
                 }
             }
+            DbCommand::AppendManifestRecoveryEvents { events, reply } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = append_manifest_recovery_events(&mut registry, &events);
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
             DbCommand::RecordSetupEnsure {
                 job_id,
                 execution,
@@ -5849,10 +6269,51 @@ async fn registry_actor(
             DbCommand::RecordManifestEnsure {
                 job_id,
                 execution,
+                contract,
                 reply,
             } => {
                 let worker = async_engine::launch_blocking(move || {
-                    let result = record_manifest_ensure(&mut registry, job_id, &execution);
+                    let result =
+                        record_manifest_ensure(&mut registry, job_id, &execution, &contract);
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
+            DbCommand::ManifestRecoveryContracts { reply } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = registry
+                        .manifest_recovery_contract_details(MANIFEST_RECOVERY_MAX_CONTRACTS);
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
+            DbCommand::ManifestRecoveryAuthorized { contract, reply } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = registry.manifest_recovery_container_active(
+                        &contract.resource_id,
+                        &contract.name,
+                        &contract.stack,
+                        &contract.generation,
+                        &contract.workspace,
+                    );
                     (registry, result)
                 });
                 match worker.await {
@@ -6167,7 +6628,19 @@ fn record_manifest_ensure(
     registry: &mut Registry,
     job_id: u64,
     execution: &SetupEnsureExecution,
+    contract: &ManifestRecoveryContract,
 ) -> Result<(), bosn_registry::Error> {
+    if contract.resource_id != execution.resource.id
+        || contract.name != execution.resource.name
+        || contract.workspace != execution.resource.workspace
+        || contract.stack != execution.resource.stack
+        || contract.generation != execution.resource.generation
+        || contract.image_identity != execution.image.generation
+        || contract.guest != execution.resource.id.starts_with("manifest-guest:")
+        || !safe_manifest_relative_path(&contract.manifest)
+    {
+        return Err(bosn_registry::Error::BadRow("manifest recovery contract"));
+    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
@@ -6249,6 +6722,11 @@ fn record_manifest_ensure(
         &execution.resource.workspace,
         &execution.resource.stack,
         &execution.resource.generation,
+    )?;
+    transaction.append_event(
+        now,
+        "manifest.recovery.contract",
+        &manifest_recovery_contract_json(contract),
     )?;
     transaction.append_event(
         now,
@@ -6381,6 +6859,27 @@ fn append_setup_ensure_events(
     }
     transaction.commit()
 }
+
+fn append_manifest_recovery_events(
+    registry: &mut Registry,
+    events: &[(String, String)],
+) -> Result<(), bosn_registry::Error> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
+        .as_secs_f64();
+    let mut transaction = registry.begin_immediate()?;
+    for (kind, detail) in events {
+        if !kind.starts_with("manifest.recovery.") || kind.len() > 128 || detail.len() > 1024 {
+            return Err(bosn_registry::Error::BadRow("manifest recovery event"));
+        }
+        transaction.append_event(now, kind, detail)?;
+    }
+    transaction.commit()
+}
 impl Service {
     pub fn new(state_dir: impl Into<PathBuf>) -> Self {
         let state_dir = state_dir.into();
@@ -6398,6 +6897,7 @@ impl Service {
             setup_adopt_executor: Arc::new(DockerSetupAdoptExecutor::new(state_dir.clone())),
             doctor_executor: Arc::new(DockerDoctorExecutor::new()),
             setup_reconcile_executor: Arc::new(DockerSetupReconcileExecutor::new()),
+            manifest_recovery_executor: Arc::new(DockerManifestRecoveryExecutor::new()),
             state_dir,
             stop: CancellationSource::new(),
         }
@@ -6460,6 +6960,14 @@ impl Service {
         self.setup_reconcile_executor = executor;
         self
     }
+    /// Substitute only the fixed inspect/start recovery seam for tests.
+    pub fn with_manifest_recovery_executor(
+        mut self,
+        executor: Arc<dyn ManifestRecoveryExecutor>,
+    ) -> Self {
+        self.manifest_recovery_executor = executor;
+        self
+    }
     /// Foreground lifecycle: acquires the sole registry writer before binding.
     pub async fn serve(self) -> Result<(), Error> {
         ipc::ensure_owner_private_directory(&self.state_dir)?;
@@ -6512,6 +7020,17 @@ impl Service {
             #[cfg(test)]
             None,
         ));
+        // Recovery runs before accepting user requests so a newly submitted
+        // task cannot race a stopped-container restart. Failure to inspect a
+        // local Docker daemon is recorded as a bounded recovery outcome when
+        // possible and never prevents the authenticated control plane from
+        // coming up.
+        let _ = recover_manifest_startup(
+            &actor,
+            &self.state_dir,
+            self.manifest_recovery_executor.as_ref(),
+        )
+        .await;
         let mut clients = async_engine::TaskGroup::new();
         while !self.stop.is_cancelled() {
             // TaskGroup retains completed tasks until collected.  Reap only
@@ -8356,6 +8875,21 @@ mod tests {
         }
     }
 
+    fn test_manifest_recovery_contract(
+        execution: &SetupEnsureExecution,
+    ) -> ManifestRecoveryContract {
+        ManifestRecoveryContract {
+            resource_id: execution.resource.id.clone(),
+            name: execution.resource.name.clone(),
+            workspace: execution.resource.workspace.clone(),
+            stack: execution.resource.stack.clone(),
+            generation: execution.resource.generation.clone(),
+            manifest: "bosn.toml".into(),
+            image_identity: execution.image.generation.clone(),
+            guest: false,
+        }
+    }
+
     fn manifest_volume_resource(workspace: &str, stack: &str) -> ManifestVolumeResource {
         let name = "bosn-v-stack-aaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
         ManifestVolumeResource {
@@ -9129,6 +9663,190 @@ mod tests {
     }
 
     #[test]
+    fn daemon_start_reproves_then_starts_only_an_exact_stopped_manifest_container() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let image = format!("example.invalid/app@sha256:{}", "a".repeat(64));
+        std::fs::write(
+            workspace.join("bosn.toml"),
+            format!("[stack.app]\nimage = '{image}'\n"),
+        )
+        .unwrap();
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.run(async {
+            let request = ManifestEnsureJobRequest {
+                workspace: workspace.clone(),
+                manifest: "bosn.toml".into(),
+                stack: "app".into(),
+                deadline: Duration::from_secs(2),
+                output_limit: 4096,
+            };
+            let plan = manifest_stack_setup_plan(&request).await.unwrap();
+            let content = plan.generation.strip_prefix("sha256:").unwrap();
+            let name = format!("bosn-setup-recovery-{content}");
+            let execution = SetupEnsureExecution {
+                receipt: "seed".into(),
+                resource: SetupEnsureResource {
+                    id: format!("manifest-container:app:{}", plan.generation),
+                    name: name.clone(),
+                    stack: "app".into(),
+                    generation: plan.generation.clone(),
+                    workspace: plan.plan.workspace_root.to_string_lossy().into_owned(),
+                },
+                image: SetupEnsureImageResource {
+                    id: "manifest-image:sha256:recovery-test".into(),
+                    name: "manifest-image:sha256:recovery-test".into(),
+                    stack: "app".into(),
+                    generation: "sha256:recovery-test".into(),
+                    workspace: plan.plan.workspace_root.to_string_lossy().into_owned(),
+                },
+                volumes: Vec::new(),
+            };
+            let contract = manifest_recovery_contract(&request, &execution).unwrap();
+            let mut registry = Registry::create_writer(
+                state.join("registry.sqlite3"),
+                "11111111-2222-4333-8444-555555555555",
+            )
+            .unwrap();
+            record_manifest_ensure(&mut registry, 1, &execution, &contract).unwrap();
+            drop(registry);
+            let fake = Arc::new(FakeManifestRecoveryExecutor {
+                observed: Mutex::new(Some(SetupReconcileObserved {
+                    name: format!("/{name}"),
+                    running: false,
+                    image_identity: contract.image_identity.clone(),
+                    managed: "v1".into(),
+                    content: content.into(),
+                    container: name,
+                })),
+                starts: AtomicUsize::new(0),
+            });
+            let server = async_engine::launch(
+                Service::new(state.clone())
+                    .with_manifest_recovery_executor(fake.clone())
+                    .serve(),
+            );
+            let client = wait_for_client(&state).await;
+            assert_eq!(fake.starts.load(Ordering::SeqCst), 1);
+            assert!(fake.observed.lock().unwrap().as_ref().unwrap().running);
+            client.shutdown().await.unwrap();
+            stopped(server).await;
+            let events = Registry::open_read_only(state.join("registry.sqlite3"))
+                .unwrap()
+                .events(0, 32)
+                .unwrap();
+            assert!(
+                events
+                    .items
+                    .iter()
+                    .any(|event| event.kind == "manifest.recovery.started")
+            );
+        });
+    }
+
+    #[test]
+    fn daemon_start_refuses_manifest_source_drift_without_inspecting_or_starting() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let image = format!("example.invalid/app@sha256:{}", "a".repeat(64));
+        std::fs::write(
+            workspace.join("bosn.toml"),
+            format!("[stack.app]\nimage = '{image}'\n"),
+        )
+        .unwrap();
+        RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let request = ManifestEnsureJobRequest {
+                    workspace: workspace.clone(),
+                    manifest: "bosn.toml".into(),
+                    stack: "app".into(),
+                    deadline: Duration::from_secs(2),
+                    output_limit: 4096,
+                };
+                let plan = manifest_stack_setup_plan(&request).await.unwrap();
+                let content = plan.generation.strip_prefix("sha256:").unwrap();
+                let name = format!("bosn-setup-recovery-{content}");
+                let execution = SetupEnsureExecution {
+                    receipt: "seed".into(),
+                    resource: SetupEnsureResource {
+                        id: format!("manifest-container:app:{}", plan.generation),
+                        name: name.clone(),
+                        stack: "app".into(),
+                        generation: plan.generation.clone(),
+                        workspace: plan.plan.workspace_root.to_string_lossy().into_owned(),
+                    },
+                    image: SetupEnsureImageResource {
+                        id: "manifest-image:sha256:recovery-test".into(),
+                        name: "manifest-image:sha256:recovery-test".into(),
+                        stack: "app".into(),
+                        generation: "sha256:recovery-test".into(),
+                        workspace: plan.plan.workspace_root.to_string_lossy().into_owned(),
+                    },
+                    volumes: Vec::new(),
+                };
+                let contract = manifest_recovery_contract(&request, &execution).unwrap();
+                let mut registry = Registry::create_writer(
+                    state.join("registry.sqlite3"),
+                    "11111111-2222-4333-8444-555555555555",
+                )
+                .unwrap();
+                record_manifest_ensure(&mut registry, 1, &execution, &contract).unwrap();
+                drop(registry);
+                // Changing a declared environment member changes the native
+                // runtime generation. Recovery must refuse before inspecting
+                // the old container, let alone starting it.
+                std::fs::write(
+                    workspace.join("bosn.toml"),
+                    format!("[stack.app]\nimage = '{image}'\n[stack.app.env]\nCHANGED = 'yes'\n"),
+                )
+                .unwrap();
+                let fake = Arc::new(FakeManifestRecoveryExecutor {
+                    observed: Mutex::new(Some(SetupReconcileObserved {
+                        name: format!("/{name}"),
+                        running: false,
+                        image_identity: contract.image_identity.clone(),
+                        managed: "v1".into(),
+                        content: content.into(),
+                        container: name,
+                    })),
+                    starts: AtomicUsize::new(0),
+                });
+                let server = async_engine::launch(
+                    Service::new(state.clone())
+                        .with_manifest_recovery_executor(fake.clone())
+                        .serve(),
+                );
+                let client = wait_for_client(&state).await;
+                assert_eq!(fake.starts.load(Ordering::SeqCst), 0);
+                assert!(!fake.observed.lock().unwrap().as_ref().unwrap().running);
+                client.shutdown().await.unwrap();
+                stopped(server).await;
+                let events = Registry::open_read_only(state.join("registry.sqlite3"))
+                    .unwrap()
+                    .events(0, 32)
+                    .unwrap();
+                assert!(
+                    events
+                        .items
+                        .iter()
+                        .any(|event| event.kind == "manifest.recovery.refused_source")
+                );
+            });
+    }
+
+    #[test]
     fn manifest_converge_orders_all_stacks_and_records_each_before_completion() {
         let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
         let state = temporary.path().join("state");
@@ -9354,10 +10072,12 @@ mod tests {
         )
         .unwrap();
         let workspace = "/canonical/manifest";
+        let old = manifest_ensure_execution(workspace, "app", "old", "sha256:old-image");
         record_manifest_ensure(
             &mut registry,
             1,
-            &manifest_ensure_execution(workspace, "app", "old", "sha256:old-image"),
+            &old,
+            &test_manifest_recovery_contract(&old),
         )
         .unwrap();
         let mut transaction = registry.begin_immediate().unwrap();
@@ -9377,11 +10097,13 @@ mod tests {
             })
             .unwrap();
         transaction.commit().unwrap();
+        let new = manifest_ensure_execution(workspace, "app", "new", "sha256:new-image");
         assert!(matches!(
             record_manifest_ensure(
                 &mut registry,
                 2,
-                &manifest_ensure_execution(workspace, "app", "new", "sha256:new-image"),
+                &new,
+                &test_manifest_recovery_contract(&new),
             ),
             Err(bosn_registry::Error::ResourceIdentityConflict)
         ));
@@ -9433,7 +10155,13 @@ mod tests {
         let mut execution =
             manifest_ensure_execution(workspace, "app", "generation", "sha256:image");
         execution.volumes.push(volume.clone());
-        record_manifest_ensure(&mut registry, 1, &execution).unwrap();
+        record_manifest_ensure(
+            &mut registry,
+            1,
+            &execution,
+            &test_manifest_recovery_contract(&execution),
+        )
+        .unwrap();
 
         assert!(
             registry
@@ -9457,6 +10185,68 @@ mod tests {
                 .items
                 .iter()
                 .any(|use_record| use_record.resource_id == volume.id)
+        );
+    }
+
+    #[test]
+    fn manifest_restart_authorization_refuses_pending_volume_intents_and_uncertain_sessions() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let mut registry = Registry::create_writer(
+            temporary.path().join("registry.sqlite3"),
+            "11111111-2222-4333-8444-555555555555",
+        )
+        .unwrap();
+        let execution =
+            manifest_ensure_execution("/canonical/manifest", "app", "generation", "sha256:image");
+        let contract = test_manifest_recovery_contract(&execution);
+        record_manifest_ensure(&mut registry, 1, &execution, &contract).unwrap();
+        let authorized = |registry: &Registry| {
+            registry
+                .manifest_recovery_container_active(
+                    &contract.resource_id,
+                    &contract.name,
+                    &contract.stack,
+                    &contract.generation,
+                    &contract.workspace,
+                )
+                .unwrap()
+        };
+        assert!(authorized(&registry));
+        let volume = manifest_volume_resource(&contract.workspace, &contract.stack);
+        let mut transaction = registry.begin_immediate().unwrap();
+        transaction
+            .put_volume_creation_intent(&VolumeCreationIntent {
+                name: volume.name.clone(),
+                labels: volume.labels.clone(),
+                stack: contract.stack.clone(),
+                generation: volume.generation,
+                scope: volume.scope,
+                workspace: contract.workspace.clone(),
+            })
+            .unwrap();
+        transaction.commit().unwrap();
+        assert!(
+            !authorized(&registry),
+            "a crashed volume create must block restart"
+        );
+        let mut transaction = registry.begin_immediate().unwrap();
+        transaction
+            .delete_volume_creation_intent(&volume.name)
+            .unwrap();
+        transaction
+            .put_execution_session(&ExecutionSession {
+                id: "uncertain-manifest-task".into(),
+                container_id: contract.name.clone(),
+                engine_binary: "docker".into(),
+                client_pid: 1,
+                client_start: None,
+                lease_ids: Vec::new(),
+            })
+            .unwrap();
+        transaction.commit().unwrap();
+        assert!(
+            !authorized(&registry),
+            "an uncertain task session must block restart"
         );
     }
 
@@ -10053,6 +10843,32 @@ mod tests {
                     },
                     volumes: Vec::new(),
                 })
+            })
+        }
+    }
+
+    struct FakeManifestRecoveryExecutor {
+        observed: Mutex<Option<SetupReconcileObserved>>,
+        starts: AtomicUsize,
+    }
+    impl ManifestRecoveryExecutor for FakeManifestRecoveryExecutor {
+        fn inspect<'a>(
+            &'a self,
+            _name: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<SetupReconcileObserved>, String>> + Send + 'a>>
+        {
+            Box::pin(async move { Ok(self.observed.lock().unwrap().clone()) })
+        }
+        fn start<'a>(
+            &'a self,
+            _name: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.starts.fetch_add(1, Ordering::SeqCst);
+                if let Some(observed) = self.observed.lock().unwrap().as_mut() {
+                    observed.running = true;
+                }
+                Ok(())
             })
         }
     }

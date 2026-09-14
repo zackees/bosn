@@ -115,12 +115,41 @@ lifecycle declaration. Before each ensure and manifest app-task operation the
 daemon re-reads the manifest; the typed setup primitive then canonicalizes the
 same mount sources again immediately before its engine operation.
 
+## Daemon-start recovery
+
+After a successful native `manifest ensure` or `manifest converge` member, the
+same registry transaction records a bounded daemon-written recovery contract:
+the canonical workspace, safe relative manifest spelling, stack, runtime
+generation, deterministic container name, observed image identity, and guest
+kind. On its next start, before accepting requests, the daemon reads only those
+contracts (never a Docker listing), deduplicates them by resource ID, and:
+
+1. re-reads and re-derives the current manifest stack, including Dockerfile
+   context, mounts, volumes, tmpfs, and guest checks;
+2. requires the generation and guest kind to remain exact, then requires one
+   active native-manifest registry resource/use with no execution session and
+   no unresolved volume-creation intent for that workspace/stack;
+3. inspects only the deterministic name and requires exact managed/content/
+   container labels and the recorded image ID; and
+4. starts only a stopped matching container, then re-inspects it to prove it
+   is running.
+
+Missing manifests, changed sources, unavailable Dockerfile context, stale or
+retired registry facts, uncertain app-task sessions, pending volume intents,
+missing containers, malformed contracts, label/image/name drift, engine errors,
+and the fixed 20-second startup recovery deadline all fail closed. They neither
+adopt, create, delete, stop, or replace an engine object. Recovery outcomes are
+durably appended as bounded `manifest.recovery.*` events and are observable via
+the existing authenticated `bosn registry setup-ensure-events` CLI/Python/MCP
+diagnostic page. Dockerfile materialization during source proof remains inside
+owner-private Bosn state; a missing source is never replaced from the cache.
+
 ## Remaining work
 
 This does not claim completion of manifest migration. Future slices must add
 explicit volume release/GC application, broader Dockerfile forms (alternate
 Dockerfile paths plus selected symlink and empty-directory representation),
 dependency syntax/ordering (if the legacy TOML schema gains an explicit relation), guest SSH/SCP task lifecycle, declarative tasks,
-autostart/recovery, and generation reconciliation. Each must
+broader autostart policy, and generation reconciliation. Each must
 remain daemon-owned and registry-backed rather than reintroducing raw Docker or
 Python business logic.

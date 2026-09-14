@@ -1672,13 +1672,62 @@ impl Registry {
             event,
         )
     }
-    /// Return bounded setup-ensure diagnostics newest first.  This deliberate
-    /// allowlist prevents product front ends from treating the registry event
-    /// table as an unbounded raw audit export.
+    /// Return the bounded daemon-written native-manifest recovery contracts,
+    /// newest first.  Contracts deliberately live in the append-only audit
+    /// log rather than an unversioned side database: an existing v5 registry
+    /// remains readable, and a malformed or older record is simply not a
+    /// recovery authorization.  The service still re-proves every detail
+    /// against the active resource rows and current manifest before it can
+    /// start an engine object.
+    pub fn manifest_recovery_contract_details(&self, limit: usize) -> Result<Vec<String>, Error> {
+        let limit = limit.clamp(1, MAX_PAGE_SIZE);
+        let rows = self.connection.query(
+            "SELECT detail FROM events WHERE kind='manifest.recovery.contract' ORDER BY id DESC LIMIT ?",
+            &[Value::Integer(i64::try_from(limit).map_err(|_| Error::BadRow("page limit"))?)],
+            QueryLimits {
+                max_rows: limit,
+                max_bytes: 1_048_576,
+            },
+        )?;
+        rows.into_iter().map(|row| text(&row, 0)).collect()
+    }
+    /// Exact, registry-only authorization for restart recovery of one native
+    /// manifest container.  This discovers nothing from Docker: the service
+    /// supplies a previously daemon-written contract and must independently
+    /// prove the current manifest and engine labels before any start.
+    pub fn manifest_recovery_container_active(
+        &self,
+        id: &str,
+        name: &str,
+        stack: &str,
+        generation: &str,
+        workspace: &str,
+    ) -> Result<bool, Error> {
+        let rows = self.connection.query(
+            "SELECT 1 FROM resources AS r WHERE r.id=? AND r.name=? AND r.stack=? AND r.generation=? AND r.workspace=? \
+               AND r.kind='container' AND r.scope='machine' AND r.state='active' \
+               AND (r.id GLOB 'manifest-container:*' OR r.id GLOB 'manifest-guest:*') \
+               AND EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id AND u.workspace=? AND u.stack=? AND u.generation=? AND u.state='active') \
+               AND NOT EXISTS (SELECT 1 FROM volume_creation_intents AS v WHERE v.workspace=? AND v.stack=?) \
+               AND NOT EXISTS (SELECT 1 FROM execution_sessions AS s WHERE s.container_id=r.id OR s.container_id=r.name) LIMIT 1",
+            &[
+                Value::Text(id.into()), Value::Text(name.into()), Value::Text(stack.into()),
+                Value::Text(generation.into()), Value::Text(workspace.into()),
+                Value::Text(workspace.into()), Value::Text(stack.into()), Value::Text(generation.into()),
+                Value::Text(workspace.into()), Value::Text(stack.into()),
+            ],
+            QueryLimits { max_rows: 1, max_bytes: 128 },
+        )?;
+        Ok(!rows.is_empty())
+    }
+    /// Return bounded native lifecycle diagnostics newest first. This
+    /// deliberate allowlist includes setup ensure plus manifest restart
+    /// recovery outcomes, but prevents product front ends from treating the
+    /// registry event table as an unbounded raw audit export.
     pub fn setup_ensure_events(&self, offset: usize, limit: usize) -> Result<Page<Event>, Error> {
         page(
             &self.connection,
-            "SELECT id,at,kind,detail FROM events WHERE kind LIKE 'setup.ensure.%' ORDER BY id DESC LIMIT ? OFFSET ?",
+            "SELECT id,at,kind,detail FROM events WHERE kind LIKE 'setup.ensure.%' OR kind LIKE 'manifest.recovery.%' ORDER BY id DESC LIMIT ? OFFSET ?",
             offset,
             limit,
             event,
@@ -1822,7 +1871,7 @@ impl ReadOnlyRegistry {
     pub fn setup_ensure_events(&self, offset: usize, limit: usize) -> Result<Page<Event>, Error> {
         page(
             &self.connection,
-            "SELECT id,at,kind,detail FROM events WHERE kind LIKE 'setup.ensure.%' ORDER BY id DESC LIMIT ? OFFSET ?",
+            "SELECT id,at,kind,detail FROM events WHERE kind LIKE 'setup.ensure.%' OR kind LIKE 'manifest.recovery.%' ORDER BY id DESC LIMIT ? OFFSET ?",
             offset,
             limit,
             event,
