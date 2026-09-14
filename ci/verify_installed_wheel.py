@@ -116,7 +116,33 @@ def platform_executable_suffix() -> str:
 def platform_extension_suffix() -> str:
     """The one extension suffix ABI3 promises across supported Python hosts."""
 
-    return ".abi3.pyd" if os.name == "nt" else ".abi3.so"
+    # Windows deliberately has no ABI tag in the extension filename: CPython
+    # recognizes ``.pyd`` there.  ABI3 is expressed by the wheel tag instead.
+    return ".pyd" if os.name == "nt" else ".abi3.so"
+
+
+def assert_abi3_wheel_tag(wheel: Path, archive: zipfile.ZipFile) -> None:
+    """Require both filename and WHEEL metadata to declare cp310-abi3."""
+
+    if wheel.suffix != ".whl":
+        fail(f"not a wheel: {wheel}")
+    try:
+        _distribution, _version, python_tag, abi_tag, platform_tag = wheel.stem.rsplit("-", 4)
+    except ValueError:
+        fail(f"wheel filename has no Python/ABI/platform tags: {wheel.name}")
+    expected = f"cp310-abi3-{platform_tag}"
+    if (python_tag, abi_tag) != ("cp310", "abi3") or platform_tag == "any":
+        fail(f"wheel filename must declare {expected!r}, got {wheel.name!r}")
+    wheel_metadata = [name for name in archive.namelist() if name.endswith(".dist-info/WHEEL")]
+    if len(wheel_metadata) != 1:
+        fail(f"wheel must contain exactly one dist-info/WHEEL, got {wheel_metadata}")
+    tags = {
+        line.removeprefix("Tag: ").strip()
+        for line in archive.read(wheel_metadata[0]).decode("utf-8").splitlines()
+        if line.startswith("Tag: ")
+    }
+    if expected not in tags:
+        fail(f"wheel metadata must declare {expected!r}, got {sorted(tags)}")
 
 
 def smoke_temporary_directory() -> str | None:
@@ -160,6 +186,7 @@ def assert_platform_wheel_contents(wheel: Path) -> None:
     executable = f".data/platlib/bosn/_bin/bosn-native{platform_executable_suffix()}"
     with zipfile.ZipFile(wheel) as archive:
         names = archive.namelist()
+        assert_abi3_wheel_tag(wheel, archive)
     retired = [
         f"bosn/{module}.py" for module in RETIRED_LIFECYCLE_MODULES if f"bosn/{module}.py" in names
     ]
