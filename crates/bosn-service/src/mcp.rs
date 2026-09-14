@@ -481,7 +481,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "bosn_setup_ensure_events",
-                "description": "Read a bounded newest-first cursor page of credential-safe setup ensure history from the already-running native Bosn daemon. Does not start a daemon, initialize a registry, or mutate state.",
+                "description": "Read a bounded newest-first cursor page of credential-safe setup ensure and native-manifest lifecycle history from the already-running native Bosn daemon. Does not start a daemon, initialize a registry, or mutate state.",
                 "inputSchema": registry_page_schema(),
                 "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
             },
