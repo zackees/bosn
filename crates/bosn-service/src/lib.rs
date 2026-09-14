@@ -5,7 +5,12 @@ use bosn_core::{
     parse_manifest_toml,
 };
 use bosn_engine::{DockerDoctorReport, DockerDoctorState, DockerEngine, EngineEvent, RunOptions};
-use bosn_generation::{ExternalImageIdentity, collector::CollectorLimits, stack_generation_async};
+use bosn_generation::{
+    ContextEntry, ExternalImageIdentity,
+    collector::{CollectorLimits, collect_context},
+    dockerfile::external_images,
+    stack_generation_async, stack_generation_from_context,
+};
 use bosn_registry::{
     Event, ExecutionSession, Registry, RegistryStatus, Resource, ResourceUse, SetupDone,
     SetupGcPreview, VolumeCreationIntent,
@@ -13,11 +18,11 @@ use bosn_registry::{
 #[cfg(test)]
 use bosn_setup::PreparedImageKind;
 use bosn_setup::{
-    PreparedImage, SetupAcquirePolicy, SetupAppTaskRequest, SetupEnsureEngine,
-    SetupEnsureRequest as CoreSetupEnsureRequest, SetupEnsureResult, SetupImageEngine,
-    SetupNamedVolume, SetupPlan, SetupPlanAppSource, SetupPlanRequest, SetupTaskRequest,
-    SetupTmpfs, SetupTmpfsSize, SetupTmpfsSizeUnit, adopt_setup_app, ensure_setup_app,
-    execute_setup_app_task, execute_setup_task, plan_setup, prepare_setup_image,
+    ManifestBuildFile, PreparedImage, SetupAcquirePolicy, SetupAppTaskRequest, SetupAssetStore,
+    SetupEnsureEngine, SetupEnsureRequest as CoreSetupEnsureRequest, SetupEnsureResult,
+    SetupImageEngine, SetupNamedVolume, SetupPlan, SetupPlanAppSource, SetupPlanRequest,
+    SetupTaskRequest, SetupTmpfs, SetupTmpfsSize, SetupTmpfsSizeUnit, adopt_setup_app,
+    ensure_setup_app, execute_setup_app_task, execute_setup_task, plan_setup, prepare_setup_image,
 };
 use jobs::{Jobs, Submission};
 use kernal_api::{
@@ -635,11 +640,13 @@ impl SetupEnsureExecutor for DockerSetupEnsureExecutor {
 /// it never invokes a generic Compose/Docker runner.
 #[derive(Clone)]
 pub struct DockerManifestEnsureExecutor {
+    state_dir: PathBuf,
     engine: DockerEngine,
 }
 impl DockerManifestEnsureExecutor {
-    fn new() -> Self {
+    fn new(state_dir: PathBuf) -> Self {
         Self {
+            state_dir,
             engine: DockerEngine::docker(),
         }
     }
@@ -663,7 +670,10 @@ impl ManifestEnsureExecutor for DockerManifestEnsureExecutor {
             let deadline = async_engine::Deadline::after(request.deadline);
             let runtime = async_engine::cancellable(
                 cancellation,
-                async_engine::timeout_at(deadline, manifest_stack_setup_plan(&request)),
+                async_engine::timeout_at(
+                    deadline,
+                    manifest_stack_setup_plan_at(&request, Some(&self.state_dir)),
+                ),
             )
             .await
             .map_err(|_| "manifest ensure cancelled".to_owned())?
@@ -741,11 +751,13 @@ impl ManifestEnsureExecutor for DockerManifestEnsureExecutor {
 /// immediately before the one fixed `container exec` operation.
 #[derive(Clone)]
 pub struct DockerManifestAppTaskExecutor {
+    state_dir: PathBuf,
     engine: DockerEngine,
 }
 impl DockerManifestAppTaskExecutor {
-    fn new() -> Self {
+    fn new(state_dir: PathBuf) -> Self {
         Self {
+            state_dir,
             engine: DockerEngine::docker(),
         }
     }
@@ -769,7 +781,10 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
             let deadline = async_engine::Deadline::after(request.deadline);
             let runtime = async_engine::cancellable(
                 cancellation,
-                async_engine::timeout_at(deadline, manifest_stack_task_setup_plan(&request)),
+                async_engine::timeout_at(
+                    deadline,
+                    manifest_stack_task_setup_plan_at(&request, Some(&self.state_dir)),
+                ),
             )
             .await
             .map_err(|_| "manifest app task cancelled before ownership inspection".to_owned())?
@@ -891,20 +906,44 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
 /// typed setup receipt. This is intentionally a refusal boundary, not a
 /// lossy migration: fields which would need more lifecycle semantics are
 /// rejected before Docker is contacted.
+#[cfg(test)]
 async fn manifest_stack_setup_plan(
     request: &ManifestEnsureJobRequest,
 ) -> Result<ManifestRuntimePlan, String> {
-    manifest_stack_plan(&request.workspace, &request.manifest, &request.stack, None).await
+    manifest_stack_setup_plan_at(request, None).await
 }
 
+async fn manifest_stack_setup_plan_at(
+    request: &ManifestEnsureJobRequest,
+    state_dir: Option<&Path>,
+) -> Result<ManifestRuntimePlan, String> {
+    manifest_stack_plan(
+        &request.workspace,
+        &request.manifest,
+        &request.stack,
+        None,
+        state_dir,
+    )
+    .await
+}
+
+#[cfg(test)]
 async fn manifest_stack_task_setup_plan(
     request: &ManifestAppTaskJobRequest,
+) -> Result<ManifestRuntimePlan, String> {
+    manifest_stack_task_setup_plan_at(request, None).await
+}
+
+async fn manifest_stack_task_setup_plan_at(
+    request: &ManifestAppTaskJobRequest,
+    state_dir: Option<&Path>,
 ) -> Result<ManifestRuntimePlan, String> {
     manifest_stack_plan(
         &request.workspace,
         &request.manifest,
         &request.stack,
         Some(&request.task_name),
+        state_dir,
     )
     .await
 }
@@ -918,6 +957,7 @@ async fn manifest_stack_plan(
     request_manifest: &str,
     request_stack: &str,
     task_name: Option<&str>,
+    state_dir: Option<&Path>,
 ) -> Result<ManifestRuntimePlan, String> {
     let workspace = fs::canonical_context_path(request_workspace)
         .map_err(|_| "manifest workspace cannot be canonicalized".to_owned())?;
@@ -951,17 +991,9 @@ async fn manifest_stack_plan(
     let stack = manifest
         .stack(request_stack)
         .map_err(|_| "selected manifest stack does not exist".to_owned())?;
-    if stack.dockerfile.is_some() || stack.kind.is_some() || stack.guest.is_some() {
+    if stack.kind.is_some() || stack.guest.is_some() {
         return Err("selected manifest stack uses an unsupported runtime field".into());
     }
-    let image = stack
-        .image
-        .as_deref()
-        .filter(|image| valid_manifest_pinned_image(image))
-        .ok_or_else(|| {
-            "selected manifest stack must use an immutable digest-pinned image".to_owned()
-        })?
-        .to_owned();
     if stack.env.len() > bosn_core::MAX_ENVIRONMENT_ENTRIES
         || stack.env.iter().any(|(key, value)| {
             key.is_empty()
@@ -987,24 +1019,42 @@ async fn manifest_stack_plan(
         .as_deref()
         .map(|value| manifest_workdir_to_workspace_relative(&workspace, value, &mounts))
         .transpose()?;
-    let digest = image
-        .rsplit_once("@sha256:")
-        .map(|(_, value)| format!("sha256:{value}"))
-        .expect("validated pinned image has digest");
     let tmpfs = manifest_tmpfs(stack)?;
-    let base_generation = stack_generation_async(
-        &manifest,
-        stack,
-        &workspace,
-        &CollectorLimits::default(),
-        &[ExternalImageIdentity {
-            reference: image.clone(),
-            platform: None,
-            identity: Some(digest),
-        }],
-    )
-    .await
-    .map_err(|_| "manifest generation could not be derived".to_owned())?;
+    let (pinned_image, dockerfile_build, base_generation) = if stack.dockerfile.is_some() {
+        if stack.image.is_some() {
+            return Err("manifest Dockerfile build cannot also set image".into());
+        }
+        let build = manifest_dockerfile_build_plan(&manifest, stack, &workspace).await?;
+        let generation = build.generation.clone();
+        (None, Some(build), generation)
+    } else {
+        let image = stack
+            .image
+            .as_deref()
+            .filter(|image| valid_manifest_pinned_image(image))
+            .ok_or_else(|| {
+                "selected manifest stack must use an immutable digest-pinned image".to_owned()
+            })?
+            .to_owned();
+        let digest = image
+            .rsplit_once("@sha256:")
+            .map(|(_, value)| format!("sha256:{value}"))
+            .expect("validated pinned image has digest");
+        let base_generation = stack_generation_async(
+            &manifest,
+            stack,
+            &workspace,
+            &CollectorLimits::default(),
+            &[ExternalImageIdentity {
+                reference: image.clone(),
+                platform: None,
+                identity: Some(digest),
+            }],
+        )
+        .await
+        .map_err(|_| "manifest generation could not be derived".to_owned())?;
+        (Some(image), None, base_generation)
+    };
     // `bosn-generation` deliberately excludes workdir from the historical
     // content identity because legacy `docker exec` supplied it per task.
     // Native setup creates a persistent container with its workdir and binds,
@@ -1020,6 +1070,35 @@ async fn manifest_stack_plan(
         .strip_prefix("sha256:")
         .ok_or_else(|| "manifest generation is invalid".to_owned())?
         .to_owned();
+    let (source, app_source, asset_root) = if let Some(build) = dockerfile_build {
+        let state_dir = state_dir
+            .ok_or_else(|| {
+                "manifest Dockerfile build requires daemon-owned state materialization".to_owned()
+            })?
+            .to_path_buf();
+        let materialization_hash = content_sha256.clone();
+        let asset_root = async_engine::launch_blocking(move || {
+            SetupAssetStore::under_state_dir(state_dir)?
+                .materialize_manifest_context(&materialization_hash, &build.files)
+        })
+        .await
+        .map_err(|_| "manifest Dockerfile materialization stopped".to_owned())?
+        .map_err(|_| "manifest Dockerfile materialization was refused".to_owned())?;
+        (
+            SetupSource::InlineDockerfile(build.dockerfile),
+            SetupPlanAppSource::InlineDockerfile {
+                dockerfile_path: asset_root.join("Dockerfile"),
+            },
+            Some(asset_root),
+        )
+    } else {
+        let image = pinned_image.expect("manifest source has image or Dockerfile");
+        (
+            SetupSource::PinnedImage(image.clone()),
+            SetupPlanAppSource::PinnedImage { image },
+            None,
+        )
+    };
     let mut tasks = BTreeMap::new();
     if let Some(task_name) = task_name {
         let task = manifest
@@ -1044,7 +1123,7 @@ async fn manifest_stack_plan(
     let workspace_string = workspace.to_string_lossy().into_owned();
     let volumes = manifest_named_volumes(stack, &workspace_string, &generation)?;
     let app = SetupApp {
-        source: SetupSource::PinnedImage(image.clone()),
+        source,
         environment: stack.env.clone(),
         workdir,
         command: None,
@@ -1056,11 +1135,11 @@ async fn manifest_stack_plan(
             content_sha256,
             schema_version: bosn_core::SETUP_DOCUMENT_VERSION,
             workspace_root: workspace,
-            asset_root: None,
+            asset_root,
             task_names,
             app,
             tasks,
-            app_source: SetupPlanAppSource::PinnedImage { image },
+            app_source,
             named_volumes: volumes
                 .iter()
                 .map(|volume| SetupNamedVolume {
@@ -1081,6 +1160,111 @@ struct ManifestRuntimePlan {
     plan: SetupPlan,
     generation: String,
     volumes: Vec<ManifestVolumeResource>,
+}
+
+/// One immutable, already-selected Docker build context.  It carries bytes
+/// rather than paths so the later setup materializer cannot be redirected by a
+/// changed workspace entry.
+#[derive(Clone, Debug)]
+struct ManifestDockerfileBuild {
+    generation: String,
+    dockerfile: String,
+    files: Vec<ManifestBuildFile>,
+}
+
+/// Collect and authorize the exact build bytes for the deliberately narrow
+/// manifest-Dockerfile form.  This happens on the kernel blocking lane once;
+/// the returned bytes are then copied into owner-private setup state, rather
+/// than handing Docker the selected workspace path.
+async fn manifest_dockerfile_build_plan(
+    manifest: &bosn_core::Manifest,
+    stack: &bosn_core::manifest::Stack,
+    workspace: &Path,
+) -> Result<ManifestDockerfileBuild, String> {
+    let manifest = manifest.clone();
+    let stack = stack.clone();
+    let workspace = workspace.to_path_buf();
+    async_engine::launch_blocking(move || {
+        let dockerfile = stack
+            .dockerfile
+            .as_deref()
+            .ok_or_else(|| "manifest Dockerfile build is missing its Dockerfile".to_owned())?;
+        if dockerfile != "Dockerfile" {
+            return Err(
+                "manifest Dockerfile build supports only the workspace-root Dockerfile".into(),
+            );
+        }
+        let context = collect_context(&workspace, Some(dockerfile), &CollectorLimits::default())
+            .map_err(|_| "manifest Dockerfile context was refused".to_owned())?;
+        let mut files = Vec::new();
+        let mut directories = std::collections::BTreeSet::new();
+        for entry in &context.entries {
+            match entry {
+                ContextEntry::File { path, bytes } => files.push(ManifestBuildFile {
+                    path: path.clone(),
+                    content: bytes.clone(),
+                }),
+                ContextEntry::Directory { path } => {
+                    directories.insert(path.clone());
+                }
+                ContextEntry::Symlink { .. } => {
+                    return Err("manifest Dockerfile context contains a symlink".into());
+                }
+            }
+        }
+        if directories.iter().any(|directory| {
+            !files.iter().any(|file| {
+                file.path
+                    .strip_prefix(directory)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+            })
+        }) {
+            return Err(
+                "manifest Dockerfile context contains an unsupported empty directory".into(),
+            );
+        }
+        let dockerfile_bytes = files
+            .iter()
+            .find(|file| file.path == dockerfile)
+            .map(|file| file.content.as_slice())
+            .ok_or_else(|| "manifest Dockerfile context has no root Dockerfile".to_owned())?;
+        let dockerfile_text = std::str::from_utf8(dockerfile_bytes)
+            .map_err(|_| "manifest Dockerfile is not UTF-8".to_owned())?
+            .to_owned();
+        let required = external_images(&dockerfile_text)
+            .map_err(|_| "manifest Dockerfile uses an unsupported build form".to_owned())?;
+        let mut observed = Vec::new();
+        let mut identities = std::collections::BTreeSet::new();
+        for image in required {
+            if !valid_manifest_pinned_image(&image.reference) {
+                return Err(
+                    "manifest Dockerfile external images must be immutable digest-pinned".into(),
+                );
+            }
+            if !identities.insert((image.reference.clone(), image.platform.clone())) {
+                return Err("manifest Dockerfile repeats an external image declaration".into());
+            }
+            let digest = image
+                .reference
+                .rsplit_once("@sha256:")
+                .map(|(_, digest)| format!("sha256:{digest}"))
+                .expect("validated image has a digest");
+            observed.push(ExternalImageIdentity {
+                reference: image.reference,
+                platform: image.platform,
+                identity: Some(digest),
+            });
+        }
+        let generation = stack_generation_from_context(&manifest, &stack, &context, &observed)
+            .map_err(|_| "manifest Dockerfile generation could not be derived".to_owned())?;
+        Ok(ManifestDockerfileBuild {
+            generation,
+            dockerfile: dockerfile_text,
+            files,
+        })
+    })
+    .await
+    .map_err(|_| "manifest Dockerfile planning stopped".to_owned())?
 }
 
 fn manifest_named_volumes(
@@ -5756,8 +5940,12 @@ impl Service {
             setup_task_executor: Arc::new(DockerSetupTaskExecutor::new(state_dir.clone())),
             setup_app_task_executor: Arc::new(DockerSetupAppTaskExecutor::new(state_dir.clone())),
             setup_ensure_executor: Arc::new(DockerSetupEnsureExecutor::new(state_dir.clone())),
-            manifest_ensure_executor: Arc::new(DockerManifestEnsureExecutor::new()),
-            manifest_app_task_executor: Arc::new(DockerManifestAppTaskExecutor::new()),
+            manifest_ensure_executor: Arc::new(DockerManifestEnsureExecutor::new(
+                state_dir.clone(),
+            )),
+            manifest_app_task_executor: Arc::new(DockerManifestAppTaskExecutor::new(
+                state_dir.clone(),
+            )),
             setup_adopt_executor: Arc::new(DockerSetupAdoptExecutor::new(state_dir.clone())),
             doctor_executor: Arc::new(DockerDoctorExecutor::new()),
             setup_reconcile_executor: Arc::new(DockerSetupReconcileExecutor::new()),
@@ -7783,6 +7971,173 @@ mod tests {
                     deadline: Duration::from_secs(1),
                     output_limit: 64,
                 }))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn manifest_dockerfile_plan_materializes_one_selected_context_and_rolls_generation() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("bosn.toml"),
+            "[stack.app]\ndockerfile = 'Dockerfile'\n[task.check]\nstack = 'app'\ncmd = 'test -f /payload'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("Dockerfile"),
+            "FROM scratch\nCOPY payload /payload\n",
+        )
+        .unwrap();
+        std::fs::write(workspace.join("payload"), "one\n").unwrap();
+        let request = ManifestEnsureJobRequest {
+            workspace: workspace.clone(),
+            manifest: "bosn.toml".into(),
+            stack: "app".into(),
+            deadline: Duration::from_secs(1),
+            output_limit: 64,
+        };
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let first = runtime
+            .run(manifest_stack_setup_plan_at(&request, Some(&state)))
+            .unwrap();
+        assert!(matches!(
+            first.plan.app.source,
+            SetupSource::InlineDockerfile(_)
+        ));
+        let asset_root = first.plan.asset_root.as_ref().unwrap();
+        assert_eq!(
+            asset_root.file_name().and_then(|name| name.to_str()),
+            Some(first.plan.content_sha256.as_str())
+        );
+        assert_eq!(
+            std::fs::read_to_string(asset_root.join("payload")).unwrap(),
+            "one\n"
+        );
+        assert_eq!(
+            first.plan.app_source,
+            SetupPlanAppSource::InlineDockerfile {
+                dockerfile_path: asset_root.join("Dockerfile"),
+            }
+        );
+        std::fs::write(workspace.join("payload"), "two\n").unwrap();
+        let second = runtime
+            .run(manifest_stack_setup_plan_at(&request, Some(&state)))
+            .unwrap();
+        assert_ne!(first.generation, second.generation);
+        assert_ne!(first.plan.content_sha256, second.plan.content_sha256);
+        assert_eq!(
+            std::fs::read_to_string(second.plan.asset_root.unwrap().join("payload")).unwrap(),
+            "two\n"
+        );
+
+        std::fs::write(
+            workspace.join("Dockerfile"),
+            "FROM alpine:3.21\nCOPY payload /payload\n",
+        )
+        .unwrap();
+        assert!(
+            runtime
+                .run(manifest_stack_setup_plan_at(&request, Some(&state)))
+                .is_err()
+        );
+        std::fs::write(
+            workspace.join("bosn.toml"),
+            format!(
+                "[stack.app]\ndockerfile = 'Dockerfile'\nimage = 'example.invalid/app@sha256:{}'\n",
+                "a".repeat(64)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("Dockerfile"),
+            "FROM scratch\nCOPY payload /payload\n",
+        )
+        .unwrap();
+        assert!(
+            runtime
+                .run(manifest_stack_setup_plan_at(&request, Some(&state)))
+                .is_err()
+        );
+        std::fs::write(
+            workspace.join("bosn.toml"),
+            "[stack.app]\ndockerfile = 'Dockerfile'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join("Dockerfile"),
+            "FROM scratch\nCOPY ../outside /outside\n",
+        )
+        .unwrap();
+        assert!(
+            runtime
+                .run(manifest_stack_setup_plan_at(&request, Some(&state)))
+                .is_err()
+        );
+        std::fs::write(
+            workspace.join("bosn.toml"),
+            "[stack.app]\ndockerfile = 'docker/Dockerfile'\n",
+        )
+        .unwrap();
+        assert!(
+            runtime
+                .run(manifest_stack_setup_plan_at(&request, Some(&state)))
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_dockerfile_plan_refuses_selected_context_symlinks_and_empty_directories() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("bosn.toml"),
+            "[stack.app]\ndockerfile = 'Dockerfile'\n",
+        )
+        .unwrap();
+        std::fs::write(workspace.join("payload"), "ok\n").unwrap();
+        std::fs::write(
+            workspace.join("Dockerfile"),
+            "FROM scratch\nCOPY link /payload\n",
+        )
+        .unwrap();
+        symlink("payload", workspace.join("link")).unwrap();
+        let request = ManifestEnsureJobRequest {
+            workspace: workspace.clone(),
+            manifest: "bosn.toml".into(),
+            stack: "app".into(),
+            deadline: Duration::from_secs(1),
+            output_limit: 64,
+        };
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert!(
+            runtime
+                .run(manifest_stack_setup_plan_at(&request, Some(&state)))
+                .is_err()
+        );
+        std::fs::remove_file(workspace.join("link")).unwrap();
+        std::fs::create_dir(workspace.join("empty")).unwrap();
+        std::fs::write(
+            workspace.join("Dockerfile"),
+            "FROM scratch\nCOPY empty /empty\n",
+        )
+        .unwrap();
+        assert!(
+            runtime
+                .run(manifest_stack_setup_plan_at(&request, Some(&state)))
                 .is_err()
         );
     }
@@ -10618,8 +10973,10 @@ mod tests {
                         task: Arc::new(FakeSetupTaskExecutor::new()),
                         app_task: Arc::new(FakeSetupAppTaskExecutor::new()),
                         ensure: fake,
-                        manifest_ensure: Arc::new(DockerManifestEnsureExecutor::new()),
-                        manifest_app_task: Arc::new(DockerManifestAppTaskExecutor::new()),
+                        manifest_ensure: Arc::new(DockerManifestEnsureExecutor::new(state.clone())),
+                        manifest_app_task: Arc::new(DockerManifestAppTaskExecutor::new(
+                            state.clone(),
+                        )),
                     },
                     job_sender.clone(),
                     registry_handle.clone(),

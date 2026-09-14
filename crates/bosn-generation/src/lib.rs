@@ -318,9 +318,25 @@ pub fn stack_generation(
         return Err(StackGenerationError::RootMismatch);
     }
     let context = collector::collect_context(root, stack.dockerfile.as_deref(), limits)?;
+    stack_generation_from_context(manifest, stack, &context, observed)
+}
+
+/// Derive one generation from a single already-collected context observation.
+///
+/// This is the companion to [`stack_generation`], for a caller which must
+/// materialize the exact same selected bytes after authorizing their
+/// generation.  It keeps collection and materialization from observing two
+/// different workspace snapshots while retaining the same external-image
+/// policy as the ordinary entry point.
+pub fn stack_generation_from_context(
+    manifest: &Manifest,
+    stack: &Stack,
+    context: &ContextObservation,
+    observed: &[ExternalImageIdentity],
+) -> Result<String, StackGenerationError> {
     let mut normalized_manifest = manifest.clone();
     normalized_manifest.roots.materialization_root = context.materialization_root.clone();
-    let content = content_digest(&normalized_manifest, stack, &context)?;
+    let content = content_digest(&normalized_manifest, stack, context)?;
     let required = if let Some(dockerfile) = &stack.dockerfile {
         let bytes = context
             .entries

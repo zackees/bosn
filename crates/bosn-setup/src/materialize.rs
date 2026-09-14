@@ -42,6 +42,16 @@ pub struct SetupAssetStore {
     directory: PathBuf,
 }
 
+/// One already-observed regular file from a legacy manifest Docker build
+/// context.  The daemon obtains these bytes through the bounded generation
+/// collector before asking the setup layer to create any private assets; this
+/// type is deliberately not a host path or a Docker argument.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManifestBuildFile {
+    pub path: String,
+    pub content: Vec<u8>,
+}
+
 impl SetupAssetStore {
     /// Create or validate `<state_dir>/setup-assets` as Bosn-owned state.
     ///
@@ -90,31 +100,7 @@ impl SetupAssetStore {
             SetupSource::InlineDockerfile(dockerfile) => {
                 let content_hash = validated_content_hash(&provenance.content_sha256)?;
                 let expected = expected_assets(dockerfile, &resolved.document.files)?;
-                let asset_root = self.directory.join(&content_hash);
-                let created = ensure_private_directory(&asset_root)?;
-                let lock_path = asset_root.join(LOCK_NAME);
-                let lock =
-                    fs::open_lock_file(&lock_path).map_err(SetupMaterializeError::Filesystem)?;
-                let _lock = fs::lock_exclusive(&lock).map_err(SetupMaterializeError::Filesystem)?;
-
-                let receipt = receipt_bytes(&content_hash, &expected)?;
-                let receipt_path = asset_root.join(RECEIPT_NAME);
-                match fs::context_path_metadata_no_follow(&receipt_path) {
-                    Ok(metadata) if metadata.kind == fs::ContextPathKind::RegularFile => {
-                        verify_complete_assets(&asset_root, &expected, &receipt)?;
-                    }
-                    Ok(_) => return Err(SetupMaterializeError::ExistingAssetsConflict),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound && created => {
-                        write_expected_assets(&asset_root, &expected)?;
-                        atomic_write_new(&receipt_path, &receipt)?;
-                        fs::sync_directory(&asset_root)
-                            .map_err(SetupMaterializeError::Filesystem)?;
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        return Err(SetupMaterializeError::IncompleteAssets);
-                    }
-                    Err(error) => return Err(SetupMaterializeError::Filesystem(error)),
-                }
+                let asset_root = self.materialize_expected_assets(&content_hash, &expected)?;
 
                 let dockerfile_path = asset_root.join("Dockerfile");
                 let files = expected
@@ -138,6 +124,78 @@ impl SetupAssetStore {
                 })
             }
         }
+    }
+
+    /// Materialize a bounded, already-selected manifest Docker context below
+    /// Bosn-owned state.  This is intentionally narrower than Docker's raw
+    /// build interface: callers supply content bytes, never a host context
+    /// path, build args, tag, or Docker argv.  The selected Dockerfile must be
+    /// the context-root `Dockerfile`; alternate Dockerfile locations are
+    /// refused by the manifest runtime until that shape has a separately
+    /// audited typed representation.
+    pub fn materialize_manifest_context(
+        &self,
+        content_sha256: &str,
+        files: &[ManifestBuildFile],
+    ) -> Result<PathBuf, SetupMaterializeError> {
+        let content_hash = validated_content_hash(content_sha256)?;
+        let mut expected = Vec::with_capacity(files.len());
+        let mut paths = BTreeSet::new();
+        let mut total = 0_usize;
+        for file in files {
+            if !valid_relative_asset_path(&file.path)
+                || matches!(file.path.as_str(), RECEIPT_NAME | LOCK_NAME)
+                || !paths.insert(file.path.clone())
+                || file.content.len() > MAX_COMPANION_FILE_BYTES
+            {
+                return Err(SetupMaterializeError::InvalidAssetPath);
+            }
+            total = total
+                .checked_add(file.content.len())
+                .ok_or(SetupMaterializeError::InvalidAssetPath)?;
+            if total > 64 * 1024 * 1024 {
+                return Err(SetupMaterializeError::InvalidAssetPath);
+            }
+            expected.push(ExpectedAsset {
+                relative: file.path.clone(),
+                content: file.content.clone(),
+            });
+        }
+        if !paths.contains("Dockerfile") {
+            return Err(SetupMaterializeError::InvalidAssetPath);
+        }
+        self.materialize_expected_assets(&content_hash, &expected)
+    }
+
+    fn materialize_expected_assets(
+        &self,
+        content_hash: &str,
+        expected: &[ExpectedAsset],
+    ) -> Result<PathBuf, SetupMaterializeError> {
+        let asset_root = self.directory.join(content_hash);
+        let created = ensure_private_directory(&asset_root)?;
+        let lock_path = asset_root.join(LOCK_NAME);
+        let lock = fs::open_lock_file(&lock_path).map_err(SetupMaterializeError::Filesystem)?;
+        let _lock = fs::lock_exclusive(&lock).map_err(SetupMaterializeError::Filesystem)?;
+
+        let receipt = receipt_bytes(content_hash, expected)?;
+        let receipt_path = asset_root.join(RECEIPT_NAME);
+        match fs::context_path_metadata_no_follow(&receipt_path) {
+            Ok(metadata) if metadata.kind == fs::ContextPathKind::RegularFile => {
+                verify_complete_assets(&asset_root, expected, &receipt)?;
+            }
+            Ok(_) => return Err(SetupMaterializeError::ExistingAssetsConflict),
+            Err(error) if error.kind() == io::ErrorKind::NotFound && created => {
+                write_expected_assets(&asset_root, expected)?;
+                atomic_write_new(&receipt_path, &receipt)?;
+                fs::sync_directory(&asset_root).map_err(SetupMaterializeError::Filesystem)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(SetupMaterializeError::IncompleteAssets);
+            }
+            Err(error) => return Err(SetupMaterializeError::Filesystem(error)),
+        }
+        Ok(asset_root)
     }
 }
 

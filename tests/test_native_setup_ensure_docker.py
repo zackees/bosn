@@ -893,6 +893,158 @@ def test_native_manifest_task_inherits_declared_workspace_binds_and_workdir(
             _remove_exact_managed_container(container_name, content_sha256)
 
 
+def test_native_manifest_dockerfile_context_is_private_content_addressed_and_rolls(
+    tmp_path: Path,
+) -> None:
+    """A fresh wheel builds a manifest context and task-reuses its exact app.
+
+    The selected workspace Dockerfile uses a digest-pinned base.  The test
+    changes a copied source file, proves a new private build generation and
+    managed container, then runs each declaration-only task in its matching
+    persistent application.  Docker is used only as an external verifier and
+    for exact-label container cleanup.
+    """
+
+    _pinned_image_id()
+    state_dir = tmp_path / "state"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manifest = workspace / "bosn.toml"
+    dockerfile = workspace / "Dockerfile"
+    payload = workspace / "payload.txt"
+    containers: list[tuple[str, str]] = []
+
+    def write_manifest(task_name: str, expected: str) -> None:
+        manifest.write_text(
+            "[stack.app]\n"
+            "dockerfile = 'Dockerfile'\n"
+            f"[task.{task_name}]\n"
+            "stack = 'app'\n"
+            f"cmd = '''test \"$(cat /payload.txt)\" = \"{expected}\"'''\n",
+            encoding="utf-8",
+        )
+
+    dockerfile.write_text(
+        f"FROM {PINNED_ALPINE}\n"
+        "COPY payload.txt /payload.txt\n"
+        "CMD [\"sh\", \"-c\", \"while true; do sleep 30; done\"]\n",
+        encoding="utf-8",
+    )
+    payload.write_text("one\n", encoding="utf-8")
+    write_manifest("one", "one")
+    try:
+        client = bosn.Client(state_dir)
+        with _production_daemon(state_dir) as (_, daemon):
+            _wait_for_daemon(client, daemon)
+            first_job = client.submit_manifest_ensure(
+                workspace, "bosn.toml", "app", deadline_ms=90_000, output_limit=1_048_576
+            )
+            assert "[manifest] preparing immutable application image" in _wait_for_success(
+                client, first_job
+            )
+            first = next(
+                record
+                for record in client.registry_resources(limit=32).records
+                if record.kind == "container" and record.state == "active"
+            )
+            first_content = first.generation.removeprefix("sha256:")
+            first_name = f"bosn-setup-{first_content}"
+            containers.append((first_name, first_content))
+            first_observed = _inspect_container(first_name)
+            assert first_observed is not None and first_observed[1]
+            assert first_observed[3] == {
+                MANAGED_LABEL: "v1",
+                CONTENT_LABEL: first_content,
+                NAME_LABEL: first_name,
+            }
+            _wait_for_success(
+                client,
+                client.submit_manifest_app_task(
+                    workspace,
+                    "bosn.toml",
+                    "app",
+                    "one",
+                    deadline_ms=90_000,
+                    output_limit=1_048_576,
+                ),
+            )
+
+            payload.write_text("two\n", encoding="utf-8")
+            write_manifest("two", "two")
+            _wait_for_success(
+                client,
+                client.submit_manifest_ensure(
+                    workspace,
+                    "bosn.toml",
+                    "app",
+                    deadline_ms=90_000,
+                    output_limit=1_048_576,
+                ),
+            )
+            second = next(
+                record
+                for record in client.registry_resources(limit=32).records
+                if record.kind == "container" and record.state == "active"
+            )
+            second_content = second.generation.removeprefix("sha256:")
+            second_name = f"bosn-setup-{second_content}"
+            assert second_name != first_name
+            containers.append((second_name, second_content))
+            assert _inspect_container(second_name) is not None
+            _wait_for_success(
+                client,
+                client.submit_manifest_app_task(
+                    workspace,
+                    "bosn.toml",
+                    "app",
+                    "two",
+                    deadline_ms=90_000,
+                    output_limit=1_048_576,
+                ),
+            )
+
+            dockerfile.write_text(
+                f"FROM {PINNED_ALPINE}\n"
+                "LABEL bosn.manifest-rollover=three\n"
+                "COPY payload.txt /payload.txt\n"
+                "CMD [\"sh\", \"-c\", \"while true; do sleep 30; done\"]\n",
+                encoding="utf-8",
+            )
+            _wait_for_success(
+                client,
+                client.submit_manifest_ensure(
+                    workspace,
+                    "bosn.toml",
+                    "app",
+                    deadline_ms=90_000,
+                    output_limit=1_048_576,
+                ),
+            )
+            third = next(
+                record
+                for record in client.registry_resources(limit=32).records
+                if record.kind == "container" and record.state == "active"
+            )
+            third_content = third.generation.removeprefix("sha256:")
+            third_name = f"bosn-setup-{third_content}"
+            assert third_name not in {first_name, second_name}
+            containers.append((third_name, third_content))
+            _wait_for_success(
+                client,
+                client.submit_manifest_app_task(
+                    workspace,
+                    "bosn.toml",
+                    "app",
+                    "two",
+                    deadline_ms=90_000,
+                    output_limit=1_048_576,
+                ),
+            )
+    finally:
+        for name, content in reversed(containers):
+            _remove_exact_managed_container(name, content)
+
+
 def test_native_manifest_tmpfs_is_typed_and_empty_after_generation_rollover(
     tmp_path: Path,
 ) -> None:

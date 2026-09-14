@@ -521,7 +521,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "bosn_manifest_ensure",
-                "description": "Submit a bounded daemon-owned ensure of one explicitly named legacy Bosn manifest stack. The supported runtime slice accepts a workspace-contained local TOML manifest, immutable external image, declared environment, typed managed volumes, safe workspace binds/workdir, and bounded tmpfs target/mode/size declarations. Builds, guests, replacement controls, and arbitrary Docker controls are refused.",
+                "description": "Submit a bounded daemon-owned ensure of one explicitly named legacy Bosn manifest stack. The supported runtime slice accepts a workspace-contained local TOML manifest, an immutable external image or a workspace-root Dockerfile with a digest-pinned external-image context, declared environment, typed managed volumes, safe workspace binds/workdir, and bounded tmpfs target/mode/size declarations. Dockerfile contexts are copied into daemon-owned content-addressed state; alternate Dockerfile paths, symlinks, empty selected directories, guests, replacement controls, and arbitrary Docker controls are refused.",
                 "inputSchema": manifest_ensure_schema(),
                 "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}
             },

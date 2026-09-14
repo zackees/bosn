@@ -39,8 +39,9 @@ The daemon canonicalizes the workspace and manifest, requires the latter to
 remain beneath the workspace, reads a bounded regular UTF-8 file through
 `kernal-api`, and parses the existing `bosn-core` manifest model. It requires
 the caller's exact stack name. For the supported shape it derives a generation
-with `bosn-generation::stack_generation_async`, prepares/pulls the declared
-immutable image, then uses the existing finite typed ensure primitive to
+with the bounded `bosn-generation` collector, prepares/pulls the declared
+immutable image or materializes an accepted Dockerfile context into
+owner-private Bosn state, then uses the existing finite typed ensure primitive to
 inspect/create/start only the deterministic Bosn-owned container. The daemon
 atomically records its container, inspected image, resource uses, and a
 `manifest.ensure.succeeded` event through the sole registry actor. A successful
@@ -63,7 +64,7 @@ changed.
 | `[stack.NAME.env]` scalar environment | Supported after bounded validation |
 | One explicitly named stack | Supported |
 | Named `[task.NAME]` for that stack in an already ensured container | Supported; fixed daemon-owned exec only |
-| Dockerfile/build context | Refused |
+| `dockerfile = 'Dockerfile'` build context | Supported for the selected workspace-root Dockerfile. The daemon collects the finite Docker-selected `COPY`/`ADD` context through `kernal-api`, refuses selected symlinks, special files, empty selected directories, traversal, unbounded assets, alternate Dockerfile locations, and a simultaneous `image`. It copies exact observed regular-file bytes to an owner-private content-addressed setup asset tree before the typed build primitive invokes Docker; Docker never receives the workspace as its build context. Every external Dockerfile image must itself be digest-pinned. |
 | macOS guest / guest fields | Refused |
 | named `[stack.NAME.volumes]` | Supported for typed Bosn-managed named volumes. The daemon derives the engine name from the declared logical name, scope, canonical workspace, and (for `spec`) generation; callers cannot supply a Docker volume name or mount string. It writes a durable creation intent before `docker volume create`, requires exact ownership labels before reuse, then atomically records the resource and consumes the intent after container ensure. `spec` rolls with generation; `stack` survives generations within its workspace; `machine` follows the declared `family` or stack. Normal rollover and GC never delete volume data in this slice; retention is recorded for later explicit lifecycle work. |
 | `tmpfs` | Supported only as an array of normalized legacy strings: `/target`, `/target:ro`, `/target:rw`, with an optional one `size=POSITIVE{b,k,m,g}` option (for example `/run/cache:rw,size=64m`). The daemon parses those into typed target/mode/size values before its engine seam, incorporates the declaration into the runtime generation, and emits only its own finite `--tmpfs` form. Repeated modes/sizes and all other options (`noexec`, `mode`, `uid`, etc.) are refused rather than passed through. tmpfs is disposable container state; a generation rollover creates a new empty tmpfs. |
@@ -87,7 +88,8 @@ same mount sources again immediately before its engine operation.
 ## Remaining work
 
 This does not claim completion of manifest migration. Future slices must add
-explicit volume release/GC application, build materialization,
+explicit volume release/GC application, broader Dockerfile forms (alternate
+Dockerfile paths plus selected symlink and empty-directory representation),
 multi-stack dependency ordering, guest lifecycle, declarative tasks,
 autostart/recovery, and generation reconciliation. Each must
 remain daemon-owned and registry-backed rather than reintroducing raw Docker or
