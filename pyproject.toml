@@ -28,6 +28,12 @@ dev = [
     "pyright>=1.1.380",
 ]
 
+# Target state is `build-backend = "soldr"` (soldr's own dogfooded pattern), but
+# soldr's native build has no hook to build and bundle Bosn's separate
+# `bosn-native` CLI binary into the wheel — only the maturin extension. Until
+# soldr grows auxiliary-binary staging (tracked in zackees/soldr#3239,
+# zackees/bosn#262), bosn_build_backend stays the PEP 517 backend: it builds and
+# stages the CLI, then delegates the extension build to maturin.
 [build-system]
 requires = ["maturin>=1.15,<2"]
 build-backend = "bosn_build_backend"

@@ -130,6 +130,14 @@ jobs:
       - name: Install and smoke-test platform wheel outside the checkout
         run: python ci/verify_installed_wheel.py "dist/bosn-*.whl"
 
+      # The macOS Recovery lane (macos-x64-execute.yml) has no uv and no
+      # network, so it installs with the interpreter's own pip, offline.
+      # Exercise that exact path here on every run so the advisory lane never
+      # fails for a verifier reason the gating lanes would have caught.
+      - name: Smoke-test the wheel through the offline pip installer path
+        if: runner.os == 'Linux'
+        run: python ci/verify_installed_wheel.py --installer pip "dist/bosn-*.whl"
+
   darwin-cross-wheel:
     name: Darwin wheel (${{ matrix.target }}, Linux-hosted Soldr)
     runs-on: ubuntu-latest
