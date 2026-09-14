@@ -521,7 +521,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "bosn_manifest_ensure",
-                "description": "Submit a bounded daemon-owned ensure of one explicitly named legacy Bosn manifest stack. The first runtime slice accepts only a workspace-contained local TOML manifest, immutable external image, and declared environment; builds, guests, volumes, mounts, tmpfs, workdirs, replacement, and arbitrary Docker controls are refused.",
+                "description": "Submit a bounded daemon-owned ensure of one explicitly named legacy Bosn manifest stack. The supported runtime slice accepts a workspace-contained local TOML manifest, immutable external image, declared environment, typed managed volumes, safe workspace binds/workdir, and bounded tmpfs target/mode/size declarations. Builds, guests, replacement controls, and arbitrary Docker controls are refused.",
                 "inputSchema": manifest_ensure_schema(),
                 "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}
             },
@@ -1803,6 +1803,7 @@ mod tests {
                     image: "registry.example/demo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
                 },
                 named_volumes: Vec::new(),
+                tmpfs: Vec::new(),
             })
         }
     }

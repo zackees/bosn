@@ -52,6 +52,32 @@ pub struct SetupNamedVolume {
     pub labels: BTreeMap<String, String>,
 }
 
+/// A bounded tmpfs declaration derived by the manifest runtime.  Setup
+/// documents intentionally have no tmpfs syntax: this value is created only
+/// after the daemon has parsed the finite legacy manifest form.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupTmpfs {
+    pub target: String,
+    pub readonly: bool,
+    pub size: Option<SetupTmpfsSize>,
+}
+
+/// Unit accepted for a manifest tmpfs `size=` option.  Keeping this an enum
+/// prevents a manifest option string from becoming a Docker argument.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetupTmpfsSizeUnit {
+    Bytes,
+    Kibibytes,
+    Mebibytes,
+    Gibibytes,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupTmpfsSize {
+    pub value: u64,
+    pub unit: SetupTmpfsSizeUnit,
+}
+
 /// Typed receipt of a setup plan.  The source bytes have been validated and
 /// cached according to the request, while Docker and the Bosn daemon remain
 /// untouched.
@@ -84,6 +110,9 @@ pub struct SetupPlan {
     /// Named volumes derived by the manifest runtime. Ordinary setup documents
     /// leave this empty.
     pub named_volumes: Vec<SetupNamedVolume>,
+    /// Tmpfs mounts derived from an accepted manifest declaration. Ordinary
+    /// setup documents leave this empty.
+    pub tmpfs: Vec<SetupTmpfs>,
 }
 
 /// Planning stops before side effects outside Bosn-owned cache/asset state.
@@ -169,5 +198,6 @@ pub async fn plan_setup_with_transport<T: SetupRemoteTransport>(
         tasks: materialized.tasks().clone(),
         app_source,
         named_volumes: Vec::new(),
+        tmpfs: Vec::new(),
     })
 }

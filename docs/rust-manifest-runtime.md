@@ -66,7 +66,7 @@ changed.
 | Dockerfile/build context | Refused |
 | macOS guest / guest fields | Refused |
 | named `[stack.NAME.volumes]` | Supported for typed Bosn-managed named volumes. The daemon derives the engine name from the declared logical name, scope, canonical workspace, and (for `spec`) generation; callers cannot supply a Docker volume name or mount string. It writes a durable creation intent before `docker volume create`, requires exact ownership labels before reuse, then atomically records the resource and consumes the intent after container ensure. `spec` rolls with generation; `stack` survives generations within its workspace; `machine` follows the declared `family` or stack. Normal rollover and GC never delete volume data in this slice; retention is recorded for later explicit lifecycle work. |
-| tmpfs | Refused |
+| `tmpfs` | Supported only as an array of normalized legacy strings: `/target`, `/target:ro`, `/target:rw`, with an optional one `size=POSITIVE{b,k,m,g}` option (for example `/run/cache:rw,size=64m`). The daemon parses those into typed target/mode/size values before its engine seam, incorporates the declaration into the runtime generation, and emits only its own finite `--tmpfs` form. Repeated modes/sizes and all other options (`noexec`, `mode`, `uid`, etc.) are refused rather than passed through. tmpfs is disposable container state; a generation rollover creates a new empty tmpfs. |
 | `[stack.NAME.mounts]` workspace bind mounts | Supported for existing paths that canonicalize beneath the selected workspace. Sources may be legacy absolute paths only when they resolve beneath that workspace; traversal, source symlinks, escapes, duplicate targets, reserved targets, and unrepresentable Docker paths are refused. `readonly` is retained. |
 | `workdir` | Supported only when its normalized absolute container path is covered by a declared workspace bind. It is translated to the typed workspace-relative form, becomes the persistent container workdir, and is therefore inherited by declared `manifest app-task` exec. Image-only workdirs are refused. |
 | image tags or unpinned image references | Refused |
@@ -76,7 +76,8 @@ changed.
 
 The deterministic engine container is still checked against its exact derived
 image and labels before reuse. An occupied mismatched candidate fails closed.
-The runtime generation incorporates the accepted effective bind/workdir shape
+The runtime generation incorporates the accepted effective bind/workdir, named
+volume, and tmpfs shape
 in addition to the historical manifest generation, so a bind target/source/
 readonly or workdir change cannot reuse a container configured for the prior
 lifecycle declaration. Before each ensure and manifest app-task operation the

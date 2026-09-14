@@ -43,6 +43,15 @@ pub struct SetupEnsureVolume {
     pub labels: BTreeMap<String, String>,
 }
 
+/// A typed tmpfs mount. It has no arbitrary option field: all permitted
+/// options were parsed into finite values before reaching this engine seam.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupEnsureTmpfs {
+    pub target: String,
+    pub readonly: bool,
+    pub size: Option<crate::SetupTmpfsSize>,
+}
+
 /// A finite semantic engine command used by [`ensure_setup_app`].
 ///
 /// The operation deliberately has no generic Docker argument, network,
@@ -64,6 +73,7 @@ pub enum SetupEnsureCommand {
         image_identity: String,
         mounts: Vec<SetupEnsureMount>,
         volumes: Vec<SetupEnsureVolume>,
+        tmpfs: Vec<SetupEnsureTmpfs>,
         environment: BTreeMap<String, String>,
         workdir: Option<String>,
         command: Option<String>,
@@ -109,6 +119,7 @@ impl SetupEnsureCommand {
                 image_identity,
                 mounts,
                 volumes,
+                tmpfs,
                 environment,
                 workdir,
                 command,
@@ -142,6 +153,10 @@ impl SetupEnsureCommand {
                         "type=volume,src={},dst={}",
                         volume.name, volume.target
                     ));
+                }
+                for mount in tmpfs {
+                    args.push("--tmpfs".into());
+                    args.push(tmpfs_docker_value(mount));
                 }
                 for (key, value) in environment {
                     args.push("--env".into());
@@ -648,6 +663,7 @@ struct DerivedEnsure {
     command: Option<String>,
     labels: BTreeMap<String, String>,
     volumes: Vec<SetupEnsureVolume>,
+    tmpfs: Vec<SetupEnsureTmpfs>,
 }
 
 impl DerivedEnsure {
@@ -657,6 +673,7 @@ impl DerivedEnsure {
             image_identity: self.image_identity.clone(),
             mounts: self.mounts.clone(),
             volumes: self.volumes.clone(),
+            tmpfs: self.tmpfs.clone(),
             environment: self.environment.clone(),
             workdir: self.workdir.clone(),
             command: self.command.clone(),
@@ -701,6 +718,7 @@ fn derive_command(request: &SetupEnsureRequest<'_>) -> Result<DerivedEnsure, Set
         (LABEL_CONTAINER_NAME.into(), container_name.clone()),
     ]);
     let volumes = derive_volumes(request.plan)?;
+    let tmpfs = derive_tmpfs(request.plan)?;
     Ok(DerivedEnsure {
         container_name,
         image_identity: request.prepared_image.observed_identity.clone(),
@@ -710,6 +728,7 @@ fn derive_command(request: &SetupEnsureRequest<'_>) -> Result<DerivedEnsure, Set
         command,
         labels,
         volumes,
+        tmpfs,
     })
 }
 
@@ -746,7 +765,12 @@ fn validate_plan_shape(plan: &SetupPlan) -> Result<(), SetupEnsureError> {
         validate_workspace_relative(Some(&mount.source))?;
         validate_container_path(&mount.target)?;
     }
-    let mut targets = BTreeSet::new();
+    let mut targets: BTreeSet<String> = plan
+        .app
+        .mounts
+        .iter()
+        .map(|mount| mount.target.clone())
+        .collect();
     for volume in &plan.named_volumes {
         if !valid_volume_name(&volume.name)
             || validate_container_path(&volume.target).is_err()
@@ -762,6 +786,16 @@ fn validate_plan_shape(plan: &SetupPlan) -> Result<(), SetupEnsureError> {
         {
             return Err(SetupEnsureError::InvalidRequest(
                 "named volume receipt was modified",
+            ));
+        }
+    }
+    for tmpfs in &plan.tmpfs {
+        if validate_container_path(&tmpfs.target).is_err()
+            || !targets.insert(tmpfs.target.clone())
+            || tmpfs.size.as_ref().is_some_and(|size| size.value == 0)
+        {
+            return Err(SetupEnsureError::InvalidRequest(
+                "tmpfs receipt was modified",
             ));
         }
     }
@@ -785,6 +819,40 @@ fn derive_volumes(plan: &SetupPlan) -> Result<Vec<SetupEnsureVolume>, SetupEnsur
             })
         })
         .collect()
+}
+
+fn derive_tmpfs(plan: &SetupPlan) -> Result<Vec<SetupEnsureTmpfs>, SetupEnsureError> {
+    plan.tmpfs
+        .iter()
+        .map(|mount| {
+            Ok(SetupEnsureTmpfs {
+                target: mount.target.clone(),
+                readonly: mount.readonly,
+                size: mount.size.clone(),
+            })
+        })
+        .collect()
+}
+
+fn tmpfs_docker_value(mount: &SetupEnsureTmpfs) -> String {
+    let mut options = Vec::new();
+    if mount.readonly {
+        options.push("ro".to_owned());
+    }
+    if let Some(size) = &mount.size {
+        let unit = match size.unit {
+            crate::SetupTmpfsSizeUnit::Bytes => "b",
+            crate::SetupTmpfsSizeUnit::Kibibytes => "k",
+            crate::SetupTmpfsSizeUnit::Mebibytes => "m",
+            crate::SetupTmpfsSizeUnit::Gibibytes => "g",
+        };
+        options.push(format!("size={}{}", size.value, unit));
+    }
+    if options.is_empty() {
+        mount.target.clone()
+    } else {
+        format!("{}:{}", mount.target, options.join(","))
+    }
 }
 
 fn valid_volume_name(value: &str) -> bool {
@@ -1267,6 +1335,7 @@ mod tests {
             tasks: BTreeMap::new(),
             app_source: SetupPlanAppSource::PinnedImage { image },
             named_volumes: Vec::new(),
+            tmpfs: Vec::new(),
         }
     }
 
@@ -1463,6 +1532,66 @@ mod tests {
         assert!(args[3].contains('\t'));
         assert!(!args[3].contains("\\\\t"));
         assert_eq!(args[4], volume_name);
+    }
+
+    #[test]
+    fn typed_tmpfs_is_emitted_without_a_raw_option_channel() {
+        let command = SetupEnsureCommand::Create {
+            container_name: "bosn-setup-test".into(),
+            image_identity: IDENTITY.into(),
+            mounts: Vec::new(),
+            volumes: Vec::new(),
+            tmpfs: vec![SetupEnsureTmpfs {
+                target: "/run/cache".into(),
+                readonly: true,
+                size: Some(crate::SetupTmpfsSize {
+                    value: 64,
+                    unit: crate::SetupTmpfsSizeUnit::Mebibytes,
+                }),
+            }],
+            environment: BTreeMap::new(),
+            workdir: None,
+            command: None,
+            labels: BTreeMap::new(),
+        };
+        let args = command.docker_args();
+        assert_eq!(
+            args.windows(2)
+                .find(|pair| pair[0] == "--tmpfs")
+                .map(|pair| pair[1].as_str()),
+            Some("/run/cache:ro,size=64m")
+        );
+    }
+
+    #[test]
+    fn tmpfs_target_cannot_collide_with_a_bind_or_be_modified() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(workspace.join("src")).unwrap();
+        let mut plan = plan(&workspace);
+        plan.tmpfs.push(crate::SetupTmpfs {
+            target: "/workspace".into(),
+            readonly: false,
+            size: None,
+        });
+        let image = prepared(&plan);
+        let engine = FakeEngine::with_results([]);
+        let cancellation = CancellationSource::new();
+        assert!(matches!(
+            run(
+                &engine,
+                &plan,
+                &workspace,
+                &image,
+                &cancellation.token(),
+                RunOptions::streaming(Duration::from_secs(2), 4096),
+            ),
+            Err(SetupEnsureError::InvalidRequest(
+                "tmpfs receipt was modified"
+            ))
+        ));
+        assert!(engine.calls.lock().unwrap().is_empty());
     }
 
     #[test]
