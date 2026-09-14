@@ -515,8 +515,7 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
             output_limit=1_048_576,
         )
 
-    container_name: str | None = None
-    content_sha256: str | None = None
+    managed_containers: list[tuple[str, str]] = []
     try:
         with _production_daemon(state_dir) as (_, daemon):
             _wait_for_daemon(client, daemon)
@@ -553,6 +552,7 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
             content_sha256 = container_resource.generation.removeprefix("sha256:")
             assert len(content_sha256) == 64
             container_name = f"bosn-setup-{content_sha256}"
+            managed_containers.append((container_name, content_sha256))
             assert container_resource.id == (
                 f"manifest-container:linux:{container_resource.generation}"
             )
@@ -629,6 +629,72 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
                 ("manifest.ensure.succeeded", f"job_id={first_job}"),
                 ("manifest.ensure.succeeded", f"job_id={second_job}"),
             ]
+            # A changed accepted declaration derives a new manifest generation.
+            # The daemon creates/starts the new exact app first, atomically
+            # retires only the old durable use, and deliberately leaves the
+            # old container running for explicit conservative lifecycle work.
+            rollover_unique = f"{unique}-rollover"
+            manifest.write_text(
+                "[stack.linux]\n"
+                f"image = '{PINNED_MANIFEST_MYSQL}'\n"
+                "[stack.linux.env]\n"
+                "MYSQL_ALLOW_EMPTY_PASSWORD = 'yes'\n"
+                f"BOSN_MANIFEST_PROOF = '{rollover_unique}'\n"
+                "[task.prove]\n"
+                "stack = 'linux'\n"
+                f"cmd = \"test \\\"$BOSN_MANIFEST_PROOF\\\" = '{rollover_unique}'\"\n",
+                encoding="utf-8",
+            )
+            rollover_job = client.submit_manifest_ensure(
+                workspace,
+                "bosn.toml",
+                "linux",
+                deadline_ms=90_000,
+                output_limit=1_048_576,
+            )
+            assert isinstance(_wait_for_success(client, rollover_job), tuple)
+            rollover_resources = client.registry_resources(limit=16).records
+            retired = next(
+                record
+                for record in rollover_resources
+                if record.id == container_resource.id
+            )
+            new_container = next(
+                record
+                for record in rollover_resources
+                if record.kind == "container" and record.state == "active"
+            )
+            assert retired.state == "retired"
+            assert new_container.id != container_resource.id
+            rollover_content = new_container.generation.removeprefix("sha256:")
+            rollover_name = f"bosn-setup-{rollover_content}"
+            managed_containers.append((rollover_name, rollover_content))
+            assert _inspect_container(container_name) is not None
+            rollover_observed = _inspect_container(rollover_name)
+            assert rollover_observed is not None
+            assert rollover_observed[1]
+            assert rollover_observed[2] == image_id
+            assert rollover_observed[3][CONTENT_LABEL] == rollover_content
+            rollover_uses = _read_exact_resource_uses(state_dir)
+            assert (
+                container_resource.id,
+                str(workspace.resolve()),
+                "linux",
+                container_resource.generation,
+                "retired",
+            ) in rollover_uses
+            assert (
+                new_container.id,
+                str(workspace.resolve()),
+                "linux",
+                new_container.generation,
+                "active",
+            ) in rollover_uses
+            assert _read_manifest_success_events(state_dir) == [
+                ("manifest.ensure.succeeded", f"job_id={first_job}"),
+                ("manifest.ensure.succeeded", f"job_id={second_job}"),
+                ("manifest.ensure.succeeded", f"job_id={rollover_job}"),
+            ]
             # Manifest app-task accepts only the declared task selector. The
             # command above is persisted in bosn.toml and proves `exec` sees
             # the app's declared environment; callers cannot inject a command
@@ -657,8 +723,8 @@ def test_native_python_client_ensures_and_reuses_manifest_stack(tmp_path: Path) 
             assert "[manifest-app-task] running declared task prove" in task_logs
             assert client.status().sessions == 0
     finally:
-        if container_name is not None and content_sha256 is not None:
-            _remove_exact_managed_container(container_name, content_sha256)
+        for name, content in reversed(managed_containers):
+            _remove_exact_managed_container(name, content)
 
 
 def test_native_python_client_runs_declared_task_inside_ensured_managed_app(
