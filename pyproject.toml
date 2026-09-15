@@ -16,8 +16,8 @@ dependencies = []
 [project.urls]
 Homepage = "https://github.com/zackees/bosn"
 
-[project.scripts]
-bosn = "bosn.native_cli:main"
+# No [project.scripts]: the `bosn` command is the native binary itself, staged
+# into the wheel's .data/scripts by bosn_build_backend (see AGENTS.md, #262).
 
 [dependency-groups]
 dev = [

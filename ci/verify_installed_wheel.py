@@ -183,7 +183,10 @@ def wheel_from_argument(argument: str) -> Path:
 
 def assert_platform_wheel_contents(wheel: Path) -> None:
     extension = f"bosn/_native{platform_extension_suffix()}"
-    executable = f".data/platlib/bosn/_bin/bosn-native{platform_executable_suffix()}"
+    # The CLI is the native binary itself, staged into the wheel's scripts tree
+    # (installed onto PATH as `bosn`), not a package-local file behind a Python
+    # launcher.
+    executable = f".data/scripts/bosn{platform_executable_suffix()}"
     with zipfile.ZipFile(wheel) as archive:
         names = archive.namelist()
         assert_abi3_wheel_tag(wheel, archive)
@@ -206,21 +209,16 @@ def installed_extension_smoke_script() -> str:
         """
         import importlib.util
         import json
-        import os
         import pathlib
         import sys
 
         import bosn
-        from bosn.native_cli import native_executable
 
         origin = pathlib.Path(importlib.util.find_spec("bosn._native").origin)
-        executable = native_executable()
         assert pathlib.Path(bosn.__file__).resolve().is_relative_to(
             pathlib.Path(sys.prefix).resolve()
         )
         assert origin.name == "__BOSN_EXPECTED_EXTENSION__"
-        assert executable.is_file()
-        assert executable.name == "bosn-native" + (".exe" if os.name == "nt" else "")
         versions = {
             "package_version": bosn.__version__,
             "native_version": bosn.native_version(),

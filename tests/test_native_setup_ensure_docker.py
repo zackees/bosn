@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 import bosn
-from bosn.native_cli import _configure_native_library_path, native_executable
+from native_binary import native_binary
 
 PINNED_ALPINE = "alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b"
 # The legacy-manifest runtime intentionally derives no application command.
@@ -97,12 +97,10 @@ def _production_daemon(
 ) -> Iterator[tuple[Path, subprocess.Popen[bytes]]]:
     """Start exactly the package-local production daemon, not a Cargo binary."""
 
-    executable = native_executable()
+    executable = native_binary()
     assert executable.is_file()
-    # The native wheel launcher configures the package-local bundled libraries
-    # before exec. Apply that same package helper to this direct daemon child;
-    # it does not select PATH or any checkout binary.
-    _configure_native_library_path(executable)
+    # The installed binary carries an $ORIGIN rpath to its co-located OpenSSL
+    # sidecars, so it runs with no launcher configuring the library path.
     daemon = subprocess.Popen(
         [str(executable), "daemon", "serve", "--state-dir", str(state_dir)],
         stdin=subprocess.DEVNULL,

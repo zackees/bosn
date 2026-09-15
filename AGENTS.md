@@ -25,14 +25,17 @@ explicit new decision, not by inference.
   binary-only, with no extension, so it can be pure `build-backend = "soldr"`. Bosn
   cannot. So a custom PEP 517 backend that builds the CLI and stages it, then lets
   maturin build the extension, is the correct shape — do not "simplify" it away.
-  - maturin **does** auto-bundle the Linux OpenSSL libs into `bosn.libs/` via
-    auditwheel; the backend's `_copy_linux_openssl` predates/duplicates that and could
-    be dropped independently.
-  - The open improvement (tracked in **#262**) is directive-driven: make the staged
-    binary the `bosn` command itself (stage into the wheel's `.data/scripts/`, drop the
-    `native_cli.py` Python wrapper and `[project.scripts]`), instead of
-    `bosn/_bin/bosn-native` + a Python launcher. That still needs a backend to build and
-    stage the bin; it does not remove maturin.
+  - **The `bosn` command IS the native binary** (#262, done): the backend stages the
+    CLI into the wheel's `.data/scripts/` (installed on PATH as `bosn`), with an
+    `$ORIGIN` rpath so it finds its co-located OpenSSL sidecars — there is no
+    `native_cli.py` launcher and no `[project.scripts]`. The Cargo bin stays
+    `bosn-native` (bosn-service already owns a `bosn` bin; a second would collide on
+    `target/<profile>/bosn`); the backend renames it to `bosn` while staging.
+  - Remaining cruft is tracked in **#265**: OpenSSL is bundled twice (`bosn.libs/` by
+    auditwheel for the extension, plus the hand-copied `.data/scripts/` sidecars for the
+    CLI); collapse via static/rustls or an rpath into `bosn.libs/`. Dropping
+    `bosn_build_backend.py` entirely still waits on **soldr#3239** (native aux-bin
+    staging) → **#262**.
 
 ## macOS (issue #252)
 

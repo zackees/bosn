@@ -187,9 +187,7 @@ def verify(wheel: Path, target: Target, root: Path) -> None:
         if forbidden:
             fail(f"Darwin wheel contains non-Darwin/sidecar artifacts: {forbidden}")
         extension = "bosn/_native.abi3.so"
-        cli = next(
-            (name for name in names if name.endswith(".data/platlib/bosn/_bin/bosn-native")), None
-        )
+        cli = next((name for name in names if name.endswith(".data/scripts/bosn")), None)
         if extension not in names or cli is None:
             fail(
                 "wheel misses Darwin extension or packaged CLI: "

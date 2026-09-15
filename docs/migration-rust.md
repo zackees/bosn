@@ -33,14 +33,14 @@ The retained `bosn` package is deliberately small:
 
 ```text
 bosn/__init__.py    native API re-exports
-bosn/__main__.py    native CLI entry point
-bosn/native_cli.py  package-local executable launcher
 bosn/_native.*      Rust PyO3 extension (wheel artifact)
 ```
 
-`native_cli.py` may only execute the version-matched packaged Rust binary. The
-PEP 517 backend may run Cargo while building a wheel. Neither is a Bosn
-lifecycle implementation. The package has no runtime Python dependencies.
+The `bosn` command is the native Rust binary itself, staged into the wheel's
+`.data/scripts` tree by the PEP 517 backend and installed on PATH — there is no
+Python launcher or console-script entry point. The backend may run Cargo while
+building a wheel. Neither the extension nor the CLI is a Bosn lifecycle
+implementation in Python, and the package has no runtime Python dependencies.
 
 ## Native operation boundary
 
