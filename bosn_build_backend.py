@@ -23,8 +23,13 @@ from typing import Any
 import maturin
 
 _ROOT = Path(__file__).resolve().parent
-_WHEEL_NATIVE_DIRECTORY = _ROOT / "target" / "bosn-wheel-data" / "platlib" / "bosn" / "_bin"
 _WHEEL_DATA = _ROOT / "target" / "bosn-wheel-data"
+# The CLI is staged into the wheel's ``.data/scripts`` tree so pip installs it
+# as the ``bosn`` command on PATH (like soldr ships its own binary), rather than
+# behind a Python launcher.  On Linux its OpenSSL sidecars ride in the same
+# directory and an ``$ORIGIN`` rpath finds them, so the binary is self-contained
+# with no wrapper configuring ``LD_LIBRARY_PATH``.
+_WHEEL_NATIVE_DIRECTORY = _WHEEL_DATA / "scripts"
 _LINUX_OPENSSL = compile_regex(r"^(lib(?:ssl|crypto)\.so\.\d+) => (\S+)")
 _MACHO_64_MAGIC = 0xFEEDFACF
 
@@ -58,6 +63,14 @@ def _wheel_target() -> _DarwinTarget | None:
             f"BOSN_WHEEL_TARGET={requested!r} is not a supported Bosn wheel target; "
             f"allowed values: {allowed}"
         ) from error
+
+
+# The command installed on PATH.  The Cargo bin stays `bosn-native` (the
+# workspace already has a distinct `bosn` bin in bosn-service; a second one
+# would collide on `target/<profile>/bosn`), so the backend renames it to the
+# command name while staging it into the wheel's scripts tree.
+def _command_name() -> str:
+    return "bosn.exe" if os_name == "nt" else "bosn"
 
 
 def _native_cli(target: _DarwinTarget | None) -> Path:
@@ -111,6 +124,33 @@ def _cross_pyo3_environment(target: _DarwinTarget | None) -> Iterator[None]:
             environ["MACOSX_DEPLOYMENT_TARGET"] = old_deployment
 
 
+@contextmanager
+def _linux_rpath_environment(target: _DarwinTarget | None) -> Iterator[None]:
+    """Give the Linux CLI an ``$ORIGIN`` rpath so it finds co-located OpenSSL.
+
+    Only the native Linux host build needs this: macOS links system frameworks
+    and Windows uses SChannel, neither of which ships a sidecar.  A cross build
+    (``target`` set) carries its own soldr-provided linker flags and is left
+    alone.  The flag is a final-link argument, so appending it to ``RUSTFLAGS``
+    is safe for dependency compiles.
+    """
+
+    if target is not None or not platform.startswith("linux"):
+        yield
+        return
+    key = "RUSTFLAGS"
+    previous = environ.get(key)
+    flag = "-C link-arg=-Wl,-rpath,$ORIGIN"
+    environ[key] = f"{previous} {flag}" if previous else flag
+    try:
+        yield
+    finally:
+        if previous is None:
+            environ.pop(key, None)
+        else:
+            environ[key] = previous
+
+
 def _build_native_cli() -> None:
     target = _wheel_target()
     command = [
@@ -125,12 +165,12 @@ def _build_native_cli() -> None:
     ]
     if target is not None:
         command.extend(["--target", target.triple])
-    with _cross_pyo3_environment(target):
+    with _cross_pyo3_environment(target), _linux_rpath_environment(target):
         run(command, cwd=_ROOT, check=True)
     native_cli = _native_cli(target)
     _assert_target_magic(native_cli, target)
     rmtree(_WHEEL_DATA, ignore_errors=True)
-    destination = _WHEEL_NATIVE_DIRECTORY / native_cli.name
+    destination = _WHEEL_NATIVE_DIRECTORY / _command_name()
     destination.parent.mkdir(parents=True, exist_ok=True)
     copy2(native_cli, destination)
     chmod(destination, native_cli.stat().st_mode)

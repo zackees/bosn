@@ -15,7 +15,7 @@ import verify_installed_wheel as verifier  # noqa: E402
 def write_windows_wheel(path: Path, *, tag: str) -> None:
     with zipfile.ZipFile(path, "w") as wheel:
         wheel.writestr("bosn/_native.pyd", b"native-dll")
-        wheel.writestr("bosn-0.1.3.data/platlib/bosn/_bin/bosn-native.exe", b"native-cli")
+        wheel.writestr("bosn-0.1.3.data/scripts/bosn.exe", b"native-cli")
         wheel.writestr("bosn-0.1.3.dist-info/WHEEL", f"Wheel-Version: 1.0\nTag: {tag}\n")
 
 
