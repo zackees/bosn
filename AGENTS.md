@@ -16,19 +16,23 @@ explicit new decision, not by inference.
     `cp310-abi3` tag and the `_native.abi3.so` / `.pyd` extension name. Keep them in
     lockstep with any change here.
 
-- **Build backend: target state is `build-backend = "soldr"` (soldr's own pattern).**
-  `bosn_build_backend.py` is a custom PEP 517 wrapper built on a **false premise**
-  its docstring states outright — that maturin "does not package a Cargo binary from
-  the same mixed project." maturin **does**: soldr's own wheel (`soldr-cli` = `[lib]`
-  → `soldr._native` + `[[bin]] name="soldr"`) ships a `bin/soldr` next to the
-  extension via pure `build-backend = "soldr"`, no delegate. `bosn-python` has the
-  same shape but disabled the bin (`[tool.maturin] targets = [cdylib]`) and
-  hand-stages it. Bosn can drop the custom backend and mirror soldr; the Linux
-  OpenSSL bundling is maturin+patchelf (why soldr adds `patchelf` to build-requires).
-  Migration and the one open validation (cross-crate `[[bin]]` source) are tracked in
-  **zackees/bosn#262**. Until then `bosn_build_backend.py` stays — do not reduce it to
-  plain maturin without also un-disabling the bin target and rewiring the `bosn`
-  command.
+- **Build backend: `bosn_build_backend.py` stays; the bin cannot ride on maturin.**
+  Bosn's wheel needs **both** a PyO3 abi3 extension (`bosn._native`, used by
+  `import bosn`) **and** the `bosn-native` CLI. maturin builds one artifact kind per
+  wheel — a pyo3 extension **or** a `bindings="bin"` binary — and does **not** ship a
+  bin alongside a pyo3 extension (verified by building it: bin un-disabled → wheel
+  `scripts: []`). soldr is **not** a counterexample: soldr's wheel is `py3-none-*`,
+  binary-only, with no extension, so it can be pure `build-backend = "soldr"`. Bosn
+  cannot. So a custom PEP 517 backend that builds the CLI and stages it, then lets
+  maturin build the extension, is the correct shape — do not "simplify" it away.
+  - maturin **does** auto-bundle the Linux OpenSSL libs into `bosn.libs/` via
+    auditwheel; the backend's `_copy_linux_openssl` predates/duplicates that and could
+    be dropped independently.
+  - The open improvement (tracked in **#262**) is directive-driven: make the staged
+    binary the `bosn` command itself (stage into the wheel's `.data/scripts/`, drop the
+    `native_cli.py` Python wrapper and `[project.scripts]`), instead of
+    `bosn/_bin/bosn-native` + a Python launcher. That still needs a backend to build and
+    stage the bin; it does not remove maturin.
 
 ## macOS (issue #252)
 
