@@ -16,22 +16,23 @@ explicit new decision, not by inference.
     `cp310-abi3` tag and the `_native.abi3.so` / `.pyd` extension name. Keep them in
     lockstep with any change here.
 
-- **Build backend: target state is `build-backend = "soldr"`; current state is the
-  custom `bosn_build_backend`.** soldr dogfoods `build-backend = "soldr"` for its own
-  wheel (no delegate, no `maturin` in `build-system.requires` — soldr provisions its
-  own pinned maturin and reads `[tool.maturin]`). Bosn cannot use the pure soldr path
-  **yet**: Bosn ships a *second* artifact in the wheel — the `bosn-native` CLI
-  (`crates/bosn-service/src/bin/bosn.rs`, staged into `.data/platlib/bosn/_bin/`) — and
-  soldr's native build has no hook to build+stage an auxiliary Cargo bin. So
-  `bosn_build_backend.py` builds+stages the CLI, then delegates the extension to
-  maturin.
-  - Do not "simplify" `bosn_build_backend.py` down to plain maturin: that drops the CLI
-    from the wheel and breaks the `bosn` entry point.
-  - Migration is tracked: **zackees/soldr#3239** (native auxiliary-bin staging) →
-    **zackees/bosn#262** (adopt the soldr backend once it lands). When adopting the
-    interim delegate form, `zackees/setup-soldr` must be added to **every** build lane
-    (the Linux/Windows `native-wheel` jobs currently have none; a soldr backend without
-    it fails with "cannot resolve the broker daemon route").
+- **Build backend: `bosn_build_backend.py` stays; the bin cannot ride on maturin.**
+  Bosn's wheel needs **both** a PyO3 abi3 extension (`bosn._native`, used by
+  `import bosn`) **and** the `bosn-native` CLI. maturin builds one artifact kind per
+  wheel — a pyo3 extension **or** a `bindings="bin"` binary — and does **not** ship a
+  bin alongside a pyo3 extension (verified by building it: bin un-disabled → wheel
+  `scripts: []`). soldr is **not** a counterexample: soldr's wheel is `py3-none-*`,
+  binary-only, with no extension, so it can be pure `build-backend = "soldr"`. Bosn
+  cannot. So a custom PEP 517 backend that builds the CLI and stages it, then lets
+  maturin build the extension, is the correct shape — do not "simplify" it away.
+  - maturin **does** auto-bundle the Linux OpenSSL libs into `bosn.libs/` via
+    auditwheel; the backend's `_copy_linux_openssl` predates/duplicates that and could
+    be dropped independently.
+  - The open improvement (tracked in **#262**) is directive-driven: make the staged
+    binary the `bosn` command itself (stage into the wheel's `.data/scripts/`, drop the
+    `native_cli.py` Python wrapper and `[project.scripts]`), instead of
+    `bosn/_bin/bosn-native` + a Python launcher. That still needs a backend to build and
+    stage the bin; it does not remove maturin.
 
 ## macOS (issue #252)
 
