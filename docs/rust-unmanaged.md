@@ -88,11 +88,9 @@ Safe to remove with a documented command. Age is measured from engine timestamps
 
 | Class | What | Age gate |
 |---|---|---|
-| A | Dangling images, referenced by no container | > TTL |
+| A | Dangling images, per Docker's own `dangling=true` verdict | > TTL |
 | B | Exited or created containers | > TTL |
-| C | Tagged images with a non-empty `RepoDigests` (re-pullable), unreferenced | > 30 d |
-| D | Anonymous (64-hex-named) volumes, attached to nothing | > TTL |
-| E | User-defined networks (not `bridge` / `host` / `none`) with no attached container | > TTL |
+| D | Anonymous (64-hex-named, or Docker-marked) volumes, attached to nothing | > TTL |
 | F | Build cache | > TTL |
 
 ### Tier 2 — never swept
@@ -100,16 +98,53 @@ Safe to remove with a documented command. Age is measured from engine timestamps
 Enters a plan **only** when named explicitly with `--include <id>`. There is deliberately no
 flag that selects all of Tier 2 at once.
 
-- Local-only tagged images (empty `RepoDigests`) — cannot be re-pulled, so not reclaimable
-  under invariant 2 of #149.
+- **Tagged, unreferenced images.** See "what the engine cannot prove" below.
 - Named volumes.
 - Attached, running, or otherwise in-use resources.
 - All foreign-registry and incomplete-label resources (above).
+
+### What the engine cannot prove
+
+Two classes in the original #148 ruleset are **not implementable** against a current Docker
+engine. Both were verified against Docker 29.7.2 with the containerd image store, and both
+resolve toward keeping, never toward reclaiming:
+
+- **#148 class C (tagged re-pullable images) does not exist as specified.** The rule was
+  "non-empty `RepoDigests` ⇒ still in a registry ⇒ re-pullable ⇒ safe to delete". On a
+  containerd-store engine *every* image reports a `RepoDigests` entry, including images built
+  locally and never pushed: 79 of 79 images on the reference host, with
+  `twp-e2e-kumquat-php:local` carrying `twp-e2e-kumquat-php@sha256:<its own local id>`.
+  `docker system df -v` reports an empty `Digest` for all of them, and
+  `docker image ls --format '{{.Digest}}'` returns the image *ID*, not a repository digest.
+  Proving remote existence would require a network call to the registry, which a read-only
+  census does not do. So a tagged, unreferenced image is reported in full and left for a
+  human: removing it could destroy the only copy, which invariant 2 forbids.
+- **#148 class E (orphan networks) has no data source.** `docker system df -v` returns no
+  network section, so a network has no byte total and no age. Networks contribute nothing to
+  a byte-thresholded warning, and inventing one from separate reads is not worth the extra
+  engine surface. A network observed by the census is protected as unclassified.
+
+Consequently class A (Docker's dangling verdict) is the only image class the census can
+sweep. That is the correct outcome, not a shortfall: dangling images are the large reclaimable
+set in both incidents (12 GB in #147), and the rest genuinely require a judgment the engine's
+accounting data cannot make.
 
 ### Byte accounting
 
 The census reports, per class: object count, bytes, and oldest age. Build cache is included
 (F — `docs/migration-rust.md`'s predecessor accounting never read it).
+
+It is assembled from bounded, read-only engine reads:
+
+| Read | Supplies |
+|---|---|
+| `docker system df -v --format json` | one document containing images, containers, volumes, and build cache, with sizes and creation times |
+| `docker image ls -aq --filter dangling=true` | Docker's authoritative dangling verdict |
+| `docker image ls -aq --filter label=<key>` | which images carry a Bosn label — `image ls` exposes no labels, so this is one bounded query per required key |
+| `docker volume inspect <names…>` | volume creation time, which the accounting document does not report at all |
+
+Every read carries an explicit deadline and output cap. A volume the engine does not answer
+for stays unaged, and an unaged artifact is protected.
 
 **Bytes are approximate; identity is exact.** Docker's own accounting surfaces
 (`docker system df -v --format json`, `docker buildx du`) report human-unit strings with
