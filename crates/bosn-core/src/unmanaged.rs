@@ -138,6 +138,85 @@ pub fn acknowledgement_suppresses(
     census.reclaimable_bytes <= byte_ceiling && census.reclaimable_objects <= object_ceiling
 }
 
+/// Why free-space pressure may or may not justify evicting what Bosn owns.
+///
+/// This is G7 from #147. Free-space pressure is measured against the whole filesystem, while
+/// the byte ceiling counts only Bosn-owned bytes. On a disk dominated by artifacts Bosn is
+/// not permitted to reclaim, pressure latches on permanently and drives Bosn to evict its own
+/// warm caches — for zero net benefit, because the bytes causing the pressure are not the
+/// bytes being freed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PressureAttribution {
+    /// Not under free-space pressure, so eviction policy is unchanged.
+    NotUnderPressure,
+    /// The shortfall is small enough that reclaiming owned bytes can actually close it.
+    OwnedBytesCanClose,
+    /// The shortfall exceeds everything Bosn owns: no owned eviction can help.
+    ForeignBytesDominate,
+    /// The census could not be read completely, so nothing may be evicted.
+    CensusIncomplete,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PressureDecision {
+    /// Whether owned warm caches may be evicted under this pressure.
+    pub may_evict_owned: bool,
+    /// How many bytes short of the free-space floor the filesystem is.
+    pub shortfall_bytes: i128,
+    pub attribution: PressureAttribution,
+}
+
+/// Decide whether pressure justifies evicting owned resources.
+///
+/// The rule is deliberately narrow. Eviction is only suppressed when it provably cannot help:
+/// the shortfall is larger than everything Bosn owns. Everything else keeps the existing
+/// behaviour, so this cannot silently disable retention.
+#[must_use]
+pub fn pressure_decision(
+    under_pressure: bool,
+    free_space_exceeded: bool,
+    free_bytes: i128,
+    min_free_bytes: i128,
+    owned_bytes: i128,
+    census_trustworthy: bool,
+) -> PressureDecision {
+    if !census_trustworthy {
+        // An incomplete census is a reason to keep, never to free.
+        return PressureDecision {
+            may_evict_owned: false,
+            shortfall_bytes: 0,
+            attribution: PressureAttribution::CensusIncomplete,
+        };
+    }
+    if !under_pressure {
+        return PressureDecision {
+            may_evict_owned: true,
+            shortfall_bytes: 0,
+            attribution: PressureAttribution::NotUnderPressure,
+        };
+    }
+    // Pressure from a count or byte ceiling is about Bosn's own resources, not the disk, so
+    // there is no shortfall to attribute.
+    let shortfall = if free_space_exceeded {
+        min_free_bytes.saturating_sub(free_bytes).max(0)
+    } else {
+        0
+    };
+    if shortfall <= owned_bytes {
+        PressureDecision {
+            may_evict_owned: true,
+            shortfall_bytes: shortfall,
+            attribution: PressureAttribution::OwnedBytesCanClose,
+        }
+    } else {
+        PressureDecision {
+            may_evict_owned: false,
+            shortfall_bytes: shortfall,
+            attribution: PressureAttribution::ForeignBytesDominate,
+        }
+    }
+}
+
 /// One artifact the plan would remove.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlanCandidate {
@@ -1246,6 +1325,46 @@ mod tests {
             bytes: Some(bytes),
             age_seconds: Some(age),
         }
+    }
+
+    #[test]
+    fn foreign_bytes_cannot_drive_eviction_of_owned_caches() {
+        // G7, the RED case from #147 and from #273: the disk is 50 GiB short of its floor,
+        // foreign artifacts hold 80 GiB Bosn may not touch, and Bosn owns 1 GiB of warm
+        // cache. Evicting the cache cannot close a 50 GiB gap.
+        let decision = pressure_decision(true, true, 10, 60, 1, true);
+        assert!(!decision.may_evict_owned);
+        assert_eq!(decision.attribution, PressureAttribution::ForeignBytesDominate);
+        assert_eq!(decision.shortfall_bytes, 50);
+    }
+
+    #[test]
+    fn a_partial_census_never_authorises_eviction() {
+        let decision = pressure_decision(true, true, 0, 60, 1_000, false);
+        assert!(!decision.may_evict_owned);
+        assert_eq!(decision.attribution, PressureAttribution::CensusIncomplete);
+    }
+
+    #[test]
+    fn eviction_behaviour_is_unchanged_when_owned_bytes_can_close_the_gap() {
+        // The no-regression case: the shortfall is small and Bosn owns enough to close it.
+        let decision = pressure_decision(true, true, 50, 60, 40, true);
+        assert!(decision.may_evict_owned);
+        assert_eq!(decision.attribution, PressureAttribution::OwnedBytesCanClose);
+        // Exactly enough is enough.
+        assert!(pressure_decision(true, true, 50, 60, 10, true).may_evict_owned);
+    }
+
+    #[test]
+    fn pressure_without_a_free_space_shortfall_is_untouched() {
+        // A count or byte-ceiling pressure has no shortfall to attribute, and keeping the
+        // existing behaviour here is what stops this from silently disabling retention.
+        let decision = pressure_decision(true, false, 0, 60, 0, true);
+        assert!(decision.may_evict_owned);
+        assert_eq!(decision.shortfall_bytes, 0);
+        let idle = pressure_decision(false, false, 0, 60, 0, true);
+        assert!(idle.may_evict_owned);
+        assert_eq!(idle.attribution, PressureAttribution::NotUnderPressure);
     }
 
     #[test]
