@@ -49,6 +49,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+pub mod autostart;
 pub mod jobs;
 pub mod mcp;
 pub mod unmanaged;
@@ -8572,6 +8573,48 @@ impl Service {
             self.manifest_recovery_executor.as_ref(),
         )
         .await;
+        // Unattended maintenance. A machine that opted into autostart should learn about its
+        // unowned Docker footprint on its own: #147 recorded 45 hours of normal use in which
+        // nothing was ever said. The pass runs on the blocking pool because the census makes
+        // bounded child-process calls, and the accept loop must not wait behind them. The
+        // wait between passes is cancellable, so shutdown is not delayed by up to an hour.
+        let _maintenance = {
+            let state_dir = self.state_dir.clone();
+            let stop = self.stop.token();
+            async_engine::launch(async move {
+                loop {
+                    let state_dir = state_dir.clone();
+                    let _ = async_engine::launch_blocking(move || {
+                        let (scan, warning) = unmanaged::maintenance_pass(
+                            &state_dir,
+                            bosn_core::CensusConfig::default(),
+                        );
+                        match warning {
+                            Some(warning) => {
+                                for line in unmanaged::warning_lines(&warning) {
+                                    eprintln!("bosn maintenance: {line}");
+                                }
+                            }
+                            None if !scan.is_trustworthy() => eprintln!(
+                                "bosn maintenance: the unmanaged census could not be read \
+                                 completely, so this machine is not known to be clean"
+                            ),
+                            None => {}
+                        }
+                    })
+                    .await;
+                    if async_engine::cancellable(
+                        &stop,
+                        async_engine::sleep(unmanaged::MAINTENANCE_INTERVAL),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+        };
         let mut clients = async_engine::TaskGroup::new();
         while !self.stop.is_cancelled() {
             // TaskGroup retains completed tasks until collected.  Reap only
