@@ -825,17 +825,61 @@ fn run_gc_unmanaged(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
         }
         .unwrap_or_else(|_| usage());
     }
-    if apply {
-        // The removal itself is a daemon-owned operation, and this build does not have it.
-        // Refusing loudly beats a silent no-op or a direct local delete that would bypass the
-        // boundary every other Bosn mutation respects.
-        eprintln!(
-            "bosn gc --unmanaged: removal is not implemented in this build; the preview above is read-only"
-        );
-        std::process::exit(2);
-    }
-    let _ = yes;
     let state_dir = state_dir.unwrap_or_else(bosn_service::mcp::default_state_dir);
+    if apply {
+        if !yes {
+            eprintln!("bosn gc --unmanaged --apply: pass --yes to confirm the removal");
+            std::process::exit(2);
+        }
+        // The daemon re-derives the census and the plan itself. The preview this process
+        // could build is never trusted: it was taken against state that may have changed.
+        let ttl = ttl_seconds.map_or(0u64, |value| value.max(0.0) as u64);
+        let result = Client::for_state(state_dir).ok().and_then(|client| {
+            RuntimeBuilder::current_thread()
+                .enable_all()
+                .build()
+                .ok()
+                .and_then(|runtime| {
+                    runtime
+                        .run(client.unmanaged_gc_apply(include.clone(), ttl, true))
+                        .ok()
+                })
+        });
+        let Some(summary) = result else {
+            eprintln!("bosn gc --unmanaged --apply: daemon unavailable or request failed");
+            std::process::exit(1);
+        };
+        if json_output {
+            println!(
+                "{}",
+                json!({
+                    "action": "gc_unmanaged_apply",
+                    "planned": summary.planned,
+                    "removed": summary.removed,
+                    "removed_bytes": summary.removed_bytes,
+                    "failed": summary.failed,
+                    "failures": summary.failures,
+                    "refused": summary.refused,
+                })
+            );
+        } else {
+            println!("gc --unmanaged --apply");
+            println!("planned: {}", summary.planned);
+            println!(
+                "removed: {} objects, {}",
+                summary.removed,
+                bosn_service::unmanaged::human_bytes(summary.removed_bytes)
+            );
+            for failure in &summary.failures {
+                println!("failed:  {failure}");
+            }
+        }
+        if let Some(refused) = &summary.refused {
+            eprintln!("gc --unmanaged: {refused}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let config = census_config(ttl_seconds);
     let (scan, our_registry) = scan_host(&state_dir, config);
     if !scan.is_trustworthy() {
@@ -887,7 +931,7 @@ fn run_gc_unmanaged(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
             json!({
                 "action": "gc_unmanaged_preview",
                 "preview_only": true,
-                "apply_available": false,
+                "apply_available": true,
                 "bytes": plan.bytes,
                 "candidates": candidates,
                 "review": review,
@@ -929,7 +973,6 @@ fn run_gc_unmanaged(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
             plan.review.len()
         );
     }
-    println!("removal is not in this build yet; this preview is read-only");
 }
 
 fn run_gc_apply(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
@@ -2889,7 +2932,10 @@ fn usage() -> ! {
         "   or: bosn job logs --state-dir STATE_DIR --job-id ID [--after CURSOR] [--limit 1..={MAX_JOB_LOG_LIMIT}] [--json]"
     );
     eprintln!("   or: bosn job cancel --state-dir STATE_DIR --job-id ID [--json]");
-    eprintln!("   or: bosn scan [--state-dir STATE_DIR] [--ttl-seconds N] [--json]");
+    eprintln!("   or: bosn scan [--state-dir STATE_DIR] [--ttl-seconds N] [--ack] [--json]");
+    eprintln!(
+        "   or: bosn gc --unmanaged [--state-dir STATE_DIR] [--ttl-seconds N] [--include ID]... [--apply --yes] [--json]"
+    );
     eprintln!(
         "   or: bosn gc preview --state-dir STATE_DIR --workspace WORKSPACE [--after CURSOR] [--limit 1..=64] [--json]"
     );
