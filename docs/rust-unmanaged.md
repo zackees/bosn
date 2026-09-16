@@ -37,9 +37,10 @@ This is the honest baseline. It is the reason S2–S5 are not a port but a build
 | `bosn gc` | Retired **Bosn-managed setup containers** in one workspace | `crates/bosn-service/src/bin/bosn.rs:506` (`preview`), `:537` (`apply --candidate TOKEN`) |
 | `bosn manifest volume-gc` | Retired warm **spec-scoped manifest volumes**, one workspace | `crates/bosn-service/src/bin/bosn.rs:2389` |
 | `excluded_unmanaged` | A count of **registry rows in one workspace** that do not match the `bosn-setup-*` shape — not a host census | `crates/bosn-registry/src/lib.rs:2428`, `:2441`; volumes `:2539`, `:2559` |
-| Engine census | **absent** — the only read-only probes are `docker version` and `docker info --format {{.SystemTime}}` | `crates/bosn-engine/src/lib.rs:558`, `:580` |
-| Byte accounting | **absent** for anything Bosn does not own | `crates/bosn-service/src/bin/bosn.rs:636` returns daemon/registry/engine strings only |
-| `scan` / `--ack` / `foreign_ttl` / warning threshold | **absent** | verb set `crates/bosn-service/src/bin/bosn.rs:52-60` |
+| Engine census | **present** since S2 (`bosn scan`, #270): one bounded `docker system df -v --format json` plus a dangling filter, one label query per required key, and a bounded `docker volume inspect` | `crates/bosn-core/src/unmanaged.rs`, `crates/bosn-service/src/unmanaged.rs` |
+| Byte accounting | **present** for the unowned bucket since S2 (#270); approximate by construction, and never zero for an unmeasurable class | `bosn scan --json` |
+| `scan` | **present** since S2 (#270), read-only | `crates/bosn-service/src/bin/bosn.rs` `run_scan` |
+| `--ack` / `foreign_ttl` / warning threshold | **absent** — S3 | verb set `crates/bosn-service/src/bin/bosn.rs:52-60` |
 | Autostart, maintenance pass | **absent** — no service unit, no `systemctl`/`launchctl` call, no idle or maintenance loop | slice S4 |
 | Retention / pressure / verdict model | **Implemented and tested, and unwired.** `Pressure::assess`, `evaluate`, `collectable_ordered`, `container_should_stop`, `lease_expired`, `retention_signals`, `PolicyDefaults`, `RetentionConfig` have **zero production consumers** | `crates/bosn-core/src/lib.rs:362-570`; `crates/bosn-core/src/config.rs:53-74`; exercised only by `crates/bosn-core/tests/domain.rs` |
 
