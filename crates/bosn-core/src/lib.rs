@@ -29,11 +29,13 @@ pub use setup::{
     SetupSource, SetupTask, WorkspaceMount, parse_setup_config_locator, parse_setup_document_toml,
 };
 pub use unmanaged::{
-    Census, CensusConfig, ClassSummary, Classification, DEFAULT_TTL_SECONDS, ObservedArtifact,
-    OwnershipClass, ProtectedReason, ProtectedSummary,
-    EngineObservation, InspectedVolume, Signals, SystemDfReport, Tier, UnmanagedClass, census,
-    classify, classify_ownership, observe, parse_docker_size, parse_docker_timestamp,
-    parse_label_list, parse_rfc3339_timestamp,
+    ACK_GROWTH_RATIO, ACK_MAX_AGE_SECONDS, Acknowledgement, Census, CensusConfig, ClassSummary,
+    Classification, DEFAULT_TTL_SECONDS, DEFAULT_WARN_BYTES, DEFAULT_WARN_OBJECTS,
+    EngineObservation, InspectedVolume, ObservedArtifact, OwnershipClass, Plan, PlanCandidate,
+    ProtectedReason, ProtectedSummary, Signals, SystemDfReport, Tier, UnmanagedClass, Warning,
+    WarningThreshold, acknowledgement_suppresses, census, classify, classify_ownership,
+    is_removable_by_id, observe, parse_docker_size, parse_docker_timestamp, parse_label_list,
+    parse_rfc3339_timestamp, plan, removal_rank, warning,
 };
 
 pub const NAMESPACE: &str = "com.zackees.bosn";

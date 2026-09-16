@@ -506,17 +506,25 @@ fn compose_failure(error: &str) -> ! {
 
 /// Read-only census of Docker artifacts Bosn does not own.
 ///
-/// This reports; it never deletes, and it never suggests a Docker command. The warning
-/// surface and `bosn gc --unmanaged` build on it. A census that cannot be read completely is
-/// reported as partial and is never a clean machine.
+/// This reports; it never deletes, and it never suggests a Docker command. A census that
+/// cannot be read completely is reported as partial and is never a clean machine.
 fn run_scan(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
     let mut state_dir = None;
     let mut ttl_seconds = None;
+    let mut warn_bytes = None;
+    let mut warn_objects = None;
     let mut json_output = false;
+    let mut ack = false;
     while let Some(argument) = arguments.next() {
         match argument.to_string_lossy().as_ref() {
             "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
             "--ttl-seconds" => set_once_parsed(&mut ttl_seconds, arguments.next(), parse_ttl_seconds),
+            "--warn-bytes" => set_once_parsed(&mut warn_bytes, arguments.next(), parse_ttl_seconds),
+            "--warn-objects" => set_once_parsed(&mut warn_objects, arguments.next(), parse_ttl_seconds),
+            "--ack" if !ack => {
+                ack = true;
+                Ok(())
+            }
             "--json" if !json_output => {
                 json_output = true;
                 Ok(())
@@ -526,76 +534,109 @@ fn run_scan(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
         .unwrap_or_else(|_| usage());
     }
     let state_dir = state_dir.unwrap_or_else(bosn_service::mcp::default_state_dir);
-    let config = bosn_core::CensusConfig {
+    let config = census_config(ttl_seconds);
+    let threshold = warning_threshold(warn_bytes, warn_objects);
+    let (scan, our_registry) = scan_host(&state_dir, config);
+    let census = &scan.census;
+    let warning = bosn_core::warning(census, threshold);
+    let acknowledged = bosn_core::acknowledgement_suppresses(
+        bosn_service::unmanaged::read_acknowledgement(&state_dir),
+        census,
+        now_seconds(),
+    );
+    if ack {
+        if let Some(warning) = &warning {
+            let stored = bosn_core::Acknowledgement {
+                at: now_seconds(),
+                objects: warning.reclaimable_objects,
+                bytes: warning.reclaimable_bytes,
+            };
+            match bosn_service::unmanaged::write_acknowledgement(&state_dir, stored) {
+                Ok(()) => {
+                    if !json_output {
+                        eprintln!("scan: acknowledged {} objects", stored.objects);
+                    }
+                }
+                Err(detail) => {
+                    eprintln!("scan: could not record the acknowledgement: {detail}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        return;
+    }
+    if json_output {
+        println!("{}", scan_json(scan, warning.as_ref(), acknowledged));
+        return;
+    }
+    println!("scan");
+    print_census(census);
+    for detail in &scan.unreadable {
+        eprintln!("scan: partial: {detail}");
+    }
+    // A partial census is never a clean machine, so it warns regardless of size.
+    if let Some(warning) = warning {
+        if !acknowledged {
+            print_warning(&warning);
+        }
+    }
+    let _ = our_registry;
+}
+
+/// The census configuration, with the documented default age gate.
+fn census_config(ttl_seconds: Option<f64>) -> bosn_core::CensusConfig {
+    bosn_core::CensusConfig {
         ttl_seconds: ttl_seconds.unwrap_or(bosn_core::DEFAULT_TTL_SECONDS),
-    };
-    // Read-only, and only for this registry's UUID. A missing or unreadable registry leaves
-    // the UUID unknown, which classifies every complete label set as foreign: protective,
-    // never exposing.
+    }
+}
+
+fn warning_threshold(bytes: Option<f64>, objects: Option<f64>) -> bosn_core::WarningThreshold {
+    let default = bosn_core::WarningThreshold::default();
+    bosn_core::WarningThreshold {
+        bytes: bytes.map_or(default.bytes, |value| value as i128),
+        objects: objects.map_or(default.objects, |value| value as u64),
+    }
+}
+
+fn now_seconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |duration| duration.as_secs_f64())
+}
+
+/// Run one census pass against this host, reading only this registry's UUID from state.
+///
+/// The registry is opened read-only and only for its identity. A missing or unreadable
+/// registry leaves the UUID unknown, which classifies every complete label set as foreign:
+/// protective, never exposing.
+fn scan_host(
+    state_dir: &Path,
+    config: bosn_core::CensusConfig,
+) -> (bosn_service::unmanaged::UnmanagedCensus, Option<String>) {
     let our_registry = bosn_registry::Registry::open_read_only(state_dir.join("registry.sqlite3"))
         .ok()
         .and_then(|registry| registry.registry_id().ok());
     let engine = DockerEngine::docker();
-    let scan =
-        bosn_service::unmanaged::unmanaged_census(&engine, our_registry.as_deref(), config);
-    let census = &scan.census;
-    if json_output {
-        let classes: Vec<_> = census
-            .classes
-            .iter()
-            .map(|summary| {
-                json!({
-                    "class": summary.class.as_str(),
-                    "tier": match summary.tier {
-                        bosn_core::Tier::Reclaimable => "reclaimable",
-                        bosn_core::Tier::Review => "review",
-                    },
-                    "objects": summary.objects,
-                    "bytes": summary.bytes,
-                    "eligible_objects": summary.eligible_objects,
-                    "eligible_bytes": summary.eligible_bytes,
-                    "oldest_age_seconds": summary.oldest_age_seconds,
-                })
-            })
-            .collect();
-        let protected: Vec<_> = census
-            .protected
-            .iter()
-            .map(|summary| {
-                json!({
-                    "reason": summary.reason.as_str(),
-                    "objects": summary.objects,
-                    "bytes": summary.bytes,
-                })
-            })
-            .collect();
-        println!(
-            "{}",
-            json!({
-                "action": "scan",
-                "reclaimable_objects": census.reclaimable_objects,
-                "reclaimable_bytes": census.reclaimable_bytes,
-                "bytes_approximate": census.bytes_approximate,
-                "partial": census.partial,
-                "classes": classes,
-                "protected": protected,
-                "unreadable": scan.unreadable,
-            })
-        );
-        return;
+    let scan = bosn_service::unmanaged::unmanaged_census(&engine, our_registry.as_deref(), config);
+    (scan, our_registry)
+}
+
+fn class_tier(tier: bosn_core::Tier) -> &'static str {
+    match tier {
+        bosn_core::Tier::Reclaimable => "reclaimable",
+        bosn_core::Tier::Review => "review",
     }
-    println!("scan");
+}
+
+fn print_census(census: &bosn_core::Census) {
     if census.classes.is_empty() {
         println!("nothing unowned observed");
     }
     for summary in &census.classes {
-        let tier = match summary.tier {
-            bosn_core::Tier::Reclaimable => "reclaimable",
-            bosn_core::Tier::Review => "review",
-        };
         println!(
-            "{:<20} {tier:<12} {:>6} objects  {}  eligible {}",
+            "{:<20} {:<12} {:>6} objects  {}  eligible {}",
             summary.class.as_str(),
+            class_tier(summary.tier),
             summary.objects,
             human_bytes(summary.bytes),
             summary.eligible_objects,
@@ -616,12 +657,116 @@ fn run_scan(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
             human_bytes(summary.bytes)
         );
     }
-    for detail in &scan.unreadable {
-        eprintln!("scan: partial: {detail}");
+}
+
+fn scan_json(
+    scan: bosn_service::unmanaged::UnmanagedCensus,
+    warning: Option<&bosn_core::Warning>,
+    acknowledged: bool,
+) -> serde_json::Value {
+    let census = &scan.census;
+    let classes: Vec<_> = census
+        .classes
+        .iter()
+        .map(|summary| {
+            json!({
+                "class": summary.class.as_str(),
+                "tier": class_tier(summary.tier),
+                "objects": summary.objects,
+                "bytes": summary.bytes,
+                "eligible_objects": summary.eligible_objects,
+                "eligible_bytes": summary.eligible_bytes,
+                "oldest_age_seconds": summary.oldest_age_seconds,
+            })
+        })
+        .collect();
+    let protected: Vec<_> = census
+        .protected
+        .iter()
+        .map(|summary| {
+            json!({
+                "reason": summary.reason.as_str(),
+                "objects": summary.objects,
+                "bytes": summary.bytes,
+            })
+        })
+        .collect();
+    // JSON never carries caps or ANSI, and never a suggested Docker command.
+    let foreign_reclaimable = warning.map_or(json!(null), |warning| {
+        json!({
+            "reclaimable_objects": warning.reclaimable_objects,
+            "reclaimable_bytes": warning.reclaimable_bytes,
+            "review_objects": warning.review_objects,
+            "review_bytes": warning.review_bytes,
+            "report_only_bytes": warning.report_only_bytes,
+            "partial": warning.partial,
+            "acknowledged": acknowledged,
+        })
+    });
+    json!({
+        "action": "scan",
+        "reclaimable_objects": census.reclaimable_objects,
+        "reclaimable_bytes": census.reclaimable_bytes,
+        "bytes_approximate": census.bytes_approximate,
+        "partial": census.partial,
+        "classes": classes,
+        "protected": protected,
+        "foreign_reclaimable": foreign_reclaimable,
+        "unreadable": scan.unreadable,
+    })
+}
+
+/// Colour is opt-out by environment and by pipe, matching the existing problem-output
+/// precedent. Caps survive; escape codes do not.
+fn colour_enabled() -> bool {
+    use std::io::IsTerminal;
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
     }
-    if census.partial {
-        eprintln!("scan: partial census; nothing here is safe to act on");
+    if std::env::var("TERM").map(|term| term == "dumb").unwrap_or(false) {
+        return false;
     }
+    std::io::stderr().is_terminal()
+}
+
+/// The loud warning. Printed to stderr, at most once per invocation, and never in JSON.
+///
+/// The commands it prints are exactly the ones this build implements. Advertising a removal
+/// path that does not exist would send the user to a command that fails, which is worse than
+/// saying plainly that it is not here yet.
+fn print_warning(warning: &bosn_core::Warning) {
+    let yellow = if colour_enabled() { "\x1b[33m" } else { "" };
+    let reset = if colour_enabled() { "\x1b[0m" } else { "" };
+    if warning.partial {
+        eprintln!(
+            "{yellow}UNMANAGED DOCKER ARTIFACTS COULD NOT BE FULLY MEASURED \u{2014} THIS MACHINE IS NOT KNOWN TO BE CLEAN{reset}"
+        );
+    }
+    if warning.reclaimable_objects > 0 {
+        eprintln!(
+            "{yellow}{} UNMANAGED DOCKER OBJECTS ARE RECLAIMABLE ({}){reset}",
+            warning.reclaimable_objects,
+            human_bytes(warning.reclaimable_bytes),
+        );
+        eprintln!("  see them:  bosn gc --unmanaged");
+        eprintln!(
+            "  removal is not in this build yet; it lands with the daemon-owned apply slice"
+        );
+    }
+    if warning.report_only_bytes > 0 {
+        eprintln!(
+            "  build cache holds {} with no per-object removal, so bosn never sweeps it",
+            human_bytes(warning.report_only_bytes)
+        );
+    }
+    if warning.review_objects > 0 {
+        eprintln!(
+            "  review {} items ({}) needing judgment: listed by the preview, opt one in with --include <id>",
+            warning.review_objects,
+            human_bytes(warning.review_bytes)
+        );
+    }
+    eprintln!("  silence:   bosn scan --ack");
 }
 
 /// Render bytes for humans. Byte figures in the census are approximate by construction.
@@ -645,6 +790,9 @@ fn run_gc(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
     let Some(verb) = arguments.next() else {
         usage();
     };
+    if verb.as_os_str() == std::ffi::OsStr::new("--unmanaged") {
+        return run_gc_unmanaged(arguments);
+    }
     if verb.as_os_str() == std::ffi::OsStr::new("apply") {
         return run_gc_apply(arguments);
     }
@@ -672,6 +820,158 @@ fn run_gc(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
 /// Explicit one-candidate destructive action. Both `--apply` and `--yes` are
 /// required even though the subcommand is named apply, preventing accidental
 /// shell/script invocation. The daemon revalidates ownership before Docker.
+/// `bosn gc --unmanaged` — the human-triggered path for artifacts Bosn does not own.
+///
+/// The preview is read-only and lists exactly what a removal pass would take. It is a new
+/// planning mode, not a widening of the token-bound owned-candidate apply: that protocol
+/// proves a positive (this resource is ours and safe), while this proves a negative (nothing
+/// proves this resource is ours, nothing uses it, and it is past its age gate).
+fn run_gc_unmanaged(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
+    let mut state_dir = None;
+    let mut ttl_seconds = None;
+    let mut include: Vec<String> = Vec::new();
+    let mut apply = false;
+    let mut yes = false;
+    let mut json_output = false;
+    while let Some(argument) = arguments.next() {
+        match argument.to_string_lossy().as_ref() {
+            "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
+            "--ttl-seconds" => set_once_parsed(&mut ttl_seconds, arguments.next(), parse_ttl_seconds),
+            "--include" => match arguments.next().and_then(|value| {
+                value
+                    .to_str()
+                    .map(str::to_owned)
+                    .filter(|value| !value.is_empty())
+            }) {
+                Some(value) => {
+                    include.push(value);
+                    Ok(())
+                }
+                None => Err(()),
+            },
+            "--apply" if !apply => {
+                apply = true;
+                Ok(())
+            }
+            "--yes" if !yes => {
+                yes = true;
+                Ok(())
+            }
+            "--json" if !json_output => {
+                json_output = true;
+                Ok(())
+            }
+            _ => Err(()),
+        }
+        .unwrap_or_else(|_| usage());
+    }
+    if apply {
+        // The removal itself is a daemon-owned operation, and this build does not have it.
+        // Refusing loudly beats a silent no-op or a direct local delete that would bypass the
+        // boundary every other Bosn mutation respects.
+        eprintln!(
+            "bosn gc --unmanaged: removal is not implemented in this build; the preview above is read-only"
+        );
+        std::process::exit(2);
+    }
+    let _ = yes;
+    let state_dir = state_dir.unwrap_or_else(bosn_service::mcp::default_state_dir);
+    let config = census_config(ttl_seconds);
+    let (scan, our_registry) = scan_host(&state_dir, config);
+    if !scan.is_trustworthy() {
+        // A plan is never built from a partial census.
+        for detail in &scan.unreadable {
+            eprintln!("gc --unmanaged: partial: {detail}");
+        }
+        eprintln!("gc --unmanaged: the census was incomplete, so nothing is proposed");
+        std::process::exit(1);
+    }
+    let plan = bosn_core::plan(&scan.artifacts, our_registry.as_deref(), config, &include);
+    if json_output {
+        let candidates: Vec<_> = plan
+            .candidates
+            .iter()
+            .map(|candidate| {
+                json!({
+                    "id": candidate.id,
+                    "class": candidate.class.as_str(),
+                    "bytes": candidate.bytes,
+                })
+            })
+            .collect();
+        let review: Vec<_> = plan
+            .review
+            .iter()
+            .map(|candidate| {
+                json!({
+                    "id": candidate.id,
+                    "class": candidate.class.as_str(),
+                    "bytes": candidate.bytes,
+                })
+            })
+            .collect();
+        let report_only: Vec<_> = plan
+            .report_only
+            .iter()
+            .map(|summary| {
+                json!({
+                    "class": summary.class.as_str(),
+                    "objects": summary.eligible_objects,
+                    "bytes": summary.eligible_bytes,
+                    "reason": "no per-object removal",
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            json!({
+                "action": "gc_unmanaged_preview",
+                "preview_only": true,
+                "apply_available": false,
+                "bytes": plan.bytes,
+                "candidates": candidates,
+                "review": review,
+                "report_only": report_only,
+            })
+        );
+        return;
+    }
+    println!("gc --unmanaged (preview)");
+    if plan.candidates.is_empty() {
+        println!("nothing eligible for removal");
+    }
+    for candidate in &plan.candidates {
+        println!(
+            "{:<18} {:>10}  {}",
+            candidate.class.as_str(),
+            human_bytes(candidate.bytes),
+            candidate.id
+        );
+    }
+    if !plan.candidates.is_empty() {
+        println!(
+            "would remove {} objects, {}",
+            plan.candidates.len(),
+            human_bytes(plan.bytes)
+        );
+    }
+    for summary in &plan.report_only {
+        println!(
+            "report only: {:<18} {} objects, {} — no per-object removal",
+            summary.class.as_str(),
+            summary.eligible_objects,
+            human_bytes(summary.eligible_bytes)
+        );
+    }
+    if !plan.review.is_empty() {
+        println!(
+            "review: {} objects await judgment; opt one in with --include <id>",
+            plan.review.len()
+        );
+    }
+    println!("removal is not in this build yet; this preview is read-only");
+}
+
 fn run_gc_apply(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
     let mut state_dir = None;
     let mut workspace = None;
@@ -807,6 +1107,35 @@ fn run_doctor(arguments: impl Iterator<Item = std::ffi::OsString>) {
                 println!("{key}: {value}");
             }
         }
+    }
+    // The warning rides along with doctor because doctor is the command a user runs when
+    // something is wrong. #147's failure was silence: the pile grew for 45 hours while the
+    // tool was being used. This is the surface that would have caught it.
+    doctor_unmanaged_warning(&state_dir);
+}
+
+/// Print the unmanaged-artifact warning after a doctor report, if it applies.
+///
+/// An unreachable engine is reported as unavailable rather than as a warning: crying
+/// "not known to be clean" on every machine without Docker would make the loud warning the
+/// noise it is meant not to be.
+fn doctor_unmanaged_warning(state_dir: &Path) {
+    let config = census_config(None);
+    let (scan, _) = scan_host(state_dir, config);
+    if scan.census.classes.is_empty() && !scan.unreadable.is_empty() {
+        eprintln!("unmanaged artifacts: census unavailable (is the Docker engine reachable?)");
+        return;
+    }
+    let Some(warning) = bosn_core::warning(&scan.census, warning_threshold(None, None)) else {
+        return;
+    };
+    let acknowledged = bosn_core::acknowledgement_suppresses(
+        bosn_service::unmanaged::read_acknowledgement(state_dir),
+        &scan.census,
+        now_seconds(),
+    );
+    if !acknowledged {
+        print_warning(&warning);
     }
 }
 

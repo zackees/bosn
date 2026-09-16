@@ -7,8 +7,8 @@
 //! captured engine observation, matching the rest of this crate.
 //!
 //! Nothing here deletes anything, and nothing here decides to delete. The output is a
-//! report plus a per-artifact eligibility verdict; the human-triggered plan and apply live
-//! in the daemon.
+//! report, a per-artifact eligibility verdict, and the plan those verdicts imply. Running
+//! that plan is a daemon-owned operation; it is not in this crate and not in this build.
 
 use std::collections::BTreeMap;
 
@@ -20,6 +20,238 @@ use crate::{
 
 /// Default Tier-1 age gate. Matches `foreign_ttl` in #148.
 pub const DEFAULT_TTL_SECONDS: f64 = 7.0 * 86_400.0;
+/// Warn at all above this footprint, so a healthy machine stays silent.
+pub const DEFAULT_WARN_BYTES: i128 = 5 * 1024 * 1024 * 1024;
+/// The object-count half of the same threshold.
+pub const DEFAULT_WARN_OBJECTS: u64 = 25;
+/// An acknowledged footprint re-warns once it grows by this ratio.
+pub const ACK_GROWTH_RATIO: f64 = 1.25;
+/// ...or once this much time has passed, whichever comes first.
+pub const ACK_MAX_AGE_SECONDS: f64 = 30.0 * 86_400.0;
+
+/// When a footprint is worth mentioning.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WarningThreshold {
+    pub bytes: i128,
+    pub objects: u64,
+}
+
+impl Default for WarningThreshold {
+    fn default() -> Self {
+        Self {
+            bytes: DEFAULT_WARN_BYTES,
+            objects: DEFAULT_WARN_OBJECTS,
+        }
+    }
+}
+
+/// A footprint the user should be told about.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Warning {
+    pub reclaimable_objects: u64,
+    pub reclaimable_bytes: i128,
+    /// Tier-2 objects awaiting judgment.
+    pub review_objects: u64,
+    pub review_bytes: i128,
+    /// Bytes the census can see but cannot remove by immutable ID.
+    pub report_only_bytes: i128,
+    /// The census could not be read completely. A partial census is never a clean machine.
+    pub partial: bool,
+}
+
+/// Whether the census is worth a warning, and what to say.
+///
+/// A partial census always warns: silence would claim a cleanliness that was never
+/// established. Otherwise the threshold decides, so a healthy machine says nothing.
+#[must_use]
+pub fn warning(census: &Census, threshold: WarningThreshold) -> Option<Warning> {
+    let review_objects: u64 = census
+        .classes
+        .iter()
+        .filter(|summary| summary.tier == Tier::Review)
+        .map(|summary| summary.objects)
+        .sum();
+    let review_bytes: i128 = census
+        .classes
+        .iter()
+        .filter(|summary| summary.tier == Tier::Review)
+        .map(|summary| summary.bytes)
+        .sum();
+    let report_only_bytes: i128 = census
+        .classes
+        .iter()
+        .filter(|summary| !is_removable_by_id(summary.class))
+        .map(|summary| summary.eligible_bytes)
+        .sum();
+    let over = census.reclaimable_bytes >= threshold.bytes
+        || census.reclaimable_objects >= threshold.objects;
+    if !over && !census.partial {
+        return None;
+    }
+    Some(Warning {
+        reclaimable_objects: census.reclaimable_objects,
+        reclaimable_bytes: census.reclaimable_bytes,
+        review_objects,
+        review_bytes,
+        report_only_bytes,
+        partial: census.partial,
+    })
+}
+
+/// Whether a class can be removed by naming one immutable identity.
+///
+/// Build cache is the exception: `buildx` exposes no per-record removal, only an
+/// age-filtered prune, and a filtered prune is not the same as deleting a proven, listed
+/// object. It is reported so the warning is truthful, and never swept.
+#[must_use]
+pub fn is_removable_by_id(class: UnmanagedClass) -> bool {
+    !matches!(class, UnmanagedClass::BuildCache)
+}
+
+/// A remembered acknowledgement of the current footprint.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Acknowledgement {
+    pub at: f64,
+    pub objects: u64,
+    pub bytes: i128,
+}
+
+/// Whether an acknowledgement still suppresses the warning.
+#[must_use]
+pub fn acknowledgement_suppresses(
+    acknowledgement: Option<Acknowledgement>,
+    census: &Census,
+    now: f64,
+) -> bool {
+    let Some(acknowledgement) = acknowledgement else {
+        return false;
+    };
+    if !now.is_finite() || !acknowledgement.at.is_finite() || now < acknowledgement.at {
+        // An unreadable clock must not silently re-arm a warning the user acknowledged.
+        return true;
+    }
+    if now - acknowledgement.at >= ACK_MAX_AGE_SECONDS {
+        return false;
+    }
+    let byte_ceiling = (acknowledgement.bytes as f64 * ACK_GROWTH_RATIO) as i128;
+    let object_ceiling = (acknowledgement.objects as f64 * ACK_GROWTH_RATIO) as u64;
+    census.reclaimable_bytes <= byte_ceiling && census.reclaimable_objects <= object_ceiling
+}
+
+/// One artifact the plan would remove.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlanCandidate {
+    pub id: String,
+    pub class: UnmanagedClass,
+    pub bytes: i128,
+}
+
+/// What `gc --unmanaged` would do.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Plan {
+    /// Tier-1 artifacts eligible for removal, in removal order.
+    pub candidates: Vec<PlanCandidate>,
+    /// Tier-2 artifacts awaiting an explicit `--include`.
+    pub review: Vec<PlanCandidate>,
+    /// Artifacts that are eligible but cannot be removed by identity.
+    pub report_only: Vec<ClassSummary>,
+    pub bytes: i128,
+}
+
+/// Build the plan for one observation.
+///
+/// Only Tier 1 is selected, and only artifacts the engine measured. `include` opts specific
+/// Tier-2 artifacts in by identity; there is deliberately no way to select all of them.
+#[must_use]
+pub fn plan(
+    artifacts: &[ObservedArtifact],
+    our_registry: Option<&str>,
+    config: CensusConfig,
+    include: &[String],
+) -> Plan {
+    let mut candidates = Vec::new();
+    let mut review = Vec::new();
+    let mut report_only: BTreeMap<UnmanagedClass, ClassSummary> = BTreeMap::new();
+    let mut bytes = 0i128;
+    for artifact in artifacts {
+        // A plan is never built from an artifact the engine did not measure.
+        let Some(artifact_bytes) = artifact.bytes else {
+            continue;
+        };
+        let verdict = classify(
+            artifact.kind,
+            &artifact.labels,
+            our_registry,
+            artifact.signals,
+            artifact.age_seconds,
+            config,
+        );
+        let Some(class) = verdict.class else {
+            continue;
+        };
+        if verdict.protected.is_some() {
+            continue;
+        }
+        if !verdict.age_eligible {
+            continue;
+        }
+        if !is_removable_by_id(class) {
+            let entry = report_only.entry(class).or_insert(ClassSummary {
+                class,
+                tier: class.tier(),
+                objects: 0,
+                bytes: 0,
+                eligible_objects: 0,
+                eligible_bytes: 0,
+                oldest_age_seconds: None,
+            });
+            entry.objects += 1;
+            entry.bytes += artifact_bytes;
+            entry.eligible_objects += 1;
+            entry.eligible_bytes += artifact_bytes;
+            continue;
+        }
+        let candidate = PlanCandidate {
+            id: artifact.id.clone(),
+            class,
+            bytes: artifact_bytes,
+        };
+        match class.tier() {
+            Tier::Reclaimable => {
+                bytes += artifact_bytes;
+                candidates.push(candidate);
+            }
+            Tier::Review => {
+                if include.iter().any(|id| id == &artifact.id) {
+                    bytes += artifact_bytes;
+                    candidates.push(candidate);
+                } else {
+                    review.push(candidate);
+                }
+            }
+        }
+    }
+    candidates.sort_by_key(|candidate| removal_rank(candidate.class));
+    Plan {
+        candidates,
+        review,
+        report_only: report_only.into_values().collect(),
+        bytes,
+    }
+}
+
+/// Removal order: containers first, because removing them is what releases the image
+/// references blocking image deletion. Mirrors `collectable_ordered`'s intent for owned
+/// resources.
+#[must_use]
+pub fn removal_rank(class: UnmanagedClass) -> u8 {
+    match class {
+        UnmanagedClass::StoppedContainer => 0,
+        UnmanagedClass::UnreferencedImage | UnmanagedClass::DanglingImage => 1,
+        UnmanagedClass::AnonymousVolume | UnmanagedClass::NamedVolume => 2,
+        UnmanagedClass::BuildCache => 3,
+    }
+}
 
 /// How much of this artifact Bosn owns, per the label contract.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,8 +375,11 @@ pub struct Classification {
     pub ownership: OwnershipClass,
     pub class: Option<UnmanagedClass>,
     pub protected: Option<ProtectedReason>,
-    /// Whether the age gate is satisfied. A classed artifact below its gate is reported but
-    /// is not eligible for reclamation.
+    /// Whether the artifact is past its age gate.
+    ///
+    /// This is deliberately independent of tier: a Tier-2 artifact past its gate is still
+    /// never swept on its own, but it may be named explicitly with `--include`. Sweepability
+    /// is a property of the tier, not of the gate.
     pub age_eligible: bool,
 }
 
@@ -216,9 +451,7 @@ pub fn classify(
     };
     Classification {
         class: Some(class),
-        // Only a Tier-1 class can be swept, so only a Tier-1 class can be eligible. A Tier-2
-        // artifact is reported in full but is never auto-selected, whatever its age.
-        age_eligible: age >= gate && class.tier() == Tier::Reclaimable,
+        age_eligible: age >= gate,
         ..base
     }
 }
@@ -346,20 +579,28 @@ pub fn census(artifacts: &[ObservedArtifact], our_registry: Option<&str>, config
                 _ => age,
             });
         }
-        if verdict.age_eligible {
+        // Only a Tier-1 class can be swept, so only a Tier-1 class contributes to the
+        // reclaimable totals the warning and the threshold are built on.
+        if verdict.age_eligible && class.tier() == Tier::Reclaimable {
             entry.eligible_objects += 1;
             entry.eligible_bytes += bytes;
         }
     }
     let reclaimable_classes: Vec<ClassSummary> = classes.values().copied().collect();
+    // "Reclaimable" means a command can actually take it. Build cache is Tier 1 but has no
+    // per-object removal, so counting it here would promise bytes no command can free; it is
+    // reported separately instead.
+    let countable = |summary: &&ClassSummary| {
+        summary.tier == Tier::Reclaimable && is_removable_by_id(summary.class)
+    };
     let reclaimable_objects = reclaimable_classes
         .iter()
-        .filter(|summary| summary.tier == Tier::Reclaimable)
+        .filter(countable)
         .map(|summary| summary.eligible_objects)
         .sum();
     let reclaimable_bytes = reclaimable_classes
         .iter()
-        .filter(|summary| summary.tier == Tier::Reclaimable)
+        .filter(countable)
         .map(|summary| summary.eligible_bytes)
         .sum();
     Census {
@@ -878,7 +1119,8 @@ mod tests {
         );
         assert_eq!(tagged.class, Some(UnmanagedClass::UnreferencedImage));
         assert_eq!(tagged.class.unwrap().tier(), Tier::Review);
-        assert!(!tagged.age_eligible, "a review-tier class is never eligible");
+        // Past its gate, but a review-tier class is still never swept on its own.
+        assert!(tagged.age_eligible);
 
         let container = classify(
             ResourceKind::Container,
@@ -993,6 +1235,168 @@ mod tests {
             config,
         );
         assert_eq!(in_use.protected, Some(ProtectedReason::InUse));
+    }
+
+    fn artifact(id: &str, kind: ResourceKind, bytes: i128, age: f64) -> ObservedArtifact {
+        ObservedArtifact {
+            id: id.to_owned(),
+            kind,
+            labels: BTreeMap::new(),
+            signals: Signals::default(),
+            bytes: Some(bytes),
+            age_seconds: Some(age),
+        }
+    }
+
+    #[test]
+    fn a_healthy_machine_is_silent() {
+        let artifacts = [artifact("c", ResourceKind::Container, 1024, DEFAULT_TTL_SECONDS * 2.0)];
+        let census = census(&artifacts, None, CensusConfig::default());
+        assert_eq!(warning(&census, WarningThreshold::default()), None);
+    }
+
+    #[test]
+    fn the_threshold_decides_by_bytes_or_objects() {
+        let artifacts = [artifact(
+            "c",
+            ResourceKind::Container,
+            DEFAULT_WARN_BYTES + 1,
+            DEFAULT_TTL_SECONDS * 2.0,
+        )];
+        let census = census(&artifacts, None, CensusConfig::default());
+        let warning = warning(&census, WarningThreshold::default()).expect("over the byte gate");
+        assert!(!warning.partial);
+        assert_eq!(warning.reclaimable_objects, 1);
+    }
+
+    #[test]
+    fn a_partial_census_always_warns() {
+        let census = Census {
+            partial: true,
+            ..Census::default()
+        };
+        let warning = warning(&census, WarningThreshold::default()).expect("partial warns");
+        assert!(warning.partial);
+        assert_eq!(warning.reclaimable_bytes, 0);
+    }
+
+    #[test]
+    fn the_reclaimable_total_never_promises_bytes_no_command_can_free() {
+        let artifacts = [
+            artifact("c", ResourceKind::Container, 100, DEFAULT_TTL_SECONDS * 2.0),
+            artifact("cache", ResourceKind::Builder, 900, DEFAULT_TTL_SECONDS * 2.0),
+        ];
+        let census = census(&artifacts, None, CensusConfig::default());
+        assert_eq!(census.reclaimable_objects, 1);
+        assert_eq!(census.reclaimable_bytes, 100);
+        // The build cache is still reported, and the warning says so separately.
+        let summary = census
+            .classes
+            .iter()
+            .find(|summary| summary.class == UnmanagedClass::BuildCache)
+            .expect("build cache reported");
+        assert_eq!(summary.eligible_bytes, 900);
+        assert!(
+            warning(&census, WarningThreshold::default()).is_none(),
+            "below threshold, so no warning at all"
+        );
+        let loud = warning(
+            &census,
+            WarningThreshold {
+                bytes: 1,
+                objects: 1,
+            },
+        )
+        .expect("over threshold");
+        assert_eq!(loud.report_only_bytes, 900);
+        assert_eq!(loud.reclaimable_bytes, 100);
+    }
+
+    #[test]
+    fn build_cache_is_reported_but_never_removed_by_id() {
+        let artifacts = [artifact(
+            "cache",
+            ResourceKind::Builder,
+            4096,
+            DEFAULT_TTL_SECONDS * 2.0,
+        )];
+        let selected = plan(&artifacts, None, CensusConfig::default(), &[]);
+        assert!(selected.candidates.is_empty(), "build cache is never a candidate");
+        assert_eq!(selected.report_only.len(), 1);
+        assert_eq!(selected.report_only[0].class, UnmanagedClass::BuildCache);
+        assert_eq!(selected.report_only[0].eligible_bytes, 4096);
+    }
+
+    #[test]
+    fn a_plan_selects_tier_one_only_unless_named() {
+        let mut dangling_image =
+            artifact("image", ResourceKind::Image, 200, DEFAULT_TTL_SECONDS * 2.0);
+        dangling_image.signals.dangling = true;
+        let mut unmeasured =
+            artifact("unmeasured", ResourceKind::Container, 0, DEFAULT_TTL_SECONDS * 2.0);
+        unmeasured.bytes = None;
+        let artifacts = [
+            artifact("container", ResourceKind::Container, 100, DEFAULT_TTL_SECONDS * 2.0),
+            dangling_image,
+            // Tagged and unreferenced: reviewable, never swept.
+            artifact("local", ResourceKind::Image, 300, DEFAULT_TTL_SECONDS * 2.0),
+            artifact("young", ResourceKind::Container, 400, 60.0),
+            unmeasured,
+        ];
+        let selected = plan(&artifacts, None, CensusConfig::default(), &[]);
+        let ids: Vec<&str> = selected.candidates.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["container", "image"], "containers before images");
+        assert_eq!(selected.bytes, 300);
+        assert!(selected.review.iter().any(|c| c.id == "local"));
+
+        // Naming a Tier-2 artifact opts exactly that one in.
+        let included = plan(&artifacts, None, CensusConfig::default(), &["local".to_owned()]);
+        let ids: Vec<&str> = included.candidates.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["container", "image", "local"]);
+        assert_eq!(included.bytes, 600);
+        assert!(included.review.iter().all(|c| c.id != "local"));
+    }
+
+    #[test]
+    fn an_unmeasured_artifact_never_enters_a_plan() {
+        let mut unmeasured = artifact("x", ResourceKind::Container, 0, DEFAULT_TTL_SECONDS * 2.0);
+        unmeasured.bytes = None;
+        let selected = plan(&[unmeasured], None, CensusConfig::default(), &[]);
+        assert!(selected.candidates.is_empty());
+        assert_eq!(selected.bytes, 0);
+    }
+
+    #[test]
+    fn an_acknowledgement_suppresses_until_the_footprint_grows() {
+        let artifacts = [artifact(
+            "c",
+            ResourceKind::Container,
+            DEFAULT_WARN_BYTES + 1,
+            DEFAULT_TTL_SECONDS * 2.0,
+        )];
+        let census = census(&artifacts, None, CensusConfig::default());
+        let now = 1_000_000.0;
+        let ack = Acknowledgement {
+            at: now,
+            objects: census.reclaimable_objects,
+            bytes: census.reclaimable_bytes,
+        };
+        assert!(acknowledgement_suppresses(Some(ack), &census, now));
+        // Material growth re-arms it.
+        let grown = Census {
+            reclaimable_bytes: (ack.bytes as f64 * 1.5) as i128,
+            ..census.clone()
+        };
+        assert!(!acknowledgement_suppresses(Some(ack), &grown, now));
+        // So does age.
+        assert!(!acknowledgement_suppresses(
+            Some(ack),
+            &census,
+            now + ACK_MAX_AGE_SECONDS
+        ));
+        // An unreadable clock keeps the user's acknowledgement.
+        assert!(acknowledgement_suppresses(Some(ack), &census, f64::NAN));
+        assert!(!acknowledgement_suppresses(None, &census, now));
     }
 
     #[test]
