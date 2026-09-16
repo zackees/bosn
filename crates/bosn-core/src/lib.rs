@@ -9,6 +9,7 @@ pub mod compose;
 pub mod config;
 pub mod manifest;
 pub mod setup;
+pub mod unmanaged;
 
 pub use compose::{
     BuildSpec, COMPOSE_PLAN_VERSION, COMPOSE_SETUP_PLAN_VERSION, ComposeDocument, ComposeError,
@@ -26,6 +27,13 @@ pub use setup::{
     MAX_INLINE_DOCKERFILE_BYTES, MAX_MOUNTS, MAX_SETUP_DOCUMENT_BYTES, MAX_TASKS,
     SETUP_DOCUMENT_VERSION, SetupApp, SetupConfigLocator, SetupDocument, SetupDocumentError,
     SetupSource, SetupTask, WorkspaceMount, parse_setup_config_locator, parse_setup_document_toml,
+};
+pub use unmanaged::{
+    Census, CensusConfig, ClassSummary, Classification, DEFAULT_TTL_SECONDS, ObservedArtifact,
+    OwnershipClass, ProtectedReason, ProtectedSummary,
+    EngineObservation, InspectedVolume, Signals, SystemDfReport, Tier, UnmanagedClass, census,
+    classify, classify_ownership, observe, parse_docker_size, parse_docker_timestamp,
+    parse_label_list, parse_rfc3339_timestamp,
 };
 
 pub const NAMESPACE: &str = "com.zackees.bosn";

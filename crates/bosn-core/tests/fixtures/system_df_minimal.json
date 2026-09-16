@@ -1,0 +1,63 @@
+{
+  "Images": [
+    {
+      "Containers": "0",
+      "CreatedAt": "2026-09-16 12:13:31 -0700 PDT",
+      "CreatedSince": "23 minutes ago",
+      "Digest": "",
+      "ID": "sha256:danglingimage",
+      "Repository": "<none>",
+      "SharedSize": "1.472GB",
+      "Size": "1.67GB",
+      "Tag": "<none>",
+      "UniqueSize": "195.6MB"
+    },
+    {
+      "Containers": "0",
+      "CreatedAt": "2026-08-01 00:00:00 +0000 UTC",
+      "CreatedSince": "6 weeks ago",
+      "Digest": "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "ID": "sha256:bosnimage",
+      "Repository": "bosn/test",
+      "SharedSize": "188.2MB",
+      "Size": "446MB",
+      "Tag": "local",
+      "UniqueSize": "258.1MB"
+    }
+  ],
+  "Containers": [
+    {
+      "Command": "\"/usr/bin/dumb-init -- /usr/local/bin/ephemeral-session\"",
+      "CreatedAt": "2026-09-13 10:06:21 -0700 PDT",
+      "HealthStatus": "none",
+      "ID": "59af958a441ece90ea50735a002946384ea5daaa6ce2c65533e91c51e38161b7",
+      "Image": "sha256:eb333770de6405d51661e3ca76ba8b071d94b768fcbf7d12b015428db27dc416",
+      "Labels": "com.docker.compose.project=twp-e2e-dev-presign,com.docker.compose.service=gateway",
+      "LocalVolumes": "0",
+      "Mounts": "",
+      "Names": "twp-e2e-dev-presign-gateway-1",
+      "Networks": "twp-e2e-dev-presign_default",
+      "Platform": null,
+      "Ports": "",
+      "RunningFor": "3 days ago",
+      "Size": "32.8kB",
+      "State": "exited",
+      "Status": "Exited (143) 45 hours ago"
+    }
+  ],
+  "Volumes": [
+    {
+      "Availability": "N/A",
+      "Driver": "local",
+      "Group": "N/A",
+      "Labels": "com.docker.volume.anonymous=",
+      "Links": "0",
+      "Mountpoint": "/var/lib/docker/volumes/f1c1cdf1f2ba212d6d08336115a83821aa80e1971ce9aa2513dd65bfce07f7ca/_data",
+      "Name": "f1c1cdf1f2ba212d6d08336115a83821aa80e1971ce9aa2513dd65bfce07f7ca",
+      "Scope": "local",
+      "Size": "173.9MB",
+      "Status": "N/A"
+    }
+  ],
+  "BuildCache": []
+}

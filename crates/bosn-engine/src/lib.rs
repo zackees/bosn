@@ -137,6 +137,29 @@ impl GuestScpCommand {
     }
 }
 
+/// Outcome of one read-only census read.
+///
+/// A refusal is modelled as data rather than an error: the caller must be able to tell
+/// "the engine said nothing" from "the engine said zero", because a census that cannot be
+/// read is a reason to keep everything, never a reason to reclaim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CensusRead {
+    /// The engine returned a complete document.
+    Document(String),
+    /// The engine refused, or answered in a form that cannot be read.
+    Unavailable { detail: String },
+}
+
+impl CensusRead {
+    #[must_use]
+    pub fn document(&self) -> Option<&str> {
+        match self {
+            Self::Document(text) => Some(text),
+            Self::Unavailable { .. } => None,
+        }
+    }
+}
+
 /// The locally installed OpenSSH client, restricted to [`GuestSshCommand`].
 /// It has no raw argv, host, port, or credential configuration surface.
 #[derive(Clone, Debug)]
@@ -588,6 +611,82 @@ impl DockerEngine {
             .await;
         doctor_report(result)
     }
+    /// Read-only Docker accounting, as one bounded `docker system df -v --format json`.
+    ///
+    /// This reports images, containers, volumes, and build cache together. Unlike
+    /// [`Self::capture`] it does not let the caller select argv, and it never pulls,
+    /// prunes, creates, inspects, or otherwise mutates engine state. Parsing and
+    /// classification are pure and live in `bosn-core`.
+    pub fn system_df_verbose(&self, options: RunOptions) -> Result<CensusRead, CommandError> {
+        let result = self
+            .with_args(["system", "df", "-v", "--format", "json"])
+            .capture(options)?;
+        Ok(census_read(result, "docker system df -v"))
+    }
+
+    /// Read-only image IDs Docker itself considers dangling.
+    ///
+    /// This is the authoritative signal. An untagged image that is still the parent of a
+    /// tagged one is *not* dangling, and inferring "untagged" from the accounting document
+    /// would over-report it as reclaimable.
+    pub fn image_ids_dangling(&self, options: RunOptions) -> Result<CensusRead, CommandError> {
+        let result = self
+            .with_args([
+                "image",
+                "ls",
+                "-a",
+                "-q",
+                "--no-trunc",
+                "--filter",
+                "dangling=true",
+            ])
+            .capture(options)?;
+        Ok(census_read(result, "docker image ls --filter dangling"))
+    }
+
+    /// Read-only detail for specific volumes, as one bounded `docker volume inspect`.
+    ///
+    /// The accounting document reports no volume creation time, so volume age is only
+    /// available here. Callers batch the names they need rather than probing one at a time.
+    pub fn inspect_volumes(
+        &self,
+        names: &[String],
+        options: RunOptions,
+    ) -> Result<CensusRead, CommandError> {
+        let mut args: Vec<OsString> = ["volume", "inspect"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        args.extend(names.iter().cloned().map(OsString::from));
+        let result = self.with_args(args).capture(options)?;
+        Ok(census_read(result, "docker volume inspect"))
+    }
+
+    /// Read-only image IDs carrying one label key, as a bounded `docker image ls`.
+    ///
+    /// `docker image ls` does not expose labels, so image ownership cannot be read from the
+    /// accounting document alone. Callers query the keys they care about and union the
+    /// results; the engine itself knows nothing about Bosn's label contract.
+    pub fn image_ids_with_label(
+        &self,
+        key: &str,
+        options: RunOptions,
+    ) -> Result<CensusRead, CommandError> {
+        let filter = format!("label={key}");
+        let result = self
+            .with_args([
+                "image",
+                "ls",
+                "-a",
+                "-q",
+                "--no-trunc",
+                "--filter",
+                filter.as_str(),
+            ])
+            .capture(options)?;
+        Ok(census_read(result, "docker image ls --filter label"))
+    }
+
     /// Append trusted, product-selected Docker CLI arguments. This local
     /// transport is not a sandbox or authorization boundary and is not RPC.
     #[must_use]
@@ -634,6 +733,22 @@ pub enum DockerDoctorState {
     Deadline,
     OutputLimit,
     InvalidResponse,
+}
+
+/// Convert one bounded capture into a census read, so a refusal is never mistaken for an
+/// empty result.
+fn census_read(result: CommandResult, what: &str) -> CensusRead {
+    if !result.ok() {
+        return CensusRead::Unavailable {
+            detail: format!("{what} exited with {}", result.exit_code),
+        };
+    }
+    match String::from_utf8(result.stdout) {
+        Ok(text) => CensusRead::Document(text),
+        Err(_) => CensusRead::Unavailable {
+            detail: format!("{what} returned non-UTF-8 output"),
+        },
+    }
 }
 
 fn doctor_report(result: Result<CommandResult, CommandError>) -> DockerDoctorReport {

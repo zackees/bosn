@@ -58,6 +58,7 @@ fn main() {
         "job" => run_job(arguments),
         "registry" => run_registry(arguments),
         "gc" => run_gc(arguments),
+        "scan" => run_scan(arguments),
         _ => usage(),
     }
 }
@@ -501,6 +502,143 @@ fn read_compose_file(path: &Path) -> Result<String, String> {
 fn compose_failure(error: &str) -> ! {
     eprintln!("bosn compose plan: {error}");
     std::process::exit(1)
+}
+
+/// Read-only census of Docker artifacts Bosn does not own.
+///
+/// This reports; it never deletes, and it never suggests a Docker command. The warning
+/// surface and `bosn gc --unmanaged` build on it. A census that cannot be read completely is
+/// reported as partial and is never a clean machine.
+fn run_scan(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
+    let mut state_dir = None;
+    let mut ttl_seconds = None;
+    let mut json_output = false;
+    while let Some(argument) = arguments.next() {
+        match argument.to_string_lossy().as_ref() {
+            "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
+            "--ttl-seconds" => set_once_parsed(&mut ttl_seconds, arguments.next(), parse_ttl_seconds),
+            "--json" if !json_output => {
+                json_output = true;
+                Ok(())
+            }
+            _ => Err(()),
+        }
+        .unwrap_or_else(|_| usage());
+    }
+    let state_dir = state_dir.unwrap_or_else(bosn_service::mcp::default_state_dir);
+    let config = bosn_core::CensusConfig {
+        ttl_seconds: ttl_seconds.unwrap_or(bosn_core::DEFAULT_TTL_SECONDS),
+    };
+    // Read-only, and only for this registry's UUID. A missing or unreadable registry leaves
+    // the UUID unknown, which classifies every complete label set as foreign: protective,
+    // never exposing.
+    let our_registry = bosn_registry::Registry::open_read_only(state_dir.join("registry.sqlite3"))
+        .ok()
+        .and_then(|registry| registry.registry_id().ok());
+    let engine = DockerEngine::docker();
+    let scan =
+        bosn_service::unmanaged::unmanaged_census(&engine, our_registry.as_deref(), config);
+    let census = &scan.census;
+    if json_output {
+        let classes: Vec<_> = census
+            .classes
+            .iter()
+            .map(|summary| {
+                json!({
+                    "class": summary.class.as_str(),
+                    "tier": match summary.tier {
+                        bosn_core::Tier::Reclaimable => "reclaimable",
+                        bosn_core::Tier::Review => "review",
+                    },
+                    "objects": summary.objects,
+                    "bytes": summary.bytes,
+                    "eligible_objects": summary.eligible_objects,
+                    "eligible_bytes": summary.eligible_bytes,
+                    "oldest_age_seconds": summary.oldest_age_seconds,
+                })
+            })
+            .collect();
+        let protected: Vec<_> = census
+            .protected
+            .iter()
+            .map(|summary| {
+                json!({
+                    "reason": summary.reason.as_str(),
+                    "objects": summary.objects,
+                    "bytes": summary.bytes,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            json!({
+                "action": "scan",
+                "reclaimable_objects": census.reclaimable_objects,
+                "reclaimable_bytes": census.reclaimable_bytes,
+                "bytes_approximate": census.bytes_approximate,
+                "partial": census.partial,
+                "classes": classes,
+                "protected": protected,
+                "unreadable": scan.unreadable,
+            })
+        );
+        return;
+    }
+    println!("scan");
+    if census.classes.is_empty() {
+        println!("nothing unowned observed");
+    }
+    for summary in &census.classes {
+        let tier = match summary.tier {
+            bosn_core::Tier::Reclaimable => "reclaimable",
+            bosn_core::Tier::Review => "review",
+        };
+        println!(
+            "{:<20} {tier:<12} {:>6} objects  {}  eligible {}",
+            summary.class.as_str(),
+            summary.objects,
+            human_bytes(summary.bytes),
+            summary.eligible_objects,
+        );
+    }
+    if census.reclaimable_objects > 0 {
+        println!(
+            "eligible: {} objects, {}",
+            census.reclaimable_objects,
+            human_bytes(census.reclaimable_bytes)
+        );
+    }
+    for summary in &census.protected {
+        println!(
+            "protected: {:<26} {:>6} objects  {}",
+            summary.reason.as_str(),
+            summary.objects,
+            human_bytes(summary.bytes)
+        );
+    }
+    for detail in &scan.unreadable {
+        eprintln!("scan: partial: {detail}");
+    }
+    if census.partial {
+        eprintln!("scan: partial census; nothing here is safe to act on");
+    }
+}
+
+/// Render bytes for humans. Byte figures in the census are approximate by construction.
+fn human_bytes(bytes: i128) -> String {
+    const UNITS: [(&str, i128); 5] = [
+        ("PiB", 1 << 50),
+        ("TiB", 1 << 40),
+        ("GiB", 1 << 30),
+        ("MiB", 1 << 20),
+        ("KiB", 1 << 10),
+    ];
+    for (unit, scale) in UNITS {
+        if bytes >= scale {
+            return format!("{:.1}{unit}", bytes as f64 / scale as f64);
+        }
+    }
+    format!("{bytes}B")
 }
 
 fn run_gc(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
@@ -1876,6 +2014,13 @@ fn parse_state_dir(value: std::ffi::OsString) -> Result<PathBuf, ()> {
     (!path.as_os_str().is_empty()).then_some(path).ok_or(())
 }
 
+/// A non-negative, finite age gate in seconds. NaN and infinity are refused rather than
+/// silently treated as "no gate", which would make everything eligible.
+fn parse_ttl_seconds(value: std::ffi::OsString) -> Result<f64, ()> {
+    let seconds: f64 = value.to_str().ok_or(())?.parse().map_err(|_| ())?;
+    (seconds.is_finite() && seconds >= 0.0).then_some(seconds).ok_or(())
+}
+
 fn parse_job_id(value: std::ffi::OsString) -> Result<u64, ()> {
     let id = parse_u64(value)?;
     (id > 0).then_some(id).ok_or(())
@@ -2379,6 +2524,7 @@ fn usage() -> ! {
         "   or: bosn job logs --state-dir STATE_DIR --job-id ID [--after CURSOR] [--limit 1..={MAX_JOB_LOG_LIMIT}] [--json]"
     );
     eprintln!("   or: bosn job cancel --state-dir STATE_DIR --job-id ID [--json]");
+    eprintln!("   or: bosn scan [--state-dir STATE_DIR] [--ttl-seconds N] [--json]");
     eprintln!(
         "   or: bosn gc preview --state-dir STATE_DIR --workspace WORKSPACE [--after CURSOR] [--limit 1..=64] [--json]"
     );
