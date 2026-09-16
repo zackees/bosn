@@ -638,7 +638,7 @@ fn print_census(census: &bosn_core::Census) {
             summary.class.as_str(),
             class_tier(summary.tier),
             summary.objects,
-            human_bytes(summary.bytes),
+            bosn_service::unmanaged::human_bytes(summary.bytes),
             summary.eligible_objects,
         );
     }
@@ -646,7 +646,7 @@ fn print_census(census: &bosn_core::Census) {
         println!(
             "eligible: {} objects, {}",
             census.reclaimable_objects,
-            human_bytes(census.reclaimable_bytes)
+            bosn_service::unmanaged::human_bytes(census.reclaimable_bytes)
         );
     }
     for summary in &census.protected {
@@ -654,7 +654,7 @@ fn print_census(census: &bosn_core::Census) {
             "protected: {:<26} {:>6} objects  {}",
             summary.reason.as_str(),
             summary.objects,
-            human_bytes(summary.bytes)
+            bosn_service::unmanaged::human_bytes(summary.bytes)
         );
     }
 }
@@ -731,59 +731,19 @@ fn colour_enabled() -> bool {
 
 /// The loud warning. Printed to stderr, at most once per invocation, and never in JSON.
 ///
-/// The commands it prints are exactly the ones this build implements. Advertising a removal
-/// path that does not exist would send the user to a command that fails, which is worse than
-/// saying plainly that it is not here yet.
+/// The lines come from the shared formatter so the daemon's unattended pass and this
+/// interactive surface say exactly the same thing.
 fn print_warning(warning: &bosn_core::Warning) {
-    let yellow = if colour_enabled() { "\x1b[33m" } else { "" };
-    let reset = if colour_enabled() { "\x1b[0m" } else { "" };
-    if warning.partial {
-        eprintln!(
-            "{yellow}UNMANAGED DOCKER ARTIFACTS COULD NOT BE FULLY MEASURED \u{2014} THIS MACHINE IS NOT KNOWN TO BE CLEAN{reset}"
-        );
-    }
-    if warning.reclaimable_objects > 0 {
-        eprintln!(
-            "{yellow}{} UNMANAGED DOCKER OBJECTS ARE RECLAIMABLE ({}){reset}",
-            warning.reclaimable_objects,
-            human_bytes(warning.reclaimable_bytes),
-        );
-        eprintln!("  see them:  bosn gc --unmanaged");
-        eprintln!(
-            "  removal is not in this build yet; it lands with the daemon-owned apply slice"
-        );
-    }
-    if warning.report_only_bytes > 0 {
-        eprintln!(
-            "  build cache holds {} with no per-object removal, so bosn never sweeps it",
-            human_bytes(warning.report_only_bytes)
-        );
-    }
-    if warning.review_objects > 0 {
-        eprintln!(
-            "  review {} items ({}) needing judgment: listed by the preview, opt one in with --include <id>",
-            warning.review_objects,
-            human_bytes(warning.review_bytes)
-        );
-    }
-    eprintln!("  silence:   bosn scan --ack");
-}
-
-/// Render bytes for humans. Byte figures in the census are approximate by construction.
-fn human_bytes(bytes: i128) -> String {
-    const UNITS: [(&str, i128); 5] = [
-        ("PiB", 1 << 50),
-        ("TiB", 1 << 40),
-        ("GiB", 1 << 30),
-        ("MiB", 1 << 20),
-        ("KiB", 1 << 10),
-    ];
-    for (unit, scale) in UNITS {
-        if bytes >= scale {
-            return format!("{:.1}{unit}", bytes as f64 / scale as f64);
+    let colour = colour_enabled();
+    for (index, line) in bosn_service::unmanaged::warning_lines(warning).iter().enumerate() {
+        // Only the headline shouts, and only it is coloured: an all-caps table is unreadable
+        // and the shouting has to mean something.
+        if colour && index == 0 {
+            eprintln!("\x1b[33m{line}\x1b[0m");
+        } else {
+            eprintln!("{line}");
         }
     }
-    format!("{bytes}B")
 }
 
 fn run_gc(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
@@ -944,7 +904,7 @@ fn run_gc_unmanaged(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
         println!(
             "{:<18} {:>10}  {}",
             candidate.class.as_str(),
-            human_bytes(candidate.bytes),
+            bosn_service::unmanaged::human_bytes(candidate.bytes),
             candidate.id
         );
     }
@@ -952,7 +912,7 @@ fn run_gc_unmanaged(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
         println!(
             "would remove {} objects, {}",
             plan.candidates.len(),
-            human_bytes(plan.bytes)
+            bosn_service::unmanaged::human_bytes(plan.bytes)
         );
     }
     for summary in &plan.report_only {
@@ -960,7 +920,7 @@ fn run_gc_unmanaged(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
             "report only: {:<18} {} objects, {} — no per-object removal",
             summary.class.as_str(),
             summary.eligible_objects,
-            human_bytes(summary.eligible_bytes)
+            bosn_service::unmanaged::human_bytes(summary.eligible_bytes)
         );
     }
     if !plan.review.is_empty() {
@@ -1529,10 +1489,85 @@ fn print_setup_ensure_events(page: bosn_service::SetupEnsureEventPage, _json_out
 /// does not fork, register an autostart entry, or make Docker calls. The
 /// service itself owns state-directory hardening, registry-writer exclusion,
 /// and authenticated local IPC.
+/// Register or unregister the daemon with the platform's user service manager.
+///
+/// Writing the entry file is not the operation — registering it is. The Python
+/// implementation wrote a LaunchAgent plist and returned, so a macOS user who asked for
+/// autostart got nothing until their next login.
+fn run_daemon_autostart(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
+    let Some(verb) = arguments.next() else {
+        usage();
+    };
+    let mut state_dir = None;
+    let mut json_output = false;
+    while let Some(argument) = arguments.next() {
+        match argument.to_string_lossy().as_ref() {
+            "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
+            "--json" if !json_output => {
+                json_output = true;
+                Ok(())
+            }
+            _ => Err(()),
+        }
+        .unwrap_or_else(|_| usage());
+    }
+    let Some(platform) = bosn_service::autostart::Platform::current() else {
+        eprintln!("bosn daemon autostart: this platform has no supported service manager");
+        std::process::exit(2);
+    };
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        eprintln!("bosn daemon autostart: HOME is not set");
+        std::process::exit(2);
+    };
+    let runner = bosn_service::autostart::SystemRunner;
+    let state_dir = state_dir.unwrap_or_else(bosn_service::mcp::default_state_dir);
+    let action = verb.to_string_lossy().into_owned();
+    let result = match action.as_str() {
+        "enable" => std::env::current_exe()
+            .map_err(|error| error.to_string())
+            .and_then(|binary| {
+                bosn_service::autostart::enable(&runner, platform, &home, &binary, &state_dir)
+            }),
+        "disable" => bosn_service::autostart::disable(&runner, platform, &home),
+        "status" => Ok(bosn_service::autostart::status(platform, &home)),
+        _ => usage(),
+    };
+    match result {
+        Ok(status) => {
+            if json_output {
+                println!(
+                    "{}",
+                    json!({
+                        "action": format!("daemon_autostart_{action}"),
+                        "written": status.written,
+                        "registered": status.registered,
+                        "path": status.path.to_string_lossy(),
+                    })
+                );
+            } else {
+                println!("daemon autostart {action}");
+                println!("entry:      {}", status.path.to_string_lossy());
+                println!("written:    {}", status.written);
+                println!("registered: {}", status.registered);
+            }
+        }
+        Err(detail) => {
+            eprintln!("bosn daemon autostart {action}: {detail}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn run_daemon(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
     let Some(command) = arguments.next() else {
         usage();
     };
+    // Autostart is not a daemon invocation: it never contacts a running daemon, and it
+    // returns rather than entering the runtime below.
+    if command.to_string_lossy() == "autostart" {
+        run_daemon_autostart(arguments);
+        return;
+    }
     let invocation = match command.to_string_lossy().as_ref() {
         "serve" => parse_daemon_serve_arguments(arguments)
             .map(|state_dir| DaemonInvocation::Serve { state_dir }),
@@ -2813,6 +2848,7 @@ fn usage() -> ! {
     eprintln!("   or: bosn daemon serve --state-dir STATE_DIR");
     eprintln!("   or: bosn daemon status --state-dir STATE_DIR [--json]");
     eprintln!("   or: bosn daemon stop --state-dir STATE_DIR [--json]");
+    eprintln!("   or: bosn daemon autostart (enable|disable|status) [--state-dir STATE_DIR] [--json]");
     eprintln!(
         "   or: bosn registry import-v4 --legacy-state-dir LEGACY_STATE_DIR --state-dir NEW_STATE_DIR --yes [--json]"
     );

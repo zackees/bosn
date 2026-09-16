@@ -42,7 +42,8 @@ This is the honest baseline. It is the reason S2–S5 are not a port but a build
 | `scan` | **present** since S2 (#270), read-only | `crates/bosn-service/src/bin/bosn.rs` `run_scan` |
 | `--ack` / `foreign_ttl` / warning threshold | **present** since S3 (#271): `bosn scan --ack`, `--ttl-seconds`, `--warn-bytes`, `--warn-objects` | `crates/bosn-core/src/unmanaged.rs` |
 | `gc --unmanaged` | **preview present** since S3 (#271); removal is a daemon-owned job-backed operation and is its own slice | `crates/bosn-service/src/bin/bosn.rs` `run_gc_unmanaged` |
-| Autostart, maintenance pass | **absent** — no service unit, no `systemctl`/`launchctl` call, no idle or maintenance loop | slice S4 |
+| Autostart | **present** since S4 (#272): `bosn daemon autostart enable\|disable\|status` writes the platform entry **and registers it** (`systemctl --user enable --now`, `launchctl load -w`) | `crates/bosn-service/src/autostart.rs` |
+| Maintenance pass | **present** since S4 (#272): the daemon runs the census at start and every hour, logging the warning | `crates/bosn-service/src/lib.rs` `serve` |
 | Retention / pressure / verdict model | **Implemented and tested, and unwired.** `Pressure::assess`, `evaluate`, `collectable_ordered`, `container_should_stop`, `lease_expired`, `retention_signals`, `PolicyDefaults`, `RetentionConfig` have **zero production consumers** | `crates/bosn-core/src/lib.rs:362-570`; `crates/bosn-core/src/config.rs:53-74`; exercised only by `crates/bosn-core/tests/domain.rs` |
 
 Two consequences worth stating plainly, because both change what the remaining slices are:
@@ -289,6 +290,29 @@ Recorded here to close #268's open questions. Each is a judgment call, not a dis
    warning fire, and the reference machine below is the argument for it. But it is **not** a
    prerequisite for S3: the interactive warning on `status` and `doctor` works without a
    daemon that survives being idle, so S3 may land first.
+
+## Unattended operation
+
+Two halves, because a warning nobody is running cannot fire.
+
+**Autostart registers, it does not merely write.** The Python implementation wrote the
+LaunchAgent plist and returned without ever calling `launchctl`, so a macOS user who opted in
+got no daemon until their next login. Writing the file is not the operation. `enable` writes
+the entry, reloads the manager, and registers; `disable` unregisters, removes the entry, and
+reloads — symmetric, because an unloaded file or an unlinked registration is the same defect
+from the other side. Every mutating step goes through a `CommandRunner`, so the exact argv is
+asserted in tests without requiring `systemctl` or `launchctl` in CI. Real registration was
+**not** executed on the development host; only `status`, which reads the filesystem.
+
+**The daemon maintains itself.** It runs the census at start and then on a one-hour interval,
+logging the warning to its own stderr — the systemd journal or the launchd log — so a machine
+that opted in learns about its unowned footprint without anyone typing anything. The pass runs
+on the blocking pool, so the bounded child-process calls cannot stall the accept loop, and the
+wait between passes is cancellable, so shutdown is not delayed by up to an hour.
+
+The B5 defect in #147 — "maintenance can be skipped in favour of shutdown" — **cannot occur
+here**, because the native daemon has no idle watchdog and no retirement: it runs until it is
+stopped. That is a difference in mechanism, not a fix.
 
 ## Reference measurement
 

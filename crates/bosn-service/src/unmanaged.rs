@@ -120,6 +120,89 @@ pub fn unmanaged_census(
     }
 }
 
+/// The default interval between unattended maintenance passes.
+pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// One unattended maintenance pass.
+///
+/// This is what makes the warning fire on a machine where nobody runs a command — which was
+/// the reference machine in #147, where `~/.local/state/bosn` did not exist and nothing was
+/// ever routed through bosn.
+#[must_use]
+pub fn maintenance_pass(
+    state_dir: &Path,
+    config: CensusConfig,
+) -> (UnmanagedCensus, Option<bosn_core::Warning>) {
+    let our_registry = bosn_registry::Registry::open_read_only(state_dir.join("registry.sqlite3"))
+        .ok()
+        .and_then(|registry| registry.registry_id().ok());
+    let engine = DockerEngine::docker();
+    let scan = unmanaged_census(&engine, our_registry.as_deref(), config);
+    let warning = bosn_core::warning(&scan.census, bosn_core::WarningThreshold::default());
+    (scan, warning)
+}
+
+/// The warning's lines, without colour, so every surface says the same thing.
+///
+/// The caller decides how to render them; JSON never calls this, because JSON carries neither
+/// caps nor ANSI.
+#[must_use]
+pub fn warning_lines(warning: &bosn_core::Warning) -> Vec<String> {
+    let mut lines = Vec::new();
+    if warning.partial {
+        lines.push(
+            "UNMANAGED DOCKER ARTIFACTS COULD NOT BE FULLY MEASURED \u{2014} THIS MACHINE IS NOT \
+             KNOWN TO BE CLEAN"
+                .to_owned(),
+        );
+    }
+    if warning.reclaimable_objects > 0 {
+        lines.push(format!(
+            "{} UNMANAGED DOCKER OBJECTS ARE RECLAIMABLE ({})",
+            warning.reclaimable_objects,
+            human_bytes(warning.reclaimable_bytes),
+        ));
+        lines.push("  see them:  bosn gc --unmanaged".to_owned());
+        lines.push(
+            "  removal is not in this build yet; it lands with the daemon-owned apply slice"
+                .to_owned(),
+        );
+    }
+    if warning.report_only_bytes > 0 {
+        lines.push(format!(
+            "  build cache holds {} with no per-object removal, so bosn never sweeps it",
+            human_bytes(warning.report_only_bytes),
+        ));
+    }
+    if warning.review_objects > 0 {
+        lines.push(format!(
+            "  review {} items ({}) needing judgment: listed by the preview, opt one in with --include <id>",
+            warning.review_objects,
+            human_bytes(warning.review_bytes),
+        ));
+    }
+    lines.push("  silence:   bosn scan --ack".to_owned());
+    lines
+}
+
+/// Render bytes for humans. Census byte figures are approximate by construction.
+#[must_use]
+pub fn human_bytes(bytes: i128) -> String {
+    const UNITS: [(&str, i128); 5] = [
+        ("PiB", 1 << 50),
+        ("TiB", 1 << 40),
+        ("GiB", 1 << 30),
+        ("MiB", 1 << 20),
+        ("KiB", 1 << 10),
+    ];
+    for (unit, scale) in UNITS {
+        if bytes >= scale {
+            return format!("{:.1}{unit}", bytes as f64 / scale as f64);
+        }
+    }
+    format!("{bytes}B")
+}
+
 /// What one apply pass did.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UnmanagedApplyOutcome {
@@ -406,6 +489,42 @@ mod tests {
             unreadable: Vec::new(),
         };
         assert!(census.is_trustworthy());
+    }
+
+    #[test]
+    fn the_warning_lines_never_name_a_docker_command() {
+        let warning = bosn_core::Warning {
+            reclaimable_objects: 3,
+            reclaimable_bytes: 3 * 1024 * 1024 * 1024,
+            review_objects: 1,
+            review_bytes: 10,
+            report_only_bytes: 2 * 1024 * 1024 * 1024,
+            partial: false,
+        };
+        let lines = warning_lines(&warning);
+        assert!(lines[0].contains("3 UNMANAGED DOCKER OBJECTS ARE RECLAIMABLE"));
+        assert!(lines.iter().any(|line| line.contains("bosn gc --unmanaged")));
+        assert!(lines.iter().any(|line| line.contains("bosn scan --ack")));
+        // The founding invariant: the way out is never `docker system prune`.
+        assert!(!lines.iter().any(|line| line.contains("docker ")));
+        // A build-cache figure the tool cannot free is stated separately, never in the
+        // reclaimable headline.
+        assert!(!lines[0].contains("2.0GiB"));
+    }
+
+    #[test]
+    fn a_partial_warning_says_the_machine_is_not_known_to_be_clean() {
+        let warning = bosn_core::Warning {
+            reclaimable_objects: 0,
+            reclaimable_bytes: 0,
+            review_objects: 0,
+            review_bytes: 0,
+            report_only_bytes: 0,
+            partial: true,
+        };
+        let lines = warning_lines(&warning);
+        assert!(lines[0].contains("NOT KNOWN TO BE CLEAN"));
+        assert!(!lines.iter().any(|line| line.contains("ARE RECLAIMABLE")));
     }
 
     #[test]
