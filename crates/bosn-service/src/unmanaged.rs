@@ -7,10 +7,14 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use std::path::Path;
+
 use bosn_core::{
-    Census, CensusConfig, EngineObservation, InspectedVolume, SystemDfReport, census, observe,
+    Acknowledgement, Census, CensusConfig, EngineObservation, InspectedVolume, Plan,
+    SystemDfReport, census, observe, plan, removal_rank,
 };
 use bosn_engine::{CensusRead, DockerEngine, RunOptions};
+use serde::{Deserialize, Serialize};
 
 /// Deadline for each individual read. A census issues one accounting read plus one label
 /// read per required label key.
@@ -24,11 +28,23 @@ const CENSUS_INSPECT_CHUNK: usize = 256;
 /// Volumes the census will inspect in total. Beyond this the census is partial rather than
 /// silently leaving volumes unmeasured.
 const CENSUS_INSPECT_MAX: usize = 2048;
+/// Removals one apply pass will attempt. A plan larger than this stops early and says so
+/// rather than running unbounded.
+pub const MAX_UNMANAGED_REMOVALS: usize = 1024;
+/// One removal's deadline.
+const REMOVAL_DEADLINE: Duration = Duration::from_secs(60);
+const REMOVAL_OUTPUT_LIMIT: usize = 1024 * 1024;
+/// The acknowledgement file under the state directory.
+pub const ACK_FILE: &str = "unmanaged-ack.json";
+const MAX_ACK_BYTES: usize = 4 * 1024;
 
 /// One census pass.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UnmanagedCensus {
     pub census: Census,
+    /// The per-artifact observation the census was aggregated from, kept so a plan can be
+    /// built without a second engine pass.
+    pub artifacts: Vec<bosn_core::ObservedArtifact>,
     /// Reads the engine refused or answered unreadably. A non-empty list means the census is
     /// partial, and a partial census must never authorise reclamation.
     pub unreadable: Vec<String>,
@@ -99,8 +115,163 @@ pub fn unmanaged_census(
     }
     UnmanagedCensus {
         census: result,
+        artifacts: observed,
         unreadable,
     }
+}
+
+/// What one apply pass did.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnmanagedApplyOutcome {
+    /// The plan rebuilt from a fresh census immediately before any removal. The caller's plan
+    /// is never trusted: every candidate is re-derived here.
+    pub plan: Plan,
+    pub removed: u64,
+    pub removed_bytes: i128,
+    pub failed: u64,
+    pub failures: Vec<String>,
+    /// Set when the pass refused to remove anything.
+    pub refused: Option<String>,
+}
+
+/// Remove the Tier-1 (and explicitly included) artifacts this engine still confirms.
+///
+/// The census is taken inside this call, so a plan built earlier cannot authorise a removal
+/// against state that has since changed. A census that is not complete refuses outright:
+/// nothing is deleted from partial information.
+#[must_use]
+pub fn unmanaged_gc_apply(
+    engine: &DockerEngine,
+    our_registry: Option<&str>,
+    config: CensusConfig,
+    include: &[String],
+) -> UnmanagedApplyOutcome {
+    let scan = unmanaged_census(engine, our_registry, config);
+    let plan = plan(&scan.artifacts, our_registry, config, include);
+    if !scan.is_trustworthy() {
+        return UnmanagedApplyOutcome {
+            plan,
+            removed: 0,
+            removed_bytes: 0,
+            failed: 0,
+            failures: Vec::new(),
+            refused: Some(
+                "the census was incomplete, so nothing was removed; \
+                 an unreadable census is never a reason to delete"
+                    .to_owned(),
+            ),
+        };
+    }
+    let mut removed = 0u64;
+    let mut removed_bytes = 0i128;
+    let mut failed = 0u64;
+    let mut failures = Vec::new();
+    let mut refused = None;
+    let mut ordered = plan.candidates.clone();
+    ordered.sort_by_key(|candidate| removal_rank(candidate.class));
+    for candidate in ordered {
+        if removed as usize >= MAX_UNMANAGED_REMOVALS {
+            refused = Some(format!(
+                "stopped after {MAX_UNMANAGED_REMOVALS} removals; re-run to continue"
+            ));
+            break;
+        }
+        match remove_one(engine, &candidate.id, candidate.class) {
+            Ok(()) => {
+                removed += 1;
+                removed_bytes += candidate.bytes;
+            }
+            Err(detail) => {
+                failed += 1;
+                failures.push(detail);
+            }
+        }
+    }
+    UnmanagedApplyOutcome {
+        plan,
+        removed,
+        removed_bytes,
+        failed,
+        failures,
+        refused,
+    }
+}
+
+/// Remove exactly one artifact by its immutable identity.
+///
+/// A volume's identity *is* its name: Docker exposes no separate volume id, so the generated
+/// name is what is proven and passed here. Nothing is removed by tag.
+fn remove_one(
+    engine: &DockerEngine,
+    id: &str,
+    class: bosn_core::UnmanagedClass,
+) -> Result<(), String> {
+    let options = RunOptions::bounded(REMOVAL_DEADLINE, REMOVAL_OUTPUT_LIMIT);
+    let argv: Vec<&str> = match class {
+        bosn_core::UnmanagedClass::StoppedContainer => vec!["rm", id],
+        bosn_core::UnmanagedClass::DanglingImage
+        | bosn_core::UnmanagedClass::UnreferencedImage => vec!["rmi", id],
+        bosn_core::UnmanagedClass::AnonymousVolume
+        | bosn_core::UnmanagedClass::NamedVolume => vec!["volume", "rm", id],
+        // Build cache is never removable by identity, so it never reaches this call.
+        bosn_core::UnmanagedClass::BuildCache => {
+            return Err("build cache is not removable by identity".to_owned());
+        }
+    };
+    match engine.with_args(argv).capture(options) {
+        Ok(result) if result.ok() => Ok(()),
+        // Docker refusing a removal is already fail-closed: the artifact stays.
+        Ok(result) => Err(format!("{id}: docker exited with {}", result.exit_code)),
+        Err(error) => Err(format!("{id}: {error}")),
+    }
+}
+
+/// Read the acknowledgement, if one was written and is still readable.
+///
+/// Unreadable or malformed content is treated as "no acknowledgement", which fails toward
+/// warning rather than toward silence.
+#[must_use]
+pub fn read_acknowledgement(state_dir: &Path) -> Option<Acknowledgement> {
+    let path = state_dir.join(ACK_FILE);
+    // Read with std::fs and an explicit cap, so the read and the write agree on the file's
+    // shape. The kernel facade's private reader additionally requires owner-only permissions,
+    // which the state directory does not impose.
+    let bytes = std::fs::read(&path).ok()?;
+    if bytes.len() > MAX_ACK_BYTES {
+        return None;
+    }
+    let wire: AckWire = serde_json::from_slice(&bytes).ok()?;
+    Some(Acknowledgement {
+        at: wire.at,
+        objects: wire.objects,
+        bytes: i128::from(wire.bytes),
+    })
+}
+
+/// Record that the user has seen the current footprint.
+pub fn write_acknowledgement(
+    state_dir: &Path,
+    acknowledgement: Acknowledgement,
+) -> Result<(), String> {
+    // The kernel facade deliberately exposes no plain write primitive, so this one bounded
+    // preference file is written with std::fs. It is not state: an unreadable or torn file
+    // reads as "no acknowledgement", which warns rather than stays silent.
+    std::fs::create_dir_all(state_dir).map_err(|error| error.to_string())?;
+    let wire = AckWire {
+        at: acknowledgement.at,
+        objects: acknowledgement.objects,
+        // Saturating, not wrapping: an unrepresentable mark must not become a small one.
+        bytes: i64::try_from(acknowledgement.bytes).unwrap_or(i64::MAX),
+    };
+    let encoded = serde_json::to_vec(&wire).map_err(|error| error.to_string())?;
+    std::fs::write(state_dir.join(ACK_FILE), &encoded).map_err(|error| error.to_string())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AckWire {
+    at: f64,
+    objects: u64,
+    bytes: i64,
 }
 
 /// Image IDs carrying any required Bosn label.
@@ -208,6 +379,7 @@ mod tests {
     fn an_unreadable_census_is_never_trustworthy() {
         let census = UnmanagedCensus {
             census: Census::default(),
+            artifacts: Vec::new(),
             unreadable: vec!["docker system df -v exited with 1".to_owned()],
         };
         assert!(!census.is_trustworthy());
@@ -220,6 +392,7 @@ mod tests {
                 partial: true,
                 ..Census::default()
             },
+            artifacts: Vec::new(),
             unreadable: Vec::new(),
         };
         assert!(!census.is_trustworthy());
@@ -229,9 +402,38 @@ mod tests {
     fn a_complete_census_is_trustworthy() {
         let census = UnmanagedCensus {
             census: Census::default(),
+            artifacts: Vec::new(),
             unreadable: Vec::new(),
         };
         assert!(census.is_trustworthy());
+    }
+
+    #[test]
+    fn an_acknowledgement_round_trips_through_the_state_file() {
+        let directory =
+            kernal_api::platform::fs::TemporaryDirectory::new().expect("temporary directory");
+        assert!(read_acknowledgement(directory.path()).is_none());
+        let acknowledgement = Acknowledgement {
+            at: 1_789_588_000.0,
+            objects: 17,
+            bytes: 16_477_292_500,
+        };
+        write_acknowledgement(directory.path(), acknowledgement).expect("write");
+        let read = read_acknowledgement(directory.path()).expect("read");
+        assert_eq!(read, acknowledgement);
+    }
+
+    #[test]
+    fn an_unreadable_acknowledgement_reads_as_no_acknowledgement() {
+        // Failing toward "no acknowledgement" means failing toward warning, never toward
+        // silence.
+        let directory =
+            kernal_api::platform::fs::TemporaryDirectory::new().expect("temporary directory");
+        std::fs::write(directory.path().join(ACK_FILE), b"not json").expect("write");
+        assert!(read_acknowledgement(directory.path()).is_none());
+        std::fs::write(directory.path().join(ACK_FILE), vec![b'x'; MAX_ACK_BYTES + 1])
+            .expect("write oversized");
+        assert!(read_acknowledgement(directory.path()).is_none());
     }
 
     #[test]

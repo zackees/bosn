@@ -40,7 +40,8 @@ This is the honest baseline. It is the reason S2–S5 are not a port but a build
 | Engine census | **present** since S2 (`bosn scan`, #270): one bounded `docker system df -v --format json` plus a dangling filter, one label query per required key, and a bounded `docker volume inspect` | `crates/bosn-core/src/unmanaged.rs`, `crates/bosn-service/src/unmanaged.rs` |
 | Byte accounting | **present** for the unowned bucket since S2 (#270); approximate by construction, and never zero for an unmeasurable class | `bosn scan --json` |
 | `scan` | **present** since S2 (#270), read-only | `crates/bosn-service/src/bin/bosn.rs` `run_scan` |
-| `--ack` / `foreign_ttl` / warning threshold | **absent** — S3 | verb set `crates/bosn-service/src/bin/bosn.rs:52-60` |
+| `--ack` / `foreign_ttl` / warning threshold | **present** since S3 (#271): `bosn scan --ack`, `--ttl-seconds`, `--warn-bytes`, `--warn-objects` | `crates/bosn-core/src/unmanaged.rs` |
+| `gc --unmanaged` | **preview present** since S3 (#271); removal is a daemon-owned job-backed operation and is its own slice | `crates/bosn-service/src/bin/bosn.rs` `run_gc_unmanaged` |
 | Autostart, maintenance pass | **absent** — no service unit, no `systemctl`/`launchctl` call, no idle or maintenance loop | slice S4 |
 | Retention / pressure / verdict model | **Implemented and tested, and unwired.** `Pressure::assess`, `evaluate`, `collectable_ordered`, `container_should_stop`, `lease_expired`, `retention_signals`, `PolicyDefaults`, `RetentionConfig` have **zero production consumers** | `crates/bosn-core/src/lib.rs:362-570`; `crates/bosn-core/src/config.rs:53-74`; exercised only by `crates/bosn-core/tests/domain.rs` |
 
@@ -92,7 +93,10 @@ Safe to remove with a documented command. Age is measured from engine timestamps
 | A | Dangling images, per Docker's own `dangling=true` verdict | > TTL |
 | B | Exited or created containers | > TTL |
 | D | Anonymous (64-hex-named, or Docker-marked) volumes, attached to nothing | > TTL |
-| F | Build cache | > TTL |
+
+| Class | What | Why it is reported but never swept |
+|---|---|---|
+| F | Build cache | `buildx` exposes no per-record removal — only an age-filtered prune, which is not the same as deleting a proven, listed object. It is reported so the warning is truthful about the pile, and **excluded from the reclaimable headline**, because a byte count no command can free is a promise the tool cannot keep. |
 
 ### Tier 2 — never swept
 
@@ -124,6 +128,8 @@ resolve toward keeping, never toward reclaiming:
   network section, so a network has no byte total and no age. Networks contribute nothing to
   a byte-thresholded warning, and inventing one from separate reads is not worth the extra
   engine surface. A network observed by the census is protected as unclassified.
+- **#148 class F (build cache) has no per-object removal.** See the table above: it is
+  counted and reported, and never swept.
 
 Consequently class A (Docker's dangling verdict) is the only image class the census can
 sweep. That is the correct outcome, not a shortfall: dangling images are the large reclaimable
@@ -163,8 +169,10 @@ eviction.
 
 ## The warning (S3)
 
-Printed by `bosn status` and `bosn doctor` when the footprint is over threshold, and by the
-tail of any command that ran a maintenance pass (S4). At most once per invocation.
+Printed by `bosn doctor` and by `bosn scan` when the footprint is over threshold, and by the
+tail of any command that ran a maintenance pass (S4). At most once per invocation. There is no
+`bosn status` verb in the native CLI; `doctor` is the always-on surface — the one a user runs
+when something is wrong, and the one that would have caught #147.
 
 1. **Yellow, ALL CAPS headline.** Detail lines stay mixed-case — an all-caps table is
    unreadable and the shouting must mean something.
@@ -176,6 +184,9 @@ tail of any command that ran a maintenance pass (S4). At most once per invocatio
    block: per-class counts, bytes, oldest age, and `partial: true` when a scan was incomplete.
 5. **Bosn never runs the suggested command itself.** It prints it, and it is always a `bosn`
    command — never `docker system prune`, whose semantics are the failure mode, not the fix.
+6. **It only prints commands this build implements.** Advertising a removal path that does
+   not exist would send the user to a command that fails, which is worse than saying plainly
+   that it is not here yet.
 
 ### Alarm fatigue
 
@@ -201,6 +212,14 @@ bosn gc --unmanaged --include <id>   # opt one Tier 2 item into the plan
 
 Preview is the default and deletion is explicit, matching the existing `gc` convention.
 Bare `bosn gc` keeps today's behaviour unchanged: owned resources only.
+
+### Removal is a daemon-owned job, not an inline request
+
+The preview is read-only and runs locally, like the census. The **removal** mutates Docker,
+and only the daemon mutates Docker. It is also long-running — hundreds of bounded removals,
+each with its own deadline — so it belongs to the daemon's job machinery rather than to an
+inline request handler that would block the actor for the duration. It ships as its own
+slice; until then the warning says so rather than pointing at a command that does not exist.
 
 ### Why this is a new planning mode, not a widened `gc apply`
 
@@ -248,10 +267,9 @@ Recorded here to close #268's open questions. Each is a judgment call, not a dis
 1. **`scan --ack` state lives in a dedicated bounded state file, not the registry.** The ack
    is a user preference about a *notice*, not a fact about a resource. Keeping it out of the
    registry avoids a schema version bump for a preference and, more importantly, keeps
-   `status` and `doctor` — which must be safe to run against an uninitialised or read-only
-   state directory — from needing a registry write. It is written atomically through the
-   kernel's durable-atomic-write facade, with the same owner-private-directory rules as the
-   registry.
+   `doctor` and `scan` — which must be safe to run against an uninitialised or read-only
+   state directory — from needing a registry write. It is a bounded file in the state
+   directory, and decision 4 below records exactly how it is written and why.
 2. **The default warning threshold is 5 GiB / 25 objects.** Carried over from #148
    unchanged, and checked against the reference measurement below: a healthy machine is far
    under it, and #147's incident was ~16 GB across ~34 objects.
@@ -261,7 +279,13 @@ Recorded here to close #268's open questions. Each is a judgment call, not a dis
    preview must compute anyway is a second code path over the same data — and #148's own
    concern was that extra surfaces go unread. `--include <id>` remains the only way a Tier 2
    item enters a plan.
-4. **Autostart (S4) stays in this workstream.** It is what makes the unattended half of the
+4. **The acknowledgement lives in a bounded `unmanaged-ack.json` in the state directory, and
+   is written with `std::fs`.** The kernel facade exposes no plain write primitive, and
+   `read_private_regular_file_bounded` requires owner-only permissions the state directory
+   does not impose, so both sides use `std::fs` with an explicit size cap and agree on the
+   shape. A torn or oversized file reads as *no* acknowledgement — failing toward warning,
+   never toward silence.
+5. **Autostart (S4) stays in this workstream.** It is what makes the unattended half of the
    warning fire, and the reference machine below is the argument for it. But it is **not** a
    prerequisite for S3: the interactive warning on `status` and `doctor` works without a
    daemon that survives being idle, so S3 may land first.
