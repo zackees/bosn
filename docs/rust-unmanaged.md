@@ -41,7 +41,7 @@ This is the honest baseline. It is the reason S2–S5 are not a port but a build
 | Byte accounting | **present** for the unowned bucket since S2 (#270); approximate by construction, and never zero for an unmeasurable class | `bosn scan --json` |
 | `scan` | **present** since S2 (#270), read-only | `crates/bosn-service/src/bin/bosn.rs` `run_scan` |
 | `--ack` / `foreign_ttl` / warning threshold | **present** since S3 (#271): `bosn scan --ack`, `--ttl-seconds`, `--warn-bytes`, `--warn-objects` | `crates/bosn-core/src/unmanaged.rs` |
-| `gc --unmanaged` | **preview present** since S3 (#271); removal is a daemon-owned job-backed operation and is its own slice | `crates/bosn-service/src/bin/bosn.rs` `run_gc_unmanaged` |
+| `gc --unmanaged` | **present** since S3 (#271) and S3b (#276): the preview is read-only and local, the removal is a daemon operation | `crates/bosn-service/src/bin/bosn.rs` `run_gc_unmanaged`; daemon op 35 in `crates/bosn-service/src/lib.rs` |
 | Autostart | **present** since S4 (#272): `bosn daemon autostart enable\|disable\|status` writes the platform entry **and registers it** (`systemctl --user enable --now`, `launchctl load -w`) | `crates/bosn-service/src/autostart.rs` |
 | Maintenance pass | **present** since S4 (#272): the daemon runs the census at start and every hour, logging the warning | `crates/bosn-service/src/lib.rs` `serve` |
 | Retention / pressure / verdict model | **Implemented and tested, and unwired.** `Pressure::assess`, `evaluate`, `collectable_ordered`, `container_should_stop`, `lease_expired`, `retention_signals`, `PolicyDefaults`, `RetentionConfig` have **zero production consumers** | `crates/bosn-core/src/lib.rs:362-570`; `crates/bosn-core/src/config.rs:53-74`; exercised only by `crates/bosn-core/tests/domain.rs` |
@@ -214,13 +214,22 @@ bosn gc --unmanaged --include <id>   # opt one Tier 2 item into the plan
 Preview is the default and deletion is explicit, matching the existing `gc` convention.
 Bare `bosn gc` keeps today's behaviour unchanged: owned resources only.
 
-### Removal is a daemon-owned job, not an inline request
+### Removal is daemon-owned, and re-derives its own plan
 
 The preview is read-only and runs locally, like the census. The **removal** mutates Docker,
-and only the daemon mutates Docker. It is also long-running — hundreds of bounded removals,
-each with its own deadline — so it belongs to the daemon's job machinery rather than to an
-inline request handler that would block the actor for the duration. It ships as its own
-slice; until then the warning says so rather than pointing at a command that does not exist.
+and only the daemon mutates Docker, so it is a daemon operation.
+
+The plan a client sends is **never trusted**. The daemon takes a fresh census and rebuilds the
+plan immediately before removing anything, because a client's preview was taken against state
+that may already have changed. That is also why the whole pass refuses outright on an
+incomplete census: nothing is deleted from partial information.
+
+This was originally scoped as a job-backed operation, on the assumption that an inline handler
+would block the daemon's actor. That assumption was wrong: the daemon spawns a task per client
+connection, so a bounded pass blocks only its own caller. The pass is therefore a synchronous
+operation with per-removal deadlines, and a cap on how many removals one pass will attempt.
+A job would still buy progress reporting and cancellation, and remains available if the
+operation grows long enough to need them.
 
 ### Why this is a new planning mode, not a widened `gc apply`
 
@@ -246,6 +255,10 @@ reuse the owned-candidate token path.
   auditable as an owned one.
 - **Re-probe free space afterwards** and report bytes actually reclaimed, not bytes
   predicted. This is where the stale-probe fix (B3) lands.
+- **Report what was measured, not what was predicted.** The outcome carries the bytes the
+  pass actually accounted for, and the count the daemon re-derived — not the client's.
+- **A volume is removed by its generated name.** Docker exposes no separate volume id, so the
+  name is the identity; nothing is ever removed by tag.
 
 ## Invariants
 

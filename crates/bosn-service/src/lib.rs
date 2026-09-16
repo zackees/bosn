@@ -3368,6 +3368,20 @@ pub struct SetupGcApplyResult {
     pub removed: bool,
     pub reconciled_missing: bool,
 }
+/// Outcome of one `gc --unmanaged --apply`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnmanagedApplySummary {
+    /// Candidates the daemon re-derived immediately before removing anything.
+    pub planned: u64,
+    pub removed: u64,
+    /// Measured after the pass completed, not predicted before it.
+    pub removed_bytes: i128,
+    pub failed: u64,
+    pub failures: Vec<String>,
+    /// Set when the pass refused to remove anything.
+    pub refused: Option<String>,
+}
+
 /// Result of stopping one exact retired setup generation.  An already-stopped
 /// exact candidate is intentionally idempotent: no Docker mutation or event
 /// write occurs, and its retired registry record remains for GC apply.
@@ -4225,6 +4239,34 @@ impl Client {
             _ => Err(Error::Protocol("unexpected setup gc preview response")),
         }
     }
+    /// Re-derive the unmanaged plan in the daemon and remove it in one bounded pass.
+    ///
+    /// The caller's preview is never trusted. The daemon takes a fresh census and rebuilds
+    /// the plan immediately before removing anything, and refuses outright if that census is
+    /// incomplete, because an unreadable census is never a reason to delete.
+    pub async fn unmanaged_gc_apply(
+        &self,
+        include: Vec<String>,
+        ttl_seconds: u64,
+        confirm: bool,
+    ) -> Result<UnmanagedApplySummary, Error> {
+        if !confirm {
+            return Err(Error::Protocol("unmanaged apply requires confirmation"));
+        }
+        match self
+            .call(Request {
+                gc_confirm: true,
+                unmanaged_include: include,
+                unmanaged_ttl_seconds: ttl_seconds,
+                ..Request::operation(35)
+            })
+            .await?
+        {
+            Reply::UnmanagedApply(v) => Ok(v),
+            _ => Err(Error::Protocol("unexpected unmanaged apply response")),
+        }
+    }
+
     /// Preview only retired disposable native-manifest volumes. Stack,
     /// machine, and pinned data are excluded by policy.
     pub async fn manifest_volume_gc_preview(
@@ -8648,8 +8690,9 @@ impl Service {
             let doctor = Arc::clone(&self.doctor_executor);
             let reconcile = Arc::clone(&self.setup_reconcile_executor);
             let adopt = Arc::clone(&self.setup_adopt_executor);
+            let state_dir = self.state_dir.clone();
             clients.spawn(async move {
-                handle(stream, actor, jobs, stop, doctor, adopt, reconcile).await
+                handle(stream, actor, jobs, stop, doctor, adopt, reconcile, state_dir).await
             });
         }
         while clients.join_next().await.is_some() {}
@@ -9290,6 +9333,7 @@ async fn handle(
     doctor: Arc<dyn DoctorExecutor>,
     adopt: Arc<dyn SetupAdoptExecutor>,
     reconcile: Arc<dyn SetupReconcileExecutor>,
+    state_dir: PathBuf,
 ) -> Result<(), Error> {
     if !peer_is_authorized(&s.peer_identity()?.user_id, &ipc::current_user_id()?) {
         return Err(Error::Unauthorized);
@@ -10012,6 +10056,58 @@ async fn handle(
                     ..Default::default()
                 },
             },
+            35 => match validate_unmanaged_apply_request_wire(&r) {
+                Ok(()) => {
+                    let include = r.unmanaged_include.clone();
+                    let ttl_seconds = r.unmanaged_ttl_seconds;
+                    // The daemon re-derives both the census and the plan here. A plan a
+                    // client built earlier is never trusted: it was taken against state
+                    // that may already have changed.
+                    let outcome = async_engine::launch_blocking(move || {
+                        let state_dir = state_dir.clone();
+                        let our_registry =
+                            bosn_registry::Registry::open_read_only(state_dir.join("registry.sqlite3"))
+                                .ok()
+                                .and_then(|registry| registry.registry_id().ok());
+                        let config = bosn_core::CensusConfig {
+                            ttl_seconds: if ttl_seconds == 0 {
+                                bosn_core::DEFAULT_TTL_SECONDS
+                            } else {
+                                ttl_seconds as f64
+                            },
+                        };
+                        let engine = DockerEngine::docker();
+                        unmanaged::unmanaged_gc_apply(
+                            &engine,
+                            our_registry.as_deref(),
+                            config,
+                            &include,
+                        )
+                    })
+                    .await;
+                    match outcome {
+                        Ok(outcome) => ReplyWire {
+                            code: 200,
+                            unmanaged_planned: outcome.plan.candidates.len() as u64,
+                            unmanaged_removed: outcome.removed,
+                            unmanaged_removed_bytes: i64::try_from(outcome.removed_bytes)
+                                .unwrap_or(i64::MAX),
+                            unmanaged_failed: outcome.failed,
+                            unmanaged_failures: outcome.failures,
+                            unmanaged_refused: outcome.refused.unwrap_or_default(),
+                            ..Default::default()
+                        },
+                        Err(_) => ReplyWire {
+                            code: 3,
+                            ..Default::default()
+                        },
+                    }
+                }
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
             _ => ReplyWire {
                 code: 2,
                 ..Default::default()
@@ -10113,6 +10209,10 @@ struct Request {
     setup_done_confirm: bool,
     #[prost(bool, tag = "19")]
     setup_adopt_confirm: bool,
+    #[prost(string, repeated, tag = "20")]
+    unmanaged_include: Vec<String>,
+    #[prost(uint64, tag = "21")]
+    unmanaged_ttl_seconds: u64,
 }
 impl Request {
     fn operation(operation: u32) -> Self {
@@ -10136,8 +10236,34 @@ impl Request {
             gc_confirm: false,
             setup_done_confirm: false,
             setup_adopt_confirm: false,
+            unmanaged_include: Vec::new(),
+            unmanaged_ttl_seconds: 0,
         }
     }
+}
+
+/// The unmanaged apply carries only what it needs: whether the caller confirmed, which
+/// Tier-2 identities it opted in, and the age gate it used for its preview.
+fn validate_unmanaged_apply_request_wire(r: &Request) -> Result<(), Error> {
+    if !r.gc_confirm
+        || r.workspace.len() > 8 * 1024
+        || !r.gc_candidate_token.is_empty()
+        || !r.digest.is_empty()
+        || !r.stack.is_empty()
+        || r.job_id != 0
+        || !r.setup_config.is_empty()
+        || r.setup_task_name.is_empty() && r.setup_deadline_ms != 0
+    {
+        return Err(Error::Protocol("nonsemantic unmanaged apply fields"));
+    }
+    if r.unmanaged_include.len() > 1024
+        || r.unmanaged_include
+            .iter()
+            .any(|id| id.is_empty() || id.len() > 8 * 1024 || id.bytes().any(|b| b == 0))
+    {
+        return Err(Error::Protocol("invalid unmanaged apply include list"));
+    }
+    Ok(())
 }
 
 fn validate_setup_prepare_wire(
@@ -10508,6 +10634,18 @@ struct ReplyWire {
     volume_gc_removed: bool,
     #[prost(bool, tag = "49")]
     volume_gc_reconciled_missing: bool,
+    #[prost(uint64, tag = "50")]
+    unmanaged_removed: u64,
+    #[prost(int64, tag = "51")]
+    unmanaged_removed_bytes: i64,
+    #[prost(uint64, tag = "52")]
+    unmanaged_failed: u64,
+    #[prost(string, repeated, tag = "53")]
+    unmanaged_failures: Vec<String>,
+    #[prost(string, tag = "54")]
+    unmanaged_refused: String,
+    #[prost(uint64, tag = "55")]
+    unmanaged_planned: u64,
 }
 #[derive(Message)]
 struct LogRecordWire {
@@ -10723,6 +10861,7 @@ enum Reply {
     SetupReconcileMissingRepair(SetupReconcileMissingRepairResult),
     ManifestVolumeGcPreview(ManifestVolumeGcPreviewPage),
     ManifestVolumeGcApply(ManifestVolumeGcApplyResult),
+    UnmanagedApply(UnmanagedApplySummary),
 }
 fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
     match v.code {
@@ -10835,6 +10974,14 @@ fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
         190 => Ok(Reply::ManifestVolumeGcApply(ManifestVolumeGcApplyResult {
             removed: v.volume_gc_removed,
             reconciled_missing: v.volume_gc_reconciled_missing,
+        })),
+        200 => Ok(Reply::UnmanagedApply(UnmanagedApplySummary {
+            planned: v.unmanaged_planned,
+            removed: v.unmanaged_removed,
+            removed_bytes: i128::from(v.unmanaged_removed_bytes),
+            failed: v.unmanaged_failed,
+            failures: v.unmanaged_failures,
+            refused: (!v.unmanaged_refused.is_empty()).then_some(v.unmanaged_refused),
         })),
         1 => Err(Error::Protocol("unsupported protocol")),
         2 => Err(Error::Protocol("unknown operation")),
@@ -15633,6 +15780,8 @@ mod tests {
                 gc_confirm: false,
                 setup_done_confirm: false,
                 setup_adopt_confirm: false,
+                unmanaged_include: Vec::new(),
+                unmanaged_ttl_seconds: 0,
             }
             .encode(&mut payload)
             .unwrap();
