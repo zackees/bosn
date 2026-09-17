@@ -35,7 +35,7 @@ explicit new decision, not by inference.
     auditwheel for the extension, plus the hand-copied `.data/scripts/` sidecars for the
     CLI); collapse via static/rustls or an rpath into `bosn.libs/`. Dropping
     `bosn_build_backend.py` entirely still waits on **soldr#3239** (native aux-bin
-    staging) → **#262**.
+    staging).
 
 ## macOS (issue #252)
 
