@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import importlib.util
+import re
 from pathlib import Path
 
 import tomllib
-
-import bosn
 
 ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = ROOT / "src" / "bosn"
@@ -53,10 +51,12 @@ def test_python_distribution_contains_only_native_boundary_modules() -> None:
         assert forbidden not in source.lower()
 
 
-def test_retired_python_lifecycle_modules_are_not_importable() -> None:
-    assert bosn.__version__
+def test_retired_python_lifecycle_modules_are_absent_from_source() -> None:
+    text = (PACKAGE / "__init__.py").read_text(encoding="utf-8")
+    assert re.search(r'^__version__ = "[^"]+"$', text, re.MULTILINE)
     for module in RETIRED_MODULES:
-        assert importlib.util.find_spec(f"bosn.{module}") is None
+        assert not (PACKAGE / f"{module}.py").exists()
+        assert not (PACKAGE / module).exists()
 
 
 def test_distribution_has_no_python_runtime_lifecycle_dependencies() -> None:

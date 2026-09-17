@@ -1,4 +1,4 @@
-"""The native surface is exercised after ``maturin develop`` in release checks."""
+"""The native extension surface, re-exported by the ``bosn`` package."""
 
 import hashlib
 from pathlib import Path
@@ -6,8 +6,7 @@ from pathlib import Path
 import pytest
 
 import bosn
-
-native = pytest.importorskip("bosn._native")
+from bosn import _native as native
 
 
 def test_native_extension_is_reexported_by_python_package(tmp_path: Path) -> None:
