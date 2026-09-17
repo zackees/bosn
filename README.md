@@ -22,11 +22,12 @@ pip install bosn
 bosn --version
 ```
 
-Platform wheels contain the matching `bosn-native` binary and Python extension.
+Platform wheels contain the native `bosn` CLI and the `bosn._native` Python
+extension. Installing the wheel puts the `bosn` binary itself into the
+environment's scripts directory, so the `bosn` on `PATH` is the native CLI,
+with no Python wrapper in between.
 The extension uses PyO3's `abi3-py310` ABI, so Bosn supports CPython 3.10 and
 newer with one platform wheel rather than publishing cp311-only artifacts.
-The Python launcher resolves that binary from its installed package directory;
-it never selects a `bosn` executable from `PATH`.
 
 ## One-file setup
 
