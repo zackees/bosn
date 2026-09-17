@@ -2280,4 +2280,77 @@ mod tests {
             ]
         ));
     }
+
+    /// Extracts the first ```toml fenced block from docs/macos-guest.md. Read at
+    /// run time (not include_str!) so builds from a package without docs still compile.
+    fn macos_guest_doc_example() -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/macos-guest.md");
+        let doc = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let fence = "```toml\n";
+        let (_, after) = doc.split_once(fence).expect("toml example");
+        let (example, _) = after.split_once("```").expect("closed fence");
+        example.to_owned()
+    }
+
+    /// Replaces a documentation placeholder such as `<64 lowercase hex>` in the
+    /// digest position with a real-shaped digest, leaving a literal digest alone.
+    fn substitute_doc_digest_placeholder(example: &str) -> String {
+        let mut out = String::new();
+        let mut rest = example;
+        while let Some((before, after)) = rest.split_once("@sha256:<") {
+            let (_, tail) = after.split_once('>').expect("placeholder is closed");
+            out.push_str(before);
+            out.push_str("@sha256:");
+            out.push_str(HASH);
+            rest = tail;
+        }
+        out.push_str(rest);
+        out
+    }
+
+    #[test]
+    fn macos_guest_doc_example_image_is_accepted_by_runtime() {
+        let raw = macos_guest_doc_example();
+        let example = substitute_doc_digest_placeholder(&raw);
+        let manifest = bosn_core::parse_manifest_toml(
+            &example,
+            bosn_core::ManifestRoots::new("docs/macos-guest.md", "assets", "workspace"),
+        )
+        .unwrap_or_else(|error| panic!("docs/macos-guest.md example must parse: {error:?}"));
+        let stack = manifest.stack("macos-x64").expect("stack macos-x64");
+        assert_eq!(stack.kind.as_deref(), Some("macos-x64-guest"));
+        assert!(stack.acknowledge_macos_license);
+        let image = stack.image.as_deref().expect("example declares an image");
+        assert!(
+            valid_macos_guest_image(image),
+            "docs/macos-guest.md example image {image:?} is refused by valid_macos_guest_image"
+        );
+        let storage = stack
+            .volumes
+            .iter()
+            .find(|volume| volume.name == "storage")
+            .expect("example declares the storage volume");
+        assert_eq!(storage.scope, Scope::Machine);
+        assert_eq!(storage.destination.as_deref(), Some("/storage"));
+        assert_eq!(storage.retention, Retention::Pinned);
+    }
+
+    #[test]
+    fn macos_guest_doc_digest_substitution_only_fills_placeholders() {
+        let placeholder = "image = \"dockurr/macos@sha256:<64 lowercase hex>\"";
+        assert_eq!(
+            substitute_doc_digest_placeholder(placeholder),
+            format!("image = \"dockurr/macos@sha256:{HASH}\"")
+        );
+        let literal = format!("image = \"dockurr/macos@sha256:{HASH}\"");
+        assert_eq!(substitute_doc_digest_placeholder(&literal), literal);
+        // The substitution must not make a foreign registry acceptable.
+        assert!(!valid_macos_guest_image(
+            "ghcr.io/o/r/macos-x64-guest:ventura"
+        ));
+        assert!(!valid_macos_guest_image(&format!(
+            "ghcr.io/o/r/macos-x64-guest@sha256:{HASH}"
+        )));
+    }
 }

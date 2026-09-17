@@ -9,7 +9,7 @@ lifecycle bosn already gives every other container resource.
 [stack.macos-x64]
 kind = "macos-x64-guest"
 acknowledge_macos_license = true          # see Licensing, below — no default
-image = "ghcr.io/<org>/<repo>/macos-x64-guest:ventura"
+image = "dockurr/macos@sha256:<64 lowercase hex>"   # only dockurr/macos pinned by digest; see below
 family = "macos-x64"
 workdir = "/Users/runner"
 
@@ -27,6 +27,17 @@ storage = { scope = "machine", destination = "/storage", retention = "pinned" }
 stack = "macos-x64"
 cmd = "cargo-nextest nextest run --archive-file ~/kernal-x64.tar.zst"
 ```
+
+`image` must be `dockurr/macos` — or a Docker Hub registry alias (`docker.io/`,
+`index.docker.io/`, `registry-1.docker.io/`) — pinned by a lowercase 64-hex `sha256` digest.
+Any other reference, including a tag-only reference or an image you baked from the prepared
+disk and pushed to another registry such as ghcr.io, is refused at converge time with
+"macOS guest must use dockurr/macos (or a Docker Hub registry alias) pinned by sha256
+digest". The prepared macOS install lives on the pinned `/storage` machine volume declared
+below, not in the image. Get the digest with, for example, `docker buildx imagetools inspect
+dockurr/macos:latest`, or `docker inspect --format '{{index .RepoDigests 0}}'
+dockurr/macos:latest` after a pull. A doc-example test in `crates/bosn-setup` keeps the
+manifest above valid against this rule.
 
 ## Native runtime status
 
@@ -205,9 +216,11 @@ stability. An explicit `cpu_cores` in `[stack.X.guest]` is honored as written.
 
 **Bootstrap is manual and one-time.** `dockurr/macos` has no unattended install path, and
 Docker-OSX's prebuilt `:auto` tag no longer exists on Docker Hub. bosn supervises the
-*result*; it cannot automate the install. The realistic flow is: install once by hand → bake
-the prepared disk into an image → publish it → every consumer pulls. See "One-time
-bootstrap" below.
+*result*; it cannot automate the install. The realistic flow is: install once by hand into
+the pinned machine-scoped `/storage` volume declared above, and the `macos-x64-guest` stack
+kind then supervises that local guest. Baking the disk into an image is optional and only
+useful for running the guest with plain Docker — the stack kind will not pull a baked image.
+See "One-time bootstrap" below.
 
 **One guest per machine.** The container name is per-workspace, but `ssh_port` is a fixed
 host port, so a second workspace declaring the same guest stack will fail to start on
@@ -239,18 +252,25 @@ environment variable, and no flag.
 bosn does not automate this; it is here so the manifest above has something to point at.
 
 1. **Install macOS (~30–60 min, one core).** Start a `dockurr/macos` container with
-   `-p 8006:8006 -p 2222:22`, the two devices and `NET_ADMIN`, and a `/storage` volume. Open
+   `-p 8006:8006 -p 2222:22`, the two devices and `NET_ADMIN`, and a `/storage` volume — this
+   should be the same volume the stack declares (the machine-scoped, pinned `storage`
+   volume above), so the install performed here is exactly what the stack kind boots. Open
    `http://localhost:8006`: Disk Utility → erase the QEMU disk as APFS → Reinstall macOS →
    walk the setup screens. Skip Apple ID; create a local account named `runner` (or set
    `ssh_user` to whatever you chose).
 2. **Enable ssh in the guest.** System Settings → General → Sharing → Remote Login: on.
 3. **Install whatever the task needs.** For the recommended shape above that is one binary:
    `scp -P 2222 cargo-nextest runner@localhost:~/` then move it to `/usr/local/bin`.
-4. **Bake the prepared disk into an image** with a Dockerfile that is `FROM
-   dockurr/macos:latest` plus `COPY storage/ /storage/`, and push it. Stop the container
-   first so the disk is quiescent — a baked image of a live filesystem is a torn one.
-5. Point the stack's `image` at the published tag. Every consumer now pulls a guest that
-   boots straight to a login-capable system.
+4. **(Optional) Bake the prepared disk into an image.** A Dockerfile that is `FROM
+   dockurr/macos:latest` plus `COPY storage/ /storage/`, pushed after stopping the container
+   first so the disk is quiescent — a baked image of a live filesystem is a torn one —
+   produces an image for running the guest with plain `docker run` on a dev box, or for CI
+   outside Bosn, such as the kernal-api `ghcr.io/zackees/kernal-api/macos-x64-guest:ventura`
+   shape. The `macos-x64-guest` stack kind refuses such an image: its runtime accepts only
+   `dockurr/macos` (or a Docker Hub registry alias) pinned by digest, because the fixed
+   KVM/tun/NET_ADMIN create shape must never run a manifest-selected privileged image.
+5. Point the stack's `image` at `dockurr/macos@sha256:<digest>` and keep the pinned
+   `storage` volume declared above. Bosn then boots the guest installed in steps 1–3.
 
-Working reference scripts for all five steps live in `zackees/kernal-api` under
+Working reference scripts for these steps live in `zackees/kernal-api` under
 `ci/macos-x64/`.
