@@ -47,11 +47,30 @@ def init_version() -> str:
     raise AssertionError("__version__ string literal not found in src/bosn/__init__.py")
 
 
+def native_version_assertion() -> str:
+    """The version the extension's own unit test pins `native_version()` to.
+
+    `native_version()` returns `CARGO_PKG_VERSION`, so this literal is a fourth
+    hand-written declaration: a bump that misses it fails only once the crate is
+    compiled, which is far later than here.
+    """
+    path = ROOT / "crates" / "bosn-python" / "src" / "lib.rs"
+    match = re.search(
+        r"assert_eq!\(native_version\(\),\s*\"([^\"]+)\"\)",
+        path.read_text(encoding="utf-8"),
+    )
+    assert match is not None, (
+        "native_version() assertion not found in crates/bosn-python/src/lib.rs"
+    )
+    return match.group(1)
+
+
 def test_version_declarations_match() -> None:
     versions = {
         "pyproject.toml": pyproject_version(),
         "crates/bosn-python/Cargo.toml": cargo_version(),
         "src/bosn/__init__.py": init_version(),
+        "crates/bosn-python/src/lib.rs": native_version_assertion(),
     }
     assert len(set(versions.values())) == 1, versions
 

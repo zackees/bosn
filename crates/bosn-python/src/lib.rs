@@ -2242,7 +2242,7 @@ mod tests {
 
     #[test]
     fn native_version_matches_python_distribution() {
-        assert_eq!(native_version(), "0.1.3");
+        assert_eq!(native_version(), "0.1.4");
     }
 
     #[test]

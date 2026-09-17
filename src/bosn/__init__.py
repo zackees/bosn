@@ -1,6 +1,6 @@
 """bosn - a machine-wide lifecycle supervisor for container development resources."""
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 # The extension is always present: installed wheels ship it, and `uv sync` builds it for the
 # source tree.

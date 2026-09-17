@@ -66,18 +66,24 @@ downstream consumer migrations (Soldr, clud, and kernal-api), exact published
 Actions evidence. Existing Docker state must remain protected during that
 cutover; removing compatibility code does not authorize deleting data.
 
-The migration also dropped the "clean machine" chain ([#147], [#148], [#149]):
-nothing in the native tree sizes, reports, or offers to clear Docker artifacts
-Bosn does not own, which was the product's original promise and its one
-reproduced failure. That workstream is re-based onto the native daemon in
-[unmanaged artifacts](rust-unmanaged.md) and tracked by [#268]. It is not
-covered by the retirement of the Python lifecycle, and closing #153 does not
-close it.
+The migration initially dropped the "clean machine" chain ([#147], [#148],
+[#149]) — the product's original promise and its one reproduced failure. That
+workstream was re-based onto the native daemon in
+[unmanaged artifacts](rust-unmanaged.md), tracked by [#268], and has since
+shipped: the daemon sizes and reports the Docker artifacts Bosn does not own,
+warns about them on `status`, `doctor`, and its own unattended maintenance
+pass, and offers `bosn gc --unmanaged [--apply]` as the one way to clear them.
+It is not covered by the retirement of the Python lifecycle, and closing #153
+does not close it. What remains is the supervised destructive acceptance run
+([#281]) and the gaps still listed on #147 (adoption of pre-existing images,
+first-run autostart, a configurable free-space floor, and the macOS state
+directory).
 
 [#147]: https://github.com/zackees/bosn/issues/147
 [#148]: https://github.com/zackees/bosn/issues/148
 [#149]: https://github.com/zackees/bosn/issues/149
 [#268]: https://github.com/zackees/bosn/issues/268
+[#281]: https://github.com/zackees/bosn/issues/281
 
 macOS artifact builds no longer consume hosted Mac capacity: the two Darwin
 wheel targets are cross-built on Linux with Soldr's pinned LLVM 21.1.5 and
