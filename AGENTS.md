@@ -52,9 +52,11 @@ explicit new decision, not by inference.
   ≥ 2.39), Windows x86_64, and both Darwin targets. No sdist: building Bosn from source
   needs the Rust toolchain and the staging backend, so an unsupported platform should get
   "no matching distribution" rather than a failed compile.
-- **PyPI needs** `vars.PUBLISH_PYPI == 'true'` and a `PYPI_API_TOKEN` secret on the `release`
-  environment. Without them a tag still produces the GitHub release, and the run summary
-  says PyPI was skipped.
+- **PyPI uses trusted publishing** (OIDC), like kernal-api's crates.io release: no PyPI
+  token is stored. It needs `vars.PUBLISH_PYPI == 'true'`, a `release` environment, and
+  this repo registered on pypi.org as a trusted publisher for `bosn` (workflow
+  `release.yml`, environment `release`). Without the variable a tag still produces the
+  GitHub release, and the run summary says PyPI was skipped.
 - The build steps are **copies** of `ci.yml`'s wheel lanes, not a shared `workflow_call`:
   branch protection requires those job names verbatim. Change both together.
 

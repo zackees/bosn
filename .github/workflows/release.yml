@@ -11,9 +11,10 @@ name: Release
 # shared `workflow_call`, because branch protection requires ci.yml's job names
 # verbatim and a reusable workflow would rename them.
 #
-# Publishing needs `vars.PUBLISH_PYPI == 'true'` and a `PYPI_API_TOKEN` secret
-# on the `release` environment. Every publishing step is idempotent: a re-run
-# verifies what is already published instead of overwriting it.
+# Publishing needs `vars.PUBLISH_PYPI == 'true'`, a `release` environment, and
+# this workflow registered as a PyPI trusted publisher for `bosn`; no PyPI
+# token is stored. Every publishing step is idempotent: a re-run verifies what
+# is already published and uploads only what is missing.
 
 on:
   push:
@@ -251,41 +252,50 @@ jobs:
     if: ${{ needs.guard.outputs.dry_run == 'false' && vars.PUBLISH_PYPI == 'true' }}
     runs-on: ubuntu-latest
     environment: release
+    permissions:
+      # PyPI trusted publishing: the OIDC token is exchanged for a short-lived
+      # upload token, so no PyPI credential is stored in this repository.
+      id-token: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: bosn-release-${{ env.RELEASE_TAG }}
           path: dist
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-
-      - name: Publish, or verify identical files already published
+      # PyPI never lets a filename be replaced. A re-run, or a recovery after a
+      # partial upload, must prove that every file PyPI already holds is
+      # byte-identical to this build; only the missing ones are then uploaded.
+      - name: Refuse if PyPI already holds different bytes
         shell: bash
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
         run: |
           set -euo pipefail
           version="${RELEASE_TAG#v}"
           status="$(curl -sS -o pypi.json -w '%{http_code}' \
             "https://pypi.org/pypi/bosn/${version}/json")"
           if [[ "$status" == "404" ]]; then
-            uv run --no-project --with twine twine upload --non-interactive dist/*.whl
-          elif [[ "$status" == "200" ]]; then
-            # PyPI never lets a filename be re-uploaded, so a re-run proves the
-            # published files are byte-identical instead of trying.
-            for wheel in dist/*.whl; do
-              digest="$(sha256sum "$wheel" | awk '{print $1}')"
-              jq -e --arg name "$(basename "$wheel")" --arg sha "$digest" \
-                '.urls[] | select(.filename == $name and .digests.sha256 == $sha)' \
-                pypi.json > /dev/null \
-                || { echo "::error::$(basename "$wheel") differs from PyPI's copy" >&2; exit 1; }
-            done
-          else
-            echo "::error::PyPI returned HTTP $status" >&2
-            exit 1
+            echo "bosn ${version} is not on PyPI yet"
+            exit 0
           fi
+          [[ "$status" == "200" ]] || { echo "::error::PyPI returned HTTP $status" >&2; exit 1; }
+          for wheel in dist/*.whl; do
+            name="$(basename "$wheel")"
+            published="$(jq -r --arg name "$name" \
+              '.urls[] | select(.filename == $name) | .digests.sha256' pypi.json)"
+            if [[ -z "$published" ]]; then
+              echo "$name: not on PyPI yet"
+            elif [[ "$published" == "$(sha256sum "$wheel" | awk '{print $1}')" ]]; then
+              echo "$name: already on PyPI, identical"
+            else
+              echo "::error::$name differs from the copy already on PyPI" >&2
+              exit 1
+            fi
+          done
+
+      - name: Publish the wheels PyPI does not have yet
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist
+          skip-existing: true
 
   github-release:
     name: GitHub release
