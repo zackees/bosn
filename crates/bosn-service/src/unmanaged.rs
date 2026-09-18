@@ -163,10 +163,7 @@ pub fn warning_lines(warning: &bosn_core::Warning) -> Vec<String> {
             human_bytes(warning.reclaimable_bytes),
         ));
         lines.push("  see them:  bosn gc --unmanaged".to_owned());
-        lines.push(
-            "  removal is not in this build yet; it lands with the daemon-owned apply slice"
-                .to_owned(),
-        );
+        lines.push("  remove:    bosn gc --unmanaged --apply --yes".to_owned());
     }
     if warning.report_only_bytes > 0 {
         lines.push(format!(
@@ -510,6 +507,32 @@ mod tests {
         // A build-cache figure the tool cannot free is stated separately, never in the
         // reclaimable headline.
         assert!(!lines[0].contains("2.0GiB"));
+    }
+
+    #[test]
+    fn the_warning_names_the_command_that_removes_them() {
+        // #148: the warning is only useful if the way out is one obvious command. Removal
+        // shipped with the daemon-owned apply (#276); the warning must say how to run it,
+        // not that it does not exist.
+        let warning = bosn_core::Warning {
+            reclaimable_objects: 3,
+            reclaimable_bytes: 3 * 1024 * 1024 * 1024,
+            review_objects: 0,
+            review_bytes: 0,
+            report_only_bytes: 0,
+            partial: false,
+        };
+        let lines = warning_lines(&warning);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("bosn gc --unmanaged --apply --yes")),
+            "{lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("not in this build")),
+            "{lines:#?}"
+        );
     }
 
     #[test]

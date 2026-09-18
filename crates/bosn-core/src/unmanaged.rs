@@ -8,7 +8,7 @@
 //!
 //! Nothing here deletes anything, and nothing here decides to delete. The output is a
 //! report, a per-artifact eligibility verdict, and the plan those verdicts imply. Running
-//! that plan is a daemon-owned operation; it is not in this crate and not in this build.
+//! that plan is a daemon-owned operation (`bosn gc --unmanaged --apply`), not in this crate.
 
 use std::collections::BTreeMap;
 
