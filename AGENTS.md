@@ -37,6 +37,29 @@ explicit new decision, not by inference.
     `bosn_build_backend.py` entirely still waits on **soldr#3239** (native aux-bin
     staging).
 
+## Releasing
+
+- **Push a tag `vX.Y.Z` on main**; `.github/workflows/release.yml` does the rest. Before
+  tagging, bump the version in all four places `ci/verify_release.py` checks
+  (`pyproject.toml`, `crates/bosn-python/Cargo.toml`, `src/bosn/__init__.py`, and the
+  `native_version()` literal in `crates/bosn-python/src/lib.rs`); `tests/test_version_sync.py`
+  catches a missed one before the tag does.
+- **Rehearse first**: `gh workflow run release.yml -f tag=vX.Y.Z` is a dry run by default,
+  and works before the tag exists (it rehearses main). It builds and verifies all four
+  wheels and publishes nothing. Pass `-f dry_run=false` to publish an existing tag, e.g. to
+  recover a failed run; every publish step is idempotent.
+- **A release is exactly four `cp310-abi3` wheels**: Linux x86_64 (`manylinux_2_39`, so glibc
+  ≥ 2.39), Windows x86_64, and both Darwin targets. No sdist: building Bosn from source
+  needs the Rust toolchain and the staging backend, so an unsupported platform should get
+  "no matching distribution" rather than a failed compile.
+- **PyPI uses trusted publishing** (OIDC), like kernal-api's crates.io release: no PyPI
+  token is stored. It needs `vars.PUBLISH_PYPI == 'true'`, a `release` environment, and
+  this repo registered on pypi.org as a trusted publisher for `bosn` (workflow
+  `release.yml`, environment `release`). Without the variable a tag still produces the
+  GitHub release, and the run summary says PyPI was skipped.
+- The build steps are **copies** of `ci.yml`'s wheel lanes, not a shared `workflow_call`:
+  branch protection requires those job names verbatim. Change both together.
+
 ## macOS (issue #252)
 
 - **No hosted macOS runners.** `ci/lint_no_macos_runners.py` fails CI on any `macos-*`
