@@ -33,6 +33,6 @@ bosn-engine = { path = "../bosn-engine" }
 bosn-service = { path = "../bosn-service" }
 bosn-registry = { path = "../bosn-registry" }
 bosn-setup = { path = "../bosn-setup" }
-kernal-api = { git = "https://github.com/zackees/kernal-api", rev = "fc634e507024d63ccaaf75fa564818b9dcfbff36", version = "=0.1.0", default-features = false, features = ["ipc-async"] }
+kernal-api = { version = "=0.1.14", default-features = false, features = ["ipc-async"] }
 pyo3 = "=0.29.2"
 serde_json = "=1.0.149"

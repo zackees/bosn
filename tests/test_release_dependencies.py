@@ -10,21 +10,29 @@ _SPEC.loader.exec_module(_MODULE)
 verify = _MODULE.verify
 
 
-def test_development_git_kernel_is_rejected_for_release() -> None:
-    errors = verify(Path("crates/bosn-registry/Cargo.toml"))
-    assert any("git or path" in error for error in errors)
+def test_every_repo_manifest_uses_the_published_kernel() -> None:
+    # kernal-api is on crates.io, so the release gate must pass for the real
+    # tree. Before it was published this asserted the opposite.
+    manifests = [
+        path
+        for path in sorted(Path("crates").glob("*/Cargo.toml"))
+        if "kernal-api" in path.read_text(encoding="utf-8")
+    ]
+    assert len(manifests) == 6, manifests
+    for manifest in manifests:
+        assert verify(manifest) == [], manifest
 
 
 def test_exact_published_kernel_is_accepted(tmp_path: Path) -> None:
     manifest = tmp_path / "Cargo.toml"
-    manifest.write_text('[dependencies]\nkernal-api = "=0.1.0"\n', encoding="utf-8")
+    manifest.write_text('[dependencies]\nkernal-api = "=0.1.14"\n', encoding="utf-8")
     assert verify(manifest) == []
 
 
 def test_valid_inline_table_dependency_is_accepted(tmp_path: Path) -> None:
     manifest = tmp_path / "Cargo.toml"
     manifest.write_text(
-        '[dependencies]\nkernal-api = { version = "=0.1.0", default-features = false }\n',
+        '[dependencies]\nkernal-api = { version = "=0.1.14", default-features = false }\n',
         encoding="utf-8",
     )
     assert verify(manifest) == []
@@ -33,8 +41,8 @@ def test_valid_inline_table_dependency_is_accepted(tmp_path: Path) -> None:
 def test_toml_forms_and_source_bypasses_are_not_spoofed_by_comments(tmp_path: Path) -> None:
     manifest = tmp_path / "Cargo.toml"
     manifest.write_text(
-        '# kernal-api = "=0.1.0"\n'
-        '[dependencies.kernal-api]\nversion = "=0.1.0"\n'
+        '# kernal-api = "=0.1.14"\n'
+        '[dependencies.kernal-api]\nversion = "=0.1.14"\n'
         'git = "https://example.invalid/k"\n[patch.crates-io]\n'
         'kernal-api = { path = "../k" }\n',
         encoding="utf-8",
@@ -47,15 +55,15 @@ def test_toml_forms_and_source_bypasses_are_not_spoofed_by_comments(tmp_path: Pa
 def test_replace_rename_target_and_workspace_bypasses_are_rejected(tmp_path: Path) -> None:
     root = tmp_path / "Cargo.toml"
     root.write_text(
-        '[workspace]\n[replace]\n"kernal-api:0.1.0" = { path = "kernel" }\n', encoding="utf-8"
+        '[workspace]\n[replace]\n"kernal-api:0.1.14" = { path = "kernel" }\n', encoding="utf-8"
     )
     member = tmp_path / "member" / "Cargo.toml"
     member.parent.mkdir()
     member.write_text(
         "[dependencies]\n"
-        'k = { package = "kernal-api", version = "=0.1.0", workspace = true }\n'
+        'k = { package = "kernal-api", version = "=0.1.14", workspace = true }\n'
         "[target.'cfg(unix)'.dependencies]\n"
-        'kernal-api = { version = "=0.1.0", git = "https://example.invalid" }\n',
+        'kernal-api = { version = "=0.1.14", git = "https://example.invalid" }\n',
         encoding="utf-8",
     )
     errors = verify(member)
@@ -65,13 +73,13 @@ def test_replace_rename_target_and_workspace_bypasses_are_rejected(tmp_path: Pat
 
 def test_each_kernel_source_selector_is_rejected_individually(tmp_path: Path) -> None:
     variants = {
-        "git": 'kernal-api = { version = "=0.1.0", git = "https://example.invalid" }',
-        "path": 'kernal-api = { version = "=0.1.0", path = "kernel" }',
-        "registry": 'kernal-api = { version = "=0.1.0", registry = "private-mirror" }',
+        "git": 'kernal-api = { version = "=0.1.14", git = "https://example.invalid" }',
+        "path": 'kernal-api = { version = "=0.1.14", path = "kernel" }',
+        "registry": 'kernal-api = { version = "=0.1.14", registry = "private-mirror" }',
         "rename": (
-            'k = { package = "kernal-api", version = "=0.1.0", git = "https://example.invalid" }'
+            'k = { package = "kernal-api", version = "=0.1.14", git = "https://example.invalid" }'
         ),
-        "workspace": 'kernal-api = { version = "=0.1.0", workspace = true }',
+        "workspace": 'kernal-api = { version = "=0.1.14", workspace = true }',
     }
     for name, dependency in variants.items():
         manifest = tmp_path / f"{name}.toml"
@@ -82,9 +90,9 @@ def test_each_kernel_source_selector_is_rejected_individually(tmp_path: Path) ->
 def test_target_source_selector_is_rejected_individually(tmp_path: Path) -> None:
     manifest = tmp_path / "Cargo.toml"
     manifest.write_text(
-        '[dependencies]\nkernal-api = "=0.1.0"\n'
+        '[dependencies]\nkernal-api = "=0.1.14"\n'
         "[target.'cfg(unix)'.dependencies]\n"
-        'kernal-api = { version = "=0.1.0", registry = "private-mirror" }\n',
+        'kernal-api = { version = "=0.1.14", registry = "private-mirror" }\n',
         encoding="utf-8",
     )
     assert any("bypass" in error for error in verify(manifest))

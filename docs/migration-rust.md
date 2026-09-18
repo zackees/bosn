@@ -3,8 +3,8 @@
 Bosn is being migrated under [issue #153](https://github.com/zackees/bosn/issues/153).
 The application domain, daemon protocol, SQLite state registry, Docker engine
 seam, native CLI, PyO3 binding, MCP server, and URL setup path are Rust code.
-`kernal-api` is the OS boundary and is pinned by reviewed revision until its
-required publishing workflow is available.
+`kernal-api` is the OS boundary, pinned exactly to the published crates.io
+release `=0.1.14`.
 
 The authoritative implementation/fixture/consumer inventory is the
 [issue #153 coverage matrix](issue153-coverage-matrix.md). It explicitly
@@ -89,7 +89,7 @@ macOS artifact builds no longer consume hosted Mac capacity: the two Darwin
 wheel targets are cross-built on Linux with Soldr's pinned LLVM 21.1.5 and
 Apple SDK 14.5, then checked as Mach-O artifacts on Linux.  Release is gated
 on those jobs, `ci/verify_release_dependencies.py` proving exact published
-`kernal-api 0.1.0`, and closure of the downstream-consumer items above.  A
+`kernal-api 0.1.14` (it does), and closure of the downstream-consumer items above.  A
 real x86_64 macOS guest execution lane is advisory follow-up work; arm64 has
 no Linux-hosted execution mechanism.  The package native module is
 `abi3-py310`: all platform wheels carry `cp310-abi3` tags and package metadata
