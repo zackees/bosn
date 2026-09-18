@@ -18,19 +18,16 @@ Execution-session lease IDs are read and written as `Vec<String>` and volume
 intent labels as `BTreeMap<String, String>`; malformed persisted JSON is a
 typed registry error, never silently accepted.
 
-This is deliberately unreleasable today. `kernal-api` 0.1.0 is not published,
-so normal development is pinned to upstream revision
-`fc634e507024d63ccaaf75fa564818b9dcfbff36`. The development-only kernel
-checkout is expected at `_vender/kernal-api` for bootstrap/review; Bosn links the
-exact upstream Git revision rather than that working tree. `python ci/verify_release_dependencies.py
-crates/bosn-registry/Cargo.toml` intentionally fails until that dependency is
-replaced with exact published `kernal-api = "=0.1.0"`.
+`kernal-api` is consumed from crates.io, pinned exactly to `=0.1.14`, and
+`python ci/verify_release_dependencies.py crates/bosn-registry/Cargo.toml`
+passes. A git, path, or `[patch]`/`[replace]` source is rejected by both that
+release check and `ci/verify_kernel_boundary.py`.
 
-For source inspection/bootstrap only (never as a Cargo path dependency), use:
+For source inspection only (never as a Cargo path dependency), use:
 
 ```text
 git clone https://github.com/zackees/kernal-api _vender/kernal-api
-git -C _vender/kernal-api checkout fc634e507024d63ccaaf75fa564818b9dcfbff36
+git -C _vender/kernal-api checkout v0.1.14
 ```
 
 ## Python-v4 bridge guard

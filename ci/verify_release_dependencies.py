@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Reject unpublished/local kernel sources from a release manifest.
 
-Development deliberately uses the reviewed git revision until kernal-api 0.1.0
-is published.  This check is for release automation only; it must fail now.
+kernal-api is published on crates.io, and every Bosn crate pins it exactly
+from the registry.  This check keeps a git, path, or override source from
+slipping back into a release.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from pathlib import Path
 import tomllib
 
 
-def verify(manifest: Path, expected_version: str = "=0.1.0") -> list[str]:
+def verify(manifest: Path, expected_version: str = "=0.1.14") -> list[str]:
     data = tomllib.loads(manifest.read_text(encoding="utf-8"))
     errors: list[str] = []
     dependency = data.get("dependencies", {}).get("kernal-api")
@@ -82,7 +83,7 @@ def _contains_kernel_source(value: object) -> bool:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("manifest", type=Path)
-    parser.add_argument("--expected-version", default="=0.1.0")
+    parser.add_argument("--expected-version", default="=0.1.14")
     args = parser.parse_args()
     errors = verify(args.manifest, args.expected_version)
     if errors:

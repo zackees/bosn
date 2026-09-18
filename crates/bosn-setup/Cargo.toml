@@ -10,7 +10,7 @@ path = "src/lib.rs"
 [dependencies]
 bosn-core = { path = "../bosn-core" }
 bosn-engine = { path = "../bosn-engine" }
-kernal-api = { git = "https://github.com/zackees/kernal-api", rev = "fc634e507024d63ccaaf75fa564818b9dcfbff36", version = "=0.1.0", default-features = false, features = ["fs", "hash-sha256", "http-client", "ipc"] }
+kernal-api = { version = "=0.1.14", default-features = false, features = ["fs", "hash-sha256", "http-client", "ipc"] }
 
 [features]
 native-test-helper = ["bosn-engine/native-test-helper"]

@@ -7,7 +7,7 @@ rust-version = "1.95"
 [dependencies]
 bosn-core = { path = "../bosn-core" }
 bosn-engine = { path = "../bosn-engine" }
-kernal-api = { git = "https://github.com/zackees/kernal-api", rev = "fc634e507024d63ccaaf75fa564818b9dcfbff36", version = "=0.1.0", default-features = false, features = ["hash-sha256", "fs"] }
+kernal-api = { version = "=0.1.14", default-features = false, features = ["hash-sha256", "fs"] }
 serde_json = "=1.0.149"
 
 [features]

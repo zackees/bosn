@@ -15,8 +15,8 @@ from pathlib import Path
 
 import tomllib
 
-EXPECTED_KERNEL_VERSION = "=0.1.0"
-EXPECTED_KERNEL_REVISION = "fc634e507024d63ccaaf75fa564818b9dcfbff36"
+EXPECTED_KERNEL_VERSION = "=0.1.14"
+CRATES_IO_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
 # These effects belong behind kernal-api.  Bosn may depend on application
 # libraries (for example prost and serde), but must not add a second OS,
 # SQLite, HTTP, or async-runtime boundary.
@@ -56,17 +56,13 @@ def _kernel_errors(path: Path, dependencies: dict[str, object]) -> list[str]:
             errors.append(f"{path}: direct dependency on {package} bypasses kernal-api")
         if package != "kernal-api":
             continue
-        if not isinstance(specification, dict):
-            errors.append(f"{path}: kernal-api must pin the reviewed git revision")
-            continue
-        if specification.get("version") != EXPECTED_KERNEL_VERSION:
+        version = specification.get("version") if isinstance(specification, dict) else specification
+        if version != EXPECTED_KERNEL_VERSION:
             errors.append(f"{path}: kernal-api version must be {EXPECTED_KERNEL_VERSION}")
-        if specification.get("git") != "https://github.com/zackees/kernal-api":
-            errors.append(f"{path}: kernal-api must use the reviewed upstream source")
-        if specification.get("rev") != EXPECTED_KERNEL_REVISION:
-            errors.append(f"{path}: kernal-api revision must be {EXPECTED_KERNEL_REVISION}")
-        if "path" in specification:
-            errors.append(f"{path}: kernal-api must not use a path override")
+        if isinstance(specification, dict):
+            for key in ("git", "rev", "branch", "tag", "path", "registry"):
+                if key in specification:
+                    errors.append(f"{path}: kernal-api must come from crates.io, not {key!r}")
     return errors
 
 
@@ -101,15 +97,11 @@ def verify(root: Path) -> list[str]:
         errors.append("Cargo.lock: expected exactly one kernal-api package")
     else:
         package = kernel_packages[0]
-        if package.get("version") != "0.1.0":
-            errors.append("Cargo.lock: kernal-api version must be 0.1.0")
-        source = package.get("source")
-        expected_source = (
-            "git+https://github.com/zackees/kernal-api?rev="
-            f"{EXPECTED_KERNEL_REVISION}#{EXPECTED_KERNEL_REVISION}"
-        )
-        if source != expected_source:
-            errors.append("Cargo.lock: kernal-api source must match the reviewed revision")
+        locked = EXPECTED_KERNEL_VERSION.removeprefix("=")
+        if package.get("version") != locked:
+            errors.append(f"Cargo.lock: kernal-api version must be {locked}")
+        if package.get("source") != CRATES_IO_SOURCE:
+            errors.append("Cargo.lock: kernal-api must resolve from crates.io")
     return errors
 
 

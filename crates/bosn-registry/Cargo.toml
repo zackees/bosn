@@ -21,8 +21,6 @@ required-features = ["migration-test-helper"]
 [dependencies]
 bosn-core = { path = "../bosn-core" }
 serde_json = "=1.0.149"
-# DEVELOPMENT ONLY: kernal-api 0.1.0 has not been published.  The release
-# verifier rejects this source before a Bosn release is made.
-kernal-api = { git = "https://github.com/zackees/kernal-api", rev = "fc634e507024d63ccaaf75fa564818b9dcfbff36", version = "=0.1.0", default-features = false, features = ["sqlite", "fs", "ipc", "secure-random"] }
+kernal-api = { version = "=0.1.14", default-features = false, features = ["sqlite", "fs", "ipc", "secure-random"] }
 
 [dev-dependencies]
