@@ -3,6 +3,8 @@ name = "bosn-service"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
+# Internal: amalgamated into the crates.io `bosn` crate at release.
+publish = false
 
 [[bin]]
 name = "bosn-rs"

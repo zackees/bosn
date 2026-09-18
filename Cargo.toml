@@ -1,3 +1,3 @@
 [workspace]
-members = ["crates/bosn-core", "crates/bosn-engine", "crates/bosn-generation", "crates/bosn-registry", "crates/bosn-service", "crates/bosn-python", "crates/bosn-setup"]
+members = ["crates/bosn", "crates/bosn-core", "crates/bosn-engine", "crates/bosn-generation", "crates/bosn-registry", "crates/bosn-service", "crates/bosn-python", "crates/bosn-setup"]
 resolver = "3"

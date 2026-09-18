@@ -25,6 +25,10 @@ def write_tree(root: Path, version: str = "0.1.4", rust_literal: str | None = No
     (root / "crates" / "bosn-python" / "Cargo.toml").write_text(
         f'[package]\nversion = "{version}"\n', encoding="utf-8"
     )
+    (root / "crates" / "bosn").mkdir()
+    (root / "crates" / "bosn" / "Cargo.toml").write_text(
+        f'[package]\nversion = "{version}"\n', encoding="utf-8"
+    )
     (root / "src" / "bosn" / "__init__.py").write_text(
         f'__version__ = "{version}"\n', encoding="utf-8"
     )

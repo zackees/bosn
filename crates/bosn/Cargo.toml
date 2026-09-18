@@ -1,0 +1,50 @@
+[package]
+# The crates.io `bosn`. In the workspace it is a thin facade over the internal
+# crates below; `ci/publish_amalgamate.py` rewrites it into one self-contained
+# crate at release, so crates.io consumers depend on `bosn` alone. The internal
+# crates and `bosn-python` are `publish = false`.
+name = "bosn"
+version = "0.1.4"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+description = "Let your agents use Docker all day without filling the disk: a daemon that owns, bounds, and garbage-collects Docker development resources"
+repository = "https://github.com/zackees/bosn"
+homepage = "https://github.com/zackees/bosn"
+readme = "README.md"
+keywords = ["docker", "daemon", "garbage-collection", "containers", "agents"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+# Test-only helpers. The amalgamation keeps these names, because the copied
+# sources gate on them, and drops the internal-crate items.
+native-test-helper = ["dep:libc", "bosn-engine/native-test-helper"]
+migration-test-helper = ["bosn-registry/migration-test-helper"]
+
+[dependencies]
+# internal facade crates
+bosn-core = { path = "../bosn-core" }
+bosn-engine = { path = "../bosn-engine" }
+bosn-generation = { path = "../bosn-generation" }
+bosn-registry = { path = "../bosn-registry" }
+bosn-setup = { path = "../bosn-setup" }
+bosn-service = { path = "../bosn-service" }
+# The union of the internal crates' external dependencies, so the amalgamated
+# crate builds from crates.io alone. Keep in step with their manifests;
+# `ci/publish_amalgamate.py` refuses a copy whose sources need anything else.
+kernal-api = { version = "=0.1.14", default-features = false, features = ["daemon-frame-v1", "fs", "hash-sha256", "http-client", "ipc", "ipc-async", "secure-random", "sqlite"] }
+libc = { version = "=0.2.189", optional = true }
+prost = "=0.14.4"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.149"
+serde_yaml = "=0.9.34"
+sha2 = "=0.10.9"
+toml = "=0.8.23"
+
+[dev-dependencies]
+native-tls = "=0.2.18"
+tempfile = "=3.27.0"
