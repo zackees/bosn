@@ -11,8 +11,10 @@ name: Release
 # shared `workflow_call`, because branch protection requires ci.yml's job names
 # verbatim and a reusable workflow would rename them.
 #
-# Publishing needs `vars.PUBLISH_PYPI == 'true'`, a `release` environment, and
-# this workflow registered as a PyPI trusted publisher for `bosn`; no PyPI
+# Publishing needs `vars.PUBLISH_PYPI == 'true'` and this workflow registered on
+# pypi.org as the trusted publisher for `bosn`: repository zackees/bosn,
+# workflow `auto-release.yml`, environment `pypi`. PyPI matches both names
+# exactly, so renaming this file or the environment breaks publishing. No PyPI
 # token is stored. Every publishing step is idempotent: a re-run verifies what
 # is already published and uploads only what is missing.
 
@@ -251,7 +253,8 @@ jobs:
     needs: [guard, collect]
     if: ${{ needs.guard.outputs.dry_run == 'false' && vars.PUBLISH_PYPI == 'true' }}
     runs-on: ubuntu-latest
-    environment: release
+    # Must equal the environment on the PyPI trusted-publisher entry.
+    environment: pypi
     permissions:
       # PyPI trusted publishing: the OIDC token is exchanged for a short-lived
       # upload token, so no PyPI credential is stored in this repository.
