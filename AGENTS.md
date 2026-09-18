@@ -39,12 +39,12 @@ explicit new decision, not by inference.
 
 ## Releasing
 
-- **Push a tag `vX.Y.Z` on main**; `.github/workflows/release.yml` does the rest. Before
+- **Push a tag `vX.Y.Z` on main**; `.github/workflows/auto-release.yml` does the rest. Before
   tagging, bump the version in all four places `ci/verify_release.py` checks
   (`pyproject.toml`, `crates/bosn-python/Cargo.toml`, `src/bosn/__init__.py`, and the
   `native_version()` literal in `crates/bosn-python/src/lib.rs`); `tests/test_version_sync.py`
   catches a missed one before the tag does.
-- **Rehearse first**: `gh workflow run release.yml -f tag=vX.Y.Z` is a dry run by default,
+- **Rehearse first**: `gh workflow run auto-release.yml -f tag=vX.Y.Z` is a dry run by default,
   and works before the tag exists (it rehearses main). It builds and verifies all four
   wheels and publishes nothing. Pass `-f dry_run=false` to publish an existing tag, e.g. to
   recover a failed run; every publish step is idempotent.
@@ -53,9 +53,10 @@ explicit new decision, not by inference.
   needs the Rust toolchain and the staging backend, so an unsupported platform should get
   "no matching distribution" rather than a failed compile.
 - **PyPI uses trusted publishing** (OIDC), like kernal-api's crates.io release: no PyPI
-  token is stored. It needs `vars.PUBLISH_PYPI == 'true'`, a `release` environment, and
-  this repo registered on pypi.org as a trusted publisher for `bosn` (workflow
-  `release.yml`, environment `release`). Without the variable a tag still produces the
+  token is stored. It needs `vars.PUBLISH_PYPI == 'true'` and the pypi.org trusted
+  publisher for `bosn`: repository `zackees/bosn`, workflow `auto-release.yml`,
+  environment `pypi`. PyPI matches both names exactly: renaming the workflow file or the
+  job's environment breaks publishing. Without the variable a tag still produces the
   GitHub release, and the run summary says PyPI was skipped.
 - The build steps are **copies** of `ci.yml`'s wheel lanes, not a shared `workflow_call`:
   branch protection requires those job names verbatim. Change both together.
