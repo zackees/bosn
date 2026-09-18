@@ -1,0 +1,329 @@
+name: Release
+
+# Push a tag `vX.Y.Z` on main to release it. `workflow_dispatch` runs a tag,
+# dry by default: it builds and verifies every wheel and publishes nothing.
+# A dry run of a tag that does not exist yet rehearses main instead, so a
+# release can be proven before the tag that ships it is pushed. A dispatch
+# with dry_run=false publishes an existing tag, e.g. to recover a failed run.
+#
+# The four wheel builds copy ci.yml's wheel lanes step for step, so a release
+# ships exactly what the required checks verified. They are copies, not a
+# shared `workflow_call`, because branch protection requires ci.yml's job names
+# verbatim and a reusable workflow would rename them.
+#
+# Publishing needs `vars.PUBLISH_PYPI == 'true'` and a `PYPI_API_TOKEN` secret
+# on the `release` environment. Every publishing step is idempotent: a re-run
+# verifies what is already published instead of overwriting it.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to release, e.g. v0.1.4 (a dry run may name one not pushed yet)
+        required: true
+        type: string
+      dry_run:
+        description: Build and verify everything, publish nothing
+        type: boolean
+        default: true
+
+concurrency:
+  group: bosn-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  guard:
+    name: Release guard
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      dry_run: ${{ steps.source.outputs.dry_run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # A dry run of a tag that does not exist yet rehearses main, so a release
+      # can be proven before the tag that would ship it is pushed.
+      - name: Resolve the tag once, and require it on main
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          dry_run=false
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.dry_run }}" == "true" ]]; then
+            dry_run=true
+          fi
+          if sha="$(git rev-parse -q --verify "refs/tags/${RELEASE_TAG}^{commit}")"; then
+            source="tag $RELEASE_TAG"
+          elif [[ "$dry_run" == "true" ]]; then
+            sha="$(git rev-parse origin/main)"
+            source="main (tag $RELEASE_TAG does not exist yet)"
+          else
+            echo "::error::tag $RELEASE_TAG does not exist" >&2
+            exit 1
+          fi
+          git merge-base --is-ancestor "$sha" origin/main \
+            || { echo "::error::$RELEASE_TAG ($sha) is not on main" >&2; exit 1; }
+          git checkout -q "$sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
+          echo "Releasing $RELEASE_TAG from $source at $sha (dry run: $dry_run)" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Tag matches every version declaration
+        run: python ci/verify_release.py source --tag "$RELEASE_TAG"
+
+      - name: kernal-api comes from crates.io, exactly
+        shell: bash
+        run: |
+          set -euo pipefail
+          python ci/verify_kernel_boundary.py
+          for manifest in crates/*/Cargo.toml; do
+            if grep -q kernal-api "$manifest"; then
+              python ci/verify_release_dependencies.py "$manifest"
+            fi
+          done
+
+  native-wheel:
+    name: Native wheel (${{ matrix.os }})
+    needs: guard
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Build platform wheel
+        run: uv build --wheel --out-dir dist
+
+      - name: Install and smoke-test platform wheel outside the checkout
+        run: python ci/verify_installed_wheel.py "dist/bosn-*.whl"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: bosn-wheel-${{ matrix.os }}
+          path: dist/bosn-*.whl
+          if-no-files-found: error
+
+  darwin-wheel:
+    name: Darwin wheel (${{ matrix.target }}, Linux-hosted Soldr)
+    needs: guard
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            deployment_target: "10.12"
+          - target: aarch64-apple-darwin
+            deployment_target: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Set up Soldr Darwin target
+        uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
+        with:
+          cache: false
+          cross-targets: ${{ matrix.target }}
+
+      - name: Export Soldr target environment
+        run: soldr prepare --target "${{ matrix.target }}" --github-env "$GITHUB_ENV"
+
+      - name: Install Rust standard library for Darwin target
+        run: rustup target add "${{ matrix.target }}" --toolchain 1.95.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Build Darwin wheel on Linux
+        env:
+          BOSN_WHEEL_TARGET: ${{ matrix.target }}
+          PYO3_CROSS_PYTHON_VERSION: "3.10"
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+        run: uv build --wheel --out-dir dist
+
+      - name: Verify Darwin wheel statically on Linux
+        run: >-
+          python ci/verify_cross_wheel.py "dist/bosn-*.whl"
+          --target "${{ matrix.target }}"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: bosn-wheel-${{ matrix.target }}
+          path: dist/bosn-*.whl
+          if-no-files-found: error
+
+  collect:
+    name: Collect and verify the release set
+    needs: [guard, native-wheel, darwin-wheel]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bosn-wheel-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Exactly the four platform wheels, at the tagged version
+        run: python ci/verify_release.py wheels --tag "$RELEASE_TAG" dist
+
+      - name: Package metadata renders on PyPI
+        run: uv run --no-project --with twine twine check --strict dist/*
+
+      - name: Record the release set
+        shell: bash
+        run: |
+          {
+            echo "### $RELEASE_TAG wheels"
+            echo '```'
+            (cd dist && sha256sum -- *.whl)
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bosn-release-${{ env.RELEASE_TAG }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [guard, collect]
+    if: ${{ needs.guard.outputs.dry_run == 'false' && vars.PUBLISH_PYPI == 'true' }}
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: bosn-release-${{ env.RELEASE_TAG }}
+          path: dist
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Publish, or verify identical files already published
+        shell: bash
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          status="$(curl -sS -o pypi.json -w '%{http_code}' \
+            "https://pypi.org/pypi/bosn/${version}/json")"
+          if [[ "$status" == "404" ]]; then
+            uv run --no-project --with twine twine upload --non-interactive dist/*.whl
+          elif [[ "$status" == "200" ]]; then
+            # PyPI never lets a filename be re-uploaded, so a re-run proves the
+            # published files are byte-identical instead of trying.
+            for wheel in dist/*.whl; do
+              digest="$(sha256sum "$wheel" | awk '{print $1}')"
+              jq -e --arg name "$(basename "$wheel")" --arg sha "$digest" \
+                '.urls[] | select(.filename == $name and .digests.sha256 == $sha)' \
+                pypi.json > /dev/null \
+                || { echo "::error::$(basename "$wheel") differs from PyPI's copy" >&2; exit 1; }
+            done
+          else
+            echo "::error::PyPI returned HTTP $status" >&2
+            exit 1
+          fi
+
+  github-release:
+    name: GitHub release
+    needs: [guard, collect, publish-pypi]
+    # After PyPI succeeds, or when PyPI publishing is switched off; never after
+    # a failed upload, so a GitHub release never advertises a version PyPI lacks.
+    if: >-
+      ${{ always()
+      && needs.collect.result == 'success'
+      && needs.guard.outputs.dry_run == 'false'
+      && (needs.publish-pypi.result == 'success' || needs.publish-pypi.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: bosn-release-${{ env.RELEASE_TAG }}
+          path: dist
+
+      - name: Create, or verify the existing release's assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.guard.outputs.sha }}
+          PYPI_RESULT: ${{ needs.publish-pypi.result }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            existing="$(mktemp -d)"
+            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$existing"
+            for wheel in dist/*.whl; do
+              cmp "$wheel" "$existing/$(basename "$wheel")"
+            done
+          else
+            gh release create "$RELEASE_TAG" dist/*.whl \
+              --repo "$GITHUB_REPOSITORY" --target "$RELEASE_SHA" --generate-notes
+          fi
+          if [[ "$PYPI_RESULT" == "skipped" ]]; then
+            echo "PyPI: not published (vars.PUBLISH_PYPI is not 'true')." >> "$GITHUB_STEP_SUMMARY"
+          fi
