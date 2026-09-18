@@ -70,6 +70,8 @@ def declared_versions(root: Path) -> dict[str, str]:
         "crates/bosn-python/Cargo.toml": _toml_version(
             root / "crates" / "bosn-python" / "Cargo.toml", "package"
         ),
+        # The crates.io `bosn`, amalgamated from the internal crates at release.
+        "crates/bosn/Cargo.toml": _toml_version(root / "crates" / "bosn" / "Cargo.toml", "package"),
         "src/bosn/__init__.py": _init_version(root / "src" / "bosn" / "__init__.py"),
         "crates/bosn-python/src/lib.rs": _native_version_assertion(
             root / "crates" / "bosn-python" / "src" / "lib.rs"

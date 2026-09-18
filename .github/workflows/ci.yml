@@ -66,8 +66,8 @@ jobs:
       # unit tests instead link the selected CPython explicitly.
       - name: Test Rust workspace
         run: |
-          cargo test --workspace --exclude bosn --locked
-          PYO3_PYTHON="$(command -v python)" cargo test -p bosn --lib --locked --no-default-features --features embedded-python-tests
+          cargo test --workspace --exclude bosn-python --locked
+          PYO3_PYTHON="$(command -v python)" cargo test -p bosn-python --lib --locked --no-default-features --features embedded-python-tests
 
   linux:
     name: Linux (lint + unit + docker)

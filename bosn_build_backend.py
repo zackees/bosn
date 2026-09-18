@@ -159,7 +159,7 @@ def _build_native_cli() -> None:
         "--release",
         "--locked",
         "--package",
-        "bosn",
+        "bosn-python",
         "--bin",
         "bosn-native",
     ]

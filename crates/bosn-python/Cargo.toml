@@ -1,8 +1,11 @@
 [package]
-name = "bosn"
+# The PyO3 extension behind `import bosn`. It ships in the PyPI wheel, never on
+# crates.io: the crates.io `bosn` is crates/bosn, amalgamated at release.
+name = "bosn-python"
 version = "0.1.4"
 edition = "2024"
 rust-version = "1.95"
+publish = false
 
 [lib]
 name = "bosn_native"

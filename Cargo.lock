@@ -76,12 +76,20 @@ version = "0.1.4"
 dependencies = [
  "bosn-core",
  "bosn-engine",
+ "bosn-generation",
  "bosn-registry",
  "bosn-service",
  "bosn-setup",
  "kernal-api",
- "pyo3",
+ "libc",
+ "native-tls",
+ "prost",
+ "serde",
  "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]
@@ -112,6 +120,20 @@ dependencies = [
  "kernal-api",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "bosn-python"
+version = "0.1.4"
+dependencies = [
+ "bosn-core",
+ "bosn-engine",
+ "bosn-registry",
+ "bosn-service",
+ "bosn-setup",
+ "kernal-api",
+ "pyo3",
+ "serde_json",
 ]
 
 [[package]]

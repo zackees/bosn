@@ -60,6 +60,30 @@ explicit new decision, not by inference.
 - The build steps are **copies** of `ci.yml`'s wheel lanes, not a shared `workflow_call`:
   branch protection requires those job names verbatim. Change both together.
 
+### crates.io: one amalgamated `bosn` crate
+
+- **Only `bosn` is published.** `crates/bosn` is a facade that, in the workspace,
+  re-exports the internal crates (`bosn::core`, `engine`, `generation`, `registry`,
+  `setup`, `service`). `ci/publish_amalgamate.py` (zackees/zccache's approach) rewrites it
+  into one self-contained crate: each internal crate's `src/` becomes a module, paths are
+  rewritten, the `bosn` CLI binary is carried across, test fixtures reached by
+  `include_str!` are relocated, and internal dependencies are stripped. Every internal crate
+  and `bosn-python` (the PyO3 extension, PyPI only) is `publish = false`.
+- **The script rewrites in place, so never run it on the working copy.** Publish by hand
+  from a disposable worktree:
+
+  ```bash
+  git worktree add ../bosn-extern/bosn-publish vX.Y.Z
+  cd ../bosn-extern/bosn-publish
+  python ci/publish_amalgamate.py --root .
+  cargo package -p bosn --allow-dirty          # builds the .crate in isolation
+  cargo publish -p bosn --allow-dirty          # needs `cargo login`
+  ```
+
+- **Keep the facade's `[dependencies]` in step** with the internal crates' external
+  dependencies: the amalgamated crate builds from crates.io alone, and the script refuses
+  a copy that still names an internal crate.
+
 ## macOS (issue #252)
 
 - **No hosted macOS runners.** `ci/lint_no_macos_runners.py` fails CI on any `macos-*`
