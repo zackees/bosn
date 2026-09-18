@@ -13,14 +13,24 @@ verify = _MODULE.verify
 def test_every_repo_manifest_uses_the_published_kernel() -> None:
     # kernal-api is on crates.io, so the release gate must pass for the real
     # tree. Before it was published this asserted the opposite.
-    manifests = [
-        path
-        for path in sorted(Path("crates").glob("*/Cargo.toml"))
+    manifests = {
+        path.parent.name
+        for path in Path("crates").glob("*/Cargo.toml")
         if "kernal-api" in path.read_text(encoding="utf-8")
-    ]
-    assert len(manifests) == 6, manifests
-    for manifest in manifests:
-        assert verify(manifest) == [], manifest
+    }
+    # Named, not counted, so a new crate that takes kernal-api is a deliberate edit here.
+    # `bosn` matters most: it is the one crate published to crates.io.
+    assert manifests == {
+        "bosn",
+        "bosn-engine",
+        "bosn-generation",
+        "bosn-python",
+        "bosn-registry",
+        "bosn-service",
+        "bosn-setup",
+    }
+    for crate in sorted(manifests):
+        assert verify(Path("crates") / crate / "Cargo.toml") == [], crate
 
 
 def test_exact_published_kernel_is_accepted(tmp_path: Path) -> None:
