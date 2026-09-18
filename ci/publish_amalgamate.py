@@ -265,7 +265,9 @@ def assert_publish_crate_is_self_contained(facade: Path, module_map: dict[str, s
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(
+        description="Rewrite crates/bosn into the self-contained crates.io package."
+    )
     parser.add_argument(
         "--root",
         type=Path,
