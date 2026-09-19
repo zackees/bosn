@@ -1,10 +1,16 @@
 name: Release
 
-# Push a tag `vX.Y.Z` on main to release it. `workflow_dispatch` runs a tag,
-# dry by default: it builds and verifies every wheel and publishes nothing.
-# A dry run of a tag that does not exist yet rehearses main instead, so a
-# release can be proven before the tag that ships it is pushed. A dispatch
-# with dry_run=false publishes an existing tag, e.g. to recover a failed run.
+# Merging a version bump to main releases it, the way zackees/zccache and
+# zackees/soldr do: `./bump patch` changes `[workspace.package].version` in
+# Cargo.toml (the only place it is written), and when that change lands on main
+# this workflow builds, verifies, and publishes `v<version>`, creating the tag.
+# A push to main that does not change the version does nothing.
+#
+# Two manual routes remain. Pushing a tag `vX.Y.Z` on main releases that tag.
+# `workflow_dispatch` runs a tag, dry by default: it builds and verifies every
+# wheel and publishes nothing, and a dry run of a tag that does not exist yet
+# rehearses main. A dispatch with dry_run=false publishes an existing tag, e.g.
+# to recover a failed run.
 #
 # The four wheel builds copy ci.yml's wheel lanes step for step, so a release
 # ships exactly what the required checks verified. They are copies, not a
@@ -20,6 +26,9 @@ name: Release
 
 on:
   push:
+    branches: [main]
+    # Only a manifest change can change the version.
+    paths: [Cargo.toml]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
@@ -39,14 +48,13 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-
 jobs:
   guard:
     name: Release guard
     runs-on: ubuntu-latest
     outputs:
+      release: ${{ steps.source.outputs.release }}
+      tag: ${{ steps.source.outputs.tag }}
       sha: ${{ steps.source.outputs.sha }}
       dry_run: ${{ steps.source.outputs.dry_run }}
     steps:
@@ -54,41 +62,83 @@ jobs:
         with:
           fetch-depth: 0
 
-      # A dry run of a tag that does not exist yet rehearses main, so a release
-      # can be proven before the tag that would ship it is pushed.
-      - name: Resolve the tag once, and require it on main
+      # Decides whether this run releases, which tag, and the one commit it builds.
+      - name: Resolve the release, and require it on main
         id: source
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          BEFORE: ${{ github.event.before }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
+          workspace_version() {  # [workspace.package].version at a revision, or nothing
+            git show "$1:Cargo.toml" 2>/dev/null | python3 -c \
+              'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["workspace"]["package"]["version"])' \
+              2>/dev/null || true
+          }
+          skip() {
+            echo "$1"
+            { echo "release=false"; echo "tag="; echo "sha="; echo "dry_run=true"; } >> "$GITHUB_OUTPUT"
+            echo "No release: $1" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+
           dry_run=false
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.dry_run }}" == "true" ]]; then
-            dry_run=true
-          fi
-          if sha="$(git rev-parse -q --verify "refs/tags/${RELEASE_TAG}^{commit}")"; then
-            source="tag $RELEASE_TAG"
-          elif [[ "$dry_run" == "true" ]]; then
-            sha="$(git rev-parse origin/main)"
-            source="main (tag $RELEASE_TAG does not exist yet)"
+          sha=""
+          if [[ "$EVENT" == "workflow_dispatch" ]]; then
+            tag="$INPUT_TAG"
+            [[ "$INPUT_DRY_RUN" == "true" ]] && dry_run=true
+          elif [[ "$REF_TYPE" == "tag" ]]; then
+            tag="$REF_NAME"
           else
-            echo "::error::tag $RELEASE_TAG does not exist" >&2
-            exit 1
+            # A push to main: release only if it changed the version.
+            new="$(workspace_version HEAD)"
+            old=""
+            [[ "$BEFORE" =~ ^0+$ ]] || old="$(workspace_version "$BEFORE")"
+            [[ -n "$new" ]] || { echo "::error::Cargo.toml has no [workspace.package] version" >&2; exit 1; }
+            [[ -n "$old" && "$new" != "$old" ]] || skip "the version did not change (${old:-none} -> $new)"
+            tag="v$new"
+            gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 \
+              && skip "$tag is already released"
+            git rev-parse -q --verify "refs/tags/$tag" > /dev/null \
+              && skip "tag $tag already exists; its own run releases it"
+            sha="$(git rev-parse HEAD)"
+            source="version bump $old -> $new on main"
+          fi
+
+          if [[ -z "$sha" ]]; then
+            if sha="$(git rev-parse -q --verify "refs/tags/${tag}^{commit}")"; then
+              source="tag $tag"
+            elif [[ "$dry_run" == "true" ]]; then
+              sha="$(git rev-parse origin/main)"
+              source="main (tag $tag does not exist yet)"
+            else
+              echo "::error::tag $tag does not exist" >&2
+              exit 1
+            fi
           fi
           git merge-base --is-ancestor "$sha" origin/main \
-            || { echo "::error::$RELEASE_TAG ($sha) is not on main" >&2; exit 1; }
+            || { echo "::error::$tag ($sha) is not on main" >&2; exit 1; }
           git checkout -q "$sha"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
-          echo "Releasing $RELEASE_TAG from $source at $sha (dry run: $dry_run)" >> "$GITHUB_STEP_SUMMARY"
+          { echo "release=true"; echo "tag=$tag"; echo "sha=$sha"; echo "dry_run=$dry_run"; } >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag from $source at $sha (dry run: $dry_run)" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/setup-python@v5
+        if: steps.source.outputs.release == 'true'
         with:
           python-version: "3.11"
 
-      - name: Tag matches every version declaration
-        run: python ci/verify_release.py source --tag "$RELEASE_TAG"
+      - name: Tag matches the release version, and nothing else declares one
+        if: steps.source.outputs.release == 'true'
+        run: python ci/verify_release.py source --tag "${{ steps.source.outputs.tag }}"
 
       - name: kernal-api comes from crates.io, exactly
+        if: steps.source.outputs.release == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -102,6 +152,9 @@ jobs:
   native-wheel:
     name: Native wheel (${{ matrix.os }})
     needs: guard
+    if: needs.guard.outputs.release == 'true'
+    env:
+      RELEASE_TAG: ${{ needs.guard.outputs.tag }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: true
@@ -144,6 +197,9 @@ jobs:
   darwin-wheel:
     name: Darwin wheel (${{ matrix.target }}, Linux-hosted Soldr)
     needs: guard
+    if: needs.guard.outputs.release == 'true'
+    env:
+      RELEASE_TAG: ${{ needs.guard.outputs.tag }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: true
@@ -207,6 +263,9 @@ jobs:
   collect:
     name: Collect and verify the release set
     needs: [guard, native-wheel, darwin-wheel]
+    if: needs.guard.outputs.release == 'true'
+    env:
+      RELEASE_TAG: ${{ needs.guard.outputs.tag }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -251,7 +310,9 @@ jobs:
   publish-pypi:
     name: Publish to PyPI
     needs: [guard, collect]
-    if: ${{ needs.guard.outputs.dry_run == 'false' && vars.PUBLISH_PYPI == 'true' }}
+    if: ${{ needs.guard.outputs.release == 'true' && needs.guard.outputs.dry_run == 'false' && vars.PUBLISH_PYPI == 'true' }}
+    env:
+      RELEASE_TAG: ${{ needs.guard.outputs.tag }}
     runs-on: ubuntu-latest
     # Must equal the environment on the PyPI trusted-publisher entry.
     environment: pypi
@@ -307,9 +368,12 @@ jobs:
     # a failed upload, so a GitHub release never advertises a version PyPI lacks.
     if: >-
       ${{ always()
+      && needs.guard.outputs.release == 'true'
       && needs.collect.result == 'success'
       && needs.guard.outputs.dry_run == 'false'
       && (needs.publish-pypi.result == 'success' || needs.publish-pypi.result == 'skipped') }}
+    env:
+      RELEASE_TAG: ${{ needs.guard.outputs.tag }}
     runs-on: ubuntu-latest
     permissions:
       contents: write

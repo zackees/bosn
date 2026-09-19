@@ -4,7 +4,7 @@
 # crate at release, so crates.io consumers depend on `bosn` alone. The internal
 # crates and `bosn-python` are `publish = false`.
 name = "bosn"
-version = "0.1.4"
+version.workspace = true
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Refuse to release anything the tag, the tree, and the wheels disagree about.
 
-``source --tag vX.Y.Z`` checks that the tag names exactly the version the tree
-declares, and that every hand-written declaration of that version agrees.
+``source --tag vX.Y.Z`` checks that the tag names exactly the release version,
+``[workspace.package].version`` in Cargo.toml, and that nothing that ships writes
+its own copy of it: both published crates inherit it, the wheel reads it through
+maturin, and ``bosn.__version__`` is derived.
 
 ``wheels --tag vX.Y.Z DIR`` checks that DIR holds exactly the four platform
 wheels a release ships: one ``cp310-abi3`` wheel each for Linux x86_64, Windows
@@ -33,63 +35,61 @@ PLATFORMS = (
 )
 
 
-def _toml_version(path: Path, table: str) -> str:
-    version = tomllib.loads(path.read_text(encoding="utf-8"))[table]["version"]
+def release_version(root: Path) -> str:
+    """`[workspace.package].version` in the root Cargo.toml: the only place it is written."""
+    workspace = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))["workspace"]
+    version = workspace.get("package", {}).get("version")
     if not isinstance(version, str):
-        raise ValueError(f"{path}: [{table}].version is not a literal string")
+        raise ValueError("Cargo.toml: [workspace.package] version is missing")
     return version
 
 
-def _init_version(path: Path) -> str:
-    for node in ast.parse(path.read_text(encoding="utf-8")).body:
-        if (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id == "__version__"
-            and isinstance(node.value, ast.Constant)
-            and isinstance(node.value.value, str)
-        ):
-            return node.value.value
-    raise ValueError(f"{path}: no __version__ string literal")
+def single_source_errors(root: Path) -> list[str]:
+    """Everything that ships must derive the version, never write its own copy.
 
-
-def _native_version_assertion(path: Path) -> str:
-    match = re.search(
-        r"assert_eq!\(native_version\(\),\s*\"([^\"]+)\"\)", path.read_text(encoding="utf-8")
-    )
-    if match is None:
-        raise ValueError(f"{path}: no native_version() assertion")
-    return match.group(1)
-
-
-def declared_versions(root: Path) -> dict[str, str]:
-    """Every place the release version is written by hand."""
-    return {
-        "pyproject.toml": _toml_version(root / "pyproject.toml", "project"),
-        "crates/bosn-python/Cargo.toml": _toml_version(
-            root / "crates" / "bosn-python" / "Cargo.toml", "package"
-        ),
-        # The crates.io `bosn`, amalgamated from the internal crates at release.
-        "crates/bosn/Cargo.toml": _toml_version(root / "crates" / "bosn" / "Cargo.toml", "package"),
-        "src/bosn/__init__.py": _init_version(root / "src" / "bosn" / "__init__.py"),
-        "crates/bosn-python/src/lib.rs": _native_version_assertion(
-            root / "crates" / "bosn-python" / "src" / "lib.rs"
-        ),
-    }
+    A second copy is what a bump forgets; `./bump` rewrites only the workspace line.
+    """
+    errors: list[str] = []
+    for crate in ("bosn", "bosn-python"):
+        path = root / "crates" / crate / "Cargo.toml"
+        package = tomllib.loads(path.read_text(encoding="utf-8"))["package"]
+        if package.get("version") != {"workspace": True}:
+            errors.append(f"crates/{crate}/Cargo.toml must use `version.workspace = true`")
+    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    if "version" in project or "version" not in project.get("dynamic", []):
+        errors.append(
+            'pyproject.toml must declare `dynamic = ["version"]` and no [project].version'
+        )
+    init = root / "src" / "bosn" / "__init__.py"
+    for node in ast.walk(ast.parse(init.read_text(encoding="utf-8"))):
+        targets = (
+            node.targets
+            if isinstance(node, ast.Assign)
+            else [node.target]
+            if isinstance(node, ast.AnnAssign)
+            else []
+        )
+        value = getattr(node, "value", None)
+        if any(
+            isinstance(target, ast.Name) and target.id == "__version__" for target in targets
+        ) and isinstance(value, ast.Constant):
+            errors.append("src/bosn/__init__.py must derive __version__, not write a literal")
+    lib = (root / "crates" / "bosn-python" / "src" / "lib.rs").read_text(encoding="utf-8")
+    if re.search(r'assert_eq!\(native_version\(\),\s*"', lib):
+        errors.append("crates/bosn-python/src/lib.rs must not pin native_version() to a literal")
+    return errors
 
 
 def source_errors(root: Path, tag: str) -> list[str]:
     match = TAG.match(tag)
     if match is None:
         return [f"tag {tag!r} is not of the form vMAJOR.MINOR.PATCH"]
-    versions = declared_versions(root)
-    if len(set(versions.values())) != 1:
-        found = ", ".join(f"{path}={version}" for path, version in versions.items())
-        return [f"version declarations disagree: {found}"]
-    declared = next(iter(versions.values()))
-    if match.group(1) != declared:
-        return [f"tag {tag} does not match the declared version {declared}"]
+    errors = single_source_errors(root)
+    if errors:
+        return errors
+    version = release_version(root)
+    if match.group(1) != version:
+        return [f"tag {tag} does not match the release version {version}"]
     return []
 
 
@@ -140,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "source":
         errors = source_errors(args.root.resolve(), args.tag)
-        success = f"{args.tag} matches every version declaration"
+        success = f"{args.tag} matches the release version, and nothing else declares one"
     else:
         errors = wheel_errors(args.directory, args.tag)
         success = f"{args.directory} holds exactly the four {args.tag} platform wheels"
