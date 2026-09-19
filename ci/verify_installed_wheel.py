@@ -207,6 +207,7 @@ def installed_extension_smoke_script() -> str:
     expected_extension = "_native" + platform_extension_suffix()
     return textwrap.dedent(
         """
+        import importlib.metadata
         import importlib.util
         import json
         import pathlib
@@ -219,9 +220,12 @@ def installed_extension_smoke_script() -> str:
             pathlib.Path(sys.prefix).resolve()
         )
         assert origin.name == "__BOSN_EXPECTED_EXTENSION__"
+        # The wheel's metadata version (maturin's, from Cargo) against the binary's own.
+        # `bosn.__version__` is derived from the binary, so it must agree with both.
         versions = {
-            "package_version": bosn.__version__,
+            "package_version": importlib.metadata.version("bosn"),
             "native_version": bosn.native_version(),
+            "module_version": bosn.__version__,
         }
         print(json.dumps(versions))
         """
@@ -478,7 +482,7 @@ def verify_installed_wheel(wheel: Path, installer: str = "uv") -> None:
             env=env,
         )
         versions = json.loads(imported.stdout)
-        if versions["package_version"] != versions["native_version"]:
+        if len(set(versions.values())) != 1:
             fail(f"Python and native versions differ: {versions}")
 
         cli = scripts / f"bosn{platform_executable_suffix()}"

@@ -133,13 +133,16 @@ def inspect_macho(data: bytes, *, target: Target, expected_filetype: int, name: 
 
 
 def project_version(root: Path) -> str:
-    cargo = tomllib.loads((root / "crates/bosn-python/Cargo.toml").read_text(encoding="utf-8"))
-    pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
-    cargo_version = cargo["package"]["version"]
-    python_version = pyproject["project"]["version"]
-    if cargo_version != python_version:
-        fail(f"manifest version mismatch: Cargo={cargo_version!r}, pyproject={python_version!r}")
-    return str(cargo_version)
+    """`[workspace.package].version`: the only place the release version is written.
+
+    `bosn-python` inherits it and maturin reads it for the wheel (`dynamic = ["version"]`),
+    so the wheel filename checked below is the real cross-check.
+    """
+    workspace = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))["workspace"]
+    version = workspace.get("package", {}).get("version")
+    if not isinstance(version, str):
+        fail("Cargo.toml: [workspace.package] version is missing")
+    return version
 
 
 def wheel_from_argument(argument: str) -> Path:

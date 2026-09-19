@@ -1,6 +1,7 @@
 """The native extension surface, re-exported by the ``bosn`` package."""
 
 import hashlib
+import importlib.metadata
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,7 @@ def test_native_extension_is_reexported_by_python_package(tmp_path: Path) -> Non
     assert bosn.Status is native.Status
     assert bosn.RegistryResourcePage is native.RegistryResourcePage
     assert bosn.SetupEnsureEventPage is native.SetupEnsureEventPage
-    assert bosn.native_version() == bosn.__version__
+    assert bosn.native_version() == bosn.__version__ == importlib.metadata.version("bosn")
     assert bosn.protocol_version() == 1
 
     compose_plan = bosn.plan_compose_yaml("services:\n  api:\n    image: alpine:3.21\n")

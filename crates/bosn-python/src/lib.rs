@@ -2241,11 +2241,6 @@ mod tests {
     }
 
     #[test]
-    fn native_version_matches_python_distribution() {
-        assert_eq!(native_version(), "0.1.4");
-    }
-
-    #[test]
     fn compose_plan_is_pure_and_returns_an_immutable_receipt() {
         let plan = plan_compose_yaml("services:\n  api:\n    image: alpine:3.21\n").unwrap();
         assert_eq!(plan.version, 1);

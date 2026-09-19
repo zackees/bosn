@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import tomllib
@@ -53,7 +52,8 @@ def test_python_distribution_contains_only_native_boundary_modules() -> None:
 
 def test_retired_python_lifecycle_modules_are_absent_from_source() -> None:
     text = (PACKAGE / "__init__.py").read_text(encoding="utf-8")
-    assert re.search(r'^__version__ = "[^"]+"$', text, re.MULTILINE)
+    # Derived from the extension; the one written version is in Cargo.toml.
+    assert "__version__: str = native_version()" in text
     for module in RETIRED_MODULES:
         assert not (PACKAGE / f"{module}.py").exists()
         assert not (PACKAGE / module).exists()
