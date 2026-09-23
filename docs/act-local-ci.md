@@ -45,3 +45,39 @@ an isolated engine whose entire lifecycle and storage are owned by Bosn, plus
 bounded serial logs and a complete coverage report, before these commands can
 be enabled. Do not use a host-socket task as evidence that nested resources
 are supervised.
+
+## Execution milestones
+
+1. Define a repository adapter with a closed list of supported workflow/job
+   IDs and exact event inputs. A PR adapter must build the event payload with
+   the reviewed `ci-test` or `ci-full` label; a release adapter must require
+   the requested commit SHA and full mode. Check out that SHA into a private,
+   immutable source snapshot before either workflow inspection or execution.
+   Refuse jobs whose event, `if`, matrix, reusable workflow, runner, or required
+   secret behavior cannot be resolved locally. A successful `act -l` alone is
+   not a coverage decision.
+2. Add a Linux-only, fixed-shape nested Docker engine to Bosn's daemon-owned
+   resource lifecycle. Pin its image by digest, record an intent before
+   creation, and durably register the engine container and its storage before
+   handing its private socket to Act. Never mount the host Docker socket into
+   Act. On timeout, cancellation, client loss, and daemon restart, reconcile
+   the exact registered engine identity and retire it only after ownership
+   checks. The nested engine's storage is the cleanup boundary for Act-created
+   containers, networks, images, and volumes.
+3. Run the pinned Act binary against only that private socket and the frozen
+   source snapshot. Stream bounded output into a durable run record with an
+   exact SHA, event payload digest, workflow/job IDs, Act version, engine
+   identity, start/end times, exit status, and explicit cleanup outcome. A
+   timeout or incomplete cleanup is a failed run, never a successful report.
+4. Make `bosn act report` require every declared supported job to have a
+   completed result. Report unsupported/skipped jobs separately and never
+   summarize them as a full pass. Exercise RED-to-GREEN tests with a synthetic
+   engine for resource creation failure, Act failure, timeout, client death,
+   daemon restart, and cleanup; then run one live isolated-engine test on
+   Linux. GitHub-only runners and services remain explicitly uncovered.
+
+The current setup engine cannot implement milestone 2 by configuration: its
+only privileged container shape is the fixed macOS guest, and the Docker
+command endpoint is not a nested-engine ownership boundary. That capability
+needs a typed Bosn daemon operation and registry recovery before `act run`
+can be enabled.
