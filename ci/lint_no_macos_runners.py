@@ -74,9 +74,7 @@ def _allowed_job(file: Path, document: object, path: str) -> bool:
     matrix = job.get("strategy", {}).get("matrix", {})
     targets = matrix.get("include", []) if isinstance(matrix, dict) else []
     runner_pair = {
-        (entry.get("target"), entry.get("runner"))
-        for entry in targets
-        if isinstance(entry, dict)
+        (entry.get("target"), entry.get("runner")) for entry in targets if isinstance(entry, dict)
     }
     if runner_pair != {
         ("x86_64-apple-darwin", "macos-15-intel"),
@@ -84,11 +82,12 @@ def _allowed_job(file: Path, document: object, path: str) -> bool:
     }:
         return False
     if file.name == "ci.yml":
-        return (
-            condition
-            == "(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full')) || (github.event_name == 'workflow_dispatch' && inputs.tier == 'full')"
-            and needs == "darwin-cross-wheel"
+        full_condition = (
+            "(github.event_name == 'pull_request' && "
+            "contains(github.event.pull_request.labels.*.name, 'ci-full')) || "
+            "(github.event_name == 'workflow_dispatch' && inputs.tier == 'full')"
         )
+        return condition == full_condition and needs == "darwin-cross-wheel"
     if file.name == "auto-release.yml":
         return (
             condition == "needs.guard.outputs.release == 'true'"
