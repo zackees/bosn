@@ -23,7 +23,9 @@ permissions:
 
 jobs:
   lint-no-macos-runners:
-    name: CI policy (hosted macOS only in full/release)
+    # Legacy required-check name in branch protection. The implementation now
+    # permits hosted Macs only in ci-full and release; keep this status stable.
+    name: CI policy (no hosted macOS runners)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

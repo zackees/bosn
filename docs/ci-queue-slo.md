@@ -19,7 +19,7 @@ minus job start.
 |---|---|---:|---:|
 | Native wheel (windows-latest) | windows-latest | 6.5 min | 13.0 min |
 | Darwin wheel (aarch64-apple-darwin, Linux-hosted Soldr) | ubuntu-latest | 9.6 min | 4.3 min |
-| CI policy (hosted macOS only in full/release) — gate | ubuntu-latest | 17.5 min | 0.1 min |
+| CI policy (no hosted macOS runners) — gate | ubuntu-latest | 17.5 min | 0.1 min |
 | Rust workspace (locked tests) — gate | ubuntu-latest | 19.8 min | 1.2 min |
 | Native wheel (ubuntu-latest) | ubuntu-latest | 21.9 min | 3.0 min |
 | Linux (lint + unit + docker) | ubuntu-latest | 23.0 min | 5.8 min |
@@ -90,8 +90,12 @@ Measured per job as start minus creation, on hosted runners:
 
 | Class | Jobs | Must start within |
 |---|---|---:|
-| Gates | `CI policy (hosted macOS only in full/release)`, `Rust workspace (locked tests)` | 5 min |
+| Gates | `CI policy (no hosted macOS runners)`, `Rust workspace (locked tests)` | 5 min |
 | Release-relevant matrix | every other lane: Linux, both native wheels, both Darwin cross wheels | 15 min |
+
+The CI policy check keeps its legacy name because branch protection requires
+that exact status. Its current guard allows hosted macOS runners only for
+`ci-full` and release smoke jobs.
 
 Execution time has no SLO here; it is reported so regressions are visible, and
 tracked by their own issues (soldr#3231 for the Windows bootstrap).
