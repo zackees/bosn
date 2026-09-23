@@ -74,13 +74,15 @@ def test_post_policy_main_run_meets_slo_with_seconds_of_queue() -> None:
 
 def test_intentionally_skipped_tier_is_not_a_queue_breach() -> None:
     run = {"id": 1, "created_at": "2026-09-23T00:00:00Z", "head_branch": "main"}
-    jobs = [{
-        "name": "Native wheel (windows-latest)",
-        "created_at": "2026-09-23T00:00:00Z",
-        "started_at": None,
-        "completed_at": "2026-09-23T00:00:02Z",
-        "conclusion": "skipped",
-    }]
+    jobs = [
+        {
+            "name": "Native wheel (windows-latest)",
+            "created_at": "2026-09-23T00:00:00Z",
+            "started_at": None,
+            "completed_at": "2026-09-23T00:00:02Z",
+            "conclusion": "skipped",
+        }
+    ]
     report = timing.analyze(run, jobs, now=timing.parse_timestamp("2026-09-23T01:00:00Z"))
     assert report.ok
     assert "skipped" in timing.render_markdown(report)

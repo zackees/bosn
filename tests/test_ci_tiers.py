@@ -65,8 +65,13 @@ def test_full_coverage_sentinel_waits_for_every_lane() -> None:
     assert "always()" in job["if"]
     assert "needs.select-tier.outputs.full == 'true'" in job["if"]
     assert set(job["needs"]) >= {
-        "select-tier", "lint-no-macos-runners", "rust", "linux",
-        "native-wheel", "darwin-cross-wheel", "darwin-hosted-smoke",
+        "select-tier",
+        "lint-no-macos-runners",
+        "rust",
+        "linux",
+        "native-wheel",
+        "darwin-cross-wheel",
+        "darwin-hosted-smoke",
     }
     assert any("ci/verify_full_coverage.py" in step.get("run", "") for step in job["steps"])
     timing = CI["jobs"]["ci-queue-timing"]

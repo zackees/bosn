@@ -84,9 +84,7 @@ def _allowed_job(file: Path, document: object, path: str) -> bool:
     if file.name == "ci.yml":
         selector = jobs.get("select-tier", {})
         command = " ".join(
-            str(step.get("run", ""))
-            for step in selector.get("steps", [])
-            if isinstance(step, dict)
+            str(step.get("run", "")) for step in selector.get("steps", []) if isinstance(step, dict)
         )
         return (
             condition == "needs.select-tier.outputs.full == 'true'"
