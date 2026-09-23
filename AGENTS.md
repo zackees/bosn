@@ -94,19 +94,21 @@ explicit new decision, not by inference.
 
 ## macOS (issue #252)
 
-- **No hosted macOS runners.** `ci/lint_no_macos_runners.py` fails CI on any `macos-*`
-  `runs-on`/matrix label. Both `x86_64-apple-darwin` and `aarch64-apple-darwin` wheels
+- **Hosted macOS runners are reserved for `ci-full` and release smoke checks.**
+  `ci/lint_no_macos_runners.py` rejects macOS runner labels outside those gated jobs.
+  Both `x86_64-apple-darwin` and `aarch64-apple-darwin` wheels
   build on `ubuntu-latest` through `zackees/setup-soldr` (pinned SHA) +
   `soldr prepare --target …`, using Soldr's LLVM 21.1.5 and managed Apple SDK 14.5 —
   never Xcode, zig, or osxcross.
-- **Linux verifies macOS wheels statically; it never executes them.**
+- **Linux verifies macOS wheels statically; full CI and release execute them on
+  matching hosted Macs.**
   `ci/verify_cross_wheel.py` checks the Mach-O extension and bundled CLI (arch,
   filetype, min-OS ≤ tag floor, allowed system dylibs, no ELF/OpenSSL contamination),
   tag, and version alignment. The floors are 10.12 (x86_64) and 11.0 (arm64).
-- **Executing the macOS wheel is the advisory `macos-x64-execute.yml` lane** — a macOS
+- **The legacy Recovery smoke remains advisory in `macos-x64-execute.yml`** — a macOS
   Recovery guest (`zackees/docker-mac-x64`, OSX-KVM on `ubuntu-latest`, no macOS
-  runner). It is nightly + manual, never a required check or release gate. arm64 has no
-  execution path anywhere in the fleet; it stays compile+static-verify only. See
+  runner). It is nightly + manual, never a required check or release gate. Both
+  architectures now have hosted full CI and release smoke checks. See
   `docs/macos-guest.md` "Executing the wheel".
 
 ## Toolchain note (host hazard)

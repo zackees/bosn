@@ -135,18 +135,21 @@ For distributable Python wheels, Bosn uses this same boundary in CI.  Both
 `bb28e96d2dc32c058242f56722297caf1efcbd90`, followed by
 `soldr prepare --target <triple> --github-env "$GITHUB_ENV"`.  Soldr provides
 LLVM 21.1.5 and its managed Apple SDK 14.5; no hosted macOS runner, Xcode,
-zig, or osxcross is involved.  The wheel backend sets the documented floors:
+zig, or osxcross is involved in the build. The wheel backend sets the documented floors:
 macOS 10.12 for x86_64 and 11.0 for arm64.  Linux statically checks each
 Mach-O extension and bundled CLI before publishing the artifact.  The PyO3
 module is `abi3-py310`, so release wheels are `cp310-abi3` rather than
 cp311-only artifacts and support CPython 3.10 and newer.
 
-### Executing the wheel: the advisory Recovery lane
+### Executing the wheel
 
-Linux cannot run a Mach-O, and no fake smoke test stands in for one.  The
-only sanctioned way to *execute* a Darwin artifact from CI is an x86_64 macOS
-guest on a Linux runner, and `.github/workflows/macos-x64-execute.yml` does
-exactly that (issue #252, Part 2):
+Linux cannot run a Mach-O. A `ci-full` PR label or a full manual CI dispatch
+installs and smoke-tests both Linux-built Darwin wheels on matching hosted
+macOS runners. Release repeats the same check on the exact release wheels
+before collecting the release set. Ordinary PR and `main` CI use no hosted Mac.
+
+The advisory `.github/workflows/macos-x64-execute.yml` also tests Intel in a
+macOS Recovery guest on a Linux runner (issue #252, Part 2):
 
 1. `build-x64-wheel` rebuilds the `cp310-abi3-macosx_10_12_x86_64` wheel with
    the same pinned Soldr contract as CI and verifies it statically.
@@ -158,8 +161,7 @@ exactly that (issue #252, Part 2):
    mimalloc-pprof proved on 3.12).  3.10 is deliberate: the wheel is exercised
    on the oldest interpreter its abi3 tag claims.
 3. `zackees/docker-mac-x64` (pinned sha) boots a macOS **Recovery** guest
-   (OSX-KVM under QEMU/KVM) on `ubuntu-latest`.  No macOS runner is involved;
-   `ci/lint_no_macos_runners.py` still refuses one.  The guest fetches the
+   (OSX-KVM under QEMU/KVM) on `ubuntu-latest`. The guest fetches the
    payload over the action's local HTTP share, creates a venv, installs the
    wheel offline with `--installer pip`, and runs the full verifier — import,
    `bosn --version`, offline `doctor`, daemon start/readiness/stop — writing
@@ -177,10 +179,8 @@ records the runs.  Recovery is a cut-down userland (no dyld shared cache, no
 Xcode CLT, ramdisk `/tmp`); a phase that only fails there is an environment
 fact to waive with a reason, not a product defect.
 
-**arm64 has no execution path anywhere in the fleet.**  There is no arm64
-macOS guest that runs on Linux, and no repository executes an
-`aarch64-apple-darwin` artifact in CI; that wheel stays compile-plus-static-
-verification only, like every sibling repository's.
+The Recovery guest remains Intel-only; Apple Silicon execution runs on
+`macos-15` in full CI and release.
 
 Bosn's own `macos-x64-guest` stack kind (this document) remains the dev-box
 path for a *full* macOS userland; it is not used by CI because its runtime

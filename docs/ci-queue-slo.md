@@ -19,7 +19,7 @@ minus job start.
 |---|---|---:|---:|
 | Native wheel (windows-latest) | windows-latest | 6.5 min | 13.0 min |
 | Darwin wheel (aarch64-apple-darwin, Linux-hosted Soldr) | ubuntu-latest | 9.6 min | 4.3 min |
-| CI policy (no hosted macOS runners) — gate | ubuntu-latest | 17.5 min | 0.1 min |
+| CI policy (hosted macOS only in full/release) — gate | ubuntu-latest | 17.5 min | 0.1 min |
 | Rust workspace (locked tests) — gate | ubuntu-latest | 19.8 min | 1.2 min |
 | Native wheel (ubuntu-latest) | ubuntu-latest | 21.9 min | 3.0 min |
 | Linux (lint + unit + docker) | ubuntu-latest | 23.0 min | 5.8 min |
@@ -54,9 +54,9 @@ competing load lived in other repositories.
 **Capacity decision: stay on hosted runners; reclaim the pool instead of
 buying more of it.** No self-hosted or reserved runner group is introduced —
 that would add an operational surface for a problem that was waste, not
-demand — and the no-hosted-macOS-runner policy from #252 is unchanged
-(`ci/lint_no_macos_runners.py` still enforces it; Darwin wheels remain
-Linux-hosted Soldr cross builds on `ubuntu-latest`).
+demand. Darwin wheels remain Linux-hosted Soldr cross builds on
+`ubuntu-latest`; hosted Mac execution is reserved for full CI and release,
+as `ci/lint_no_macos_runners.py` enforces.
 
 1. **Fleet-wide concurrency policy** (19 repositories, 224 workflow files,
    2026-09-14). Every workflow now carries:
@@ -90,7 +90,7 @@ Measured per job as start minus creation, on hosted runners:
 
 | Class | Jobs | Must start within |
 |---|---|---:|
-| Gates | `CI policy (no hosted macOS runners)`, `Rust workspace (locked tests)` | 5 min |
+| Gates | `CI policy (hosted macOS only in full/release)`, `Rust workspace (locked tests)` | 5 min |
 | Release-relevant matrix | every other lane: Linux, both native wheels, both Darwin cross wheels | 15 min |
 
 Execution time has no SLO here; it is reported so regressions are visible, and
