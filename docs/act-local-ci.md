@@ -1,5 +1,23 @@
 # Local GitHub Actions planning
 
+`bosn act payload` is the first repository adapter. It emits a versioned JSON
+envelope for `zackees/bosn`'s committed `ci.yml` selector: `pull_request`
+minimal/test/full maps to no label/`ci-test`/`ci-full`, `push` maps to minimal
+on main, and `release` maps to full `workflow_dispatch` with `commit_sha`.
+PR payloads require `--pr-number`. All forms require a 40-hex `--sha`.
+For example:
+
+```sh
+bosn act payload --event pull_request --mode full \
+  --sha 0123456789abcdef0123456789abcdef01234567 --pr-number 17
+```
+
+The envelope contains the event payload to save as Act's `--eventpath` input.
+It does not attest that the SHA belongs to the PR or main; a future
+repository snapshot adapter must verify that before execution. Its
+`executable` field remains false. Other repositories require their own
+reviewed adapters because their selectors and dispatch inputs differ.
+
 `bosn act plan` is a read-only first step for mapping a fleet CI request to a
 specific checkout and workflow file. It accepts `--event pull_request|push|release`,
 `--mode minimal|test|full`, and an exact 40-hex `--sha`. A release requires full

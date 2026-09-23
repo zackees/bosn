@@ -16,8 +16,11 @@ use serde_json::{Value, json};
 
 pub fn run(mut arguments: impl Iterator<Item = OsString>) {
     let Some(verb) = arguments.next() else {
-        fail("expected plan, run, or report")
+        fail("expected plan, payload, run, or report")
     };
+    if verb == "payload" {
+        return payload(arguments);
+    }
     if verb == "run" {
         fail(
             "act run requires isolated Docker ownership; nested Docker resources are not supervised",
@@ -27,7 +30,7 @@ pub fn run(mut arguments: impl Iterator<Item = OsString>) {
         fail("act report requires a completed, supervised run")
     }
     if verb != "plan" {
-        fail("expected plan, run, or report")
+        fail("expected plan, payload, run, or report")
     }
     let mut workspace = None;
     let mut workflow = None;
@@ -260,6 +263,81 @@ pub fn run(mut arguments: impl Iterator<Item = OsString>) {
             "execution unavailable: repository event adapter and isolated Docker ownership are required"
         );
     }
+}
+
+/// Bosn's checked-in CI selector consumes these exact GitHub event fields.
+/// This adapter deliberately supports one repository and leaves execution closed.
+fn payload(mut arguments: impl Iterator<Item = OsString>) {
+    let mut event = None;
+    let mut mode = None;
+    let mut sha = None;
+    let mut pr_number = None;
+    while let Some(flag) = arguments.next() {
+        let slot = match flag.to_str() {
+            Some("--event") => &mut event,
+            Some("--mode") => &mut mode,
+            Some("--sha") => &mut sha,
+            Some("--pr-number") => &mut pr_number,
+            _ => fail("invalid or duplicate payload option"),
+        };
+        if slot.is_some() {
+            fail("duplicate payload option")
+        }
+        *slot = Some(
+            arguments
+                .next()
+                .and_then(|v| v.into_string().ok())
+                .unwrap_or_else(|| fail("missing payload option value")),
+        );
+    }
+    let event = event.unwrap_or_else(|| fail("--event is required"));
+    let mode = mode.unwrap_or_else(|| fail("--mode is required"));
+    let sha = sha.unwrap_or_else(|| fail("--sha is required"));
+    if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        fail("--sha must be 40 hexadecimal characters")
+    }
+    let sha = sha.to_ascii_lowercase();
+    let (github_event, payload) = match (event.as_str(), mode.as_str()) {
+        ("pull_request", "minimal" | "test" | "full") => {
+            let number = pr_number
+                .as_deref()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or_else(|| fail("pull_request requires positive --pr-number"));
+            let labels: Vec<&str> = match mode.as_str() {
+                "test" => vec!["ci-test"],
+                "full" => vec!["ci-full"],
+                _ => vec![],
+            };
+            (
+                "pull_request",
+                json!({"action":"synchronize","number":number,
+                "repository":{"full_name":"zackees/bosn"},
+                "pull_request":{"number":number,"head":{"sha":sha},
+                    "labels":labels.iter().map(|name| json!({"name":name})).collect::<Vec<_>>()}}),
+            )
+        }
+        ("push", "minimal") if pr_number.is_none() => (
+            "push",
+            json!({
+            "ref":"refs/heads/main", "after":sha,
+            "repository":{"full_name":"zackees/bosn"}}),
+        ),
+        ("release", "full") if pr_number.is_none() => (
+            "workflow_dispatch",
+            json!({
+            "ref":"refs/heads/main", "inputs":{"tier":"full","commit_sha":sha},
+            "repository":{"full_name":"zackees/bosn"}}),
+        ),
+        _ => fail("unsupported event/mode combination or unexpected --pr-number"),
+    };
+    println!(
+        "{}",
+        json!({"schema_version":1,"repository":"zackees/bosn",
+        "workflow":".github/workflows/ci.yml","github_event":github_event,
+        "mode":mode,"sha":sha,"payload":payload,"executable":false,
+        "reason":"event adapter only; isolated Docker engine and job coverage report are required"})
+    );
 }
 
 /// Run only the two non-executing Act queries. Pipe readers drain concurrently

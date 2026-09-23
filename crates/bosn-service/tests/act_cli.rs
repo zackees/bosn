@@ -2,6 +2,66 @@
 use std::os::unix::fs::PermissionsExt;
 use std::{fs, process::Command};
 
+#[test]
+fn bosn_payload_maps_literal_ci_labels_and_release_dispatch() {
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+    for (event, mode, expected_event, expected_label) in [
+        ("pull_request", "minimal", "pull_request", None),
+        ("pull_request", "test", "pull_request", Some("ci-test")),
+        ("pull_request", "full", "pull_request", Some("ci-full")),
+        ("release", "full", "workflow_dispatch", None),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bosn"));
+        command.args([
+            "act", "payload", "--event", event, "--mode", mode, "--sha", sha,
+        ]);
+        if event == "pull_request" {
+            command.args(["--pr-number", "17"]);
+        }
+        let result = command.output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(value["github_event"], expected_event);
+        assert_eq!(value["payload"]["repository"]["full_name"], "zackees/bosn");
+        assert_eq!(value["executable"], false);
+        if event == "release" {
+            assert_eq!(value["payload"]["inputs"]["tier"], "full");
+            assert_eq!(value["payload"]["inputs"]["commit_sha"], sha);
+        } else {
+            assert_eq!(value["payload"]["pull_request"]["head"]["sha"], sha);
+            let labels = value["payload"]["pull_request"]["labels"]
+                .as_array()
+                .unwrap();
+            assert_eq!(labels.len(), usize::from(expected_label.is_some()));
+            if let Some(label) = expected_label {
+                assert_eq!(labels[0]["name"], label);
+            }
+        }
+    }
+}
+
+#[test]
+fn bosn_payload_rejects_mismatched_events_and_missing_pr_identity() {
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+    for args in [
+        vec!["--event", "push", "--mode", "full", "--sha", sha],
+        vec!["--event", "release", "--mode", "test", "--sha", sha],
+        vec!["--event", "pull_request", "--mode", "test", "--sha", sha],
+    ] {
+        let result = Command::new(env!("CARGO_BIN_EXE_bosn"))
+            .args(["act", "payload"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(2));
+        assert!(result.stdout.is_empty());
+    }
+}
+
 fn commit_workflow(root: &std::path::Path, workflow: &str) -> String {
     assert!(root.join(workflow).is_file());
     let init = Command::new("git")
