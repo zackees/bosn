@@ -22,8 +22,8 @@ def test_full_ci_hosted_job_requires_explicit_full_mode() -> None:
     assert "labeled" in ci[True]["pull_request"]["types"]
     assert ci["jobs"]["lint-no-macos-runners"]["name"] == "CI policy (no hosted macOS runners)"
     job = ci["jobs"]["darwin-hosted-smoke"]
-    assert "ci-full" in job["if"]
-    assert "inputs.tier == 'full'" in job["if"]
+    assert "needs.select-tier.outputs.full == 'true'" == job["if"]
+    assert "select-tier" in job["needs"]
     assert "darwin-cross-wheel" in job["needs"]
 
 

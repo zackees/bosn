@@ -3,6 +3,21 @@
 Settled decisions, recorded so they are not re-litigated. Change them only with an
 explicit new decision, not by inference.
 
+## CI and release gate (staged rollout)
+
+Ordinary PRs and `main` pushes run minimal CI; the literal `ci-test` PR label
+adds Linux lint, unit, and Docker tests. The literal `ci-full` PR label runs the
+full platform matrix, including hosted Intel and Apple Silicon macOS smoke
+checks. Before **any** tag or release, full CI must pass on the exact candidate
+commit SHA. See [CI tiers and queue cost](docs/ci-queue-slo.md) and the
+[fleet rollout issue](https://github.com/zackees/soldr/issues/3345).
+
+The current version-triggered `auto-release.yml` path is legacy: it can publish
+and tag after a version bump reaches `main` without the normalized issue-driven
+pretag gate. **Do not use that path for a new release** until the gate is
+implemented. The release section below documents existing behavior, not an
+approved release procedure.
+
 ## Python packaging
 
 - **The extension is `abi3-py310`. Always. Only.** `crates/bosn-python/Cargo.toml`
@@ -37,24 +52,25 @@ explicit new decision, not by inference.
     `bosn_build_backend.py` entirely still waits on **soldr#3239** (native aux-bin
     staging).
 
-## Releasing
+## Releasing (legacy behavior; not an approved new-release procedure)
 
 - **The version is written once**: `[workspace.package].version` in the root `Cargo.toml`
   (the zccache/soldr pattern). `bosn` and `bosn-python` inherit it, the wheel reads it through
   maturin (`dynamic = ["version"]`), `bosn.__version__` comes from the loaded extension, and
   `uv.lock` records the project as dynamic. `ci/verify_release.py` refuses any second copy.
   The internal crates are never published and keep their own versions.
-- **To release: `./bump patch` (or `minor`, `major`, `X.Y.Z`), open a PR, merge it.** The bump
-  rewrites that one line and refreshes `Cargo.lock`'s two workspace entries; merging a version
-  change to main makes `auto-release.yml` build, verify, publish, and tag `vX.Y.Z` itself. A
+- **Legacy version-triggered path (do not use for a new release):** `./bump patch`
+  (or `minor`, `major`, `X.Y.Z`) rewrites that one line and refreshes `Cargo.lock`'s
+  two workspace entries; merging a version change to main currently makes
+  `auto-release.yml` build, verify, publish, and tag `vX.Y.Z` itself. A
   push that does not change the version releases nothing (`tests/test_auto_release_guard.py`
   runs the guard's bash against a scratch repo to hold that). Pushing a tag `vX.Y.Z` on main
-  still works as a manual route.
-- **Rehearse first** if you want: `gh workflow run auto-release.yml -f tag=vX.Y.Z` is a dry run by
+  still triggers the manual route.
+- **Legacy dry-run behavior:** `gh workflow run auto-release.yml -f tag=vX.Y.Z` is a dry run by
   default, and works before the tag exists (it rehearses main). It builds and verifies all four
-  wheels and publishes nothing. Pass `-f dry_run=false` to publish an existing tag, e.g. to
-  recover a failed run; every publish step is idempotent. A failed release-on-bump run does not
-  retry by itself: recover it with that dispatch.
+  wheels and publishes nothing. `-f dry_run=false` can publish an existing tag; this
+  capability is not the approved release gate. A failed release-on-bump run does not
+  retry by itself.
 - **A release is exactly four `cp310-abi3` wheels**: Linux x86_64 (`manylinux_2_39`, so glibc
   ≥ 2.39), Windows x86_64, and both Darwin targets. No sdist: building Bosn from source
   needs the Rust toolchain and the staging backend, so an unsupported platform should get
