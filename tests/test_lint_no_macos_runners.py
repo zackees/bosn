@@ -19,6 +19,7 @@ def test_current_workflows_allow_only_full_and_release_macos_runner() -> None:
 def test_full_ci_hosted_job_requires_explicit_full_mode() -> None:
     root = Path(__file__).resolve().parents[1]
     ci = yaml.safe_load((root / ".github/workflows/ci.yml").read_text())
+    assert "labeled" in ci[True]["pull_request"]["types"]
     job = ci["jobs"]["darwin-hosted-smoke"]
     assert "ci-full" in job["if"]
     assert "inputs.tier == 'full'" in job["if"]
