@@ -12,7 +12,8 @@ bosn act payload --event pull_request --mode full \
   --sha 0123456789abcdef0123456789abcdef01234567 --pr-number 17
 ```
 
-The envelope contains the event payload to save as Act's `--eventpath` input.
+The envelope's `payload` member can be saved as Act's `--eventpath` input
+once execution is implemented; the whole envelope is not an Act event file.
 It does not attest that the SHA belongs to the PR or main; a future
 repository snapshot adapter must verify that before execution. Its
 `executable` field remains false. Other repositories require their own
