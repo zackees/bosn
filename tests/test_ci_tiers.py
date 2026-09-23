@@ -15,14 +15,27 @@ CI = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
 
 def test_expensive_jobs_require_selector() -> None:
     jobs = CI["jobs"]
-    for name, tier in {
-        "linux": "test",
-        "native-wheel": "full",
-        "darwin-cross-wheel": "full",
-        "darwin-hosted-smoke": "full",
-    }.items():
+    for name, tier in {"linux": "test", "darwin-hosted-smoke": "full"}.items():
         assert "select-tier" in jobs[name]["needs"]
         assert f"needs.select-tier.outputs.{tier} == 'true'" in jobs[name]["if"]
+
+
+def test_required_wheel_matrix_cells_exist_on_every_tier() -> None:
+    jobs = CI["jobs"]
+    for name, expected_cells in {
+        "native-wheel": {"ubuntu-latest", "windows-latest"},
+        "darwin-cross-wheel": {"x86_64-apple-darwin", "aarch64-apple-darwin"},
+    }.items():
+        job = jobs[name]
+        assert "select-tier" in job["needs"]
+        assert "if" not in job, "job-level if prevents concrete matrix check names"
+        matrix = job["strategy"]["matrix"]
+        cells = set(matrix.get("os", [])) or {cell["target"] for cell in matrix["include"]}
+        assert cells == expected_cells
+        assert job["steps"][0]["name"] == "Minimal tier required-check placeholder"
+        assert job["steps"][0]["if"] == "needs.select-tier.outputs.full != 'true'"
+        for step in job["steps"][1:]:
+            assert "needs.select-tier.outputs.full == 'true'" in step.get("if", ""), step
 
 
 def test_required_status_names_remain() -> None:

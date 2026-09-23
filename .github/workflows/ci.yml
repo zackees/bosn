@@ -138,7 +138,6 @@ jobs:
 
   native-wheel:
     name: Native wheel (${{ matrix.os }})
-    if: needs.select-tier.outputs.full == 'true'
     needs: [select-tier]
     runs-on: ${{ matrix.os }}
     strategy:
@@ -147,21 +146,30 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         python: ["3.11"]
     steps:
+      # Branch protection requires each concrete matrix cell on every PR SHA.
+      - name: Minimal tier required-check placeholder
+        if: needs.select-tier.outputs.full != 'true'
+        run: echo "Native wheel build runs in full CI"
+
       - uses: actions/checkout@v4
+        if: needs.select-tier.outputs.full == 'true'
         with:
           ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Python ${{ matrix.python }}
+        if: needs.select-tier.outputs.full == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
 
       - name: Set up Rust
+        if: needs.select-tier.outputs.full == 'true'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
 
       - name: Install uv
+        if: needs.select-tier.outputs.full == 'true'
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -172,9 +180,11 @@ jobs:
       # This matrix intentionally has no Docker setup or Docker invocation.
       # The Linux job above remains the dedicated Docker integration lane.
       - name: Build platform wheel
+        if: needs.select-tier.outputs.full == 'true'
         run: uv build --wheel --out-dir dist
 
       - name: Install and smoke-test platform wheel outside the checkout
+        if: needs.select-tier.outputs.full == 'true'
         run: python ci/verify_installed_wheel.py "dist/bosn-*.whl"
 
       # The macOS Recovery lane (macos-x64-execute.yml) has no uv and no
@@ -182,12 +192,11 @@ jobs:
       # Exercise that exact path here on every run so the advisory lane never
       # fails for a verifier reason the gating lanes would have caught.
       - name: Smoke-test the wheel through the offline pip installer path
-        if: runner.os == 'Linux'
+        if: needs.select-tier.outputs.full == 'true' && runner.os == 'Linux'
         run: python ci/verify_installed_wheel.py --installer pip "dist/bosn-*.whl"
 
   darwin-cross-wheel:
     name: Darwin wheel (${{ matrix.target }}, Linux-hosted Soldr)
-    if: needs.select-tier.outputs.full == 'true'
     needs: [select-tier]
     runs-on: ubuntu-latest
     strategy:
@@ -199,16 +208,24 @@ jobs:
           - target: aarch64-apple-darwin
             deployment_target: "11.0"
     steps:
+      # Preserve both required target contexts even when the full tier is off.
+      - name: Minimal tier required-check placeholder
+        if: needs.select-tier.outputs.full != 'true'
+        run: echo "Darwin wheel build runs in full CI"
+
       - uses: actions/checkout@v4
+        if: needs.select-tier.outputs.full == 'true'
         with:
           ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Python 3.11
+        if: needs.select-tier.outputs.full == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Set up Rust
+        if: needs.select-tier.outputs.full == 'true'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
@@ -216,26 +233,31 @@ jobs:
       # Pinned setup-soldr v0. The action supplies Soldr's blessed LLVM 21.1.5
       # and Apple SDK 14.5, not a host macOS runner or zig/osxcross fallback.
       - name: Set up Soldr Darwin target
+        if: needs.select-tier.outputs.full == 'true'
         uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
         with:
           cache: false
           cross-targets: ${{ matrix.target }}
 
       - name: Export Soldr target environment
+        if: needs.select-tier.outputs.full == 'true'
         run: soldr prepare --target "${{ matrix.target }}" --github-env "$GITHUB_ENV"
 
       # Maturin invokes Cargo directly through the PEP 517 backend.  Ensure
       # that the runner's pinned Rust toolchain has the same std component
       # Soldr prepared, rather than relying on a host default target set.
       - name: Install Rust standard library for Darwin target
+        if: needs.select-tier.outputs.full == 'true'
         run: rustup target add "${{ matrix.target }}" --toolchain 1.95.0
 
       - name: Install uv
+        if: needs.select-tier.outputs.full == 'true'
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
 
       - name: Build Darwin wheel on Linux
+        if: needs.select-tier.outputs.full == 'true'
         env:
           BOSN_WHEEL_TARGET: ${{ matrix.target }}
           PYO3_CROSS_PYTHON_VERSION: "3.10"
@@ -243,11 +265,13 @@ jobs:
         run: uv build --wheel --out-dir dist
 
       - name: Verify Darwin wheel statically on Linux
+        if: needs.select-tier.outputs.full == 'true'
         run: >-
           python ci/verify_cross_wheel.py "dist/bosn-*.whl"
           --target "${{ matrix.target }}"
 
       - name: Upload Darwin wheel
+        if: needs.select-tier.outputs.full == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: bosn-wheel-${{ matrix.target }}
