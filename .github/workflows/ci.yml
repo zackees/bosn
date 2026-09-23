@@ -110,34 +110,65 @@ jobs:
 
   linux:
     name: Linux (lint + unit + docker)
-    if: needs.select-tier.outputs.test == 'true'
+    if: always()
     needs: [select-tier]
     runs-on: ubuntu-latest
     steps:
+      # A skipped required check can satisfy branch protection. Fail explicitly
+      # if the selector failed or returned an unknown/inconsistent tier.
+      - name: Verify selected CI tier
+        if: always()
+        shell: bash
+        env:
+          SELECT_RESULT: ${{ needs.select-tier.result }}
+          CI_TIER: ${{ needs.select-tier.outputs.tier }}
+          RUN_TESTS: ${{ needs.select-tier.outputs.test }}
+          RUN_FULL: ${{ needs.select-tier.outputs.full }}
+        run: |
+          if [[ "$SELECT_RESULT" != success ]]; then
+            echo "CI tier selection failed: $SELECT_RESULT" >&2
+            exit 1
+          fi
+          case "$CI_TIER:$RUN_TESTS:$RUN_FULL" in
+            minimal:false:false|test:true:false|full:true:true) ;;
+            *) echo "Invalid CI tier selection" >&2; exit 1 ;;
+          esac
+
+      - name: Minimal tier required-check placeholder
+        if: needs.select-tier.outputs.test != 'true'
+        run: echo "Linux integration runs in test and full CI"
+
       - uses: actions/checkout@v4
+        if: needs.select-tier.outputs.test == 'true'
         with:
           ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
 
       - name: Install uv
+        if: needs.select-tier.outputs.test == 'true'
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
 
       - name: Docker engine version
+        if: needs.select-tier.outputs.test == 'true'
         run: docker version
 
       - name: Install
+        if: needs.select-tier.outputs.test == 'true'
         run: ./install
 
       - name: Lint
+        if: needs.select-tier.outputs.test == 'true'
         run: ./lint
 
       - name: Test (unit + docker)
+        if: needs.select-tier.outputs.test == 'true'
         run: ./test
 
 
   native-wheel:
     name: Native wheel (${{ matrix.os }})
+    if: always()
     needs: [select-tier]
     runs-on: ${{ matrix.os }}
     strategy:
@@ -146,6 +177,24 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         python: ["3.11"]
     steps:
+      - name: Verify selected CI tier
+        if: always()
+        shell: bash
+        env:
+          SELECT_RESULT: ${{ needs.select-tier.result }}
+          CI_TIER: ${{ needs.select-tier.outputs.tier }}
+          RUN_TESTS: ${{ needs.select-tier.outputs.test }}
+          RUN_FULL: ${{ needs.select-tier.outputs.full }}
+        run: |
+          if [[ "$SELECT_RESULT" != success ]]; then
+            echo "CI tier selection failed: $SELECT_RESULT" >&2
+            exit 1
+          fi
+          case "$CI_TIER:$RUN_TESTS:$RUN_FULL" in
+            minimal:false:false|test:true:false|full:true:true) ;;
+            *) echo "Invalid CI tier selection" >&2; exit 1 ;;
+          esac
+
       # Branch protection requires each concrete matrix cell on every PR SHA.
       - name: Minimal tier required-check placeholder
         if: needs.select-tier.outputs.full != 'true'
@@ -197,6 +246,7 @@ jobs:
 
   darwin-cross-wheel:
     name: Darwin wheel (${{ matrix.target }}, Linux-hosted Soldr)
+    if: always()
     needs: [select-tier]
     runs-on: ubuntu-latest
     strategy:
@@ -208,6 +258,24 @@ jobs:
           - target: aarch64-apple-darwin
             deployment_target: "11.0"
     steps:
+      - name: Verify selected CI tier
+        if: always()
+        shell: bash
+        env:
+          SELECT_RESULT: ${{ needs.select-tier.result }}
+          CI_TIER: ${{ needs.select-tier.outputs.tier }}
+          RUN_TESTS: ${{ needs.select-tier.outputs.test }}
+          RUN_FULL: ${{ needs.select-tier.outputs.full }}
+        run: |
+          if [[ "$SELECT_RESULT" != success ]]; then
+            echo "CI tier selection failed: $SELECT_RESULT" >&2
+            exit 1
+          fi
+          case "$CI_TIER:$RUN_TESTS:$RUN_FULL" in
+            minimal:false:false|test:true:false|full:true:true) ;;
+            *) echo "Invalid CI tier selection" >&2; exit 1 ;;
+          esac
+
       # Preserve both required target contexts even when the full tier is off.
       - name: Minimal tier required-check placeholder
         if: needs.select-tier.outputs.full != 'true'
