@@ -90,8 +90,8 @@ wheel targets are cross-built on Linux with Soldr's pinned LLVM 21.1.5 and
 Apple SDK 14.5, then checked as Mach-O artifacts on Linux.  Release is gated
 on those jobs, `ci/verify_release_dependencies.py` proving exact published
 `kernal-api 0.1.14` (it does), and closure of the downstream-consumer items above.  A
-real x86_64 macOS guest execution lane is advisory follow-up work; arm64 has
-no Linux-hosted execution mechanism.  The package native module is
+real x86_64 macOS guest execution lane remains advisory; full CI and release
+execute both Darwin wheels on hosted macOS runners. The package native module is
 `abi3-py310`: all platform wheels carry `cp310-abi3` tags and package metadata
 permits CPython 3.10+, rather than releasing cp311-only Darwin wheels.
 

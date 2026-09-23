@@ -54,9 +54,9 @@ competing load lived in other repositories.
 **Capacity decision: stay on hosted runners; reclaim the pool instead of
 buying more of it.** No self-hosted or reserved runner group is introduced —
 that would add an operational surface for a problem that was waste, not
-demand — and the no-hosted-macOS-runner policy from #252 is unchanged
-(`ci/lint_no_macos_runners.py` still enforces it; Darwin wheels remain
-Linux-hosted Soldr cross builds on `ubuntu-latest`).
+demand. Darwin wheels remain Linux-hosted Soldr cross builds on
+`ubuntu-latest`; hosted Mac execution is reserved for full CI and release,
+as `ci/lint_no_macos_runners.py` enforces.
 
 1. **Fleet-wide concurrency policy** (19 repositories, 224 workflow files,
    2026-09-14). Every workflow now carries:
@@ -92,6 +92,10 @@ Measured per job as start minus creation, on hosted runners:
 |---|---|---:|
 | Gates | `CI policy (no hosted macOS runners)`, `Rust workspace (locked tests)` | 5 min |
 | Release-relevant matrix | every other lane: Linux, both native wheels, both Darwin cross wheels | 15 min |
+
+The CI policy check keeps its legacy name because branch protection requires
+that exact status. Its current guard allows hosted macOS runners only for
+`ci-full` and release smoke jobs.
 
 Execution time has no SLO here; it is reported so regressions are visible, and
 tracked by their own issues (soldr#3231 for the Windows bootstrap).

@@ -3,13 +3,13 @@ name: macOS x64 execute
 # Advisory execution of the Linux-built Intel macOS wheel (issue #252, Part 2).
 #
 # CI builds both Darwin wheels on Linux through Soldr and proves them
-# statically; nothing there runs a Mach-O.  This lane boots a macOS Recovery
+# statically; full CI also runs both wheels on hosted Macs. This lane boots a macOS Recovery
 # guest (zackees/docker-mac-x64: OSX-KVM under QEMU/KVM on an ubuntu runner —
-# no hosted macOS runner, which ci/lint_no_macos_runners.py still enforces),
+# no hosted macOS runner),
 # installs the x86_64 wheel into a relocatable CPython 3.10 shipped in the
 # payload, and runs the same ci/verify_installed_wheel.py the Linux and
-# Windows lanes run.  aarch64-apple-darwin has no execution path anywhere in
-# the fleet (no arm64 macOS guest exists on Linux); it stays compile-only.
+# Windows lanes run. This guest lane is still Intel-only; full CI and release
+# exercise Apple Silicon on a hosted runner.
 #
 # Advisory: nightly + manual, never a required check, never a release gate.
 # Promotion is a separate decision after a green track record

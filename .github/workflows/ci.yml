@@ -4,7 +4,14 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_dispatch:
+    inputs:
+      tier:
+        description: "CI tier; hosted macOS smoke runs only for full"
+        type: choice
+        options: [minimal, full]
+        default: minimal
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
@@ -16,6 +23,8 @@ permissions:
 
 jobs:
   lint-no-macos-runners:
+    # Legacy required-check name in branch protection. The implementation now
+    # permits hosted Macs only in ci-full and release; keep this status stable.
     name: CI policy (no hosted macOS runners)
     runs-on: ubuntu-latest
     steps:
@@ -23,7 +32,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - name: Refuse native macOS runner labels
+      - name: Check hosted macOS runner scope
         # This policy needs only PyYAML.  Keep it independent from the Rust
         # extension build so it can fail immediately before build capacity is
         # spent on any wheel lane.
@@ -202,6 +211,33 @@ jobs:
           name: bosn-wheel-${{ matrix.target }}
           path: dist/bosn-*.whl
           if-no-files-found: error
+
+  darwin-hosted-smoke:
+    name: Hosted macOS wheel smoke (${{ matrix.target }})
+    if: >-
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.tier == 'full')
+    needs: darwin-cross-wheel
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v4
+        with:
+          name: bosn-wheel-${{ matrix.target }}
+          path: dist
+      - name: Install and smoke-test Linux-built Darwin wheel
+        run: python ci/verify_installed_wheel.py --installer pip "dist/bosn-*.whl"
 
   # Queue visibility (issue #257). The hosted runner pool is shared account-wide,
   # so a run can wait behind other repositories' work for longer than it takes
