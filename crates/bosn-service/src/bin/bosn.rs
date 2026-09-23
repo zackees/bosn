@@ -30,6 +30,9 @@ use kernal_api::{
 };
 use serde_json::json;
 
+#[path = "bosn/act.rs"]
+mod act;
+
 const SETUP_PREPARE_MAX_DEADLINE_MS: u64 = 5 * 60 * 1_000;
 const SETUP_PREPARE_MAX_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 const DEFAULT_JOB_LOG_LIMIT: u32 = 64;
@@ -53,6 +56,7 @@ fn main() {
         "daemon" => run_daemon(arguments),
         "doctor" => run_doctor(arguments),
         "compose" => run_compose(arguments),
+        "act" => act::run(arguments),
         "manifest" => run_manifest(arguments),
         "setup" => run_setup(arguments),
         "job" => run_job(arguments),
@@ -2887,6 +2891,8 @@ fn print_json(plan: &SetupPlan) {
 }
 
 fn usage() -> ! {
+    eprintln!("   or: bosn act plan --workspace WORKSPACE --workflow RELATIVE_YML --event pull_request|push|release --mode minimal|test|full --sha 40_HEX --act-version VERSION [--act-bin PATH] [--job ID] [--json]");
+    eprintln!("   or: bosn act run|report (refuses until isolated Docker ownership is implemented)");
     eprintln!("usage: bosn mcp [--state-dir STATE_DIR]");
     eprintln!("   or: bosn daemon serve --state-dir STATE_DIR");
     eprintln!("   or: bosn daemon status --state-dir STATE_DIR [--json]");
