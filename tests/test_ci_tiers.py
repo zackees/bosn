@@ -45,6 +45,30 @@ def test_label_changes_reselect_same_sha() -> None:
 
 def test_manual_and_main_tiers() -> None:
     assert select_ci_tier.select("push", {}) == "minimal"
-    assert select_ci_tier.select("workflow_dispatch", {}, "full", "a" * 40, "a" * 40) == "full"
-    with pytest.raises(ValueError, match="commit_sha"):
-        select_ci_tier.select("workflow_dispatch", {}, "full", "a" * 40, "b" * 40)
+    assert select_ci_tier.select("workflow_dispatch", {}, "full", "a" * 40) == "full"
+    with pytest.raises(ValueError, match="40-character"):
+        select_ci_tier.select("workflow_dispatch", {}, "full", "not-a-sha")
+
+
+def test_every_job_checks_out_exact_candidate() -> None:
+    for job in CI["jobs"].values():
+        checkout = next(
+            step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@")
+        )
+        assert checkout["with"]["ref"] == (
+            "${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}"
+        )
+
+
+def test_full_coverage_sentinel_waits_for_every_lane() -> None:
+    job = CI["jobs"]["full-coverage"]
+    assert "always()" in job["if"]
+    assert "needs.select-tier.outputs.full == 'true'" in job["if"]
+    assert set(job["needs"]) >= {
+        "select-tier", "lint-no-macos-runners", "rust", "linux",
+        "native-wheel", "darwin-cross-wheel", "darwin-hosted-smoke",
+    }
+    assert any("ci/verify_full_coverage.py" in step.get("run", "") for step in job["steps"])
+    timing = CI["jobs"]["ci-queue-timing"]
+    assert timing["if"] == "always()"
+    assert "full-coverage" in timing["needs"]

@@ -94,12 +94,18 @@ lint, unit, and Docker job. A PR with `ci-full` runs that tier plus both native
 wheel jobs, both Linux-hosted Darwin cross-wheel jobs, and both hosted macOS
 wheel smokes. `ci-full` takes precedence when both labels are present. Label
 additions and removals trigger a new run and reselect from the current labels.
+PR lanes explicitly check out `pull_request.head.sha`: the proof is for the
+candidate commit, not GitHub's synthetic PR merge commit. The full-tier
+`Full CI coverage (exact candidate SHA)` status checks every required Linux,
+Windows, Darwin cross, and hosted Mac cell after the matrix finishes; a
+missing, skipped, cancelled, or failed cell makes that status fail.
 
 Manual dispatch accepts `minimal`, `test`, or `full`. A full dispatch requires
-`commit_sha` matching the workflow run's exact `github.sha`; the checkout and
-all wheel jobs use that same commit. For example, dispatch on a branch whose
-head is the desired commit and supply its 40-character SHA. A mismatch fails
-selection before the matrix starts. Release still uses its separate workflow.
+the 40-character `commit_sha` of the candidate. This input selects the checkout
+for every job, so it can differ from the branch SHA used to dispatch the workflow.
+The requested commit must be reachable and contain the CI selector scripts.
+The coverage status confirms its own checkout SHA and all named cell outcomes.
+Release still uses its separate workflow.
 
 The target for ordinary CI is at most 12.5% of a matched full event's total
 runner minutes. The lane selection is in place, but that ratio needs live

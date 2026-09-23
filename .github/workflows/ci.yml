@@ -13,7 +13,7 @@ on:
         options: [minimal, test, full]
         default: minimal
       commit_sha:
-        description: "Exact workflow commit SHA (required for full)"
+        description: "Candidate commit SHA to check out (required for full)"
         type: string
 
 concurrency:
@@ -34,17 +34,18 @@ jobs:
       full: ${{ steps.select.outputs.full }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
       - id: select
         env:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_PATH: ${{ github.event_path }}
           MANUAL_TIER: ${{ inputs.tier }}
           MANUAL_SHA: ${{ inputs.commit_sha }}
-          WORKFLOW_SHA: ${{ github.sha }}
         run: >-
           python3 ci/select_ci_tier.py --event "$EVENT_NAME"
           --payload "$EVENT_PATH" --manual-tier "${MANUAL_TIER:-minimal}"
-          --manual-sha "$MANUAL_SHA" --workflow-sha "$WORKFLOW_SHA"
+          --manual-sha "$MANUAL_SHA"
           --output "$GITHUB_OUTPUT"
 
   lint-no-macos-runners:
@@ -54,6 +55,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -68,6 +71,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@master
@@ -110,6 +115,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -141,6 +148,8 @@ jobs:
         python: ["3.11"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Python ${{ matrix.python }}
         uses: actions/setup-python@v5
@@ -191,6 +200,8 @@ jobs:
             deployment_target: "11.0"
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -258,6 +269,8 @@ jobs:
             runner: macos-15
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -268,6 +281,26 @@ jobs:
       - name: Install and smoke-test Linux-built Darwin wheel
         run: python ci/verify_installed_wheel.py --installer pip "dist/bosn-*.whl"
 
+  full-coverage:
+    name: Full CI coverage (exact candidate SHA)
+    if: always() && needs.select-tier.outputs.full == 'true'
+    needs: [select-tier, lint-no-macos-runners, rust, linux, native-wheel, darwin-cross-wheel, darwin-hosted-smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
+      - name: Verify all full-tier platform cells
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
+        run: >-
+          python3 ci/verify_full_coverage.py --run-id "${{ github.run_id }}"
+          --candidate-sha "$CANDIDATE_SHA"
+
   # Queue visibility (issue #257). The hosted runner pool is shared account-wide,
   # so a run can wait behind other repositories' work for longer than it takes
   # to execute. This job reports every lane's queue and execution time to the
@@ -277,13 +310,15 @@ jobs:
   ci-queue-timing:
     name: CI queue timing
     if: always()
-    needs: [select-tier, lint-no-macos-runners, rust, linux, native-wheel, darwin-cross-wheel, darwin-hosted-smoke]
+    needs: [select-tier, lint-no-macos-runners, rust, linux, native-wheel, darwin-cross-wheel, darwin-hosted-smoke, full-coverage]
     runs-on: ubuntu-latest
     permissions:
       actions: read
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
       - name: Report queue and execution timing against the SLO
         env:
           GITHUB_TOKEN: ${{ github.token }}
