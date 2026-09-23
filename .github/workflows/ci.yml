@@ -10,8 +10,11 @@ on:
       tier:
         description: "CI tier; hosted macOS smoke runs only for full"
         type: choice
-        options: [minimal, full]
+        options: [minimal, test, full]
         default: minimal
+      commit_sha:
+        description: "Exact workflow commit SHA (required for full)"
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
@@ -22,6 +25,28 @@ permissions:
   contents: read
 
 jobs:
+  select-tier:
+    name: Select CI tier
+    runs-on: ubuntu-latest
+    outputs:
+      tier: ${{ steps.select.outputs.tier }}
+      test: ${{ steps.select.outputs.test }}
+      full: ${{ steps.select.outputs.full }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: select
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PATH: ${{ github.event_path }}
+          MANUAL_TIER: ${{ inputs.tier }}
+          MANUAL_SHA: ${{ inputs.commit_sha }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: >-
+          python3 ci/select_ci_tier.py --event "$EVENT_NAME"
+          --payload "$EVENT_PATH" --manual-tier "${MANUAL_TIER:-minimal}"
+          --manual-sha "$MANUAL_SHA" --workflow-sha "$WORKFLOW_SHA"
+          --output "$GITHUB_OUTPUT"
+
   lint-no-macos-runners:
     # Legacy required-check name in branch protection. The implementation now
     # permits hosted Macs only in ci-full and release; keep this status stable.
@@ -80,6 +105,8 @@ jobs:
 
   linux:
     name: Linux (lint + unit + docker)
+    if: needs.select-tier.outputs.test == 'true'
+    needs: [select-tier]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -104,6 +131,8 @@ jobs:
 
   native-wheel:
     name: Native wheel (${{ matrix.os }})
+    if: needs.select-tier.outputs.full == 'true'
+    needs: [select-tier]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -149,6 +178,8 @@ jobs:
 
   darwin-cross-wheel:
     name: Darwin wheel (${{ matrix.target }}, Linux-hosted Soldr)
+    if: needs.select-tier.outputs.full == 'true'
+    needs: [select-tier]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -214,10 +245,8 @@ jobs:
 
   darwin-hosted-smoke:
     name: Hosted macOS wheel smoke (${{ matrix.target }})
-    if: >-
-      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci-full')) ||
-      (github.event_name == 'workflow_dispatch' && inputs.tier == 'full')
-    needs: darwin-cross-wheel
+    if: needs.select-tier.outputs.full == 'true'
+    needs: [select-tier, darwin-cross-wheel]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -248,7 +277,7 @@ jobs:
   ci-queue-timing:
     name: CI queue timing
     if: always()
-    needs: [lint-no-macos-runners, rust, linux, native-wheel, darwin-cross-wheel]
+    needs: [select-tier, lint-no-macos-runners, rust, linux, native-wheel, darwin-cross-wheel, darwin-hosted-smoke]
     runs-on: ubuntu-latest
     permissions:
       actions: read

@@ -82,12 +82,17 @@ def _allowed_job(file: Path, document: object, path: str) -> bool:
     }:
         return False
     if file.name == "ci.yml":
-        full_condition = (
-            "(github.event_name == 'pull_request' && "
-            "contains(github.event.pull_request.labels.*.name, 'ci-full')) || "
-            "(github.event_name == 'workflow_dispatch' && inputs.tier == 'full')"
+        selector = jobs.get("select-tier", {})
+        command = " ".join(
+            str(step.get("run", ""))
+            for step in selector.get("steps", [])
+            if isinstance(step, dict)
         )
-        return condition == full_condition and needs == "darwin-cross-wheel"
+        return (
+            condition == "needs.select-tier.outputs.full == 'true'"
+            and set(needs) == {"select-tier", "darwin-cross-wheel"}
+            and "ci/select_ci_tier.py" in command
+        )
     if file.name == "auto-release.yml":
         return (
             condition == "needs.guard.outputs.release == 'true'"
