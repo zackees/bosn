@@ -54,9 +54,9 @@ competing load lived in other repositories.
 **Capacity decision: stay on hosted runners; reclaim the pool instead of
 buying more of it.** No self-hosted or reserved runner group is introduced —
 that would add an operational surface for a problem that was waste, not
-demand — and the no-hosted-macOS-runner policy from #252 is unchanged
-(`ci/lint_no_macos_runners.py` still enforces it; Darwin wheels remain
-Linux-hosted Soldr cross builds on `ubuntu-latest`).
+demand. Darwin wheels remain Linux-hosted Soldr cross builds on
+`ubuntu-latest`; hosted Mac execution is reserved for full CI and release,
+as `ci/lint_no_macos_runners.py` enforces.
 
 1. **Fleet-wide concurrency policy** (19 repositories, 224 workflow files,
    2026-09-14). Every workflow now carries:
@@ -84,6 +84,33 @@ Linux-hosted Soldr cross builds on `ubuntu-latest`).
    --count 3` prints the last three main-branch runs with maximum queue and
    execution times side by side and exits non-zero if any breached.
 
+## CI tiers (soldr#3345)
+
+Ordinary pull requests and main pushes run the minimal gate: the stable CI
+policy and Rust workspace status jobs, plus tier selection and queue timing.
+The `Rust workspace (locked tests)` job continues to run its locked tests, so
+minimal still checks executable code. A PR with `ci-test` also runs the Linux
+lint, unit, and Docker job. A PR with `ci-full` runs that tier plus both native
+wheel jobs, both Linux-hosted Darwin cross-wheel jobs, and both hosted macOS
+wheel smokes. `ci-full` takes precedence when both labels are present. Label
+additions and removals trigger a new run and reselect from the current labels.
+PR lanes explicitly check out `pull_request.head.sha`: the proof is for the
+candidate commit, not GitHub's synthetic PR merge commit. The full-tier
+`Full CI coverage (exact candidate SHA)` status checks every required Linux,
+Windows, Darwin cross, and hosted Mac cell after the matrix finishes; a
+missing, skipped, cancelled, or failed cell makes that status fail.
+
+Manual dispatch accepts `minimal`, `test`, or `full`. A full dispatch requires
+the 40-character `commit_sha` of the candidate. This input selects the checkout
+for every job, so it can differ from the branch SHA used to dispatch the workflow.
+The requested commit must be reachable and contain the CI selector scripts.
+The coverage status confirms its own checkout SHA and all named cell outcomes.
+Release still uses its separate workflow.
+
+The target for ordinary CI is at most 12.5% of a matched full event's total
+runner minutes. The lane selection is in place, but that ratio needs live
+minimal and full runs at the same revision before it can be reported.
+
 ## SLO
 
 Measured per job as start minus creation, on hosted runners:
@@ -92,6 +119,10 @@ Measured per job as start minus creation, on hosted runners:
 |---|---|---:|
 | Gates | `CI policy (no hosted macOS runners)`, `Rust workspace (locked tests)` | 5 min |
 | Release-relevant matrix | every other lane: Linux, both native wheels, both Darwin cross wheels | 15 min |
+
+The CI policy check keeps its legacy name because branch protection requires
+that exact status. Its current guard allows hosted macOS runners only for
+`ci-full` and release smoke jobs.
 
 Execution time has no SLO here; it is reported so regressions are visible, and
 tracked by their own issues (soldr#3231 for the Windows bootstrap).

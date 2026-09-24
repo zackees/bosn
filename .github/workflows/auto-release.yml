@@ -260,9 +260,36 @@ jobs:
           path: dist/bosn-*.whl
           if-no-files-found: error
 
+  darwin-hosted-smoke:
+    name: Hosted macOS release wheel smoke (${{ matrix.target }})
+    needs: [guard, darwin-wheel]
+    if: needs.guard.outputs.release == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v4
+        with:
+          name: bosn-wheel-${{ matrix.target }}
+          path: dist
+      - name: Install and smoke-test release wheel
+        run: python ci/verify_installed_wheel.py --installer pip "dist/bosn-*.whl"
+
   collect:
     name: Collect and verify the release set
-    needs: [guard, native-wheel, darwin-wheel]
+    needs: [guard, native-wheel, darwin-wheel, darwin-hosted-smoke]
     if: needs.guard.outputs.release == 'true'
     env:
       RELEASE_TAG: ${{ needs.guard.outputs.tag }}

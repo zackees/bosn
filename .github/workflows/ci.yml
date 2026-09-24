@@ -4,7 +4,17 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_dispatch:
+    inputs:
+      tier:
+        description: "CI tier; hosted macOS smoke runs only for full"
+        type: choice
+        options: [minimal, test, full]
+        default: minimal
+      commit_sha:
+        description: "Candidate commit SHA to check out (required for full)"
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
@@ -15,15 +25,42 @@ permissions:
   contents: read
 
 jobs:
+  select-tier:
+    name: Select CI tier
+    runs-on: ubuntu-latest
+    outputs:
+      tier: ${{ steps.select.outputs.tier }}
+      test: ${{ steps.select.outputs.test }}
+      full: ${{ steps.select.outputs.full }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
+      - id: select
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PATH: ${{ github.event_path }}
+          MANUAL_TIER: ${{ inputs.tier }}
+          MANUAL_SHA: ${{ inputs.commit_sha }}
+        run: >-
+          python3 ci/select_ci_tier.py --event "$EVENT_NAME"
+          --payload "$EVENT_PATH" --manual-tier "${MANUAL_TIER:-minimal}"
+          --manual-sha "$MANUAL_SHA"
+          --output "$GITHUB_OUTPUT"
+
   lint-no-macos-runners:
+    # Legacy required-check name in branch protection. The implementation now
+    # permits hosted Macs only in ci-full and release; keep this status stable.
     name: CI policy (no hosted macOS runners)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - name: Refuse native macOS runner labels
+      - name: Check hosted macOS runner scope
         # This policy needs only PyYAML.  Keep it independent from the Rust
         # extension build so it can fail immediately before build capacity is
         # spent on any wheel lane.
@@ -34,6 +71,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@master
@@ -71,30 +110,66 @@ jobs:
 
   linux:
     name: Linux (lint + unit + docker)
+    if: always()
+    needs: [select-tier]
     runs-on: ubuntu-latest
     steps:
+      # A skipped required check can satisfy branch protection. Fail explicitly
+      # if the selector failed or returned an unknown/inconsistent tier.
+      - name: Verify selected CI tier
+        if: always()
+        shell: bash
+        env:
+          SELECT_RESULT: ${{ needs.select-tier.result }}
+          CI_TIER: ${{ needs.select-tier.outputs.tier }}
+          RUN_TESTS: ${{ needs.select-tier.outputs.test }}
+          RUN_FULL: ${{ needs.select-tier.outputs.full }}
+        run: |
+          if [[ "$SELECT_RESULT" != success ]]; then
+            echo "CI tier selection failed: $SELECT_RESULT" >&2
+            exit 1
+          fi
+          case "$CI_TIER:$RUN_TESTS:$RUN_FULL" in
+            minimal:false:false|test:true:false|full:true:true) ;;
+            *) echo "Invalid CI tier selection" >&2; exit 1 ;;
+          esac
+
+      - name: Minimal tier required-check placeholder
+        if: needs.select-tier.outputs.test != 'true'
+        run: echo "Linux integration runs in test and full CI"
+
       - uses: actions/checkout@v4
+        if: needs.select-tier.outputs.test == 'true'
+        with:
+          ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
 
       - name: Install uv
+        if: needs.select-tier.outputs.test == 'true'
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
 
       - name: Docker engine version
+        if: needs.select-tier.outputs.test == 'true'
         run: docker version
 
       - name: Install
+        if: needs.select-tier.outputs.test == 'true'
         run: ./install
 
       - name: Lint
+        if: needs.select-tier.outputs.test == 'true'
         run: ./lint
 
       - name: Test (unit + docker)
+        if: needs.select-tier.outputs.test == 'true'
         run: ./test
 
 
   native-wheel:
     name: Native wheel (${{ matrix.os }})
+    if: always()
+    needs: [select-tier]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -102,19 +177,48 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         python: ["3.11"]
     steps:
+      - name: Verify selected CI tier
+        if: always()
+        shell: bash
+        env:
+          SELECT_RESULT: ${{ needs.select-tier.result }}
+          CI_TIER: ${{ needs.select-tier.outputs.tier }}
+          RUN_TESTS: ${{ needs.select-tier.outputs.test }}
+          RUN_FULL: ${{ needs.select-tier.outputs.full }}
+        run: |
+          if [[ "$SELECT_RESULT" != success ]]; then
+            echo "CI tier selection failed: $SELECT_RESULT" >&2
+            exit 1
+          fi
+          case "$CI_TIER:$RUN_TESTS:$RUN_FULL" in
+            minimal:false:false|test:true:false|full:true:true) ;;
+            *) echo "Invalid CI tier selection" >&2; exit 1 ;;
+          esac
+
+      # Branch protection requires each concrete matrix cell on every PR SHA.
+      - name: Minimal tier required-check placeholder
+        if: needs.select-tier.outputs.full != 'true'
+        run: echo "Native wheel build runs in full CI"
+
       - uses: actions/checkout@v4
+        if: needs.select-tier.outputs.full == 'true'
+        with:
+          ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Python ${{ matrix.python }}
+        if: needs.select-tier.outputs.full == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
 
       - name: Set up Rust
+        if: needs.select-tier.outputs.full == 'true'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
 
       - name: Install uv
+        if: needs.select-tier.outputs.full == 'true'
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
@@ -125,9 +229,11 @@ jobs:
       # This matrix intentionally has no Docker setup or Docker invocation.
       # The Linux job above remains the dedicated Docker integration lane.
       - name: Build platform wheel
+        if: needs.select-tier.outputs.full == 'true'
         run: uv build --wheel --out-dir dist
 
       - name: Install and smoke-test platform wheel outside the checkout
+        if: needs.select-tier.outputs.full == 'true'
         run: python ci/verify_installed_wheel.py "dist/bosn-*.whl"
 
       # The macOS Recovery lane (macos-x64-execute.yml) has no uv and no
@@ -135,11 +241,13 @@ jobs:
       # Exercise that exact path here on every run so the advisory lane never
       # fails for a verifier reason the gating lanes would have caught.
       - name: Smoke-test the wheel through the offline pip installer path
-        if: runner.os == 'Linux'
+        if: needs.select-tier.outputs.full == 'true' && runner.os == 'Linux'
         run: python ci/verify_installed_wheel.py --installer pip "dist/bosn-*.whl"
 
   darwin-cross-wheel:
     name: Darwin wheel (${{ matrix.target }}, Linux-hosted Soldr)
+    if: always()
+    needs: [select-tier]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -150,14 +258,42 @@ jobs:
           - target: aarch64-apple-darwin
             deployment_target: "11.0"
     steps:
+      - name: Verify selected CI tier
+        if: always()
+        shell: bash
+        env:
+          SELECT_RESULT: ${{ needs.select-tier.result }}
+          CI_TIER: ${{ needs.select-tier.outputs.tier }}
+          RUN_TESTS: ${{ needs.select-tier.outputs.test }}
+          RUN_FULL: ${{ needs.select-tier.outputs.full }}
+        run: |
+          if [[ "$SELECT_RESULT" != success ]]; then
+            echo "CI tier selection failed: $SELECT_RESULT" >&2
+            exit 1
+          fi
+          case "$CI_TIER:$RUN_TESTS:$RUN_FULL" in
+            minimal:false:false|test:true:false|full:true:true) ;;
+            *) echo "Invalid CI tier selection" >&2; exit 1 ;;
+          esac
+
+      # Preserve both required target contexts even when the full tier is off.
+      - name: Minimal tier required-check placeholder
+        if: needs.select-tier.outputs.full != 'true'
+        run: echo "Darwin wheel build runs in full CI"
+
       - uses: actions/checkout@v4
+        if: needs.select-tier.outputs.full == 'true'
+        with:
+          ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Python 3.11
+        if: needs.select-tier.outputs.full == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Set up Rust
+        if: needs.select-tier.outputs.full == 'true'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
@@ -165,26 +301,31 @@ jobs:
       # Pinned setup-soldr v0. The action supplies Soldr's blessed LLVM 21.1.5
       # and Apple SDK 14.5, not a host macOS runner or zig/osxcross fallback.
       - name: Set up Soldr Darwin target
+        if: needs.select-tier.outputs.full == 'true'
         uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
         with:
           cache: false
           cross-targets: ${{ matrix.target }}
 
       - name: Export Soldr target environment
+        if: needs.select-tier.outputs.full == 'true'
         run: soldr prepare --target "${{ matrix.target }}" --github-env "$GITHUB_ENV"
 
       # Maturin invokes Cargo directly through the PEP 517 backend.  Ensure
       # that the runner's pinned Rust toolchain has the same std component
       # Soldr prepared, rather than relying on a host default target set.
       - name: Install Rust standard library for Darwin target
+        if: needs.select-tier.outputs.full == 'true'
         run: rustup target add "${{ matrix.target }}" --toolchain 1.95.0
 
       - name: Install uv
+        if: needs.select-tier.outputs.full == 'true'
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
 
       - name: Build Darwin wheel on Linux
+        if: needs.select-tier.outputs.full == 'true'
         env:
           BOSN_WHEEL_TARGET: ${{ matrix.target }}
           PYO3_CROSS_PYTHON_VERSION: "3.10"
@@ -192,16 +333,65 @@ jobs:
         run: uv build --wheel --out-dir dist
 
       - name: Verify Darwin wheel statically on Linux
+        if: needs.select-tier.outputs.full == 'true'
         run: >-
           python ci/verify_cross_wheel.py "dist/bosn-*.whl"
           --target "${{ matrix.target }}"
 
       - name: Upload Darwin wheel
+        if: needs.select-tier.outputs.full == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: bosn-wheel-${{ matrix.target }}
           path: dist/bosn-*.whl
           if-no-files-found: error
+
+  darwin-hosted-smoke:
+    name: Hosted macOS wheel smoke (${{ matrix.target }})
+    if: needs.select-tier.outputs.full == 'true'
+    needs: [select-tier, darwin-cross-wheel]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v4
+        with:
+          name: bosn-wheel-${{ matrix.target }}
+          path: dist
+      - name: Install and smoke-test Linux-built Darwin wheel
+        run: python ci/verify_installed_wheel.py --installer pip "dist/bosn-*.whl"
+
+  full-coverage:
+    name: Full CI coverage (exact candidate SHA)
+    if: always() && needs.select-tier.outputs.full == 'true'
+    needs: [select-tier, lint-no-macos-runners, rust, linux, native-wheel, darwin-cross-wheel, darwin-hosted-smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
+      - name: Verify all full-tier platform cells
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
+        run: >-
+          python3 ci/verify_full_coverage.py --run-id "${{ github.run_id }}"
+          --candidate-sha "$CANDIDATE_SHA"
 
   # Queue visibility (issue #257). The hosted runner pool is shared account-wide,
   # so a run can wait behind other repositories' work for longer than it takes
@@ -212,13 +402,15 @@ jobs:
   ci-queue-timing:
     name: CI queue timing
     if: always()
-    needs: [lint-no-macos-runners, rust, linux, native-wheel, darwin-cross-wheel]
+    needs: [select-tier, lint-no-macos-runners, rust, linux, native-wheel, darwin-cross-wheel, darwin-hosted-smoke, full-coverage]
     runs-on: ubuntu-latest
     permissions:
       actions: read
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
       - name: Report queue and execution timing against the SLO
         env:
           GITHUB_TOKEN: ${{ github.token }}

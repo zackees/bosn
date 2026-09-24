@@ -157,7 +157,7 @@ def analyze(
         limit = limit_for(job, slo)
         if job.started is None:
             waited = (clock - job.created).total_seconds() / 60
-            if job.conclusion in (None, "cancelled", "skipped") and waited > limit:
+            if job.conclusion in (None, "cancelled") and waited > limit:
                 report.breaches.append(Breach(job, "never-started", waited, limit))
             elif job.conclusion is None:
                 report.breaches.append(Breach(job, "never-started", waited, limit))

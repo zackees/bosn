@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Fail CI when a workflow schedules a native macOS runner.
+"""Allow hosted macOS only in explicitly full CI and release smoke jobs.
 
-Issue #252 replaces Bosn's hosted macOS wheel lane with Soldr's Linux-hosted
-Darwin cross build.  This parses YAML scheduling positions rather than grepping
-prose, conditions, or the explanation of why native Mac runners are absent.
+Darwin wheels stay Linux-built through Soldr. This parses YAML scheduling
+positions so prose cannot accidentally change the runner policy.
 """
 
 from __future__ import annotations
@@ -62,6 +61,46 @@ def offenders(document: object) -> Iterator[tuple[str, str]]:
                 yield path, text.strip()
 
 
+def _allowed_job(file: Path, document: object, path: str) -> bool:
+    """Accept only the named smoke job with its event and dependency gate."""
+    if not path.startswith("jobs.darwin-hosted-smoke.") or not isinstance(document, dict):
+        return False
+    jobs = document.get("jobs", {})
+    job = jobs.get("darwin-hosted-smoke", {}) if isinstance(jobs, dict) else {}
+    if not isinstance(job, dict):
+        return False
+    condition = " ".join(str(job.get("if", "")).split())
+    needs = job.get("needs", [])
+    matrix = job.get("strategy", {}).get("matrix", {})
+    targets = matrix.get("include", []) if isinstance(matrix, dict) else []
+    runner_pair = {
+        (entry.get("target"), entry.get("runner")) for entry in targets if isinstance(entry, dict)
+    }
+    if runner_pair != {
+        ("x86_64-apple-darwin", "macos-15-intel"),
+        ("aarch64-apple-darwin", "macos-15"),
+    }:
+        return False
+    if file.name == "ci.yml":
+        selector = jobs.get("select-tier", {})
+        command = " ".join(
+            str(step.get("run", "")) for step in selector.get("steps", []) if isinstance(step, dict)
+        )
+        return (
+            condition == "needs.select-tier.outputs.full == 'true'"
+            and set(needs) == {"select-tier", "darwin-cross-wheel"}
+            and "ci/select_ci_tier.py" in command
+        )
+    if file.name == "auto-release.yml":
+        return (
+            condition == "needs.guard.outputs.release == 'true'"
+            and isinstance(needs, list)
+            and "guard" in needs
+            and "darwin-wheel" in needs
+        )
+    return False
+
+
 def check(*targets: Path) -> int:
     files = [
         file
@@ -82,6 +121,8 @@ def check(*targets: Path) -> int:
             print(f"lint_no_macos_runners: {file}: {error}", file=sys.stderr)
             return 2
         for path, label in offenders(document):
+            if _allowed_job(file, document, path):
+                continue
             print(f"{file}: {path}: native macOS runner label {label!r}", file=sys.stderr)
             failures += 1
     if failures:
