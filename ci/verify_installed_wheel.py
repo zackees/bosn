@@ -40,6 +40,9 @@ RETIRED_LIFECYCLE_MODULES = (
 # The smoke lane must fail diagnostically rather than leave a platform runner
 # occupied forever when a child process or its local IPC transport wedges.
 CLI_TIMEOUT_SECONDS = 10
+# Doctor prints its report before scanning Docker for unmanaged artifacts. One
+# census read may legitimately use its 30-second deadline on Windows.
+DOCTOR_TIMEOUT_SECONDS = 45
 INSTALL_TIMEOUT_SECONDS = 120
 REAP_TIMEOUT_SECONDS = 10
 
@@ -337,6 +340,7 @@ def json_output(
     state: Path | None = None,
     daemon: subprocess.Popen[bytes] | None = None,
     daemon_log: BinaryIO | None = None,
+    timeout: int = CLI_TIMEOUT_SECONDS,
 ) -> dict[str, object]:
     result = run(
         command,
@@ -345,6 +349,7 @@ def json_output(
         state=state,
         daemon=daemon,
         daemon_log=daemon_log,
+        timeout=timeout,
     )
     try:
         value = json.loads(result.stdout)
@@ -353,6 +358,26 @@ def json_output(
     if not isinstance(value, dict):
         fail(f"{command!r} emitted a non-object JSON value: {value!r}")
     return value
+
+
+def doctor_json_output(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    state: Path | None = None,
+    daemon: subprocess.Popen[bytes] | None = None,
+    daemon_log: BinaryIO | None = None,
+) -> dict[str, object]:
+    return json_output(
+        command,
+        cwd=cwd,
+        env=env,
+        state=state,
+        daemon=daemon,
+        daemon_log=daemon_log,
+        timeout=DOCTOR_TIMEOUT_SECONDS,
+    )
 
 
 def wait_for_daemon(
@@ -492,7 +517,7 @@ def verify_installed_wheel(wheel: Path, installer: str = "uv") -> None:
             fail(f"installed CLI reported an unexpected version: {version.stdout!r}")
 
         phase("verify offline doctor")
-        offline_doctor = json_output(
+        offline_doctor = doctor_json_output(
             [str(cli), "doctor", "--state-dir", str(state), "--json"], cwd=workdir, env=env
         )
         if (
@@ -527,7 +552,7 @@ def verify_installed_wheel(wheel: Path, installer: str = "uv") -> None:
                     daemon_log=daemon_log,
                 )
                 phase("verify online doctor")
-                doctor = json_output(
+                doctor = doctor_json_output(
                     [str(cli), "doctor", "--state-dir", str(state), "--json"],
                     cwd=workdir,
                     env=env,

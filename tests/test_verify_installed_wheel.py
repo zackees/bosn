@@ -73,3 +73,30 @@ def test_inline_smoke_script_uses_the_platform_extension_contract(
     script = verifier.installed_extension_smoke_script()
 
     assert f'assert origin.name == "{expected_extension}"' in script
+
+
+def test_doctor_smoke_allows_the_bounded_census_deadline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_json_output(command: list[str], **kwargs: object) -> dict[str, object]:
+        calls.append({"command": command, **kwargs})
+        return {"action": "doctor"}
+
+    monkeypatch.setattr(verifier, "json_output", fake_json_output)
+    command = ["bosn", "doctor", "--json"]
+
+    assert verifier.doctor_json_output(command, cwd=tmp_path, env={}) == {"action": "doctor"}
+    assert calls == [
+        {
+            "command": command,
+            "cwd": tmp_path,
+            "env": {},
+            "state": None,
+            "daemon": None,
+            "daemon_log": None,
+            "timeout": verifier.DOCTOR_TIMEOUT_SECONDS,
+        }
+    ]
+    assert verifier.DOCTOR_TIMEOUT_SECONDS > 30
