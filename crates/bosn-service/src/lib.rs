@@ -16121,9 +16121,16 @@ mod tests {
 
     async fn wait_for_client(state: &Path) -> Client {
         let client = Client::for_state(state).unwrap();
-        for _ in 0..30 {
+        // Keep the fast 20 ms poll, but give a saturated CI runner time to
+        // start the daemon. The old 30 polls allowed only 600 ms and made
+        // unrelated service tests fail before their assertions ran.
+        let started = std::time::Instant::now();
+        loop {
             if client.ping().await.is_ok() {
                 return client;
+            }
+            if started.elapsed() >= Duration::from_secs(5) {
+                break;
             }
             async_engine::sleep(Duration::from_millis(20)).await;
         }
