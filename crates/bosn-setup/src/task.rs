@@ -477,10 +477,9 @@ fn validate_plan_shape(plan: &SetupPlan) -> Result<(), SetupTaskError> {
         (
             bosn_core::SetupSource::InlineDockerfile(_),
             SetupPlanAppSource::InlineDockerfile { dockerfile_path },
-        ) if plan
-            .asset_root
-            .as_ref()
-            .is_some_and(|root| dockerfile_path == &root.join("Dockerfile")) => {}
+        ) if plan.asset_root.as_ref().is_some_and(|root| {
+            crate::materialize::materialized_dockerfile_relative(root, dockerfile_path).is_some()
+        }) => {}
         _ => {
             return Err(SetupTaskError::InvalidRequest(
                 "plan application receipt was modified",
@@ -927,6 +926,7 @@ mod tests {
             app_source: SetupPlanAppSource::PinnedImage { image },
             named_volumes: Vec::new(),
             tmpfs: Vec::new(),
+            host_docker_socket: None,
             macos_guest: None,
         }
     }

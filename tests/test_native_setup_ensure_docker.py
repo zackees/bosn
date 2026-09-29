@@ -22,10 +22,9 @@ import bosn
 from native_binary import native_binary
 
 PINNED_ALPINE = "alpine@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b"
-# The legacy-manifest runtime intentionally derives no application command.
-# Unlike Alpine's interactive shell default, MySQL's image-declared server is
-# long-running, so it proves the daemon has actually started a standard Linux
-# application without adding a command escape hatch to the manifest surface.
+# A Linux manifest stack runs a fixed daemon-owned idle PID 1 (declared tasks
+# run through exec), so any base image works; the manifest surface still has
+# no command escape hatch. MySQL is kept as a realistic non-trivial image.
 PINNED_MANIFEST_MYSQL = (
     "mysql@sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b"
 )

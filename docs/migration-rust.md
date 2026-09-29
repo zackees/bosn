@@ -95,6 +95,55 @@ execute both Darwin wheels on hosted macOS runners. The package native module is
 `abi3-py310`: all platform wheels carry `cp310-abi3` tags and package metadata
 permits CPython 3.10+, rather than releasing cp311-only Darwin wheels.
 
+## Consumer migration: from the Python CLI (0.1.x) to native `bosn`
+
+The Python CLI's `bosn run --task NAME` is restored natively (see
+[`bosn run`](rust-manifest-runtime.md#bosn-run)); `bosn run -- COMMAND`,
+`bosn shell`, `bosn tasks`, and the other Python-only verbs are not. A
+consumer such as clud migrates as follows.
+
+1. **Pin every Dockerfile `FROM`.** Native Bosn refuses a tag-only external
+   image because a tag cannot prove which bytes a generation was built from.
+   Rewrite `FROM debian:bookworm-slim` as
+   `FROM debian:bookworm-slim@sha256:<digest>` (the digest comes from
+   `docker buildx imagetools inspect debian:bookworm-slim`). The refusal
+   message names the offending reference. Multi-stage `FROM x AS name` lines
+   are pinned the same way; `FROM <earlier stage>` needs nothing.
+2. **Keep the manifest.** Nested Dockerfiles, workspace binds, stack/machine
+   volumes, `tmpfs = ["/p:rw,exec,mode=1777"]`, `env`, `workdir`, and a bind
+   of `/var/run/docker.sock` (for `act`) are accepted as written. The socket
+   bind is outside Bosn supervision: `act`'s sibling job containers are not
+   Bosn-managed (clud's `ci/act_ci.sh` already passes `--rm`).
+3. **Optionally declare `secrets = ["github_token"]`** on `act` tasks and run
+   `bosn secret set github_token --from-gh` once; see
+   [task-secrets.md](task-secrets.md). Without it, anonymous GitHub API calls
+   are rate-limited and the daemon prints a warning.
+4. **Install native Bosn** in place of the Python CLI. From a checkout of
+   `main` (no release carries this yet):
+   `uv tool install --force 'bosn @ git+https://github.com/zackees/bosn@main'`
+   (building needs the Rust toolchain and `soldr`), or install the published
+   wheel once one is released.
+5. **Cut over the daemon.** The Python CLI and native Bosn default to the
+   same state directory (`~/.local/state/bosn`), and the native daemon refuses
+   an older-schema registry (`bosn daemon serve` reports
+   `LegacyImportRequired(3)` for 0.1.x). With the *old* CLI still installed,
+   stop its daemon (`bosn daemon stop`) and wait for running tasks to finish,
+   then move its state aside (for example to
+   `~/.local/state/bosn-python-0.1`) before the first native `bosn run`, which
+   starts the native daemon on a fresh registry. The offline
+   `bosn registry import-v4` bridge ([python-v4-cutover.md](python-v4-cutover.md))
+   accepts only a v4 registry with the marker a bridge-capable Python-v4
+   release writes; a 0.1.x (schema 3) registry cannot be imported. Native
+   stacks therefore start with cold named volumes (for example clud's
+   `act-cache` and `act-server-cache`, now named `bosn-v-machine-*`) and
+   rebuild their images once. The Python CLI's containers and volumes are not
+   adopted, changed, or deleted; remove them yourself once the native stacks
+   work (the read-only `bosn gc --unmanaged` preview lists Docker artifacts the
+   native registry does not own; review it before any `--apply`).
+6. **Replace commands.** `bosn run --task act-ci-static` and
+   `bosn run --task act-ci-linux` keep their spelling. Scripts that parsed the
+   Python CLI's output should rely only on the exit status: it is the task's.
+
 ## Verification
 
 The retirement slice is checked by:

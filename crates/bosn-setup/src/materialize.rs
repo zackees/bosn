@@ -437,6 +437,19 @@ fn expected_assets(
     Ok(output)
 }
 
+/// The Dockerfile's spelling relative to its materialized asset root, when it
+/// is a normalized relative path strictly below that root. A setup document's
+/// inline Dockerfile is always `Dockerfile`; a manifest may name a nested one
+/// (for example `bosn/act.Dockerfile`), which is materialized at the same
+/// relative path with the workspace-root build context.
+pub(crate) fn materialized_dockerfile_relative(
+    asset_root: &Path,
+    dockerfile_path: &Path,
+) -> Option<String> {
+    let relative = dockerfile_path.strip_prefix(asset_root).ok()?.to_str()?;
+    valid_relative_asset_path(relative).then(|| relative.to_owned())
+}
+
 fn valid_relative_asset_path(path: &str) -> bool {
     let bytes = path.as_bytes();
     !path.is_empty()

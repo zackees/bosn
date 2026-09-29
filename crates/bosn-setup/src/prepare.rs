@@ -36,7 +36,11 @@ impl SetupImageCommand {
     fn docker_args(&self) -> Vec<String> {
         match self {
             Self::Pull { image } => vec!["image".into(), "pull".into(), image.clone()],
-            Self::Build { tag, .. } => vec![
+            Self::Build {
+                tag,
+                asset_root,
+                dockerfile_path,
+            } => vec![
                 "build".into(),
                 // A local setup app is single-platform. Without this,
                 // recent BuildKit releases export an OCI index whose `.Id`
@@ -49,7 +53,8 @@ impl SetupImageCommand {
                 "--file".into(),
                 // The Dockerfile and context are relative to a validated,
                 // private current directory; neither is caller argv.
-                "Dockerfile".into(),
+                crate::materialize::materialized_dockerfile_relative(asset_root, dockerfile_path)
+                    .expect("validated plan Dockerfile lies below its asset root"),
                 ".".into(),
             ],
             Self::Inspect { image } => vec![
@@ -197,11 +202,13 @@ pub async fn prepare_setup_image<E: SetupImageEngine>(
             image: image.clone(),
         },
         ValidatedPlan::Inline {
-            tag, asset_root, ..
+            tag,
+            asset_root,
+            dockerfile_path,
         } => SetupImageCommand::Build {
             tag: tag.clone(),
             asset_root: asset_root.clone(),
-            dockerfile_path: asset_root.join("Dockerfile"),
+            dockerfile_path: dockerfile_path.clone(),
         },
     };
     let action_name = match &action {
@@ -258,8 +265,14 @@ pub async fn prepare_setup_image<E: SetupImageEngine>(
 
 #[derive(Clone, Debug)]
 enum ValidatedPlan {
-    Pinned { image: String },
-    Inline { tag: String, asset_root: PathBuf },
+    Pinned {
+        image: String,
+    },
+    Inline {
+        tag: String,
+        asset_root: PathBuf,
+        dockerfile_path: PathBuf,
+    },
 }
 
 impl ValidatedPlan {
@@ -303,9 +316,11 @@ fn validate_plan(plan: &SetupPlan) -> Result<ValidatedPlan, SetupPrepareError> {
                     "inline Dockerfile has no asset root",
                 ));
             };
-            if dockerfile_path != &asset_root.join("Dockerfile") {
+            if crate::materialize::materialized_dockerfile_relative(asset_root, dockerfile_path)
+                .is_none()
+            {
                 return Err(SetupPrepareError::InvalidPlan(
-                    "inline Dockerfile is not the root Dockerfile",
+                    "inline Dockerfile is not below its asset root",
                 ));
             }
             verify_materialized_assets(&plan.content_sha256, asset_root)
@@ -313,6 +328,7 @@ fn validate_plan(plan: &SetupPlan) -> Result<ValidatedPlan, SetupPrepareError> {
             Ok(ValidatedPlan::Inline {
                 tag: format!("bosn-setup:{}", plan.content_sha256),
                 asset_root: asset_root.clone(),
+                dockerfile_path: dockerfile_path.clone(),
             })
         }
     }
@@ -487,6 +503,7 @@ mod tests {
             },
             named_volumes: Vec::new(),
             tmpfs: Vec::new(),
+            host_docker_socket: None,
             macos_guest: None,
         }
     }
@@ -530,6 +547,7 @@ mod tests {
                 },
                 named_volumes: Vec::new(),
                 tmpfs: Vec::new(),
+                host_docker_socket: None,
                 macos_guest: None,
             },
         )
@@ -694,6 +712,46 @@ mod tests {
             run(&engine, &plan, &cancel.token()),
             Err(SetupPrepareError::InvalidPlan(_))
         ));
+        plan.app_source = SetupPlanAppSource::InlineDockerfile {
+            dockerfile_path: root.join("..").join("Dockerfile"),
+        };
+        assert!(matches!(
+            run(&engine, &plan, &cancel.token()),
+            Err(SetupPrepareError::InvalidPlan(_))
+        ));
         assert!(engine.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn nested_manifest_dockerfile_builds_with_its_relative_file_and_root_context() {
+        let root = PathBuf::from("/state/assets/abc");
+        assert_eq!(
+            SetupImageCommand::Build {
+                tag: "bosn-setup:x".into(),
+                asset_root: root.clone(),
+                dockerfile_path: root.join("bosn").join("act.Dockerfile"),
+            }
+            .docker_args(),
+            vec![
+                "build".to_owned(),
+                "--provenance=false".into(),
+                "--tag".into(),
+                "bosn-setup:x".into(),
+                "--file".into(),
+                "bosn/act.Dockerfile".into(),
+                ".".into(),
+            ]
+        );
+        for escaped in [
+            root.join("..").join("Dockerfile"),
+            PathBuf::from("/elsewhere/Dockerfile"),
+            root.clone(),
+        ] {
+            assert_eq!(
+                crate::materialize::materialized_dockerfile_relative(&root, &escaped),
+                None,
+                "{escaped:?}"
+            );
+        }
     }
 }
