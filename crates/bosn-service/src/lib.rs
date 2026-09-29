@@ -76,6 +76,11 @@ pub const MANIFEST_MAX_DEADLINE: Duration = Duration::from_secs(4 * 60 * 60);
 pub const MANIFEST_MAX_OUTPUT: usize = 64 * 1024 * 1024;
 const SETUP_PREPARE_COMMAND_QUEUE: usize = 64;
 const SETUP_PREPARE_EVENT_QUEUE: usize = 16;
+/// Manifest builds and tasks (for example `act` running a CI job) emit
+/// bursts faster than the job log actor drains them one record at a time.
+/// The engine drops the exec rather than block when this queue is full, so
+/// buffer up to 1024 chunks of at most 8 KiB (8 MiB) before that happens.
+const MANIFEST_ENGINE_EVENT_QUEUE: usize = 1024;
 /// One fixed engine version probe. This is intentionally independent of setup
 /// job limits: diagnostic callers cannot select a deadline, output budget, or
 /// any Docker command.
@@ -1157,7 +1162,7 @@ impl ManifestEnsureExecutor for DockerManifestEnsureExecutor {
                 autostart,
                 ..
             } = runtime;
-            let (events, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
+            let (events, mut receiver) = async_engine::channel(MANIFEST_ENGINE_EVENT_QUEUE);
             let forwarded_logs = logs.clone();
             let forwarder = async_engine::launch(async move {
                 while let Some(event) = receiver.recv().await {
@@ -1283,7 +1288,7 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                 SecretMasker::new(task_secrets.values.iter().map(|(_, value)| value));
             let mut stream_masker =
                 SecretMasker::new(task_secrets.values.iter().map(|(_, value)| value));
-            let (events, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
+            let (events, mut receiver) = async_engine::channel(MANIFEST_ENGINE_EVENT_QUEUE);
             let forwarded_logs = logs.clone();
             let forwarder = async_engine::launch(async move {
                 while let Some(event) = receiver.recv().await {
