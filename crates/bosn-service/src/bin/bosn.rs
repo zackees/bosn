@@ -32,6 +32,8 @@ use serde_json::json;
 
 #[path = "bosn/act.rs"]
 mod act;
+#[path = "bosn/secret.rs"]
+mod secret;
 
 const SETUP_PREPARE_MAX_DEADLINE_MS: u64 = 5 * 60 * 1_000;
 const SETUP_PREPARE_MAX_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
@@ -63,6 +65,7 @@ fn main() {
         "registry" => run_registry(arguments),
         "gc" => run_gc(arguments),
         "scan" => run_scan(arguments),
+        "secret" => secret::run(arguments),
         _ => usage(),
     }
 }
@@ -2894,6 +2897,9 @@ fn usage() -> ! {
     eprintln!("   or: bosn act plan --workspace WORKSPACE --workflow RELATIVE_YML --event pull_request|push|release --mode minimal|test|full --sha 40_HEX --act-version VERSION [--act-bin PATH] [--job ID] [--json]");
     eprintln!("   or: bosn act run|report (refuses until isolated Docker ownership is implemented)");
     eprintln!("usage: bosn mcp [--state-dir STATE_DIR]");
+    eprintln!(
+        "   or: bosn secret set github_token [--from-gh] [--state-dir STATE_DIR] (value on stdin)\n   or: bosn secret status [--state-dir STATE_DIR] [--json]\n   or: bosn secret remove github_token [--state-dir STATE_DIR]"
+    );
     eprintln!("   or: bosn daemon serve --state-dir STATE_DIR");
     eprintln!("   or: bosn daemon status --state-dir STATE_DIR [--json]");
     eprintln!("   or: bosn daemon stop --state-dir STATE_DIR [--json]");

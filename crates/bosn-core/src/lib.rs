@@ -21,7 +21,9 @@ pub use config::{
     AppPolicy, MachinePolicy, PolicyDefaults, PolicyError, PolicyOrigin, parse_machine_policy_toml,
     resolve_app_policy, resolve_machine_policy,
 };
-pub use manifest::{Manifest, ManifestError, ManifestRoots, parse_manifest_toml};
+pub use manifest::{
+    MANIFEST_TASK_SECRETS, Manifest, ManifestError, ManifestRoots, parse_manifest_toml,
+};
 pub use setup::{
     CompanionFile, MAX_COMPANION_FILE_BYTES, MAX_COMPANION_FILES, MAX_ENVIRONMENT_ENTRIES,
     MAX_INLINE_DOCKERFILE_BYTES, MAX_MOUNTS, MAX_SETUP_DOCUMENT_BYTES, MAX_TASKS,

@@ -99,3 +99,24 @@ fn destinations_guests_and_image_dockerfile_contracts_are_explicit() {
         assert!(parse_manifest_toml(invalid, roots()).is_err());
     }
 }
+
+#[test]
+fn task_secrets_are_declared_by_name_only() {
+    let manifest = parse_manifest_toml(
+        "[stack.a]\nimage='x'\n[task.ci]\ncmd='true'\nsecrets=['github_token']\n[task.plain]\ncmd='true'\n",
+        roots(),
+    )
+    .unwrap();
+    assert_eq!(manifest.task("ci").unwrap().secrets, vec!["github_token"]);
+    assert!(manifest.task("plain").unwrap().secrets.is_empty());
+    for bad in [
+        "secrets='github_token'",
+        "secrets=['unknown']",
+        "secrets=['github_token','github_token']",
+        "secrets=[1]",
+        "secrets=['/home/me/token']",
+    ] {
+        let source = format!("[stack.a]\nimage='x'\n[task.ci]\ncmd='true'\n{bad}\n");
+        assert!(parse_manifest_toml(&source, roots()).is_err(), "{bad}");
+    }
+}

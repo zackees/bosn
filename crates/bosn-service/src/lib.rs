@@ -41,6 +41,7 @@ use kernal_api::{
     },
 };
 use prost::Message;
+use secrets::{MaskStream, SecretMasker};
 use std::{
     collections::BTreeMap,
     future::Future,
@@ -52,6 +53,7 @@ use std::{
 pub mod autostart;
 pub mod jobs;
 pub mod mcp;
+pub mod secrets;
 pub mod unmanaged;
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -1258,15 +1260,48 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
             .map_err(|_| "manifest app task planning exceeded its deadline".to_owned())??;
             let guest_task = runtime.guest_task;
             let plan = runtime.plan;
+            let task_command = plan
+                .tasks
+                .get(&request.task_name)
+                .map(|task| task.command.clone())
+                .unwrap_or_default();
+            let task_secrets = load_manifest_task_secrets(&self.state_dir, &runtime.secrets)?;
+            let (engine, passthrough_env) = task_secrets.docker_engine(&self.engine);
+            let error_masker =
+                SecretMasker::new(task_secrets.values.iter().map(|(_, value)| value));
+            let mut stream_masker =
+                SecretMasker::new(task_secrets.values.iter().map(|(_, value)| value));
             let (events, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
             let forwarded_logs = logs.clone();
             let forwarder = async_engine::launch(async move {
                 while let Some(event) = receiver.recv().await {
+                    let event = mask_engine_event(&mut stream_masker, event);
+                    forward_engine_event(&forwarded_logs, event).await?;
+                }
+                for event in [
+                    EngineEvent::Stdout(stream_masker.finish(MaskStream::Stdout)),
+                    EngineEvent::Stderr(stream_masker.finish(MaskStream::Stderr)),
+                ] {
                     forward_engine_event(&forwarded_logs, event).await?;
                 }
                 Ok::<(), String>(())
             });
+            let preflight = manifest_task_github_preflight(
+                &runtime.secrets,
+                &task_secrets.missing,
+                &task_command,
+            );
             let result = async {
+                if let Some(warning) = preflight {
+                    logs.send(warning)
+                        .await
+                        .map_err(|_| "manifest app task log consumer closed".to_owned())?;
+                }
+                if guest_task.is_some() && !passthrough_env.is_empty() {
+                    return Err(
+                        "manifest task secrets are not supported for macOS guest tasks".into(),
+                    );
+                }
                 let remaining = deadline.remaining();
                 if cancellation.is_cancelled() || remaining.is_zero() {
                     return Err("manifest app task ended before image verification".into());
@@ -1343,11 +1378,12 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                     .await
                     .map_err(|_| "manifest app task ownership recording unavailable".to_owned())?;
                 let result = execute_setup_app_task(
-                    &self.engine,
+                    &engine,
                     SetupAppTaskRequest {
                         plan: &plan,
                         workspace_root: request.workspace.clone(),
                         task_name: request.task_name.clone(),
+                        passthrough_env: passthrough_env.clone(),
                         prepared_image: &prepared,
                         options: RunOptions::streaming(deadline.remaining(), exec_output),
                         cancellation,
@@ -1382,7 +1418,11 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
             forwarder
                 .await
                 .map_err(|_| "manifest app task log forwarder stopped".to_owned())??;
+            // Error text can quote task stdout/stderr; it is stored as the
+            // job error and returned to clients, so it is masked too.
             result
+                .map(|text| error_masker.mask_text(&text))
+                .map_err(|text| error_masker.mask_text(&text))
         })
     }
 }
@@ -1902,6 +1942,7 @@ async fn manifest_stack_plan(
     };
     let mut tasks = BTreeMap::new();
     let mut guest_task = None;
+    let mut secrets = Vec::new();
     if let Some(task_name) = task_name {
         let task = manifest
             .task(task_name)
@@ -1912,6 +1953,10 @@ async fn manifest_stack_plan(
         if task.cmd.len() > 16 * 1024 || task.cmd.contains('\0') {
             return Err("selected manifest task command is unsafe".into());
         }
+        if !task.secrets.is_empty() && stack.guest.is_some() {
+            return Err("manifest task secrets are not supported for macOS guest tasks".into());
+        }
+        secrets.clone_from(&task.secrets);
         tasks.insert(
             task.name.clone(),
             SetupTask {
@@ -1994,6 +2039,7 @@ async fn manifest_stack_plan(
         is_guest: stack.kind.as_deref() == Some("macos-x64-guest"),
         autostart,
         guest_task,
+        secrets,
     })
 }
 
@@ -2067,6 +2113,8 @@ struct ManifestRuntimePlan {
     /// Remote-only details retained outside `SetupPlan`: the setup container
     /// receipt must stay free of a Linux-container workdir for a VM guest.
     guest_task: Option<ManifestGuestTask>,
+    /// Secret names the selected task declared (#308); names only.
+    secrets: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3234,6 +3282,7 @@ impl SetupAppTaskExecutor for DockerSetupAppTaskExecutor {
                     plan: &plan,
                     workspace_root: request.workspace,
                     task_name: request.task_name,
+                    passthrough_env: Vec::new(),
                     prepared_image: &prepared,
                     options: RunOptions::streaming(remaining, exec_output),
                     cancellation,
@@ -3275,6 +3324,83 @@ impl SetupAppTaskExecutor for DockerSetupAppTaskExecutor {
     }
 }
 
+/// Values of the secrets one manifest task declared and that are provisioned.
+struct ManifestTaskSecrets {
+    values: Vec<(&'static str, String)>,
+    missing: Vec<String>,
+}
+
+impl ManifestTaskSecrets {
+    /// The Docker client carrying each value in its process environment, and
+    /// the names to forward with a bare `--env NAME` (never `NAME=value`).
+    fn docker_engine(&self, base: &DockerEngine) -> (DockerEngine, Vec<String>) {
+        let engine = self
+            .values
+            .iter()
+            .fold(base.clone(), |engine, (env, value)| engine.env(*env, value));
+        let names = self
+            .values
+            .iter()
+            .map(|(env, _)| (*env).to_owned())
+            .collect();
+        (engine, names)
+    }
+}
+
+/// Resolve declared secrets from daemon state. A refused secret (symlink,
+/// loose mode, bad content) fails the task; a missing one runs without it.
+fn load_manifest_task_secrets(
+    state_dir: &Path,
+    declared: &[String],
+) -> Result<ManifestTaskSecrets, String> {
+    let mut values = Vec::new();
+    let mut missing = Vec::new();
+    for name in declared {
+        let env = secrets::secret_env_name(name)
+            .ok_or_else(|| "manifest task declares an unknown secret".to_owned())?;
+        match secrets::read_secret(state_dir, name)? {
+            Some(value) => values.push((env, value)),
+            None => missing.push(name.clone()),
+        }
+    }
+    Ok(ManifestTaskSecrets { values, missing })
+}
+
+/// One-line warning when a task will call GitHub anonymously: it declared
+/// `github_token` but none is provisioned, or it looks like an act run and
+/// declared nothing.
+fn manifest_task_github_preflight(
+    declared: &[String],
+    missing: &[String],
+    command: &str,
+) -> Option<String> {
+    const REMEDY: &str = "anonymous GitHub API calls are limited to 60/hour per IP; run `bosn secret set github_token` (a fine-grained token with no scopes is enough)";
+    if missing.iter().any(|name| name == "github_token") {
+        return Some(format!(
+            "[manifest-app-task] warning: secret github_token is not provisioned, so GITHUB_TOKEN is unset; {REMEDY}"
+        ));
+    }
+    let looks_like_act = command
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|word| word == "act");
+    if looks_like_act && !declared.iter().any(|name| name == "github_token") {
+        return Some(format!(
+            "[manifest-app-task] warning: this task looks like an act run but does not declare secrets = [\"github_token\"]; {REMEDY}"
+        ));
+    }
+    None
+}
+
+fn mask_engine_event(masker: &mut SecretMasker, event: EngineEvent) -> EngineEvent {
+    if masker.is_empty() {
+        return event;
+    }
+    match event {
+        EngineEvent::Stdout(bytes) => EngineEvent::Stdout(masker.push(MaskStream::Stdout, &bytes)),
+        EngineEvent::Stderr(bytes) => EngineEvent::Stderr(masker.push(MaskStream::Stderr, &bytes)),
+    }
+}
+
 async fn forward_engine_event(
     logs: &async_engine::Sender<String>,
     event: EngineEvent,
@@ -3283,6 +3409,9 @@ async fn forward_engine_event(
         EngineEvent::Stdout(bytes) => ("stdout", bytes),
         EngineEvent::Stderr(bytes) => ("stderr", bytes),
     };
+    if bytes.is_empty() {
+        return Ok(());
+    }
     let prefix = format!("[{stream}] ");
     // `bosn-engine` bounds source chunks at 8 KiB. Split after lossy text
     // conversion so every daemon record is valid UTF-8 and frame-safe.
@@ -10993,6 +11122,146 @@ fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
 mod tests {
     use super::*;
     use kernal_api::async_engine::RuntimeBuilder;
+
+    /// Run the production secret path against a fake `docker` (a shell that
+    /// reports its own ps-visible argv and environment, then echoes the token
+    /// whole and split across two writes). Returns (daemon log lines, stdout).
+    #[cfg(unix)]
+    fn run_fake_docker_with_secrets(state: &Path, declared: &[String]) -> (Vec<String>, String) {
+        const SCRIPT: &str = r#"printf 'argv:'; tr '\0' ' ' < /proc/$$/cmdline; echo
+printf 'env=%s\n' "${GITHUB_TOKEN-unset}"
+if [ -n "${GITHUB_TOKEN-}" ]; then
+  printf 'whole %s end\n' "$GITHUB_TOKEN"
+  printf '%s' "$(printf %s "$GITHUB_TOKEN" | cut -c1-9)" >&2
+  sleep 0.2
+  printf '%s tail\n' "$(printf %s "$GITHUB_TOKEN" | cut -c10-)" >&2
+fi
+"#;
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.run(async {
+            let secrets = load_manifest_task_secrets(state, declared).unwrap();
+            let base = DockerEngine::synthetic_for_test("/bin/sh", ["-c", SCRIPT, "fake-docker"]);
+            let (engine, passthrough_env) = secrets.docker_engine(&base);
+            let mut masker = SecretMasker::new(secrets.values.iter().map(|(_, value)| value));
+            let (logs, mut log_receiver) = async_engine::channel::<String>(1024);
+            let (events, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
+            let forwarder = async_engine::launch(async move {
+                while let Some(event) = receiver.recv().await {
+                    let event = mask_engine_event(&mut masker, event);
+                    forward_engine_event(&logs, event).await?;
+                }
+                for event in [
+                    EngineEvent::Stdout(masker.finish(MaskStream::Stdout)),
+                    EngineEvent::Stderr(masker.finish(MaskStream::Stderr)),
+                ] {
+                    forward_engine_event(&logs, event).await?;
+                }
+                Ok::<(), String>(())
+            });
+            let cancellation = async_engine::CancellationSource::new();
+            let result = bosn_setup::SetupAppTaskEngine::stream(
+                &engine,
+                bosn_setup::SetupAppTaskCommand::Exec {
+                    container_name: "bosn-setup-test".into(),
+                    passthrough_env,
+                    command: "true".into(),
+                },
+                RunOptions::streaming(Duration::from_secs(10), 64 * 1024),
+                &cancellation.token(),
+                &events,
+            )
+            .await
+            .unwrap();
+            drop(events);
+            forwarder.await.unwrap().unwrap();
+            let mut lines = Vec::new();
+            while let Some(line) = log_receiver.recv().await {
+                lines.push(line);
+            }
+            (lines, String::from_utf8_lossy(&result.stdout).into_owned())
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn declared_github_token_reaches_the_task_env_but_never_argv_or_logs() {
+        const CANARY: &str = "ghp_CANARY308abcdefghijklmnop0123456789";
+        let state = tempfile::tempdir().unwrap();
+        secrets::write_secret(state.path(), "github_token", CANARY.as_bytes()).unwrap();
+        let (lines, raw_stdout) =
+            run_fake_docker_with_secrets(state.path(), &["github_token".to_owned()]);
+        let joined = lines.join("\n");
+        // The docker client's ps-visible argv forwards the name only.
+        assert!(
+            raw_stdout.contains("--env GITHUB_TOKEN bosn-setup-test"),
+            "{raw_stdout}"
+        );
+        let argv_line = raw_stdout
+            .lines()
+            .find(|line| line.starts_with("argv:"))
+            .unwrap();
+        assert!(!argv_line.contains(CANARY), "{argv_line}");
+        // The value did reach the task (proved by the raw, unmasked capture)...
+        assert!(raw_stdout.contains(&format!("env={CANARY}")));
+        // ...but every relayed daemon log line is masked, whole and split.
+        assert!(!joined.contains(CANARY), "{joined}");
+        assert!(
+            !joined.contains(&CANARY[..9]) || !joined.contains(&CANARY[9..]),
+            "{joined}"
+        );
+        assert!(joined.contains("env=***"), "{joined}");
+        assert!(joined.contains("whole *** end"), "{joined}");
+        assert!(joined.contains("*** tail"), "{joined}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undeclared_task_gets_no_github_token_even_when_the_secret_exists() {
+        const CANARY: &str = "ghp_CANARY308undeclared0123456789";
+        let state = tempfile::tempdir().unwrap();
+        secrets::write_secret(state.path(), "github_token", CANARY.as_bytes()).unwrap();
+        // Ambient daemon env must not leak into the task either.
+        let (lines, raw_stdout) = run_fake_docker_with_secrets(state.path(), &[]);
+        assert!(raw_stdout.contains("env=unset"), "{raw_stdout}");
+        assert!(!raw_stdout.contains("--env"), "{raw_stdout}");
+        assert!(!lines.join("\n").contains(CANARY));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refused_or_missing_secret_is_reported_without_the_value() {
+        use std::os::unix::fs::PermissionsExt;
+        const CANARY: &str = "ghp_CANARY308refused0123456789";
+        let state = tempfile::tempdir().unwrap();
+        let declared = ["github_token".to_owned()];
+        let missing = load_manifest_task_secrets(state.path(), &declared).unwrap();
+        assert!(missing.values.is_empty());
+        assert_eq!(missing.missing, declared);
+        let warning = manifest_task_github_preflight(&declared, &missing.missing, "true").unwrap();
+        assert!(warning.contains("60/hour") && warning.contains("bosn secret set github_token"));
+        secrets::write_secret(state.path(), "github_token", CANARY.as_bytes()).unwrap();
+        std::fs::set_permissions(
+            secrets::secrets_dir(state.path()).join("github_token"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let Err(error) = load_manifest_task_secrets(state.path(), &declared) else {
+            panic!("loose secret was accepted");
+        };
+        assert!(!error.contains(CANARY));
+    }
+
+    #[test]
+    fn act_tasks_without_a_declared_token_get_a_quota_warning() {
+        assert!(manifest_task_github_preflight(&[], &[], "sh ci/act_ci.sh test").is_some());
+        assert!(manifest_task_github_preflight(&[], &[], "cargo test --workspace").is_none());
+        assert!(
+            manifest_task_github_preflight(&["github_token".into()], &[], "act -j lint").is_none()
+        );
+    }
     use std::{
         collections::{BTreeMap, VecDeque},
         future::{Ready, ready},

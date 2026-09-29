@@ -78,7 +78,14 @@ pub struct Task {
     pub name: String,
     pub stack: String,
     pub cmd: String,
+    /// Daemon-owned secrets this task opts into, by name only (#308). The
+    /// manifest never carries a secret value or path.
+    pub secrets: Vec<String>,
 }
+
+/// Secret names a manifest task may declare, and the environment variable
+/// each one is injected as.
+pub const MANIFEST_TASK_SECRETS: &[(&str, &str)] = &[("github_token", "GITHUB_TOKEN")];
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Guest {
     pub ssh_port: u64,
@@ -177,7 +184,8 @@ pub fn parse_manifest_toml(source: &str, roots: ManifestRoots) -> Result<Manifes
     let mut tasks = BTreeMap::new();
     for (name, body) in tasks_raw {
         let body = table_value(body, "task")?;
-        reject_unknown(body, &["stack", "cmd"], &format!("task.{name}"))?;
+        reject_unknown(body, &["stack", "cmd", "secrets"], &format!("task.{name}"))?;
+        let secrets = parse_task_secrets(body, name)?;
         let cmd = required_string(body, "cmd", &format!("task.{name}"))?;
         if cmd.is_empty() {
             return err(format!("[task.{name}] must set `cmd`"));
@@ -205,6 +213,7 @@ pub fn parse_manifest_toml(source: &str, roots: ManifestRoots) -> Result<Manifes
                 name: name.clone(),
                 stack,
                 cmd,
+                secrets,
             },
         );
     }
@@ -679,6 +688,40 @@ fn optional_bool(
                 .ok_or_else(|| ManifestError(format!("[{where_}] must be a boolean")))
         })
         .transpose()
+}
+fn parse_task_secrets(
+    body: &toml::map::Map<String, toml::Value>,
+    task: &str,
+) -> Result<Vec<String>, ManifestError> {
+    let Some(raw) = body.get("secrets") else {
+        return Ok(Vec::new());
+    };
+    let items = raw
+        .as_array()
+        .ok_or_else(|| ManifestError(format!("[task.{task}] `secrets` must be an array")))?;
+    let mut names = Vec::new();
+    for item in items {
+        let name = item.as_str().ok_or_else(|| {
+            ManifestError(format!("[task.{task}] `secrets` entries must be strings"))
+        })?;
+        if !MANIFEST_TASK_SECRETS
+            .iter()
+            .any(|(known, _)| *known == name)
+        {
+            return err(format!(
+                "[task.{task}] declares unknown secret {name:?}; known secrets: {:?}",
+                MANIFEST_TASK_SECRETS
+                    .iter()
+                    .map(|(known, _)| *known)
+                    .collect::<Vec<_>>()
+            ));
+        }
+        if names.iter().any(|seen| seen == name) {
+            return err(format!("[task.{task}] declares secret {name:?} twice"));
+        }
+        names.push(name.to_owned());
+    }
+    Ok(names)
 }
 fn reject_unknown(
     t: &toml::map::Map<String, toml::Value>,

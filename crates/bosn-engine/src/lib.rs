@@ -358,12 +358,27 @@ impl RunOptions {
 
 /// A Docker CLI endpoint. Product code starts from [`Self::docker`]; this
 /// crate has no daemon IPC surface and is not a sandbox for trusted callers.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DockerEngine {
     binary: PathBuf,
     prefix: Vec<OsString>,
     current_dir: Option<PathBuf>,
     env: Vec<(OsString, OsString)>,
+}
+/// Environment values may be secrets (#308): Debug shows only their names.
+impl std::fmt::Debug for DockerEngine {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DockerEngine")
+            .field("binary", &self.binary)
+            .field("prefix", &self.prefix)
+            .field("current_dir", &self.current_dir)
+            .field(
+                "env",
+                &self.env.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 impl DockerEngine {
     #[must_use]
@@ -899,6 +914,14 @@ mod tests {
         doctor_report,
     };
     use std::path::PathBuf;
+
+    #[test]
+    fn docker_engine_debug_never_prints_environment_values() {
+        let engine = super::DockerEngine::docker().env("GITHUB_TOKEN", "canary-308-secret");
+        let rendered = format!("{engine:?}");
+        assert!(rendered.contains("GITHUB_TOKEN"));
+        assert!(!rendered.contains("canary-308-secret"));
+    }
 
     #[test]
     fn guest_ssh_command_ignores_ambient_config_and_fixes_loopback_target() {
