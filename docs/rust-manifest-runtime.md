@@ -142,6 +142,7 @@ changed.
 | Linux container PID 1 | A fixed daemon-owned idle process (`sleep` loop that exits on `docker stop`), not the image's default command: declared tasks run through `docker exec`, and a base image such as `debian` defaults to a shell that would exit at once. This matches the legacy runtime. The command is part of the runtime generation. |
 | `workdir` | Linux: supported only when its normalized absolute container path is covered by a declared workspace bind; it is translated to the typed workspace-relative form and inherited by declared `manifest app-task` exec. Guest: a normalized absolute VM path is supported only for typed SSH app tasks and is safely shell-quoted before the declared command. |
 | `[task.NAME] secrets` | Supported for the one name `github_token`, injected per exec as `GITHUB_TOKEN` from daemon state; see [task-secrets.md](task-secrets.md). |
+| `[task.NAME] github_api` | Only `"proxy"`: a per-run, loopback, read-only GitHub API proxy is injected as `GITHUB_API_URL`; the credential stays in the daemon. See [github-api-proxy.md](github-api-proxy.md). |
 | image tags or unpinned image references | Refused |
 | generic `run`, shell, arbitrary Docker arguments | Not exposed |
 | all-stack orchestration | Supported by `manifest converge`: every declared stack in lexical order, one at a time, with per-stack durable records and partial-success semantics. The TOML model has no dependencies/root selector; dependency spellings fail closed rather than being guessed. |

@@ -111,4 +111,6 @@ details are documented in [docs/migration-rust.md](docs/migration-rust.md),
 [docs/rust-manifest-runtime.md](docs/rust-manifest-runtime.md), and
 [docs/rust-registry.md](docs/rust-registry.md). Daemon-owned task secrets
 (an opt-in `GITHUB_TOKEN` for act runs) are in
-[docs/task-secrets.md](docs/task-secrets.md).
+[docs/task-secrets.md](docs/task-secrets.md); the read-only GitHub API proxy
+that keeps the token out of containers is in
+[docs/github-api-proxy.md](docs/github-api-proxy.md).
