@@ -55,7 +55,7 @@ jobs:
 
       # Same pinned Soldr contract as the CI darwin-cross-wheel lane.
       - name: Set up Soldr Darwin target
-        uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
+        uses: zackees/setup-soldr@v0 # v0.9.82 or later (floating major)
         with:
           cache: false
           cross-targets: x86_64-apple-darwin
