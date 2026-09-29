@@ -81,6 +81,10 @@ pub struct Task {
     /// Daemon-owned secrets this task opts into, by name only (#308). The
     /// manifest never carries a secret value or path.
     pub secrets: Vec<String>,
+    /// `github_api = "proxy"`: the daemon runs a read-only GitHub API proxy
+    /// for this task and injects only its loopback URL as `GITHUB_API_URL`.
+    /// The credential it uses never enters the container.
+    pub github_api_proxy: bool,
 }
 
 /// Secret names a manifest task may declare, and the environment variable
@@ -184,8 +188,21 @@ pub fn parse_manifest_toml(source: &str, roots: ManifestRoots) -> Result<Manifes
     let mut tasks = BTreeMap::new();
     for (name, body) in tasks_raw {
         let body = table_value(body, "task")?;
-        reject_unknown(body, &["stack", "cmd", "secrets"], &format!("task.{name}"))?;
+        reject_unknown(
+            body,
+            &["stack", "cmd", "secrets", "github_api"],
+            &format!("task.{name}"),
+        )?;
         let secrets = parse_task_secrets(body, name)?;
+        let github_api_proxy = match optional_string(body, "github_api", &format!("task.{name}"))? {
+            None => false,
+            Some(mode) if mode == "proxy" => true,
+            Some(mode) => {
+                return err(format!(
+                    "[task.{name}] `github_api` must be \"proxy\", not {mode:?}"
+                ));
+            }
+        };
         let cmd = required_string(body, "cmd", &format!("task.{name}"))?;
         if cmd.is_empty() {
             return err(format!("[task.{name}] must set `cmd`"));
@@ -214,6 +231,7 @@ pub fn parse_manifest_toml(source: &str, roots: ManifestRoots) -> Result<Manifes
                 stack,
                 cmd,
                 secrets,
+                github_api_proxy,
             },
         );
     }

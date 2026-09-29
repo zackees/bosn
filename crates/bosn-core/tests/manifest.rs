@@ -120,3 +120,23 @@ fn task_secrets_are_declared_by_name_only() {
         assert!(parse_manifest_toml(&source, roots()).is_err(), "{bad}");
     }
 }
+
+#[test]
+fn task_github_api_proxy_is_opt_in_and_carries_no_value() {
+    let manifest = parse_manifest_toml(
+        "[stack.a]\nimage='x'\n[task.ci]\ncmd='true'\ngithub_api='proxy'\n[task.plain]\ncmd='true'\n",
+        roots(),
+    )
+    .unwrap();
+    assert!(manifest.task("ci").unwrap().github_api_proxy);
+    assert!(!manifest.task("plain").unwrap().github_api_proxy);
+    for bad in [
+        "github_api=true",
+        "github_api='token'",
+        "github_api='http://127.0.0.1:1'",
+        "github_api=['proxy']",
+    ] {
+        let source = format!("[stack.a]\nimage='x'\n[task.ci]\ncmd='true'\n{bad}\n");
+        assert!(parse_manifest_toml(&source, roots()).is_err(), "{bad}");
+    }
+}

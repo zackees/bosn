@@ -79,4 +79,6 @@ every workflow run locally. A `gh auth token` is usually a long-lived OAuth
 token with `repo`, `workflow` and often `admin:org`: a workflow step that
 comments, pushes tags, creates releases or calls `gh` would act for real with
 your full rights. Use a fine-grained token with **no** permissions; it is
-enough to lift the limit to 5,000 requests/hour.
+enough to lift the limit to 5,000 requests/hour. To use your `gh` login
+without giving it to any container, declare `github_api = "proxy"` instead;
+see [github-api-proxy.md](github-api-proxy.md).

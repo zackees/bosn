@@ -51,6 +51,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 pub mod autostart;
+pub mod github_proxy;
 pub mod jobs;
 pub mod mcp;
 pub mod secrets;
@@ -1238,6 +1239,11 @@ pub struct DockerManifestAppTaskExecutor {
     state_dir: PathBuf,
     engine: DockerEngine,
     guest_ssh: Arc<dyn GuestSshTaskTransport>,
+    /// `github_api = "proxy"` (#308): the host `gh` used for the credential,
+    /// the upstream, and the ETag cache shared by every task's proxy.
+    gh_program: std::ffi::OsString,
+    github_upstream: String,
+    github_cache: Arc<github_proxy::ResponseCache>,
 }
 impl DockerManifestAppTaskExecutor {
     fn new(state_dir: PathBuf) -> Self {
@@ -1245,6 +1251,9 @@ impl DockerManifestAppTaskExecutor {
             state_dir,
             engine: DockerEngine::docker(),
             guest_ssh: Arc::new(NativeGuestSshTaskTransport),
+            gh_program: "gh".into(),
+            github_upstream: github_proxy::GITHUB_API_UPSTREAM.into(),
+            github_cache: Arc::new(github_proxy::ResponseCache::default()),
         }
     }
 }
@@ -1283,11 +1292,47 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                 .map(|task| task.command.clone())
                 .unwrap_or_default();
             let task_secrets = load_manifest_task_secrets(&self.state_dir, &runtime.secrets)?;
-            let (engine, passthrough_env) = task_secrets.docker_engine(&self.engine);
-            let error_masker =
-                SecretMasker::new(task_secrets.values.iter().map(|(_, value)| value));
-            let mut stream_masker =
-                SecretMasker::new(task_secrets.values.iter().map(|(_, value)| value));
+            let (mut engine, mut passthrough_env) = task_secrets.docker_engine(&self.engine);
+            let mut masked: Vec<String> = task_secrets
+                .values
+                .iter()
+                .map(|(_, value)| value.clone())
+                .collect();
+            // The proxy lives exactly as long as this task run; dropping it
+            // at the end of `execute` stops the listener.
+            let github_api = if runtime.github_api_proxy {
+                if guest_task.is_some() {
+                    return Err(
+                        "github_api = \"proxy\" is not supported for macOS guest tasks".into(),
+                    );
+                }
+                let credential =
+                    github_proxy::resolve_credential(&self.state_dir, &self.gh_program).await?;
+                if let Some(value) = credential.secret_value() {
+                    masked.push(value.to_owned());
+                }
+                let source = credential.source();
+                let proxy = github_proxy::GithubApiProxy::start(
+                    &self.github_upstream,
+                    credential,
+                    self.github_cache.clone(),
+                    Some(logs.clone()),
+                )
+                .await
+                .map_err(|_| "GitHub API proxy could not start".to_owned())?;
+                // The URL's nonce is a capability for this run: persisted
+                // logs show `***` in its place.
+                if let Some(nonce) = proxy.url().rsplit('/').next() {
+                    masked.push(nonce.to_owned());
+                }
+                engine = engine.env("GITHUB_API_URL", proxy.url());
+                passthrough_env.push("GITHUB_API_URL".into());
+                Some((proxy, source))
+            } else {
+                None
+            };
+            let error_masker = SecretMasker::new(masked.iter());
+            let mut stream_masker = SecretMasker::new(masked.iter());
             let (events, mut receiver) = async_engine::channel(MANIFEST_ENGINE_EVENT_QUEUE);
             let forwarded_logs = logs.clone();
             let forwarder = async_engine::launch(async move {
@@ -1307,8 +1352,17 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                 &runtime.secrets,
                 &task_secrets.missing,
                 &task_command,
+                runtime.github_api_proxy,
             );
             let result = async {
+                if let Some((_, source)) = &github_api {
+                    logs.send(format!(
+                        "[manifest-app-task] read-only GitHub API proxy on loopback is GITHUB_API_URL for this task; credential: {}",
+                        source.label()
+                    ))
+                    .await
+                    .map_err(|_| "manifest app task log consumer closed".to_owned())?;
+                }
                 if let Some(warning) = preflight {
                     logs.send(warning)
                         .await
@@ -1431,6 +1485,7 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                 }
             }
             .await;
+            drop(github_api);
             drop(events);
             forwarder
                 .await
@@ -1976,6 +2031,7 @@ async fn manifest_stack_plan(
     let mut tasks = BTreeMap::new();
     let mut guest_task = None;
     let mut secrets = Vec::new();
+    let mut github_api_proxy = false;
     if let Some(task_name) = task_name {
         let task = manifest
             .task(task_name)
@@ -1989,7 +2045,11 @@ async fn manifest_stack_plan(
         if !task.secrets.is_empty() && stack.guest.is_some() {
             return Err("manifest task secrets are not supported for macOS guest tasks".into());
         }
+        if task.github_api_proxy && stack.guest.is_some() {
+            return Err("github_api = \"proxy\" is not supported for macOS guest tasks".into());
+        }
         secrets.clone_from(&task.secrets);
+        github_api_proxy = task.github_api_proxy;
         tasks.insert(
             task.name.clone(),
             SetupTask {
@@ -2082,6 +2142,7 @@ async fn manifest_stack_plan(
         autostart,
         guest_task,
         secrets,
+        github_api_proxy,
     })
 }
 
@@ -2157,6 +2218,8 @@ struct ManifestRuntimePlan {
     guest_task: Option<ManifestGuestTask>,
     /// Secret names the selected task declared (#308); names only.
     secrets: Vec<String>,
+    /// The task declared `github_api = "proxy"`.
+    github_api_proxy: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3518,8 +3581,9 @@ fn manifest_task_github_preflight(
     declared: &[String],
     missing: &[String],
     command: &str,
+    github_api_proxy: bool,
 ) -> Option<String> {
-    const REMEDY: &str = "anonymous GitHub API calls are limited to 60/hour per IP; run `bosn secret set github_token` (a fine-grained token with no scopes is enough)";
+    const REMEDY: &str = "anonymous GitHub API calls are limited to 60/hour per IP; declare `github_api = \"proxy\"` on the task (reads through the host `gh` login, token never enters the container) or run `bosn secret set github_token` (a fine-grained token with no scopes is enough)";
     if missing.iter().any(|name| name == "github_token") {
         return Some(format!(
             "[manifest-app-task] warning: secret github_token is not provisioned, so GITHUB_TOKEN is unset; {REMEDY}"
@@ -3528,7 +3592,7 @@ fn manifest_task_github_preflight(
     let looks_like_act = command
         .split(|c: char| !c.is_ascii_alphanumeric())
         .any(|word| word == "act");
-    if looks_like_act && !declared.iter().any(|name| name == "github_token") {
+    if looks_like_act && !github_api_proxy && !declared.iter().any(|name| name == "github_token") {
         return Some(format!(
             "[manifest-app-task] warning: this task looks like an act run but does not declare secrets = [\"github_token\"]; {REMEDY}"
         ));
@@ -11405,7 +11469,8 @@ fi
         let missing = load_manifest_task_secrets(state.path(), &declared).unwrap();
         assert!(missing.values.is_empty());
         assert_eq!(missing.missing, declared);
-        let warning = manifest_task_github_preflight(&declared, &missing.missing, "true").unwrap();
+        let warning =
+            manifest_task_github_preflight(&declared, &missing.missing, "true", false).unwrap();
         assert!(warning.contains("60/hour") && warning.contains("bosn secret set github_token"));
         secrets::write_secret(state.path(), "github_token", CANARY.as_bytes()).unwrap();
         std::fs::set_permissions(
@@ -11421,10 +11486,14 @@ fi
 
     #[test]
     fn act_tasks_without_a_declared_token_get_a_quota_warning() {
-        assert!(manifest_task_github_preflight(&[], &[], "sh ci/act_ci.sh test").is_some());
-        assert!(manifest_task_github_preflight(&[], &[], "cargo test --workspace").is_none());
+        assert!(manifest_task_github_preflight(&[], &[], "sh ci/act_ci.sh test", false).is_some());
+        assert!(manifest_task_github_preflight(&[], &[], "sh ci/act_ci.sh test", true).is_none());
         assert!(
-            manifest_task_github_preflight(&["github_token".into()], &[], "act -j lint").is_none()
+            manifest_task_github_preflight(&[], &[], "cargo test --workspace", false).is_none()
+        );
+        assert!(
+            manifest_task_github_preflight(&["github_token".into()], &[], "act -j lint", false)
+                .is_none()
         );
     }
     use std::{
