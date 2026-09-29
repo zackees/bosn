@@ -71,6 +71,10 @@ pub enum SetupTaskCommand {
 pub enum SetupAppTaskCommand {
     Exec {
         container_name: String,
+        /// Names forwarded as `--env NAME` (no `=value`): Docker copies each
+        /// value from the Docker client's own process environment, so a
+        /// secret never appears in argv (#308). Values never enter this crate.
+        passthrough_env: Vec<String>,
         command: String,
     },
 }
@@ -80,15 +84,22 @@ impl SetupAppTaskCommand {
         match self {
             Self::Exec {
                 container_name,
+                passthrough_env,
                 command,
-            } => vec![
-                "container".into(),
-                "exec".into(),
-                container_name.clone(),
-                "sh".into(),
-                "-lc".into(),
-                command.clone(),
-            ],
+            } => {
+                let mut args = vec!["container".into(), "exec".into()];
+                for name in passthrough_env {
+                    args.push("--env".into());
+                    args.push(name.clone());
+                }
+                args.extend([
+                    container_name.clone(),
+                    "sh".into(),
+                    "-lc".into(),
+                    command.clone(),
+                ]);
+                args
+            }
         }
     }
 }
@@ -219,6 +230,9 @@ pub struct SetupAppTaskRequest<'a> {
     pub plan: &'a SetupPlan,
     pub workspace_root: PathBuf,
     pub task_name: String,
+    /// Environment variable names to forward from the Docker client process
+    /// environment. Only names, never values; see [`SetupAppTaskCommand`].
+    pub passthrough_env: Vec<String>,
     pub prepared_image: &'a PreparedImage,
     pub options: RunOptions,
     pub cancellation: &'a CancellationToken,
@@ -342,6 +356,16 @@ pub async fn execute_setup_app_task<E: SetupAppTaskEngine>(
         cancellation: request.cancellation,
         events: request.events,
     })?;
+    if request.passthrough_env.iter().any(|name| {
+        name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    }) {
+        return Err(SetupTaskError::InvalidRequest(
+            "passthrough environment name is invalid",
+        ));
+    }
     let SetupTaskCommand::Run {
         image_identity,
         command,
@@ -365,6 +389,7 @@ pub async fn execute_setup_app_task<E: SetupAppTaskEngine>(
         .stream(
             SetupAppTaskCommand::Exec {
                 container_name: format!("bosn-setup-{}", request.plan.content_sha256),
+                passthrough_env: request.passthrough_env,
                 command,
             },
             RunOptions::streaming(remaining, request.options.output_limit),
@@ -1033,6 +1058,7 @@ mod tests {
                     plan: &plan,
                     workspace_root: workspace,
                     task_name: "check".into(),
+                    passthrough_env: Vec::new(),
                     prepared_image: &image,
                     options: RunOptions::streaming(Duration::from_secs(2), 4096),
                     cancellation: &cancellation.token(),
@@ -1045,12 +1071,14 @@ mod tests {
             *engine.calls.lock().unwrap(),
             vec![SetupAppTaskCommand::Exec {
                 container_name: format!("bosn-setup-{HASH}"),
+                passthrough_env: Vec::new(),
                 command: "cargo test --locked".into(),
             }]
         );
         assert_eq!(
             SetupAppTaskCommand::Exec {
                 container_name: format!("bosn-setup-{HASH}"),
+                passthrough_env: Vec::new(),
                 command: "cargo test --locked".into(),
             }
             .docker_args(),
@@ -1063,6 +1091,61 @@ mod tests {
                 "cargo test --locked",
             ]
         );
+    }
+
+    #[test]
+    fn app_task_secret_env_is_forwarded_by_name_only() {
+        let args = SetupAppTaskCommand::Exec {
+            container_name: format!("bosn-setup-{HASH}"),
+            passthrough_env: vec!["GITHUB_TOKEN".into()],
+            command: "true".into(),
+        }
+        .docker_args();
+        assert_eq!(
+            args,
+            vec![
+                "container",
+                "exec",
+                "--env",
+                "GITHUB_TOKEN",
+                &format!("bosn-setup-{HASH}"),
+                "sh",
+                "-lc",
+                "true",
+            ]
+        );
+        assert!(args.iter().all(|arg| !arg.contains("GITHUB_TOKEN=")));
+    }
+
+    #[test]
+    fn app_task_refuses_a_passthrough_name_that_could_carry_a_value() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(workspace.join("src")).unwrap();
+        let plan = plan(&workspace);
+        let image = prepared(&plan);
+        let engine = FakeAppEngine::with_results([]);
+        let cancellation = CancellationSource::new();
+        let (events, _receiver) = channel(8);
+        assert!(
+            runtime()
+                .run(execute_setup_app_task(
+                    &engine,
+                    SetupAppTaskRequest {
+                        plan: &plan,
+                        workspace_root: workspace,
+                        task_name: "check".into(),
+                        passthrough_env: vec!["GITHUB_TOKEN=canary".into()],
+                        prepared_image: &image,
+                        options: RunOptions::streaming(Duration::from_secs(2), 4096),
+                        cancellation: &cancellation.token(),
+                        events: &events,
+                    },
+                ))
+                .is_err()
+        );
+        assert!(engine.calls.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1087,6 +1170,7 @@ mod tests {
                         plan: &plan,
                         workspace_root: workspace,
                         task_name: "check".into(),
+                        passthrough_env: Vec::new(),
                         prepared_image: &image,
                         options: RunOptions::streaming(Duration::from_secs(2), 4096),
                         cancellation: &cancellation.token(),

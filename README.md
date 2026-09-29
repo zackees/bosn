@@ -109,4 +109,6 @@ operations return durable job IDs.
 The Rust migration status, native manifest lifecycle boundary, and registry
 details are documented in [docs/migration-rust.md](docs/migration-rust.md),
 [docs/rust-manifest-runtime.md](docs/rust-manifest-runtime.md), and
-[docs/rust-registry.md](docs/rust-registry.md).
+[docs/rust-registry.md](docs/rust-registry.md). Daemon-owned task secrets
+(an opt-in `GITHUB_TOKEN` for act runs) are in
+[docs/task-secrets.md](docs/task-secrets.md).
