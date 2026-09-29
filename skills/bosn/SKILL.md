@@ -10,19 +10,20 @@ containers over ad-hoc `docker run` commands when the project has a `bosn.toml`.
 
 ## Operate an existing stack
 
-1. Read the nearest `bosn.toml` and its task names with `bosn tasks`.
+1. Read the nearest `bosn.toml` and its `[task.NAME]` declarations.
 2. Check the engine with `bosn doctor` before diagnosing a failed stack. Treat an
    unreachable engine or clock-skew warning as a real prerequisite failure.
 3. Use the project task when available:
 
    ```text
-   bosn ensure
-   bosn test
-   bosn lint
+   bosn run --task test
+   bosn run --task lint
    ```
 
-4. For one-off non-interactive commands, use `bosn run -- <command>`. Use `bosn shell`
-   only for a terminal session.
+   `bosn run --task NAME` ensures the task's stack, runs the declared task, streams its
+   output, and exits with the task's status. `bosn run --stack NAME` only ensures.
+4. Native Bosn has no ad-hoc command or interactive shell: declare a `[task.NAME]`
+   for anything you need to run in the stack.
 5. Preserve bosn's exit code. Do not replace it with a raw Docker fallback: that bypasses
    its labels, registry, leases, and cache lifecycle.
 
@@ -42,8 +43,8 @@ unless Docker access is intentionally configured.
 
 ## Safety and recovery
 
-- Let `bosn run` and `bosn shell` own foreground execution. Their sessions serialize a
-  persistent container and clean up a killed client on the next acquire or maintenance pass.
+- Let `bosn run` own foreground execution. Ctrl-C cancels the daemon-owned job; an
+  interrupted exec is recorded as an uncertain session that protects its container.
 - Do not delete `bosn`-labeled resources manually while a task is active. Use `bosn gc` to
   inspect lifecycle decisions and `bosn done` when a workspace is finished.
 - Treat foreign registry warnings as protected state. Bosn intentionally cannot delete

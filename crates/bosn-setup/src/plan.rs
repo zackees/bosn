@@ -60,6 +60,11 @@ pub struct SetupTmpfs {
     pub target: String,
     pub readonly: bool,
     pub size: Option<SetupTmpfsSize>,
+    /// `Some(true)` emits `exec`, `Some(false)` emits `noexec`, and `None`
+    /// keeps Docker's tmpfs default (`noexec`).
+    pub exec: Option<bool>,
+    /// Octal permission bits (at most `0o7777`) for the tmpfs root.
+    pub mode: Option<u32>,
 }
 
 /// Unit accepted for a manifest tmpfs `size=` option.  Keeping this an enum
@@ -76,6 +81,46 @@ pub enum SetupTmpfsSizeUnit {
 pub struct SetupTmpfsSize {
     pub value: u64,
     pub unit: SetupTmpfsSizeUnit,
+}
+
+/// The fixed host paths at which the local Docker engine's API socket may be
+/// bind-mounted. This is a closed set, never a manifest-selected host path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetupHostDockerSocketSource {
+    /// `/var/run/docker.sock`
+    VarRun,
+    /// `/run/docker.sock`
+    Run,
+}
+
+impl SetupHostDockerSocketSource {
+    pub const fn host_path(self) -> &'static str {
+        match self {
+            Self::VarRun => "/var/run/docker.sock",
+            Self::Run => "/run/docker.sock",
+        }
+    }
+
+    /// Recognize exactly one of the fixed host socket spellings.
+    pub fn from_host_path(value: &str) -> Option<Self> {
+        match value {
+            "/var/run/docker.sock" => Some(Self::VarRun),
+            "/run/docker.sock" => Some(Self::Run),
+            _ => None,
+        }
+    }
+}
+
+/// An explicit manifest-author opt-in to hand the container the host Docker
+/// engine socket (for example to run `act`, which starts sibling job
+/// containers). Anything created through that socket is **outside** Bosn's
+/// registry, ownership labels, and GC: Bosn supervises only this container.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupHostDockerSocket {
+    pub source: SetupHostDockerSocketSource,
+    /// Normalized absolute path inside the container.
+    pub target: String,
+    pub readonly: bool,
 }
 
 /// A finite KVM-backed macOS guest shape derived solely from a legacy Bosn
@@ -132,6 +177,9 @@ pub struct SetupPlan {
     /// Tmpfs mounts derived from an accepted manifest declaration. Ordinary
     /// setup documents leave this empty.
     pub tmpfs: Vec<SetupTmpfs>,
+    /// The host Docker socket, only when a manifest explicitly binds it.
+    /// Ordinary setup documents leave this absent.
+    pub host_docker_socket: Option<SetupHostDockerSocket>,
     /// A macOS KVM guest derived by the native manifest runtime. Ordinary
     /// setup documents leave this absent.
     pub macos_guest: Option<SetupMacosGuest>,
@@ -221,6 +269,7 @@ pub async fn plan_setup_with_transport<T: SetupRemoteTransport>(
         app_source,
         named_volumes: Vec::new(),
         tmpfs: Vec::new(),
+        host_docker_socket: None,
         macos_guest: None,
     })
 }

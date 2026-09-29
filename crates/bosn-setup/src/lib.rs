@@ -32,9 +32,9 @@ pub use materialize::{
 
 mod plan;
 pub use plan::{
-    SetupMacosGuest, SetupNamedVolume, SetupPlan, SetupPlanAppSource, SetupPlanError,
-    SetupPlanRequest, SetupTmpfs, SetupTmpfsSize, SetupTmpfsSizeUnit, plan_setup,
-    plan_setup_with_transport,
+    SetupHostDockerSocket, SetupHostDockerSocketSource, SetupMacosGuest, SetupNamedVolume,
+    SetupPlan, SetupPlanAppSource, SetupPlanError, SetupPlanRequest, SetupTmpfs, SetupTmpfsSize,
+    SetupTmpfsSizeUnit, plan_setup, plan_setup_with_transport,
 };
 
 mod prepare;

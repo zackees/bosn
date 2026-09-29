@@ -32,11 +32,15 @@ use serde_json::json;
 
 #[path = "bosn/act.rs"]
 mod act;
+#[path = "bosn/run.rs"]
+mod run;
 #[path = "bosn/secret.rs"]
 mod secret;
 
 const SETUP_PREPARE_MAX_DEADLINE_MS: u64 = 5 * 60 * 1_000;
 const SETUP_PREPARE_MAX_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
+const MANIFEST_MAX_DEADLINE_MS: u64 = bosn_service::MANIFEST_MAX_DEADLINE.as_millis() as u64;
+const MANIFEST_MAX_OUTPUT_LIMIT: usize = bosn_service::MANIFEST_MAX_OUTPUT;
 const DEFAULT_JOB_LOG_LIMIT: u32 = 64;
 const MAX_JOB_LOG_LIMIT: u32 = bosn_service::jobs::MAX_LOG_PAGE_RECORDS as u32;
 /// The CLI may explicitly read one local Compose file, but it never executes
@@ -60,6 +64,7 @@ fn main() {
         "compose" => run_compose(arguments),
         "act" => act::run(arguments),
         "manifest" => run_manifest(arguments),
+        "run" => run::run(arguments),
         "setup" => run_setup(arguments),
         "job" => run_job(arguments),
         "registry" => run_registry(arguments),
@@ -268,14 +273,14 @@ fn run_manifest_converge(mut arguments: impl Iterator<Item = std::ffi::OsString>
             "--manifest" => set_once_parsed(&mut manifest, arguments.next(), parse_manifest_path),
             "--deadline-ms" => set_once_parsed(&mut deadline_ms, arguments.next(), |value| {
                 let value = parse_u64(value)?;
-                (1..=SETUP_PREPARE_MAX_DEADLINE_MS)
+                (1..=MANIFEST_MAX_DEADLINE_MS)
                     .contains(&value)
                     .then_some(value)
                     .ok_or(())
             }),
             "--output-limit" => set_once_parsed(&mut output_limit, arguments.next(), |value| {
                 let value = parse_usize(value)?;
-                (1..=SETUP_PREPARE_MAX_OUTPUT_LIMIT)
+                (1..=MANIFEST_MAX_OUTPUT_LIMIT)
                     .contains(&value)
                     .then_some(value)
                     .ok_or(())
@@ -332,14 +337,14 @@ fn run_manifest_app_task(mut arguments: impl Iterator<Item = std::ffi::OsString>
             "--task" => set_once_parsed(&mut task_name, arguments.next(), parse_setup_task_name),
             "--deadline-ms" => set_once_parsed(&mut deadline_ms, arguments.next(), |value| {
                 let value = parse_u64(value)?;
-                (1..=SETUP_PREPARE_MAX_DEADLINE_MS)
+                (1..=MANIFEST_MAX_DEADLINE_MS)
                     .contains(&value)
                     .then_some(value)
                     .ok_or(())
             }),
             "--output-limit" => set_once_parsed(&mut output_limit, arguments.next(), |value| {
                 let value = parse_usize(value)?;
-                (1..=SETUP_PREPARE_MAX_OUTPUT_LIMIT)
+                (1..=MANIFEST_MAX_OUTPUT_LIMIT)
                     .contains(&value)
                     .then_some(value)
                     .ok_or(())
@@ -394,14 +399,14 @@ fn run_manifest_ensure(mut arguments: impl Iterator<Item = std::ffi::OsString>) 
             "--stack" => set_once_parsed(&mut stack, arguments.next(), parse_setup_task_name),
             "--deadline-ms" => set_once_parsed(&mut deadline_ms, arguments.next(), |value| {
                 let value = parse_u64(value)?;
-                (1..=SETUP_PREPARE_MAX_DEADLINE_MS)
+                (1..=MANIFEST_MAX_DEADLINE_MS)
                     .contains(&value)
                     .then_some(value)
                     .ok_or(())
             }),
             "--output-limit" => set_once_parsed(&mut output_limit, arguments.next(), |value| {
                 let value = parse_usize(value)?;
-                (1..=SETUP_PREPARE_MAX_OUTPUT_LIMIT)
+                (1..=MANIFEST_MAX_OUTPUT_LIMIT)
                     .contains(&value)
                     .then_some(value)
                     .ok_or(())
@@ -1642,11 +1647,9 @@ fn run_daemon(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
     };
     match invocation {
         DaemonInvocation::Serve { state_dir } => {
-            if runtime
-                .run(bosn_service::Service::new(state_dir).serve())
-                .is_err()
-            {
-                daemon_failure("serve", false);
+            if let Err(error) = runtime.run(bosn_service::Service::new(state_dir).serve()) {
+                eprintln!("bosn daemon serve: {error}");
+                std::process::exit(1);
             }
             println!("daemon stopped");
         }
@@ -2897,6 +2900,7 @@ fn usage() -> ! {
     eprintln!("   or: bosn act plan --workspace WORKSPACE --workflow RELATIVE_YML --event pull_request|push|release --mode minimal|test|full --sha 40_HEX --act-version VERSION [--act-bin PATH] [--job ID] [--json]");
     eprintln!("   or: bosn act run|report (refuses until isolated Docker ownership is implemented)");
     eprintln!("usage: bosn mcp [--state-dir STATE_DIR]");
+    eprintln!("   or: {}", run::USAGE.trim_start_matches("usage: "));
     eprintln!(
         "   or: bosn secret set github_token [--from-gh] [--state-dir STATE_DIR] (value on stdin)\n   or: bosn secret status [--state-dir STATE_DIR] [--json]\n   or: bosn secret remove github_token [--state-dir STATE_DIR]"
     );
@@ -2924,10 +2928,13 @@ fn usage() -> ! {
         "   or: bosn setup app-task --state-dir STATE_DIR --workspace WORKSPACE --config LOCATOR (--refresh | --offline) --task NAME --deadline-ms 1..=300000 --output-limit 1..=8388608 [--json]"
     );
     eprintln!(
-        "   or: bosn manifest app-task --state-dir STATE_DIR --workspace WORKSPACE --manifest RELATIVE_TOML --stack NAME --task NAME --deadline-ms 1..=300000 --output-limit 1..=8388608 [--json]"
+        "   or: bosn manifest app-task --state-dir STATE_DIR --workspace WORKSPACE --manifest RELATIVE_TOML --stack NAME --task NAME --deadline-ms 1..=14400000 --output-limit 1..=67108864 [--json]"
     );
     eprintln!(
-        "   or: bosn manifest converge --state-dir STATE_DIR --workspace WORKSPACE --manifest RELATIVE_TOML --deadline-ms 1..=300000 --output-limit 1..=8388608 [--json]"
+        "   or: bosn manifest ensure --state-dir STATE_DIR --workspace WORKSPACE --manifest RELATIVE_TOML --stack NAME --deadline-ms 1..=14400000 --output-limit 1..=67108864 [--json]"
+    );
+    eprintln!(
+        "   or: bosn manifest converge --state-dir STATE_DIR --workspace WORKSPACE --manifest RELATIVE_TOML --deadline-ms 1..=14400000 --output-limit 1..=67108864 [--json]"
     );
     eprintln!(
         "   or: bosn setup ensure --state-dir STATE_DIR --workspace WORKSPACE --config LOCATOR (--refresh | --offline) --deadline-ms 1..=300000 --output-limit 1..=8388608 [--json]"

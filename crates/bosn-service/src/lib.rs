@@ -23,10 +23,10 @@ use bosn_setup::PreparedImageKind;
 use bosn_setup::{
     ManifestBuildEntry, PreparedImage, SetupAcquirePolicy, SetupAppTaskRequest, SetupAssetStore,
     SetupEnsureEngine, SetupEnsureRequest as CoreSetupEnsureRequest, SetupEnsureResult,
-    SetupImageEngine, SetupMacosGuest, SetupNamedVolume, SetupPlan, SetupPlanAppSource,
-    SetupPlanRequest, SetupTaskRequest, SetupTmpfs, SetupTmpfsSize, SetupTmpfsSizeUnit,
-    adopt_setup_app, ensure_setup_app, execute_setup_app_task, execute_setup_task, plan_setup,
-    prepare_setup_image,
+    SetupHostDockerSocket, SetupHostDockerSocketSource, SetupImageEngine, SetupMacosGuest,
+    SetupNamedVolume, SetupPlan, SetupPlanAppSource, SetupPlanRequest, SetupTaskRequest,
+    SetupTmpfs, SetupTmpfsSize, SetupTmpfsSizeUnit, adopt_setup_app, ensure_setup_app,
+    execute_setup_app_task, execute_setup_task, plan_setup, prepare_setup_image,
 };
 use jobs::{Jobs, Submission};
 use kernal_api::{
@@ -62,8 +62,25 @@ const MAX_FRAME: usize = 1024 * 1024;
 const IO_DEADLINE: Duration = Duration::from_secs(3);
 const SETUP_PREPARE_MAX_DEADLINE: Duration = Duration::from_secs(5 * 60);
 const SETUP_PREPARE_MAX_OUTPUT: usize = 8 * 1024 * 1024;
+/// PID 1 of every Linux manifest container: idle until stopped, and exit
+/// promptly on `docker stop`. It is a fixed daemon constant, never manifest
+/// or caller text.
+const MANIFEST_LINUX_IDLE_COMMAND: &str =
+    "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done";
+/// Declared manifest operations run whole build/CI workloads (a cold
+/// Dockerfile build, or `act` driving a CI job), so their caller-selected
+/// budget may exceed the five-minute setup-document bound. The budget is
+/// still finite and caller-declared; exec output is still held in memory, so
+/// the output ceiling stays bounded.
+pub const MANIFEST_MAX_DEADLINE: Duration = Duration::from_secs(4 * 60 * 60);
+pub const MANIFEST_MAX_OUTPUT: usize = 64 * 1024 * 1024;
 const SETUP_PREPARE_COMMAND_QUEUE: usize = 64;
 const SETUP_PREPARE_EVENT_QUEUE: usize = 16;
+/// Manifest builds and tasks (for example `act` running a CI job) emit
+/// bursts faster than the job log actor drains them one record at a time.
+/// The engine drops the exec rather than block when this queue is full, so
+/// buffer up to 1024 chunks of at most 8 KiB (8 MiB) before that happens.
+const MANIFEST_ENGINE_EVENT_QUEUE: usize = 1024;
 /// One fixed engine version probe. This is intentionally independent of setup
 /// job limits: diagnostic callers cannot select a deadline, output budget, or
 /// any Docker command.
@@ -1145,7 +1162,7 @@ impl ManifestEnsureExecutor for DockerManifestEnsureExecutor {
                 autostart,
                 ..
             } = runtime;
-            let (events, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
+            let (events, mut receiver) = async_engine::channel(MANIFEST_ENGINE_EVENT_QUEUE);
             let forwarded_logs = logs.clone();
             let forwarder = async_engine::launch(async move {
                 while let Some(event) = receiver.recv().await {
@@ -1271,7 +1288,7 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                 SecretMasker::new(task_secrets.values.iter().map(|(_, value)| value));
             let mut stream_masker =
                 SecretMasker::new(task_secrets.values.iter().map(|(_, value)| value));
-            let (events, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
+            let (events, mut receiver) = async_engine::channel(MANIFEST_ENGINE_EVENT_QUEUE);
             let forwarded_logs = logs.clone();
             let forwarder = async_engine::launch(async move {
                 while let Some(event) = receiver.recv().await {
@@ -1832,11 +1849,26 @@ async fn manifest_stack_plan(
     // used by the old Python executor.  The native runtime does not pass that
     // spelling to Docker.  It resolves it beneath this exact canonical
     // workspace and converts it into the typed setup representation first.
-    let mounts = stack
-        .mounts
-        .iter()
-        .map(|mount| manifest_workspace_mount(&workspace, mount))
-        .collect::<Result<Vec<_>, _>>()?;
+    //
+    // The one exception is the host Docker engine socket at a fixed, closed
+    // set of spellings: the manifest author's explicit choice to let the
+    // container drive the host engine (for example `act`, whose job containers
+    // are siblings). It is typed, never a generic host path.
+    let mut mounts = Vec::new();
+    let mut host_docker_socket = None;
+    for mount in &stack.mounts {
+        if let Some(socket) = manifest_host_docker_socket(mount)? {
+            if host_docker_socket.is_some() {
+                return Err("manifest declares the host Docker socket more than once".into());
+            }
+            host_docker_socket = Some(socket);
+            continue;
+        }
+        mounts.push(manifest_workspace_mount(&workspace, mount)?);
+    }
+    if host_docker_socket.is_some() && stack.kind.as_deref() == Some("macos-x64-guest") {
+        return Err("the host Docker socket cannot be bound into a macOS guest stack".into());
+    }
     // A dockurr bind exists outside the VM and is therefore intentionally not
     // a guest workdir. Keep the VM path separately for the typed SSH command;
     // the setup receipt itself must remain a pure guest container shape.
@@ -1900,6 +1932,7 @@ async fn manifest_stack_plan(
         guest_workdir.as_deref().or(workdir.as_deref()),
         &stack.volumes,
         &tmpfs,
+        host_docker_socket.as_ref(),
         macos_guest.as_ref(),
     );
     let content_sha256 = generation
@@ -2005,11 +2038,19 @@ async fn manifest_stack_plan(
             .name
             .clone();
     }
+    // A Linux manifest stack exists to host declared tasks, which run through
+    // `docker exec`. Its PID 1 is therefore a fixed daemon-owned idle process
+    // (the legacy runtime's semantics these manifests were written for), not
+    // the image's default command: a base image such as debian defaults to an
+    // interactive shell that exits at once. A guest keeps dockurr's entrypoint.
+    let command = macos_guest
+        .is_none()
+        .then(|| MANIFEST_LINUX_IDLE_COMMAND.to_owned());
     let app = SetupApp {
         source,
         environment: stack.env.clone(),
         workdir,
-        command: None,
+        command,
         mounts,
     };
     Ok(ManifestRuntimePlan {
@@ -2032,6 +2073,7 @@ async fn manifest_stack_plan(
                 })
                 .collect(),
             tmpfs,
+            host_docker_socket,
             macos_guest,
         },
         generation,
@@ -2079,7 +2121,7 @@ fn load_native_manifest(
             workspace.to_string_lossy(),
         ),
     )
-    .map_err(|_| "manifest is invalid".to_owned())?;
+    .map_err(|error| bounded_log_line(&format!("manifest is invalid: {error}")))?;
     Ok((workspace, manifest))
 }
 
@@ -2330,9 +2372,10 @@ async fn manifest_dockerfile_build_plan(
         let mut identities = std::collections::BTreeSet::new();
         for image in required {
             if !valid_manifest_pinned_image(&image.reference) {
-                return Err(
-                    "manifest Dockerfile external images must be immutable digest-pinned".into(),
-                );
+                return Err(unpinned_dockerfile_image_message(
+                    dockerfile,
+                    &image.reference,
+                ));
             }
             if !identities.insert((image.reference.clone(), image.platform.clone())) {
                 return Err("manifest Dockerfile repeats an external image declaration".into());
@@ -2359,6 +2402,15 @@ async fn manifest_dockerfile_build_plan(
     })
     .await
     .map_err(|_| "manifest Dockerfile planning stopped".to_owned())?
+}
+
+/// Name the offending `FROM` reference and the exact remedy. A tag is mutable,
+/// so Bosn could not prove which bytes a generation was built from.
+fn unpinned_dockerfile_image_message(dockerfile: &str, reference: &str) -> String {
+    let reference = bounded_log_line(reference);
+    format!(
+        "manifest Dockerfile external images must be immutable digest-pinned: {dockerfile} uses {reference}. Pin it as `FROM {reference}@sha256:<digest>` (find the digest with `docker buildx imagetools inspect {reference}`)"
+    )
 }
 
 fn manifest_named_volumes(
@@ -2413,9 +2465,11 @@ fn manifest_named_volumes(
         .collect()
 }
 
-/// Translate the limited legacy `tmpfs = ["/target[:ro|rw[,size=N{b|k|m|g}]]"]`
-/// shape to typed setup data.  Legacy fields such as `noexec`, `mode`, or an
-/// unknown size unit fail closed instead of becoming Docker option strings.
+/// Translate the limited legacy
+/// `tmpfs = ["/target[:ro|rw][,size=N{b|k|m|g}][,exec|noexec][,mode=OCTAL]"]`
+/// shape to typed setup data.  Every other option (`uid`, `nosuid`, ...), a
+/// repeated option, or an unknown size unit fails closed instead of becoming a
+/// Docker option string.
 fn manifest_tmpfs(stack: &bosn_core::manifest::Stack) -> Result<Vec<SetupTmpfs>, String> {
     let mut targets = std::collections::BTreeSet::new();
     stack
@@ -2435,6 +2489,8 @@ fn manifest_tmpfs(stack: &bosn_core::manifest::Stack) -> Result<Vec<SetupTmpfs>,
             let mut readonly = false;
             let mut mode_seen = false;
             let mut size = None;
+            let mut exec = None;
+            let mut mode = None;
             if let Some(raw_options) = raw_options {
                 for option in raw_options.split(',') {
                     match option {
@@ -2458,7 +2514,22 @@ fn manifest_tmpfs(stack: &bosn_core::manifest::Stack) -> Result<Vec<SetupTmpfs>,
                             }
                             size = Some(parse_manifest_tmpfs_size(&value[5..])?);
                         }
-                        _ => return Err("manifest tmpfs uses an unsupported option".into()),
+                        "exec" | "noexec" => {
+                            if exec.is_some() {
+                                return Err("manifest tmpfs exec option is repeated".into());
+                            }
+                            exec = Some(option == "exec");
+                        }
+                        value if value.starts_with("mode=") => {
+                            if mode.is_some() {
+                                return Err("manifest tmpfs mode= option is repeated".into());
+                            }
+                            mode = Some(parse_manifest_tmpfs_mode(&value[5..])?);
+                        }
+                        _ => return Err(
+                            "manifest tmpfs uses an unsupported option; supported options are ro, rw, size=N{b,k,m,g}, exec, noexec, and mode=OCTAL"
+                                .into(),
+                        ),
                     }
                 }
             }
@@ -2466,9 +2537,20 @@ fn manifest_tmpfs(stack: &bosn_core::manifest::Stack) -> Result<Vec<SetupTmpfs>,
                 target: tmpfs.destination.clone(),
                 readonly,
                 size,
+                exec,
+                mode,
             })
         })
         .collect()
+}
+
+/// A tmpfs `mode=` is octal permission bits only: 1-4 octal digits, at most
+/// `0o7777`, so it cannot smuggle a second option or a sign.
+fn parse_manifest_tmpfs_mode(value: &str) -> Result<u32, String> {
+    if value.is_empty() || value.len() > 4 || !value.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+        return Err("manifest tmpfs mode must be 1-4 octal digits".into());
+    }
+    u32::from_str_radix(value, 8).map_err(|_| "manifest tmpfs mode is invalid".to_owned())
 }
 
 fn parse_manifest_tmpfs_size(value: &str) -> Result<SetupTmpfsSize, String> {
@@ -2496,6 +2578,46 @@ fn parse_manifest_tmpfs_size(value: &str) -> Result<SetupTmpfsSize, String> {
         _ => unreachable!("unit was validated above"),
     };
     Ok(SetupTmpfsSize { value, unit })
+}
+
+/// Recognize an explicit bind of the host Docker engine socket. Only the fixed
+/// spellings in [`SetupHostDockerSocketSource`] qualify, and the host path
+/// must currently be a Unix socket. Everything created through the socket is
+/// outside Bosn supervision; that is the manifest author's declared choice.
+fn manifest_host_docker_socket(
+    mount: &bosn_core::manifest::Mount,
+) -> Result<Option<SetupHostDockerSocket>, String> {
+    let Some(source) = SetupHostDockerSocketSource::from_host_path(&mount.source) else {
+        return Ok(None);
+    };
+    if !normalized_container_path(&mount.destination) {
+        return Err("manifest mount target is not a normalized absolute path".into());
+    }
+    require_host_docker_socket(source.host_path())?;
+    Ok(Some(SetupHostDockerSocket {
+        source,
+        target: mount.destination.clone(),
+        readonly: mount.readonly,
+    }))
+}
+
+#[cfg(unix)]
+fn require_host_docker_socket(path: &str) -> Result<(), String> {
+    use std::os::unix::fs::FileTypeExt;
+    let metadata = std::fs::metadata(path).map_err(|_| {
+        format!("manifest binds the host Docker socket, but {path} does not exist on this host")
+    })?;
+    if !metadata.file_type().is_socket() {
+        return Err(format!(
+            "manifest binds the host Docker socket, but {path} is not a Unix socket"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn require_host_docker_socket(_path: &str) -> Result<(), String> {
+    Err("the host Docker socket bind is supported only on Unix hosts".into())
 }
 
 /// Convert one legacy manifest bind into the narrower workspace-relative setup
@@ -2551,7 +2673,9 @@ fn manifest_workspace_member(workspace: &Path, source: &str) -> Result<String, S
         .map_err(|_| "declared manifest mount source cannot be canonicalized".to_owned())?;
     let relative = canonical
         .strip_prefix(workspace)
-        .map_err(|_| "declared manifest mount source escapes workspace".to_owned())?;
+        .map_err(|_| {
+            "declared manifest mount source escapes workspace; a bind source must be inside the workspace (the only host path accepted is the Docker socket, /var/run/docker.sock or /run/docker.sock). Move the data under the workspace or declare a Bosn-managed [stack.NAME.volumes] entry instead".to_owned()
+        })?;
     if relative.as_os_str().is_empty() {
         return Ok(".".into());
     }
@@ -2656,6 +2780,7 @@ fn manifest_runtime_generation(
     workdir: Option<&str>,
     volumes: &[bosn_core::manifest::Volume],
     tmpfs: &[SetupTmpfs],
+    host_docker_socket: Option<&SetupHostDockerSocket>,
     macos_guest: Option<&SetupMacosGuest>,
 ) -> String {
     let mut hasher = Sha256Hasher::new();
@@ -2701,9 +2826,29 @@ fn manifest_runtime_generation(
         } else {
             manifest_generation_field(&mut hasher, b"no-size");
         }
+        // Hashed only when declared, so a manifest without these options
+        // keeps its pre-existing runtime generation.
+        if let Some(exec) = tmpfs.exec {
+            manifest_generation_field(&mut hasher, if exec { b"exec" } else { b"noexec" });
+        }
+        if let Some(mode) = tmpfs.mode {
+            manifest_generation_field(&mut hasher, b"mode");
+            manifest_generation_field(&mut hasher, &mode.to_be_bytes());
+        }
+    }
+    // Hashed only when declared, so manifests without it keep their
+    // pre-existing runtime generation.
+    if let Some(socket) = host_docker_socket {
+        manifest_generation_field(&mut hasher, b"host-docker-socket:v1");
+        manifest_generation_field(&mut hasher, socket.source.host_path().as_bytes());
+        manifest_generation_field(&mut hasher, socket.target.as_bytes());
+        manifest_generation_field(&mut hasher, if socket.readonly { b"1" } else { b"0" });
     }
     match macos_guest {
-        None => manifest_generation_field(&mut hasher, b"macos-guest:none"),
+        None => {
+            manifest_generation_field(&mut hasher, b"macos-guest:none");
+            manifest_generation_field(&mut hasher, MANIFEST_LINUX_IDLE_COMMAND.as_bytes());
+        }
         Some(guest) => {
             manifest_generation_field(&mut hasher, b"macos-guest:v1");
             manifest_generation_field(&mut hasher, &guest.ssh_port.to_be_bytes());
@@ -10402,6 +10547,24 @@ fn validate_setup_prepare_wire(
     deadline_ms: u64,
     output_limit: u32,
 ) -> Result<(), Error> {
+    validate_request_text_and_budget(
+        workspace,
+        config,
+        deadline_ms,
+        output_limit,
+        SETUP_PREPARE_MAX_DEADLINE,
+        SETUP_PREPARE_MAX_OUTPUT,
+    )
+}
+
+fn validate_request_text_and_budget(
+    workspace: &str,
+    config: &str,
+    deadline_ms: u64,
+    output_limit: u32,
+    max_deadline: Duration,
+    max_output: usize,
+) -> Result<(), Error> {
     const MAX_TEXT: usize = 8 * 1024;
     if workspace.is_empty()
         || workspace.len() > MAX_TEXT
@@ -10413,14 +10576,31 @@ fn validate_setup_prepare_wire(
         return Err(Error::Protocol("invalid setup request text"));
     }
     let deadline = Duration::from_millis(deadline_ms);
-    if deadline.is_zero() || deadline > SETUP_PREPARE_MAX_DEADLINE {
+    if deadline.is_zero() || deadline > max_deadline {
         return Err(Error::Protocol("invalid setup deadline"));
     }
     let output_limit = output_limit as usize;
-    if output_limit == 0 || output_limit > SETUP_PREPARE_MAX_OUTPUT {
+    if output_limit == 0 || output_limit > max_output {
         return Err(Error::Protocol("invalid setup output limit"));
     }
     Ok(())
+}
+
+/// Manifest operations use the larger declared-workload budget.
+fn validate_manifest_text_and_budget(
+    workspace: &str,
+    manifest: &str,
+    deadline_ms: u64,
+    output_limit: u32,
+) -> Result<(), Error> {
+    validate_request_text_and_budget(
+        workspace,
+        manifest,
+        deadline_ms,
+        output_limit,
+        MANIFEST_MAX_DEADLINE,
+        MANIFEST_MAX_OUTPUT,
+    )
 }
 
 fn validate_setup_task_wire(
@@ -10432,6 +10612,10 @@ fn validate_setup_task_wire(
     output_limit: u32,
 ) -> Result<(), Error> {
     validate_setup_prepare_wire(workspace, config, policy, deadline_ms, output_limit)?;
+    validate_setup_task_name(task_name)
+}
+
+fn validate_setup_task_name(task_name: &str) -> Result<(), Error> {
     if task_name.is_empty()
         || task_name.len() > 64
         || !task_name.bytes().enumerate().all(|(index, byte)| {
@@ -10461,13 +10645,7 @@ fn validate_manifest_ensure_wire(
     deadline_ms: u64,
     output_limit: u32,
 ) -> Result<(), Error> {
-    validate_setup_prepare_wire(
-        workspace,
-        manifest,
-        SetupPreparePolicy::Refresh,
-        deadline_ms,
-        output_limit,
-    )?;
+    validate_manifest_text_and_budget(workspace, manifest, deadline_ms, output_limit)?;
     if !safe_manifest_relative_path(manifest)
         || stack.is_empty()
         || stack.len() > 128
@@ -10486,13 +10664,7 @@ fn validate_manifest_converge_wire(
     deadline_ms: u64,
     output_limit: u32,
 ) -> Result<(), Error> {
-    validate_setup_prepare_wire(
-        workspace,
-        manifest,
-        SetupPreparePolicy::Refresh,
-        deadline_ms,
-        output_limit,
-    )?;
+    validate_manifest_text_and_budget(workspace, manifest, deadline_ms, output_limit)?;
     if !safe_manifest_relative_path(manifest) {
         return Err(Error::Protocol("invalid manifest converge selector"));
     }
@@ -10559,14 +10731,7 @@ fn validate_manifest_app_task_wire(
     output_limit: u32,
 ) -> Result<(), Error> {
     validate_manifest_ensure_wire(workspace, manifest, stack, deadline_ms, output_limit)?;
-    validate_setup_task_wire(
-        workspace,
-        manifest,
-        SetupPreparePolicy::Refresh,
-        task_name,
-        deadline_ms,
-        output_limit,
-    )
+    validate_setup_task_name(task_name)
 }
 fn validate_manifest_app_task_request_wire(request: &Request) -> Result<(), Error> {
     validate_manifest_app_task_wire(
@@ -11698,10 +11863,18 @@ fi
             "FROM alpine:3.21\nCOPY payload /payload\n",
         )
         .unwrap();
+        let unpinned = runtime
+            .run(manifest_stack_setup_plan_at(&request, Some(&state)))
+            .err()
+            .expect("a tag-only FROM is refused");
+        // The refusal names the reference and the exact remedy.
         assert!(
-            runtime
-                .run(manifest_stack_setup_plan_at(&request, Some(&state)))
-                .is_err()
+            unpinned.contains("Dockerfile uses alpine:3.21"),
+            "{unpinned}"
+        );
+        assert!(
+            unpinned.contains("FROM alpine:3.21@sha256:<digest>"),
+            "{unpinned}"
         );
         std::fs::write(
             workspace.join("bosn.toml"),
@@ -11930,10 +12103,32 @@ fi
         let changed = runtime.run(manifest_stack_setup_plan(&request())).unwrap();
         assert_ne!(first.generation, changed.generation);
 
+        std::fs::write(
+            workspace.join("bosn.toml"),
+            format!("[stack.app]\nimage = '{image}'\ntmpfs = ['/run/cache:rw,size=64m,exec,mode=1777']\n"),
+        )
+        .unwrap();
+        let executable = runtime.run(manifest_stack_setup_plan(&request())).unwrap();
+        assert_eq!(executable.plan.tmpfs[0].exec, Some(true));
+        assert_eq!(executable.plan.tmpfs[0].mode, Some(0o1777));
+        assert_ne!(executable.generation, changed.generation);
+        std::fs::write(
+            workspace.join("bosn.toml"),
+            format!("[stack.app]\nimage = '{image}'\ntmpfs = ['/run/cache:noexec']\n"),
+        )
+        .unwrap();
+        let noexec = runtime.run(manifest_stack_setup_plan(&request())).unwrap();
+        assert_eq!(noexec.plan.tmpfs[0].exec, Some(false));
+        assert_eq!(noexec.plan.tmpfs[0].mode, None);
+
         for declaration in [
             "['/run/cache:ro,rw']",
             "['/run/cache:size=64m,size=32m']",
-            "['/run/cache:noexec']",
+            "['/run/cache:exec,noexec']",
+            "['/run/cache:mode=8']",
+            "['/run/cache:mode=17777']",
+            "['/run/cache:mode=1777,mode=1777']",
+            "['/run/cache:uid=0']",
             "['/run/cache:size=0m']",
             "['/run/cache:size=1t']",
             "['/one', '/one/']",
@@ -11944,6 +12139,83 @@ fi
             )
             .unwrap();
             assert!(runtime.run(manifest_stack_setup_plan(&request())).is_err());
+        }
+    }
+
+    #[test]
+    fn manifest_host_docker_socket_is_typed_and_other_host_paths_explain_the_remedy() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let image = format!("example.invalid/app@sha256:{}", "a".repeat(64));
+        let request = || ManifestEnsureJobRequest {
+            workspace: workspace.clone(),
+            manifest: "bosn.toml".into(),
+            stack: "app".into(),
+            deadline: Duration::from_secs(1),
+            output_limit: 64,
+        };
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let write = |source: &str| {
+            std::fs::write(
+                workspace.join("bosn.toml"),
+                format!(
+                    "[stack.app]\nimage = '{image}'\n[stack.app.mounts.source]\nsource = '.'\ndestination = '/workspace'\nreadonly = true\n[stack.app.mounts.docker]\nsource = '{source}'\ndestination = '/var/run/docker.sock'\n"
+                ),
+            )
+            .unwrap();
+        };
+
+        write(&outside.to_string_lossy());
+        let refused = runtime
+            .run(manifest_stack_setup_plan(&request()))
+            .err()
+            .expect("a host path outside the workspace is refused");
+        assert!(refused.contains("escapes workspace"), "{refused}");
+        assert!(refused.contains("/var/run/docker.sock"), "{refused}");
+        assert!(refused.contains("[stack.NAME.volumes]"), "{refused}");
+
+        write("/var/run/docker.sock");
+        let host_has_socket = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt;
+                std::fs::metadata("/var/run/docker.sock")
+                    .is_ok_and(|metadata| metadata.file_type().is_socket())
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        };
+        match runtime.run(manifest_stack_setup_plan(&request())) {
+            Ok(plan) => {
+                assert!(host_has_socket);
+                // Typed, never a workspace bind.
+                assert_eq!(
+                    plan.plan.host_docker_socket,
+                    Some(SetupHostDockerSocket {
+                        source: SetupHostDockerSocketSource::VarRun,
+                        target: "/var/run/docker.sock".into(),
+                        readonly: false,
+                    })
+                );
+                assert_eq!(plan.plan.app.mounts.len(), 1);
+                assert_eq!(plan.plan.app.mounts[0].target, "/workspace");
+                assert_eq!(
+                    plan.plan.app.command.as_deref(),
+                    Some(MANIFEST_LINUX_IDLE_COMMAND)
+                );
+            }
+            Err(error) => {
+                assert!(!host_has_socket, "{error}");
+                assert!(error.contains("host Docker socket"), "{error}");
+            }
         }
     }
 
@@ -13537,6 +13809,7 @@ fi
             app_source: bosn_setup::SetupPlanAppSource::PinnedImage { image },
             named_volumes: Vec::new(),
             tmpfs: Vec::new(),
+            host_docker_socket: None,
             macos_guest: None,
         }
     }

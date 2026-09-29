@@ -50,6 +50,8 @@ pub struct SetupEnsureTmpfs {
     pub target: String,
     pub readonly: bool,
     pub size: Option<crate::SetupTmpfsSize>,
+    pub exec: Option<bool>,
+    pub mode: Option<u32>,
 }
 
 /// The only privileged container shape accepted by setup ensure.  Every value
@@ -86,6 +88,9 @@ pub enum SetupEnsureCommand {
         mounts: Vec<SetupEnsureMount>,
         volumes: Vec<SetupEnsureVolume>,
         tmpfs: Vec<SetupEnsureTmpfs>,
+        /// Explicit manifest opt-in; resources created through it are not
+        /// Bosn-managed.
+        host_docker_socket: Option<crate::SetupHostDockerSocket>,
         environment: BTreeMap<String, String>,
         workdir: Option<String>,
         command: Option<String>,
@@ -133,6 +138,7 @@ impl SetupEnsureCommand {
                 mounts,
                 volumes,
                 tmpfs,
+                host_docker_socket,
                 environment,
                 workdir,
                 command,
@@ -171,6 +177,18 @@ impl SetupEnsureCommand {
                 for mount in tmpfs {
                     args.push("--tmpfs".into());
                     args.push(tmpfs_docker_value(mount));
+                }
+                if let Some(socket) = host_docker_socket {
+                    let mut value = format!(
+                        "type=bind,src={},dst={}",
+                        socket.source.host_path(),
+                        socket.target
+                    );
+                    if socket.readonly {
+                        value.push_str(",readonly");
+                    }
+                    args.push("--mount".into());
+                    args.push(value);
                 }
                 for (key, value) in environment {
                     args.push("--env".into());
@@ -705,6 +723,7 @@ struct DerivedEnsure {
     labels: BTreeMap<String, String>,
     volumes: Vec<SetupEnsureVolume>,
     tmpfs: Vec<SetupEnsureTmpfs>,
+    host_docker_socket: Option<crate::SetupHostDockerSocket>,
     macos_guest: Option<SetupEnsureMacosGuest>,
 }
 
@@ -716,6 +735,7 @@ impl DerivedEnsure {
             mounts: self.mounts.clone(),
             volumes: self.volumes.clone(),
             tmpfs: self.tmpfs.clone(),
+            host_docker_socket: self.host_docker_socket.clone(),
             environment: self.environment.clone(),
             workdir: self.workdir.clone(),
             command: self.command.clone(),
@@ -784,6 +804,7 @@ fn derive_command(request: &SetupEnsureRequest<'_>) -> Result<DerivedEnsure, Set
         labels,
         volumes,
         tmpfs,
+        host_docker_socket: request.plan.host_docker_socket.clone(),
         macos_guest,
     })
 }
@@ -806,10 +827,9 @@ fn validate_plan_shape(plan: &SetupPlan) -> Result<(), SetupEnsureError> {
         (
             bosn_core::SetupSource::InlineDockerfile(_),
             SetupPlanAppSource::InlineDockerfile { dockerfile_path },
-        ) if plan
-            .asset_root
-            .as_ref()
-            .is_some_and(|root| dockerfile_path == &root.join("Dockerfile")) => {}
+        ) if plan.asset_root.as_ref().is_some_and(|root| {
+            crate::materialize::materialized_dockerfile_relative(root, dockerfile_path).is_some()
+        }) => {}
         _ => {
             return Err(SetupEnsureError::InvalidRequest(
                 "plan application receipt was modified",
@@ -849,11 +869,23 @@ fn validate_plan_shape(plan: &SetupPlan) -> Result<(), SetupEnsureError> {
         if validate_container_path(&tmpfs.target).is_err()
             || !targets.insert(tmpfs.target.clone())
             || tmpfs.size.as_ref().is_some_and(|size| size.value == 0)
+            || tmpfs.mode.is_some_and(|mode| mode > 0o7777)
         {
             return Err(SetupEnsureError::InvalidRequest(
                 "tmpfs receipt was modified",
             ));
         }
+    }
+    if let Some(socket) = &plan.host_docker_socket
+        && (validate_container_path(&socket.target).is_err()
+            || !targets.insert(socket.target.clone())
+            || plan.macos_guest.is_some()
+            || crate::SetupHostDockerSocketSource::from_host_path(socket.source.host_path())
+                != Some(socket.source))
+    {
+        return Err(SetupEnsureError::InvalidRequest(
+            "host Docker socket receipt was modified",
+        ));
     }
     if let Some(guest) = &plan.macos_guest
         && (!matches!(plan.app.source, bosn_core::SetupSource::PinnedImage(_))
@@ -954,6 +986,8 @@ fn derive_tmpfs(plan: &SetupPlan) -> Result<Vec<SetupEnsureTmpfs>, SetupEnsureEr
                 target: mount.target.clone(),
                 readonly: mount.readonly,
                 size: mount.size.clone(),
+                exec: mount.exec,
+                mode: mount.mode,
             })
         })
         .collect()
@@ -972,6 +1006,14 @@ fn tmpfs_docker_value(mount: &SetupEnsureTmpfs) -> String {
             crate::SetupTmpfsSizeUnit::Gibibytes => "g",
         };
         options.push(format!("size={}{}", size.value, unit));
+    }
+    match mount.exec {
+        Some(true) => options.push("exec".to_owned()),
+        Some(false) => options.push("noexec".to_owned()),
+        None => {}
+    }
+    if let Some(mode) = mount.mode {
+        options.push(format!("mode={mode:o}"));
     }
     if options.is_empty() {
         mount.target.clone()
@@ -1461,6 +1503,7 @@ mod tests {
             app_source: SetupPlanAppSource::PinnedImage { image },
             named_volumes: Vec::new(),
             tmpfs: Vec::new(),
+            host_docker_socket: None,
             macos_guest: None,
         }
     }
@@ -1706,7 +1749,10 @@ mod tests {
                     value: 64,
                     unit: crate::SetupTmpfsSizeUnit::Mebibytes,
                 }),
+                exec: None,
+                mode: None,
             }],
+            host_docker_socket: None,
             environment: BTreeMap::new(),
             workdir: None,
             command: None,
@@ -1723,6 +1769,83 @@ mod tests {
     }
 
     #[test]
+    fn typed_tmpfs_exec_mode_and_host_docker_socket_are_emitted_from_typed_fields() {
+        let command = SetupEnsureCommand::Create {
+            container_name: "bosn-setup-test".into(),
+            image_identity: IDENTITY.into(),
+            mounts: Vec::new(),
+            volumes: Vec::new(),
+            tmpfs: vec![SetupEnsureTmpfs {
+                target: "/mount-probe".into(),
+                readonly: false,
+                size: None,
+                exec: Some(true),
+                mode: Some(0o1777),
+            }],
+            host_docker_socket: Some(crate::SetupHostDockerSocket {
+                source: crate::SetupHostDockerSocketSource::VarRun,
+                target: "/var/run/docker.sock".into(),
+                readonly: false,
+            }),
+            environment: BTreeMap::new(),
+            workdir: None,
+            command: None,
+            labels: BTreeMap::new(),
+            macos_guest: Box::new(None),
+        };
+        let args = command.docker_args();
+        assert_eq!(
+            args.windows(2)
+                .find(|pair| pair[0] == "--tmpfs")
+                .map(|pair| pair[1].as_str()),
+            Some("/mount-probe:exec,mode=1777")
+        );
+        assert!(args.windows(2).any(|pair| pair[0] == "--mount"
+            && pair[1] == "type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock"));
+        let noexec = SetupEnsureTmpfs {
+            target: "/t".into(),
+            readonly: true,
+            size: None,
+            exec: Some(false),
+            mode: Some(0o700),
+        };
+        assert_eq!(tmpfs_docker_value(&noexec), "/t:ro,noexec,mode=700");
+    }
+
+    #[test]
+    fn host_docker_socket_target_cannot_collide_or_enter_a_guest() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut plan = plan(temporary.path());
+        plan.host_docker_socket = Some(crate::SetupHostDockerSocket {
+            source: crate::SetupHostDockerSocketSource::Run,
+            target: plan.app.mounts[0].target.clone(),
+            readonly: false,
+        });
+        assert!(matches!(
+            validate_plan_shape(&plan),
+            Err(SetupEnsureError::InvalidRequest(
+                "host Docker socket receipt was modified"
+            ))
+        ));
+        plan.host_docker_socket = Some(crate::SetupHostDockerSocket {
+            source: crate::SetupHostDockerSocketSource::Run,
+            target: "/var/run/docker.sock".into(),
+            readonly: false,
+        });
+        assert!(validate_plan_shape(&plan).is_ok());
+
+        let mut guest = macos_guest_plan(temporary.path());
+        assert!(validate_plan_shape(&guest).is_ok());
+        guest.host_docker_socket = plan.host_docker_socket.clone();
+        assert!(matches!(
+            validate_plan_shape(&guest),
+            Err(SetupEnsureError::InvalidRequest(
+                "host Docker socket receipt was modified"
+            ))
+        ));
+    }
+
+    #[test]
     fn typed_macos_guest_emits_only_its_fixed_privileged_runtime_shape() {
         let command = SetupEnsureCommand::Create {
             container_name: "bosn-setup-test".into(),
@@ -1730,6 +1853,7 @@ mod tests {
             mounts: Vec::new(),
             volumes: Vec::new(),
             tmpfs: Vec::new(),
+            host_docker_socket: None,
             environment: BTreeMap::new(),
             workdir: None,
             command: Some("must-not-be-emitted".into()),
@@ -1812,6 +1936,8 @@ mod tests {
             target: "/workspace".into(),
             readonly: false,
             size: None,
+            exec: None,
+            mode: None,
         });
         let image = prepared(&plan);
         let engine = FakeEngine::with_results([]);

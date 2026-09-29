@@ -10,6 +10,44 @@ bosn manifest ensure --state-dir STATE --workspace WORKSPACE \
   --manifest bosn.toml --stack app --deadline-ms 300000 --output-limit 8388608
 ```
 
+## `bosn run`
+
+`bosn run` is the everyday front door. It adds no authority of its own: it
+composes `manifest ensure` and `manifest app-task` with defaults taken from
+the working tree.
+
+```text
+bosn run --task NAME [--stack NAME] [--manifest PATH] [--state-dir STATE_DIR]
+         [--deadline-ms 1..=14400000] [--output-limit 1..=67108864] [--no-ensure]
+bosn run --stack NAME [--manifest PATH] [--state-dir STATE_DIR] [...]
+```
+
+| Input | Default |
+| --- | --- |
+| `--manifest` | the nearest `bosn.toml` in the current directory or a parent; the workspace is the manifest's own directory |
+| `--stack` | the `stack` the named task declares (a contradicting `--stack` is refused) |
+| `--state-dir` | `$BOSN_STATE_DIR`, else `$XDG_STATE_HOME/bosn`, else `~/.local/state/bosn` (`%LOCALAPPDATA%\bosn` on Windows) |
+| `--deadline-ms` | 1 hour for the ensure, 2 hours for the task |
+| `--output-limit` | 64 MiB (the manifest maximum) |
+
+It pings the daemon for that state directory and, when none answers, starts
+`bosn daemon serve --state-dir STATE_DIR` detached (its own process group, so
+Ctrl-C on the client does not reach it). It then submits the stack's ensure
+(skipped with `--no-ensure`), which reuses the exact running container when
+the generation is unchanged, and the declared task. Each job's logs are
+streamed as they arrive: the task's stdout goes to stdout, its stderr and all
+daemon progress to stderr, and every ensure record to stderr. Ctrl-C cancels
+the running job and exits 130. The exit status is the task's own exit status
+(0 on success); a Bosn-side refusal or failure exits 1 with a `bosn run:`
+message, and bad arguments exit 2. `bosn run --stack NAME` only ensures.
+
+Manifest operations (`manifest ensure`, `manifest converge`, `manifest
+app-task`, their MCP tools, and `bosn run`) accept a deadline of up to four
+hours and an output budget of up to 64 MiB, because a declared stack builds
+and runs whole CI workloads. Setup-document operations keep their five-minute
+and 8 MiB bounds. Task output is held in daemon memory until the exec ends, so
+the output ceiling remains finite.
+
 The same bounded semantic operation is available as
 `Client.submit_manifest_ensure(...)` in the Python wheel and the
 `bosn_manifest_ensure` Hermes MCP tool. The public request can select only the
@@ -95,11 +133,13 @@ changed.
 | `[stack.NAME.env]` scalar environment | Supported after bounded validation |
 | One explicitly named stack | Supported |
 | Named `[task.NAME]` for that stack in an already ensured container | Supported; fixed daemon-owned exec only |
-| `dockerfile = 'relative/Dockerfile'` build context | Supported for a safe relative Dockerfile label, selected regular files, and selected empty directories. The daemon collects finite Docker-selected `COPY`/`ADD` entries through `kernal-api`, copies their typed representation into an owner-private content-addressed setup asset tree, and Docker never receives the workspace as build context. A selected symlink is currently refused after safe target validation: `kernal-api` 0.1.14 exposes non-following observation/read but no public private-root symlink-creation facade. The smallest required upstream addition is a facade operation that creates a supplied relative link below a caller-owned private directory only after non-following destination/parent checks, with a portable directory/file target policy. Every external Dockerfile image must itself be digest-pinned. |
+| `dockerfile = 'relative/Dockerfile'` build context | Supported for a safe relative Dockerfile label, selected regular files, and selected empty directories. The daemon collects finite Docker-selected `COPY`/`ADD` entries through `kernal-api`, copies their typed representation into an owner-private content-addressed setup asset tree, and Docker never receives the workspace as build context. A selected symlink is currently refused after safe target validation: `kernal-api` 0.1.14 exposes non-following observation/read but no public private-root symlink-creation facade. The smallest required upstream addition is a facade operation that creates a supplied relative link below a caller-owned private directory only after non-following destination/parent checks, with a portable directory/file target policy. Every external Dockerfile image must itself be digest-pinned; the refusal names the tag-only reference and the `FROM image:tag@sha256:<digest>` remedy. A nested Dockerfile (for example `dockerfile = 'bosn/act.Dockerfile'`) is materialized at the same relative path and built with `--file` that path and the workspace root as its context. |
 | `kind = 'macos-x64-guest'` with explicit license acknowledgement | Supported only for `dockurr/macos` and Docker Hub aliases (`docker.io`, `index.docker.io`, `registry-1.docker.io`) pinned by a lowercase 64-hex `sha256` digest, with exactly `[stack.NAME.volumes.storage]` declared as `scope = 'machine'`, `destination = '/storage'`, and `retention = 'pinned'`. A tag-only reference and an image baked from a prepared disk and published elsewhere (for example ghcr.io) are refused; the prepared install lives on the pinned `/storage` volume, not the image. This prevents an ephemeral VM disk and prevents the fixed KVM/tun create shape from executing a manifest-selected privileged image. On Linux, kernal-api must report both `/dev/kvm` and `/dev/net/tun`. Bosn emits only the fixed dockurr KVM/tun/NET_ADMIN, loopback SSH/web-port, 120-second stop timeout, and sizing shape; it never accepts raw privilege/device/port arguments. The durable container resource uses the `manifest-guest:` namespace and rolls over conservatively like a manifest container. Guest SSH is fixed to `127.0.0.1`; non-loopback `guest.ssh_host` declarations are refused. See `docs/macos-guest.md`, whose example manifest is test-checked against this rule. |
 | named `[stack.NAME.volumes]` | Supported for typed Bosn-managed named volumes. The daemon derives the engine name from the declared logical name, scope, canonical workspace, and (for `spec`) generation; callers cannot supply a Docker volume name or mount string. It writes a durable creation intent before `docker volume create`, requires exact ownership labels before reuse, then atomically records the resource and consumes the intent after container ensure. `spec` rolls with generation; `stack` survives generations within its workspace; `machine` follows the declared `family` or stack. Normal rollover never removes data. `manifest volume-gc` can collect only a retired native `spec` + `warm` volume. Durable `stack`/`machine` or `pinned` data remains outside GC and is removable only through confirmation-gated `manifest volume-release`: preview an opaque candidate token, then apply exactly that token. Apply repeats exact registry/use/lease/session/intent checks, two exact Docker-label-and-attachment inspections, and a fixed exact-name remove. |
-| `tmpfs` | Supported only as an array of normalized legacy strings: `/target`, `/target:ro`, `/target:rw`, with an optional one `size=POSITIVE{b,k,m,g}` option (for example `/run/cache:rw,size=64m`). The daemon parses those into typed target/mode/size values before its engine seam, incorporates the declaration into the runtime generation, and emits only its own finite `--tmpfs` form. Repeated modes/sizes and all other options (`noexec`, `mode`, `uid`, etc.) are refused rather than passed through. tmpfs is disposable container state; a generation rollover creates a new empty tmpfs. |
-| `[stack.NAME.mounts]` workspace bind mounts | Supported for existing paths that canonicalize beneath the selected workspace. Sources may be legacy absolute paths only when they resolve beneath that workspace; traversal, source symlinks, escapes, duplicate targets, reserved targets, and unrepresentable Docker paths are refused. `readonly` is retained. |
+| `tmpfs` | Supported only as an array of normalized legacy strings: `/target`, `/target:ro`, `/target:rw`, with at most one each of `size=POSITIVE{b,k,m,g}`, `exec` or `noexec`, and `mode=OCTAL` (1-4 octal digits, at most `7777`), for example `/mount-probe:rw,exec,mode=1777`. The daemon parses those into typed target/readonly/size/exec/mode values before its engine seam, incorporates the declaration into the runtime generation (exec/mode only when declared), and emits only its own finite `--tmpfs` form. Repeated options and all other options (`uid`, `nosuid`, etc.) are refused rather than passed through. tmpfs is disposable container state; a generation rollover creates a new empty tmpfs. |
+| `[stack.NAME.mounts]` workspace bind mounts | Supported for existing paths that canonicalize beneath the selected workspace. Sources may be legacy absolute paths only when they resolve beneath that workspace; traversal, source symlinks, escapes, duplicate targets, reserved targets, and unrepresentable Docker paths are refused, and the refusal names the remedy (move the data under the workspace or declare a Bosn-managed volume). `readonly` is retained. |
+| `[stack.NAME.mounts]` host Docker socket | A mount whose `source` is exactly `/var/run/docker.sock` or `/run/docker.sock` is accepted as a typed host-Docker-socket bind (at most one per stack, Linux stacks only, and only when that host path is currently a Unix socket). This is the manifest author's explicit choice to let the container drive the host engine, for example to run `act`, whose job containers are siblings. **Everything created through the socket is outside Bosn supervision**: it carries no Bosn labels, is not in the registry, and is never garbage-collected or protected by Bosn. Bosn supervises only the stack's own container. No other host path is accepted. |
+| Linux container PID 1 | A fixed daemon-owned idle process (`sleep` loop that exits on `docker stop`), not the image's default command: declared tasks run through `docker exec`, and a base image such as `debian` defaults to a shell that would exit at once. This matches the legacy runtime. The command is part of the runtime generation. |
 | `workdir` | Linux: supported only when its normalized absolute container path is covered by a declared workspace bind; it is translated to the typed workspace-relative form and inherited by declared `manifest app-task` exec. Guest: a normalized absolute VM path is supported only for typed SSH app tasks and is safely shell-quoted before the declared command. |
 | `[task.NAME] secrets` | Supported for the one name `github_token`, injected per exec as `GITHUB_TOKEN` from daemon state; see [task-secrets.md](task-secrets.md). |
 | image tags or unpinned image references | Refused |

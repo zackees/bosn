@@ -15,12 +15,12 @@
 //! numeric arguments are bounded before they reach the native daemon.
 
 use crate::{
-    Client, DoctorReport, Error, JobLogPage, JobStatus, MAX_REGISTRY_DIAGNOSTIC_PAGE,
-    ManifestAppTaskJobRequest, ManifestConvergeJobRequest, ManifestEnsureJobRequest,
-    ManifestVolumeGcApplyResult, ManifestVolumeGcPreviewPage, RegistryResourcePage,
-    SetupAdoptRequest, SetupAdoptResult, SetupAppTaskJobRequest, SetupDoneResult,
-    SetupEnsureEventPage, SetupEnsureJobRequest, SetupGcApplyResult, SetupGcPreviewPage,
-    SetupPreparePolicy, SetupPrepareRequest, SetupReconcileMissingRepairResult,
+    Client, DoctorReport, Error, JobLogPage, JobStatus, MANIFEST_MAX_DEADLINE, MANIFEST_MAX_OUTPUT,
+    MAX_REGISTRY_DIAGNOSTIC_PAGE, ManifestAppTaskJobRequest, ManifestConvergeJobRequest,
+    ManifestEnsureJobRequest, ManifestVolumeGcApplyResult, ManifestVolumeGcPreviewPage,
+    RegistryResourcePage, SetupAdoptRequest, SetupAdoptResult, SetupAppTaskJobRequest,
+    SetupDoneResult, SetupEnsureEventPage, SetupEnsureJobRequest, SetupGcApplyResult,
+    SetupGcPreviewPage, SetupPreparePolicy, SetupPrepareRequest, SetupReconcileMissingRepairResult,
     SetupReconcilePreviewPage, SetupRetiredStopResult, SetupTaskJobRequest, Status,
 };
 use bosn_core::parse_and_plan_compose_yaml;
@@ -601,7 +601,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "bosn_manifest_ensure",
-                "description": "Submit a bounded daemon-owned ensure of one explicitly named legacy Bosn manifest stack. The supported runtime slice accepts a workspace-contained local TOML manifest, an immutable external image or a workspace-root Dockerfile with a digest-pinned external-image context, declared environment, typed managed volumes, safe workspace binds/workdir, and bounded tmpfs target/mode/size declarations. Dockerfile contexts are copied into daemon-owned content-addressed state; alternate Dockerfile paths, symlinks, empty selected directories, guests, replacement controls, and arbitrary Docker controls are refused.",
+                "description": "Submit a bounded daemon-owned ensure of one explicitly named legacy Bosn manifest stack. The supported runtime slice accepts a workspace-contained local TOML manifest, an immutable external image or a workspace Dockerfile (root or nested) whose external images are digest-pinned, declared environment, typed managed volumes, safe workspace binds/workdir, an explicit host Docker socket bind (its resources are outside Bosn supervision), and bounded tmpfs target/ro/rw/size/exec/mode declarations. Dockerfile contexts are copied into daemon-owned content-addressed state; symlinks, other host paths, replacement controls, and arbitrary Docker controls are refused.",
                 "inputSchema": manifest_ensure_schema(),
                 "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}
             },
@@ -692,16 +692,16 @@ fn manifest_ensure_schema() -> Value {
         "workspace":{"type":"string","minLength":1,"maxLength":MAX_MCP_SETUP_STRING_BYTES},
         "manifest":{"type":"string","minLength":1,"maxLength":4096,"description":"Safe relative TOML path beneath workspace; URLs and absolute paths are refused."},
         "stack":{"type":"string","minLength":1,"maxLength":128},
-        "deadline_ms":{"type":"integer","minimum":1,"maximum":300000},
-        "output_limit":{"type":"integer","minimum":1,"maximum":8388608}
+        "deadline_ms":{"type":"integer","minimum":1,"maximum":14400000},
+        "output_limit":{"type":"integer","minimum":1,"maximum":67108864}
     }})
 }
 fn manifest_converge_schema() -> Value {
     json!({"type":"object","additionalProperties":false,"required":["workspace","manifest","deadline_ms","output_limit"],"properties":{
         "workspace":{"type":"string","minLength":1,"maxLength":MAX_MCP_SETUP_STRING_BYTES},
         "manifest":{"type":"string","minLength":1,"maxLength":4096,"description":"Safe relative TOML path beneath workspace; URLs, dependency selectors, and absolute paths are refused."},
-        "deadline_ms":{"type":"integer","minimum":1,"maximum":300000},
-        "output_limit":{"type":"integer","minimum":1,"maximum":8388608}
+        "deadline_ms":{"type":"integer","minimum":1,"maximum":14400000},
+        "output_limit":{"type":"integer","minimum":1,"maximum":67108864}
     }})
 }
 fn manifest_app_task_schema() -> Value {
@@ -710,8 +710,8 @@ fn manifest_app_task_schema() -> Value {
         "manifest":{"type":"string","minLength":1,"maxLength":4096,"description":"Safe relative TOML path beneath workspace; URLs and absolute paths are refused."},
         "stack":{"type":"string","minLength":1,"maxLength":128},
         "task_name":{"type":"string","minLength":1,"maxLength":64,"description":"A declared task belonging to the selected stack."},
-        "deadline_ms":{"type":"integer","minimum":1,"maximum":300000},
-        "output_limit":{"type":"integer","minimum":1,"maximum":8388608}
+        "deadline_ms":{"type":"integer","minimum":1,"maximum":14400000},
+        "output_limit":{"type":"integer","minimum":1,"maximum":67108864}
     }})
 }
 
@@ -1212,9 +1212,10 @@ fn manifest_ensure_request(
         deadline: std::time::Duration::from_millis(required_bounded_u64(
             arguments,
             "deadline_ms",
-            300_000,
+            MANIFEST_MAX_DEADLINE.as_millis() as u64,
         )?),
-        output_limit: required_bounded_u64(arguments, "output_limit", 8 * 1024 * 1024)? as usize,
+        output_limit: required_bounded_u64(arguments, "output_limit", MANIFEST_MAX_OUTPUT as u64)?
+            as usize,
     })
 }
 fn manifest_converge_request(
@@ -1241,9 +1242,10 @@ fn manifest_converge_request(
         deadline: std::time::Duration::from_millis(required_bounded_u64(
             arguments,
             "deadline_ms",
-            300_000,
+            MANIFEST_MAX_DEADLINE.as_millis() as u64,
         )?),
-        output_limit: required_bounded_u64(arguments, "output_limit", 8 * 1024 * 1024)? as usize,
+        output_limit: required_bounded_u64(arguments, "output_limit", MANIFEST_MAX_OUTPUT as u64)?
+            as usize,
     })
 }
 fn manifest_app_task_request(
@@ -2028,6 +2030,7 @@ mod tests {
                 },
                 named_volumes: Vec::new(),
                 tmpfs: Vec::new(),
+                host_docker_socket: None,
                 macos_guest: None,
             })
         }
