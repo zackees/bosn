@@ -28,6 +28,12 @@ jobs:
   select-tier:
     name: Select CI tier
     runs-on: ubuntu-latest
+    # Read-only grants for the shadow reuse decision below (PR association,
+    # commit trees, run/job lists). Nothing here writes.
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
     outputs:
       tier: ${{ steps.select.outputs.tier }}
       test: ${{ steps.select.outputs.test }}
@@ -47,6 +53,39 @@ jobs:
           --payload "$EVENT_PATH" --manual-tier "${MANUAL_TIER:-minimal}"
           --manual-sha "$MANUAL_SHA"
           --output "$GITHUB_OUTPUT"
+
+      # GEN-021 verified reuse, SHADOW mode only (zackees/ci.yml#162): on a
+      # main push, report in the step summary whether this commit's tree is
+      # identical to a PR head whose CI passed every job below. It never skips
+      # anything (shadow always yields reuse=false), sets no job output, and
+      # both steps are continue-on-error so a failure cannot turn CI red.
+      - name: Check out ci-lint (shadow reuse decision)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        timeout-minutes: 3
+        uses: actions/checkout@v4
+        with:
+          repository: zackees/ci.yml
+          ref: b93b8c4a20ce3cd476c75a278ad01a31bde2438b
+          path: .ci-lint
+          persist-credentials: false
+
+      - name: Verified reuse decision (GEN-021, shadow)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        timeout-minutes: 3
+        working-directory: .ci-lint
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 -m ci_lint reuse-check --workflow ci.yml --mode shadow
+          --required-job "CI policy (no hosted macOS runners)"
+          --required-job "Rust workspace (locked tests)"
+          --required-job "Linux (lint + unit + docker)"
+          --required-job "Native wheel (ubuntu-latest)"
+          --required-job "Native wheel (windows-latest)"
+          --required-job "Darwin wheel (x86_64-apple-darwin, Linux-hosted Soldr)"
+          --required-job "Darwin wheel (aarch64-apple-darwin, Linux-hosted Soldr)"
 
   lint-no-macos-runners:
     # Legacy required-check name in branch protection. The implementation now
