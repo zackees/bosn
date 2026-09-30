@@ -113,7 +113,7 @@ approved release procedure.
 - **Hosted macOS runners are reserved for `ci-full` and release smoke checks.**
   `ci/lint_no_macos_runners.py` rejects macOS runner labels outside those gated jobs.
   Both `x86_64-apple-darwin` and `aarch64-apple-darwin` wheels
-  build on `ubuntu-latest` through `zackees/setup-soldr` (pinned SHA) +
+  build on `ubuntu-latest` through `zackees/setup-soldr` (floating `@v0`) +
   `soldr prepare --target …`, using Soldr's LLVM 21.1.5 and managed Apple SDK 14.5 —
   never Xcode, zig, or osxcross.
 - **Linux verifies macOS wheels statically; full CI and release execute them on
@@ -131,5 +131,5 @@ approved release procedure.
 
 `clud`, on launch, re-pins its blessed `soldr==0.7.11` as the `uv` tool
 (`~/.local/bin/soldr`), which predates the `prepare` subcommand and breaks local cross
-builds. CI is unaffected (it uses `zackees/setup-soldr`, pinned). If a local `soldr`
+builds. CI is unaffected (it uses `zackees/setup-soldr@v0`). If a local `soldr`
 build fails with "tool not found: prepare", run `uv tool install 'soldr==0.9.15'`.
