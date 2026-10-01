@@ -20,6 +20,27 @@ pub enum ActRegistryCommand {
         observed: ActEngineObservation,
         at: f64,
     },
+    Verify {
+        run: String,
+        observed: ActEngineObservation,
+    },
+    Claim {
+        intent: ActEngineIntent,
+        observed: ActEngineObservation,
+        token: String,
+        at: f64,
+    },
+    VerifyClaimed {
+        run: String,
+        observed: ActEngineObservation,
+        token: String,
+    },
+    CleanupClaimed {
+        run: String,
+        token: String,
+        outcome: ActRunOutcome,
+        at: f64,
+    },
     Recover {
         run: String,
         observed: ActEngineObservation,
@@ -27,6 +48,7 @@ pub enum ActRegistryCommand {
     },
     Execution {
         run: String,
+        token: String,
         outcome: ActRunOutcome,
         at: f64,
     },
@@ -53,6 +75,8 @@ pub enum ActRegistryCommand {
 pub enum ActRegistryReply {
     Committed,
     Authorized(Box<ActEngineRecord>),
+    Verified(Box<ActEngineRecord>),
+    Claimed(Box<ActEngineRecord>),
     Recovery(ActEngineRecoveryPage),
 }
 
@@ -99,12 +123,52 @@ pub(crate) fn apply(
             transaction.register_act_engine(&run, &observed, at)?;
             ActRegistryReply::Committed
         }
+        ActRegistryCommand::Verify { run, observed } => {
+            let record = transaction.verify_act_engine(&run, &observed)?;
+            if record.state != bosn_registry::act::ActEngineState::Registered
+                || record.execution_claim.is_some()
+            {
+                return Err(bosn_registry::Error::BadRow(
+                    "Act execution requires registered ownership",
+                ));
+            }
+            ActRegistryReply::Verified(Box::new(record))
+        }
+        ActRegistryCommand::Claim {
+            intent,
+            observed,
+            token,
+            at,
+        } => ActRegistryReply::Claimed(Box::new(
+            transaction.claim_act_execution(&intent, &observed, &token, at)?,
+        )),
+        ActRegistryCommand::VerifyClaimed {
+            run,
+            observed,
+            token,
+        } => ActRegistryReply::Verified(Box::new(
+            transaction.verify_act_execution_owner(&run, &observed, &token)?,
+        )),
+        ActRegistryCommand::CleanupClaimed {
+            run,
+            token,
+            outcome,
+            at,
+        } => {
+            transaction.request_act_execution_cleanup(&run, &token, outcome, at)?;
+            ActRegistryReply::Committed
+        }
         ActRegistryCommand::Recover { run, observed, at } => {
             transaction.recover_act_engine(&run, &observed, at)?;
             ActRegistryReply::Committed
         }
-        ActRegistryCommand::Execution { run, outcome, at } => {
-            transaction.record_act_execution(&run, outcome, at)?;
+        ActRegistryCommand::Execution {
+            run,
+            token,
+            outcome,
+            at,
+        } => {
+            transaction.record_act_execution(&run, &token, outcome, at)?;
             ActRegistryReply::Committed
         }
         ActRegistryCommand::Cleanup { run, outcome, at } => {
@@ -182,6 +246,71 @@ mod tests {
                 panic!("expected recovery page")
             };
             assert_eq!(page.items[0].intent, intent);
+            let observed = ActEngineObservation {
+                name: intent.engine_name(),
+                engine_id: "1".repeat(64),
+                image_digest: intent.engine_image_digest.clone(),
+                labels: intent
+                    .required_labels("11111111-2222-4333-8444-555555555555")
+                    .unwrap(),
+            };
+            assert!(
+                actor
+                    .act_registry(ActRegistryCommand::Verify {
+                        run: intent.run_id.clone(),
+                        observed: observed.clone()
+                    })
+                    .await
+                    .is_err(),
+                "pending creation cannot authorize execution"
+            );
+            actor
+                .act_registry(ActRegistryCommand::Register {
+                    run: intent.run_id.clone(),
+                    observed: observed.clone(),
+                    at: 2.0,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                actor
+                    .act_registry(ActRegistryCommand::Verify {
+                        run: intent.run_id.clone(),
+                        observed: observed.clone()
+                    })
+                    .await
+                    .unwrap(),
+                ActRegistryReply::Verified(_)
+            ));
+            let mut wrong = observed.clone();
+            wrong.engine_id = "2".repeat(64);
+            assert!(
+                actor
+                    .act_registry(ActRegistryCommand::Verify {
+                        run: intent.run_id.clone(),
+                        observed: wrong
+                    })
+                    .await
+                    .is_err()
+            );
+            actor
+                .act_registry(ActRegistryCommand::Cleanup {
+                    run: intent.run_id.clone(),
+                    outcome: ActRunOutcome::Failed,
+                    at: 3.0,
+                })
+                .await
+                .unwrap();
+            assert!(
+                actor
+                    .act_registry(ActRegistryCommand::Verify {
+                        run: intent.run_id.clone(),
+                        observed
+                    })
+                    .await
+                    .is_err(),
+                "cleanup ownership never authorizes execution"
+            );
             actor.stop().await;
             task.await.unwrap();
         });

@@ -48,6 +48,8 @@ pub struct ActEngineRecord {
     pub state: ActEngineState,
     pub engine_id: Option<String>,
     pub execution: Option<ActRunOutcome>,
+    #[serde(default)]
+    pub execution_claim: Option<String>,
     pub outcome: Option<ActRunOutcome>,
     pub updated_at: f64,
     pub removal: Option<ActEngineRemovalProof>,
@@ -165,7 +167,16 @@ impl ActEngineRecord {
         {
             return Err(Error::BadRow("act removal snapshot"));
         }
-        if self.schema_version != 1
+        if !matches!(self.schema_version, 1 | 2)
+            || (self.schema_version == 1 && self.execution_claim.is_some())
+            || self.execution_claim.as_ref().is_some_and(|token| {
+                canonical_run(token).is_err()
+                    || self.engine_id.is_none()
+                    || self.state == ActEngineState::Pending
+            })
+            || (self.schema_version == 2
+                && self.execution.is_some()
+                && self.execution_claim.is_none())
             || !is_uuid(&self.registry_id)
             || !self.updated_at.is_finite()
             || self.updated_at < self.intent.created_at
@@ -257,12 +268,13 @@ impl Immediate<'_> {
         )?;
         let registry_id = text(rows.first().ok_or(Error::BadRow("registry_id"))?, 0)?;
         self.store_act_record(&ActEngineRecord {
-            schema_version: 1,
+            schema_version: 2,
             registry_id,
             intent: intent.clone(),
             state: ActEngineState::Pending,
             engine_id: None,
             execution: None,
+            execution_claim: None,
             outcome: None,
             removal: None,
             updated_at: intent.created_at,
@@ -374,9 +386,72 @@ impl Immediate<'_> {
         record.updated_at = at;
         self.store_act_record(&record)
     }
+    /// Commit one exclusive daemon execution owner before any runtime mutation.
+    /// Older snapshots remain cleanup-only; a persisted claim cannot be reused.
+    pub fn claim_act_execution(
+        &mut self,
+        intent: &ActEngineIntent,
+        observed: &ActEngineObservation,
+        token: &str,
+        at: f64,
+    ) -> Result<ActEngineRecord, Error> {
+        canonical_run(token)?;
+        let mut record = self.verify_act_engine(&intent.run_id, observed)?;
+        record.check_time(at)?;
+        if record.schema_version != 2
+            || record.intent != *intent
+            || record.state != ActEngineState::Registered
+            || record.execution.is_some()
+            || record.execution_claim.is_some()
+        {
+            return Err(Error::BadRow("act exclusive execution claim"));
+        }
+        record.execution_claim = Some(token.into());
+        record.updated_at = at;
+        self.store_act_record(&record)?;
+        Ok(record)
+    }
+    pub fn verify_act_execution(
+        &mut self,
+        run: &str,
+        observed: &ActEngineObservation,
+        token: &str,
+    ) -> Result<ActEngineRecord, Error> {
+        let record = self.verify_act_execution_owner(run, observed, token)?;
+        if record.state != ActEngineState::Registered || record.execution.is_some() {
+            return Err(Error::BadRow("act active execution claim"));
+        }
+        Ok(record)
+    }
+    /// Trusted cleanup ownership probe also admits an execution already recorded
+    /// or cleanup already requested, but never a terminal retired engine.
+    pub fn verify_act_execution_owner(
+        &mut self,
+        run: &str,
+        observed: &ActEngineObservation,
+        token: &str,
+    ) -> Result<ActEngineRecord, Error> {
+        let record = self.verify_act_engine(run, observed)?;
+        Self::check_execution_owner(&record, token)?;
+        if !matches!(
+            record.state,
+            ActEngineState::Registered | ActEngineState::CleanupRequired
+        ) {
+            return Err(Error::BadRow("act execution ownership state"));
+        }
+        Ok(record)
+    }
+    fn check_execution_owner(record: &ActEngineRecord, token: &str) -> Result<(), Error> {
+        canonical_run(token)?;
+        if record.schema_version != 2 || record.execution_claim.as_deref() != Some(token) {
+            return Err(Error::BadRow("act execution owner"));
+        }
+        Ok(())
+    }
     pub fn record_act_execution(
         &mut self,
         run: &str,
+        token: &str,
         outcome: ActRunOutcome,
         at: f64,
     ) -> Result<(), Error> {
@@ -384,6 +459,7 @@ impl Immediate<'_> {
             .act_record(run)?
             .ok_or(Error::BadRow("act intent missing"))?;
         record.check_time(at)?;
+        Self::check_execution_owner(&record, token)?;
         if record.state != ActEngineState::Registered || record.execution.is_some() {
             return Err(Error::BadRow("act execution transition"));
         }
@@ -391,9 +467,33 @@ impl Immediate<'_> {
         record.updated_at = at;
         self.store_act_record(&record)
     }
+    /// Owner-only cleanup. Startup recovery must first establish that the
+    /// recorded owner cannot still execute; a live claim is not removal authority.
+    pub fn request_act_execution_cleanup(
+        &mut self,
+        run: &str,
+        token: &str,
+        outcome: ActRunOutcome,
+        at: f64,
+    ) -> Result<(), Error> {
+        let record = self
+            .act_record(run)?
+            .ok_or(Error::BadRow("act intent missing"))?;
+        Self::check_execution_owner(&record, token)?;
+        self.request_act_cleanup_inner(run, Some(token), outcome, at)
+    }
     pub fn request_act_cleanup(
         &mut self,
         run: &str,
+        outcome: ActRunOutcome,
+        at: f64,
+    ) -> Result<(), Error> {
+        self.request_act_cleanup_inner(run, None, outcome, at)
+    }
+    fn request_act_cleanup_inner(
+        &mut self,
+        run: &str,
+        token: Option<&str>,
         outcome: ActRunOutcome,
         at: f64,
     ) -> Result<(), Error> {
@@ -401,11 +501,12 @@ impl Immediate<'_> {
             .act_record(run)?
             .ok_or(Error::BadRow("act intent missing"))?;
         record.check_time(at)?;
-        if !matches!(
-            record.state,
-            ActEngineState::Pending | ActEngineState::Registered
-        ) || (outcome == ActRunOutcome::Passed
-            && record.execution != Some(ActRunOutcome::Passed))
+        if record.execution_claim.as_deref() != token
+            || !matches!(
+                record.state,
+                ActEngineState::Pending | ActEngineState::Registered
+            )
+            || (outcome == ActRunOutcome::Passed && record.execution != Some(ActRunOutcome::Passed))
         {
             return Err(Error::BadRow("act cleanup transition"));
         }

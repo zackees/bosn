@@ -55,6 +55,7 @@ pub mod act_archive;
 pub mod act_engine;
 pub mod act_image;
 pub mod act_registry;
+pub mod act_runtime;
 pub mod autostart;
 pub mod github_proxy;
 pub mod jobs;

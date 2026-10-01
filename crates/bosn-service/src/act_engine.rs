@@ -138,6 +138,10 @@ pub fn create_arguments(
         intent.engine_name(),
         "--privileged".into(),
         "--read-only".into(),
+        // The image's entrypoint otherwise adds a TCP dockerd listener.
+        // Execute only our verified Unix-socket command directly.
+        "--entrypoint".into(),
+        "".into(),
         "--cgroupns".into(),
         "private".into(),
         "--ipc".into(),
@@ -156,6 +160,8 @@ pub fn create_arguments(
         limits.pids.to_string(),
         "--env".into(),
         "DOCKER_TLS_CERTDIR=".into(),
+        "--env".into(),
+        "DOCKER_CONTAINERD_ROOT=/var/lib/docker/containerd/daemon".into(),
         "--no-healthcheck".into(),
         "--log-driver".into(),
         "local".into(),
@@ -173,7 +179,10 @@ pub fn create_arguments(
     args.extend([
         format!("docker.io/library/docker@{}", intent.engine_image_digest),
         "dockerd".into(),
-        "--storage-driver=vfs".into(),
+        "--feature=containerd-snapshotter=true".into(),
+        "--storage-driver=native".into(),
+        "--data-root=/var/lib/docker".into(),
+        "--exec-root=/run/docker".into(),
         "--host=unix:///var/run/docker.sock".into(),
     ]);
     Ok(args)
@@ -427,10 +436,16 @@ pub fn observe_engine(
         || host["LogConfig"]["Type"] != "local"
         || host["LogConfig"]["Config"]["max-size"] != "1m"
         || host["LogConfig"]["Config"]["max-file"] != "2"
+        || engine["Config"]
+            .get("Entrypoint")
+            .is_none_or(|v| !v.is_null() && !v.as_array().is_some_and(|v| v.is_empty()))
         || engine["Config"]["Cmd"]
             != serde_json::json!([
                 "dockerd",
-                "--storage-driver=vfs",
+                "--feature=containerd-snapshotter=true",
+                "--storage-driver=native",
+                "--data-root=/var/lib/docker",
+                "--exec-root=/run/docker",
                 "--host=unix:///var/run/docker.sock"
             ])
         || !empty(&host["Binds"])
@@ -458,6 +473,16 @@ pub fn observe_engine(
             })
             .collect::<Vec<_>>()
             != vec![&Value::String("DOCKER_TLS_CERTDIR=".into())]
+        || env
+            .iter()
+            .filter(|v| {
+                v.as_str()
+                    .is_some_and(|s| s.starts_with("DOCKER_CONTAINERD_ROOT="))
+            })
+            .collect::<Vec<_>>()
+            != vec![&Value::String(
+                "DOCKER_CONTAINERD_ROOT=/var/lib/docker/containerd/daemon".into(),
+            )]
         || env
             .iter()
             .any(|v| v.as_str().is_some_and(|s| s.starts_with("DOCKER_HOST=")))
@@ -509,7 +534,10 @@ mod tests {
     fn document() -> serde_json::Value {
         let i = intent();
         let l = limits();
-        json!([{"Id":"1".repeat(64),"Name":format!("/{}",i.engine_name()),"Image":format!("sha256:{}","2".repeat(64)),"Config":{"Image":format!("docker.io/library/docker@{}",i.engine_image_digest),"Labels":i.required_labels(OWNER).unwrap(),"Env":["DOCKER_TLS_CERTDIR="],"Volumes":{"/var/lib/docker":{}},"Healthcheck":{"Test":["NONE"]},"Cmd":["dockerd","--storage-driver=vfs","--host=unix:///var/run/docker.sock"]},"HostConfig":{"Privileged":true,"Memory":l.memory_bytes,"MemorySwap":l.memory_bytes,"CpuPeriod":100000,"CpuQuota":l.nano_cpus/10_000,"ReadonlyRootfs":true,"PidMode":"","IpcMode":"private","CgroupnsMode":"private","PidsLimit":l.pids,"Binds":null,"PortBindings":{},"NetworkMode":"bridge","LogConfig":{"Type":"local","Config":{"max-size":"1m","max-file":"2"}},"Tmpfs":l.tmpfs()},"Mounts":[{"Type":"tmpfs","Destination":"/var/lib/docker"},{"Type":"tmpfs","Destination":"/run"},{"Type":"tmpfs","Destination":"/tmp"}]}])
+        json!([{"Id":"1".repeat(64),"Name":format!("/{}",i.engine_name()),"Image":format!("sha256:{}","2".repeat(64)),"Config":{"Image":format!("docker.io/library/docker@{}",i.engine_image_digest),"Entrypoint":null,"Labels":i.required_labels(OWNER).unwrap(),"Env":["DOCKER_TLS_CERTDIR=","DOCKER_CONTAINERD_ROOT=/var/lib/docker/containerd/daemon"],"Volumes":{"/var/lib/docker":{}},"Healthcheck":{"Test":["NONE"]},"Cmd":["dockerd","--feature=containerd-snapshotter=true",
+                "--storage-driver=native",
+                "--data-root=/var/lib/docker",
+                "--exec-root=/run/docker","--host=unix:///var/run/docker.sock"]},"HostConfig":{"Privileged":true,"Memory":l.memory_bytes,"MemorySwap":l.memory_bytes,"CpuPeriod":100000,"CpuQuota":l.nano_cpus/10_000,"ReadonlyRootfs":true,"PidMode":"","IpcMode":"private","CgroupnsMode":"private","PidsLimit":l.pids,"Binds":null,"PortBindings":{},"NetworkMode":"bridge","LogConfig":{"Type":"local","Config":{"max-size":"1m","max-file":"2"}},"Tmpfs":l.tmpfs()},"Mounts":[{"Type":"tmpfs","Destination":"/var/lib/docker"},{"Type":"tmpfs","Destination":"/run"},{"Type":"tmpfs","Destination":"/tmp"}]}])
     }
     fn classic_identity() -> VerifiedEngineImage {
         let i = intent();
@@ -604,6 +632,56 @@ mod tests {
                 "mutation {change}"
             );
         }
+    }
+    #[test]
+    fn image_entrypoint_cannot_add_an_unverified_tcp_docker_listener() {
+        let args = create_arguments(&intent(), OWNER, limits()).unwrap();
+        assert!(args.windows(2).any(|p| p == ["--entrypoint", ""]));
+        let mut observed = document();
+        observed[0]["Config"]["Entrypoint"] = json!(["dockerd-entrypoint.sh"]);
+        assert!(
+            observe_engine(
+                &serde_json::to_vec(&observed).unwrap(),
+                &intent(),
+                OWNER,
+                &classic_identity(),
+                limits()
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn native_containerd_content_and_runtime_remain_under_bounded_roots() {
+        let args = create_arguments(&intent(), OWNER, limits()).unwrap();
+        let expected = [
+            "dockerd",
+            "--feature=containerd-snapshotter=true",
+            "--storage-driver=native",
+            "--data-root=/var/lib/docker",
+            "--exec-root=/run/docker",
+            "--host=unix:///var/run/docker.sock",
+        ];
+        assert_eq!(&args[args.len() - expected.len()..], expected);
+        assert!(args.windows(2).any(|p| p
+            == [
+                "--env",
+                "DOCKER_CONTAINERD_ROOT=/var/lib/docker/containerd/daemon"
+            ]));
+        let mut observed = document();
+        observed[0]["Config"]["Env"] = json!([
+            "DOCKER_TLS_CERTDIR=",
+            "DOCKER_CONTAINERD_ROOT=/var/lib/containerd"
+        ]);
+        assert!(
+            observe_engine(
+                &serde_json::to_vec(&observed).unwrap(),
+                &intent(),
+                OWNER,
+                &classic_identity(),
+                limits()
+            )
+            .is_err()
+        );
     }
     #[test]
     fn engine_arguments_override_image_volume_without_any_host_bind() {
@@ -714,17 +792,21 @@ else: sys.exit(9)
                     assert!(created.is_err());
                 } else {
                     let observed = created.unwrap();
+                    let token = "12345678-1234-4234-8234-123456789abc";
+                    actor.act_registry(ActRegistryCommand::Claim { intent: intent(), observed: observed.clone(), token: token.into(), at: 2.0 }).await.unwrap();
                     actor
                         .act_registry(ActRegistryCommand::Execution {
                             run: intent().run_id,
+                            token: token.into(),
                             outcome: ActRunOutcome::Passed,
                             at: 2.0,
                         })
                         .await
                         .unwrap();
                     actor
-                        .act_registry(ActRegistryCommand::Cleanup {
+                        .act_registry(ActRegistryCommand::CleanupClaimed {
                             run: intent().run_id,
+                            token: token.into(),
                             outcome: ActRunOutcome::Passed,
                             at: 2.0,
                         })

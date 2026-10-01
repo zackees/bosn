@@ -30,6 +30,9 @@ pub struct ActArchiveBlob<'a> {
 }
 
 const MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+const DOCKER_MANIFEST: &str = "application/vnd.docker.distribution.manifest.v2+json";
+const DOCKER_CONFIG: &str = "application/vnd.docker.container.image.v1+json";
+const DOCKER_GZIP: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
 const CONFIG: &str = "application/vnd.oci.image.config.v1+json";
 const TAR: &str = "application/vnd.oci.image.layer.v1.tar";
 const GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
@@ -93,7 +96,7 @@ pub fn write_act_oci_archive(
     writer: &mut impl Write,
 ) -> Result<u64, ActArchiveError> {
     if reference_name.is_empty()
-        || reference_name.len() > 128
+        || reference_name.len() > 121
         || !reference_name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
@@ -101,7 +104,9 @@ pub fn write_act_oci_archive(
     {
         return Err(invalid("unsafe OCI reference name"));
     }
-    if package.manifest.len() > MAX_JSON
+    if package.runner_manifest.len() > MAX_JSON
+        || package.runner_config.len() > MAX_JSON
+        || package.manifest.len() > MAX_JSON
         || package.config.len() > MAX_JSON
         || package.layer.len() > 64 * 1024 * 1024 + 16384
         || package.base_layers.len() > 128
@@ -157,6 +162,45 @@ pub fn write_act_oci_archive(
     if diffs.last().unwrap() != &layer_digest {
         return Err(invalid("Act layer DiffID mismatch"));
     }
+    // Preserve and validate the independently pinned runner graph. Sharing layer
+    // bytes alone does not make the runner image available in a fresh engine.
+    let runner_manifest: Value = serde_json::from_slice(&package.runner_manifest)
+        .map_err(|_| invalid("invalid runner manifest JSON"))?;
+    let runner_config: Value = serde_json::from_slice(&package.runner_config)
+        .map_err(|_| invalid("invalid runner config JSON"))?;
+    let runner_layers = runner_manifest["layers"]
+        .as_array()
+        .ok_or_else(|| invalid("missing runner layers"))?;
+    let runner_diffs = runner_config["rootfs"]["diff_ids"]
+        .as_array()
+        .ok_or_else(|| invalid("missing runner DiffIDs"))?;
+    if runner_manifest["schemaVersion"] != 2
+        || !matches!(
+            runner_manifest["mediaType"].as_str(),
+            Some(MANIFEST | DOCKER_MANIFEST)
+        )
+        || runner_config["os"] != "linux"
+        || runner_config["architecture"] != "amd64"
+        || !runner_config["config"].is_object()
+        || runner_config["config"].get("Volumes").is_some()
+        || runner_config["rootfs"]["type"] != "layers"
+        || runner_layers.len() != package.base_layers.len()
+        || runner_diffs.as_slice() != &diffs[..package.base_layers.len()]
+        || manifest["annotations"]["com.zackees.bosn.act.base-manifest"]
+            != package.runner_manifest_digest
+    {
+        return Err(invalid("runner graph mismatch"));
+    }
+    let runner_config_media = runner_manifest["config"]["mediaType"]
+        .as_str()
+        .filter(|media| matches!(*media, CONFIG | DOCKER_CONFIG))
+        .ok_or_else(|| invalid("unsupported runner config media type"))?;
+    descriptor(
+        &runner_manifest["config"],
+        runner_config_media,
+        &package.runner_config_digest,
+        package.runner_config.len() as u64,
+    )?;
     let mut required = BTreeMap::new();
     for (i, base) in package.base_layers.iter().enumerate() {
         if !matches!(base.media_type.as_str(), TAR | GZIP)
@@ -167,6 +211,13 @@ pub fn write_act_oci_archive(
             return Err(invalid("unsupported base layer"));
         }
         descriptor(&layers[i], &base.media_type, &base.digest, base.size)?;
+        let runner_media = runner_layers[i]["mediaType"]
+            .as_str()
+            .filter(|media| {
+                *media == base.media_type || (base.media_type == GZIP && *media == DOCKER_GZIP)
+            })
+            .ok_or_else(|| invalid("unsupported runner layer media type"))?;
+        descriptor(&runner_layers[i], runner_media, &base.digest, base.size)?;
         if base.media_type == TAR && diffs[i] != base.digest {
             return Err(invalid("plain base layer DiffID mismatch"));
         }
@@ -187,11 +238,31 @@ pub fn write_act_oci_archive(
     if required.keys().any(|d| !blobs.contains_key(*d)) {
         return Err(invalid("missing base blob"));
     }
+    add_blob(
+        &mut blobs,
+        &package.runner_manifest_digest,
+        &package.runner_manifest,
+    )?;
+    add_blob(
+        &mut blobs,
+        &package.runner_config_digest,
+        &package.runner_config,
+    )?;
     add_blob(&mut blobs, &package.manifest_digest, &package.manifest)?;
     add_blob(&mut blobs, &package.config_digest, &package.config)?;
     add_blob(&mut blobs, &layer_digest, &package.layer)?;
     let layout = b"{\"imageLayoutVersion\":\"1.0.0\"}";
-    let index=serde_json::to_vec(&json!({"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":MANIFEST,"digest":package.manifest_digest,"size":package.manifest.len(),"platform":{"architecture":"amd64","os":"linux"},"annotations":{"org.opencontainers.image.ref.name":reference_name}}]})).map_err(|_|invalid("index serialization failed"))?;
+    let index = serde_json::to_vec(&json!({
+        "schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [
+            {"mediaType": MANIFEST, "digest": package.manifest_digest,
+             "size": package.manifest.len(), "platform": {"architecture":"amd64","os":"linux"},
+             "annotations": {"org.opencontainers.image.ref.name": reference_name}},
+            {"mediaType": runner_manifest["mediaType"], "digest": package.runner_manifest_digest,
+             "size": package.runner_manifest.len(), "platform": {"architecture":"amd64","os":"linux"},
+             "annotations": {"org.opencontainers.image.ref.name": format!("{reference_name}-runner")}}
+        ]
+    })).map_err(|_| invalid("index serialization failed"))?;
     let mut entries = vec![
         ("oci-layout".to_owned(), layout.as_slice()),
         ("index.json".to_owned(), index.as_slice()),
@@ -319,7 +390,15 @@ mod tests {
             index["manifests"][0]["annotations"]["org.opencontainers.image.ref.name"],
             "bosn-act"
         );
+        assert_eq!(index["manifests"].as_array().unwrap().len(), 2);
+        assert_eq!(index["manifests"][1]["digest"], p.runner_manifest_digest);
+        assert_eq!(
+            index["manifests"][1]["annotations"]["org.opencontainers.image.ref.name"],
+            "bosn-act-runner"
+        );
         for (d, b) in [
+            (&p.runner_manifest_digest, p.runner_manifest.as_slice()),
+            (&p.runner_config_digest, p.runner_config.as_slice()),
             (&p.manifest_digest, p.manifest.as_slice()),
             (&p.config_digest, p.config.as_slice()),
             (&p.base_layers[0].digest, base.as_slice()),
@@ -473,6 +552,96 @@ mod tests {
                 .is_err()
             );
             assert!(output.is_empty());
+        }
+    }
+
+    #[test]
+    fn docker_runner_media_types_keep_original_pinned_graph() {
+        let base = b"synthetic compressed layer";
+        let config = serde_json::to_vec(&json!({"architecture":"amd64","os":"linux","config":{},"rootfs":{"type":"layers","diff_ids":[digest(b"uncompressed fixture")]}})).unwrap();
+        let manifest = serde_json::to_vec(&json!({"schemaVersion":2,"mediaType":DOCKER_MANIFEST,"config":{"mediaType":DOCKER_CONFIG,"digest":digest(&config),"size":config.len()},"layers":[{"mediaType":DOCKER_GZIP,"digest":digest(base),"size":base.len()}]})).unwrap();
+        let binary = b"Act fixture";
+        let p = package_act_image(
+            &manifest,
+            &digest(&manifest),
+            &config,
+            &digest(&config),
+            binary,
+            &digest(binary),
+            "0.2.88",
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        write_act_oci_archive(
+            &p,
+            &[ActArchiveBlob {
+                digest: &digest(base),
+                bytes: base,
+            }],
+            "act",
+            100000,
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(p.runner_manifest, manifest);
+        assert_eq!(p.runner_config, config);
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn runner_graph_tampering_writes_nothing() {
+        let (p, base) = fixture();
+        for change in [
+            "manifest_bytes",
+            "config_bytes",
+            "config_descriptor",
+            "layers",
+            "diff_ids",
+            "pin",
+        ] {
+            let mut bad = p.clone();
+            match change {
+                "manifest_bytes" => bad.runner_manifest.push(0),
+                "config_bytes" => bad.runner_config.push(0),
+                "pin" => bad.runner_manifest_digest = digest(b"foreign runner"),
+                "config_descriptor" | "layers" => {
+                    let mut value: Value = serde_json::from_slice(&bad.runner_manifest).unwrap();
+                    if change == "layers" {
+                        value["layers"] = json!([]);
+                    } else {
+                        value["config"]["digest"] = json!(digest(b"foreign config"));
+                    }
+                    bad.runner_manifest = serde_json::to_vec(&value).unwrap();
+                    bad.runner_manifest_digest = digest(&bad.runner_manifest);
+                    let mut driver: Value = serde_json::from_slice(&bad.manifest).unwrap();
+                    driver["annotations"]["com.zackees.bosn.act.base-manifest"] =
+                        json!(bad.runner_manifest_digest);
+                    bad.manifest = serde_json::to_vec(&driver).unwrap();
+                    bad.manifest_digest = digest(&bad.manifest);
+                }
+                _ => {
+                    let mut value: Value = serde_json::from_slice(&bad.runner_config).unwrap();
+                    value["rootfs"]["diff_ids"][0] = json!(digest(b"foreign filesystem"));
+                    bad.runner_config = serde_json::to_vec(&value).unwrap();
+                    bad.runner_config_digest = digest(&bad.runner_config);
+                }
+            }
+            let mut output = Vec::new();
+            assert!(
+                write_act_oci_archive(
+                    &bad,
+                    &[ActArchiveBlob {
+                        digest: &p.base_layers[0].digest,
+                        bytes: &base,
+                    }],
+                    "act",
+                    100000,
+                    &mut output
+                )
+                .is_err(),
+                "{change}"
+            );
+            assert!(output.is_empty(), "{change}");
         }
     }
 

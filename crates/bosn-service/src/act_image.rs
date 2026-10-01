@@ -33,6 +33,11 @@ pub struct ActBaseLayer {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActImagePackage {
+    /// Original pinned runner graph, imported alongside the Act driver.
+    pub runner_manifest: Vec<u8>,
+    pub runner_config: Vec<u8>,
+    pub runner_manifest_digest: String,
+    pub runner_config_digest: String,
     pub manifest: Vec<u8>,
     pub config: Vec<u8>,
     /// Uncompressed POSIX USTAR; its blob digest equals its rootfs DiffID.
@@ -208,6 +213,10 @@ pub fn package_act_image(
         &json!({"schemaVersion":2,"mediaType":OCI_MANIFEST,"config":{"mediaType":OCI_CONFIG,"digest":config_digest,"size":config.len()},"layers":descriptors,"annotations":{"com.zackees.bosn.act.packaging-schema":"1","com.zackees.bosn.act.version":act_version,"com.zackees.bosn.act.binary-sha256":binary_pin,"com.zackees.bosn.act.base-manifest":manifest_pin}}),
     )?;
     Ok(ActImagePackage {
+        runner_manifest: base_manifest.to_vec(),
+        runner_config: base_config.to_vec(),
+        runner_manifest_digest: manifest_pin.into(),
+        runner_config_digest: config_pin.into(),
         manifest_digest: digest(&manifest),
         config_digest,
         binary_digest: binary_pin.into(),
