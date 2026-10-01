@@ -18,6 +18,8 @@ use kernal_api::{
     sqlite::{Connection, Error as SqlError, QueryLimits, Row, Transaction, Value},
 };
 
+pub mod act;
+
 pub const SCHEMA_VERSION: u32 = 5;
 pub const DEFAULT_PAGE_SIZE: usize = 100;
 pub const MAX_PAGE_SIZE: usize = 1_000;
