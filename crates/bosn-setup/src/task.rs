@@ -52,7 +52,8 @@ pub struct SetupTaskMount {
 ///
 /// The shell text is the command already declared in the validated document;
 /// it is not supplied by the operation caller.  The Docker adapter converts it
-/// only to `docker run --rm ... IMAGE sh -lc COMMAND`.
+/// only to `docker run --rm ... IMAGE sh -lc COMMAND`, wrapped so the image's
+/// `ENV PATH` survives the login profile (see `crate::shell`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SetupTaskCommand {
     Run {
@@ -92,12 +93,8 @@ impl SetupAppTaskCommand {
                     args.push("--env".into());
                     args.push(name.clone());
                 }
-                args.extend([
-                    container_name.clone(),
-                    "sh".into(),
-                    "-lc".into(),
-                    command.clone(),
-                ]);
+                args.push(container_name.clone());
+                args.extend(crate::shell::login_shell_args(command));
                 args
             }
         }
@@ -135,12 +132,8 @@ impl SetupTaskCommand {
                     args.push("--workdir".into());
                     args.push(workdir.clone());
                 }
-                args.extend([
-                    image_identity.clone(),
-                    "sh".into(),
-                    "-lc".into(),
-                    command.clone(),
-                ]);
+                args.push(image_identity.clone());
+                args.extend(crate::shell::login_shell_args(command));
                 args
             }
         }
@@ -338,7 +331,9 @@ pub async fn execute_setup_task<E: SetupTaskEngine>(
 
 /// Execute exactly one named task in the deterministic setup application.
 ///
-/// This function derives only `docker container exec NAME sh -lc COMMAND`.
+/// This function derives only `docker container exec NAME sh -lc COMMAND`
+/// (wrapped so the image's `ENV PATH` survives the login profile; see
+/// `crate::shell`).
 /// It never accepts a container identity, raw argv, mounts, environment, or
 /// working-directory override. A killed local `docker exec` client does not
 /// prove the remote command stopped; callers must retain that uncertainty in
@@ -1033,10 +1028,11 @@ mod tests {
                 "--workdir",
                 "/workspace/src",
                 IDENTITY,
-                "sh",
-                "-lc",
-                "cargo test --locked",
             ]
+            .into_iter()
+            .map(String::from)
+            .chain(crate::shell::login_shell_args("cargo test --locked"))
+            .collect::<Vec<_>>()
         );
     }
 
@@ -1082,14 +1078,11 @@ mod tests {
                 command: "cargo test --locked".into(),
             }
             .docker_args(),
-            vec![
-                "container",
-                "exec",
-                &format!("bosn-setup-{HASH}"),
-                "sh",
-                "-lc",
-                "cargo test --locked",
-            ]
+            vec!["container", "exec", &format!("bosn-setup-{HASH}"),]
+                .into_iter()
+                .map(String::from)
+                .chain(crate::shell::login_shell_args("cargo test --locked"))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1109,10 +1102,11 @@ mod tests {
                 "--env",
                 "GITHUB_TOKEN",
                 &format!("bosn-setup-{HASH}"),
-                "sh",
-                "-lc",
-                "true",
             ]
+            .into_iter()
+            .map(String::from)
+            .chain(crate::shell::login_shell_args("true"))
+            .collect::<Vec<_>>()
         );
         assert!(args.iter().all(|arg| !arg.contains("GITHUB_TOKEN=")));
     }

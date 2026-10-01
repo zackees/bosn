@@ -1,0 +1,8 @@
+{"v":1,"ts":"2026-10-01T20:25:26.101Z","elapsed_sec":0.0,"event":"START","repo":"origin","pr":320,"log_path":".clud/logs/pr-merge-watch/20261001T202526.101Z-pr-320.jsonl"}
+{"v":1,"elapsed_sec":4.01,"event":"checks","checks":{"total":11,"pending":6,"failed":5,"succeeded":0,"skipped":0},"mergeable":"MERGEABLE","merge_state_status":"BLOCKED"}
+{"v":1,"elapsed_sec":6.6,"event":"required_failure","check":{"name":"Native wheel (windows-latest)","state":"failure","link":"https://github.com/zackees/bosn/actions/runs/36921386466/job/110568043098","workflow":".github/workflows/ci.yml"}}
+{"v":1,"elapsed_sec":8.64,"event":"cancel_item","watcher_pid":851642,"watcher_host":"nixos","mode":"runs","run_id":36921386990,"status":"skipped","reason":"out_of_scope"}
+{"v":1,"elapsed_sec":9.32,"event":"cancel_item","watcher_pid":851642,"watcher_host":"nixos","mode":"runs","item_id":36921386466,"status":"cancelled"}
+{"v":1,"elapsed_sec":9.32,"event":"cancel","trigger":"fail","attempts":1,"mode":"runs"}
+{"v":1,"elapsed_sec":9.32,"event":"failure_diagnostic","check_name":"Native wheel (windows-latest)","first_error":"Process completed with exit code 1.","classifier":null}
+{"v":1,"elapsed_sec":9.32,"event":"EXIT","code":1,"reason":"fail"}

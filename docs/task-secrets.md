@@ -44,7 +44,9 @@ the task: it runs without `GITHUB_TOKEN` and logs a one-line warning.
 ## How it is injected
 
 The daemon puts the value only into the Docker client's process environment
-and runs `docker container exec --env GITHUB_TOKEN <container> sh -lc <cmd>`.
+and runs `docker container exec --env GITHUB_TOKEN <container> sh -lc <cmd>`
+(wrapped so the image's `ENV PATH` survives the login profile; see
+[the manifest runtime](rust-manifest-runtime.md)).
 The bare `--env NAME` makes Docker copy the value from its own environment, so
 it never appears in argv, `ps`, the registry/SQLite, session records, or job
 metadata. `DockerEngine`'s `Debug` output prints environment names only.

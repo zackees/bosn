@@ -530,9 +530,13 @@ fn run_scan(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
     while let Some(argument) = arguments.next() {
         match argument.to_string_lossy().as_ref() {
             "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
-            "--ttl-seconds" => set_once_parsed(&mut ttl_seconds, arguments.next(), parse_ttl_seconds),
+            "--ttl-seconds" => {
+                set_once_parsed(&mut ttl_seconds, arguments.next(), parse_ttl_seconds)
+            }
             "--warn-bytes" => set_once_parsed(&mut warn_bytes, arguments.next(), parse_ttl_seconds),
-            "--warn-objects" => set_once_parsed(&mut warn_objects, arguments.next(), parse_ttl_seconds),
+            "--warn-objects" => {
+                set_once_parsed(&mut warn_objects, arguments.next(), parse_ttl_seconds)
+            }
             "--ack" if !ack => {
                 ack = true;
                 Ok(())
@@ -735,7 +739,10 @@ fn colour_enabled() -> bool {
     if std::env::var_os("NO_COLOR").is_some() {
         return false;
     }
-    if std::env::var("TERM").map(|term| term == "dumb").unwrap_or(false) {
+    if std::env::var("TERM")
+        .map(|term| term == "dumb")
+        .unwrap_or(false)
+    {
         return false;
     }
     std::io::stderr().is_terminal()
@@ -747,7 +754,10 @@ fn colour_enabled() -> bool {
 /// interactive surface say exactly the same thing.
 fn print_warning(warning: &bosn_core::Warning) {
     let colour = colour_enabled();
-    for (index, line) in bosn_service::unmanaged::warning_lines(warning).iter().enumerate() {
+    for (index, line) in bosn_service::unmanaged::warning_lines(warning)
+        .iter()
+        .enumerate()
+    {
         // Only the headline shouts, and only it is coloured: an all-caps table is unreadable
         // and the shouting has to mean something.
         if colour && index == 0 {
@@ -808,7 +818,9 @@ fn run_gc_unmanaged(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
     while let Some(argument) = arguments.next() {
         match argument.to_string_lossy().as_ref() {
             "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
-            "--ttl-seconds" => set_once_parsed(&mut ttl_seconds, arguments.next(), parse_ttl_seconds),
+            "--ttl-seconds" => {
+                set_once_parsed(&mut ttl_seconds, arguments.next(), parse_ttl_seconds)
+            }
             "--include" => match arguments.next().and_then(|value| {
                 value
                     .to_str()
@@ -1645,20 +1657,40 @@ fn run_daemon(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
     };
     match invocation {
         DaemonInvocation::Serve { state_dir } => {
-            if let Err(error) = runtime.run(bosn_service::Service::new(state_dir).serve()) {
+            if let Err(error) = runtime.run(
+                bosn_service::Service::new(state_dir)
+                    .with_release_version(env!("CARGO_PKG_VERSION"))
+                    .serve(),
+            ) {
                 eprintln!("bosn daemon serve: {error}");
                 std::process::exit(1);
             }
             println!("daemon stopped");
         }
         DaemonInvocation::Status { state_dir, json } => {
-            let status = match Client::for_state(&state_dir)
-                .and_then(|client| runtime.run(client.status()))
-            {
-                Ok(status) => status,
-                Err(_) => daemon_failure("status", json),
+            let Ok(client) = Client::for_state(&state_dir) else {
+                daemon_failure("status", json)
             };
-            print_daemon_status(&status, json);
+            // Ask for the version first: it is the one request every daemon
+            // release answers, so a mismatch is reported, not a bare failure.
+            let daemon_version = runtime.run(client.daemon_version()).ok();
+            let status = match runtime.run(client.status()) {
+                Ok(status) => status,
+                Err(_) => {
+                    if let Some(mismatch) = daemon_version.as_deref().and_then(|version| {
+                        bosn_service::daemon_version_mismatch(
+                            &state_dir,
+                            env!("CARGO_PKG_VERSION"),
+                            version,
+                        )
+                    }) && !json
+                    {
+                        eprintln!("bosn daemon status: {mismatch}");
+                    }
+                    daemon_failure("status", json)
+                }
+            };
+            print_daemon_status(&status, daemon_version.as_deref(), &state_dir, json);
         }
         DaemonInvocation::Stop { state_dir, json } => {
             if Client::for_state(&state_dir)
@@ -1744,7 +1776,16 @@ fn daemon_failure(action: &str, json: bool) -> ! {
     std::process::exit(1)
 }
 
-fn print_daemon_status(status: &bosn_service::Status, json: bool) {
+fn print_daemon_status(
+    status: &bosn_service::Status,
+    daemon_version: Option<&str>,
+    state_dir: &Path,
+    json: bool,
+) {
+    let client_version = env!("CARGO_PKG_VERSION");
+    let mismatch = daemon_version.and_then(|version| {
+        bosn_service::daemon_version_mismatch(state_dir, client_version, version)
+    });
     if json {
         println!(
             "{}",
@@ -1757,11 +1798,21 @@ fn print_daemon_status(status: &bosn_service::Status, json: bool) {
                 "leases": status.leases,
                 "sessions": status.sessions,
                 "reconciliation_required": status.reconciliation_required,
+                "daemon_version": daemon_version.filter(|version| !version.is_empty()),
+                "client_version": client_version,
+                "version_mismatch": mismatch,
             })
         );
     } else {
         println!("daemon status");
         println!("daemon: online");
+        println!(
+            "daemon_version: {}",
+            daemon_version
+                .filter(|version| !version.is_empty())
+                .unwrap_or("unknown")
+        );
+        println!("client_version: {client_version}");
         println!("registry_id: {}", status.registry_id);
         println!("schema_version: {}", status.schema_version);
         println!("resources: {}", status.resources);
@@ -1771,6 +1822,9 @@ fn print_daemon_status(status: &bosn_service::Status, json: bool) {
             "reconciliation_required: {}",
             status.reconciliation_required
         );
+        if let Some(mismatch) = mismatch {
+            eprintln!("bosn daemon status: {mismatch}");
+        }
     }
 }
 
@@ -2433,7 +2487,9 @@ fn parse_state_dir(value: std::ffi::OsString) -> Result<PathBuf, ()> {
 /// silently treated as "no gate", which would make everything eligible.
 fn parse_ttl_seconds(value: std::ffi::OsString) -> Result<f64, ()> {
     let seconds: f64 = value.to_str().ok_or(())?.parse().map_err(|_| ())?;
-    (seconds.is_finite() && seconds >= 0.0).then_some(seconds).ok_or(())
+    (seconds.is_finite() && seconds >= 0.0)
+        .then_some(seconds)
+        .ok_or(())
 }
 
 fn parse_job_id(value: std::ffi::OsString) -> Result<u64, ()> {
@@ -2895,8 +2951,12 @@ fn print_json(plan: &SetupPlan) {
 }
 
 fn usage() -> ! {
-    eprintln!("   or: bosn act plan --workspace WORKSPACE --workflow RELATIVE_YML --event pull_request|push|release --mode minimal|test|full --sha 40_HEX --act-version VERSION [--act-bin PATH] [--job ID] [--json]");
-    eprintln!("   or: bosn act run|report (refuses until isolated Docker ownership is implemented)");
+    eprintln!(
+        "   or: bosn act plan --workspace WORKSPACE --workflow RELATIVE_YML --event pull_request|push|release --mode minimal|test|full --sha 40_HEX --act-version VERSION [--act-bin PATH] [--job ID] [--json]"
+    );
+    eprintln!(
+        "   or: bosn act run|report (refuses until isolated Docker ownership is implemented)"
+    );
     eprintln!("usage: bosn mcp [--state-dir STATE_DIR]");
     eprintln!("   or: {}", run::USAGE.trim_start_matches("usage: "));
     eprintln!(
@@ -2905,7 +2965,9 @@ fn usage() -> ! {
     eprintln!("   or: bosn daemon serve --state-dir STATE_DIR");
     eprintln!("   or: bosn daemon status --state-dir STATE_DIR [--json]");
     eprintln!("   or: bosn daemon stop --state-dir STATE_DIR [--json]");
-    eprintln!("   or: bosn daemon autostart (enable|disable|status) [--state-dir STATE_DIR] [--json]");
+    eprintln!(
+        "   or: bosn daemon autostart (enable|disable|status) [--state-dir STATE_DIR] [--json]"
+    );
     eprintln!(
         "   or: bosn registry import-v4 --legacy-state-dir LEGACY_STATE_DIR --state-dir NEW_STATE_DIR --yes [--json]"
     );

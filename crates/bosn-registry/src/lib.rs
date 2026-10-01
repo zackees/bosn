@@ -1597,7 +1597,48 @@ impl Registry {
         let connection =
             Connection::open_read_only_with_busy_timeout(path, std::time::Duration::from_secs(5))?;
         Self::validate(&connection, path)?;
-        Ok(ReadOnlyRegistry { connection })
+        Ok(ReadOnlyRegistry {
+            connection,
+            _writer_lock: None,
+        })
+    }
+    /// Inspect a reconciliation-gated registry without any SQLite write.
+    /// This is the preview counterpart to the explicit reconciliation writer.
+    pub fn open_reconciliation_preview(path: impl AsRef<Path>) -> Result<ReadOnlyRegistry, Error> {
+        Self::open_reconciliation_preview_inner(path.as_ref(), None)
+    }
+    // The callback is test-only plumbing for a deterministic pre-lock race.
+    fn open_reconciliation_preview_inner(
+        path: &Path,
+        after_probe: Option<&dyn Fn()>,
+    ) -> Result<ReadOnlyRegistry, Error> {
+        let identity = fs::path_identity(path)?;
+        let probe =
+            Connection::open_read_only_with_busy_timeout(path, std::time::Duration::from_secs(5))?;
+        Self::validate_for_reconciliation(&probe, path)?;
+        if meta(&probe, RECONCILIATION_REQUIRED)?.as_deref() != Some("true") {
+            return Err(Error::ReconciliationNotRequired);
+        }
+        verify_database_identity(path, identity)?;
+        drop(probe);
+        if let Some(callback) = after_probe {
+            callback();
+        }
+        let writer = acquire_writer_lock(path)?;
+        verify_database_identity(path, identity)?;
+        // A writer may have changed the gate or schema between probe and lock.
+        // Reopen read-only under the fence so no earlier SQLite snapshot is reused.
+        let connection =
+            Connection::open_read_only_with_busy_timeout(path, std::time::Duration::from_secs(5))?;
+        Self::validate_for_reconciliation(&connection, path)?;
+        if meta(&connection, RECONCILIATION_REQUIRED)?.as_deref() != Some("true") {
+            return Err(Error::ReconciliationNotRequired);
+        }
+        verify_database_identity(path, identity)?;
+        Ok(ReadOnlyRegistry {
+            connection,
+            _writer_lock: Some(writer),
+        })
     }
     /// Verify SQLite's internal consistency through the already-open sole
     /// writer. This is a read-only integrity operation: it neither migrates
@@ -2187,6 +2228,9 @@ fn is_uuid(value: &str) -> bool {
 }
 pub struct ReadOnlyRegistry {
     connection: Connection,
+    // Present only for the offline reconciliation preview, whose existing
+    // contract excludes a second writer for the complete inspection.
+    _writer_lock: Option<kernal_api::platform::fs::OwnedFileLock>,
 }
 impl ReadOnlyRegistry {
     pub fn meta(&self, key: &str) -> Result<Option<String>, Error> {
@@ -2862,6 +2906,48 @@ mod tests {
     use std::io::Write as _;
 
     use super::*;
+
+    #[test]
+    fn reconciliation_preview_rechecks_gate_and_schema_after_writer_race() {
+        for (mutation, gate_changed) in [
+            (
+                "DELETE FROM meta WHERE key='migration.reconciliation_required'",
+                true,
+            ),
+            (
+                "UPDATE meta SET value='7' WHERE key='schema_version'",
+                false,
+            ),
+        ] {
+            let directory = fs::TemporaryDirectory::new().unwrap();
+            let path = directory.path().join("registry.sqlite3");
+            drop(Registry::create_writer(&path, "11111111-2222-4333-8444-555555555555").unwrap());
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO meta VALUES ('migration.reconciliation_required','true')",
+                    &[],
+                )
+                .unwrap();
+            drop(connection);
+
+            // A writer commits after the first read-only probe but before the
+            // preview owns the writer fence. It must observe the later state.
+            let result = Registry::open_reconciliation_preview_inner(
+                &path,
+                Some(&|| {
+                    let connection = Connection::open(&path).unwrap();
+                    connection.execute(mutation, &[]).unwrap();
+                }),
+            );
+            if gate_changed {
+                assert!(matches!(result, Err(Error::ReconciliationNotRequired)));
+            } else {
+                assert!(matches!(result, Err(Error::UnsupportedSchema(7))));
+            }
+            acquire_writer_lock(&path).unwrap();
+        }
+    }
 
     // This runs before the read-only SQLite open, so the rename is portable:
     // Windows does not permit replacing a file with an already-open handle.

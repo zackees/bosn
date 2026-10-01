@@ -15,7 +15,6 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-
 /// Unit name shared by both platforms' generated entries.
 pub const SERVICE_NAME: &str = "com.zackees.bosn";
 
@@ -165,8 +164,12 @@ pub fn unit_contents(platform: Platform, binary: &Path, state_dir: &Path) -> Str
 #[must_use]
 pub fn unit_path(platform: Platform, home: &Path) -> PathBuf {
     match platform {
-        Platform::LinuxSystemd => home.join(".config/systemd/user").join(format!("{SERVICE_NAME}.service")),
-        Platform::MacosLaunchd => home.join("Library/LaunchAgents").join(format!("{SERVICE_NAME}.plist")),
+        Platform::LinuxSystemd => home
+            .join(".config/systemd/user")
+            .join(format!("{SERVICE_NAME}.service")),
+        Platform::MacosLaunchd => home
+            .join("Library/LaunchAgents")
+            .join(format!("{SERVICE_NAME}.plist")),
     }
 }
 
@@ -348,7 +351,11 @@ mod tests {
             Path::new("/Users/u/.local/state/bosn"),
         )
         .expect("enable");
-        assert!(status.path.ends_with("Library/LaunchAgents/com.zackees.bosn.plist"));
+        assert!(
+            status
+                .path
+                .ends_with("Library/LaunchAgents/com.zackees.bosn.plist")
+        );
         let contents = std::fs::read_to_string(&status.path).expect("read plist");
         assert!(contents.contains("<key>RunAtLoad</key>"));
         let calls = runner.calls.lock().expect("lock").clone();

@@ -15,8 +15,9 @@ use bosn_generation::{
     stack_generation_async, stack_generation_from_context,
 };
 use bosn_registry::{
-    Event, ExecutionSession, Lease, ManifestVolumeGcPreview, ReconciliationProof, Registry,
-    RegistryStatus, Resource, ResourceUse, SetupDone, SetupGcPreview, VolumeCreationIntent,
+    Event, ExecutionSession, Lease, ManifestVolumeGcPreview, ReadOnlyRegistry, ReconciliationProof,
+    Registry, RegistryStatus, Resource, ResourceUse, SetupDone, SetupGcPreview,
+    VolumeCreationIntent,
 };
 #[cfg(test)]
 use bosn_setup::PreparedImageKind;
@@ -142,7 +143,7 @@ pub fn preview_python_v4_reconciliation(
     registry_path: &Path,
     engine: &dyn PythonV4ReconcileExecutor,
 ) -> Result<PythonV4ReconciliationReport, Error> {
-    let registry = Registry::open_reconciliation_writer(registry_path)?;
+    let registry = Registry::open_reconciliation_preview(registry_path)?;
     Ok(collect_python_v4_reconciliation(&registry, engine)?.report)
 }
 
@@ -171,7 +172,7 @@ struct CollectedPythonV4Reconciliation {
 }
 
 fn collect_python_v4_reconciliation(
-    registry: &Registry,
+    registry: &impl ReconciliationReader,
     engine: &dyn PythonV4ReconcileExecutor,
 ) -> Result<CollectedPythonV4Reconciliation, Error> {
     let registry_id = registry.registry_id()?;
@@ -276,7 +277,81 @@ fn collect_python_v4_reconciliation(
 // Imported state is normally small, but never silently truncate it: that
 // would make a successful-looking preview omit an active legacy resource.
 const MAX_RECONCILIATION_ROWS: usize = 10_000;
-fn reconciliation_resources(registry: &Registry) -> Result<Vec<Resource>, Error> {
+trait ReconciliationReader {
+    fn registry_id(&self) -> Result<String, bosn_registry::Error>;
+    fn resources(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<bosn_registry::Page<Resource>, bosn_registry::Error>;
+    fn resource_uses(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<bosn_registry::Page<ResourceUse>, bosn_registry::Error>;
+    fn leases(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<bosn_registry::Page<Lease>, bosn_registry::Error>;
+    fn execution_sessions(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<bosn_registry::Page<ExecutionSession>, bosn_registry::Error>;
+    fn volume_creation_intents(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<bosn_registry::Page<VolumeCreationIntent>, bosn_registry::Error>;
+}
+macro_rules! impl_reconciliation_reader {
+    ($type:ty) => {
+        impl ReconciliationReader for $type {
+            fn registry_id(&self) -> Result<String, bosn_registry::Error> {
+                <$type>::registry_id(self)
+            }
+            fn resources(
+                &self,
+                offset: usize,
+                limit: usize,
+            ) -> Result<bosn_registry::Page<Resource>, bosn_registry::Error> {
+                <$type>::resources(self, offset, limit)
+            }
+            fn resource_uses(
+                &self,
+                offset: usize,
+                limit: usize,
+            ) -> Result<bosn_registry::Page<ResourceUse>, bosn_registry::Error> {
+                <$type>::resource_uses(self, offset, limit)
+            }
+            fn leases(
+                &self,
+                offset: usize,
+                limit: usize,
+            ) -> Result<bosn_registry::Page<Lease>, bosn_registry::Error> {
+                <$type>::leases(self, offset, limit)
+            }
+            fn execution_sessions(
+                &self,
+                offset: usize,
+                limit: usize,
+            ) -> Result<bosn_registry::Page<ExecutionSession>, bosn_registry::Error> {
+                <$type>::execution_sessions(self, offset, limit)
+            }
+            fn volume_creation_intents(
+                &self,
+                offset: usize,
+                limit: usize,
+            ) -> Result<bosn_registry::Page<VolumeCreationIntent>, bosn_registry::Error> {
+                <$type>::volume_creation_intents(self, offset, limit)
+            }
+        }
+    };
+}
+impl_reconciliation_reader!(Registry);
+impl_reconciliation_reader!(ReadOnlyRegistry);
+fn reconciliation_resources(registry: &impl ReconciliationReader) -> Result<Vec<Resource>, Error> {
     let mut values = Vec::new();
     let mut offset = 0;
     loop {
@@ -293,7 +368,7 @@ fn reconciliation_resources(registry: &Registry) -> Result<Vec<Resource>, Error>
         }
     }
 }
-fn reconciliation_uses(registry: &Registry) -> Result<Vec<ResourceUse>, Error> {
+fn reconciliation_uses(registry: &impl ReconciliationReader) -> Result<Vec<ResourceUse>, Error> {
     let mut values = Vec::new();
     let mut offset = 0;
     loop {
@@ -306,7 +381,7 @@ fn reconciliation_uses(registry: &Registry) -> Result<Vec<ResourceUse>, Error> {
         }
     }
 }
-fn reconciliation_leases(registry: &Registry) -> Result<Vec<Lease>, Error> {
+fn reconciliation_leases(registry: &impl ReconciliationReader) -> Result<Vec<Lease>, Error> {
     // Only presence is an authorization veto; avoid retaining a second public
     // liveness representation in this service layer.
     let mut values = Vec::new();
@@ -321,7 +396,9 @@ fn reconciliation_leases(registry: &Registry) -> Result<Vec<Lease>, Error> {
         }
     }
 }
-fn reconciliation_sessions(registry: &Registry) -> Result<Vec<ExecutionSession>, Error> {
+fn reconciliation_sessions(
+    registry: &impl ReconciliationReader,
+) -> Result<Vec<ExecutionSession>, Error> {
     let mut values = Vec::new();
     let mut offset = 0;
     loop {
@@ -334,7 +411,9 @@ fn reconciliation_sessions(registry: &Registry) -> Result<Vec<ExecutionSession>,
         }
     }
 }
-fn reconciliation_intents(registry: &Registry) -> Result<Vec<VolumeCreationIntent>, Error> {
+fn reconciliation_intents(
+    registry: &impl ReconciliationReader,
+) -> Result<Vec<VolumeCreationIntent>, Error> {
     let mut values = Vec::new();
     let mut offset = 0;
     loop {
@@ -4483,8 +4562,14 @@ impl Client {
         })
     }
     pub async fn ping(&self) -> Result<(), Error> {
+        self.daemon_version().await.map(drop)
+    }
+    /// Ping the daemon and return the release version it reports. Empty means
+    /// a daemon that predates the version handshake (bosn 0.1.5 and older).
+    /// Compare it with [`daemon_version_mismatch`] before submitting work.
+    pub async fn daemon_version(&self) -> Result<String, Error> {
         match self.call(Request::operation(1)).await? {
-            Reply::Pong => Ok(()),
+            Reply::Pong(version) => Ok(version),
             _ => Err(Error::Protocol("unexpected ping response")),
         }
     }
@@ -5237,6 +5322,7 @@ pub struct Service {
     doctor_executor: Arc<dyn DoctorExecutor>,
     setup_reconcile_executor: Arc<dyn SetupReconcileExecutor>,
     manifest_recovery_executor: Arc<dyn ManifestRecoveryExecutor>,
+    release_version: Arc<str>,
 }
 
 #[cfg(test)]
@@ -8843,9 +8929,17 @@ impl Service {
             doctor_executor: Arc::new(DockerDoctorExecutor::new()),
             setup_reconcile_executor: Arc::new(DockerSetupReconcileExecutor::new()),
             manifest_recovery_executor: Arc::new(DockerManifestRecoveryExecutor::new()),
+            release_version: Arc::from(""),
             state_dir,
             stop: CancellationSource::new(),
         }
+    }
+    /// The release version this daemon reports on ping, so a client of another
+    /// release can refuse it clearly instead of sending requests the daemon may
+    /// misread. The `bosn` binary passes its own package version.
+    pub fn with_release_version(mut self, version: impl Into<String>) -> Self {
+        self.release_version = Arc::from(version.into());
+        self
     }
     /// Substitute only the semantic setup executor. This is primarily an
     /// integration-test seam; production callers retain the Docker adapter.
@@ -8936,7 +9030,7 @@ impl Service {
         };
         let ep = endpoint(&self.state_dir)?;
         if ep.target_exists()? {
-            return Err(Error::EndpointOccupied(ep.display().into()));
+            retire_stale_socket(&ep)?;
         }
         let listener = AsyncListener::bind_owner_only(&ep)?;
         let (sender, receiver) = async_engine::channel(16);
@@ -9052,6 +9146,7 @@ impl Service {
             let reconcile = Arc::clone(&self.setup_reconcile_executor);
             let adopt = Arc::clone(&self.setup_adopt_executor);
             let state_dir = self.state_dir.clone();
+            let release_version = Arc::clone(&self.release_version);
             clients.spawn(async move {
                 handle(
                     stream,
@@ -9063,6 +9158,7 @@ impl Service {
                         adopt,
                         reconcile,
                         state_dir,
+                        release_version,
                     },
                 )
                 .await
@@ -9706,6 +9802,7 @@ struct ConnectionContext {
     adopt: Arc<dyn SetupAdoptExecutor>,
     reconcile: Arc<dyn SetupReconcileExecutor>,
     state_dir: PathBuf,
+    release_version: Arc<str>,
 }
 
 async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Result<(), Error> {
@@ -9717,6 +9814,7 @@ async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Result<(), Er
         adopt,
         reconcile,
         state_dir,
+        release_version,
     } = context;
     if !peer_is_authorized(&s.peer_identity()?.user_id, &ipc::current_user_id()?) {
         return Err(Error::Unauthorized);
@@ -9738,6 +9836,7 @@ async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Result<(), Er
         match r.operation {
             1 => ReplyWire {
                 code: 10,
+                daemon_version: release_version.to_string(),
                 ..Default::default()
             },
             2 => {
@@ -10504,6 +10603,56 @@ async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Result<(), Er
         .map_err(|_| Error::Protocol("reply encode"))?;
     write_frame(&mut s, DaemonFrame::response_to(&f, p)).await
 }
+/// Reclaim the endpoint a dead daemon left behind, or refuse it.
+///
+/// Called only while this process holds the registry's sole writer, so no
+/// other daemon for this state directory can be alive. Even so, only a Unix
+/// socket file that refuses connections (nothing listening) is removed; any
+/// other file, a live listener, or an unclassifiable probe stays occupied.
+fn retire_stale_socket(ep: &Endpoint) -> Result<(), Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+        let is_socket = std::fs::symlink_metadata(ep.display())
+            .is_ok_and(|metadata| metadata.file_type().is_socket());
+        if is_socket && ep.is_stale() {
+            ep.retire()?;
+            eprintln!(
+                "bosn daemon serve: removed stale socket {} (no daemon was listening)",
+                ep.display()
+            );
+            return Ok(());
+        }
+    }
+    Err(Error::EndpointOccupied(ep.display().into()))
+}
+
+/// Explain a daemon from another release instead of letting it misread this
+/// client's requests (it may answer with a reset connection or a refusal).
+/// `None` when the versions match. An empty `daemon_version` is a daemon that
+/// predates the version handshake (bosn 0.1.5 and older).
+pub fn daemon_version_mismatch(
+    state_dir: &Path,
+    client_version: &str,
+    daemon_version: &str,
+) -> Option<String> {
+    if daemon_version == client_version {
+        return None;
+    }
+    let daemon = if daemon_version.is_empty() {
+        "an older bosn (0.1.5 or earlier, which does not report its version)".to_owned()
+    } else {
+        format!("bosn {daemon_version}")
+    };
+    let state = state_dir.display();
+    Some(format!(
+        "the bosn daemon for {state} is {daemon}, but this client is bosn {client_version}; \
+         a daemon from another release can misread this client's requests. \
+         Stop it with `bosn daemon stop --state-dir {state}` (this also cancels any job it \
+         is running for another session), then retry: a matching daemon starts on demand"
+    ))
+}
+
 fn peer_is_authorized(peer_user_id: &str, expected_user_id: &str) -> bool {
     !peer_user_id.is_empty() && peer_user_id == expected_user_id
 }
@@ -11050,6 +11199,10 @@ struct ReplyWire {
     unmanaged_refused: String,
     #[prost(uint64, tag = "55")]
     unmanaged_planned: u64,
+    /// The daemon's release version, on a ping reply only. Empty from a
+    /// daemon that predates the version handshake (bosn 0.1.5 and older).
+    #[prost(string, tag = "56")]
+    daemon_version: String,
 }
 #[derive(Message)]
 struct LogRecordWire {
@@ -11246,7 +11399,7 @@ impl From<SetupReconcileRecordWire> for SetupReconcileRecord {
     }
 }
 enum Reply {
-    Pong,
+    Pong(String),
     Status(Status),
     Shutdown,
     Job(u64),
@@ -11269,7 +11422,7 @@ enum Reply {
 }
 fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
     match v.code {
-        10 => Ok(Reply::Pong),
+        10 => Ok(Reply::Pong(v.daemon_version)),
         20 => Ok(Reply::Status(Status {
             registry_id: v.registry_id,
             schema_version: v.schema_version,
@@ -16383,8 +16536,27 @@ fi
         let request = DaemonFrame::request(PAYLOAD_PROTOCOL, Vec::new()).with_request_id(7);
         assert!(matches!(
             decode_response_frame(DaemonFrame::response_to(&request, payload.clone()), 7),
-            Ok(Reply::Pong)
+            Ok(Reply::Pong(version)) if version.is_empty()
         ));
+        let mut versioned = Vec::new();
+        ReplyWire {
+            code: 10,
+            daemon_version: "0.1.6".into(),
+            ..Default::default()
+        }
+        .encode(&mut versioned)
+        .unwrap();
+        assert!(matches!(
+            decode_response_frame(DaemonFrame::response_to(&request, versioned), 7),
+            Ok(Reply::Pong(version)) if version == "0.1.6"
+        ));
+        let state = Path::new("/state");
+        assert_eq!(daemon_version_mismatch(state, "0.1.6", "0.1.6"), None);
+        let newer = daemon_version_mismatch(state, "0.1.6", "0.1.7").unwrap();
+        assert!(newer.contains("is bosn 0.1.7, but this client is bosn 0.1.6"));
+        assert!(newer.contains("`bosn daemon stop --state-dir /state`"));
+        let legacy = daemon_version_mismatch(state, "0.1.6", "").unwrap();
+        assert!(legacy.contains("0.1.5 or earlier"));
         for frame in [
             DaemonFrame::response_to(&request, payload.clone()).with_request_id(8),
             DaemonFrame::request(PAYLOAD_PROTOCOL, payload.clone()).with_request_id(7),
@@ -16915,6 +17087,7 @@ fi
     #[test]
     fn offline_python_v4_reconciliation_repeats_fake_engine_proof_then_clears_gate_atomically() {
         let (_directory, path, observed) = gated_v4_reconciliation_registry(false);
+        let before_preview = std::fs::read(&path).unwrap();
         let preview = preview_python_v4_reconciliation(
             &path,
             &FakePythonV4Engine {
@@ -16924,6 +17097,7 @@ fi
         .unwrap();
         assert_eq!(preview.verified, ["legacy-volume"]);
         assert!(preview.ready());
+        assert_eq!(std::fs::read(&path).unwrap(), before_preview);
         let applied = apply_python_v4_reconciliation(
             &path,
             &FakePythonV4Engine {

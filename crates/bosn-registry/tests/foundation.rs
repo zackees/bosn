@@ -1667,3 +1667,35 @@ fn malformed_v5_wrong_foreign_key_is_refused_before_writer_open() {
         Err(Error::InvalidSchema)
     ));
 }
+
+#[test]
+fn reconciliation_preview_is_read_only_holds_writer_fence_and_requires_gate() {
+    let (_directory, path) = database_path();
+    let registry = Registry::create_writer(&path, "11111111-2222-4333-8444-555555555555").unwrap();
+    drop(registry);
+    assert!(matches!(
+        Registry::open_reconciliation_preview(&path),
+        Err(Error::ReconciliationNotRequired)
+    ));
+    let connection = kernal_api::sqlite::Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO meta VALUES ('migration.reconciliation_required','true')",
+            &[],
+        )
+        .unwrap();
+    drop(connection);
+    let before = std::fs::read(&path).unwrap();
+    let preview = Registry::open_reconciliation_preview(&path).unwrap();
+    assert_eq!(
+        preview.meta("schema_version").unwrap().as_deref(),
+        Some("5")
+    );
+    assert!(matches!(
+        Registry::open_reconciliation_writer(&path),
+        Err(Error::WriterAlreadyHeld(_))
+    ));
+    drop(preview);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    drop(Registry::open_reconciliation_writer(&path).unwrap());
+}

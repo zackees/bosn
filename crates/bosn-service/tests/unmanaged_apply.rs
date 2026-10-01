@@ -36,7 +36,10 @@ exit 0
     );
     let engine = synthetic(dir.path(), &script);
     let outcome = unmanaged_gc_apply(&engine, None, CensusConfig::default(), &[]);
-    assert!(outcome.refused.is_some(), "an incomplete census must refuse");
+    assert!(
+        outcome.refused.is_some(),
+        "an incomplete census must refuse"
+    );
     assert_eq!(outcome.removed, 0);
     assert!(
         !marker.exists(),

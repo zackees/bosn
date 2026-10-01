@@ -50,6 +50,8 @@ pub use ensure::{
     SetupEnsureResult, SetupEnsureTmpfs, adopt_setup_app, ensure_setup_app,
 };
 
+mod shell;
+
 mod task;
 pub use task::{
     SetupAppTaskCommand, SetupAppTaskEngine, SetupAppTaskRequest, SetupTaskCommand,
