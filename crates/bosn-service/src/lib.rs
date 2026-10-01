@@ -50,6 +50,8 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+pub mod act_engine;
+pub mod act_image;
 pub mod act_registry;
 pub mod autostart;
 pub mod github_proxy;
