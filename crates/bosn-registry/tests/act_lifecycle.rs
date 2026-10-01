@@ -146,7 +146,7 @@ fn success_requires_execution_and_exact_cleanup_proof() {
             .finalize_act_cleanup(RUN, &bad, 5.0)
             .is_err()
     );
-    assert_eq!(r.pending_act_engines(0, 10).unwrap().items.len(), 1);
+    assert_eq!(r.pending_act_engines(None, 10).unwrap().items.len(), 1);
     {
         let mut tx = r.begin_immediate().unwrap();
         tx.finalize_act_cleanup(
@@ -163,7 +163,7 @@ fn success_requires_execution_and_exact_cleanup_proof() {
     let record = r.act_engine(RUN).unwrap().unwrap();
     assert_eq!(record.state, ActEngineState::Terminal);
     assert_eq!(record.outcome, Some(ActRunOutcome::Passed));
-    assert!(r.pending_act_engines(0, 10).unwrap().items.is_empty());
+    assert!(r.pending_act_engines(None, 10).unwrap().items.is_empty());
     assert!(
         r.begin_immediate()
             .unwrap()
@@ -199,7 +199,9 @@ fn pending_create_failure_is_recoverable_and_history_does_not_cap_recovery() {
         tx.commit().unwrap();
     }
     assert_eq!(
-        r.pending_act_engines(0, 1).unwrap().items[0].intent.run_id,
+        r.pending_act_engines(None, 1).unwrap().items[0]
+            .intent
+            .run_id,
         RUN
     );
 }
@@ -264,16 +266,24 @@ fn recovery_pages_are_explicit_and_pending_ownership_check_is_exact() {
         tx.begin_act_engine(&i).unwrap();
         tx.commit().unwrap();
     }
-    let first = r.pending_act_engines(0, 2).unwrap();
+    let first = r.pending_act_engines(None, 2).unwrap();
     assert_eq!(first.items.len(), 2);
-    assert_eq!(first.next_offset, Some(2));
+    assert_eq!(
+        first.next_run_id.as_deref(),
+        Some("00000001-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+    );
     let last = r
-        .pending_act_engines(first.next_offset.unwrap(), 2)
+        .pending_act_engines(first.next_run_id.as_deref(), 2)
         .unwrap();
     assert_eq!(last.items.len(), 1);
-    assert_eq!(last.next_offset, None);
-    assert!(r.pending_act_engines(0, 0).is_err());
-    assert!(r.pending_act_engines(0, 1001).is_err());
+    assert_eq!(last.next_run_id, None);
+    assert!(r.pending_act_engines(None, 0).is_err());
+    assert!(r.pending_act_engines(None, 1001).is_err());
+    assert!(r.pending_act_engines(Some("not-a-uuid"), 2).is_err());
+    assert!(
+        r.pending_act_engines(Some("AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"), 2)
+            .is_err()
+    );
     let i = last.items[0].intent.clone();
     let mut foreign = observed(&i);
     foreign
@@ -481,5 +491,46 @@ fn crash_before_registration_recovers_exact_id_for_cleanup_only() {
     assert_eq!(
         r.act_engine(RUN).unwrap().unwrap().state,
         ActEngineState::Terminal
+    );
+}
+
+#[test]
+fn retirement_between_recovery_pages_does_not_skip_remaining_engines() {
+    let dir = TemporaryDirectory::new().unwrap();
+    let mut r = Registry::create_writer(dir.path().join("r"), OWNER).unwrap();
+    for n in 0..3 {
+        let mut i = intent();
+        i.run_id = format!("{n:08x}-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+        let mut tx = r.begin_immediate().unwrap();
+        tx.begin_act_engine(&i).unwrap();
+        tx.commit().unwrap();
+    }
+    let first = r.pending_act_engines(None, 2).unwrap();
+    for record in &first.items {
+        let mut tx = r.begin_immediate().unwrap();
+        tx.request_act_cleanup(&record.intent.run_id, ActRunOutcome::Interrupted, 2.0)
+            .unwrap();
+        tx.finalize_act_cleanup(
+            &record.intent.run_id,
+            &ActEngineRemovalProof {
+                name: record.intent.engine_name(),
+                engine_id: None,
+            },
+            3.0,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    let second = r
+        .pending_act_engines(first.next_run_id.as_deref(), 2)
+        .unwrap();
+    assert_eq!(
+        second.items.len(),
+        1,
+        "cleanup of an earlier page must not shift the cursor past unprocessed engines"
+    );
+    assert_eq!(
+        second.items[0].intent.run_id,
+        "00000002-bbbb-4ccc-8ddd-eeeeeeeeeeee"
     );
 }

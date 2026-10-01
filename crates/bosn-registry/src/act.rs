@@ -52,6 +52,12 @@ pub struct ActEngineRecord {
     pub updated_at: f64,
     pub removal: Option<ActEngineRemovalProof>,
 }
+/// Keyset page ordered by immutable canonical run UUID, independent of state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActEngineRecoveryPage {
+    pub items: Vec<ActEngineRecord>,
+    pub next_run_id: Option<String>,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActEngineObservation {
     pub name: String,
@@ -486,18 +492,22 @@ impl Registry {
         }
         Ok(record)
     }
-    /// Bounded active recovery page. Callers must follow next_offset until
-    /// absent; a page never silently represents the complete recovery set.
+    /// Bounded active recovery page using immutable run-ID keyset ordering.
+    /// Follow next_run_id until absent; retiring earlier pages cannot skip work.
+    /// Concurrent inserts at or before the cursor are intentionally covered by
+    /// the next reconciliation pass. A runtime must repeat passes, rather than
+    /// claim that a single traversal proves no concurrent work remains.
     pub fn pending_act_engines(
         &self,
-        offset: usize,
+        after_run_id: Option<&str>,
         limit: usize,
-    ) -> Result<Page<ActEngineRecord>, Error> {
+    ) -> Result<ActEngineRecoveryPage, Error> {
         if limit == 0 || limit > MAX_PAGE_SIZE {
             return Err(Error::BadRow("act recovery page limit"));
         }
-        let rows = self.connection.query("SELECT e.kind,e.detail FROM events e JOIN (SELECT MAX(id) AS id FROM events WHERE kind GLOB 'act.engine.v1:*' GROUP BY kind) latest ON latest.id=e.id WHERE (json_extract(e.detail,'$.state') IS NULL OR json_extract(e.detail,'$.state')<>'terminal') ORDER BY e.kind LIMIT ? OFFSET ?",
-            &[Value::Integer((limit+1) as i64),Value::Integer(i64::try_from(offset).map_err(|_| Error::BadRow("act recovery offset"))?)], QueryLimits { max_rows: limit+1, max_bytes: (limit+1)*32768 })?;
+        let after_kind = after_run_id.map(kind).transpose()?.unwrap_or_default();
+        let rows = self.connection.query("SELECT e.kind,e.detail FROM events e JOIN (SELECT MAX(id) AS id FROM events WHERE kind GLOB 'act.engine.v1:*' GROUP BY kind) latest ON latest.id=e.id WHERE e.kind > ? AND (json_extract(e.detail,'$.state') IS NULL OR json_extract(e.detail,'$.state')<>'terminal') ORDER BY e.kind LIMIT ?",
+            &[Value::Text(after_kind),Value::Integer((limit+1) as i64)], QueryLimits { max_rows: limit+1, max_bytes: (limit+1)*32768 })?;
         let more = rows.len() > limit;
         let items = rows
             .iter()
@@ -515,17 +525,14 @@ impl Registry {
         if items.iter().any(|r| r.registry_id != owner) {
             return Err(Error::ResourceIdentityConflict);
         }
-        Ok(Page {
-            items,
-            next_offset: if more {
-                Some(
-                    offset
-                        .checked_add(limit)
-                        .ok_or(Error::BadRow("act recovery offset"))?,
-                )
-            } else {
-                None
-            },
-        })
+        let next_run_id = more.then(|| {
+            items
+                .last()
+                .expect("nonempty bounded page")
+                .intent
+                .run_id
+                .clone()
+        });
+        Ok(ActEngineRecoveryPage { items, next_run_id })
     }
 }
