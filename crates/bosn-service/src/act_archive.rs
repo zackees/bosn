@@ -1,5 +1,5 @@
 //! Verified, bounded OCI layout archive transport; no engine or network I/O.
-use crate::act_image::ActImagePackage;
+use crate::act_image::{ActImagePackage, has_no_declared_volumes};
 use kernal_api::hash::Sha256Hasher;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, io::Write};
@@ -124,7 +124,7 @@ pub fn write_act_oci_archive(
         || config["os"] != "linux"
         || config["architecture"] != "amd64"
         || !config["config"].is_object()
-        || config["config"].get("Volumes").is_some()
+        || !has_no_declared_volumes(config["config"].get("Volumes"))
     {
         return Err(invalid("unsupported manifest or config"));
     }
@@ -182,7 +182,7 @@ pub fn write_act_oci_archive(
         || runner_config["os"] != "linux"
         || runner_config["architecture"] != "amd64"
         || !runner_config["config"].is_object()
-        || runner_config["config"].get("Volumes").is_some()
+        || !has_no_declared_volumes(runner_config["config"].get("Volumes"))
         || runner_config["rootfs"]["type"] != "layers"
         || runner_layers.len() != package.base_layers.len()
         || runner_diffs.as_slice() != &diffs[..package.base_layers.len()]
@@ -329,7 +329,7 @@ mod tests {
     }
     fn fixture() -> (ActImagePackage, Vec<u8>) {
         let base = b"base layer fixture".to_vec();
-        let config = serde_json::to_vec(&json!({"architecture":"amd64","os":"linux","config":{},"rootfs":{"type":"layers","diff_ids":[digest(&base)]}})).unwrap();
+        let config = serde_json::to_vec(&json!({"architecture":"amd64","os":"linux","config":{"Volumes":{}},"rootfs":{"type":"layers","diff_ids":[digest(&base)]}})).unwrap();
         let manifest = serde_json::to_vec(&json!({"schemaVersion":2,"mediaType":MANIFEST,"config":{"mediaType":CONFIG,"digest":digest(&config),"size":config.len()},"layers":[{"mediaType":TAR,"digest":digest(&base),"size":base.len()}]})).unwrap();
         let binary = b"synthetic verified Act binary";
         (
@@ -347,6 +347,43 @@ mod tests {
         )
     }
 
+    #[test]
+    fn declared_or_malformed_driver_volumes_write_nothing() {
+        let (p, base) = fixture();
+        for volume in [
+            json!({"/data":{}}),
+            json!(null),
+            json!([]),
+            json!("bad"),
+            json!(true),
+        ] {
+            let mut bad = p.clone();
+            let mut config: Value = serde_json::from_slice(&bad.config).unwrap();
+            config["config"]["Volumes"] = volume;
+            bad.config = serde_json::to_vec(&config).unwrap();
+            bad.config_digest = digest(&bad.config);
+            let mut manifest: Value = serde_json::from_slice(&bad.manifest).unwrap();
+            manifest["config"]["digest"] = json!(bad.config_digest);
+            manifest["config"]["size"] = json!(bad.config.len());
+            bad.manifest = serde_json::to_vec(&manifest).unwrap();
+            bad.manifest_digest = digest(&bad.manifest);
+            let mut output = Vec::new();
+            assert!(
+                write_act_oci_archive(
+                    &bad,
+                    &[ActArchiveBlob {
+                        digest: &p.base_layers[0].digest,
+                        bytes: &base
+                    }],
+                    "act",
+                    100000,
+                    &mut output
+                )
+                .is_err()
+            );
+            assert!(output.is_empty());
+        }
+    }
     #[test]
     fn deterministic_system_tar_and_oci_references() {
         let (p, base) = fixture();
@@ -558,7 +595,7 @@ mod tests {
     #[test]
     fn docker_runner_media_types_keep_original_pinned_graph() {
         let base = b"synthetic compressed layer";
-        let config = serde_json::to_vec(&json!({"architecture":"amd64","os":"linux","config":{},"rootfs":{"type":"layers","diff_ids":[digest(b"uncompressed fixture")]}})).unwrap();
+        let config = serde_json::to_vec(&json!({"architecture":"amd64","os":"linux","config":{"Volumes":{}},"rootfs":{"type":"layers","diff_ids":[digest(b"uncompressed fixture")]}})).unwrap();
         let manifest = serde_json::to_vec(&json!({"schemaVersion":2,"mediaType":DOCKER_MANIFEST,"config":{"mediaType":DOCKER_CONFIG,"digest":digest(&config),"size":config.len()},"layers":[{"mediaType":DOCKER_GZIP,"digest":digest(base),"size":base.len()}]})).unwrap();
         let binary = b"Act fixture";
         let p = package_act_image(

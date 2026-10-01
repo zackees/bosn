@@ -75,10 +75,14 @@ fn parse(bytes: &[u8]) -> Result<Value, ActImageError> {
     }
     Ok(value)
 }
+/// An absent or empty object declares no volume paths. Null and other shapes fail closed.
+pub(crate) fn has_no_declared_volumes(value: Option<&serde_json::Value>) -> bool {
+    value.is_none_or(|value| value.as_object().is_some_and(|volumes| volumes.is_empty()))
+}
 /// Package a verified static Linux/amd64 Act binary over one pinned runner
 /// image manifest (not an image index). Digests include their sha256: prefix.
-/// Configuration volumes are refused even when empty; no anonymous image
-/// volume may be inherited. This emits only actual content-addressed OCI bytes.
+/// Declared volume paths and malformed volume metadata are refused; an empty
+/// volume object declares no anonymous storage. This emits only actual content-addressed OCI bytes.
 pub fn package_act_image(
     base_manifest: &[u8],
     manifest_pin: &str,
@@ -124,7 +128,7 @@ pub fn package_act_image(
     let image_config = config["config"]
         .as_object_mut()
         .ok_or(ActImageError("missing image configuration"))?;
-    if image_config.contains_key("Volumes") {
+    if !has_no_declared_volumes(image_config.get("Volumes")) {
         return Err(ActImageError("base image declares volumes"));
     }
     if image_config.get("Labels").is_some_and(|v| !v.is_object()) {
@@ -310,7 +314,7 @@ mod tests {
     use super::*;
     use serde_json::{Value, json};
     fn fixture() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        let config = serde_json::to_vec(&json!({"architecture":"amd64","os":"linux","config":{"Env":["PATH=/usr/bin"],"Cmd":["/bin/bash"]},"rootfs":{"type":"layers","diff_ids":[format!("sha256:{}","1".repeat(64))]},"history":[{"created":"2026-01-01T00:00:00Z"}]})).unwrap();
+        let config = serde_json::to_vec(&json!({"architecture":"amd64","os":"linux","config":{"Volumes":{},"Env":["PATH=/usr/bin"],"Cmd":["/bin/bash"]},"rootfs":{"type":"layers","diff_ids":[format!("sha256:{}","1".repeat(64))]},"history":[{"created":"2026-01-01T00:00:00Z"}]})).unwrap();
         let manifest = serde_json::to_vec(&json!({"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{"mediaType":"application/vnd.docker.container.image.v1+json","digest":digest(&config),"size":config.len()},"layers":[{"mediaType":"application/vnd.docker.image.rootfs.diff.tar.gzip","digest":format!("sha256:{}","2".repeat(64)),"size":77}]})).unwrap();
         (
             manifest,
@@ -385,7 +389,13 @@ mod tests {
     #[test]
     fn inherited_volumes_and_incompatible_rootfs_are_refused() {
         let (m, c, b) = fixture();
-        for change in [json!({"/data":{}}), json!({})] {
+        for change in [
+            json!({"/data":{}}),
+            json!(null),
+            json!([]),
+            json!("invalid"),
+            json!(true),
+        ] {
             let mut config: Value = serde_json::from_slice(&c).unwrap();
             config["config"]["Volumes"] = change;
             let config = serde_json::to_vec(&config).unwrap();
