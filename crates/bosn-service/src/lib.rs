@@ -50,6 +50,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+pub mod act_registry;
 pub mod autostart;
 pub mod github_proxy;
 pub mod jobs;
@@ -5246,6 +5247,10 @@ pub struct RegistryActor {
     sender: async_engine::Sender<DbCommand>,
 }
 enum DbCommand {
+    ActRegistry {
+        command: Box<act_registry::ActRegistryCommand>,
+        reply: async_engine::OneshotSender<Result<act_registry::ActRegistryReply, Error>>,
+    },
     Status(async_engine::OneshotSender<Result<Status, Error>>),
     DoctorIntegrity(async_engine::OneshotSender<&'static str>),
     Resources {
@@ -7509,6 +7514,22 @@ async fn registry_actor(
 ) {
     while let Some(command) = receiver.recv().await {
         match command {
+            DbCommand::ActRegistry { command, reply } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = act_registry::apply(&mut registry, *command);
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
             DbCommand::Status(reply) => {
                 let worker = async_engine::launch_blocking(move || {
                     let result = registry.status().map(Status::from);
