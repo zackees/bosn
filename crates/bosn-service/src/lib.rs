@@ -15,8 +15,9 @@ use bosn_generation::{
     stack_generation_async, stack_generation_from_context,
 };
 use bosn_registry::{
-    Event, ExecutionSession, Lease, ManifestVolumeGcPreview, ReconciliationProof, Registry,
-    RegistryStatus, Resource, ResourceUse, SetupDone, SetupGcPreview, VolumeCreationIntent,
+    Event, ExecutionSession, Lease, ManifestVolumeGcPreview, ReadOnlyRegistry, ReconciliationProof,
+    Registry, RegistryStatus, Resource, ResourceUse, SetupDone, SetupGcPreview,
+    VolumeCreationIntent,
 };
 #[cfg(test)]
 use bosn_setup::PreparedImageKind;
@@ -140,7 +141,7 @@ pub fn preview_python_v4_reconciliation(
     registry_path: &Path,
     engine: &dyn PythonV4ReconcileExecutor,
 ) -> Result<PythonV4ReconciliationReport, Error> {
-    let registry = Registry::open_reconciliation_writer(registry_path)?;
+    let registry = Registry::open_reconciliation_preview(registry_path)?;
     Ok(collect_python_v4_reconciliation(&registry, engine)?.report)
 }
 
@@ -169,7 +170,7 @@ struct CollectedPythonV4Reconciliation {
 }
 
 fn collect_python_v4_reconciliation(
-    registry: &Registry,
+    registry: &impl ReconciliationReader,
     engine: &dyn PythonV4ReconcileExecutor,
 ) -> Result<CollectedPythonV4Reconciliation, Error> {
     let registry_id = registry.registry_id()?;
@@ -274,7 +275,81 @@ fn collect_python_v4_reconciliation(
 // Imported state is normally small, but never silently truncate it: that
 // would make a successful-looking preview omit an active legacy resource.
 const MAX_RECONCILIATION_ROWS: usize = 10_000;
-fn reconciliation_resources(registry: &Registry) -> Result<Vec<Resource>, Error> {
+trait ReconciliationReader {
+    fn registry_id(&self) -> Result<String, bosn_registry::Error>;
+    fn resources(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<bosn_registry::Page<Resource>, bosn_registry::Error>;
+    fn resource_uses(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<bosn_registry::Page<ResourceUse>, bosn_registry::Error>;
+    fn leases(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<bosn_registry::Page<Lease>, bosn_registry::Error>;
+    fn execution_sessions(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<bosn_registry::Page<ExecutionSession>, bosn_registry::Error>;
+    fn volume_creation_intents(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<bosn_registry::Page<VolumeCreationIntent>, bosn_registry::Error>;
+}
+macro_rules! impl_reconciliation_reader {
+    ($type:ty) => {
+        impl ReconciliationReader for $type {
+            fn registry_id(&self) -> Result<String, bosn_registry::Error> {
+                <$type>::registry_id(self)
+            }
+            fn resources(
+                &self,
+                offset: usize,
+                limit: usize,
+            ) -> Result<bosn_registry::Page<Resource>, bosn_registry::Error> {
+                <$type>::resources(self, offset, limit)
+            }
+            fn resource_uses(
+                &self,
+                offset: usize,
+                limit: usize,
+            ) -> Result<bosn_registry::Page<ResourceUse>, bosn_registry::Error> {
+                <$type>::resource_uses(self, offset, limit)
+            }
+            fn leases(
+                &self,
+                offset: usize,
+                limit: usize,
+            ) -> Result<bosn_registry::Page<Lease>, bosn_registry::Error> {
+                <$type>::leases(self, offset, limit)
+            }
+            fn execution_sessions(
+                &self,
+                offset: usize,
+                limit: usize,
+            ) -> Result<bosn_registry::Page<ExecutionSession>, bosn_registry::Error> {
+                <$type>::execution_sessions(self, offset, limit)
+            }
+            fn volume_creation_intents(
+                &self,
+                offset: usize,
+                limit: usize,
+            ) -> Result<bosn_registry::Page<VolumeCreationIntent>, bosn_registry::Error> {
+                <$type>::volume_creation_intents(self, offset, limit)
+            }
+        }
+    };
+}
+impl_reconciliation_reader!(Registry);
+impl_reconciliation_reader!(ReadOnlyRegistry);
+fn reconciliation_resources(registry: &impl ReconciliationReader) -> Result<Vec<Resource>, Error> {
     let mut values = Vec::new();
     let mut offset = 0;
     loop {
@@ -291,7 +366,7 @@ fn reconciliation_resources(registry: &Registry) -> Result<Vec<Resource>, Error>
         }
     }
 }
-fn reconciliation_uses(registry: &Registry) -> Result<Vec<ResourceUse>, Error> {
+fn reconciliation_uses(registry: &impl ReconciliationReader) -> Result<Vec<ResourceUse>, Error> {
     let mut values = Vec::new();
     let mut offset = 0;
     loop {
@@ -304,7 +379,7 @@ fn reconciliation_uses(registry: &Registry) -> Result<Vec<ResourceUse>, Error> {
         }
     }
 }
-fn reconciliation_leases(registry: &Registry) -> Result<Vec<Lease>, Error> {
+fn reconciliation_leases(registry: &impl ReconciliationReader) -> Result<Vec<Lease>, Error> {
     // Only presence is an authorization veto; avoid retaining a second public
     // liveness representation in this service layer.
     let mut values = Vec::new();
@@ -319,7 +394,9 @@ fn reconciliation_leases(registry: &Registry) -> Result<Vec<Lease>, Error> {
         }
     }
 }
-fn reconciliation_sessions(registry: &Registry) -> Result<Vec<ExecutionSession>, Error> {
+fn reconciliation_sessions(
+    registry: &impl ReconciliationReader,
+) -> Result<Vec<ExecutionSession>, Error> {
     let mut values = Vec::new();
     let mut offset = 0;
     loop {
@@ -332,7 +409,9 @@ fn reconciliation_sessions(registry: &Registry) -> Result<Vec<ExecutionSession>,
         }
     }
 }
-fn reconciliation_intents(registry: &Registry) -> Result<Vec<VolumeCreationIntent>, Error> {
+fn reconciliation_intents(
+    registry: &impl ReconciliationReader,
+) -> Result<Vec<VolumeCreationIntent>, Error> {
     let mut values = Vec::new();
     let mut offset = 0;
     loop {
@@ -16913,6 +16992,7 @@ fi
     #[test]
     fn offline_python_v4_reconciliation_repeats_fake_engine_proof_then_clears_gate_atomically() {
         let (_directory, path, observed) = gated_v4_reconciliation_registry(false);
+        let before_preview = std::fs::read(&path).unwrap();
         let preview = preview_python_v4_reconciliation(
             &path,
             &FakePythonV4Engine {
@@ -16922,6 +17002,7 @@ fi
         .unwrap();
         assert_eq!(preview.verified, ["legacy-volume"]);
         assert!(preview.ready());
+        assert_eq!(std::fs::read(&path).unwrap(), before_preview);
         let applied = apply_python_v4_reconciliation(
             &path,
             &FakePythonV4Engine {

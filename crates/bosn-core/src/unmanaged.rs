@@ -14,9 +14,7 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-use crate::{
-    LABEL_REGISTRY, NAMESPACE, REQUIRED_LABELS, ResourceKind,
-};
+use crate::{LABEL_REGISTRY, NAMESPACE, REQUIRED_LABELS, ResourceKind};
 
 /// Default Tier-1 age gate. Matches `foreign_ttl` in #148.
 pub const DEFAULT_TTL_SECONDS: f64 = 7.0 * 86_400.0;
@@ -559,7 +557,10 @@ pub fn classify_ownership(
 
 #[must_use]
 pub fn is_bosn_label(key: &str) -> bool {
-    key == NAMESPACE || key.strip_prefix(NAMESPACE).is_some_and(|rest| rest.starts_with('.'))
+    key == NAMESPACE
+        || key
+            .strip_prefix(NAMESPACE)
+            .is_some_and(|rest| rest.starts_with('.'))
 }
 
 /// One artifact's engine observations, ready to classify.
@@ -610,7 +611,11 @@ pub struct Census {
 
 /// Aggregate a full observation into per-class and per-reason summaries.
 #[must_use]
-pub fn census(artifacts: &[ObservedArtifact], our_registry: Option<&str>, config: CensusConfig) -> Census {
+pub fn census(
+    artifacts: &[ObservedArtifact],
+    our_registry: Option<&str>,
+    config: CensusConfig,
+) -> Census {
     let mut classes: BTreeMap<UnmanagedClass, ClassSummary> = BTreeMap::new();
     let mut protected: BTreeMap<ProtectedReason, ProtectedSummary> = BTreeMap::new();
     let mut partial = false;
@@ -816,9 +821,7 @@ pub fn parse_docker_timestamp(raw: &str) -> Option<f64> {
     let offset_token = rest.trim().split(' ').next()?;
     let offset_seconds = parse_offset(offset_token)?;
     let days = days_from_civil(year, month, day);
-    let seconds = days as f64 * 86_400.0
-        + (hour * 3600 + minute * 60 + second) as f64
-        + sub_second
+    let seconds = days as f64 * 86_400.0 + (hour * 3600 + minute * 60 + second) as f64 + sub_second
         - offset_seconds as f64;
     seconds.is_finite().then_some(seconds)
 }
@@ -1148,7 +1151,10 @@ mod tests {
             classify_ownership(&labels(&[(crate::LABEL_KIND, "image")]), Some("r1")),
             OwnershipClass::IncompleteLabels
         );
-        assert_eq!(classify_ownership(&BTreeMap::new(), Some("r1")), OwnershipClass::Unlabeled);
+        assert_eq!(
+            classify_ownership(&BTreeMap::new(), Some("r1")),
+            OwnershipClass::Unlabeled
+        );
     }
 
     #[test]
@@ -1164,7 +1170,10 @@ mod tests {
     #[test]
     fn names_never_prove_ownership() {
         // A bosn-looking name with no labels is still unlabeled.
-        assert_eq!(classify_ownership(&BTreeMap::new(), Some("r1")), OwnershipClass::Unlabeled);
+        assert_eq!(
+            classify_ownership(&BTreeMap::new(), Some("r1")),
+            OwnershipClass::Unlabeled
+        );
     }
 
     #[test]
@@ -1280,7 +1289,10 @@ mod tests {
             old,
             config,
         );
-        assert_eq!(incomplete.protected, Some(ProtectedReason::IncompleteLabels));
+        assert_eq!(
+            incomplete.protected,
+            Some(ProtectedReason::IncompleteLabels)
+        );
 
         // A pin is a label, so it cannot appear on an unlabeled artifact. A half-written
         // label set containing only a pin is therefore incomplete, and protected as such.
@@ -1334,7 +1346,10 @@ mod tests {
         // cache. Evicting the cache cannot close a 50 GiB gap.
         let decision = pressure_decision(true, true, 10, 60, 1, true);
         assert!(!decision.may_evict_owned);
-        assert_eq!(decision.attribution, PressureAttribution::ForeignBytesDominate);
+        assert_eq!(
+            decision.attribution,
+            PressureAttribution::ForeignBytesDominate
+        );
         assert_eq!(decision.shortfall_bytes, 50);
     }
 
@@ -1350,7 +1365,10 @@ mod tests {
         // The no-regression case: the shortfall is small and Bosn owns enough to close it.
         let decision = pressure_decision(true, true, 50, 60, 40, true);
         assert!(decision.may_evict_owned);
-        assert_eq!(decision.attribution, PressureAttribution::OwnedBytesCanClose);
+        assert_eq!(
+            decision.attribution,
+            PressureAttribution::OwnedBytesCanClose
+        );
         // Exactly enough is enough.
         assert!(pressure_decision(true, true, 50, 60, 10, true).may_evict_owned);
     }
@@ -1369,7 +1387,12 @@ mod tests {
 
     #[test]
     fn a_healthy_machine_is_silent() {
-        let artifacts = [artifact("c", ResourceKind::Container, 1024, DEFAULT_TTL_SECONDS * 2.0)];
+        let artifacts = [artifact(
+            "c",
+            ResourceKind::Container,
+            1024,
+            DEFAULT_TTL_SECONDS * 2.0,
+        )];
         let census = census(&artifacts, None, CensusConfig::default());
         assert_eq!(warning(&census, WarningThreshold::default()), None);
     }
@@ -1403,7 +1426,12 @@ mod tests {
     fn the_reclaimable_total_never_promises_bytes_no_command_can_free() {
         let artifacts = [
             artifact("c", ResourceKind::Container, 100, DEFAULT_TTL_SECONDS * 2.0),
-            artifact("cache", ResourceKind::Builder, 900, DEFAULT_TTL_SECONDS * 2.0),
+            artifact(
+                "cache",
+                ResourceKind::Builder,
+                900,
+                DEFAULT_TTL_SECONDS * 2.0,
+            ),
         ];
         let census = census(&artifacts, None, CensusConfig::default());
         assert_eq!(census.reclaimable_objects, 1);
@@ -1440,7 +1468,10 @@ mod tests {
             DEFAULT_TTL_SECONDS * 2.0,
         )];
         let selected = plan(&artifacts, None, CensusConfig::default(), &[]);
-        assert!(selected.candidates.is_empty(), "build cache is never a candidate");
+        assert!(
+            selected.candidates.is_empty(),
+            "build cache is never a candidate"
+        );
         assert_eq!(selected.report_only.len(), 1);
         assert_eq!(selected.report_only[0].class, UnmanagedClass::BuildCache);
         assert_eq!(selected.report_only[0].eligible_bytes, 4096);
@@ -1451,11 +1482,20 @@ mod tests {
         let mut dangling_image =
             artifact("image", ResourceKind::Image, 200, DEFAULT_TTL_SECONDS * 2.0);
         dangling_image.signals.dangling = true;
-        let mut unmeasured =
-            artifact("unmeasured", ResourceKind::Container, 0, DEFAULT_TTL_SECONDS * 2.0);
+        let mut unmeasured = artifact(
+            "unmeasured",
+            ResourceKind::Container,
+            0,
+            DEFAULT_TTL_SECONDS * 2.0,
+        );
         unmeasured.bytes = None;
         let artifacts = [
-            artifact("container", ResourceKind::Container, 100, DEFAULT_TTL_SECONDS * 2.0),
+            artifact(
+                "container",
+                ResourceKind::Container,
+                100,
+                DEFAULT_TTL_SECONDS * 2.0,
+            ),
             dangling_image,
             // Tagged and unreferenced: reviewable, never swept.
             artifact("local", ResourceKind::Image, 300, DEFAULT_TTL_SECONDS * 2.0),
@@ -1469,7 +1509,12 @@ mod tests {
         assert!(selected.review.iter().any(|c| c.id == "local"));
 
         // Naming a Tier-2 artifact opts exactly that one in.
-        let included = plan(&artifacts, None, CensusConfig::default(), &["local".to_owned()]);
+        let included = plan(
+            &artifacts,
+            None,
+            CensusConfig::default(),
+            &["local".to_owned()],
+        );
         let ids: Vec<&str> = included.candidates.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, vec!["container", "image", "local"]);
         assert_eq!(included.bytes, 600);
@@ -1645,7 +1690,10 @@ mod tests {
     #[test]
     fn docker_timestamps_parse_with_numeric_offsets() {
         // 1970-01-01T00:00:00Z
-        assert_eq!(parse_docker_timestamp("1970-01-01 00:00:00 +0000 UTC"), Some(0.0));
+        assert_eq!(
+            parse_docker_timestamp("1970-01-01 00:00:00 +0000 UTC"),
+            Some(0.0)
+        );
         // A negative offset shifts the instant later in UTC.
         assert_eq!(
             parse_docker_timestamp("1970-01-01 00:00:00 -0700 PDT"),
@@ -1654,9 +1702,15 @@ mod tests {
         // Fractional seconds are truncated to nanosecond precision.
         let fraction = parse_docker_timestamp("1970-01-01 00:00:01.5 +0000 UTC").unwrap();
         assert!((fraction - 1.5).abs() < 1e-9);
-        assert_eq!(parse_docker_timestamp("2026-09-16 12:13:31 -0700 PDT"), Some(1_789_586_011.0));
+        assert_eq!(
+            parse_docker_timestamp("2026-09-16 12:13:31 -0700 PDT"),
+            Some(1_789_586_011.0)
+        );
         assert_eq!(parse_docker_timestamp("not a timestamp"), None);
-        assert_eq!(parse_docker_timestamp("2026-13-16 12:13:31 -0700 PDT"), None);
+        assert_eq!(
+            parse_docker_timestamp("2026-13-16 12:13:31 -0700 PDT"),
+            None
+        );
         assert_eq!(parse_docker_timestamp("2026-09-16 12:13:31"), None);
     }
 
@@ -1665,7 +1719,10 @@ mod tests {
         let parsed = parse_label_list("a=1,b=2");
         assert_eq!(parsed.get("a"), Some(&"1".to_owned()));
         assert_eq!(parsed.get("b"), Some(&"2".to_owned()));
-        assert!(parse_label_list("com.docker.volume.anonymous=").contains_key("com.docker.volume.anonymous"));
+        assert!(
+            parse_label_list("com.docker.volume.anonymous=")
+                .contains_key("com.docker.volume.anonymous")
+        );
         assert!(parse_label_list("bare").contains_key("bare"));
         assert!(parse_label_list("").is_empty());
     }
@@ -1698,7 +1755,10 @@ mod tests {
             .iter()
             .find(|artifact| artifact.kind == ResourceKind::Volume)
             .expect("volume present");
-        assert!(volume.signals.anonymous, "anonymous volume detected from its label");
+        assert!(
+            volume.signals.anonymous,
+            "anonymous volume detected from its label"
+        );
         assert_eq!(
             volume.age_seconds, None,
             "a volume without inspect detail has no age, and is therefore protected"
@@ -1745,10 +1805,7 @@ mod tests {
             inspected_volumes: &[InspectedVolume {
                 name: "f1c1cdf1f2ba212d6d08336115a83821aa80e1971ce9aa2513dd65bfce07f7ca".to_owned(),
                 created_at: "2026-08-01T00:00:00-07:00".to_owned(),
-                labels: BTreeMap::from([(
-                    "com.docker.volume.anonymous".to_owned(),
-                    String::new(),
-                )]),
+                labels: BTreeMap::from([("com.docker.volume.anonymous".to_owned(), String::new())]),
             }],
             now,
         });
@@ -1768,7 +1825,10 @@ mod tests {
             CensusConfig::default(),
         );
         assert_eq!(verdict.class, Some(UnmanagedClass::AnonymousVolume));
-        assert!(verdict.age_eligible, "a month-old anonymous volume is eligible");
+        assert!(
+            verdict.age_eligible,
+            "a month-old anonymous volume is eligible"
+        );
     }
 
     #[test]
@@ -1785,10 +1845,7 @@ mod tests {
         );
         assert_eq!(parse_rfc3339_timestamp("nonsense"), None);
         // A UTC designator is accepted, and a date without a zone is not.
-        assert_eq!(
-            parse_rfc3339_timestamp("1970-01-01T00:00:00Z"),
-            Some(0.0)
-        );
+        assert_eq!(parse_rfc3339_timestamp("1970-01-01T00:00:00Z"), Some(0.0));
         assert_eq!(parse_rfc3339_timestamp("1970-01-01T00:00:00"), None);
     }
 }

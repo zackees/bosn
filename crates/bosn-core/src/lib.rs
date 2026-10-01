@@ -34,9 +34,9 @@ pub use unmanaged::{
     ACK_GROWTH_RATIO, ACK_MAX_AGE_SECONDS, Acknowledgement, Census, CensusConfig, ClassSummary,
     Classification, DEFAULT_TTL_SECONDS, DEFAULT_WARN_BYTES, DEFAULT_WARN_OBJECTS,
     EngineObservation, InspectedVolume, ObservedArtifact, OwnershipClass, Plan, PlanCandidate,
-    ProtectedReason, ProtectedSummary, Signals, SystemDfReport, Tier, UnmanagedClass, Warning,
-    WarningThreshold, acknowledgement_suppresses, census, classify, classify_ownership,
-    PressureAttribution, PressureDecision, is_removable_by_id, observe, parse_docker_size,
+    PressureAttribution, PressureDecision, ProtectedReason, ProtectedSummary, Signals,
+    SystemDfReport, Tier, UnmanagedClass, Warning, WarningThreshold, acknowledgement_suppresses,
+    census, classify, classify_ownership, is_removable_by_id, observe, parse_docker_size,
     parse_docker_timestamp, parse_label_list, parse_rfc3339_timestamp, plan, pressure_decision,
     removal_rank, warning,
 };

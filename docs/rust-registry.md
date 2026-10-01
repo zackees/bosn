@@ -62,6 +62,14 @@ transition into a reconciliation-gated v5 target. Old-daemon activation proof,
 engine/daemon cutover coordination, reconciliation, and native Windows/macOS
 validation remain follow-up work.
 
+`open_reconciliation_preview` is the explicit read-only inspection path for a
+reconciliation-gated database. It retains the same exclusive writer fence
+during inspection, revalidates the gate and schema after taking the fence, and
+never writes SQLite. It can create the sibling `registry.sqlite3.writer.lock`
+file; the preservation guarantee is for the database bytes, not the whole
+state directory. Service reconciliation preview uses this read-only handle;
+apply reopens the writer and repeats every check before clearing the gate.
+
 Local development checks:
 
 ```text

@@ -1,0 +1,27 @@
+{"v":1,"ts":"2026-10-01T20:26:52.021Z","elapsed_sec":0.0,"event":"START","repo":"origin","pr":320,"log_path":".clud/logs/pr-merge-watch/20261001T202652.021Z-pr-320.jsonl"}
+{"v":1,"elapsed_sec":3.85,"event":"checks","checks":{"total":11,"pending":4,"failed":0,"succeeded":7,"skipped":0},"mergeable":"MERGEABLE","merge_state_status":"BLOCKED"}
+{"v":1,"elapsed_sec":3.85,"event":"coderabbit","coderabbit":{"state":"not_detected","sampled_merged_prs":5}}
+{"v":1,"elapsed_sec":33.73,"event":"checks","checks":{"total":11,"pending":4,"failed":0,"succeeded":7,"skipped":0},"mergeable":"MERGEABLE","merge_state_status":"BLOCKED"}
+{"v":1,"elapsed_sec":63.77,"event":"checks","checks":{"total":11,"pending":4,"failed":0,"succeeded":7,"skipped":0},"mergeable":"MERGEABLE","merge_state_status":"BLOCKED"}
+{"v":1,"elapsed_sec":63.77,"event":"coderabbit","coderabbit":{"state":"not_detected","sampled_merged_prs":5}}
+{"v":1,"elapsed_sec":93.49,"event":"checks","checks":{"total":11,"pending":4,"failed":0,"succeeded":7,"skipped":0},"mergeable":"MERGEABLE","merge_state_status":"BLOCKED"}
+{"v":1,"elapsed_sec":124.13,"event":"checks","checks":{"total":11,"pending":4,"failed":0,"succeeded":7,"skipped":0},"mergeable":"MERGEABLE","merge_state_status":"BLOCKED"}
+{"v":1,"elapsed_sec":154.23,"event":"checks","checks":{"total":11,"pending":4,"failed":0,"succeeded":7,"skipped":0},"mergeable":"MERGEABLE","merge_state_status":"BLOCKED"}
+{"v":1,"elapsed_sec":154.23,"event":"coderabbit","coderabbit":{"state":"not_detected","sampled_merged_prs":5}}
+{"v":1,"elapsed_sec":183.27,"event":"checks","checks":{"total":11,"pending":4,"failed":0,"succeeded":7,"skipped":0},"mergeable":"MERGEABLE","merge_state_status":"BLOCKED"}
+{"v":1,"elapsed_sec":213.55,"event":"checks","checks":{"total":11,"pending":4,"failed":0,"succeeded":7,"skipped":0},"mergeable":"MERGEABLE","merge_state_status":"BLOCKED"}
+{"v":1,"elapsed_sec":243.41,"event":"checks","checks":{"total":11,"pending":4,"failed":0,"succeeded":7,"skipped":0},"mergeable":"MERGEABLE","merge_state_status":"BLOCKED"}
+{"v":1,"elapsed_sec":243.41,"event":"coderabbit","coderabbit":{"state":"not_detected","sampled_merged_prs":5}}
+{"v":1,"elapsed_sec":273.31,"event":"checks","checks":{"total":11,"pending":4,"failed":0,"succeeded":7,"skipped":0},"mergeable":"MERGEABLE","merge_state_status":"BLOCKED"}
+{"v":1,"elapsed_sec":303.43,"event":"checks","checks":{"total":11,"pending":4,"failed":0,"succeeded":7,"skipped":0},"mergeable":"MERGEABLE","merge_state_status":"BLOCKED"}
+{"v":1,"elapsed_sec":333.73,"event":"checks","checks":{"total":11,"pending":4,"failed":0,"succeeded":7,"skipped":0},"mergeable":"MERGEABLE","merge_state_status":"BLOCKED"}
+{"v":1,"elapsed_sec":333.73,"event":"coderabbit","coderabbit":{"state":"not_detected","sampled_merged_prs":5}}
+{"v":1,"elapsed_sec":363.43,"event":"checks","checks":{"total":11,"pending":4,"failed":0,"succeeded":7,"skipped":0},"mergeable":"MERGEABLE","merge_state_status":"BLOCKED"}
+{"v":1,"elapsed_sec":393.56,"event":"checks","checks":{"total":11,"pending":4,"failed":0,"succeeded":7,"skipped":0},"mergeable":"MERGEABLE","merge_state_status":"BLOCKED"}
+{"v":1,"elapsed_sec":423.55,"event":"checks","checks":{"total":11,"pending":4,"failed":0,"succeeded":7,"skipped":0},"mergeable":"MERGEABLE","merge_state_status":"BLOCKED"}
+{"v":1,"elapsed_sec":423.55,"event":"coderabbit","coderabbit":{"state":"not_detected","sampled_merged_prs":5}}
+{"v":1,"elapsed_sec":453.57,"event":"checks","checks":{"total":11,"pending":2,"failed":1,"succeeded":8,"skipped":0},"mergeable":"MERGEABLE","merge_state_status":"BLOCKED"}
+{"v":1,"elapsed_sec":454.78,"event":"required_failure","check":{"name":"Full CI coverage (exact candidate SHA)","state":"cancelled","link":"https://github.com/zackees/bosn/actions/runs/36921386990/job/110571674218","workflow":".github/workflows/ci.yml"}}
+{"v":1,"elapsed_sec":461.34,"event":"cancel_item","watcher_pid":855149,"watcher_host":"nixos","mode":"runs","item_id":36921386466,"status":"cancelled"}
+{"v":1,"elapsed_sec":461.34,"event":"cancel","trigger":"fail","attempts":1,"mode":"runs"}
+{"v":1,"elapsed_sec":461.34,"event":"EXIT","code":1,"reason":"fail"}

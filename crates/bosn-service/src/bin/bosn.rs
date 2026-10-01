@@ -530,9 +530,13 @@ fn run_scan(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
     while let Some(argument) = arguments.next() {
         match argument.to_string_lossy().as_ref() {
             "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
-            "--ttl-seconds" => set_once_parsed(&mut ttl_seconds, arguments.next(), parse_ttl_seconds),
+            "--ttl-seconds" => {
+                set_once_parsed(&mut ttl_seconds, arguments.next(), parse_ttl_seconds)
+            }
             "--warn-bytes" => set_once_parsed(&mut warn_bytes, arguments.next(), parse_ttl_seconds),
-            "--warn-objects" => set_once_parsed(&mut warn_objects, arguments.next(), parse_ttl_seconds),
+            "--warn-objects" => {
+                set_once_parsed(&mut warn_objects, arguments.next(), parse_ttl_seconds)
+            }
             "--ack" if !ack => {
                 ack = true;
                 Ok(())
@@ -735,7 +739,10 @@ fn colour_enabled() -> bool {
     if std::env::var_os("NO_COLOR").is_some() {
         return false;
     }
-    if std::env::var("TERM").map(|term| term == "dumb").unwrap_or(false) {
+    if std::env::var("TERM")
+        .map(|term| term == "dumb")
+        .unwrap_or(false)
+    {
         return false;
     }
     std::io::stderr().is_terminal()
@@ -747,7 +754,10 @@ fn colour_enabled() -> bool {
 /// interactive surface say exactly the same thing.
 fn print_warning(warning: &bosn_core::Warning) {
     let colour = colour_enabled();
-    for (index, line) in bosn_service::unmanaged::warning_lines(warning).iter().enumerate() {
+    for (index, line) in bosn_service::unmanaged::warning_lines(warning)
+        .iter()
+        .enumerate()
+    {
         // Only the headline shouts, and only it is coloured: an all-caps table is unreadable
         // and the shouting has to mean something.
         if colour && index == 0 {
@@ -808,7 +818,9 @@ fn run_gc_unmanaged(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
     while let Some(argument) = arguments.next() {
         match argument.to_string_lossy().as_ref() {
             "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
-            "--ttl-seconds" => set_once_parsed(&mut ttl_seconds, arguments.next(), parse_ttl_seconds),
+            "--ttl-seconds" => {
+                set_once_parsed(&mut ttl_seconds, arguments.next(), parse_ttl_seconds)
+            }
             "--include" => match arguments.next().and_then(|value| {
                 value
                     .to_str()
@@ -2433,7 +2445,9 @@ fn parse_state_dir(value: std::ffi::OsString) -> Result<PathBuf, ()> {
 /// silently treated as "no gate", which would make everything eligible.
 fn parse_ttl_seconds(value: std::ffi::OsString) -> Result<f64, ()> {
     let seconds: f64 = value.to_str().ok_or(())?.parse().map_err(|_| ())?;
-    (seconds.is_finite() && seconds >= 0.0).then_some(seconds).ok_or(())
+    (seconds.is_finite() && seconds >= 0.0)
+        .then_some(seconds)
+        .ok_or(())
 }
 
 fn parse_job_id(value: std::ffi::OsString) -> Result<u64, ()> {
@@ -2895,8 +2909,12 @@ fn print_json(plan: &SetupPlan) {
 }
 
 fn usage() -> ! {
-    eprintln!("   or: bosn act plan --workspace WORKSPACE --workflow RELATIVE_YML --event pull_request|push|release --mode minimal|test|full --sha 40_HEX --act-version VERSION [--act-bin PATH] [--job ID] [--json]");
-    eprintln!("   or: bosn act run|report (refuses until isolated Docker ownership is implemented)");
+    eprintln!(
+        "   or: bosn act plan --workspace WORKSPACE --workflow RELATIVE_YML --event pull_request|push|release --mode minimal|test|full --sha 40_HEX --act-version VERSION [--act-bin PATH] [--job ID] [--json]"
+    );
+    eprintln!(
+        "   or: bosn act run|report (refuses until isolated Docker ownership is implemented)"
+    );
     eprintln!("usage: bosn mcp [--state-dir STATE_DIR]");
     eprintln!("   or: {}", run::USAGE.trim_start_matches("usage: "));
     eprintln!(
@@ -2905,7 +2923,9 @@ fn usage() -> ! {
     eprintln!("   or: bosn daemon serve --state-dir STATE_DIR");
     eprintln!("   or: bosn daemon status --state-dir STATE_DIR [--json]");
     eprintln!("   or: bosn daemon stop --state-dir STATE_DIR [--json]");
-    eprintln!("   or: bosn daemon autostart (enable|disable|status) [--state-dir STATE_DIR] [--json]");
+    eprintln!(
+        "   or: bosn daemon autostart (enable|disable|status) [--state-dir STATE_DIR] [--json]"
+    );
     eprintln!(
         "   or: bosn registry import-v4 --legacy-state-dir LEGACY_STATE_DIR --state-dir NEW_STATE_DIR --yes [--json]"
     );
