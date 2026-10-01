@@ -96,15 +96,14 @@ pub fn run(mut arguments: impl Iterator<Item = OsString>) {
     {
         fail("invalid act version")
     }
-    if let Some(ref job) = job {
-        if job.is_empty()
+    if let Some(ref job) = job
+        && (job.is_empty()
             || job.len() > 128
             || !job
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        {
-            fail("invalid job ID")
-        }
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+    {
+        fail("invalid job ID")
     }
     let root = PathBuf::from(workspace)
         .canonicalize()

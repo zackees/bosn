@@ -50,6 +50,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+pub mod act_registry;
 pub mod autostart;
 pub mod github_proxy;
 pub mod jobs;
@@ -5246,6 +5247,10 @@ pub struct RegistryActor {
     sender: async_engine::Sender<DbCommand>,
 }
 enum DbCommand {
+    ActRegistry {
+        command: Box<act_registry::ActRegistryCommand>,
+        reply: async_engine::OneshotSender<Result<act_registry::ActRegistryReply, Error>>,
+    },
     Status(async_engine::OneshotSender<Result<Status, Error>>),
     DoctorIntegrity(async_engine::OneshotSender<&'static str>),
     Resources {
@@ -7509,6 +7514,22 @@ async fn registry_actor(
 ) {
     while let Some(command) = receiver.recv().await {
         match command {
+            DbCommand::ActRegistry { command, reply } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = act_registry::apply(&mut registry, *command);
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
             DbCommand::Status(reply) => {
                 let worker = async_engine::launch_blocking(move || {
                     let result = registry.status().map(Status::from);
@@ -9030,7 +9051,19 @@ impl Service {
             let adopt = Arc::clone(&self.setup_adopt_executor);
             let state_dir = self.state_dir.clone();
             clients.spawn(async move {
-                handle(stream, actor, jobs, stop, doctor, adopt, reconcile, state_dir).await
+                handle(
+                    stream,
+                    ConnectionContext {
+                        actor,
+                        jobs,
+                        stop,
+                        doctor,
+                        adopt,
+                        reconcile,
+                        state_dir,
+                    },
+                )
+                .await
             });
         }
         while clients.join_next().await.is_some() {}
@@ -9663,8 +9696,7 @@ async fn stop_setup_retired_candidate(
     })
 }
 
-async fn handle(
-    mut s: AsyncStream,
+struct ConnectionContext {
     actor: RegistryActor,
     jobs: JobActor,
     stop: CancellationSource,
@@ -9672,7 +9704,18 @@ async fn handle(
     adopt: Arc<dyn SetupAdoptExecutor>,
     reconcile: Arc<dyn SetupReconcileExecutor>,
     state_dir: PathBuf,
-) -> Result<(), Error> {
+}
+
+async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Result<(), Error> {
+    let ConnectionContext {
+        actor,
+        jobs,
+        stop,
+        doctor,
+        adopt,
+        reconcile,
+        state_dir,
+    } = context;
     if !peer_is_authorized(&s.peer_identity()?.user_id, &ipc::current_user_id()?) {
         return Err(Error::Unauthorized);
     }
@@ -10403,10 +10446,11 @@ async fn handle(
                     // that may already have changed.
                     let outcome = async_engine::launch_blocking(move || {
                         let state_dir = state_dir.clone();
-                        let our_registry =
-                            bosn_registry::Registry::open_read_only(state_dir.join("registry.sqlite3"))
-                                .ok()
-                                .and_then(|registry| registry.registry_id().ok());
+                        let our_registry = bosn_registry::Registry::open_read_only(
+                            state_dir.join("registry.sqlite3"),
+                        )
+                        .ok()
+                        .and_then(|registry| registry.registry_id().ok());
                         let config = bosn_core::CensusConfig {
                             ttl_seconds: if ttl_seconds == 0 {
                                 bosn_core::DEFAULT_TTL_SECONDS
@@ -11932,10 +11976,10 @@ fi
             "FROM alpine:3.21\nCOPY payload /payload\n",
         )
         .unwrap();
-        let unpinned = runtime
-            .run(manifest_stack_setup_plan_at(&request, Some(&state)))
-            .err()
-            .expect("a tag-only FROM is refused");
+        let unpinned = match runtime.run(manifest_stack_setup_plan_at(&request, Some(&state))) {
+            Err(error) => error,
+            Ok(_) => panic!("a tag-only FROM is refused"),
+        };
         // The refusal names the reference and the exact remedy.
         assert!(
             unpinned.contains("Dockerfile uses alpine:3.21"),
@@ -12241,10 +12285,10 @@ fi
         };
 
         write(&outside.to_string_lossy());
-        let refused = runtime
-            .run(manifest_stack_setup_plan(&request()))
-            .err()
-            .expect("a host path outside the workspace is refused");
+        let refused = match runtime.run(manifest_stack_setup_plan(&request())) {
+            Err(error) => error,
+            Ok(_) => panic!("a host path outside the workspace is refused"),
+        };
         assert!(refused.contains("escapes workspace"), "{refused}");
         assert!(refused.contains("/var/run/docker.sock"), "{refused}");
         assert!(refused.contains("[stack.NAME.volumes]"), "{refused}");
