@@ -196,8 +196,17 @@ pub fn run(mut arguments: impl Iterator<Item = OsString>) {
         &event
     };
     let act_bin = act_bin.unwrap_or_else(|| "act".to_owned());
-    let version_line = String::from_utf8(bounded_act_output(
-        Command::new(&act_bin).current_dir(&root).arg("--version"),
+    // Preserve workspace-relative --act-bin semantics before moving the child
+    // into an empty control directory. Bare names retain PATH lookup.
+    let act_path = Path::new(&act_bin);
+    let act_bin = if act_path.components().count() > 1 && !act_path.is_absolute() {
+        root.join(act_path).into_os_string()
+    } else {
+        OsString::from(act_bin)
+    };
+    let version_line = String::from_utf8(sterile_act_output(
+        &act_bin,
+        &[OsString::from("--version")],
         Duration::from_secs(2),
         4096,
     ))
@@ -205,10 +214,15 @@ pub fn run(mut arguments: impl Iterator<Item = OsString>) {
     if version_line.trim() != format!("act version {version}") {
         fail("act binary does not match --act-version")
     }
-    let output = String::from_utf8(bounded_act_output(
-        Command::new(&act_bin)
-            .current_dir(&root)
-            .args(["-l", "-W", &workflow]),
+    let output = String::from_utf8(sterile_act_output(
+        &act_bin,
+        &[
+            OsString::from("-l"),
+            OsString::from("-C"),
+            root.clone().into_os_string(),
+            OsString::from("-W"),
+            path.clone().into_os_string(),
+        ],
         Duration::from_secs(2),
         1024 * 1024,
     ))
@@ -339,14 +353,116 @@ fn payload(mut arguments: impl Iterator<Item = OsString>) {
     );
 }
 
+/// A private per-query control directory prevents Act's implicit .actrc search
+/// from reaching source or the caller's HOME/XDG configuration. Distinct query
+/// directories also prevent version-query side effects affecting listing.
+struct ActControlDirectory {
+    root: PathBuf,
+    removed: bool,
+}
+impl ActControlDirectory {
+    fn create() -> std::io::Result<Self> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_nanos();
+        for attempt in 0..16 {
+            let root = std::env::temp_dir().join(format!(
+                "bosn-act-query-{}-{stamp}-{attempt}",
+                std::process::id()
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&root) {
+                Ok(()) => {
+                    let owned = Self {
+                        root,
+                        removed: false,
+                    };
+                    std::fs::create_dir(owned.root.join("home"))?;
+                    std::fs::create_dir(owned.root.join("config"))?;
+                    std::fs::create_dir(owned.root.join("tmp"))?;
+                    return Ok(owned);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::other("control directory collisions"))
+    }
+    fn cleanup(&mut self) -> std::io::Result<()> {
+        std::fs::remove_dir_all(&self.root)?;
+        self.removed = true;
+        Ok(())
+    }
+}
+impl Drop for ActControlDirectory {
+    fn drop(&mut self) {
+        if !self.removed {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+}
+fn sterile_act_output(
+    binary: &OsString,
+    args: &[OsString],
+    deadline: Duration,
+    limit: usize,
+) -> Vec<u8> {
+    let result = (|| {
+        let mut control =
+            ActControlDirectory::create().map_err(|_| "act control directory unavailable")?;
+        let mut command = Command::new(binary);
+        command.current_dir(&control.root).args(args).env_clear();
+        // Allow only executable lookup and the Windows loader's system paths.
+        // Tokens, Docker settings, proxies, loader injection and Act variables
+        // are removed by default instead of relying on credential-name guesses.
+        let essential = if cfg!(windows) {
+            &["PATH", "SystemRoot", "WINDIR", "PATHEXT"][..]
+        } else {
+            &["PATH"][..]
+        };
+        for key in essential {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        command
+            .env("HOME", control.root.join("home"))
+            .env("USERPROFILE", control.root.join("home"))
+            .env("XDG_CONFIG_HOME", control.root.join("config"))
+            .env("TMPDIR", control.root.join("tmp"))
+            .env("TMP", control.root.join("tmp"))
+            .env("TEMP", control.root.join("tmp"))
+            .env("LC_ALL", "C")
+            .stdin(std::process::Stdio::null());
+        let result = bounded_act_output(&mut command, deadline, limit);
+        control
+            .cleanup()
+            .map_err(|_| "act control directory cleanup failed")?;
+        result
+    })();
+    // Drop the control directory before fail() exits the CLI without unwinding.
+    result.unwrap_or_else(|message| fail(message))
+}
+
 /// Run only the two non-executing Act queries. Pipe readers drain concurrently
 /// so neither stdout nor stderr can block the child before the deadline.
-fn bounded_act_output(command: &mut Command, deadline: Duration, limit: usize) -> Vec<u8> {
+fn bounded_act_output(
+    command: &mut Command,
+    deadline: Duration,
+    limit: usize,
+) -> Result<Vec<u8>, &'static str> {
     let mut child = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .unwrap_or_else(|_| fail("act executable is unavailable"));
+        .map_err(|_| "act executable is unavailable")?;
     let (tx, rx) = mpsc::sync_channel::<Option<(bool, Vec<u8>)>>(8);
     for (is_stdout, mut pipe) in [
         (
@@ -385,7 +501,7 @@ fn bounded_act_output(command: &mut Command, deadline: Duration, limit: usize) -
         let Some(remaining) = deadline.checked_sub(start.elapsed()) else {
             let _ = child.kill();
             let _ = child.wait();
-            fail("act query timed out")
+            return Err("act query timed out");
         };
         match rx.recv_timeout(remaining.min(Duration::from_millis(50))) {
             Ok(None) => eof += 1,
@@ -394,14 +510,18 @@ fn bounded_act_output(command: &mut Command, deadline: Duration, limit: usize) -
                 if used > limit {
                     let _ = child.kill();
                     let _ = child.wait();
-                    fail("act query output limit exceeded")
+                    return Err("act query output limit exceeded");
                 }
                 if is_stdout {
                     stdout.extend_from_slice(&bytes)
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => fail("act query output ended unexpectedly"),
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("act query output ended unexpectedly");
+            }
         }
     }
     let status = loop {
@@ -411,15 +531,19 @@ fn bounded_act_output(command: &mut Command, deadline: Duration, limit: usize) -
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                fail("act query timed out")
+                return Err("act query timed out");
             }
-            Err(_) => fail("act query could not be reaped"),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("act query could not be reaped");
+            }
         }
     };
     if !status.success() {
-        fail("act query failed")
+        return Err("act query failed");
     }
-    stdout
+    Ok(stdout)
 }
 
 fn parse_list(output: &str) -> Vec<Value> {
