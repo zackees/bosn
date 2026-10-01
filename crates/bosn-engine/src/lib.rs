@@ -18,6 +18,10 @@ use kernal_api::{
 };
 
 const SESSION_POLL: Duration = Duration::from_millis(20);
+/// How long `DockerCommand::stream` waits on a full event queue before it
+/// declares the consumer stalled and reaps the client (zackees/ci.yml#166:
+/// `soldr ci-test`'s warning burst was reaped after a momentary full queue).
+const CONSUMER_STALL_LIMIT: Duration = Duration::from_secs(60);
 
 /// One SSH invocation whose network endpoint and authentication shape are
 /// deliberately finite.  It exists for the macOS guest transport; it is not
@@ -459,9 +463,11 @@ impl DockerEngine {
     /// killing `docker exec` does not establish that a remote container command
     /// stopped; later job integration must use ownership-validated container
     /// cancellation before reporting remote cancellation.
-    /// Events use a bounded kernal-api channel. A full queue returns
-    /// `OutputConsumerSlow` and reaps the client rather than pinning the
-    /// runtime; a dropped receiver returns `OutputConsumerClosed`.
+    /// Events use a bounded kernal-api channel. A full queue applies
+    /// backpressure: the stream waits up to `CONSUMER_STALL_LIMIT` (bounded by
+    /// the deadline) for the consumer, and only a consumer stalled that long
+    /// returns `OutputConsumerSlow` and reaps the client; a dropped receiver
+    /// returns `OutputConsumerClosed`.
     pub async fn stream(
         &self,
         options: RunOptions,
@@ -540,15 +546,38 @@ impl DockerEngine {
                     }
                     match events.try_send(event) {
                         Ok(()) => {}
-                        Err(async_engine::TrySendError::Full(_)) => {
-                            return reap(
-                                session,
-                                CommandError::OutputConsumerSlow {
-                                    reaped_pid: Some(pid),
-                                    cleanup: None,
-                                },
-                            )
-                            .await;
+                        Err(async_engine::TrySendError::Full(event)) => {
+                            // A full queue is ordinary backpressure during an
+                            // output burst (a compiler's warning flood), not a
+                            // dead consumer: wait for it, which also stops
+                            // draining the pipe and so throttles the client.
+                            // Only a consumer stalled for the whole budget (or
+                            // past the job deadline) reaps the client.
+                            let remaining = options.deadline.saturating_sub(started.elapsed());
+                            let wait = CONSUMER_STALL_LIMIT.min(remaining);
+                            match async_engine::timeout(wait, events.send(event)).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(_)) => {
+                                    return reap(
+                                        session,
+                                        CommandError::OutputConsumerClosed {
+                                            reaped_pid: Some(pid),
+                                            cleanup: None,
+                                        },
+                                    )
+                                    .await;
+                                }
+                                Err(_) => {
+                                    return reap(
+                                        session,
+                                        CommandError::OutputConsumerSlow {
+                                            reaped_pid: Some(pid),
+                                            cleanup: None,
+                                        },
+                                    )
+                                    .await;
+                                }
+                            }
                         }
                         Err(async_engine::TrySendError::Closed(_)) => {
                             return reap(

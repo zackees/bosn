@@ -24,6 +24,16 @@ fn main() {
             std::io::stdout().flush().expect("flush");
             std::thread::sleep(Duration::from_secs(30));
         }
+        Some("burst") => {
+            // A compiler-warning flood: far more output than the event queue
+            // holds, written as fast as the pipe accepts it, then exit 0.
+            let line = "warning: duplicate compiler identity executed 2 times\n";
+            let mut out = std::io::stdout().lock();
+            for _ in 0..4_000 {
+                out.write_all(line.as_bytes()).expect("write");
+            }
+            out.flush().expect("flush");
+        }
         Some("short-sleep") => std::thread::sleep(Duration::from_millis(250)),
         Some("context") => {
             println!(
