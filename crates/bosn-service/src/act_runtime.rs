@@ -94,8 +94,43 @@ pub fn verify_loaded_image(
     document: &[u8],
     manifest: &str,
     config: &str,
-    expected: &Value,
+    manifest_bytes: &[u8],
+    config_bytes: &[u8],
 ) -> std::io::Result<String> {
+    if manifest_bytes.len() > 1 << 20
+        || config_bytes.len() > 1 << 20
+        || hash(manifest_bytes) != manifest
+        || hash(config_bytes) != config
+    {
+        return Err(error("imported image proof bytes do not match pins"));
+    }
+    let manifest_proof: Value = serde_json::from_slice(manifest_bytes)?;
+    let expected: Value = serde_json::from_slice(config_bytes)?;
+    if manifest_proof["schemaVersion"] != 2
+        || !matches!(
+            manifest_proof["mediaType"].as_str(),
+            Some(
+                "application/vnd.oci.image.manifest.v1+json"
+                    | "application/vnd.docker.distribution.manifest.v2+json"
+            )
+        )
+        || manifest_proof["config"]["digest"] != config
+        || manifest_proof["config"]["size"].as_u64() != Some(config_bytes.len() as u64)
+        || !matches!(
+            manifest_proof["config"]["mediaType"].as_str(),
+            Some(
+                "application/vnd.oci.image.config.v1+json"
+                    | "application/vnd.docker.container.image.v1+json"
+            )
+        )
+        || expected["os"] != "linux"
+        || expected["architecture"] != "amd64"
+        || expected["rootfs"]["type"] != "layers"
+    {
+        return Err(error(
+            "imported image manifest does not bind pinned Linux config",
+        ));
+    }
     let v: Value = serde_json::from_slice(document)?;
     let records = v
         .as_array()
@@ -111,7 +146,8 @@ pub fn verify_loaded_image(
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     }) || (id != manifest && id != config)
         || image["Descriptor"]["digest"] != manifest
-        || image["Descriptor"]["annotations"]["config.digest"] != config
+        || image["Descriptor"]["mediaType"] != manifest_proof["mediaType"]
+        || image["Descriptor"]["size"].as_u64() != Some(manifest_bytes.len() as u64)
         || image["RootFS"]["Type"] != "layers"
         || image["RootFS"]["Layers"] != expected["rootfs"]["diff_ids"]
         || (!image["Config"]["Volumes"].is_null()
@@ -736,12 +772,12 @@ pub async fn run_registered_act(
             "bosn-act".into(),
         ])
         .await?;
-        let config: Value = serde_json::from_slice(&request.package.config)?;
         let image_id = verify_loaded_image(
             &loaded,
             &request.package.manifest_digest,
             &request.package.config_digest,
-            &config,
+            &request.package.manifest,
+            &request.package.config,
         )?;
         let runner_loaded = control(vec![
             "exec".into(),
@@ -759,7 +795,8 @@ pub async fn run_registered_act(
             &runner_loaded,
             &request.package.runner_manifest_digest,
             &request.package.runner_config_digest,
-            &serde_json::from_slice(&request.package.runner_config)?,
+            &request.package.runner_manifest,
+            &request.package.runner_config,
         )?;
         report.act_docker_image_id = Some(image_id.clone());
         report.runner_docker_image_id = Some(runner_id.clone());
@@ -1044,7 +1081,7 @@ else: raise Exception('unexpected args '+repr(args))
             transaction.commit().unwrap();
             let image_config: Value = serde_json::from_slice(&package.config).unwrap();
             let runner_config: Value = serde_json::from_slice(&package.runner_config).unwrap();
-            let image = json!({"act":[{"Id":package.manifest_digest,"Descriptor":{"digest":package.manifest_digest,"annotations":{"config.digest":package.config_digest}},"RootFS":{"Type":"layers","Layers":image_config["rootfs"]["diff_ids"]},"Config":{"Volumes":null}}],"runner":[{"Id":package.runner_manifest_digest,"Descriptor":{"digest":package.runner_manifest_digest,"annotations":{"config.digest":package.runner_config_digest}},"RootFS":{"Type":"layers","Layers":runner_config["rootfs"]["diff_ids"]},"Config":{"Volumes":null}}]});
+            let image = json!({"act":[{"Id":package.manifest_digest,"Descriptor":{"digest":package.manifest_digest,"mediaType":serde_json::from_slice::<Value>(&package.manifest).unwrap()["mediaType"],"size":package.manifest.len()},"RootFS":{"Type":"layers","Layers":image_config["rootfs"]["diff_ids"]},"Config":{"Volumes":null}}],"runner":[{"Id":package.runner_manifest_digest,"Descriptor":{"digest":package.runner_manifest_digest,"mediaType":serde_json::from_slice::<Value>(&package.runner_manifest).unwrap()["mediaType"],"size":package.runner_manifest.len()},"RootFS":{"Type":"layers","Layers":runner_config["rootfs"]["diff_ids"]},"Config":{"Volumes":null}}]});
             let image_path = dir.path().join("image.json");
             std::fs::write(&image_path, serde_json::to_vec(&image).unwrap()).unwrap();
             let script = dir.path().join("docker.py");
@@ -1427,40 +1464,34 @@ else: raise Exception('unexpected args '+repr(args))
     }
     #[test]
     fn imported_manifest_and_config_are_separate_from_docker_image_id() {
-        let manifest = format!("sha256:{}", "a".repeat(64));
-        let config = format!("sha256:{}", "b".repeat(64));
-        let expected =
-            json!({"rootfs":{"type":"layers","diff_ids":[format!("sha256:{}","c".repeat(64))]}});
-        let observation = json!([{"Id":manifest,"Descriptor":{"digest":manifest,"annotations":{"config.digest":config}},"RootFS":{"Type":"layers","Layers":expected["rootfs"]["diff_ids"]},"Config":{"Volumes":null}}]);
+        let config_bytes = serde_json::to_vec(&json!({"architecture":"amd64","os":"linux","config":{"Volumes":{}},"rootfs":{"type":"layers","diff_ids":[format!("sha256:{}","c".repeat(64))]}})).unwrap();
+        let config = hash(&config_bytes);
+        let manifest_bytes = serde_json::to_vec(&json!({"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":config,"size":config_bytes.len(),"mediaType":"application/vnd.oci.image.config.v1+json"}})).unwrap();
+        let manifest = hash(&manifest_bytes);
+        let expected: Value = serde_json::from_slice(&config_bytes).unwrap();
+        let observation = json!([{"Id":manifest,"Descriptor":{"digest":manifest,"mediaType":"application/vnd.oci.image.manifest.v1+json","size":manifest_bytes.len()},"RootFS":{"Type":"layers","Layers":expected["rootfs"]["diff_ids"]},"Config":{"Volumes":{}}}]);
+        let verify = |v: &Value, m: &[u8], c: &[u8]| {
+            verify_loaded_image(&serde_json::to_vec(v).unwrap(), &manifest, &config, m, c)
+        };
         assert_eq!(
-            verify_loaded_image(
-                &serde_json::to_vec(&observation).unwrap(),
-                &manifest,
-                &config,
-                &expected
-            )
-            .unwrap(),
+            verify(&observation, &manifest_bytes, &config_bytes).unwrap(),
             manifest
         );
-        for field in ["manifest", "config", "layers", "volumes"] {
+        for field in ["manifest", "size", "mediaType", "layers", "volumes"] {
             let mut bad = observation.clone();
             match field {
                 "manifest" => bad[0]["Descriptor"]["digest"] = json!(config),
-                "config" => bad[0]["Descriptor"]["annotations"]["config.digest"] = json!(manifest),
+                "size" => bad[0]["Descriptor"]["size"] = json!(0),
+                "mediaType" => bad[0]["Descriptor"]["mediaType"] = json!("unknown"),
                 "layers" => bad[0]["RootFS"]["Layers"] = json!([]),
                 _ => bad[0]["Config"]["Volumes"] = json!({"/data":{}}),
             };
-            assert!(
-                verify_loaded_image(
-                    &serde_json::to_vec(&bad).unwrap(),
-                    &manifest,
-                    &config,
-                    &expected
-                )
-                .is_err()
-            );
+            assert!(verify(&bad, &manifest_bytes, &config_bytes).is_err());
         }
+        assert!(verify(&observation, b"{}", &config_bytes).is_err());
+        assert!(verify(&observation, &manifest_bytes, b"{}").is_err());
     }
+
     #[test]
     fn results_do_not_promote_unknown_or_foreign_jobs() {
         let data=b"{\"jobID\":\"lint\",\"job\":\"lint\",\"matrix\":{},\"jobResult\":\"success\"}\n{\"jobID\":\"mac\",\"job\":\"mac\",\"matrix\":{},\"msg\":\"Skipping unsupported platform macos-latest\"}\n";

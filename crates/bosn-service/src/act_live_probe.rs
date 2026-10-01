@@ -5,7 +5,8 @@
 use super::*;
 use crate::act_archive::ActArchiveBlob;
 use crate::act_engine::{
-    ActEngineLimits, create_owned_engine, observe_engine, observe_engine_image, remove_owned_engine,
+    ActEngineLimits, VerifiedEngineManifest, create_owned_engine_from_manifest, observe_engine,
+    observe_engine_image_from_manifest, remove_owned_engine,
 };
 use crate::act_image::{ActBaseLayer, ActImagePackage, package_act_image};
 use crate::act_registry::{ActRegistryCommand, ActRegistryReply};
@@ -260,6 +261,7 @@ async fn cleanup(
     engine: &DockerEngine,
     intent: &ActEngineIntent,
     owner: &str,
+    proof: &VerifiedEngineManifest,
 ) -> std::io::Result<()> {
     let Some(current) = record(registry, &intent.run_id).await? else {
         return Ok(());
@@ -276,8 +278,8 @@ async fn cleanup(
         ],
     )
     .await?;
-    let identity =
-        observe_engine_image(&image, intent, ENGINE_CONFIG).map_err(|e| fail(e.to_string()))?;
+    let identity = observe_engine_image_from_manifest(&image, intent, proof)
+        .map_err(|e| fail(e.to_string()))?;
     let observed = if let Some(id) = &current.engine_id {
         let raw = docker(
             engine,
@@ -494,12 +496,13 @@ async fn watch_cancellation(
 async fn probe_case(
     registry: &RegistryActor,
     engine: &DockerEngine,
-    package: &ActImagePackage,
+    images: (&ActImagePackage, &VerifiedEngineManifest),
     blobs: &[ActArchiveBlob<'_>],
     root: &Path,
     owner: &str,
     cancel_case: bool,
 ) -> std::io::Result<Value> {
+    let (package, engine_manifest) = images;
     let (source, snapshot, payload, sha) = source_fixture(root, cancel_case)?;
     let run = random_uuid().await?;
     let intent = ActEngineIntent {
@@ -521,12 +524,12 @@ async fn probe_case(
     let cancellation = CancellationSource::new();
     let mut observer = ProbeObserver::new();
     let result = match async_engine::timeout(Duration::from_secs(120), async {
-        let observed = create_owned_engine(
+        let observed = create_owned_engine_from_manifest(
             registry,
             engine,
             intent.clone(),
             owner,
-            ENGINE_CONFIG,
+            engine_manifest,
             limits(),
             at(),
         )
@@ -550,7 +553,7 @@ async fn probe_case(
             ],
         )
         .await?;
-        let image = observe_engine_image(&host_image, &intent, ENGINE_CONFIG)
+        let image = observe_engine_image_from_manifest(&host_image, &intent, engine_manifest)
             .map_err(|e| fail(e.to_string()))?;
         let confirmed = observe_engine(&raw, &intent, owner, &image, limits())
             .map_err(|e| fail(e.to_string()))?;
@@ -630,7 +633,7 @@ async fn probe_case(
             json!({"cancel_case":cancel_case,"nested_cancellation_observed":nested_cancelled,"report":report}),
         )
     })();
-    let cleanup_result = cleanup(registry, engine, &intent, owner).await;
+    let cleanup_result = cleanup(registry, engine, &intent, owner, engine_manifest).await;
     let summary = match (&result, &cleanup_result) {
         (Ok(value), Ok(())) => value.clone(),
         _ => {
@@ -660,6 +663,7 @@ fn live_pinned_act_success_and_cancellation_remove_private_nested_engines() {
         let config = bounded_file(&input.join("runner-config.json"), 1<<20).unwrap();
         let binary = bounded_file(&input.join("act"), 64<<20).unwrap();
         let package = package_act_image(&manifest, RUNNER, &config, RUNNER_CONFIG, &binary, ACT_BINARY, "0.2.88").unwrap();
+        let engine_manifest = VerifiedEngineManifest::verify(&bounded_file(&input.join("engine-manifest.json"),1<<20).unwrap(), ENGINE, &bounded_file(&input.join("engine-config.json"),1<<20).unwrap(), ENGINE_CONFIG).unwrap();
         let owned_blobs = read_layers(&input, &package.base_layers).unwrap();
         let blobs = package.base_layers.iter().zip(&owned_blobs).map(|(layer,bytes)| ActArchiveBlob { digest: &layer.digest, bytes }).collect::<Vec<_>>();
         let root = input.join(format!("probe-{}", random_uuid().await.unwrap())); private_dir(&root).unwrap(); private_dir(&root.join("evidence")).unwrap();
@@ -672,7 +676,7 @@ fn live_pinned_act_success_and_cancellation_remove_private_nested_engines() {
         let engine = DockerEngine::docker();
         let mut results = Vec::new();
         let mut error = None;
-        for cancel in [false,true] { match probe_case(&actor, &engine, &package, &blobs, &root, &owner, cancel).await { Ok(result) => results.push(result), Err(failure) => { error = Some(failure.to_string()); break; } } }
+        for cancel in [false,true] { match probe_case(&actor, &engine, (&package, &engine_manifest), &blobs, &root, &owner, cancel).await { Ok(result) => results.push(result), Err(failure) => { error = Some(failure.to_string()); break; } } }
         actor.stop().await; task.await.unwrap();
         retain(&root.join("probe-summary.json"), &serde_json::to_vec_pretty(&json!({"schema_version":1,"scope":"two real Linux shell probes; no public API, fleet graph or native parity proof","results":results,"error":error})).unwrap()).unwrap();
         eprintln!("retained real Act probe evidence: {}", root.display());

@@ -19,6 +19,117 @@ pub struct VerifiedEngineImage {
     docker_image_id: String,
 }
 
+/// Hash-verified publisher manifest/config bytes; never derived from Docker annotations.
+#[derive(Clone, Debug)]
+pub struct VerifiedEngineManifest {
+    manifest_digest: String,
+    config_digest: String,
+    media_type: String,
+    manifest_size: u64,
+}
+impl VerifiedEngineManifest {
+    pub fn verify(
+        manifest: &[u8],
+        manifest_pin: &str,
+        config: &[u8],
+        config_pin: &str,
+    ) -> Result<Self, ActEngineError> {
+        let hash =
+            |bytes: &[u8]| format!("sha256:{}", kernal_api::hash::Sha256Hasher::digest(bytes));
+        if manifest.len() > 1 << 20
+            || config.len() > 1 << 20
+            || hash(manifest) != manifest_pin
+            || hash(config) != config_pin
+        {
+            return Err(ActEngineError(
+                "publisher manifest/config digest or bounds mismatch".into(),
+            ));
+        }
+        let m: Value =
+            serde_json::from_slice(manifest).map_err(|e| ActEngineError(e.to_string()))?;
+        let c: Value = serde_json::from_slice(config).map_err(|e| ActEngineError(e.to_string()))?;
+        let media = m["mediaType"].as_str().unwrap_or_default();
+        if m["schemaVersion"] != 2
+            || !matches!(
+                media,
+                "application/vnd.oci.image.manifest.v1+json"
+                    | "application/vnd.docker.distribution.manifest.v2+json"
+            )
+            || !matches!(
+                m["config"]["mediaType"].as_str(),
+                Some(
+                    "application/vnd.oci.image.config.v1+json"
+                        | "application/vnd.docker.container.image.v1+json"
+                )
+            )
+            || m["config"]["digest"] != config_pin
+            || m["config"]["size"].as_u64() != Some(config.len() as u64)
+            || c["os"] != "linux"
+            || c["architecture"] != "amd64"
+        {
+            return Err(ActEngineError(
+                "publisher manifest does not bind expected Linux engine config".into(),
+            ));
+        }
+        Ok(Self {
+            manifest_digest: manifest_pin.into(),
+            config_digest: config_pin.into(),
+            media_type: media.into(),
+            manifest_size: manifest.len() as u64,
+        })
+    }
+}
+pub fn observe_engine_image_from_manifest(
+    document: &[u8],
+    intent: &ActEngineIntent,
+    proof: &VerifiedEngineManifest,
+) -> Result<VerifiedEngineImage, ActEngineError> {
+    if proof.manifest_digest != intent.engine_image_digest {
+        return Err(ActEngineError(
+            "publisher manifest differs from immutable intent".into(),
+        ));
+    }
+    let value: Value =
+        serde_json::from_slice(document).map_err(|e| ActEngineError(e.to_string()))?;
+    let image = value
+        .as_array()
+        .filter(|v| v.len() == 1)
+        .and_then(|v| v.first())
+        .ok_or_else(|| ActEngineError("image inspect must contain exactly one image".into()))?;
+    let id = image["Id"]
+        .as_str()
+        .ok_or_else(|| ActEngineError("missing Docker image ID".into()))?;
+    let pin = format!("docker.io/library/docker@{}", proof.manifest_digest);
+    let short = format!("docker@{}", proof.manifest_digest);
+    if !image["RepoDigests"].as_array().is_some_and(|v| {
+        v.iter()
+            .any(|v| v.as_str() == Some(&pin) || v.as_str() == Some(&short))
+    }) {
+        return Err(ActEngineError(
+            "image lacks pinned repository digest".into(),
+        ));
+    }
+    let descriptor = &image["Descriptor"];
+    if descriptor.is_null() {
+        if id != proof.config_digest {
+            return Err(ActEngineError(
+                "classic image ID differs from verified config".into(),
+            ));
+        }
+    } else if descriptor["digest"] != proof.manifest_digest
+        || descriptor["mediaType"] != proof.media_type
+        || descriptor["size"].as_u64() != Some(proof.manifest_size)
+        || (id != proof.manifest_digest && id != proof.config_digest)
+    {
+        return Err(ActEngineError(
+            "Docker descriptor differs from verified publisher manifest".into(),
+        ));
+    }
+    Ok(VerifiedEngineImage {
+        manifest_digest: proof.manifest_digest.clone(),
+        docker_image_id: id.into(),
+    })
+}
 pub fn observe_engine_image(
     document: &[u8],
     intent: &ActEngineIntent,
@@ -233,6 +344,54 @@ pub async fn create_owned_engine(
     limits: ActEngineLimits,
     at: f64,
 ) -> Result<ActEngineObservation, ActEngineError> {
+    create_owned_engine_inner(
+        registry,
+        engine,
+        intent,
+        owner,
+        EngineImageProof::Legacy(expected_config_digest),
+        limits,
+        at,
+    )
+    .await
+}
+pub async fn create_owned_engine_from_manifest(
+    registry: &RegistryActor,
+    engine: &DockerEngine,
+    intent: ActEngineIntent,
+    owner: &str,
+    proof: &VerifiedEngineManifest,
+    limits: ActEngineLimits,
+    at: f64,
+) -> Result<ActEngineObservation, ActEngineError> {
+    create_owned_engine_inner(
+        registry,
+        engine,
+        intent,
+        owner,
+        EngineImageProof::Publisher(proof),
+        limits,
+        at,
+    )
+    .await
+}
+enum EngineImageProof<'a> {
+    Legacy(&'a str),
+    Publisher(&'a VerifiedEngineManifest),
+}
+async fn create_owned_engine_inner(
+    registry: &RegistryActor,
+    engine: &DockerEngine,
+    intent: ActEngineIntent,
+    owner: &str,
+    proof: EngineImageProof<'_>,
+    limits: ActEngineLimits,
+    at: f64,
+) -> Result<ActEngineObservation, ActEngineError> {
+    let expected_config_digest = match &proof {
+        EngineImageProof::Legacy(digest) => *digest,
+        EngineImageProof::Publisher(proof) => &proof.config_digest,
+    };
     let args = create_arguments(&intent, owner, limits)?;
     if !at.is_finite()
         || at < intent.created_at
@@ -257,7 +416,14 @@ pub async fn create_owned_engine(
         ],
     )
     .await?;
-    let image_identity = observe_engine_image(&image_document, &intent, expected_config_digest)?;
+    let image_identity = match proof {
+        EngineImageProof::Legacy(_) => {
+            observe_engine_image(&image_document, &intent, expected_config_digest)?
+        }
+        EngineImageProof::Publisher(proof) => {
+            observe_engine_image_from_manifest(&image_document, &intent, proof)?
+        }
+    };
     let created = docker_control(engine, args).await?;
     let id = std::str::from_utf8(&created)
         .map_err(|_| ActEngineError("Docker create returned non-UTF8 ID".into()))?
@@ -539,6 +705,65 @@ mod tests {
                 "--data-root=/var/lib/docker",
                 "--exec-root=/run/docker","--host=unix:///var/run/docker.sock"]},"HostConfig":{"Privileged":true,"Memory":l.memory_bytes,"MemorySwap":l.memory_bytes,"CpuPeriod":100000,"CpuQuota":l.nano_cpus/10_000,"ReadonlyRootfs":true,"PidMode":"","IpcMode":"private","CgroupnsMode":"private","PidsLimit":l.pids,"Binds":null,"PortBindings":{},"NetworkMode":"bridge","LogConfig":{"Type":"local","Config":{"max-size":"1m","max-file":"2"}},"Tmpfs":l.tmpfs()},"Mounts":[{"Type":"tmpfs","Destination":"/var/lib/docker"},{"Type":"tmpfs","Destination":"/run"},{"Type":"tmpfs","Destination":"/tmp"}]}])
     }
+    #[test]
+    fn real_descriptor_without_annotations_requires_publisher_config_proof() {
+        let config =
+            serde_json::to_vec(&serde_json::json!({"os":"linux","architecture":"amd64"})).unwrap();
+        let hash = |b: &[u8]| format!("sha256:{}", kernal_api::hash::Sha256Hasher::digest(b));
+        let config_pin = hash(&config);
+        let manifest = serde_json::to_vec(&serde_json::json!({"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":config_pin,"size":config.len()}})).unwrap();
+        let pin = hash(&manifest);
+        let mut i = intent();
+        i.engine_image_digest = pin.clone();
+        let image = serde_json::json!([{"Id":pin,"RepoDigests":[format!("docker.io/library/docker@{pin}")],"Descriptor":{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":pin,"size":manifest.len()}}]);
+        let document = serde_json::to_vec(&image).unwrap();
+        assert!(
+            observe_engine_image(&document, &i, &config_pin).is_err(),
+            "real shape reproduces legacy refusal"
+        );
+        let proof = VerifiedEngineManifest::verify(&manifest, &pin, &config, &config_pin).unwrap();
+        let verified = observe_engine_image_from_manifest(&document, &i, &proof).unwrap();
+        assert_eq!(verified.docker_image_id, pin);
+        let classic =
+            serde_json::json!([{"Id":config_pin,"RepoDigests":[format!("docker@{pin}")]}]);
+        assert!(
+            observe_engine_image_from_manifest(&serde_json::to_vec(&classic).unwrap(), &i, &proof)
+                .is_ok()
+        );
+        let mut foreign_intent = i.clone();
+        foreign_intent.engine_image_digest = format!("sha256:{}", "0".repeat(64));
+        assert!(observe_engine_image_from_manifest(&document, &foreign_intent, &proof).is_err());
+
+        for change in ["digest", "size", "mediaType", "Id", "RepoDigests"] {
+            let mut wrong = image.clone();
+            match change {
+                "size" => wrong[0]["Descriptor"][change] = serde_json::json!(0),
+                "Id" => wrong[0][change] = serde_json::json!(config_pin.replace('a', "b") + "0"),
+                "RepoDigests" => wrong[0][change] = serde_json::json!([]),
+                _ => wrong[0]["Descriptor"][change] = serde_json::json!("foreign"),
+            }
+            assert!(
+                observe_engine_image_from_manifest(
+                    &serde_json::to_vec(&wrong).unwrap(),
+                    &i,
+                    &proof
+                )
+                .is_err(),
+                "{change}"
+            );
+        }
+        for change in ["digest", "size", "mediaType"] {
+            let mut wrong = serde_json::from_slice::<Value>(&manifest).unwrap();
+            wrong["config"][change] = serde_json::json!("foreign");
+            let bytes = serde_json::to_vec(&wrong).unwrap();
+            assert!(
+                VerifiedEngineManifest::verify(&bytes, &hash(&bytes), &config, &config_pin)
+                    .is_err()
+            );
+        }
+        assert!(VerifiedEngineManifest::verify(&manifest, &pin, b"corrupt", &config_pin).is_err());
+        assert!(VerifiedEngineManifest::verify(b"corrupt", &pin, &config, &config_pin).is_err());
+    }
     fn classic_identity() -> VerifiedEngineImage {
         let i = intent();
         let config = format!("sha256:{}", "2".repeat(64));
@@ -793,7 +1018,15 @@ else: sys.exit(9)
                 } else {
                     let observed = created.unwrap();
                     let token = "12345678-1234-4234-8234-123456789abc";
-                    actor.act_registry(ActRegistryCommand::Claim { intent: intent(), observed: observed.clone(), token: token.into(), at: 2.0 }).await.unwrap();
+                    actor
+                        .act_registry(ActRegistryCommand::Claim {
+                            intent: intent(),
+                            observed: observed.clone(),
+                            token: token.into(),
+                            at: 2.0,
+                        })
+                        .await
+                        .unwrap();
                     actor
                         .act_registry(ActRegistryCommand::Execution {
                             run: intent().run_id,
