@@ -289,10 +289,12 @@ fn remove_one(
     let options = RunOptions::bounded(REMOVAL_DEADLINE, REMOVAL_OUTPUT_LIMIT);
     let argv: Vec<&str> = match class {
         bosn_core::UnmanagedClass::StoppedContainer => vec!["rm", id],
-        bosn_core::UnmanagedClass::DanglingImage
-        | bosn_core::UnmanagedClass::UnreferencedImage => vec!["rmi", id],
-        bosn_core::UnmanagedClass::AnonymousVolume
-        | bosn_core::UnmanagedClass::NamedVolume => vec!["volume", "rm", id],
+        bosn_core::UnmanagedClass::DanglingImage | bosn_core::UnmanagedClass::UnreferencedImage => {
+            vec!["rmi", id]
+        }
+        bosn_core::UnmanagedClass::AnonymousVolume | bosn_core::UnmanagedClass::NamedVolume => {
+            vec!["volume", "rm", id]
+        }
         // Build cache is never removable by identity, so it never reaches this call.
         bosn_core::UnmanagedClass::BuildCache => {
             return Err("build cache is not removable by identity".to_owned());
@@ -423,7 +425,9 @@ fn inspect_volumes(
         ));
     }
     let mut inspected = Vec::new();
-    for chunk in names.chunks(CENSUS_INSPECT_CHUNK).take(CENSUS_INSPECT_MAX / CENSUS_INSPECT_CHUNK)
+    for chunk in names
+        .chunks(CENSUS_INSPECT_CHUNK)
+        .take(CENSUS_INSPECT_MAX / CENSUS_INSPECT_CHUNK)
     {
         let text = match engine.inspect_volumes(chunk, options) {
             Ok(CensusRead::Document(text)) => text,
@@ -438,8 +442,9 @@ fn inspect_volumes(
         };
         match serde_json::from_str::<Vec<InspectedVolume>>(&text) {
             Ok(mut volumes) => inspected.append(&mut volumes),
-            Err(_) => unreadable
-                .push("docker volume inspect returned a document this build cannot read".to_owned()),
+            Err(_) => unreadable.push(
+                "docker volume inspect returned a document this build cannot read".to_owned(),
+            ),
         }
     }
     inspected
@@ -500,7 +505,11 @@ mod tests {
         };
         let lines = warning_lines(&warning);
         assert!(lines[0].contains("3 UNMANAGED DOCKER OBJECTS ARE RECLAIMABLE"));
-        assert!(lines.iter().any(|line| line.contains("bosn gc --unmanaged")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("bosn gc --unmanaged"))
+        );
         assert!(lines.iter().any(|line| line.contains("bosn scan --ack")));
         // The founding invariant: the way out is never `docker system prune`.
         assert!(!lines.iter().any(|line| line.contains("docker ")));
@@ -573,8 +582,11 @@ mod tests {
             kernal_api::platform::fs::TemporaryDirectory::new().expect("temporary directory");
         std::fs::write(directory.path().join(ACK_FILE), b"not json").expect("write");
         assert!(read_acknowledgement(directory.path()).is_none());
-        std::fs::write(directory.path().join(ACK_FILE), vec![b'x'; MAX_ACK_BYTES + 1])
-            .expect("write oversized");
+        std::fs::write(
+            directory.path().join(ACK_FILE),
+            vec![b'x'; MAX_ACK_BYTES + 1],
+        )
+        .expect("write oversized");
         assert!(read_acknowledgement(directory.path()).is_none());
     }
 
