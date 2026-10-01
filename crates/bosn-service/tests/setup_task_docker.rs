@@ -337,3 +337,69 @@ fn live_docker_setup_task_runs_only_the_declared_one_file_task() {
         "second daemon failed"
     );
 }
+
+/// Run with:
+/// `soldr cargo test -j1 -p bosn-service --test setup_task_docker --locked -- --ignored --exact live_docker_setup_task_keeps_the_declared_path_through_the_login_profile`
+///
+/// Alpine's `/etc/profile`, like Debian's, assigns `PATH` outright, so a bare
+/// `sh -lc` dropped every container `PATH` entry (an image's `ENV PATH`, or
+/// one declared in `[app.environment]`). The declared entries must lead the
+/// task's `PATH` after the login profile ran.
+#[test]
+#[ignore = "requires a local Docker daemon and the pinned Alpine image"]
+fn live_docker_setup_task_keeps_the_declared_path_through_the_login_profile() {
+    let engine = DockerEngine::docker();
+    require_pinned_alpine(&engine);
+    let root = tempfile::tempdir().expect("temporary test root");
+    let state = root.path().join("state");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("create workspace");
+    let config = root.path().join("setup.toml");
+    let declared =
+        "/opt/bosn-path-marker/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    std::fs::write(
+        &config,
+        format!(
+            "version = 1\n\
+             [app]\n\
+             image = '{PINNED_ALPINE}'\n\
+             workdir = '.'\n\
+             [app.environment]\n\
+             PATH = '{declared}'\n\
+             [[app.mount]]\n\
+             source = '.'\n\
+             target = '/workspace'\n\
+             readonly = false\n\
+             [task.path]\n\
+             command = '''printf '%s\\n' \"$PATH\" > task-path.txt'''\n\
+             workdir = '.'\n"
+        ),
+    )
+    .expect("write setup document");
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("construct kernal-api runtime");
+    let mut daemon = DaemonChild::start(&state);
+    let client = wait_for_client(&runtime, &mut daemon, &state);
+    let job = runtime
+        .run(client.submit_setup_task(SetupTaskJobRequest {
+            workspace: workspace.clone(),
+            config: config.to_string_lossy().into_owned(),
+            policy: SetupPreparePolicy::Refresh,
+            task_name: "path".into(),
+            deadline: JOB_DEADLINE,
+            output_limit: OUTPUT_LIMIT,
+        }))
+        .expect("submit declared PATH task");
+    wait_for_success_and_logs(&runtime, &client, job);
+    let path =
+        std::fs::read_to_string(workspace.join("task-path.txt")).expect("read the task's PATH");
+    assert!(
+        path.trim().starts_with(&format!("{declared}:")),
+        "the login profile dropped the container's declared PATH: {path:?}"
+    );
+    runtime.run(client.shutdown()).expect("shut down daemon");
+    assert!(daemon.wait_for_exit().success(), "daemon failed");
+}

@@ -1645,20 +1645,40 @@ fn run_daemon(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
     };
     match invocation {
         DaemonInvocation::Serve { state_dir } => {
-            if let Err(error) = runtime.run(bosn_service::Service::new(state_dir).serve()) {
+            if let Err(error) = runtime.run(
+                bosn_service::Service::new(state_dir)
+                    .with_release_version(env!("CARGO_PKG_VERSION"))
+                    .serve(),
+            ) {
                 eprintln!("bosn daemon serve: {error}");
                 std::process::exit(1);
             }
             println!("daemon stopped");
         }
         DaemonInvocation::Status { state_dir, json } => {
-            let status = match Client::for_state(&state_dir)
-                .and_then(|client| runtime.run(client.status()))
-            {
-                Ok(status) => status,
-                Err(_) => daemon_failure("status", json),
+            let Ok(client) = Client::for_state(&state_dir) else {
+                daemon_failure("status", json)
             };
-            print_daemon_status(&status, json);
+            // Ask for the version first: it is the one request every daemon
+            // release answers, so a mismatch is reported, not a bare failure.
+            let daemon_version = runtime.run(client.daemon_version()).ok();
+            let status = match runtime.run(client.status()) {
+                Ok(status) => status,
+                Err(_) => {
+                    if let Some(mismatch) = daemon_version.as_deref().and_then(|version| {
+                        bosn_service::daemon_version_mismatch(
+                            &state_dir,
+                            env!("CARGO_PKG_VERSION"),
+                            version,
+                        )
+                    }) && !json
+                    {
+                        eprintln!("bosn daemon status: {mismatch}");
+                    }
+                    daemon_failure("status", json)
+                }
+            };
+            print_daemon_status(&status, daemon_version.as_deref(), &state_dir, json);
         }
         DaemonInvocation::Stop { state_dir, json } => {
             if Client::for_state(&state_dir)
@@ -1744,7 +1764,16 @@ fn daemon_failure(action: &str, json: bool) -> ! {
     std::process::exit(1)
 }
 
-fn print_daemon_status(status: &bosn_service::Status, json: bool) {
+fn print_daemon_status(
+    status: &bosn_service::Status,
+    daemon_version: Option<&str>,
+    state_dir: &Path,
+    json: bool,
+) {
+    let client_version = env!("CARGO_PKG_VERSION");
+    let mismatch = daemon_version.and_then(|version| {
+        bosn_service::daemon_version_mismatch(state_dir, client_version, version)
+    });
     if json {
         println!(
             "{}",
@@ -1757,11 +1786,21 @@ fn print_daemon_status(status: &bosn_service::Status, json: bool) {
                 "leases": status.leases,
                 "sessions": status.sessions,
                 "reconciliation_required": status.reconciliation_required,
+                "daemon_version": daemon_version.filter(|version| !version.is_empty()),
+                "client_version": client_version,
+                "version_mismatch": mismatch,
             })
         );
     } else {
         println!("daemon status");
         println!("daemon: online");
+        println!(
+            "daemon_version: {}",
+            daemon_version
+                .filter(|version| !version.is_empty())
+                .unwrap_or("unknown")
+        );
+        println!("client_version: {client_version}");
         println!("registry_id: {}", status.registry_id);
         println!("schema_version: {}", status.schema_version);
         println!("resources: {}", status.resources);
@@ -1771,6 +1810,9 @@ fn print_daemon_status(status: &bosn_service::Status, json: bool) {
             "reconciliation_required: {}",
             status.reconciliation_required
         );
+        if let Some(mismatch) = mismatch {
+            eprintln!("bosn daemon status: {mismatch}");
+        }
     }
 }
 

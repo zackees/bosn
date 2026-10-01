@@ -60,7 +60,7 @@ exactly one service with all of the following properties:
 | explicit `environment` mapping/list values that satisfy setup's identifier, size, and NUL rules | the same ordered-map environment |
 | bind mounts with safe relative sources and normalized absolute targets | the same `WorkspaceMount` values |
 | `working_dir` covered by a bind target | workspace-relative setup workdir which resolves back to that exact target |
-| no `command`, or `command: [sh, -lc, <nonempty bounded script>]` | no setup command, or the same script used by setup's fixed `sh -lc` command shape |
+| no `command`, or `command: [sh, -lc, <nonempty bounded script>]` | no setup command, or the same script used by setup's fixed login-shell (`sh -lc`) command shape, which keeps the image's `ENV PATH` (see rust-manifest-runtime.md) |
 
 The adapter neither chooses a workspace nor verifies that bind sources exist. It only derives a
 workspace-relative workdir lexically from an already-declared bind mount. This keeps path

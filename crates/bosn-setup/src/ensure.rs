@@ -227,7 +227,7 @@ impl SetupEnsureCommand {
                 if macos_guest.is_none()
                     && let Some(command) = command
                 {
-                    args.extend(["sh".into(), "-lc".into(), command.clone()]);
+                    args.extend(crate::shell::login_shell_args(command));
                 }
                 args
             }

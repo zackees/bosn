@@ -344,8 +344,8 @@ fn execute(arguments: RunArguments) -> Result<i32, String> {
 
 /// Start `bosn daemon serve` for this state directory when none answers.
 fn ensure_daemon(runtime: &Runtime, client: &Client, state_dir: &Path) -> Result<(), String> {
-    if runtime.run(client.ping()).is_ok() {
-        return Ok(());
+    if let Ok(version) = runtime.run(client.daemon_version()) {
+        return matching_daemon(state_dir, &version);
     }
     let executable = std::env::current_exe()
         .map_err(|_| "cannot locate the bosn executable to start its daemon".to_owned())?;
@@ -364,7 +364,9 @@ fn ensure_daemon(runtime: &Runtime, client: &Client, state_dir: &Path) -> Result
         .map_err(|error| format!("cannot start the bosn daemon: {error}"))?;
     let started = Instant::now();
     while started.elapsed() < DAEMON_START_WAIT {
-        if runtime.run(client.ping()).is_ok() {
+        if let Ok(version) = runtime.run(client.daemon_version()) {
+            // Another session may have won the start race with its own binary.
+            matching_daemon(state_dir, &version)?;
             eprintln!(
                 "bosn run: started the bosn daemon for {}",
                 state_dir.display()
@@ -377,6 +379,20 @@ fn ensure_daemon(runtime: &Runtime, client: &Client, state_dir: &Path) -> Result
         std::thread::sleep(POLL_INTERVAL);
     }
     Err(daemon_start_failure(state_dir))
+}
+
+/// Refuse a daemon from another release rather than sending it requests it may
+/// misread. It is never restarted here: it may be running another session's
+/// jobs, so stopping it is the user's explicit choice.
+fn matching_daemon(state_dir: &Path, daemon_version: &str) -> Result<(), String> {
+    match bosn_service::daemon_version_mismatch(
+        state_dir,
+        env!("CARGO_PKG_VERSION"),
+        daemon_version,
+    ) {
+        Some(mismatch) => Err(mismatch),
+        None => Ok(()),
+    }
 }
 
 /// Explain a daemon that would not start, including the one cutover trap: a
