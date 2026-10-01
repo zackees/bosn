@@ -587,10 +587,10 @@ fn run_scan(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
         eprintln!("scan: partial: {detail}");
     }
     // A partial census is never a clean machine, so it warns regardless of size.
-    if let Some(warning) = warning {
-        if !acknowledged {
-            print_warning(&warning);
-        }
+    if let Some(warning) = warning
+        && !acknowledged
+    {
+        print_warning(&warning);
     }
     let _ = our_registry;
 }
@@ -1343,13 +1343,11 @@ fn run_registry_reconcile_v4(mut arguments: impl Iterator<Item = std::ffi::OsStr
     let Some(state_dir) = state_dir else {
         registry_reconcile_failure(json_output);
     };
-    let is_apply = verb.as_os_str() == std::ffi::OsStr::new("apply");
-    if !(verb.as_os_str() == std::ffi::OsStr::new("preview") || is_apply)
-        || (is_apply && (!apply || !yes))
-        || (!is_apply && (apply || yes))
-    {
-        registry_reconcile_failure(json_output);
-    }
+    let is_apply = match verb.to_str() {
+        Some("preview") if !apply && !yes => false,
+        Some("apply") if apply && yes => true,
+        _ => registry_reconcile_failure(json_output),
+    };
     let executor = OfflinePythonV4Docker {
         engine: DockerEngine::docker(),
     };
