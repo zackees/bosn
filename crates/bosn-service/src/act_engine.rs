@@ -1,6 +1,6 @@
 //! Daemon-only Docker observations for the private Act engine boundary.
-//! An OCI manifest digest names content; Docker's `Image` field names its
-//! config blob. Both must be checked before trusting ownership labels.
+//! OCI manifest/config identities and Docker's store-dependent image ID are
+//! observed separately before trusting container ownership labels.
 
 use crate::{
     RegistryActor,
@@ -10,6 +10,68 @@ use bosn_engine::{DockerEngine, RunOptions};
 use bosn_registry::act::{ActEngineIntent, ActEngineObservation};
 use serde_json::Value;
 use std::{collections::BTreeMap, fmt};
+
+/// Produced only by a successful image inspection bound to the pinned manifest.
+/// Docker classic uses the config digest as its ID; containerd may use manifest.
+#[derive(Clone, Debug)]
+pub struct VerifiedEngineImage {
+    manifest_digest: String,
+    docker_image_id: String,
+}
+
+pub fn observe_engine_image(
+    document: &[u8],
+    intent: &ActEngineIntent,
+    expected_config_digest: &str,
+) -> Result<VerifiedEngineImage, ActEngineError> {
+    if !expected_config_digest
+        .strip_prefix("sha256:")
+        .is_some_and(|v| hexadecimal(v, 64))
+    {
+        return Err(ActEngineError("invalid pinned engine config digest".into()));
+    }
+    let value: Value =
+        serde_json::from_slice(document).map_err(|e| ActEngineError(e.to_string()))?;
+    let image = value
+        .as_array()
+        .filter(|v| v.len() == 1)
+        .and_then(|v| v.first())
+        .ok_or_else(|| ActEngineError("image inspect must contain exactly one image".into()))?;
+    let id = image["Id"]
+        .as_str()
+        .filter(|v| {
+            v.strip_prefix("sha256:")
+                .is_some_and(|v| hexadecimal(v, 64))
+        })
+        .ok_or_else(|| ActEngineError("missing Docker image ID".into()))?;
+    let descriptor = &image["Descriptor"];
+    if !descriptor.is_null() {
+        if descriptor["digest"].as_str() != Some(intent.engine_image_digest.as_str())
+            || descriptor["annotations"]["config.digest"].as_str() != Some(expected_config_digest)
+            || (id != expected_config_digest && id != intent.engine_image_digest)
+        {
+            return Err(ActEngineError(
+                "image descriptor does not bind pinned manifest and config".into(),
+            ));
+        }
+    } else {
+        let pin = format!("docker.io/library/docker@{}", intent.engine_image_digest);
+        let short_pin = format!("docker@{}", intent.engine_image_digest);
+        let bound = image["RepoDigests"].as_array().is_some_and(|v| {
+            v.iter()
+                .any(|v| v.as_str() == Some(pin.as_str()) || v.as_str() == Some(short_pin.as_str()))
+        });
+        if id != expected_config_digest || !bound {
+            return Err(ActEngineError(
+                "classic image store does not bind pinned manifest and config".into(),
+            ));
+        }
+    }
+    Ok(VerifiedEngineImage {
+        manifest_digest: intent.engine_image_digest.clone(),
+        docker_image_id: id.into(),
+    })
+}
 
 /// Limits apply to the entire isolated engine and all its descendants.
 /// Storage is private tmpfs; the engine's writable root is disabled.
@@ -177,6 +239,16 @@ pub async fn create_owned_engine(
         .act_registry(ActRegistryCommand::Begin(intent.clone()))
         .await
         .map_err(|e| ActEngineError(e.to_string()))?;
+    let image_document = docker_control(
+        engine,
+        vec![
+            "image".into(),
+            "inspect".into(),
+            format!("docker.io/library/docker@{}", intent.engine_image_digest),
+        ],
+    )
+    .await?;
+    let image_identity = observe_engine_image(&image_document, &intent, expected_config_digest)?;
     let created = docker_control(engine, args).await?;
     let id = std::str::from_utf8(&created)
         .map_err(|_| ActEngineError("Docker create returned non-UTF8 ID".into()))?
@@ -191,7 +263,7 @@ pub async fn create_owned_engine(
         vec!["container".into(), "inspect".into(), id.into()],
     )
     .await?;
-    let observed = observe_engine(&document, &intent, owner, expected_config_digest, limits)?;
+    let observed = observe_engine(&document, &intent, owner, &image_identity, limits)?;
     if observed.engine_id != id {
         return Err(ActEngineError("Docker inspect changed created ID".into()));
     }
@@ -300,16 +372,13 @@ pub fn observe_engine(
     document: &[u8],
     intent: &ActEngineIntent,
     owner: &str,
-    expected_config_digest: &str,
+    image_identity: &VerifiedEngineImage,
     limits: ActEngineLimits,
 ) -> Result<ActEngineObservation, ActEngineError> {
     limits.validate()?;
-    if !expected_config_digest
-        .strip_prefix("sha256:")
-        .is_some_and(|v| hexadecimal(v, 64))
-    {
+    if image_identity.manifest_digest != intent.engine_image_digest {
         return Err(ActEngineError(
-            "invalid verified engine config digest".into(),
+            "verified image belongs to another pinned manifest".into(),
         ));
     }
     let required = intent
@@ -340,7 +409,7 @@ pub fn observe_engine(
         .ok_or_else(|| ActEngineError("missing environment observation".into()))?;
     let expected_tmpfs = limits.tmpfs();
     if engine["Name"].as_str() != Some(format!("/{}", intent.engine_name()).as_str())
-        || engine["Image"].as_str() != Some(expected_config_digest)
+        || engine["Image"].as_str() != Some(image_identity.docker_image_id.as_str())
         || engine["Config"]["Image"].as_str()
             != Some(format!("docker.io/library/docker@{}", intent.engine_image_digest).as_str())
         || required.iter().any(|(k, v)| labels.get(k) != Some(v))
@@ -442,6 +511,37 @@ mod tests {
         let l = limits();
         json!([{"Id":"1".repeat(64),"Name":format!("/{}",i.engine_name()),"Image":format!("sha256:{}","2".repeat(64)),"Config":{"Image":format!("docker.io/library/docker@{}",i.engine_image_digest),"Labels":i.required_labels(OWNER).unwrap(),"Env":["DOCKER_TLS_CERTDIR="],"Volumes":{"/var/lib/docker":{}},"Healthcheck":{"Test":["NONE"]},"Cmd":["dockerd","--storage-driver=vfs","--host=unix:///var/run/docker.sock"]},"HostConfig":{"Privileged":true,"Memory":l.memory_bytes,"MemorySwap":l.memory_bytes,"CpuPeriod":100000,"CpuQuota":l.nano_cpus/10_000,"ReadonlyRootfs":true,"PidMode":"","IpcMode":"private","CgroupnsMode":"private","PidsLimit":l.pids,"Binds":null,"PortBindings":{},"NetworkMode":"bridge","LogConfig":{"Type":"local","Config":{"max-size":"1m","max-file":"2"}},"Tmpfs":l.tmpfs()},"Mounts":[{"Type":"tmpfs","Destination":"/var/lib/docker"},{"Type":"tmpfs","Destination":"/run"},{"Type":"tmpfs","Destination":"/tmp"}]}])
     }
+    fn classic_identity() -> VerifiedEngineImage {
+        let i = intent();
+        let config = format!("sha256:{}", "2".repeat(64));
+        let image =
+            json!([{"Id":config,"RepoDigests":[format!("docker@{}",i.engine_image_digest)]}]);
+        observe_engine_image(&serde_json::to_vec(&image).unwrap(), &i, &config).unwrap()
+    }
+    #[test]
+    fn containerd_manifest_image_id_is_bound_to_verified_config() {
+        let i = intent();
+        let config = format!("sha256:{}", "2".repeat(64));
+        let image = json!([{"Id":i.engine_image_digest,"Descriptor":{"digest":i.engine_image_digest,"annotations":{"config.digest":config}}}]);
+        let identity =
+            observe_engine_image(&serde_json::to_vec(&image).unwrap(), &i, &config).unwrap();
+        let mut container = document();
+        container[0]["Image"] = json!(i.engine_image_digest);
+        assert!(
+            observe_engine(
+                &serde_json::to_vec(&container).unwrap(),
+                &i,
+                OWNER,
+                &identity,
+                limits()
+            )
+            .is_ok()
+        );
+        let mut wrong = image.clone();
+        wrong[0]["Descriptor"]["annotations"]["config.digest"] =
+            json!(format!("sha256:{}", "9".repeat(64)));
+        assert!(observe_engine_image(&serde_json::to_vec(&wrong).unwrap(), &i, &config).is_err());
+    }
     #[test]
     fn verifies_real_config_identity_and_complete_private_boundary() {
         let i = intent();
@@ -450,7 +550,7 @@ mod tests {
             &serde_json::to_vec(&d).unwrap(),
             &i,
             OWNER,
-            &format!("sha256:{}", "2".repeat(64)),
+            &classic_identity(),
             limits(),
         )
         .unwrap();
@@ -461,7 +561,10 @@ mod tests {
                 &serde_json::to_vec(&d).unwrap(),
                 &i,
                 OWNER,
-                &i.engine_image_digest,
+                &VerifiedEngineImage {
+                    manifest_digest: i.engine_image_digest.clone(),
+                    docker_image_id: i.engine_image_digest.clone()
+                },
                 limits()
             )
             .is_err()
@@ -494,7 +597,7 @@ mod tests {
                     &serde_json::to_vec(&d).unwrap(),
                     &intent(),
                     OWNER,
-                    &format!("sha256:{}", "2".repeat(64)),
+                    &classic_identity(),
                     limits()
                 )
                 .is_err(),
@@ -542,7 +645,9 @@ db, observation, mode, log = sys.argv[1:5]
 args = sys.argv[5:]
 with pathlib.Path(log).open('a') as out: out.write(json.dumps(args)+'\n')
 record=json.loads(sqlite3.connect('file:'+db+'?mode=ro',uri=True).execute("SELECT detail FROM events WHERE kind LIKE 'act.engine.v1:%' ORDER BY id DESC LIMIT 1").fetchone()[0])
-if args[0]=='create':
+if args[:2]==['image','inspect']:
+ print(json.dumps([{'Id':'sha256:'+'2'*64,'RepoDigests':['docker@sha256:'+'e'*64]}]))
+elif args[0]=='create':
  assert record['state']=='pending' and record['engine_id'] is None
  print('1'*64)
 elif args[:2]==['container','inspect']:
@@ -654,7 +759,7 @@ else: sys.exit(9)
                 }
             }
             if mode == "success" {
-                assert_eq!(commands.lines().count(), 6);
+                assert_eq!(commands.lines().count(), 7);
             }
         }
     }
