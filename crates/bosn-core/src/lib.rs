@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 
+pub mod act;
 pub mod compose;
 pub mod config;
 pub mod manifest;
