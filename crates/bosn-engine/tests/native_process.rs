@@ -229,6 +229,46 @@ fn slow_output_consumer_fails_without_blocking_and_reaps_the_client() {
 }
 
 #[test]
+fn output_burst_waits_for_a_live_consumer_instead_of_reaping() {
+    // zackees/ci.yml#166: a full queue during a warning burst reaped a healthy
+    // `soldr ci-test`. A consumer that is slower than the burst but alive must
+    // receive every byte and see the client's ordinary exit.
+    let engine = helper(&["--exact-helper", "burst"]);
+    let (sender, mut receiver) = kernal_api::async_engine::channel(1);
+    let (result, received) = runtime().run(async {
+        kernal_api::async_engine::join(
+            async {
+                let result = engine
+                    .stream(
+                        RunOptions::streaming(Duration::from_secs(30), 1024 * 1024),
+                        None,
+                        &sender,
+                    )
+                    .await;
+                drop(sender);
+                result
+            },
+            async move {
+                let mut bytes = 0usize;
+                while let Some(event) = receiver.recv().await {
+                    if let EngineEvent::Stdout(chunk) = event {
+                        bytes += chunk.len();
+                    }
+                    kernal_api::async_engine::sleep(Duration::from_millis(1)).await;
+                }
+                bytes
+            },
+        )
+        .await
+    });
+    let result = result.expect("a slow but live consumer must not reap the client");
+    assert_eq!(result.exit_code, 0);
+    let expected = 4_000 * "warning: duplicate compiler identity executed 2 times\n".len();
+    assert_eq!(result.stdout.len(), expected);
+    assert_eq!(received, expected);
+}
+
+#[test]
 fn closed_output_consumer_reaps_the_client() {
     let engine = helper(&["--exact-helper", "stream"]);
     let (sender, receiver) = events();
