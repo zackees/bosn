@@ -94,6 +94,20 @@ Cancellation, deadline, and transport uncertainty retain a durable
 execution-session row and `manifest.app-task.uncertain` event so GC and
 recovery protect that container.
 
+**Login shell and the image's `ENV PATH`.** Every declared command (a setup
+task's `docker run`, the long-running app command, and each app task's
+`docker container exec`) runs in a login shell, so `/etc/profile`,
+`/etc/profile.d/*`, and `~/.profile` apply. Debian- and Alpine-based images'
+`/etc/profile` *assigns* `PATH`, which would drop every `ENV PATH` entry the
+image declares (`/usr/local/cargo/bin` in `rust:*`, `/opt/<tool>/bin`). Bosn
+therefore runs `sh -c LAUNCHER sh SCRIPT`: the non-login launcher records the
+container's pre-profile `PATH` in `BOSN_IMAGE_PATH` and `exec`s
+`sh -lc SCRIPT`, whose first line, after the profile ran, sets
+`PATH="$BOSN_IMAGE_PATH:$PATH"` and unsets the carrier. The image's entries
+lead, the profile's follow, and the declared command text is unchanged. An
+image no longer needs a `/etc/profile.d` shim to keep its `ENV PATH`
+(`crates/bosn-setup/src/shell.rs`).
+
 For an accepted macOS guest, the same operation first proves the dockurr
 container exact/running, then performs a bounded SSH `true` readiness probe
 and runs only the re-derived `[task.NAME].cmd` over SSH. The SSH adapter fixes

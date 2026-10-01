@@ -42,8 +42,8 @@ pub struct SetupApp {
     /// path and is materialized by the apply layer beneath the workspace mount.
     pub workdir: Option<String>,
     /// Optional declared long-running application command.  When present, the
-    /// setup ensure primitive runs it as `sh -lc` inside the managed app
-    /// container.  This remains document data, never a caller-supplied argv.
+    /// setup ensure primitive runs it in a login shell (`sh -lc`, keeping the
+    /// image's `ENV PATH`) inside the managed app container.  This remains document data, never a caller-supplied argv.
     pub command: Option<String>,
     pub mounts: Vec<WorkspaceMount>,
 }
