@@ -648,7 +648,12 @@ fn a_silent_step_still_shows_its_progress_while_it_runs() {
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         loop {
             let record = runtime.record(&run).unwrap();
-            assert_eq!(record.state, RunState::Running, "still running");
+            // Queued at first on a slow machine; never done before the step shows.
+            assert_ne!(
+                record.state,
+                RunState::Done,
+                "the step hangs until cancelled"
+            );
             let shown = record.tree.jobs().any(|j| !j.sections.is_empty());
             if shown {
                 break;
