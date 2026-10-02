@@ -115,8 +115,7 @@ def test_native_backend_and_compiler_fixtures_have_provisioned_tools() -> None:
         consumers = [
             index
             for index, step in enumerate(steps)
-            if "soldr cargo" in step.get("run", "")
-            or "uv build --wheel" in step.get("run", "")
+            if "soldr cargo" in step.get("run", "") or "uv build --wheel" in step.get("run", "")
         ]
         assert consumers and max(soldr, uv) < min(consumers)
         assert steps[soldr]["with"]["version"] == "0.9.27"
