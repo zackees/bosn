@@ -160,6 +160,7 @@ dependencies = [
  "kernal-api",
  "pyo3",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
