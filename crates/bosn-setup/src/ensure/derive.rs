@@ -38,23 +38,79 @@ impl DerivedEnsure {
 pub(crate) fn derive_command(
     request: &SetupEnsureRequest<'_>,
 ) -> Result<DerivedEnsure, SetupEnsureError> {
-    validate_plan_shape(request.plan)?;
-    let workspace_root = canonical_workspace(&request.workspace_root)?;
-    if workspace_root != request.plan.workspace_root {
+    derive_creation(
+        request.plan,
+        &request.workspace_root,
+        request.prepared_image,
+    )
+}
+
+/// The sole container identity derivation shared by ensure, adoption and task execution.
+pub fn setup_container_name(
+    plan: &SetupPlan,
+    workspace: &Path,
+    image: &PreparedImage,
+) -> Result<String, SetupEnsureError> {
+    Ok(derive_creation(plan, workspace, image)?.container_name)
+}
+
+/// Pure verification for trusted engine adapters. These supplied observations
+/// are data, not authentication; public clients cannot confer engine authority.
+pub fn verify_setup_observation(
+    plan: &SetupPlan,
+    image: &PreparedImage,
+    observed: &SetupEnsureObservedContainer,
+    image_configuration: &serde_json::Value,
+    volume_observations: &BTreeMap<String, serde_json::Value>,
+) -> Result<(), SetupEnsureError> {
+    let expected = derive_creation(plan, &plan.workspace_root, image)?;
+    validate_observed(observed, &expected)?;
+    verify_actual_configuration(observed, &expected, image_configuration)?;
+    if volume_observations.len() != expected.volumes.len() {
+        return Err(SetupEnsureError::OwnershipMismatch);
+    }
+    for volume in &expected.volumes {
+        let receipt = volume_observations
+            .get(&volume.name)
+            .ok_or(SetupEnsureError::OwnershipMismatch)?;
+        verify_volume_observation(
+            volume,
+            receipt,
+            Some(container_volume_source(observed, volume)?),
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn derive_creation(
+    plan: &SetupPlan,
+    workspace: &Path,
+    image: &PreparedImage,
+) -> Result<DerivedEnsure, SetupEnsureError> {
+    validate_plan_shape(plan)?;
+    let workspace_root = canonical_workspace(workspace)?;
+    if workspace_root.to_str().is_none() {
+        return Err(SetupEnsureError::InvalidRequest("workspace is not UTF-8"));
+    }
+    if workspace_root != plan.workspace_root {
         return Err(SetupEnsureError::InvalidRequest(
             "workspace is not the plan's canonical workspace root",
         ));
     }
-    validate_prepared_image(request.plan, request.prepared_image)?;
-    let mounts = derive_mounts(&workspace_root, request.plan)?;
-    let workdir = request
-        .plan
+    if plan.app.mounts.len() > 128 || plan.named_volumes.len() > 128 || plan.tmpfs.len() > 128 {
+        return Err(SetupEnsureError::InvalidRequest(
+            "creation mount inventory exceeds 128 entries per kind",
+        ));
+    }
+    validate_prepared_image(plan, image)?;
+    let mounts = derive_mounts(&workspace_root, plan)?;
+    let workdir = plan
         .app
         .workdir
         .as_deref()
-        .map(|value| resolve_workdir(value, &request.plan.app.mounts, &workspace_root))
+        .map(|value| resolve_workdir(value, &plan.app.mounts, &workspace_root))
         .transpose()?;
-    let command = request.plan.app.command.clone();
+    let command = plan.app.command.clone();
     if command
         .as_deref()
         .is_some_and(|value| value.is_empty() || value.len() > 16 * 1024 || value.contains('\0'))
@@ -63,19 +119,9 @@ pub(crate) fn derive_command(
             "declared app command is invalid",
         ));
     }
-    let container_name = format!("bosn-setup-{}", request.plan.content_sha256);
-    let labels = BTreeMap::from([
-        (LABEL_MANAGED.into(), MANAGED_VALUE.into()),
-        (
-            LABEL_CONTENT_SHA256.into(),
-            request.plan.content_sha256.clone(),
-        ),
-        (LABEL_CONTAINER_NAME.into(), container_name.clone()),
-    ]);
-    let volumes = derive_volumes(request.plan)?;
-    let tmpfs = derive_tmpfs(request.plan)?;
-    let macos_guest = request
-        .plan
+    let volumes = derive_volumes(plan)?;
+    let tmpfs = derive_tmpfs(plan)?;
+    let macos_guest = plan
         .macos_guest
         .as_ref()
         .map(|guest| SetupEnsureMacosGuest {
@@ -86,19 +132,48 @@ pub(crate) fn derive_command(
             disk_size: guest.disk_size.clone(),
             cpu_cores: guest.cpu_cores,
         });
-    Ok(DerivedEnsure {
-        container_name,
-        image_identity: request.prepared_image.observed_identity.clone(),
+    let mut derived = DerivedEnsure {
+        container_name: String::new(),
+        image_identity: image.observed_identity.clone(),
         mounts,
-        environment: validated_environment(&request.plan.app.environment)?,
+        environment: validated_environment(&plan.app.environment)?,
         workdir,
         command,
-        labels,
+        labels: BTreeMap::new(),
         volumes,
         tmpfs,
-        host_docker_socket: request.plan.host_docker_socket.clone(),
+        host_docker_socket: plan.host_docker_socket.clone(),
         macos_guest,
-    })
+    };
+    derived
+        .mounts
+        .sort_by(|left, right| left.target.cmp(&right.target));
+    derived
+        .volumes
+        .sort_by(|left, right| left.target.cmp(&right.target));
+    derived
+        .tmpfs
+        .sort_by(|left, right| left.target.cmp(&right.target));
+    let mut arguments = vec![plan.content_sha256.clone()];
+    arguments.extend(derived.create_command().docker_args());
+    if arguments
+        .iter()
+        .try_fold(0usize, |size, value| size.checked_add(value.len() + 8))
+        .is_none_or(|size| size > 2 * 1024 * 1024)
+    {
+        return Err(SetupEnsureError::InvalidRequest(
+            "creation profile exceeds 2 MiB",
+        ));
+    }
+    let digest = crate::creation::creation_digest(&workspace_root, &arguments);
+    derived.container_name = format!("bosn-setup-v2-{digest}");
+    derived.labels = BTreeMap::from([
+        (LABEL_MANAGED.into(), MANAGED_VALUE.into()),
+        (LABEL_CONTENT_SHA256.into(), plan.content_sha256.clone()),
+        (LABEL_CONTAINER_NAME.into(), derived.container_name.clone()),
+        (LABEL_CREATION_PROFILE.into(), format!("v2:{digest}")),
+    ]);
+    Ok(derived)
 }
 
 pub(crate) fn validate_plan_shape(plan: &SetupPlan) -> Result<(), SetupEnsureError> {
@@ -139,6 +214,11 @@ pub(crate) fn validate_plan_shape(plan: &SetupPlan) -> Result<(), SetupEnsureErr
         .iter()
         .map(|mount| mount.target.clone())
         .collect();
+    if targets.len() != plan.app.mounts.len() {
+        return Err(SetupEnsureError::InvalidRequest(
+            "duplicate bind mount target",
+        ));
+    }
     for volume in &plan.named_volumes {
         if !valid_volume_name(&volume.name)
             || validate_container_path(&volume.target).is_err()

@@ -103,7 +103,11 @@ impl SetupAdoptExecutor for DockerSetupAdoptExecutor {
                     adopted.container_name, adopted.container_id
                 ),
                 resource: SetupEnsureResource {
-                    id: format!("setup-container:{}", plan.content_sha256),
+                    id: setup_container_resource_id(
+                        "setup-container",
+                        "setup",
+                        &adopted.container_name,
+                    ),
                     name: adopted.container_name,
                     stack: "setup".into(),
                     generation: format!("sha256:{}", plan.content_sha256),

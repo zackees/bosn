@@ -274,6 +274,7 @@ pub async fn run_on_engine(
             registry,
             ActRegistryCommand::Execution {
                 run: run.clone(),
+                token: String::new(),
                 outcome,
                 at: clock.now(),
             },

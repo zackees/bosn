@@ -319,6 +319,7 @@ impl SetupAppTaskExecutor for DockerSetupAppTaskExecutor {
             let outcome = match &result {
                 Ok(_) => "succeeded",
                 Err(bosn_setup::SetupTaskError::TaskFailed { .. }) => "failed",
+                Err(bosn_setup::SetupTaskError::RemoteStopped(_)) => "stopped",
                 Err(_) => "uncertain",
             };
             let finished = session.finish(outcome).await;
@@ -333,6 +334,9 @@ impl SetupAppTaskExecutor for DockerSetupAppTaskExecutor {
                     "completed declared app task {} in managed container {} with image {}",
                     result.task_name, observed.container_name, result.image_identity
                 )),
+                Err(error @ bosn_setup::SetupTaskError::RemoteStopped(_)) => {
+                    Err(format!("setup app task ended early: {error}"))
+                }
                 // `docker exec` cancellation kills the local client only. Do
                 // not report that this stopped the command in the app.
                 Err(bosn_setup::SetupTaskError::Cancelled)

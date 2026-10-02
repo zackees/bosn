@@ -65,18 +65,29 @@ pub enum SetupTaskCommand {
     },
 }
 
-/// The only engine command used for a declared task inside the already
+/// The only engine commands used for a declared task inside the already
 /// ensured setup application.  The target name is content-addressed from the
 /// validated plan; callers cannot choose a container ID or Docker arguments.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SetupAppTaskCommand {
     Exec {
         container_name: String,
+        /// Per-execution marker set as `BOSN_TASK_TOKEN` in the task's
+        /// environment, so [`Self::Stop`] can find its processes (#357).
+        task_token: String,
         /// Names forwarded as `--env NAME` (no `=value`): Docker copies each
         /// value from the Docker client's own process environment, so a
         /// secret never appears in argv (#308). Values never enter this crate.
         passthrough_env: Vec<String>,
         command: String,
+    },
+    /// Signal, in the same container, exactly the processes whose
+    /// environment carries `task_token`: SIGINT, then SIGTERM, then SIGKILL.
+    /// Issued after an [`Self::Exec`] client ended without the task's exit
+    /// status, because killing `docker exec` does not stop its command.
+    Stop {
+        container_name: String,
+        task_token: String,
     },
 }
 
@@ -85,10 +96,16 @@ impl SetupAppTaskCommand {
         match self {
             Self::Exec {
                 container_name,
+                task_token,
                 passthrough_env,
                 command,
             } => {
-                let mut args = vec!["container".into(), "exec".into()];
+                let mut args = vec![
+                    "container".into(),
+                    "exec".into(),
+                    "--env".into(),
+                    format!("{}={task_token}", crate::task_stop::TASK_TOKEN_ENV),
+                ];
                 for name in passthrough_env {
                     args.push("--env".into());
                     args.push(name.clone());
@@ -97,6 +114,20 @@ impl SetupAppTaskCommand {
                 args.extend(crate::shell::login_shell_args(command));
                 args
             }
+            Self::Stop {
+                container_name,
+                task_token,
+            } => vec![
+                "container".into(),
+                "exec".into(),
+                container_name.clone(),
+                "sh".into(),
+                "-c".into(),
+                crate::task_stop::STOP_SCRIPT.into(),
+                "bosn-stop".into(),
+                task_token.clone(),
+                crate::task_stop::STOP_GRACE_SECONDS.to_string(),
+            ],
         }
     }
 }
@@ -240,7 +271,14 @@ pub enum SetupTaskError {
     Cancelled,
     Deadline,
     Transport(CommandError),
-    TaskFailed { exit_code: i32, detail: String },
+    TaskFailed {
+        exit_code: i32,
+        detail: String,
+    },
+    /// The exec client ended without the task's exit status (the boxed
+    /// cause), and a follow-up stop confirmed that none of the task's
+    /// processes remain in the container.
+    RemoteStopped(Box<SetupTaskError>),
 }
 
 impl std::fmt::Display for SetupTaskError {
@@ -259,6 +297,10 @@ impl std::fmt::Display for SetupTaskError {
                     "declared setup task exited with {exit_code}: {detail}"
                 )
             }
+            Self::RemoteStopped(cause) => write!(
+                formatter,
+                "{cause}; bosn stopped the task's processes in the container"
+            ),
         }
     }
 }
@@ -336,8 +378,11 @@ pub async fn execute_setup_task<E: SetupTaskEngine>(
 /// `crate::shell`).
 /// It never accepts a container identity, raw argv, mounts, environment, or
 /// working-directory override. A killed local `docker exec` client does not
-/// prove the remote command stopped; callers must retain that uncertainty in
-/// their lifecycle result.
+/// prove the remote command stopped, so an exec that ends without the task's
+/// exit status is followed by a stop of the task's marked processes in the
+/// same container (#357). Only a confirmed stop becomes
+/// [`SetupTaskError::RemoteStopped`]; otherwise callers must retain the
+/// uncertainty of a plain `Cancelled`/`Deadline`/`Transport` result.
 pub async fn execute_setup_app_task<E: SetupAppTaskEngine>(
     engine: &E,
     request: SetupAppTaskRequest<'_>,
@@ -380,10 +425,18 @@ pub async fn execute_setup_app_task<E: SetupAppTaskEngine>(
     if remaining.is_zero() {
         return Err(SetupTaskError::Deadline);
     }
-    let result = engine
+    let container_name = crate::setup_container_name(
+        request.plan,
+        &request.workspace_root,
+        request.prepared_image,
+    )
+    .map_err(|_| SetupTaskError::InvalidRequest("invalid container creation profile"))?;
+    let task_token = crate::task_stop::new_task_token(&container_name, &request.task_name);
+    let result = match engine
         .stream(
             SetupAppTaskCommand::Exec {
-                container_name: format!("bosn-setup-{}", request.plan.content_sha256),
+                container_name: container_name.clone(),
+                task_token: task_token.clone(),
                 passthrough_env: request.passthrough_env,
                 command,
             },
@@ -391,7 +444,27 @@ pub async fn execute_setup_app_task<E: SetupAppTaskEngine>(
             request.cancellation,
             request.events,
         )
-        .await?;
+        .await
+    {
+        Ok(result) => result,
+        // The client never started, so nothing ran in the container.
+        Err(error @ CommandError::Spawn(_)) => return Err(error.into()),
+        Err(error) => {
+            let cause = SetupTaskError::from(error);
+            let stopped = crate::task_stop::stop_task_processes(
+                engine,
+                &container_name,
+                &task_token,
+                request.events,
+            )
+            .await;
+            return Err(if stopped {
+                SetupTaskError::RemoteStopped(Box::new(cause))
+            } else {
+                cause
+            });
+        }
+    };
     let used = result.stdout.len().saturating_add(result.stderr.len());
     if used > request.options.output_limit {
         return Err(SetupTaskError::Transport(CommandError::OutputLimit {

@@ -49,9 +49,17 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+pub mod act_archive;
+#[cfg(target_os = "linux")]
+pub mod act_artifacts;
+pub mod act_engine;
+pub mod act_image;
+#[cfg(test)]
+mod act_live_probe;
 pub mod act_registry;
+pub mod act_runtime;
 pub mod autostart;
 pub mod ci;
 mod client;
@@ -124,6 +132,10 @@ const MANIFEST_LINUX_IDLE_COMMAND: &str =
 /// the output ceiling stays bounded.
 pub const MANIFEST_MAX_DEADLINE: Duration = Duration::from_secs(4 * 60 * 60);
 pub const MANIFEST_MAX_OUTPUT: usize = 64 * 1024 * 1024;
+/// Bounds of a manifest app task's follow lease (#357): long enough to
+/// survive a busy host, short enough that a killed follower's job stops soon.
+pub const FOLLOW_LEASE_MIN: Duration = Duration::from_secs(1);
+pub const FOLLOW_LEASE_MAX: Duration = Duration::from_secs(10 * 60);
 const SETUP_PREPARE_COMMAND_QUEUE: usize = 64;
 const SETUP_PREPARE_EVENT_QUEUE: usize = 16;
 /// Manifest builds and tasks (for example `act` running a CI job) emit

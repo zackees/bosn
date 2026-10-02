@@ -8,5 +8,10 @@ if ! command -v uv > /dev/null 2>&1; then
   export PATH="$HOME/.local/bin:$PATH"
 fi
 
-uv sync --all-groups
+export PATH="$HOME/.local/bin:$PATH"
+if ! command -v soldr > /dev/null 2>&1; then
+  uv tool install soldr==0.9.27
+fi
+soldr toolchain ensure --json
+uv sync --frozen --all-groups
 echo "bosn environment ready."

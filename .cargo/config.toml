@@ -1,0 +1,5 @@
+# Every test binary runs through ci/test_guard.sh (zackees/ci.yml GATE-005):
+# bosn's tests start bosn daemons and touch bosn state roots, so they refuse to
+# run on a developer host. `cargo run` of a real binary is unaffected.
+[target.'cfg(unix)']
+runner = "ci/test_guard.sh"

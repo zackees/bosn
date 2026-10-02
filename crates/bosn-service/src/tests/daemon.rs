@@ -181,6 +181,7 @@ fn unsupported_request_protocol_returns_typed_error_response() {
             unmanaged_include: Vec::new(),
             unmanaged_ttl_seconds: 0,
             ci_request: String::new(),
+            follow_lease_ms: 0,
         }
         .encode(&mut payload)
         .unwrap();
@@ -290,6 +291,46 @@ fn existing_database_aliases_share_endpoint_identity() {
             alias_client.status().await.unwrap().registry_id,
             client.status().await.unwrap().registry_id
         );
+        client.shutdown().await.unwrap();
+        stopped(server).await;
+    });
+}
+
+#[test]
+fn a_short_state_dir_keeps_its_socket_beside_the_registry() {
+    let state = Path::new("/var/lib/bosn-state");
+    let ep = endpoint(state).unwrap();
+    if kernal_api::platform::ipc::endpoint_is_filesystem_backed() {
+        assert_eq!(Path::new(ep.display()), state.join("bosn-rs.sock"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_state_dir_too_long_for_sun_path_still_serves() {
+    let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+    let state = temporary
+        .path()
+        .join("a-state-directory-name-long-enough-to-matter".repeat(3))
+        .join("state");
+    assert!(state.join("bosn-rs.sock").as_os_str().len() > 108);
+    let ep = endpoint(&state).unwrap();
+    assert!(
+        ep.display().len() < ipc::endpoint_name_limit().max_bytes,
+        "{}",
+        ep.display()
+    );
+    let runtime = RuntimeBuilder::multi_thread().enable_all().build().unwrap();
+    runtime.run(async {
+        let server = async_engine::launch(Service::new(state.clone()).serve());
+        let client = wait_for_client(&state).await;
+        let ep = endpoint(&state).unwrap();
+        assert!(
+            ep.display().len() < ipc::endpoint_name_limit().max_bytes,
+            "{}",
+            ep.display()
+        );
+        assert!(ep.target_exists().unwrap());
         client.shutdown().await.unwrap();
         stopped(server).await;
     });

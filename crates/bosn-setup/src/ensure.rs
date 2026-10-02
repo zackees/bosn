@@ -24,11 +24,13 @@ mod checks;
 mod derive;
 use checks::*;
 use derive::*;
+pub use derive::{setup_container_name, verify_setup_observation};
 
 const LABEL_MANAGED: &str = "com.zackees.bosn.setup-managed";
 const LABEL_CONTENT_SHA256: &str = "com.zackees.bosn.setup-content-sha256";
 const LABEL_CONTAINER_NAME: &str = "com.zackees.bosn.setup-container";
 const MANAGED_VALUE: &str = "v1";
+const LABEL_CREATION_PROFILE: &str = "com.zackees.bosn.setup-creation-profile";
 
 /// A document-derived workspace bind mount for a persistent setup app.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -86,6 +88,9 @@ pub enum SetupEnsureCommand {
     Inspect {
         container_name: String,
     },
+    ImageInspect {
+        image_identity: String,
+    },
     Create {
         container_name: String,
         image_identity: String,
@@ -113,9 +118,7 @@ impl SetupEnsureCommand {
                 "volume".into(),
                 "inspect".into(),
                 "--format".into(),
-                format!(
-                    "{{{{index .Labels \"{LABEL_MANAGED}\"}}}}\t{{{{index .Labels \"{LABEL_CONTENT_SHA256}\"}}}}\t{{{{index .Labels \"{LABEL_CONTAINER_NAME}\"}}}}"
-                ),
+                "{{json .}}".into(),
                 volume_name.clone(),
             ],
             Self::VolumeCreate { volume } => {
@@ -131,10 +134,15 @@ impl SetupEnsureCommand {
                 "container".into(),
                 "inspect".into(),
                 "--format".into(),
-                format!(
-                    "{{{{.Id}}}}\t{{{{.State.Running}}}}\t{{{{.Image}}}}\t{{{{index .Config.Labels \"{LABEL_MANAGED}\"}}}}\t{{{{index .Config.Labels \"{LABEL_CONTENT_SHA256}\"}}}}\t{{{{index .Config.Labels \"{LABEL_CONTAINER_NAME}\"}}}}"
-                ),
+                "{{json .}}".into(),
                 container_name.clone(),
+            ],
+            Self::ImageInspect { image_identity } => vec![
+                "image".into(),
+                "inspect".into(),
+                "--format".into(),
+                "{{json .}}".into(),
+                image_identity.clone(),
             ],
             Self::Create {
                 container_name,
@@ -249,6 +257,9 @@ pub struct SetupEnsureObservedContainer {
     pub running: bool,
     pub image_identity: String,
     pub labels: BTreeMap<String, String>,
+    /// Bounded actual Docker Config, HostConfig and Mounts evidence. Labels
+    /// alone are insufficient to authorize reuse.
+    pub configuration: serde_json::Value,
 }
 
 /// Typed response corresponding to one [`SetupEnsureCommand`].
@@ -288,7 +299,16 @@ impl SetupEnsureEngine for DockerEngine {
     ) -> Self::StreamFuture<'a> {
         let engine = self.with_args(command.docker_args());
         Box::pin(async move {
-            let result = engine.stream(options, Some(cancellation), events).await?;
+            let result = if matches!(
+                command,
+                SetupEnsureCommand::Inspect { .. }
+                    | SetupEnsureCommand::ImageInspect { .. }
+                    | SetupEnsureCommand::VolumeInspect { .. }
+            ) {
+                private_observation(&engine, options, cancellation).await?
+            } else {
+                engine.stream(options, Some(cancellation), events).await?
+            };
             if !matches!(command, SetupEnsureCommand::Inspect { .. }) {
                 return Ok(SetupEnsureResponse::Command(result));
             }
@@ -302,6 +322,24 @@ impl SetupEnsureEngine for DockerEngine {
             Ok(SetupEnsureResponse::Inspection(Some(observed), result))
         })
     }
+}
+
+/// Raw Config/Env is verifier input, never job-log output. Keep the same
+/// cancellation/deadline/reap path while draining an owned private channel.
+async fn private_observation(
+    engine: &DockerEngine,
+    options: RunOptions,
+    cancellation: &CancellationToken,
+) -> Result<CommandResult, CommandError> {
+    let (events, mut receiver) = kernal_api::async_engine::channel(32);
+    let drain =
+        kernal_api::async_engine::launch(async move { while receiver.recv().await.is_some() {} });
+    let result = engine.stream(options, Some(cancellation), &events).await;
+    drop(events);
+    drain
+        .await
+        .map_err(|e| CommandError::Io(std::io::Error::other(e.to_string())))?;
+    result
 }
 
 /// All validated inputs for one ownership-safe setup app ensure.
@@ -428,18 +466,33 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
                 ));
             }
             if result.exit_code != 0 && result.exit_code != 1 {
-                return Err(action_failed("container inspect", &result));
+                return Err(SetupEnsureError::ActionFailed {
+                    action: "container inspect",
+                    detail: "private container observation failed".into(),
+                });
             }
             observed
         }
         SetupEnsureResponse::Command(result) => {
             consume_output(&result, &mut remaining_output, request.options.output_limit)?;
-            return Err(action_failed("container inspect", &result));
+            return Err(SetupEnsureError::ActionFailed {
+                action: "container inspect",
+                detail: "private container observation failed".into(),
+            });
         }
     };
 
     if let Some(observed) = observed {
         validate_observed(&observed, &derived)?;
+        verify_configuration(
+            engine,
+            &observed,
+            &derived,
+            &deadline,
+            &mut remaining_output,
+            &request,
+        )
+        .await?;
         if observed.running {
             return Ok(SetupEnsureResult {
                 container_name: derived.container_name,
@@ -477,9 +530,8 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
     }
 
     // The daemon wrote durable volume intents before this primitive was
-    // invoked. A matching existing container already proves that its mounts
-    // were created from this immutable plan, so do not mutate or re-inspect
-    // volumes on its reuse path. For a new container, create/reuse every exact
+    // invoked. A matching existing container has now passed actual mount and
+    // configuration and volume-metadata verification. For a new container, create/reuse every exact
     // labelled volume before the container itself, leaving only recoverable
     // intent-backed volume state if an attempt is interrupted.
     for volume in &derived.volumes {
@@ -500,22 +552,9 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
         };
         consume_output(&result, &mut remaining_output, request.options.output_limit)?;
         if result.ok() {
-            let observed = std::str::from_utf8(&result.stdout).unwrap_or("").trim();
-            let expected = [
-                volume.labels.get(LABEL_MANAGED).map_or("", String::as_str),
-                volume
-                    .labels
-                    .get(LABEL_CONTENT_SHA256)
-                    .map_or("", String::as_str),
-                volume
-                    .labels
-                    .get(LABEL_CONTAINER_NAME)
-                    .map_or("", String::as_str),
-            ]
-            .join("\t");
-            if observed != expected {
-                return Err(SetupEnsureError::OwnershipMismatch);
-            }
+            let observed = crate::creation::bounded_json(&result.stdout)
+                .map_err(|_| SetupEnsureError::OwnershipMismatch)?;
+            verify_volume_observation(volume, &observed, None)?;
         } else if result.exit_code == 1 {
             let response = invoke(
                 engine,
@@ -534,7 +573,9 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
                 request.options.output_limit,
             )?;
         } else {
-            return Err(action_failed("volume inspect", &result));
+            return Err(SetupEnsureError::EngineProtocol(
+                "private volume inspect failed",
+            ));
         }
     }
 
@@ -553,6 +594,33 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
         request.options.output_limit,
     )?;
     let container_id = parse_created_id(&created.stdout)?;
+    let response = invoke(
+        engine,
+        SetupEnsureCommand::Inspect {
+            container_name: derived.container_name.clone(),
+        },
+        &deadline,
+        &mut remaining_output,
+        &request,
+    )
+    .await?;
+    let SetupEnsureResponse::Inspection(Some(observed), result) = response else {
+        return Err(SetupEnsureError::OwnershipMismatch);
+    };
+    consume_output(&result, &mut remaining_output, request.options.output_limit)?;
+    if !result.ok() || observed.container_id != container_id {
+        return Err(SetupEnsureError::OwnershipMismatch);
+    }
+    validate_observed(&observed, &derived)?;
+    verify_configuration(
+        engine,
+        &observed,
+        &derived,
+        &deadline,
+        &mut remaining_output,
+        &request,
+    )
+    .await?;
     let response = invoke(
         engine,
         SetupEnsureCommand::Start {
@@ -629,9 +697,23 @@ pub async fn adopt_setup_app<E: SetupEnsureEngine>(
                 "absent inspection has a successful result",
             ));
         }
-        None => return Err(action_failed("container inspect", &result)),
+        None => {
+            return Err(SetupEnsureError::ActionFailed {
+                action: "container inspect",
+                detail: "private container observation failed".into(),
+            });
+        }
     };
     validate_observed(&observed, &derived)?;
+    verify_configuration(
+        engine,
+        &observed,
+        &derived,
+        &deadline,
+        &mut remaining_output,
+        &request,
+    )
+    .await?;
     Ok(SetupEnsureResult {
         container_name: derived.container_name,
         container_id: observed.container_id,
@@ -663,10 +745,20 @@ async fn invoke<E: SetupEnsureEngine>(
     if remaining.is_zero() {
         return Err(SetupEnsureError::Deadline);
     }
+    let output_limit = if matches!(
+        command,
+        SetupEnsureCommand::Inspect { .. }
+            | SetupEnsureCommand::ImageInspect { .. }
+            | SetupEnsureCommand::VolumeInspect { .. }
+    ) {
+        (*remaining_output).min(crate::creation::MAX_OBSERVATION_BYTES)
+    } else {
+        *remaining_output
+    };
     Ok(engine
         .stream(
             command,
-            RunOptions::streaming(remaining, *remaining_output),
+            RunOptions::streaming(remaining, output_limit),
             request.cancellation,
             request.events,
         )

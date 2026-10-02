@@ -39,6 +39,30 @@ requires = ["maturin>=1.15,<2"]
 build-backend = "bosn_build_backend"
 backend-path = ["."]
 
+[tool.uv]
+# Native source and backend changes must invalidate the installed wheel too.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "Cargo.lock" },
+    { file = "rust-toolchain.toml" },
+    { file = ".cargo/config" },
+    { file = ".cargo/config.toml" },
+    { file = "bosn_build_backend.py" },
+    { file = "README.md" },
+    { file = "LICENSE" },
+    { file = "crates/**/Cargo.toml" },
+    { file = "crates/**/*.rs" },
+    { file = "crates/**/*.json" },
+    { file = "src/bosn/**/*.py" },
+    { env = "BOSN_WHEEL_TARGET" },
+    { env = "CARGO_BUILD_TARGET" },
+    { env = "RUSTUP_TOOLCHAIN" },
+    { env = "MACOSX_DEPLOYMENT_TARGET" },
+    { env = "RUSTFLAGS" },
+    { env = "CARGO_ENCODED_RUSTFLAGS" },
+]
+
 [tool.maturin]
 manifest-path = "crates/bosn-python/Cargo.toml"
 module-name = "bosn._native"

@@ -7,18 +7,23 @@ native CLI first, then let maturin include that artifact in the wheel.
 
 from __future__ import annotations
 
+import json
+import os
+import stat
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from os import chmod, environ
+from functools import wraps
+from os import X_OK, access, chmod, environ, pathsep, replace
 from os import name as os_name
 from pathlib import Path
 from re import compile as compile_regex
-from shutil import copy2, rmtree
+from shutil import copy2, copyfileobj, rmtree, which
 from struct import unpack_from
-from subprocess import run
+from subprocess import PIPE, CalledProcessError, Popen, TimeoutExpired, run
 from sys import platform
 from typing import Any
+from uuid import uuid4
 
 import maturin
 
@@ -32,6 +37,8 @@ _WHEEL_DATA = _ROOT / "target" / "bosn-wheel-data"
 _WHEEL_NATIVE_DIRECTORY = _WHEEL_DATA / "scripts"
 _LINUX_OPENSSL = compile_regex(r"^(lib(?:ssl|crypto)\.so\.\d+) => (\S+)")
 _MACHO_64_MAGIC = 0xFEEDFACF
+_MAX_ARTIFACT_BYTES = 32 * 1024 * 1024
+_MAX_ARTIFACT_RECORD_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -71,14 +78,6 @@ def _wheel_target() -> _DarwinTarget | None:
 # command name while staging it into the wheel's scripts tree.
 def _command_name() -> str:
     return "bosn.exe" if os_name == "nt" else "bosn"
-
-
-def _native_cli(target: _DarwinTarget | None) -> Path:
-    name = "bosn-native.exe" if target is None and os_name == "nt" else "bosn-native"
-    directory = _ROOT / "target"
-    if target is not None:
-        directory /= target.triple
-    return directory / "release" / name
 
 
 def _assert_target_magic(binary: Path, target: _DarwinTarget | None) -> None:
@@ -151,9 +150,77 @@ def _linux_rpath_environment(target: _DarwinTarget | None) -> Iterator[None]:
             environ[key] = previous
 
 
+def _soldr_executable() -> str:
+    soldr = which("soldr")
+    if soldr is None:
+        raise RuntimeError("Bosn source builds require preprovisioned Soldr and Rust toolchain")
+    return str(Path(soldr).absolute())
+
+
+@contextmanager
+def _soldr_toolchain_environment() -> Iterator[None]:
+    """Use canonical Soldr shims; trusted builder provisions toolchain first."""
+    soldr = _soldr_executable()
+    shim_dir = _ROOT / "target" / "bosn-wheel-toolchain"
+    result = run(
+        [soldr, "toolchain", "link", "--shim-dir", str(shim_dir), "--json"],
+        cwd=_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    document = json.loads(result.stdout)
+    tools = document.get("tools") if isinstance(document, dict) else None
+    expected = {"cargo", "rustfmt", "clippy-driver", "rustc", "rustdoc"}
+    if (
+        not isinstance(document, dict)
+        or type(document.get("schema_version")) is not int
+        or document["schema_version"] != 1
+        or document.get("shim_dir") != str(shim_dir)
+        or not isinstance(tools, list)
+        or len(tools) != len(expected)
+    ):
+        raise RuntimeError("Soldr toolchain link returned invalid schema")
+    seen = set()
+    for tool in tools:
+        if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
+            raise RuntimeError("Soldr toolchain link returned invalid tool")
+        name = tool["name"]
+        shim = shim_dir / (name + (".exe" if os_name == "nt" else ""))
+        if (
+            name not in expected
+            or name in seen
+            or tool.get("shim_path") != str(shim)
+            or type(tool.get("created")) is not bool
+            or (tool["created"] is False and tool.get("skip_reason") != "existing-matches")
+            or not shim.is_file()
+            or not access(shim, X_OK)
+        ):
+            raise RuntimeError(
+                "Soldr toolchain shim missing or differs; refusing untrusted Cargo route"
+            )
+        seen.add(name)
+    updates = {
+        "PATH": str(shim_dir) + pathsep + environ.get("PATH", ""),
+        "CARGO": str(shim_dir / ("cargo.exe" if os_name == "nt" else "cargo")),
+        "MATURIN_NO_INSTALL_RUST": "1",
+    }
+    previous = {key: environ.get(key) for key in updates}
+    environ.update(updates)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                environ.pop(key, None)
+            else:
+                environ[key] = value
+
+
 def _build_native_cli() -> None:
     target = _wheel_target()
     command = [
+        _soldr_executable(),
         "cargo",
         "build",
         "--release",
@@ -162,12 +229,15 @@ def _build_native_cli() -> None:
         "bosn-python",
         "--bin",
         "bosn-native",
+        "--message-format=json-render-diagnostics",
     ]
     if target is not None:
         command.extend(["--target", target.triple])
     with _cross_pyo3_environment(target), _linux_rpath_environment(target):
-        run(command, cwd=_ROOT, check=True)
-    native_cli = _native_cli(target)
+        # Cargo's machine stream identifies the executable even when Soldr
+        # supplies a host target or CARGO_TARGET_DIR redirects build outputs.
+        # Compiler diagnostics remain rendered on inherited stderr.
+        native_cli = _run_native_build(command)
     _assert_target_magic(native_cli, target)
     rmtree(_WHEEL_DATA, ignore_errors=True)
     destination = _WHEEL_NATIVE_DIRECTORY / _command_name()
@@ -175,6 +245,71 @@ def _build_native_cli() -> None:
     copy2(native_cli, destination)
     chmod(destination, native_cli.stat().st_mode)
     _copy_linux_openssl(destination.parent, native_cli, target)
+
+
+def _run_native_build(command: list[str]) -> Path:
+    process = Popen(command, cwd=_ROOT, stdout=PIPE)
+    assert process.stdout is not None
+    try:
+        executable = _cargo_native_executable(process.stdout)
+        code = process.wait()
+        if code:
+            raise CalledProcessError(code, command)
+        return executable
+    finally:
+        process.stdout.close()
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except TimeoutExpired:
+                process.kill()
+                process.wait()
+
+
+def _cargo_native_executable(artifacts) -> Path:
+    manifest = (_ROOT / "crates/bosn-python/Cargo.toml").resolve()
+    matches = []
+    finished = False
+    total_bytes = 0
+    for line in iter(lambda: artifacts.readline(_MAX_ARTIFACT_RECORD_BYTES + 1), b""):
+        total_bytes += len(line)
+        if total_bytes > _MAX_ARTIFACT_BYTES:
+            raise RuntimeError("Cargo artifact stream exceeds its size bound")
+        if len(line) > _MAX_ARTIFACT_RECORD_BYTES:
+            raise RuntimeError("Cargo artifact record exceeds its size bound")
+        if not line.lstrip().startswith(b"{"):
+            # Proc macros may write ordinary stdout alongside Cargo records.
+            print(line.decode("utf-8", errors="replace"), end="")
+            continue
+        document = json.loads(line)
+        if not isinstance(document, dict):
+            raise RuntimeError("Invalid Cargo artifact record")
+        if document.get("reason") == "build-finished":
+            if finished or document.get("success") is not True:
+                raise RuntimeError("Cargo build did not finish successfully")
+            finished = True
+        if document.get("reason") != "compiler-artifact":
+            continue
+        cargo_target = document.get("target")
+        if (
+            not isinstance(cargo_target, dict)
+            or cargo_target.get("name") != "bosn-native"
+            or cargo_target.get("kind") != ["bin"]
+            or not isinstance(document.get("manifest_path"), str)
+            or Path(document["manifest_path"]).resolve() != manifest
+        ):
+            continue
+        executable = document.get("executable")
+        if not isinstance(executable, str) or not executable:
+            raise RuntimeError("Cargo omitted the native executable path")
+        binary = Path(executable)
+        if not binary.is_absolute() or not binary.is_file():
+            raise RuntimeError("Cargo native executable is missing or not absolute")
+        matches.append(binary)
+    if not finished or len(matches) != 1:
+        raise RuntimeError("Cargo must report one completed native executable")
+    return matches[0]
 
 
 def _copy_linux_openssl(destination: Path, native_cli: Path, target: _DarwinTarget | None) -> None:
@@ -220,17 +355,104 @@ def _wheel_config(config_settings: Mapping[str, Any] | None) -> dict[str, Any]:
     return settings
 
 
+@contextmanager
+def _wheel_cache_copy_environment() -> Iterator[None]:
+    """Wheel repair rewrites ELF bytes: never let it mutate a cache hardlink."""
+    previous = environ.get("SOLDR_ZCCACHE_MODE")
+    environ["SOLDR_ZCCACHE_MODE"] = "copy"
+    try:
+        yield
+    finally:
+        if previous is None:
+            environ.pop("SOLDR_ZCCACHE_MODE", None)
+        else:
+            environ["SOLDR_ZCCACHE_MODE"] = previous
+
+
+def _detach_repaired_cargo_aliases(target: _DarwinTarget | None) -> None:
+    """Maturin restores a pristine primary, but Cargo deps may alias its stage.
+
+    Replace only proven same-inode deps aliases with independent pristine bytes.
+    Never reverse guessed SONAMEs or rewrite the repaired wheel artifact/cache.
+    """
+    if target is not None or not platform.startswith("linux"):
+        return
+    base = _ROOT / "target"
+    staged = base / "maturin" / "libbosn_native.so"
+    if not staged.exists():
+        return
+    if staged.is_symlink() or not staged.is_file():
+        raise RuntimeError("unsafe maturin extension artifact")
+    aliases = [
+        path
+        for path in (base / "release" / "deps").glob("libbosn_native*.so")
+        if path.is_file() and path.samefile(staged)
+    ]
+    if not aliases:
+        return
+    pristine = base / "release" / staged.name
+    if pristine.is_symlink() or not pristine.is_file() or pristine.samefile(staged):
+        raise RuntimeError("pristine Cargo extension unavailable; use a fresh owned target tree")
+    for alias in aliases:
+        if alias.is_symlink() or not alias.samefile(staged):
+            raise RuntimeError("Cargo extension alias changed during detachment")
+        temporary = alias.with_name(f".bosn-wheel-detached-{uuid4()}")
+        created = False
+        try:
+            source_fd = os.open(pristine, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(source_fd, "rb") as source:
+                before = os.fstat(source.fileno())
+                if not stat.S_ISREG(before.st_mode):
+                    raise RuntimeError("pristine Cargo extension is not regular")
+                destination_fd = os.open(
+                    temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+                )
+                created = True
+                with os.fdopen(destination_fd, "wb") as destination:
+                    copyfileobj(source, destination, length=65536)
+                    destination.flush()
+                    after = os.fstat(source.fileno())
+                    if any(
+                        getattr(before, key) != getattr(after, key)
+                        for key in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+                    ):
+                        raise RuntimeError("pristine Cargo extension changed during copy")
+                    os.fchmod(destination.fileno(), stat.S_IMODE(before.st_mode))
+                    os.utime(destination.fileno(), ns=(before.st_atime_ns, before.st_mtime_ns))
+                    os.fsync(destination.fileno())
+            if not alias.samefile(staged):
+                raise RuntimeError("Cargo extension alias changed during detachment")
+            replace(temporary, alias)
+        except BaseException as original:
+            if created:
+                raise original from RuntimeError(f"retained owned temporary: {temporary}")
+            raise
+
+
 def build_wheel(
     wheel_directory: str,
     config_settings: Mapping[str, Any] | None = None,
     metadata_directory: str | None = None,
 ) -> str:
     target = _wheel_target()
-    with _cross_pyo3_environment(target):
+    with (
+        _soldr_toolchain_environment(),
+        _cross_pyo3_environment(target),
+        _wheel_cache_copy_environment(),
+    ):
         _build_native_cli()
-        return maturin.build_wheel(
-            wheel_directory, _wheel_config(config_settings), metadata_directory
-        )
+        try:
+            result = maturin.build_wheel(
+                wheel_directory, _wheel_config(config_settings), metadata_directory
+            )
+        except BaseException as original:
+            try:
+                _detach_repaired_cargo_aliases(target)
+            except Exception as cleanup:
+                raise original from cleanup
+            raise
+        _detach_repaired_cargo_aliases(target)
+        return result
 
 
 def build_editable(
@@ -241,15 +463,25 @@ def build_editable(
     target = _wheel_target()
     if target is not None:
         raise RuntimeError("cross-target editable wheels are unsupported; build a wheel instead")
-    _build_native_cli()
-    return maturin.build_editable(
-        wheel_directory, _wheel_config(config_settings), metadata_directory
-    )
+    with _soldr_toolchain_environment():
+        _build_native_cli()
+        return maturin.build_editable(
+            wheel_directory, _wheel_config(config_settings), metadata_directory
+        )
 
 
-get_requires_for_build_wheel = maturin.get_requires_for_build_wheel
-get_requires_for_build_editable = maturin.get_requires_for_build_editable
-get_requires_for_build_sdist = maturin.get_requires_for_build_sdist
-prepare_metadata_for_build_wheel = maturin.prepare_metadata_for_build_wheel
-prepare_metadata_for_build_editable = maturin.prepare_metadata_for_build_editable
-build_sdist = maturin.build_sdist
+def _routed_hook(hook):
+    @wraps(hook)
+    def routed(*args, **kwargs):
+        with _soldr_toolchain_environment():
+            return hook(*args, **kwargs)
+
+    return routed
+
+
+get_requires_for_build_wheel = _routed_hook(maturin.get_requires_for_build_wheel)
+get_requires_for_build_editable = _routed_hook(maturin.get_requires_for_build_editable)
+get_requires_for_build_sdist = _routed_hook(maturin.get_requires_for_build_sdist)
+prepare_metadata_for_build_wheel = _routed_hook(maturin.prepare_metadata_for_build_wheel)
+prepare_metadata_for_build_editable = _routed_hook(maturin.prepare_metadata_for_build_editable)
+build_sdist = _routed_hook(maturin.build_sdist)

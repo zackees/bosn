@@ -115,7 +115,8 @@ pub(crate) fn endpoint(state: &Path) -> Result<Endpoint, Error> {
     // exists, retain the supplied path spelling so two fresh state roots do
     // not collide.  The current user is always part of the namespace.
     let db = state.join("registry.sqlite3");
-    let mut identity = ipc::current_user_id()?.into_bytes();
+    let uid = ipc::current_user_id()?;
+    let mut identity = uid.clone().into_bytes();
     identity.push(0);
     match kernal_api::platform::fs::path_identity(&db) {
         Ok(Some(file)) => {
@@ -130,14 +131,24 @@ pub(crate) fn endpoint(state: &Path) -> Result<Endpoint, Error> {
         }
         Err(error) => return Err(Error::Io(error)),
     }
-    let name = format!(
-        "com.zackees.bosn.{}",
-        kernal_api::hash::blake3_bytes(&identity).to_hex()
-    );
-    let address = EndpointAddressCandidates::new(Some(name), Some(state.join("bosn-rs.sock")))
+    let hash = kernal_api::hash::blake3_bytes(&identity).to_hex();
+    let name = format!("com.zackees.bosn.{hash}");
+    let address = EndpointAddressCandidates::new(Some(name), Some(socket_path(state, &uid, &hash)))
         .select()
         .ok_or(Error::Protocol("no local IPC transport"))?;
     Ok(Endpoint::new(address)?)
+}
+/// The filesystem socket: beside the registry when it fits `sun_path`, else a
+/// hashed leaf in a short owner-private directory, so a long state dir (a deep
+/// TMPDIR, a nested checkout) still gets an endpoint. The hash is the same
+/// alias-stable identity as the kernel-namespace name, and the parent is
+/// checked owner-only (0700, real dir, our uid) before the daemon binds.
+fn socket_path(state: &Path, uid: &str, hash: &str) -> PathBuf {
+    let beside = state.join("bosn-rs.sock");
+    if beside.as_os_str().len() < ipc::endpoint_name_limit().max_bytes {
+        return beside;
+    }
+    PathBuf::from(format!("/tmp/bosn-{uid}")).join(format!("{}.sock", &hash[..32]))
 }
 pub(crate) fn uuid(bytes: &[u8]) -> String {
     let mut b = [0_u8; 16];

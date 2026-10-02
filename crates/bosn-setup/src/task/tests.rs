@@ -263,6 +263,7 @@ fn declared_app_task_has_only_the_content_addressed_exec_shape() {
     std::fs::create_dir(workspace.join("src")).unwrap();
     let plan = plan(&workspace);
     let image = prepared(&plan);
+    let container_name = crate::setup_container_name(&plan, &workspace, &image).unwrap();
     let engine = FakeAppEngine::with_results([command_result(0, b"ok", b"")]);
     let cancellation = CancellationSource::new();
     let (events, _receiver) = channel(8);
@@ -282,26 +283,32 @@ fn declared_app_task_has_only_the_content_addressed_exec_shape() {
         ))
         .unwrap();
     assert_eq!(result.task_name, "check");
+    let calls = engine.calls.lock().unwrap();
+    let [SetupAppTaskCommand::Exec { task_token, .. }] = calls.as_slice() else {
+        panic!("exactly one exec: {calls:?}");
+    };
+    assert_eq!(task_token.len(), 32);
+    assert!(task_token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let exec = SetupAppTaskCommand::Exec {
+        container_name: container_name.clone(),
+        task_token: task_token.clone(),
+        passthrough_env: Vec::new(),
+        command: "cargo test --locked".into(),
+    };
+    assert_eq!(calls[0], exec);
     assert_eq!(
-        *engine.calls.lock().unwrap(),
-        vec![SetupAppTaskCommand::Exec {
-            container_name: format!("bosn-setup-{HASH}"),
-            passthrough_env: Vec::new(),
-            command: "cargo test --locked".into(),
-        }]
-    );
-    assert_eq!(
-        SetupAppTaskCommand::Exec {
-            container_name: format!("bosn-setup-{HASH}"),
-            passthrough_env: Vec::new(),
-            command: "cargo test --locked".into(),
-        }
-        .docker_args(),
-        vec!["container", "exec", &format!("bosn-setup-{HASH}"),]
-            .into_iter()
-            .map(String::from)
-            .chain(crate::shell::login_shell_args("cargo test --locked"))
-            .collect::<Vec<_>>()
+        exec.docker_args(),
+        vec![
+            "container",
+            "exec",
+            "--env",
+            &format!("BOSN_TASK_TOKEN={task_token}"),
+            &container_name.clone(),
+        ]
+        .into_iter()
+        .map(String::from)
+        .chain(crate::shell::login_shell_args("cargo test --locked"))
+        .collect::<Vec<_>>()
     );
 }
 
@@ -309,6 +316,7 @@ fn declared_app_task_has_only_the_content_addressed_exec_shape() {
 fn app_task_secret_env_is_forwarded_by_name_only() {
     let args = SetupAppTaskCommand::Exec {
         container_name: format!("bosn-setup-{HASH}"),
+        task_token: "0123456789abcdef0123456789abcdef".into(),
         passthrough_env: vec!["GITHUB_TOKEN".into()],
         command: "true".into(),
     }
@@ -318,6 +326,8 @@ fn app_task_secret_env_is_forwarded_by_name_only() {
         vec![
             "container",
             "exec",
+            "--env",
+            "BOSN_TASK_TOKEN=0123456789abcdef0123456789abcdef",
             "--env",
             "GITHUB_TOKEN",
             &format!("bosn-setup-{HASH}"),
@@ -540,4 +550,132 @@ fn nonzero_cancellation_deadline_and_output_budget_are_terminal_and_bounded() {
         Err(SetupTaskError::InvalidRequest("output budget is zero"))
     ));
     assert!(zero_budget.calls.lock().unwrap().is_empty());
+}
+
+/// An exec client that ended without the task's exit status (cancel,
+/// deadline) must be followed by a stop of the task's own processes in
+/// the same container: killing `docker exec` alone leaves them running.
+#[test]
+fn an_interrupted_app_task_exec_stops_its_processes_in_the_container() {
+    let temporary = tempfile::tempdir().unwrap();
+    let workspace = temporary.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir(workspace.join("src")).unwrap();
+    let plan = plan(&workspace);
+    let image = prepared(&plan);
+    for interrupted in [
+        CommandError::Cancelled {
+            reaped_pid: None,
+            cleanup: None,
+        },
+        CommandError::Deadline {
+            reaped_pid: None,
+            cleanup: None,
+        },
+    ] {
+        let engine =
+            FakeAppEngine::with_results([Err(interrupted), command_result(0, b"stopped", b"")]);
+        let cancellation = CancellationSource::new();
+        let (events, _receiver) = channel(8);
+        let result = runtime().run(execute_setup_app_task(
+            &engine,
+            SetupAppTaskRequest {
+                plan: &plan,
+                workspace_root: workspace.clone(),
+                task_name: "check".into(),
+                passthrough_env: Vec::new(),
+                prepared_image: &image,
+                options: RunOptions::streaming(Duration::from_secs(2), 4096),
+                cancellation: &cancellation.token(),
+                events: &events,
+            },
+        ));
+        let calls = engine.calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            2,
+            "the interrupted exec must be followed by an in-container stop: {calls:?}"
+        );
+        let SetupAppTaskCommand::Exec {
+            container_name,
+            task_token,
+            ..
+        } = &calls[0]
+        else {
+            panic!("the task runs first: {calls:?}");
+        };
+        assert_eq!(
+            calls[1],
+            SetupAppTaskCommand::Stop {
+                container_name: container_name.clone(),
+                task_token: task_token.clone(),
+            },
+            "the stop targets this execution's container and marker"
+        );
+        let args = calls[1].docker_args();
+        assert_eq!(
+            &args[..5],
+            ["container", "exec", container_name, "sh", "-c"]
+        );
+        assert_eq!(&args[7..], [task_token.as_str(), "10"]);
+        assert!(
+            matches!(&result, Err(SetupTaskError::RemoteStopped(_))),
+            "a confirmed stop is reported: {result:?}"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("stopped the task's processes")
+        );
+    }
+
+    // A stop that cannot confirm leaves the old, uncertain result.
+    let engine = FakeAppEngine::with_results([
+        Err(CommandError::Cancelled {
+            reaped_pid: None,
+            cleanup: None,
+        }),
+        command_result(1, b"", b"survived"),
+    ]);
+    let cancellation = CancellationSource::new();
+    let (events, _receiver) = channel(8);
+    let result = runtime().run(execute_setup_app_task(
+        &engine,
+        SetupAppTaskRequest {
+            plan: &plan,
+            workspace_root: workspace.clone(),
+            task_name: "check".into(),
+            passthrough_env: Vec::new(),
+            prepared_image: &image,
+            options: RunOptions::streaming(Duration::from_secs(2), 4096),
+            cancellation: &cancellation.token(),
+            events: &events,
+        },
+    ));
+    assert!(
+        matches!(result, Err(SetupTaskError::Cancelled)),
+        "{result:?}"
+    );
+
+    // A completed exec, even a failing one, needs no stop.
+    let engine = FakeAppEngine::with_results([command_result(3, b"", b"no")]);
+    let result = runtime().run(execute_setup_app_task(
+        &engine,
+        SetupAppTaskRequest {
+            plan: &plan,
+            workspace_root: workspace.clone(),
+            task_name: "check".into(),
+            passthrough_env: Vec::new(),
+            prepared_image: &image,
+            options: RunOptions::streaming(Duration::from_secs(2), 4096),
+            cancellation: &cancellation.token(),
+            events: &events,
+        },
+    ));
+    assert!(matches!(
+        result,
+        Err(SetupTaskError::TaskFailed { exit_code: 3, .. })
+    ));
+    assert_eq!(engine.calls.lock().unwrap().len(), 1);
 }

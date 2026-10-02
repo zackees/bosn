@@ -284,7 +284,9 @@ fn manifest_app_task_is_prompt_typed_and_clears_its_durable_session() {
     let state = temporary.path().join("state");
     let workspace = temporary.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
-    let fake = Arc::new(FakeManifestAppTaskExecutor::new());
+    let (entered, mut entered_wait) = async_engine::channel(1);
+    let (release, release_wait) = async_engine::channel(1);
+    let fake = Arc::new(FakeManifestAppTaskExecutor::new(entered, release_wait));
     RuntimeBuilder::multi_thread()
         .enable_all()
         .build()
@@ -308,10 +310,17 @@ fn manifest_app_task_is_prompt_typed_and_clears_its_durable_session() {
                 .submit_manifest_app_task(request.clone())
                 .await
                 .unwrap();
+            // Coalescing covers active jobs: keep this executor active
+            // until the second IPC request has joined the first one.
+            async_engine::timeout(Duration::from_secs(2), entered_wait.recv())
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 first,
                 client.submit_manifest_app_task(request).await.unwrap()
             );
+            release.send(()).await.unwrap();
             wait_for_job_state(&client, first, "Succeeded").await;
             assert_eq!(fake.observed.lock().unwrap().len(), 1);
             assert_eq!(client.status().await.unwrap().sessions, 0);
@@ -324,6 +333,131 @@ fn manifest_app_task_is_prompt_typed_and_clears_its_durable_session() {
                     .iter()
                     .any(|record| record.line.contains("manifest app task"))
             );
+            client.shutdown().await.unwrap();
+            stopped(server).await;
+        });
+}
+
+/// Runs until its job is cancelled, like an `act` task would.
+struct CancellableManifestAppTaskExecutor {
+    started: async_engine::Sender<String>,
+}
+impl ManifestAppTaskExecutor for CancellableManifestAppTaskExecutor {
+    fn execute<'a>(
+        &'a self,
+        request: ManifestAppTaskJobRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        _logs: &'a async_engine::Sender<String>,
+        _session: &'a dyn ManifestAppTaskSessionRecorder,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = self.started.send(request.task_name).await;
+            cancellation.cancelled().await;
+            Err("cancelled".into())
+        })
+    }
+}
+
+async fn next_task_start(wait: &mut async_engine::Receiver<String>) -> String {
+    async_engine::timeout(Duration::from_secs(5), wait.recv())
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// #357: a `bosn run` client killed by SIGTERM/SIGHUP/SIGKILL stops
+/// polling. Its job, running or still queued, must be cancelled rather
+/// than run on to its deadline; a job without a lease, or one whose
+/// follower keeps polling, must not be.
+#[test]
+fn a_followed_app_task_is_cancelled_once_its_follower_stops_polling() {
+    let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+    let state = temporary.path().join("state");
+    let workspace = temporary.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let (started, mut started_wait) = async_engine::channel(8);
+    let fake = Arc::new(CancellableManifestAppTaskExecutor { started });
+    let request = |task: &str| ManifestAppTaskJobRequest {
+        workspace: workspace.clone(),
+        manifest: "bosn.toml".into(),
+        stack: "app".into(),
+        task_name: task.into(),
+        deadline: Duration::from_secs(600),
+        output_limit: 4096,
+    };
+    RuntimeBuilder::multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .run(async {
+            let server = async_engine::launch(
+                Service::new(state.clone())
+                    .with_manifest_app_task_executor(fake.clone())
+                    .serve(),
+            );
+            let client = wait_for_client(&state).await;
+            let lease = Duration::from_secs(1);
+            assert!(
+                client
+                    .follow_manifest_app_task(request("bad"), Duration::from_millis(999))
+                    .await
+                    .is_err(),
+                "a lease below the minimum is refused"
+            );
+
+            // A follower that goes silent, with a second job of its
+            // queued behind the first.
+            let running = client
+                .follow_manifest_app_task(request("running"), lease)
+                .await
+                .unwrap();
+            assert_eq!(next_task_start(&mut started_wait).await, "running");
+            let queued = client
+                .follow_manifest_app_task(request("queued"), lease)
+                .await
+                .unwrap();
+            async_engine::sleep(Duration::from_secs(3)).await;
+            assert_eq!(client.job_status(running).await.unwrap().state, "Cancelled");
+            assert_eq!(client.job_status(queued).await.unwrap().state, "Cancelled");
+            assert!(
+                client
+                    .job_logs(running, 0, 16)
+                    .await
+                    .unwrap()
+                    .records
+                    .iter()
+                    .any(|record| record.line.contains("stopped polling")),
+                "the job log says why it was cancelled"
+            );
+
+            // Without a lease, silence changes nothing (#12: the job
+            // outlives its CLI unless that CLI asked otherwise).
+            let unleased = client
+                .submit_manifest_app_task(request("unleased"))
+                .await
+                .unwrap();
+            assert_eq!(next_task_start(&mut started_wait).await, "unleased");
+            async_engine::sleep(Duration::from_secs(2)).await;
+            assert_eq!(client.job_status(unleased).await.unwrap().state, "Running");
+            client.cancel_job(unleased).await.unwrap();
+            wait_for_job_state(&client, unleased, "Cancelled").await;
+
+            // A follower that keeps polling keeps its job.
+            let followed = client
+                .follow_manifest_app_task(request("followed"), lease)
+                .await
+                .unwrap();
+            assert_eq!(next_task_start(&mut started_wait).await, "followed");
+            for _ in 0..12 {
+                assert_eq!(client.job_status(followed).await.unwrap().state, "Running");
+                async_engine::sleep(Duration::from_millis(200)).await;
+            }
+            async_engine::sleep(Duration::from_secs(3)).await;
+            assert_eq!(
+                client.job_status(followed).await.unwrap().state,
+                "Cancelled"
+            );
+
             client.shutdown().await.unwrap();
             stopped(server).await;
         });

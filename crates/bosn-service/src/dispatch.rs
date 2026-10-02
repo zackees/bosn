@@ -332,14 +332,17 @@ pub(crate) async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Re
             },
             23 => match validate_manifest_app_task_request_wire(&r) {
                 Ok(()) => match jobs
-                    .submit_manifest_app_task(ManifestAppTaskJobRequest {
-                        workspace: PathBuf::from(r.workspace),
-                        manifest: r.setup_config,
-                        stack: r.stack,
-                        task_name: r.setup_task_name,
-                        deadline: Duration::from_millis(r.setup_deadline_ms),
-                        output_limit: r.setup_output_limit as usize,
-                    })
+                    .submit_manifest_app_task(
+                        ManifestAppTaskJobRequest {
+                            workspace: PathBuf::from(r.workspace),
+                            manifest: r.setup_config,
+                            stack: r.stack,
+                            task_name: r.setup_task_name,
+                            deadline: Duration::from_millis(r.setup_deadline_ms),
+                            output_limit: r.setup_output_limit as usize,
+                        },
+                        (r.follow_lease_ms != 0).then(|| Duration::from_millis(r.follow_lease_ms)),
+                    )
                     .await
                 {
                     Ok(job_id) => ReplyWire {

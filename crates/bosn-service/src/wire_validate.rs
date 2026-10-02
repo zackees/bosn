@@ -242,6 +242,12 @@ pub(crate) fn validate_manifest_app_task_request_wire(request: &Request) -> Resu
     {
         return Err(Error::Protocol("nonsemantic manifest app task fields"));
     }
+    if request.follow_lease_ms != 0
+        && !(FOLLOW_LEASE_MIN..=FOLLOW_LEASE_MAX)
+            .contains(&Duration::from_millis(request.follow_lease_ms))
+    {
+        return Err(Error::Protocol("invalid manifest app task follow lease"));
+    }
     Ok(())
 }
 

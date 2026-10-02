@@ -767,6 +767,7 @@ impl CiRuntime {
                 engine_image_digest: self.backend.resolve_engine_image().await?,
                 runner_image_digest: runner_digest.into(),
                 created_at: lifecycle::now_seconds(),
+                creation_profile: None,
             },
             source: self.store.source(&record.id),
             event: self.store.event(&record.id),

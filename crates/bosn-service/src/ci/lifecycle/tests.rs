@@ -257,6 +257,7 @@ pub fn intent(run: &str) -> ActEngineIntent {
         engine_image_digest: format!("sha256:{}", "e".repeat(64)),
         runner_image_digest: format!("sha256:{}", "f".repeat(64)),
         created_at: 1.0,
+        creation_profile: None,
     }
 }
 fn plan(run: &str, deadline: Duration) -> EnginePlan {

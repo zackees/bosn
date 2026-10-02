@@ -43,11 +43,13 @@ pub use prepare::{
     prepare_setup_image,
 };
 
+mod creation;
 mod ensure;
 pub use ensure::{
     SetupEnsureCommand, SetupEnsureEngine, SetupEnsureError, SetupEnsureMacosGuest,
     SetupEnsureMount, SetupEnsureObservedContainer, SetupEnsureRequest, SetupEnsureResponse,
-    SetupEnsureResult, SetupEnsureTmpfs, adopt_setup_app, ensure_setup_app,
+    SetupEnsureResult, SetupEnsureTmpfs, adopt_setup_app, ensure_setup_app, setup_container_name,
+    verify_setup_observation,
 };
 
 mod shell;
@@ -58,6 +60,8 @@ pub use task::{
     SetupTaskEngine, SetupTaskError, SetupTaskMount, SetupTaskRequest, SetupTaskResult,
     execute_setup_app_task, execute_setup_task,
 };
+mod task_stop;
+pub use task_stop::TASK_TOKEN_ENV;
 
 /// The current durable cache-record wire version.  It is intentionally
 /// independent of the setup-document schema version.

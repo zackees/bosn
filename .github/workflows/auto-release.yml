@@ -181,7 +181,15 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Set up Soldr for the wheel backend
+        uses: zackees/setup-soldr@fe965fc7e2c5203570072e1d0fd19d0935d98e39
+        with:
+          version: "0.9.27"
+          toolchain: "1.95.0"
+          prebuild-deps: none
+
       - name: Build platform wheel
+        # The backend requires a provisioned Soldr front door on both hosts.
         run: uv build --wheel --out-dir dist
 
       - name: Install and smoke-test platform wheel outside the checkout
@@ -234,7 +242,7 @@ jobs:
         run: soldr prepare --target "${{ matrix.target }}" --github-env "$GITHUB_ENV"
 
       - name: Install Rust standard library for Darwin target
-        run: rustup target add "${{ matrix.target }}" --toolchain 1.95.0
+        run: soldr rustup target add "${{ matrix.target }}" --toolchain 1.95.0
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5

@@ -375,6 +375,16 @@ pub(crate) struct ManifestRecoveryContract {
 /// inspect and start of a deterministic registry-owned name; no caller can
 /// inject Docker arguments, labels, images, or source paths.
 pub trait ManifestRecoveryExecutor: Send + Sync {
+    /// A label-only observation never authorizes restart. Implementations
+    /// must verify the complete current creation profile before this returns.
+    fn verify_profile<'a>(
+        &'a self,
+        _plan: &'a SetupPlan,
+        _image_identity: &'a str,
+        _name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Err("manifest recovery full profile proof unavailable".into()) })
+    }
     fn inspect<'a>(
         &'a self,
         name: &'a str,
@@ -397,6 +407,65 @@ impl DockerManifestRecoveryExecutor {
     }
 }
 impl ManifestRecoveryExecutor for DockerManifestRecoveryExecutor {
+    fn verify_profile<'a>(
+        &'a self,
+        plan: &'a SetupPlan,
+        image_identity: &'a str,
+        name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let (kind, reference) = match &plan.app_source {
+                SetupPlanAppSource::PinnedImage { image } => (
+                    bosn_setup::PreparedImageKind::PinnedImage {
+                        image: image.clone(),
+                    },
+                    image.clone(),
+                ),
+                SetupPlanAppSource::InlineDockerfile { .. } => {
+                    let tag = format!("bosn-setup:{}", plan.content_sha256);
+                    (
+                        bosn_setup::PreparedImageKind::InlineDockerfile { tag: tag.clone() },
+                        tag,
+                    )
+                }
+            };
+            // This exact immutable image ID comes from the daemon's durable
+            // successful ensure receipt; no pull/build or caller substitution.
+            let image = PreparedImage {
+                setup_content_sha256: plan.content_sha256.clone(),
+                kind,
+                reference,
+                observed_identity: image_identity.into(),
+            };
+            if bosn_setup::setup_container_name(plan, &plan.workspace_root, &image)
+                .map_err(|e| e.to_string())?
+                != name
+            {
+                return Err("manifest recovery creation identity mismatch".into());
+            }
+            let cancellation = CancellationSource::new();
+            let (events, mut receiver) = async_engine::channel(32);
+            let drain =
+                async_engine::launch(async move { while receiver.recv().await.is_some() {} });
+            let result = adopt_setup_app(
+                &self.engine,
+                CoreSetupEnsureRequest {
+                    plan,
+                    workspace_root: plan.workspace_root.clone(),
+                    prepared_image: &image,
+                    options: RunOptions::bounded(MANIFEST_RECOVERY_ENGINE_DEADLINE, 512 * 1024),
+                    cancellation: &cancellation.token(),
+                    events: &events,
+                },
+            )
+            .await;
+            drop(events);
+            drain
+                .await
+                .map_err(|_| "manifest recovery observation drain failed".to_owned())?;
+            result.map(|_| ()).map_err(|e| e.to_string())
+        })
+    }
     fn inspect<'a>(
         &'a self,
         name: &'a str,

@@ -163,7 +163,11 @@ impl SetupEnsureExecutor for DockerSetupEnsureExecutor {
                     // container was externally removed. The content-derived
                     // name is the validated logical identity and keeps this
                     // upsert idempotent across that recovery case.
-                    id: format!("setup-container:{}", plan.content_sha256),
+                    id: setup_container_resource_id(
+                        "setup-container",
+                        "setup",
+                        &ensured.container_name,
+                    ),
                     name: ensured.container_name,
                     stack: "setup".into(),
                     generation: format!("sha256:{}", plan.content_sha256),

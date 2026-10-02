@@ -16,12 +16,58 @@ pub(crate) async fn job_actor(
     let mut setup_kinds: BTreeMap<u64, SetupJobKind> = BTreeMap::new();
     let mut cancellations: BTreeMap<u64, CancellationSource> = BTreeMap::new();
     let mut tasks = async_engine::TaskGroup::new();
-    let mut stopping = None;
-    while let Some(command) = receiver.recv().await {
+    let mut stopping: Option<async_engine::OneshotSender<()>> = None;
+    loop {
+        // Wake at least once per sweep interval so a job whose follower
+        // vanished is cancelled even when no other command arrives.
+        let command = match async_engine::timeout(LEASE_SWEEP_INTERVAL, receiver.recv()).await {
+            Ok(Some(command)) => Some(command),
+            Ok(None) => break,
+            Err(_) => None,
+        };
         while matches!(
             async_engine::timeout(Duration::ZERO, tasks.join_next()).await,
             Ok(Some(_))
         ) {}
+        if stopping.is_none() {
+            for id in jobs.expired_leases(Instant::now()) {
+                let _ = jobs.log(
+                    id,
+                    "[bosn] cancelling: the client following this job stopped polling (it exited or was killed)"
+                        .into(),
+                );
+                let _ = cancel_job_in_actor(
+                    id,
+                    &mut jobs,
+                    &mut requests,
+                    &mut setup_kinds,
+                    &cancellations,
+                    &registry,
+                )
+                .await;
+            }
+        }
+        let Some(command) = command else {
+            if stopping.is_none() {
+                // Cancelling a queued job can hand its slot to the next one.
+                launch_started_setup_jobs(
+                    &mut jobs,
+                    &mut requests,
+                    &mut cancellations,
+                    &mut tasks,
+                    &executors,
+                    sender.clone(),
+                    registry.clone(),
+                );
+            } else if cancellations.is_empty() {
+                while tasks.join_next().await.is_some() {}
+                if let Some(reply) = stopping.take() {
+                    let _ = reply.send(());
+                }
+                return;
+            }
+            continue;
+        };
         match command {
             JobCommand::Submit {
                 workspace,
@@ -41,25 +87,19 @@ pub(crate) async fn job_actor(
                 let _ = reply.send(result);
             }
             JobCommand::Status { id, reply } => {
+                jobs.touch(id, Instant::now());
                 let _ = reply.send(jobs.job(id).map_err(|_| Error::Protocol("unknown job")));
             }
             JobCommand::Cancel { id, reply } => {
-                let result = jobs.cancel(id).map_err(|_| Error::Protocol("job cancel"));
-                if result.is_ok() {
-                    if let Some(cancellation) = cancellations.get(&id) {
-                        cancellation.cancel();
-                    } else if jobs.job(id).is_ok_and(|job| job.state.terminal()) {
-                        requests.remove(&id);
-                        if setup_kinds.remove(&id) == Some(SetupJobKind::Ensure) {
-                            let _ = registry
-                                .append_setup_ensure_events(vec![SetupEnsureEvent::terminal(
-                                    id,
-                                    SetupEnsureEventOutcome::Cancelled,
-                                )])
-                                .await;
-                        }
-                    }
-                }
+                let result = cancel_job_in_actor(
+                    id,
+                    &mut jobs,
+                    &mut requests,
+                    &mut setup_kinds,
+                    &cancellations,
+                    &registry,
+                )
+                .await;
                 let _ = reply.send(result);
             }
             JobCommand::Logs {
@@ -68,6 +108,7 @@ pub(crate) async fn job_actor(
                 limit,
                 reply,
             } => {
+                jobs.touch(id, Instant::now());
                 let _ = reply.send(
                     jobs.log_page(id, after, limit)
                         .map_err(|_| Error::Protocol("unknown job")),
@@ -290,7 +331,11 @@ pub(crate) async fn job_actor(
                     registry.clone(),
                 );
             }
-            JobCommand::SubmitManifestAppTask { request, reply } => {
+            JobCommand::SubmitManifestAppTask {
+                request,
+                follow_lease,
+                reply,
+            } => {
                 let digest = manifest_app_task_digest(&request);
                 let workspace = request.workspace.to_string_lossy().into_owned();
                 let job_stack = format!("manifest-app-task:{}", request.stack);
@@ -299,16 +344,22 @@ pub(crate) async fn job_actor(
                     .map(|submission| match submission {
                         Submission::Started(id) | Submission::Queued(id) => {
                             requests.insert(id, SetupJobRequest::ManifestAppTask(request));
-                            id
+                            (id, true)
                         }
-                        Submission::Joined(id) => id,
+                        Submission::Joined(id) => (id, false),
                         Submission::Superseded { replacement, .. } => {
                             requests.insert(replacement, SetupJobRequest::ManifestAppTask(request));
-                            replacement
+                            (replacement, true)
                         }
                     })
                     .map_err(|_| Error::Protocol("manifest app task job admission"));
-                let _ = reply.send(result);
+                // Only the submission that created the job sets its lease: a
+                // follower joining another caller's unleased job must not make
+                // that job depend on this follower staying alive.
+                if let (Ok((id, true)), Some(period)) = (&result, follow_lease) {
+                    jobs.lease(*id, period, Instant::now());
+                }
+                let _ = reply.send(result.map(|(id, _)| id));
                 launch_started_setup_jobs(
                     &mut jobs,
                     &mut requests,
@@ -509,6 +560,39 @@ pub(crate) async fn job_actor(
             return;
         }
     }
+}
+
+/// How often the job actor checks follow leases when no command arrives.
+const LEASE_SWEEP_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Cancel one job: a queued job ends now, a running one is signalled and
+/// settles when its executor completes. Shared by `bosn job cancel` and the
+/// follow-lease sweep.
+async fn cancel_job_in_actor(
+    id: u64,
+    jobs: &mut Jobs,
+    requests: &mut BTreeMap<u64, SetupJobRequest>,
+    setup_kinds: &mut BTreeMap<u64, SetupJobKind>,
+    cancellations: &BTreeMap<u64, CancellationSource>,
+    registry: &RegistryActor,
+) -> Result<(), Error> {
+    let result = jobs.cancel(id).map_err(|_| Error::Protocol("job cancel"));
+    if result.is_ok() {
+        if let Some(cancellation) = cancellations.get(&id) {
+            cancellation.cancel();
+        } else if jobs.job(id).is_ok_and(|job| job.state.terminal()) {
+            requests.remove(&id);
+            if setup_kinds.remove(&id) == Some(SetupJobKind::Ensure) {
+                let _ = registry
+                    .append_setup_ensure_events(vec![SetupEnsureEvent::terminal(
+                        id,
+                        SetupEnsureEventOutcome::Cancelled,
+                    )])
+                    .await;
+            }
+        }
+    }
+    result
 }
 
 pub(crate) fn launch_started_setup_jobs(

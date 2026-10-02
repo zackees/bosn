@@ -226,11 +226,24 @@ pub(crate) async fn recover_manifest_startup(
         };
         // `runtime` is deliberately retained through this check: successful
         // source proof must precede any registry/engine authority.
-        let _ = runtime;
         if !actor.manifest_recovery_authorized(contract.clone()).await? {
             events.push((
                 "manifest.recovery.refused_registry".into(),
                 "inactive_session_or_volume_intent".into(),
+            ));
+            continue;
+        }
+        if !matches!(
+            async_engine::timeout_at(
+                deadline,
+                executor.verify_profile(&runtime.plan, &contract.image_identity, &contract.name)
+            )
+            .await,
+            Ok(Ok(()))
+        ) {
+            events.push((
+                "manifest.recovery.refused_engine".into(),
+                "creation_profile_unproven".into(),
             ));
             continue;
         }

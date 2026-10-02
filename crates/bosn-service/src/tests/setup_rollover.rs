@@ -605,6 +605,7 @@ fn ensure_pipeline_does_not_reset_budget_and_never_mutates_after_prepare_or_owne
                 image_identity:
                     "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into(),
                 labels: BTreeMap::new(),
+                configuration: serde_json::Value::Null,
             }),
             command_result(0, Vec::new()),
         ))],
@@ -635,6 +636,8 @@ fn ensure_pipeline_does_not_reset_budget_and_never_mutates_after_prepare_or_owne
     });
     assert_eq!(mismatch.ensure_calls.lock().unwrap().len(), 1);
 
+    let image = recovery_fixture_image(&plan, TEST_IDENTITY);
+    let (observed, image_config, _) = recovery_fixture_proof(&plan, &image);
     let success = PipelineFakeEngine::new(
         [
             Ok(command_result(0, Vec::new())),
@@ -648,6 +651,14 @@ fn ensure_pipeline_does_not_reset_budget_and_never_mutates_after_prepare_or_owne
             Ok(bosn_setup::SetupEnsureResponse::Command(command_result(
                 0,
                 format!("{TEST_CONTAINER_ID}\n"),
+            ))),
+            Ok(bosn_setup::SetupEnsureResponse::Inspection(
+                Some(observed),
+                command_result(0, Vec::new()),
+            )),
+            Ok(bosn_setup::SetupEnsureResponse::Command(command_result(
+                0,
+                serde_json::to_vec(&image_config).unwrap(),
             ))),
             Ok(bosn_setup::SetupEnsureResponse::Command(command_result(
                 0,

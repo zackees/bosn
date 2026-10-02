@@ -716,6 +716,32 @@ impl Client {
         &self,
         request: ManifestAppTaskJobRequest,
     ) -> Result<u64, Error> {
+        self.submit_manifest_app_task_with_lease(request, None)
+            .await
+    }
+    /// Submit like [`Self::submit_manifest_app_task`], for a caller that
+    /// follows the job to its end by polling `job_status`/`job_logs`. The
+    /// daemon cancels the job (queued or running) once no poll has arrived
+    /// for `lease`, so a follower killed by SIGTERM, SIGHUP or SIGKILL does
+    /// not leave its job running to the deadline (#357). The lease must be
+    /// within [`FOLLOW_LEASE_MIN`]..=[`FOLLOW_LEASE_MAX`].
+    pub async fn follow_manifest_app_task(
+        &self,
+        request: ManifestAppTaskJobRequest,
+        lease: Duration,
+    ) -> Result<u64, Error> {
+        if !(FOLLOW_LEASE_MIN..=FOLLOW_LEASE_MAX).contains(&lease) {
+            return Err(Error::Protocol("invalid manifest app task follow lease"));
+        }
+        self.submit_manifest_app_task_with_lease(request, Some(lease))
+            .await
+    }
+    async fn submit_manifest_app_task_with_lease(
+        &self,
+        request: ManifestAppTaskJobRequest,
+        lease: Option<Duration>,
+    ) -> Result<u64, Error> {
+        let follow_lease_ms = lease.map_or(0, |lease| lease.as_millis() as u64);
         let workspace = request
             .workspace
             .to_str()
@@ -741,6 +767,7 @@ impl Client {
                 setup_task_name: request.task_name,
                 setup_deadline_ms: deadline_ms,
                 setup_output_limit: output_limit,
+                follow_lease_ms,
                 ..Request::operation(23)
             })
             .await?

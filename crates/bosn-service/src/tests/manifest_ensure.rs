@@ -74,7 +74,9 @@ fn daemon_start_reproves_then_starts_only_an_exact_stopped_manifest_container() 
         };
         let plan = manifest_stack_setup_plan(&request).await.unwrap();
         let content = plan.generation.strip_prefix("sha256:").unwrap();
-        let name = format!("bosn-setup-recovery-{content}");
+        let prepared = recovery_fixture_image(&plan.plan, TEST_IDENTITY);
+        let proof = recovery_fixture_proof(&plan.plan, &prepared);
+        let name = bosn_setup::setup_container_name(&plan.plan, &workspace, &prepared).unwrap();
         let execution = SetupEnsureExecution {
             receipt: "seed".into(),
             resource: SetupEnsureResource {
@@ -85,10 +87,10 @@ fn daemon_start_reproves_then_starts_only_an_exact_stopped_manifest_container() 
                 workspace: plan.plan.workspace_root.to_string_lossy().into_owned(),
             },
             image: SetupEnsureImageResource {
-                id: "manifest-image:sha256:recovery-test".into(),
-                name: "manifest-image:sha256:recovery-test".into(),
+                id: "manifest-image:verified-fixture".into(),
+                name: "manifest-image:verified-fixture".into(),
                 stack: "app".into(),
-                generation: "sha256:recovery-test".into(),
+                generation: TEST_IDENTITY.into(),
                 workspace: plan.plan.workspace_root.to_string_lossy().into_owned(),
             },
             volumes: Vec::new(),
@@ -112,6 +114,7 @@ fn daemon_start_reproves_then_starts_only_an_exact_stopped_manifest_container() 
                 container: name,
             })),
             starts: AtomicUsize::new(0),
+            proof: Some(proof),
         });
         let server = async_engine::launch(
             Service::new(state.clone())
@@ -209,6 +212,7 @@ fn daemon_start_refuses_manifest_source_drift_without_inspecting_or_starting() {
                     container: name.clone(),
                 })),
                 starts: AtomicUsize::new(0),
+                proof: None,
             });
             let server = async_engine::launch(
                 Service::new(state.clone())
@@ -253,6 +257,7 @@ fn daemon_start_refuses_manifest_source_drift_without_inspecting_or_starting() {
                     container: name.clone(),
                 })),
                 starts: AtomicUsize::new(0),
+                proof: None,
             });
             let server = async_engine::launch(
                 Service::new(state.clone())

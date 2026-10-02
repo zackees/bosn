@@ -515,6 +515,10 @@ pub(crate) struct Request {
     /// Operation 36: one JSON-encoded [`ci::CiRequest`].
     #[prost(string, tag = "22")]
     pub(crate) ci_request: String,
+    /// Manifest app task only: cancel the job once its follower has not
+    /// polled for this many milliseconds (#357). Zero means no lease.
+    #[prost(uint64, tag = "23")]
+    pub(crate) follow_lease_ms: u64,
 }
 impl Request {
     pub(crate) fn operation(operation: u32) -> Self {
@@ -541,6 +545,7 @@ impl Request {
             unmanaged_include: Vec::new(),
             unmanaged_ttl_seconds: 0,
             ci_request: String::new(),
+            follow_lease_ms: 0,
         }
     }
 }

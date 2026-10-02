@@ -1,7 +1,10 @@
 //! Bounded daemon-owned admission policy. Engine execution is deliberately
 //! outside this module: only validated semantic jobs may reach that layer.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    time::{Duration, Instant},
+};
 
 pub const DEFAULT_MAX_LOG_RECORDS: usize = 5_000;
 /// Keep a complete page well below the daemon frame cap, including protobuf
@@ -73,6 +76,14 @@ struct Slot {
     active: Option<u64>,
     pending: Option<u64>,
 }
+/// A follower's promise to keep polling a job (#357). `bosn run` streams a
+/// job until it ends; when it dies (SIGTERM, SIGHUP, SIGKILL, a crash) the
+/// polls stop, and the job is cancelled instead of running to its deadline.
+#[derive(Clone, Copy, Debug)]
+struct Lease {
+    period: Duration,
+    seen: Instant,
+}
 pub struct Jobs {
     max_running: usize,
     max_logs: usize,
@@ -86,6 +97,8 @@ pub struct Jobs {
     /// actor drains this handoff and attaches the semantic executor; the
     /// scheduler itself never knows about Docker or process ownership.
     started: VecDeque<u64>,
+    /// Follow leases of unfinished jobs; see [`Lease`].
+    leases: BTreeMap<u64, Lease>,
 }
 
 impl Jobs {
@@ -169,6 +182,36 @@ impl Jobs {
             self.started.push_back(id);
         }
     }
+    /// Attach a follow lease to an unfinished job. Leasing a job again keeps
+    /// the shorter period.
+    pub fn lease(&mut self, id: u64, period: Duration, now: Instant) {
+        if self.jobs.get(&id).is_none_or(|job| job.state.terminal()) {
+            return;
+        }
+        let lease = self.leases.entry(id).or_insert(Lease { period, seen: now });
+        lease.period = lease.period.min(period);
+        lease.seen = now;
+    }
+    /// A status or log poll for a job renews its lease, if it has one.
+    pub fn touch(&mut self, id: u64, now: Instant) {
+        if let Some(lease) = self.leases.get_mut(&id) {
+            lease.seen = now;
+        }
+    }
+    /// Queued or running jobs whose follower has not polled within its lease.
+    /// A job already cancelling is left to finish.
+    pub fn expired_leases(&self, now: Instant) -> Vec<u64> {
+        self.leases
+            .iter()
+            .filter(|(id, lease)| {
+                now.saturating_duration_since(lease.seen) > lease.period
+                    && self.jobs.get(id).is_some_and(|job| {
+                        matches!(job.state, JobState::Queued | JobState::Running)
+                    })
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
     /// Drain newly admitted running jobs exactly once.
     pub fn take_started(&mut self) -> Vec<u64> {
         self.started.drain(..).collect()
@@ -241,6 +284,7 @@ impl Jobs {
         let j = self.jobs.get_mut(&id).unwrap();
         j.state = state;
         j.error = error;
+        self.leases.remove(&id);
         if was_running {
             self.running -= 1
         }
@@ -328,6 +372,7 @@ impl Default for Jobs {
             slots: BTreeMap::new(),
             queue: VecDeque::new(),
             started: VecDeque::new(),
+            leases: BTreeMap::new(),
         }
     }
 }
@@ -389,6 +434,68 @@ mod tests {
         assert_eq!(page.retained_from, 1);
         assert_eq!(page.records, vec![(1, "b".into())]);
         assert_eq!(page.next, 2);
+    }
+
+    #[test]
+    fn a_follow_lease_expires_for_queued_and_running_jobs_until_polled() {
+        let mut jobs = Jobs::new(1);
+        let start = Instant::now();
+        let lease = Duration::from_secs(30);
+        let running = match jobs.submit("a", "s", "x").unwrap() {
+            Submission::Started(id) => id,
+            other => panic!("{other:?}"),
+        };
+        let queued = match jobs.submit("b", "s", "x").unwrap() {
+            Submission::Queued(id) => id,
+            other => panic!("{other:?}"),
+        };
+        let unleased = match jobs.submit("c", "s", "x").unwrap() {
+            Submission::Queued(id) => id,
+            other => panic!("{other:?}"),
+        };
+        jobs.lease(running, lease, start);
+        jobs.lease(queued, lease, start);
+        assert!(jobs.expired_leases(start + lease).is_empty(), "not yet");
+
+        // Polling one job renews only that job's lease.
+        jobs.touch(running, start + Duration::from_secs(20));
+        let later = start + Duration::from_secs(31);
+        assert_eq!(jobs.expired_leases(later), vec![queued]);
+        let much_later = start + Duration::from_secs(51);
+        assert_eq!(jobs.expired_leases(much_later), vec![running, queued]);
+        assert!(!jobs.expired_leases(much_later).contains(&unleased));
+
+        // A queued job that expires is cancelled before it ever starts.
+        jobs.cancel(queued).unwrap();
+        assert_eq!(jobs.jobs[&queued].state, JobState::Cancelled);
+        // A running one is left to its executor once it is cancelling.
+        jobs.cancel(running).unwrap();
+        assert!(jobs.expired_leases(much_later).is_empty());
+        jobs.settle(running, false).unwrap();
+        assert!(jobs.leases.is_empty(), "finished jobs forget their lease");
+
+        // The slot passes to the unleased job, which never expires.
+        assert_eq!(jobs.jobs[&unleased].state, JobState::Running);
+        assert!(
+            jobs.expired_leases(start + Duration::from_secs(3600))
+                .is_empty()
+        );
+
+        // A second follower can only shorten a lease; a finished job cannot
+        // be leased again.
+        let next = match jobs.submit("d", "s", "x").unwrap() {
+            Submission::Queued(id) => id,
+            other => panic!("{other:?}"),
+        };
+        jobs.lease(next, lease, start);
+        jobs.lease(next, Duration::from_secs(5), start);
+        assert_eq!(
+            jobs.expired_leases(start + Duration::from_secs(6)),
+            vec![next]
+        );
+        jobs.cancel(next).unwrap();
+        jobs.lease(next, lease, start);
+        assert!(jobs.leases.is_empty());
     }
 
     #[test]

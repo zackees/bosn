@@ -2,6 +2,10 @@
 
 use super::*;
 
+pub(crate) fn setup_container_resource_id(kind: &str, stack: &str, creation_name: &str) -> String {
+    format!("{kind}:{stack}:{creation_name}")
+}
+
 /// Docker-backed implementation of the deliberately narrow legacy-manifest
 /// runtime bridge. It translates only the accepted typed manifest shape into
 /// the existing finite image-prepare and ownership-safe ensure primitives;
@@ -99,15 +103,14 @@ impl ManifestEnsureExecutor for DockerManifestEnsureExecutor {
                     result.ensured.container_name
                 ),
                 resource: SetupEnsureResource {
-                    id: format!(
-                        "{}:{}:{}",
+                    id: setup_container_resource_id(
                         if is_guest {
                             "manifest-guest"
                         } else {
                             "manifest-container"
                         },
-                        request.stack,
-                        generation
+                        &request.stack,
+                        &result.ensured.container_name,
                     ),
                     name: result.ensured.container_name,
                     stack: request.stack.clone(),
@@ -313,6 +316,16 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                             .into(),
                     );
                 }
+                // #314: name the verified container and the checkout its
+                // binds were proven against, so a run in one worktree can be
+                // seen not to target another worktree's tree.
+                logs.send(format!(
+                    "[manifest-app-task] verified {} binds workspace {}",
+                    observed.container_name,
+                    plan.workspace_root.display()
+                ))
+                .await
+                .map_err(|_| "manifest app task log consumer closed".to_owned())?;
                 if cancellation.is_cancelled() || deadline.remaining().is_zero() {
                     return Err(
                         "manifest app task ended before exec; remote command was not started"
@@ -360,9 +373,12 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                     },
                 )
                 .await;
+                // A confirmed in-container stop (#357) is a known terminal
+                // outcome; only an unconfirmed one stays uncertain.
                 let outcome = match &result {
                     Ok(_) => "succeeded",
                     Err(bosn_setup::SetupTaskError::TaskFailed { .. }) => "failed",
+                    Err(bosn_setup::SetupTaskError::RemoteStopped(_)) => "stopped",
                     Err(_) => "uncertain",
                 };
                 session
@@ -374,6 +390,9 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                         "completed declared manifest task {} in managed container {} with image {}",
                         value.task_name, observed.container_name, value.image_identity
                     )),
+                    Err(error @ bosn_setup::SetupTaskError::RemoteStopped(_)) => {
+                        Err(format!("manifest app task ended early: {error}"))
+                    }
                     Err(bosn_setup::SetupTaskError::Cancelled)
                     | Err(bosn_setup::SetupTaskError::Deadline) => Err(
                         "manifest app task exec client ended; remote command completion is unknown"

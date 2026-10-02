@@ -25,15 +25,54 @@ permissions:
   contents: read
 
 jobs:
-  select-tier:
-    name: Select CI tier
+  # GATE-002/003 (zackees/ci.yml#166, bosn#361): the head commit carries a
+  # tree-bound `Local-Gate:` attestation from `ci-lint local-gate run`
+  # (local-gate.toml), and every other job needs this one. It supersedes the
+  # former GEN-021 shadow reuse report: attestations are the authoritative
+  # record of what passed locally. mode = shadow (local-gate.toml): a missing
+  # or stale attestation is reported, not enforced, until `first-pass` shows
+  # attested heads are the norm.
+  verify:
+    name: Verify local gate
     runs-on: ubuntu-latest
-    # Read-only grants for the shadow reuse decision below (PR association,
-    # commit trees, run/job lists). Nothing here writes.
+    timeout-minutes: 5
+    outputs:
+      attested: ${{ steps.verify.outputs.attested }}
+      state: ${{ steps.verify.outputs.state }}
+      trusted: ${{ steps.verify.outputs.trusted }}
+      trust_reason: ${{ steps.verify.outputs.trust_reason }}
+      # GATE-010: true only when the head passes [gate.trust] and attests
+      # every gate ci-attestations.yml maps to the job (never in shadow).
+      skip_rust: ${{ steps.verify.outputs.skip_rust }}
+      skip_lint-no-macos-runners: ${{ steps.verify.outputs.skip_lint-no-macos-runners }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: zackees/ci.yml
+          ref: c87f1a2b88c07037d5c10a8e8ff27dd25895eab9
+          path: .ci-lint
+          persist-credentials: false
+          sparse-checkout: ci_lint
+      - name: Verify the local-gate attestation and decide attested skips
+        id: verify
+        run: PYTHONPATH=.ci-lint python3 -m ci_lint local-gate verify --repo . --trust --github-output
+
+  # GATE-010 side entries: publish each valid Ci-Attestation of this commit
+  # as its own tiny lineage-keyed cache entry. Nothing waits on it.
+  ci-pre:
+    uses: ./.github/workflows/ci-pre.yml
     permissions:
       contents: read
-      actions: read
-      pull-requests: read
+
+  select-tier:
+    name: Select CI tier
+    needs: [verify]
+    runs-on: ubuntu-latest
     outputs:
       tier: ${{ steps.select.outputs.tier }}
       test: ${{ steps.select.outputs.test }}
@@ -54,43 +93,13 @@ jobs:
           --manual-sha "$MANUAL_SHA"
           --output "$GITHUB_OUTPUT"
 
-      # GEN-021 verified reuse, SHADOW mode only (zackees/ci.yml#162): on a
-      # main push, report in the step summary whether this commit's tree is
-      # identical to a PR head whose CI passed every job below. It never skips
-      # anything (shadow always yields reuse=false), sets no job output, and
-      # both steps are continue-on-error so a failure cannot turn CI red.
-      - name: Check out ci-lint (shadow reuse decision)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        continue-on-error: true
-        timeout-minutes: 3
-        uses: actions/checkout@v4
-        with:
-          repository: zackees/ci.yml
-          ref: b93b8c4a20ce3cd476c75a278ad01a31bde2438b
-          path: .ci-lint
-          persist-credentials: false
-
-      - name: Verified reuse decision (GEN-021, shadow)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        continue-on-error: true
-        timeout-minutes: 3
-        working-directory: .ci-lint
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: >-
-          python3 -m ci_lint reuse-check --workflow ci.yml --mode shadow
-          --required-job "CI policy (no hosted macOS runners)"
-          --required-job "Rust workspace (locked tests)"
-          --required-job "Linux (lint + unit + docker)"
-          --required-job "Native wheel (ubuntu-latest)"
-          --required-job "Native wheel (windows-latest)"
-          --required-job "Darwin wheel (x86_64-apple-darwin, Linux-hosted Soldr)"
-          --required-job "Darwin wheel (aarch64-apple-darwin, Linux-hosted Soldr)"
-
   lint-no-macos-runners:
     # Legacy required-check name in branch protection. The implementation now
     # permits hosted Macs only in ci-full and release; keep this status stable.
     name: CI policy (no hosted macOS runners)
+    needs: [verify]
+    # GATE-008/010: skipped only for an attested, trusted PR head.
+    if: needs.verify.outputs.skip_lint-no-macos-runners != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -107,6 +116,9 @@ jobs:
 
   rust:
     name: Rust workspace (locked tests)
+    needs: [verify]
+    # GATE-008/010: skipped only for an attested, trusted PR head.
+    if: needs.verify.outputs.skip_rust != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -123,6 +135,16 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install uv for isolated compiler fixtures
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Soldr
+        uses: zackees/setup-soldr@fe965fc7e2c5203570072e1d0fd19d0935d98e39
+        with:
+          version: "0.9.27"
+          toolchain: "1.95.0"
+          prebuild-deps: none
+
       - name: Restore Cargo build cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -136,7 +158,7 @@ jobs:
       - name: Verify kernal-api boundary and locked resolution
         run: |
           python3 ci/verify_kernel_boundary.py
-          cargo metadata --locked --format-version 1 --no-deps > /dev/null
+          soldr cargo metadata --locked --format-version 1 --no-deps > /dev/null
 
       # Deliberately does not include --ignored: Docker and Hermes acceptance
       # cases retain their explicit opt-in prerequisites and dedicated proofs.
@@ -144,8 +166,8 @@ jobs:
       # unit tests instead link the selected CPython explicitly.
       - name: Test Rust workspace
         run: |
-          cargo test --workspace --exclude bosn-python --locked
-          PYO3_PYTHON="$(command -v python)" cargo test -p bosn-python --lib --locked --no-default-features --features embedded-python-tests
+          soldr cargo test --workspace --exclude bosn-python --locked
+          PYO3_PYTHON="$(command -v python)" soldr cargo test -p bosn-python --lib --locked --no-default-features --features embedded-python-tests
 
   linux:
     name: Linux (lint + unit + docker)
@@ -262,6 +284,14 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Set up Soldr for the wheel backend
+        if: needs.select-tier.outputs.full == 'true'
+        uses: zackees/setup-soldr@fe965fc7e2c5203570072e1d0fd19d0935d98e39
+        with:
+          version: "0.9.27"
+          toolchain: "1.95.0"
+          prebuild-deps: none
+
       # No OpenSSL bootstrap on Windows: kernal-api's http-client uses reqwest
       # default-tls, which is native-tls/SChannel on MSVC, so openssl-sys is not
       # in the Windows graph (soldr#3231). ci/lint_no_vcpkg_bootstrap.py guards it.
@@ -355,7 +385,7 @@ jobs:
       # Soldr prepared, rather than relying on a host default target set.
       - name: Install Rust standard library for Darwin target
         if: needs.select-tier.outputs.full == 'true'
-        run: rustup target add "${{ matrix.target }}" --toolchain 1.95.0
+        run: soldr rustup target add "${{ matrix.target }}" --toolchain 1.95.0
 
       - name: Install uv
         if: needs.select-tier.outputs.full == 'true'

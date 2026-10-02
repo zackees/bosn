@@ -53,6 +53,9 @@ pub(crate) enum JobCommand {
     },
     SubmitManifestAppTask {
         request: ManifestAppTaskJobRequest,
+        /// Cancel the job once no status/log poll arrives for this long
+        /// (#357). `None` keeps the job running to its deadline.
+        follow_lease: Option<Duration>,
         reply: async_engine::OneshotSender<Result<u64, Error>>,
     },
     /// The job actor, rather than an executor task, owns the transition from
@@ -302,10 +305,15 @@ impl JobActor {
     pub(crate) async fn submit_manifest_app_task(
         &self,
         request: ManifestAppTaskJobRequest,
+        follow_lease: Option<Duration>,
     ) -> Result<u64, Error> {
         let (reply, wait) = async_engine::oneshot_channel();
         self.sender
-            .send(JobCommand::SubmitManifestAppTask { request, reply })
+            .send(JobCommand::SubmitManifestAppTask {
+                request,
+                follow_lease,
+                reply,
+            })
             .await
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?

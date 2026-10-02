@@ -125,6 +125,9 @@ impl Service {
             }
             Err(error) => return Err(Error::Io(error)),
         };
+        let act_owner = registry.registry_id()?;
+        let act_image_proofs = act_engine::bundled_engine_manifests()
+            .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?;
         let ep = endpoint(&self.state_dir)?;
         if ep.target_exists()? {
             retire_stale_socket(&ep)?;
@@ -156,6 +159,42 @@ impl Service {
             #[cfg(test)]
             None,
         ));
+        // The sole registry writer fences stale Act claims before this daemon
+        // accepts any new execution. A failed seal is fatal: the control plane
+        // must never admit work while startup interruption remains available.
+        let act_recovery = act_runtime::recover_startup_act_engines(
+            &actor,
+            &DockerEngine::docker(),
+            &act_owner,
+            &act_image_proofs,
+            act_runtime::ActStartupRecoveryOptions {
+                page_size: 64,
+                max_runs: 10000,
+                deadline: Duration::from_secs(120),
+            },
+            &self.stop.token(),
+        )
+        .await;
+        match act_recovery {
+            Ok(report) => {
+                for run in report.runs {
+                    if let Some(reason) = run.deferred_reason {
+                        eprintln!(
+                            "bosn Act startup cleanup deferred for {}: {reason}",
+                            run.run_id
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                jobs.stop().await;
+                drop(jobs);
+                let _ = job_worker.await;
+                actor.stop().await;
+                let _ = worker.await;
+                return Err(Error::Io(error));
+            }
+        }
         // Recovery runs before accepting user requests so a newly submitted
         // task cannot race a stopped-container restart. Failure to inspect a
         // local Docker daemon is recorded as a bounded recovery outcome when

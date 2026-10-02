@@ -19,6 +19,8 @@ WORKFLOW = Path(".github/workflows/auto-release.yml")
 ZEROS = "0" * 40
 # Hermetic git: a developer's global config (e.g. `tag.gpgSign`) must not change the result.
 HERMETIC_GIT = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+# Hermetic shell: startup files a host injects into every non-interactive shell.
+HOST_SHELL_STARTUP = frozenset({"BASH_ENV", "ENV"})
 
 pytestmark = pytest.mark.skipif(
     shutil.which("git") is None or shutil.which("bash") is None, reason="needs git and bash"
@@ -92,7 +94,9 @@ def run_guard(
     output = tmp_path / "output"
     output.write_text("", encoding="utf-8")
     env = {
-        **os.environ,
+        # BASH_ENV (and sh's ENV) run in every non-interactive shell, so a host's could
+        # rewrite PATH after it is set here and shadow the fake gh.
+        **{k: v for k, v in os.environ.items() if k not in HOST_SHELL_STARTUP},
         **HERMETIC_GIT,
         "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
         "GITHUB_OUTPUT": str(output),
@@ -201,3 +205,27 @@ def test_a_tag_off_main_is_refused(repo: Path, tmp_path: Path) -> None:
     git(repo, "checkout", "-q", "main")
     code, _ = run_guard(repo, tmp_path, event="push", ref_type="tag", ref_name="v0.1.5")
     assert code == 1
+
+
+# --- the guard sees only the fake gh, whatever the host's shell setup ---------
+
+
+def test_a_host_bash_env_cannot_put_another_gh_ahead_of_the_fake(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Some dev hosts (e.g. an agent shell) export BASH_ENV pointing at a script that
+    # re-prepends its own shim directory to PATH in every non-interactive bash. That
+    # shadowed the fake gh with the real one, which asked GitHub instead.
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    real_gh = shim / "gh"
+    real_gh.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+    real_gh.chmod(real_gh.stat().st_mode | stat.S_IEXEC)
+    bash_env = tmp_path / "bash_env.sh"
+    bash_env.write_text(f'PATH="{shim}:$PATH"; export PATH\n', encoding="utf-8")
+    monkeypatch.setenv("BASH_ENV", str(bash_env))
+    monkeypatch.setenv("ENV", str(bash_env))
+    before = commit(repo, "0.1.4", "release 0.1.4")
+    commit(repo, "0.1.5", "bump")
+    code, out = run_guard(repo, tmp_path, event="push", before=before, released={"v0.1.5"})
+    assert (code, out["release"]) == (0, "false")
