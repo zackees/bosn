@@ -36,8 +36,25 @@ Ctrl-C on the client does not reach it). It then submits the stack's ensure
 (skipped with `--no-ensure`), which reuses the exact running container when
 the generation is unchanged, and the declared task. Each job's logs are
 streamed as they arrive: the task's stdout goes to stdout, its stderr and all
-daemon progress to stderr, and every ensure record to stderr. Ctrl-C cancels
-the running job and exits 130. The exit status is the task's own exit status
+daemon progress to stderr, and every ensure record to stderr. Before
+following the task it prints `bosn run: job N` with the exact `bosn job
+cancel --state-dir … --job-id N` command, and it says so while the job is
+queued behind other jobs on the daemon. Ctrl-C cancels the running job and
+exits 130.
+
+The task is submitted with a 30-second follow lease (#357). The client polls
+every 200 ms. If no poll arrives within the lease, the daemon cancels the job,
+whether it is queued or running. This covers a client killed by SIGTERM,
+SIGHUP or SIGKILL, or a parent session that died; without the lease the job
+would run on to its deadline. Jobs submitted without a lease (`manifest
+app-task`, MCP, the Python client) are unchanged and outlive their caller. A
+cancelled, timed-out or output-limited task exec is followed by a stop in the
+same container. Every exec carries a random `BOSN_TASK_TOKEN`, which all of its
+processes inherit. The stop sends SIGINT, then SIGTERM, then SIGKILL, each
+after a 10-second grace, to exactly the processes carrying that marker, so an
+`act` run tears down its job containers rather than running on. Only a
+confirmed stop clears the job's execution session; otherwise it stays
+`uncertain`. The exit status is the task's own exit status
 (0 on success); a Bosn-side refusal or failure exits 1 with a `bosn run:`
 message, and bad arguments exit 2. `bosn run --stack NAME` only ensures.
 

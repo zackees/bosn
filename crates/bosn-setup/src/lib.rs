@@ -60,6 +60,8 @@ pub use task::{
     SetupTaskEngine, SetupTaskError, SetupTaskMount, SetupTaskRequest, SetupTaskResult,
     execute_setup_app_task, execute_setup_task,
 };
+mod task_stop;
+pub use task_stop::TASK_TOKEN_ENV;
 
 /// The current durable cache-record wire version.  It is intentionally
 /// independent of the setup-document schema version.

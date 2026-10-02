@@ -49,7 +49,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 pub mod act_archive;
 #[cfg(target_os = "linux")]
@@ -85,6 +85,10 @@ const MANIFEST_LINUX_IDLE_COMMAND: &str =
 /// the output ceiling stays bounded.
 pub const MANIFEST_MAX_DEADLINE: Duration = Duration::from_secs(4 * 60 * 60);
 pub const MANIFEST_MAX_OUTPUT: usize = 64 * 1024 * 1024;
+/// Bounds of a manifest app task's follow lease (#357): long enough to
+/// survive a busy host, short enough that a killed follower's job stops soon.
+pub const FOLLOW_LEASE_MIN: Duration = Duration::from_secs(1);
+pub const FOLLOW_LEASE_MAX: Duration = Duration::from_secs(10 * 60);
 const SETUP_PREPARE_COMMAND_QUEUE: usize = 64;
 const SETUP_PREPARE_EVENT_QUEUE: usize = 16;
 /// Manifest builds and tasks (for example `act` running a CI job) emit
@@ -1622,9 +1626,12 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                     },
                 )
                 .await;
+                // A confirmed in-container stop (#357) is a known terminal
+                // outcome; only an unconfirmed one stays uncertain.
                 let outcome = match &result {
                     Ok(_) => "succeeded",
                     Err(bosn_setup::SetupTaskError::TaskFailed { .. }) => "failed",
+                    Err(bosn_setup::SetupTaskError::RemoteStopped(_)) => "stopped",
                     Err(_) => "uncertain",
                 };
                 session
@@ -1636,6 +1643,9 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                         "completed declared manifest task {} in managed container {} with image {}",
                         value.task_name, observed.container_name, value.image_identity
                     )),
+                    Err(error @ bosn_setup::SetupTaskError::RemoteStopped(_)) => {
+                        Err(format!("manifest app task ended early: {error}"))
+                    }
                     Err(bosn_setup::SetupTaskError::Cancelled)
                     | Err(bosn_setup::SetupTaskError::Deadline) => Err(
                         "manifest app task exec client ended; remote command completion is unknown"
@@ -3674,6 +3684,7 @@ impl SetupAppTaskExecutor for DockerSetupAppTaskExecutor {
             let outcome = match &result {
                 Ok(_) => "succeeded",
                 Err(bosn_setup::SetupTaskError::TaskFailed { .. }) => "failed",
+                Err(bosn_setup::SetupTaskError::RemoteStopped(_)) => "stopped",
                 Err(_) => "uncertain",
             };
             let finished = session.finish(outcome).await;
@@ -3688,6 +3699,9 @@ impl SetupAppTaskExecutor for DockerSetupAppTaskExecutor {
                     "completed declared app task {} in managed container {} with image {}",
                     result.task_name, observed.container_name, result.image_identity
                 )),
+                Err(error @ bosn_setup::SetupTaskError::RemoteStopped(_)) => {
+                    Err(format!("setup app task ended early: {error}"))
+                }
                 // `docker exec` cancellation kills the local client only. Do
                 // not report that this stopped the command in the app.
                 Err(bosn_setup::SetupTaskError::Cancelled)
@@ -5337,6 +5351,32 @@ impl Client {
         &self,
         request: ManifestAppTaskJobRequest,
     ) -> Result<u64, Error> {
+        self.submit_manifest_app_task_with_lease(request, None)
+            .await
+    }
+    /// Submit like [`Self::submit_manifest_app_task`], for a caller that
+    /// follows the job to its end by polling `job_status`/`job_logs`. The
+    /// daemon cancels the job (queued or running) once no poll has arrived
+    /// for `lease`, so a follower killed by SIGTERM, SIGHUP or SIGKILL does
+    /// not leave its job running to the deadline (#357). The lease must be
+    /// within [`FOLLOW_LEASE_MIN`]..=[`FOLLOW_LEASE_MAX`].
+    pub async fn follow_manifest_app_task(
+        &self,
+        request: ManifestAppTaskJobRequest,
+        lease: Duration,
+    ) -> Result<u64, Error> {
+        if !(FOLLOW_LEASE_MIN..=FOLLOW_LEASE_MAX).contains(&lease) {
+            return Err(Error::Protocol("invalid manifest app task follow lease"));
+        }
+        self.submit_manifest_app_task_with_lease(request, Some(lease))
+            .await
+    }
+    async fn submit_manifest_app_task_with_lease(
+        &self,
+        request: ManifestAppTaskJobRequest,
+        lease: Option<Duration>,
+    ) -> Result<u64, Error> {
+        let follow_lease_ms = lease.map_or(0, |lease| lease.as_millis() as u64);
         let workspace = request
             .workspace
             .to_str()
@@ -5362,6 +5402,7 @@ impl Client {
                 setup_task_name: request.task_name,
                 setup_deadline_ms: deadline_ms,
                 setup_output_limit: output_limit,
+                follow_lease_ms,
                 ..Request::operation(23)
             })
             .await?
@@ -5647,6 +5688,9 @@ enum JobCommand {
     },
     SubmitManifestAppTask {
         request: ManifestAppTaskJobRequest,
+        /// Cancel the job once no status/log poll arrives for this long
+        /// (#357). `None` keeps the job running to its deadline.
+        follow_lease: Option<Duration>,
         reply: async_engine::OneshotSender<Result<u64, Error>>,
     },
     /// The job actor, rather than an executor task, owns the transition from
@@ -5874,10 +5918,15 @@ impl JobActor {
     async fn submit_manifest_app_task(
         &self,
         request: ManifestAppTaskJobRequest,
+        follow_lease: Option<Duration>,
     ) -> Result<u64, Error> {
         let (reply, wait) = async_engine::oneshot_channel();
         self.sender
-            .send(JobCommand::SubmitManifestAppTask { request, reply })
+            .send(JobCommand::SubmitManifestAppTask {
+                request,
+                follow_lease,
+                reply,
+            })
             .await
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
@@ -5903,12 +5952,58 @@ async fn job_actor(
     let mut setup_kinds: BTreeMap<u64, SetupJobKind> = BTreeMap::new();
     let mut cancellations: BTreeMap<u64, CancellationSource> = BTreeMap::new();
     let mut tasks = async_engine::TaskGroup::new();
-    let mut stopping = None;
-    while let Some(command) = receiver.recv().await {
+    let mut stopping: Option<async_engine::OneshotSender<()>> = None;
+    loop {
+        // Wake at least once per sweep interval so a job whose follower
+        // vanished is cancelled even when no other command arrives.
+        let command = match async_engine::timeout(LEASE_SWEEP_INTERVAL, receiver.recv()).await {
+            Ok(Some(command)) => Some(command),
+            Ok(None) => break,
+            Err(_) => None,
+        };
         while matches!(
             async_engine::timeout(Duration::ZERO, tasks.join_next()).await,
             Ok(Some(_))
         ) {}
+        if stopping.is_none() {
+            for id in jobs.expired_leases(Instant::now()) {
+                let _ = jobs.log(
+                    id,
+                    "[bosn] cancelling: the client following this job stopped polling (it exited or was killed)"
+                        .into(),
+                );
+                let _ = cancel_job_in_actor(
+                    id,
+                    &mut jobs,
+                    &mut requests,
+                    &mut setup_kinds,
+                    &cancellations,
+                    &registry,
+                )
+                .await;
+            }
+        }
+        let Some(command) = command else {
+            if stopping.is_none() {
+                // Cancelling a queued job can hand its slot to the next one.
+                launch_started_setup_jobs(
+                    &mut jobs,
+                    &mut requests,
+                    &mut cancellations,
+                    &mut tasks,
+                    &executors,
+                    sender.clone(),
+                    registry.clone(),
+                );
+            } else if cancellations.is_empty() {
+                while tasks.join_next().await.is_some() {}
+                if let Some(reply) = stopping.take() {
+                    let _ = reply.send(());
+                }
+                return;
+            }
+            continue;
+        };
         match command {
             JobCommand::Submit {
                 workspace,
@@ -5928,25 +6023,19 @@ async fn job_actor(
                 let _ = reply.send(result);
             }
             JobCommand::Status { id, reply } => {
+                jobs.touch(id, Instant::now());
                 let _ = reply.send(jobs.job(id).map_err(|_| Error::Protocol("unknown job")));
             }
             JobCommand::Cancel { id, reply } => {
-                let result = jobs.cancel(id).map_err(|_| Error::Protocol("job cancel"));
-                if result.is_ok() {
-                    if let Some(cancellation) = cancellations.get(&id) {
-                        cancellation.cancel();
-                    } else if jobs.job(id).is_ok_and(|job| job.state.terminal()) {
-                        requests.remove(&id);
-                        if setup_kinds.remove(&id) == Some(SetupJobKind::Ensure) {
-                            let _ = registry
-                                .append_setup_ensure_events(vec![SetupEnsureEvent::terminal(
-                                    id,
-                                    SetupEnsureEventOutcome::Cancelled,
-                                )])
-                                .await;
-                        }
-                    }
-                }
+                let result = cancel_job_in_actor(
+                    id,
+                    &mut jobs,
+                    &mut requests,
+                    &mut setup_kinds,
+                    &cancellations,
+                    &registry,
+                )
+                .await;
                 let _ = reply.send(result);
             }
             JobCommand::Logs {
@@ -5955,6 +6044,7 @@ async fn job_actor(
                 limit,
                 reply,
             } => {
+                jobs.touch(id, Instant::now());
                 let _ = reply.send(
                     jobs.log_page(id, after, limit)
                         .map_err(|_| Error::Protocol("unknown job")),
@@ -6177,7 +6267,11 @@ async fn job_actor(
                     registry.clone(),
                 );
             }
-            JobCommand::SubmitManifestAppTask { request, reply } => {
+            JobCommand::SubmitManifestAppTask {
+                request,
+                follow_lease,
+                reply,
+            } => {
                 let digest = manifest_app_task_digest(&request);
                 let workspace = request.workspace.to_string_lossy().into_owned();
                 let job_stack = format!("manifest-app-task:{}", request.stack);
@@ -6186,16 +6280,22 @@ async fn job_actor(
                     .map(|submission| match submission {
                         Submission::Started(id) | Submission::Queued(id) => {
                             requests.insert(id, SetupJobRequest::ManifestAppTask(request));
-                            id
+                            (id, true)
                         }
-                        Submission::Joined(id) => id,
+                        Submission::Joined(id) => (id, false),
                         Submission::Superseded { replacement, .. } => {
                             requests.insert(replacement, SetupJobRequest::ManifestAppTask(request));
-                            replacement
+                            (replacement, true)
                         }
                     })
                     .map_err(|_| Error::Protocol("manifest app task job admission"));
-                let _ = reply.send(result);
+                // Only the submission that created the job sets its lease: a
+                // follower joining another caller's unleased job must not make
+                // that job depend on this follower staying alive.
+                if let (Ok((id, true)), Some(period)) = (&result, follow_lease) {
+                    jobs.lease(*id, period, Instant::now());
+                }
+                let _ = reply.send(result.map(|(id, _)| id));
                 launch_started_setup_jobs(
                     &mut jobs,
                     &mut requests,
@@ -6396,6 +6496,39 @@ async fn job_actor(
             return;
         }
     }
+}
+
+/// How often the job actor checks follow leases when no command arrives.
+const LEASE_SWEEP_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Cancel one job: a queued job ends now, a running one is signalled and
+/// settles when its executor completes. Shared by `bosn job cancel` and the
+/// follow-lease sweep.
+async fn cancel_job_in_actor(
+    id: u64,
+    jobs: &mut Jobs,
+    requests: &mut BTreeMap<u64, SetupJobRequest>,
+    setup_kinds: &mut BTreeMap<u64, SetupJobKind>,
+    cancellations: &BTreeMap<u64, CancellationSource>,
+    registry: &RegistryActor,
+) -> Result<(), Error> {
+    let result = jobs.cancel(id).map_err(|_| Error::Protocol("job cancel"));
+    if result.is_ok() {
+        if let Some(cancellation) = cancellations.get(&id) {
+            cancellation.cancel();
+        } else if jobs.job(id).is_ok_and(|job| job.state.terminal()) {
+            requests.remove(&id);
+            if setup_kinds.remove(&id) == Some(SetupJobKind::Ensure) {
+                let _ = registry
+                    .append_setup_ensure_events(vec![SetupEnsureEvent::terminal(
+                        id,
+                        SetupEnsureEventOutcome::Cancelled,
+                    )])
+                    .await;
+            }
+        }
+    }
+    result
 }
 
 fn launch_started_setup_jobs(
@@ -10253,14 +10386,17 @@ async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Result<(), Er
             },
             23 => match validate_manifest_app_task_request_wire(&r) {
                 Ok(()) => match jobs
-                    .submit_manifest_app_task(ManifestAppTaskJobRequest {
-                        workspace: PathBuf::from(r.workspace),
-                        manifest: r.setup_config,
-                        stack: r.stack,
-                        task_name: r.setup_task_name,
-                        deadline: Duration::from_millis(r.setup_deadline_ms),
-                        output_limit: r.setup_output_limit as usize,
-                    })
+                    .submit_manifest_app_task(
+                        ManifestAppTaskJobRequest {
+                            workspace: PathBuf::from(r.workspace),
+                            manifest: r.setup_config,
+                            stack: r.stack,
+                            task_name: r.setup_task_name,
+                            deadline: Duration::from_millis(r.setup_deadline_ms),
+                            output_limit: r.setup_output_limit as usize,
+                        },
+                        (r.follow_lease_ms != 0).then(|| Duration::from_millis(r.follow_lease_ms)),
+                    )
                     .await
                 {
                     Ok(job_id) => ReplyWire {
@@ -10889,6 +11025,10 @@ struct Request {
     unmanaged_include: Vec<String>,
     #[prost(uint64, tag = "21")]
     unmanaged_ttl_seconds: u64,
+    /// Manifest app task only: cancel the job once its follower has not
+    /// polled for this many milliseconds (#357). Zero means no lease.
+    #[prost(uint64, tag = "22")]
+    follow_lease_ms: u64,
 }
 impl Request {
     fn operation(operation: u32) -> Self {
@@ -10914,6 +11054,7 @@ impl Request {
             setup_adopt_confirm: false,
             unmanaged_include: Vec::new(),
             unmanaged_ttl_seconds: 0,
+            follow_lease_ms: 0,
         }
     }
 }
@@ -11157,6 +11298,12 @@ fn validate_manifest_app_task_request_wire(request: &Request) -> Result<(), Erro
         || request.setup_adopt_confirm
     {
         return Err(Error::Protocol("nonsemantic manifest app task fields"));
+    }
+    if request.follow_lease_ms != 0
+        && !(FOLLOW_LEASE_MIN..=FOLLOW_LEASE_MAX)
+            .contains(&Duration::from_millis(request.follow_lease_ms))
+    {
+        return Err(Error::Protocol("invalid manifest app task follow lease"));
     }
     Ok(())
 }
@@ -11737,6 +11884,7 @@ fi
                 &engine,
                 bosn_setup::SetupAppTaskCommand::Exec {
                     container_name: "bosn-setup-test".into(),
+                    task_token: "0123456789abcdef0123456789abcdef".into(),
                     passthrough_env,
                     command: "true".into(),
                 },
@@ -11797,7 +11945,12 @@ fi
         // Ambient daemon env must not leak into the task either.
         let (lines, raw_stdout) = run_fake_docker_with_secrets(state.path(), &[]);
         assert!(raw_stdout.contains("env=unset"), "{raw_stdout}");
-        assert!(!raw_stdout.contains("--env"), "{raw_stdout}");
+        // The only forwarded variable is the per-exec stop marker (#357).
+        assert_eq!(raw_stdout.matches("--env").count(), 1, "{raw_stdout}");
+        assert!(
+            raw_stdout.contains("--env BOSN_TASK_TOKEN="),
+            "{raw_stdout}"
+        );
         assert!(!lines.join("\n").contains(CANARY));
     }
 
@@ -15265,6 +15418,131 @@ fi
             });
     }
 
+    /// Runs until its job is cancelled, like an `act` task would.
+    struct CancellableManifestAppTaskExecutor {
+        started: async_engine::Sender<String>,
+    }
+    impl ManifestAppTaskExecutor for CancellableManifestAppTaskExecutor {
+        fn execute<'a>(
+            &'a self,
+            request: ManifestAppTaskJobRequest,
+            cancellation: &'a async_engine::CancellationToken,
+            _logs: &'a async_engine::Sender<String>,
+            _session: &'a dyn ManifestAppTaskSessionRecorder,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async move {
+                let _ = self.started.send(request.task_name).await;
+                cancellation.cancelled().await;
+                Err("cancelled".into())
+            })
+        }
+    }
+
+    async fn next_task_start(wait: &mut async_engine::Receiver<String>) -> String {
+        async_engine::timeout(Duration::from_secs(5), wait.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// #357: a `bosn run` client killed by SIGTERM/SIGHUP/SIGKILL stops
+    /// polling. Its job, running or still queued, must be cancelled rather
+    /// than run on to its deadline; a job without a lease, or one whose
+    /// follower keeps polling, must not be.
+    #[test]
+    fn a_followed_app_task_is_cancelled_once_its_follower_stops_polling() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let state = temporary.path().join("state");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let (started, mut started_wait) = async_engine::channel(8);
+        let fake = Arc::new(CancellableManifestAppTaskExecutor { started });
+        let request = |task: &str| ManifestAppTaskJobRequest {
+            workspace: workspace.clone(),
+            manifest: "bosn.toml".into(),
+            stack: "app".into(),
+            task_name: task.into(),
+            deadline: Duration::from_secs(600),
+            output_limit: 4096,
+        };
+        RuntimeBuilder::multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let server = async_engine::launch(
+                    Service::new(state.clone())
+                        .with_manifest_app_task_executor(fake.clone())
+                        .serve(),
+                );
+                let client = wait_for_client(&state).await;
+                let lease = Duration::from_secs(1);
+                assert!(
+                    client
+                        .follow_manifest_app_task(request("bad"), Duration::from_millis(999))
+                        .await
+                        .is_err(),
+                    "a lease below the minimum is refused"
+                );
+
+                // A follower that goes silent, with a second job of its
+                // queued behind the first.
+                let running = client
+                    .follow_manifest_app_task(request("running"), lease)
+                    .await
+                    .unwrap();
+                assert_eq!(next_task_start(&mut started_wait).await, "running");
+                let queued = client
+                    .follow_manifest_app_task(request("queued"), lease)
+                    .await
+                    .unwrap();
+                async_engine::sleep(Duration::from_secs(3)).await;
+                assert_eq!(client.job_status(running).await.unwrap().state, "Cancelled");
+                assert_eq!(client.job_status(queued).await.unwrap().state, "Cancelled");
+                assert!(
+                    client
+                        .job_logs(running, 0, 16)
+                        .await
+                        .unwrap()
+                        .records
+                        .iter()
+                        .any(|record| record.line.contains("stopped polling")),
+                    "the job log says why it was cancelled"
+                );
+
+                // Without a lease, silence changes nothing (#12: the job
+                // outlives its CLI unless that CLI asked otherwise).
+                let unleased = client
+                    .submit_manifest_app_task(request("unleased"))
+                    .await
+                    .unwrap();
+                assert_eq!(next_task_start(&mut started_wait).await, "unleased");
+                async_engine::sleep(Duration::from_secs(2)).await;
+                assert_eq!(client.job_status(unleased).await.unwrap().state, "Running");
+                client.cancel_job(unleased).await.unwrap();
+                wait_for_job_state(&client, unleased, "Cancelled").await;
+
+                // A follower that keeps polling keeps its job.
+                let followed = client
+                    .follow_manifest_app_task(request("followed"), lease)
+                    .await
+                    .unwrap();
+                assert_eq!(next_task_start(&mut started_wait).await, "followed");
+                for _ in 0..12 {
+                    assert_eq!(client.job_status(followed).await.unwrap().state, "Running");
+                    async_engine::sleep(Duration::from_millis(200)).await;
+                }
+                async_engine::sleep(Duration::from_secs(3)).await;
+                assert_eq!(
+                    client.job_status(followed).await.unwrap().state,
+                    "Cancelled"
+                );
+
+                client.shutdown().await.unwrap();
+                stopped(server).await;
+            });
+    }
+
     #[test]
     fn uncertain_app_task_uses_verified_managed_receipt_identity_to_protect_gc() {
         let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
@@ -17019,6 +17297,7 @@ fi
                 setup_adopt_confirm: false,
                 unmanaged_include: Vec::new(),
                 unmanaged_ttl_seconds: 0,
+                follow_lease_ms: 0,
             }
             .encode(&mut payload)
             .unwrap();

@@ -43,8 +43,14 @@ unless Docker access is intentionally configured.
 
 ## Safety and recovery
 
-- Let `bosn run` own foreground execution. Ctrl-C cancels the daemon-owned job; an
-  interrupted exec is recorded as an uncertain session that protects its container.
+- Let `bosn run` own foreground execution. Ctrl-C cancels the daemon-owned job. So does
+  killing the client in any other way (SIGTERM, SIGHUP, SIGKILL): its 30-second follow
+  lease expires. A cancelled or timed-out task's processes are then stopped inside the
+  container. Only when that stop cannot be confirmed is the exec recorded as an uncertain
+  session that protects its container.
+- To stop a run, cancel its own job: `bosn run` prints `bosn job cancel --state-dir …
+  --job-id N`. Never `pkill`/`kill $(pgrep -f "bosn run …")`, because the pattern also
+  matches other sessions' runs.
 - Do not delete `bosn`-labeled resources manually while a task is active. Use `bosn gc` to
   inspect lifecycle decisions and `bosn done` when a workspace is finished.
 - Treat foreign registry warnings as protected state. Bosn intentionally cannot delete
