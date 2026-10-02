@@ -457,7 +457,7 @@ pub async fn run_on_engine(
         }
         match async_engine::timeout_at(
             deadline,
-            backend.list(held.engine(), &plan.invocation.workflow),
+            backend.list(held.engine(), &plan.invocation.workflow_arg()),
         )
         .await
         {

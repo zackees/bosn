@@ -105,6 +105,12 @@ impl Store {
     pub fn source(&self, id: &str) -> PathBuf {
         self.run_dir(id).join("source")
     }
+    /// bosn's rewrites of the run's workflow files (#424), mirroring
+    /// [`Self::source`]; act reads them through `--workflow-overlay`, so the
+    /// snapshot every job checks out stays the tree under test.
+    pub fn overlay(&self, id: &str) -> PathBuf {
+        overlay_beside(&self.source(id))
+    }
     pub fn event(&self, id: &str) -> PathBuf {
         self.run_dir(id).join("event.json")
     }
@@ -335,3 +341,9 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
     }
     Ok(())
 }
+
+/// The overlay directory that belongs to a run's `source` directory.
+pub fn overlay_beside(source: &Path) -> PathBuf {
+    source.with_file_name("overlay")
+}
+

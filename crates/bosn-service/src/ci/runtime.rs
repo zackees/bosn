@@ -732,19 +732,15 @@ impl CiRuntime {
     }
 
     /// Serve checkouts without a token (#335) and say how, naming every
-    /// repository fetched from GitHub. The rewrites are hidden from the
-    /// snapshot's Git index, so the job still sees a clean checkout (#394).
+    /// repository fetched from GitHub. The rewrites go to the run's overlay,
+    /// not the snapshot, so every job checks out the tree under test (#424).
     /// The same pass ends each POSIX `run:` step's output with a newline (#398)
     /// and confines jobs only GitHub can run (GATE-012, #400).
     fn localize_checkouts(&self, record: &RunRecord, observer: &mut RunObserver) {
         let source = self.store.source(&record.id);
-        match super::checkout::localize_tree(&source, &record.repository) {
+        let overlay = self.store.overlay(&record.id);
+        match super::checkout::localize_tree(&source, &overlay, &record.repository) {
             Ok(localized) => {
-                if let Err(error) = super::snapshot::hide_from_git(&source, &localized.files) {
-                    observer.note(&format!(
-                        "rewritten workflows show as edits to git: {error}"
-                    ));
-                }
                 if localized.own > 0 {
                     observer.note(&format!(
                         "{} actions/checkout step(s) of this repository are served from the frozen snapshot",

@@ -100,6 +100,11 @@ impl CiRuntime {
             invocation: ActInvocation {
                 event: record.event.clone(),
                 workflow: record.workflow.clone(),
+                workflow_overlaid: self
+                    .store
+                    .overlay(&record.id)
+                    .join(&record.workflow)
+                    .is_file(),
                 job: record.job.clone(),
                 cache_namespace: record.cache_namespace(),
                 secrets: self.secrets(record)?,
