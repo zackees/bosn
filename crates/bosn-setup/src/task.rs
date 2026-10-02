@@ -111,7 +111,7 @@ impl SetupAppTaskCommand {
                     args.push(name.clone());
                 }
                 args.push(container_name.clone());
-                args.extend(crate::shell::login_shell_args(command));
+                args.extend(crate::shell::task_shell_args(command));
                 args
             }
             Self::Stop {
@@ -164,7 +164,7 @@ impl SetupTaskCommand {
                     args.push(workdir.clone());
                 }
                 args.push(image_identity.clone());
-                args.extend(crate::shell::login_shell_args(command));
+                args.extend(crate::shell::task_shell_args(command));
                 args
             }
         }

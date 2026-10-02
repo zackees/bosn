@@ -11,25 +11,46 @@
 //! `exec`s the login shell, and the declared script re-prepends it after the
 //! profile: image entries come first, followed by whatever the profile set.
 //! The declared command text itself is unchanged and never quoted or parsed.
+//!
+//! A declared task also starts with umask `0022` (bosn#365): `docker exec`
+//! hands its process umask `0000`, so without it every file a task created was
+//! group- and world-writable. It is set before the login profile, as a host
+//! login sets it before `/etc/profile`, so an image whose profile chooses
+//! another umask (or a task command that runs `umask`) still decides.
 
 /// Non-login launcher: records the pre-profile `PATH` in `BOSN_IMAGE_PATH`;
 /// `$1` is the full login-shell script.
 const LAUNCHER: &str = r#"BOSN_IMAGE_PATH="$PATH"; export BOSN_IMAGE_PATH; exec sh -lc "$1""#;
+
+/// The umask every declared task starts under: the host and GitHub-runner
+/// default.
+const TASK_UMASK: &str = "umask 0022";
 
 /// First line of the login-shell script, run after the profile. An empty image
 /// `PATH` adds nothing (never an empty entry, which would mean the cwd).
 const RESTORE_IMAGE_PATH: &str =
     r#"PATH="${BOSN_IMAGE_PATH:+$BOSN_IMAGE_PATH:}$PATH"; export PATH; unset BOSN_IMAGE_PATH"#;
 
-/// The exact argv tail (after the image or container name) for one declared
-/// command: `sh -c LAUNCHER sh SCRIPT`, where the launcher runs
-/// `sh -lc SCRIPT` and `SCRIPT` is the `PATH` restore line followed by the
-/// declared command.
+/// The exact argv tail (after the image or container name) for a setup
+/// container's own long-running command: `sh -c LAUNCHER sh SCRIPT`, where
+/// the launcher runs `sh -lc SCRIPT` and `SCRIPT` is the `PATH` restore line
+/// followed by the declared command.
 pub fn login_shell_args(command: &str) -> [String; 5] {
+    shell_args(LAUNCHER.into(), command)
+}
+
+/// The argv tail for one declared task, `docker exec`ed into a setup
+/// container or `docker run` on its own: [`login_shell_args`] whose launcher
+/// first sets [`TASK_UMASK`].
+pub fn task_shell_args(command: &str) -> [String; 5] {
+    shell_args(format!("{TASK_UMASK}; {LAUNCHER}"), command)
+}
+
+fn shell_args(launcher: String, command: &str) -> [String; 5] {
     [
         "sh".into(),
         "-c".into(),
-        LAUNCHER.into(),
+        launcher,
         "sh".into(),
         format!("{RESTORE_IMAGE_PATH}\n{command}"),
     ]
@@ -42,14 +63,25 @@ mod tests {
     /// Run the production argv with the host's `/bin/sh` as a login shell
     /// whose profile clobbers `PATH`, as Debian's and Alpine's do.
     fn run_under_clobbering_profile(initial_path: &str, command: &str) -> String {
-        let home = tempfile::tempdir().unwrap();
-        std::fs::write(
-            home.path().join(".profile"),
+        run_under_profile(
             "PATH=/profile/bin:/usr/bin:/bin\nexport PATH\n",
+            initial_path,
+            &login_shell_args(command),
         )
-        .unwrap();
-        let args = login_shell_args(command);
+    }
+
+    /// Run `args` (from `sh` on) under `profile`, starting at umask 0000 as
+    /// `docker exec` does.
+    fn run_under_profile(profile: &str, initial_path: &str, args: &[String; 5]) -> String {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(".profile"), profile).unwrap();
         let output = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "umask 0000; exec \"$@\"",
+                "exec-umask-0000",
+                "/bin/sh",
+            ])
             .args(&args[1..])
             .env_clear()
             .env("HOME", home.path())
@@ -98,6 +130,26 @@ mod tests {
             "set -e\ncase x in x) printf 'a\"b' ;; esac\nprintf ' %s' \"$0\"",
         );
         assert_eq!(out, "a\"b sh");
+    }
+
+    #[test]
+    fn a_task_starts_with_umask_0022_where_exec_handed_it_0000() {
+        let args = task_shell_args("umask");
+        assert_eq!(run_under_profile("", &host_shell_dirs(), &args), "0022\n");
+    }
+
+    #[test]
+    fn an_image_profile_still_chooses_the_task_umask() {
+        let args = task_shell_args("umask");
+        let out = run_under_profile("umask 0027\n", &host_shell_dirs(), &args);
+        assert_eq!(out, "0027\n");
+    }
+
+    #[test]
+    fn the_container_command_keeps_its_unchanged_launcher() {
+        assert_eq!(login_shell_args("x")[2], LAUNCHER);
+        assert_eq!(task_shell_args("x")[2], format!("umask 0022; {LAUNCHER}"));
+        assert_eq!(login_shell_args("x")[4], task_shell_args("x")[4]);
     }
 
     #[test]
