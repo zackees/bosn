@@ -19,9 +19,10 @@ from __future__ import annotations
 
 import argparse
 import re
-import subprocess
 from collections import Counter
 from pathlib import Path
+
+from tracked_files import tracked_files as _tracked_files
 
 ROOT = Path(__file__).resolve().parent.parent
 SKIPPED_PREFIXES = ("_vender/",)
@@ -30,15 +31,7 @@ BASE = re.compile(r'include_(?:str|bytes)!\(\s*concat!\(\s*"([^"]+)"')
 
 
 def tracked_files(root: Path) -> list[Path]:
-    output = subprocess.run(
-        # The isolated test container mounts the checkout owned by another
-        # user; a read-only listing names it safe for this one command.
-        ["git", "-c", f"safe.directory={root}", "ls-files", "-z", "--", "*.rs"],
-        cwd=root,
-        check=True,
-        capture_output=True,
-    ).stdout
-    return [root / name for name in output.decode().split("\0") if name]
+    return _tracked_files(root, "*.rs")
 
 
 def directory(path: str) -> str:

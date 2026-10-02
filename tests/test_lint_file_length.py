@@ -7,6 +7,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+# The lints import their sibling helper (ci/tracked_files.py).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ci"))
+
 SPEC = importlib.util.spec_from_file_location("lint_file_length", Path("ci/lint_file_length.py"))
 assert SPEC is not None and SPEC.loader is not None
 lint = importlib.util.module_from_spec(SPEC)
