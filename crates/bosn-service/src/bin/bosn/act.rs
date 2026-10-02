@@ -1,7 +1,5 @@
-//! Read-only planning for local GitHub Actions runs.
-//!
-//! `act` uses a Docker socket and creates resources behind Bosn's registry.
-//! Execution must stay closed until Bosn owns an isolated engine lifecycle.
+//! Deprecated `bosn act` spelling. `run` and `report` route to `bosn ci`;
+//! `plan` and `payload` keep their read-only receipts for one release.
 
 use std::{
     ffi::OsString,
@@ -18,16 +16,16 @@ pub fn run(mut arguments: impl Iterator<Item = OsString>) {
     let Some(verb) = arguments.next() else {
         fail("expected plan, payload, run, or report")
     };
+    if verb == "run" || verb == "report" {
+        let alias = format!("bosn act {}", verb.to_string_lossy());
+        return super::ci::run(std::iter::once(verb).chain(arguments), Some(&alias));
+    }
+    eprintln!(
+        "bosn: `bosn act {}` is deprecated and will be removed after one release; use `bosn ci plan`",
+        verb.to_string_lossy()
+    );
     if verb == "payload" {
         return payload(arguments);
-    }
-    if verb == "run" {
-        fail(
-            "act run requires isolated Docker ownership; nested Docker resources are not supervised",
-        )
-    }
-    if verb == "report" {
-        fail("act report requires a completed, supervised run")
     }
     if verb != "plan" {
         fail("expected plan, payload, run, or report")

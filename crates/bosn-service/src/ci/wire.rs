@@ -1,0 +1,380 @@
+//! CI wire types: requests, run records and conclusions, shared by the
+//! daemon, the CLI, MCP and the Python client.
+
+use std::{path::Path, time::Duration};
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use super::{
+    model::{ItemConclusion, ItemStatus, RunTree},
+    provider::{self, Mode, Provider, Trigger},
+    scheduler::RunKey,
+};
+
+pub const SCHEMA_VERSION: u32 = 1;
+/// Default per-call caps; agents never receive unbounded output.
+pub const DEFAULT_LOG_PAGE_RECORDS: usize = 500;
+pub const MAX_LOG_PAGE_BYTES: usize = 256 * 1024;
+pub const DEFAULT_LOG_PAGE_BYTES: usize = 48 * 1024;
+pub const DEFAULT_REPORT_TAIL: usize = 40;
+pub const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+const MAX_RUN_TIMEOUT: Duration = Duration::from_secs(12 * 60 * 60);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunState {
+    Queued,
+    Running,
+    Done,
+}
+
+/// Run conclusion. Exit codes: success 0, failure/error 1,
+/// cancelled/timed_out 2, refused/incomplete 3.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Conclusion {
+    Success,
+    Failure,
+    Cancelled,
+    TimedOut,
+    /// Some jobs could not run here (unsupported runner); never a pass.
+    Incomplete,
+    Refused,
+    /// The engine or its cleanup failed; never a pass.
+    Error,
+}
+impl Conclusion {
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Self::Success => 0,
+            Self::Failure | Self::Error => 1,
+            Self::Cancelled | Self::TimedOut => 2,
+            Self::Refused | Self::Incomplete => 3,
+        }
+    }
+}
+
+/// A submission. Built by [`crate::Client::ci_submit`] after it snapshots the
+/// workspace into the daemon's staging area.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitRequest {
+    pub staging: String,
+    pub workspace: String,
+    pub provider: Provider,
+    pub engine: String,
+    pub workflow: String,
+    pub job: Option<String>,
+    pub trigger: Trigger,
+    pub mode: Mode,
+    pub actor: String,
+    pub sha: String,
+    pub branch: Option<String>,
+    pub tree_digest: String,
+    pub dirty: bool,
+    pub origin: Option<String>,
+    pub pr_number: Option<u64>,
+    pub timeout_secs: Option<u64>,
+}
+
+impl SubmitRequest {
+    /// Semantic checks the daemon applies before touching any file. The
+    /// staging directory itself is checked by the runtime.
+    pub fn validate(&self) -> Result<(), CiError> {
+        let refuse = |m: &str| Err(CiError::refused(m));
+        if !valid_uuid(&self.staging) {
+            return refuse("invalid staging ID");
+        }
+        if !valid_sha(&self.sha) || self.tree_digest.len() != 64 {
+            return refuse("invalid SHA or tree digest");
+        }
+        if self.provider != Provider::Github {
+            return refuse("only the GitHub provider is supported so far (GitLab is planned)");
+        }
+        if self.engine != "act" {
+            return refuse("only the act engine is supported");
+        }
+        if !Path::new(&self.workspace).is_absolute() || self.workspace.len() > 4096 {
+            return refuse("workspace must be an absolute path");
+        }
+        if !valid_name(&self.workflow, 512) || self.workflow.contains("..") {
+            return refuse("invalid workflow path");
+        }
+        if self.job.as_deref().is_some_and(|j| !valid_name(j, 128)) {
+            return refuse("invalid job ID");
+        }
+        if self.actor.is_empty() || self.actor.len() > 200 {
+            return refuse("invalid actor");
+        }
+        provider::validate(self.trigger, self.mode, self.dirty).map_err(CiError::refused)
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout_secs
+            .map_or(DEFAULT_RUN_TIMEOUT, Duration::from_secs)
+            .min(MAX_RUN_TIMEOUT)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RunnerAction {
+    List,
+    Drain,
+    Resume,
+    SetLimit {
+        limit: usize,
+    },
+    PruneCache {
+        older_than_secs: Option<u64>,
+        max_bytes: Option<u64>,
+    },
+}
+
+/// Every CI operation. Each maps to one typed handler; there is no generic
+/// command surface.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CiRequest {
+    Submit {
+        request: SubmitRequest,
+    },
+    List {
+        workspace: Option<String>,
+        state: Option<RunState>,
+        limit: Option<usize>,
+    },
+    Show {
+        run: String,
+        tree: Option<bool>,
+    },
+    Logs {
+        run: String,
+        job: Option<String>,
+        section: Option<String>,
+        since_seq: Option<u64>,
+        limit: Option<usize>,
+        max_bytes: Option<usize>,
+    },
+    Cancel {
+        run: String,
+    },
+    Retry {
+        run: String,
+        job: Option<String>,
+    },
+    Report {
+        run: String,
+        tail: Option<usize>,
+    },
+    Runners {
+        action: RunnerAction,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RunRecord {
+    pub schema_version: u32,
+    pub id: String,
+    pub provider: Provider,
+    pub engine: String,
+    pub workspace: String,
+    pub repository: String,
+    pub sha: String,
+    pub branch: Option<String>,
+    /// Tree digest when the run used uncommitted work (`sha + dirty`).
+    pub dirty: Option<String>,
+    pub tree_digest: String,
+    pub workflow: String,
+    pub job: Option<String>,
+    pub trigger: Trigger,
+    pub mode: Mode,
+    pub actor: String,
+    pub event: String,
+    pub payload_sha256: String,
+    pub state: RunState,
+    pub conclusion: Option<Conclusion>,
+    pub reason: Option<String>,
+    pub created_at: f64,
+    pub started_at: Option<f64>,
+    pub finished_at: Option<f64>,
+    pub act_exit_code: Option<i32>,
+    pub cleanup: Option<String>,
+    pub engine_id: Option<String>,
+    pub act_version: String,
+    pub runner_image: String,
+    pub submitters: u32,
+    pub retry_of: Option<String>,
+    pub timeout_secs: u64,
+    pub log_records: u64,
+    pub tree: RunTree,
+}
+
+impl RunRecord {
+    /// A queued record for a validated submission.
+    pub fn queued(id: String, request: &SubmitRequest, event: &str, payload: &[u8]) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            id,
+            provider: request.provider,
+            engine: request.engine.clone(),
+            workspace: request.workspace.clone(),
+            repository: provider::repository(request.origin.as_deref()),
+            sha: request.sha.clone(),
+            branch: request.branch.clone(),
+            dirty: request.dirty.then(|| request.tree_digest.clone()),
+            tree_digest: request.tree_digest.clone(),
+            workflow: request.workflow.clone(),
+            job: request.job.clone(),
+            trigger: request.trigger,
+            mode: request.mode,
+            actor: request.actor.clone(),
+            event: event.into(),
+            payload_sha256: sha256_hex(payload),
+            state: RunState::Queued,
+            conclusion: None,
+            reason: None,
+            created_at: super::lifecycle::now_seconds(),
+            started_at: None,
+            finished_at: None,
+            act_exit_code: None,
+            cleanup: None,
+            engine_id: None,
+            act_version: super::engine::ACT_VERSION.into(),
+            runner_image: super::engine::RUNNER_IMAGE.into(),
+            submitters: 1,
+            retry_of: None,
+            timeout_secs: request.timeout().as_secs(),
+            log_records: 0,
+            tree: RunTree::default(),
+        }
+    }
+
+    /// A queued re-run of a finished run, optionally narrowed to one job.
+    pub fn retry(&self, id: String, job: Option<String>) -> Self {
+        Self {
+            id,
+            job: job.or_else(|| self.job.clone()),
+            state: RunState::Queued,
+            conclusion: None,
+            reason: None,
+            created_at: super::lifecycle::now_seconds(),
+            started_at: None,
+            finished_at: None,
+            act_exit_code: None,
+            cleanup: None,
+            engine_id: None,
+            submitters: 1,
+            retry_of: Some(self.id.clone()),
+            log_records: 0,
+            tree: RunTree::default(),
+            ..self.clone()
+        }
+    }
+
+    /// Mark a record a previous daemon left unfinished.
+    pub fn interrupt(&mut self) {
+        self.state = RunState::Done;
+        self.conclusion = Some(Conclusion::Error);
+        self.reason = Some("interrupted: the daemon stopped during this run".into());
+        self.finished_at = Some(super::lifecycle::now_seconds());
+        self.tree.cancel_unfinished();
+    }
+
+    pub(crate) fn key(&self) -> RunKey {
+        RunKey {
+            sha: self.sha.clone(),
+            dirty: self.dirty.clone(),
+            workflow: self.workflow.clone(),
+            job: self.job.clone(),
+            trigger: self.trigger.as_str().into(),
+            mode: self.mode.as_str().into(),
+            provider: self.provider.as_str().into(),
+            engine: self.engine.clone(),
+        }
+    }
+    /// The record without its job tree (for listings and polling).
+    pub fn summary(&self) -> Value {
+        let mut value = serde_json::to_value(self).unwrap_or(Value::Null);
+        if let Some(map) = value.as_object_mut() {
+            map.remove("tree");
+            let jobs: Vec<_> = self.tree.jobs().collect();
+            map.insert(
+                "jobs".into(),
+                json!({
+                    "total": jobs.len(),
+                    "completed": jobs.iter().filter(|j| j.status == ItemStatus::Completed).count(),
+                    "failed": jobs.iter().filter(|j| j.conclusion == Some(ItemConclusion::Failure)).count(),
+                }),
+            );
+            map.insert(
+                "exit_code".into(),
+                json!(self.conclusion.map(Conclusion::exit_code)),
+            );
+        }
+        value
+    }
+}
+
+#[derive(Debug)]
+pub struct CiError {
+    pub code: &'static str,
+    pub message: String,
+}
+impl CiError {
+    pub fn refused(message: impl Into<String>) -> Self {
+        Self::new("refused", message)
+    }
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+impl std::fmt::Display for CiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+pub(crate) fn valid_uuid(value: &str) -> bool {
+    let parts: Vec<&str> = value.split('-').collect();
+    parts.len() == 5
+        && parts
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(p, n)| p.len() == n && p.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
+pub(crate) fn valid_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+pub(crate) fn valid_name(value: &str, max: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/' | b':'))
+}
+
+/// A fresh random v4 UUID (lowercase).
+pub async fn new_uuid() -> Result<String, CiError> {
+    let bytes = kernal_api::random::SecureRandom::new(1, Duration::from_secs(3))
+        .map_err(|_| CiError::new("internal", "randomness unavailable"))?
+        .bytes(16)
+        .await
+        .map_err(|_| CiError::new("internal", "randomness unavailable"))?;
+    Ok(crate::uuid(&bytes))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = kernal_api::hash::Sha256Hasher::new();
+    hasher.update(bytes);
+    hasher.finalize().to_hex()
+}

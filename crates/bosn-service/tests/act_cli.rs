@@ -159,13 +159,19 @@ fn act_plan_is_read_only_and_emits_selected_inputs() {
 }
 
 #[test]
-fn act_run_refuses_untracked_docker_execution() {
+fn act_run_is_a_deprecated_alias_of_ci_run_and_refuses_outside_a_checkout() {
+    let root = tempfile::tempdir().unwrap();
     let result = Command::new(env!("CARGO_BIN_EXE_bosn"))
-        .args(["act", "run"])
+        .args(["act", "run", "--workspace"])
+        .arg(root.path())
+        .args(["--state-dir"])
+        .arg(root.path().join("state"))
         .output()
         .unwrap();
-    assert!(!result.status.success());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("isolated Docker ownership"));
+    assert_eq!(result.status.code(), Some(3), "refused");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("deprecated"), "{stderr}");
+    assert!(result.stdout.is_empty(), "the notice goes to stderr only");
 }
 
 #[test]

@@ -53,6 +53,7 @@ use std::{
 };
 pub mod act_registry;
 pub mod autostart;
+pub mod ci;
 pub mod github_proxy;
 pub mod jobs;
 pub mod mcp;
@@ -5282,6 +5283,42 @@ impl Client {
             _ => Err(Error::Protocol("unexpected manifest app task response")),
         }
     }
+    /// One typed CI operation; the reply is the operation's JSON document.
+    pub async fn ci(&self, request: ci::CiRequest) -> Result<serde_json::Value, Error> {
+        let encoded =
+            serde_json::to_string(&request).map_err(|_| Error::Protocol("ci request encode"))?;
+        match self
+            .call(Request {
+                ci_request: encoded,
+                ..Request::operation(36)
+            })
+            .await?
+        {
+            Reply::Ci(json) => {
+                serde_json::from_str(&json).map_err(|_| Error::Protocol("ci reply decode"))
+            }
+            Reply::CiError(json) => {
+                let value: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+                Err(Error::Ci {
+                    code: value["code"].as_str().unwrap_or("error").into(),
+                    message: value["message"].as_str().unwrap_or(&json).into(),
+                })
+            }
+            _ => Err(Error::Protocol("unexpected ci response")),
+        }
+    }
+    /// Snapshot `workspace` into the daemon's staging area, then submit it.
+    /// The snapshot is taken here (same user) because copying a tree can
+    /// take longer than one daemon request may.
+    pub async fn ci_submit(&self, options: ci::SubmitOptions) -> Result<serde_json::Value, Error> {
+        let request = ci::stage_submission(&self.state_dir, options).await?;
+        let staging = ci::staging_root(&self.state_dir).join(&request.staging);
+        let result = self.ci(ci::CiRequest::Submit { request }).await;
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(staging);
+        }
+        result
+    }
     async fn call(&self, request: Request) -> Result<Reply, Error> {
         // Resolve on every call: a Client may have been constructed while a
         // fresh daemon was still creating its registry, before an inode-based
@@ -5308,6 +5345,7 @@ impl Client {
 }
 
 pub struct Service {
+    act_backend: Arc<dyn ci::engine::ActEngineBackend>,
     state_dir: PathBuf,
     stop: CancellationSource,
     setup_executor: Arc<dyn SetupPrepareExecutor>,
@@ -8928,6 +8966,7 @@ impl Service {
             setup_reconcile_executor: Arc::new(DockerSetupReconcileExecutor::new()),
             manifest_recovery_executor: Arc::new(DockerManifestRecoveryExecutor::new()),
             release_version: Arc::from(""),
+            act_backend: Arc::new(ci::engine::DockerActBackend::default()),
             state_dir,
             stop: CancellationSource::new(),
         }
@@ -9005,6 +9044,11 @@ impl Service {
         self.manifest_recovery_executor = executor;
         self
     }
+    /// Substitute the isolated-engine runtime behind `bosn ci` (tests).
+    pub fn with_act_backend(mut self, backend: Arc<dyn ci::engine::ActEngineBackend>) -> Self {
+        self.act_backend = backend;
+        self
+    }
     /// Foreground lifecycle: acquires the sole registry writer before binding.
     pub async fn serve(self) -> Result<(), Error> {
         ipc::ensure_owner_private_directory(&self.state_dir)?;
@@ -9062,6 +9106,26 @@ impl Service {
         // local Docker daemon is recorded as a bounded recovery outcome when
         // possible and never prevents the authenticated control plane from
         // coming up.
+        let ci = ci::CiRuntime::start(
+            &self.state_dir,
+            actor.clone(),
+            Arc::clone(&self.act_backend),
+            ci::scheduler::default_limit(
+                std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get),
+            ),
+        );
+        // Engines a previous daemon left behind are reconciled in the
+        // background; new runs use fresh IDs, so they cannot collide.
+        {
+            let ci = ci.clone();
+            async_engine::launch(async move {
+                let report = ci.recover_engines().await;
+                for (run, error) in report.failed {
+                    eprintln!("bosn ci: engine for run {run} needs attention: {error}");
+                }
+            })
+            .detach();
+        }
         let _ = recover_manifest_startup(
             &actor,
             &self.state_dir,
@@ -9145,6 +9209,7 @@ impl Service {
             let adopt = Arc::clone(&self.setup_adopt_executor);
             let state_dir = self.state_dir.clone();
             let release_version = Arc::clone(&self.release_version);
+            let ci = ci.clone();
             clients.spawn(async move {
                 handle(
                     stream,
@@ -9157,6 +9222,7 @@ impl Service {
                         reconcile,
                         state_dir,
                         release_version,
+                        ci,
                     },
                 )
                 .await
@@ -9185,6 +9251,11 @@ pub enum Error {
     EndpointOccupied(String),
     ActorClosed,
     Protocol(&'static str),
+    /// A typed CI refusal or failure (`code` is stable, e.g. `refused`).
+    Ci {
+        code: String,
+        message: String,
+    },
 }
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
@@ -9801,6 +9872,7 @@ struct ConnectionContext {
     reconcile: Arc<dyn SetupReconcileExecutor>,
     state_dir: PathBuf,
     release_version: Arc<str>,
+    ci: ci::CiRuntime,
 }
 
 async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Result<(), Error> {
@@ -9813,6 +9885,7 @@ async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Result<(), Er
         reconcile,
         state_dir,
         release_version,
+        ci,
     } = context;
     if !peer_is_authorized(&s.peer_identity()?.user_id, &ipc::current_user_id()?) {
         return Err(Error::Unauthorized);
@@ -10589,6 +10662,28 @@ async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Result<(), Er
                     ..Default::default()
                 },
             },
+            36 => match serde_json::from_str::<ci::CiRequest>(&r.ci_request) {
+                Err(error) => ReplyWire {
+                    code: 361,
+                    ci_reply:
+                        serde_json::json!({"code": "invalid_request", "message": error.to_string()})
+                            .to_string(),
+                    ..Default::default()
+                },
+                Ok(request) => match ci.handle(request).await {
+                    Ok(value) => ReplyWire {
+                        code: 360,
+                        ci_reply: value.to_string(),
+                        ..Default::default()
+                    },
+                    Err(error) => ReplyWire {
+                        code: 361,
+                        ci_reply: serde_json::json!({"code": error.code, "message": error.message})
+                            .to_string(),
+                        ..Default::default()
+                    },
+                },
+            },
             _ => ReplyWire {
                 code: 2,
                 ..Default::default()
@@ -10744,6 +10839,9 @@ struct Request {
     unmanaged_include: Vec<String>,
     #[prost(uint64, tag = "21")]
     unmanaged_ttl_seconds: u64,
+    /// Operation 36: one JSON-encoded [`ci::CiRequest`].
+    #[prost(string, tag = "22")]
+    ci_request: String,
 }
 impl Request {
     fn operation(operation: u32) -> Self {
@@ -10769,6 +10867,7 @@ impl Request {
             setup_adopt_confirm: false,
             unmanaged_include: Vec::new(),
             unmanaged_ttl_seconds: 0,
+            ci_request: String::new(),
         }
     }
 }
@@ -11201,6 +11300,9 @@ struct ReplyWire {
     /// daemon that predates the version handshake (bosn 0.1.5 and older).
     #[prost(string, tag = "56")]
     daemon_version: String,
+    /// Codes 360/361: a JSON CI reply, or a JSON `{code, message}` CI error.
+    #[prost(string, tag = "57")]
+    ci_reply: String,
 }
 #[derive(Message)]
 struct LogRecordWire {
@@ -11417,10 +11519,14 @@ enum Reply {
     ManifestVolumeGcPreview(ManifestVolumeGcPreviewPage),
     ManifestVolumeGcApply(ManifestVolumeGcApplyResult),
     UnmanagedApply(UnmanagedApplySummary),
+    Ci(String),
+    CiError(String),
 }
 fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
     match v.code {
         10 => Ok(Reply::Pong(v.daemon_version)),
+        360 => Ok(Reply::Ci(v.ci_reply)),
+        361 => Ok(Reply::CiError(v.ci_reply)),
         20 => Ok(Reply::Status(Status {
             registry_id: v.registry_id,
             schema_version: v.schema_version,
@@ -16609,6 +16715,7 @@ fi
                 setup_adopt_confirm: false,
                 unmanaged_include: Vec::new(),
                 unmanaged_ttl_seconds: 0,
+                ci_request: String::new(),
             }
             .encode(&mut payload)
             .unwrap();

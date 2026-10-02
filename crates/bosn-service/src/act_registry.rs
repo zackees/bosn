@@ -48,12 +48,17 @@ pub enum ActRegistryCommand {
         after_run_id: Option<String>,
         limit: usize,
     },
+    /// Latest state snapshot for one run (read-only).
+    Get {
+        run: String,
+    },
 }
 #[derive(Debug)]
 pub enum ActRegistryReply {
     Committed,
     Authorized(Box<ActEngineRecord>),
     Recovery(ActEngineRecoveryPage),
+    Record(Option<Box<ActEngineRecord>>),
 }
 
 impl RegistryActor {
@@ -89,6 +94,11 @@ pub(crate) fn apply(
             .pending_act_engines(after_run_id.as_deref(), limit)
             .map(ActRegistryReply::Recovery);
     }
+    if let ActRegistryCommand::Get { run } = command {
+        return registry
+            .act_engine(&run)
+            .map(|record| ActRegistryReply::Record(record.map(Box::new)));
+    }
     let mut transaction = registry.begin_immediate()?;
     let reply = match command {
         ActRegistryCommand::Begin(intent) => {
@@ -118,7 +128,9 @@ pub(crate) fn apply(
             transaction.finalize_act_cleanup(&run, &proof, at)?;
             ActRegistryReply::Committed
         }
-        ActRegistryCommand::Pending { .. } => unreachable!("read handled before transaction"),
+        ActRegistryCommand::Pending { .. } | ActRegistryCommand::Get { .. } => {
+            unreachable!("reads are handled before the transaction")
+        }
     };
     transaction.commit()?;
     Ok(reply)

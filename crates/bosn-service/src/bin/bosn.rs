@@ -32,6 +32,8 @@ use serde_json::json;
 
 #[path = "bosn/act.rs"]
 mod act;
+#[path = "bosn/ci.rs"]
+mod ci;
 #[path = "bosn/run.rs"]
 mod run;
 #[path = "bosn/secret.rs"]
@@ -63,6 +65,7 @@ fn main() {
         "doctor" => run_doctor(arguments),
         "compose" => run_compose(arguments),
         "act" => act::run(arguments),
+        "ci" => ci::run(arguments, None),
         "manifest" => run_manifest(arguments),
         "run" => run::run(arguments),
         "setup" => run_setup(arguments),
@@ -2954,9 +2957,8 @@ fn usage() -> ! {
     eprintln!(
         "   or: bosn act plan --workspace WORKSPACE --workflow RELATIVE_YML --event pull_request|push|release --mode minimal|test|full --sha 40_HEX --act-version VERSION [--act-bin PATH] [--job ID] [--json]"
     );
-    eprintln!(
-        "   or: bosn act run|report (refuses until isolated Docker ownership is implemented)"
-    );
+    eprintln!("   or: bosn act run|report (deprecated alias of bosn ci run|report)");
+    eprintln!("   or: {}", ci::USAGE.trim_start_matches("usage: "));
     eprintln!("usage: bosn mcp [--state-dir STATE_DIR]");
     eprintln!("   or: {}", run::USAGE.trim_start_matches("usage: "));
     eprintln!(

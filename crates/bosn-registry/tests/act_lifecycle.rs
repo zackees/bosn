@@ -534,3 +534,29 @@ fn retirement_between_recovery_pages_does_not_skip_remaining_engines() {
         "00000002-bbbb-4ccc-8ddd-eeeeeeeeeeee"
     );
 }
+/// Wall-clock creation times must survive the JSON state snapshot exactly:
+/// the ownership labels embed `created_at`, so a one-ULP drift on reload
+/// made a correctly labelled engine fail registration (found by bosn ci's
+/// coalescing test).
+#[test]
+fn wall_clock_created_at_round_trips_into_registration() {
+    let dir = TemporaryDirectory::new().unwrap();
+    let mut r = Registry::create_writer(dir.path().join("r"), OWNER).unwrap();
+    for n in 0..300u32 {
+        let run = format!("aaaaaaaa-bbbb-4ccc-8ddd-{n:012x}");
+        let intent = ActEngineIntent {
+            run_id: run.clone(),
+            created_at: 1_790_903_176.0 + f64::from(n) * 0.001_234_567_891,
+            ..intent()
+        };
+        let mut tx = r.begin_immediate().unwrap();
+        tx.begin_act_engine(&intent).unwrap();
+        let observed = ActEngineObservation {
+            engine_id: format!("{:064x}", n + 1),
+            ..observed(&intent)
+        };
+        tx.register_act_engine(&run, &observed, intent.created_at + 1.0)
+            .unwrap_or_else(|e| panic!("created_at {} drifted: {e:?}", intent.created_at));
+        tx.commit().unwrap();
+    }
+}
