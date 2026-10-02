@@ -23,7 +23,12 @@ SKIPPED_PREFIXES = ("_vender/",)
 
 def tracked_files(root: Path) -> list[Path]:
     output = subprocess.run(
-        ["git", "ls-files", "-z"], cwd=root, check=True, capture_output=True
+        # The isolated test container mounts the checkout owned by another
+        # user; a read-only listing names it safe for this one command.
+        ["git", "-c", f"safe.directory={root}", "ls-files", "-z"],
+        cwd=root,
+        check=True,
+        capture_output=True,
     ).stdout
     return [root / name for name in output.decode().split("\0") if name]
 
