@@ -469,6 +469,17 @@ impl Client {
             _ => Err(Error::Protocol("unexpected job status response")),
         }
     }
+    /// The daemon's runner accounting (#358): capacity, lane load, and every
+    /// queued, running and recently finished job with what it holds, as the
+    /// JSON document `bosn jobs --json` prints.
+    pub async fn jobs(&self) -> Result<serde_json::Value, Error> {
+        match self.call(Request::operation(37)).await? {
+            Reply::Jobs(json) => {
+                serde_json::from_str(&json).map_err(|_| Error::Protocol("malformed jobs view"))
+            }
+            _ => Err(Error::Protocol("unexpected jobs response")),
+        }
+    }
     pub async fn cancel_job(&self, id: u64) -> Result<(), Error> {
         match self
             .call(Request {

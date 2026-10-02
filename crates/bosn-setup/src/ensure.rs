@@ -99,7 +99,7 @@ pub enum SetupEnsureCommand {
         tmpfs: Vec<SetupEnsureTmpfs>,
         /// Explicit manifest opt-in; resources created through it are not
         /// Bosn-managed.
-        host_docker_socket: Option<crate::SetupHostDockerSocket>,
+        host_docker_socket: Box<Option<crate::SetupHostDockerSocket>>,
         environment: BTreeMap<String, String>,
         workdir: Option<String>,
         command: Option<String>,
@@ -190,7 +190,7 @@ impl SetupEnsureCommand {
                     args.push("--tmpfs".into());
                     args.push(tmpfs_docker_value(mount));
                 }
-                if let Some(socket) = host_docker_socket {
+                if let Some(socket) = host_docker_socket.as_ref() {
                     let mut value = format!(
                         "type=bind,src={},dst={}",
                         socket.source.host_path(),
@@ -201,6 +201,10 @@ impl SetupEnsureCommand {
                     }
                     args.push("--mount".into());
                     args.push(value);
+                    if let Some(dir) = &socket.proxy_dir {
+                        args.push("--mount".into());
+                        args.push(format!("type=bind,src={dir},dst={dir}"));
+                    }
                 }
                 for (key, value) in environment {
                     args.push("--env".into());

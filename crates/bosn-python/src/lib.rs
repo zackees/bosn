@@ -685,6 +685,14 @@ impl Client {
         })
     }
 
+    /// The daemon's runner accounting (#358) as the JSON document that
+    /// `bosn jobs --json` prints: capacity, lane load, and every queued,
+    /// running and recently finished job with what it holds.
+    fn jobs_json(&self, py: Python<'_>) -> PyResult<String> {
+        let state_dir = self.state_dir.clone();
+        py.detach(move || jobs_json(&state_dir).map_err(service_error))
+    }
+
     /// Return at most 256 cursor-addressed daemon log records. `next` can be
     /// passed as `after` on the next poll; `gap` reports evicted history.
     #[pyo3(signature = (job_id, *, after = 0, limit = 64))]

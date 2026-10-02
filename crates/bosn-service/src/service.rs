@@ -24,7 +24,14 @@ impl Service {
             act_backend: Arc::new(ci::engine::DockerActBackend::default()),
             state_dir,
             stop: CancellationSource::new(),
+            capacity: None,
         }
+    }
+    /// Runner capacity (#358) for this daemon, overriding `runners.toml`
+    /// and the `BOSN_RUNNER_*` environment.
+    pub fn with_runner_capacity(mut self, capacity: capacity::RunnerCapacity) -> Self {
+        self.capacity = Some(capacity);
+        self
     }
     /// The release version this daemon reports on ping, so a client of another
     /// release can refuse it clearly instead of sending requests the daemon may
@@ -139,8 +146,39 @@ impl Service {
         let jobs = JobActor {
             sender: job_sender.clone(),
         };
+        let capacity = match self.capacity.clone() {
+            Some(capacity) => capacity,
+            None => {
+                #[allow(unused_mut)]
+                let mut loaded = capacity::RunnerCapacity::load(&self.state_dir)
+                    .map_err(|error| Error::Io(std::io::Error::other(error)))?;
+                // Unit-test daemons never route through a real proxy unless
+                // a test asks for it with `with_runner_capacity`.
+                #[cfg(test)]
+                {
+                    loaded.docker_proxy = false;
+                }
+                loaded
+            }
+        };
+        DOCKER_PROXY_ENABLED.store(capacity.docker_proxy, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("bosn runners: {}", capacity.describe());
+        let runners = Arc::new(runners::Runners::new(&self.state_dir, capacity.clone()));
+        if let Some(dir) = runners.proxy_dir() {
+            runners::ensure_proxy_dir(dir)?;
+        }
+        // Reap what a previous daemon process left running before any new
+        // job can start (see `runners`): their streams and leases died with
+        // it, so they can only be torn down, never re-adopted.
+        {
+            let runners = Arc::clone(&runners);
+            let _ = async_engine::launch_blocking(move || reap_orphaned_runs(&runners)).await;
+        }
         let job_worker = async_engine::launch(job_actor(
-            Jobs::new(1),
+            Jobs::with_policy(jobs::SchedulerPolicy {
+                runner_slots: capacity.runner_slots,
+                control_slots: capacity.control_slots,
+            }),
             job_receiver,
             SetupExecutors {
                 prepare: Arc::clone(&self.setup_executor),
@@ -149,6 +187,7 @@ impl Service {
                 ensure: Arc::clone(&self.setup_ensure_executor),
                 manifest_ensure: Arc::clone(&self.manifest_ensure_executor),
                 manifest_app_task: Arc::clone(&self.manifest_app_task_executor),
+                runners: Some(runners),
             },
             job_sender.clone(),
             actor.clone(),
@@ -362,4 +401,86 @@ pub struct Service {
     pub(crate) setup_reconcile_executor: Arc<dyn SetupReconcileExecutor>,
     pub(crate) manifest_recovery_executor: Arc<dyn ManifestRecoveryExecutor>,
     pub(crate) release_version: Arc<str>,
+    /// Runner capacity from `bosn daemon serve` flags; `None` loads
+    /// `runners.toml` and the environment at serve time.
+    pub(crate) capacity: Option<capacity::RunnerCapacity>,
+}
+
+/// Stop every process in a setup container except its idle PID 1, the idle
+/// loop's own `sleep 3600` (see [`MANIFEST_LINUX_IDLE_COMMAND`]) and this
+/// script: TERM, two seconds' grace, then KILL. Plain POSIX sh, because
+/// dash's `kill` rejects the `-1` (all processes) target. Prints
+/// `signalled=<n> left=<n>`.
+const REAP_SCRIPT: &str = r#"self=$$
+idle() { [ "$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null)" = "sleep 3600 " ]; }
+targets() { for p in /proc/[0-9]*; do p=${p#/proc/}; [ "$p" = 1 ] || [ "$p" = "$self" ] || idle "$p" || echo "$p"; done; }
+n=0; for p in $(targets); do kill -s TERM "$p" 2>/dev/null && n=$((n+1)); done
+[ "$n" = 0 ] || sleep 2
+for p in $(targets); do kill -s KILL "$p" 2>/dev/null; done
+sleep 0.2; left=0; for p in $(targets); do [ -d "/proc/$p" ] && left=$((left+1)); done
+echo "signalled=$n left=$left""#;
+
+/// Tear down every run a previous daemon process recorded, then any run
+/// carrying this daemon's label that no ledger names. Returns one line per
+/// reaped run, also written to stderr.
+pub(crate) fn reap_orphaned_runs(runners: &runners::Runners) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut reaped = BTreeSet::new();
+    for record in runners.orphaned_runs() {
+        let mut detail = String::new();
+        if let Some(container) = &record.container {
+            // Only one task job runs in a setup container at a time, and no
+            // job runs yet: every process but the container's idle PID 1 is
+            // the dead daemon's task.
+            let stopped = DockerEngine::docker()
+                .with_args([
+                    "container",
+                    "exec",
+                    container.as_str(),
+                    "sh",
+                    "-c",
+                    REAP_SCRIPT,
+                ])
+                .capture(RunOptions::bounded(Duration::from_secs(20), 4096));
+            match stopped {
+                Ok(result) if result.ok() => {
+                    let text = String::from_utf8_lossy(&result.stdout);
+                    let count = |key: &str| {
+                        text.split_whitespace()
+                            .find_map(|word| word.strip_prefix(key))
+                            .unwrap_or("?")
+                            .to_owned()
+                    };
+                    detail.push_str(&format!(
+                        "signalled {} task process(es), {} still running; ",
+                        count("signalled="),
+                        count("left=")
+                    ));
+                }
+                _ => detail.push_str("its container was not running; "),
+            }
+        }
+        let teardown = runners.teardown(&record.run);
+        detail.push_str(&teardown.summary());
+        let line = format!(
+            "reaped orphaned job {} ({} {} in {}): {detail}",
+            record.job_id, record.stack, record.task, record.workspace
+        );
+        eprintln!("bosn runners: {line}");
+        lines.push(line);
+        reaped.insert(record.run);
+    }
+    match runners.stray_runs() {
+        Ok(stray) => {
+            for run in stray.difference(&reaped) {
+                let teardown = runners.teardown(run);
+                let line = format!("reaped stray run {run}: {}", teardown.summary());
+                eprintln!("bosn runners: {line}");
+                lines.push(line);
+            }
+        }
+        Err(error) => eprintln!("bosn runners: stray-run sweep skipped: {error}"),
+    }
+    runners.clear_ledger();
+    lines
 }

@@ -373,6 +373,7 @@ fn cancellation_queued_at_registry_handoff_is_rejected_after_persisted_success()
                     ensure: fake,
                     manifest_ensure: Arc::new(DockerManifestEnsureExecutor::new(state.clone())),
                     manifest_app_task: Arc::new(DockerManifestAppTaskExecutor::new(state.clone())),
+                    runners: None,
                 },
                 job_sender.clone(),
                 registry_handle.clone(),

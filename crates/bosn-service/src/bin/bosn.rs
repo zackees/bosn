@@ -44,6 +44,8 @@ mod gc;
 mod health;
 #[path = "bosn/job.rs"]
 mod job;
+#[path = "bosn/jobs.rs"]
+mod jobs;
 #[path = "bosn/manifest.rs"]
 mod manifest;
 #[path = "bosn/registry.rs"]
@@ -104,6 +106,7 @@ fn main() {
         "run" => run::run(arguments),
         "setup" => run_setup(arguments),
         "job" => run_job(arguments),
+        "jobs" => jobs::run(arguments),
         "registry" => run_registry(arguments),
         "gc" => run_gc(arguments),
         "scan" => run_scan(arguments),
@@ -198,7 +201,9 @@ fn usage() -> ! {
     eprintln!(
         "   or: bosn secret set github_token [--from-gh] [--state-dir STATE_DIR] (value on stdin)\n   or: bosn secret status [--state-dir STATE_DIR] [--json]\n   or: bosn secret remove github_token [--state-dir STATE_DIR]"
     );
-    eprintln!("   or: bosn daemon serve --state-dir STATE_DIR");
+    eprintln!(
+        "   or: bosn daemon serve --state-dir STATE_DIR [--runner-slots N] [--runner-cpus CPUS] [--runner-memory SIZE] [--control-slots N] [--stall-seconds S] [--docker-proxy true|false]"
+    );
     eprintln!("   or: bosn daemon status --state-dir STATE_DIR [--json]");
     eprintln!("   or: bosn daemon stop --state-dir STATE_DIR [--json]");
     eprintln!(
@@ -242,6 +247,7 @@ fn usage() -> ! {
     eprintln!(
         "   or: bosn setup stop-retired --state-dir STATE_DIR --workspace WORKSPACE --candidate TOKEN --apply --yes [--json]"
     );
+    eprintln!("   or: {}", jobs::USAGE);
     eprintln!("   or: bosn job status --state-dir STATE_DIR --job-id ID [--json]");
     eprintln!(
         "   or: bosn job logs --state-dir STATE_DIR --job-id ID [--after CURSOR] [--limit 1..={MAX_JOB_LOG_LIMIT}] [--json]"

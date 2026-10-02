@@ -186,6 +186,7 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
             .map_err(|_| "manifest app task cancelled before ownership inspection".to_owned())?
             .map_err(|_| "manifest app task planning exceeded its deadline".to_owned())??;
             let guest_task = runtime.guest_task;
+            let job_caches = runtime.job_caches;
             let plan = runtime.plan;
             let task_command = plan
                 .tasks
@@ -349,6 +350,30 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                     )
                     .await;
                 }
+                // Runner slot (#358): limits on this container, and the
+                // job's Docker proxy when the stack drives the host engine.
+                let runner = match session.run_context() {
+                    Some(context) => Some(
+                        task_runner::attach(
+                            context,
+                            &observed.container_name,
+                            &plan.workspace_root,
+                            plan.host_docker_socket
+                                .as_ref()
+                                .and_then(|socket| socket.proxy_dir.as_deref()),
+                            &job_caches,
+                            logs,
+                        )
+                        .await,
+                    ),
+                    None => None,
+                };
+                if let Some(runner) = &runner {
+                    for (key, value) in &runner.env {
+                        engine = engine.env(key, value);
+                        passthrough_env.push(key.clone());
+                    }
+                }
                 logs.send(format!(
                     "[manifest-app-task] running declared task {}",
                     request.task_name
@@ -373,6 +398,11 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                     },
                 )
                 .await;
+                // Whatever the outcome (success, failure, cancel, stall or
+                // a lost client), remove what the job created.
+                if let Some(runner) = runner {
+                    runner.finish(logs).await;
+                }
                 // A confirmed in-container stop (#357) is a known terminal
                 // outcome; only an unconfirmed one stays uncertain.
                 let outcome = match &result {

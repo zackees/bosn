@@ -195,8 +195,11 @@ fn fixture_configuration(command: &SetupEnsureCommand, running: bool) -> serde_j
     actual_mounts.extend(volumes.iter().map(
         |v| serde_json::json!({"Type":"volume","Driver":"local","Name":v.name,"Source":format!("/var/lib/docker/volumes/{}/_data",v.name),"Destination":v.target,"RW":true}),
     ));
-    if let Some(socket) = host_docker_socket {
+    if let Some(socket) = host_docker_socket.as_ref() {
         actual_mounts.push(serde_json::json!({"Type":"bind","Propagation":"rprivate","Source":socket.source.host_path(),"Destination":socket.target,"RW":!socket.readonly}));
+        if let Some(dir) = &socket.proxy_dir {
+            actual_mounts.push(serde_json::json!({"Type":"bind","Propagation":"rprivate","Source":dir,"Destination":dir,"RW":true}));
+        }
     }
     let tmpfs: BTreeMap<_, _> = tmpfs
         .iter()

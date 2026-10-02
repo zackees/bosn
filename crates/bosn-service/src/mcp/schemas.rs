@@ -12,6 +12,12 @@ pub(crate) fn tools_list() -> Value {
                 "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
             },
             {
+                "name": "bosn_jobs",
+                "description": "Read the daemon's runner accounting: runner slots and CPUs per slot, lane load, and every queued, running and recently finished job with its slot, idle time, setup container, Docker proxy activity and leased cache volumes. Read-only; does not start a daemon.",
+                "inputSchema": {"type": "object", "additionalProperties": false},
+                "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}
+            },
+            {
                 "name": "bosn_doctor",
                 "description": "Run fixed daemon-owned, read-only registry integrity and Docker version checks. It accepts no arguments, never starts a daemon, initializes or migrates a registry, mutates Docker, or returns raw engine output.",
                 "inputSchema": {"type": "object", "additionalProperties": false},

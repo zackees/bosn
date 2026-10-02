@@ -121,6 +121,13 @@ pub struct SetupHostDockerSocket {
     /// Normalized absolute path inside the container.
     pub target: String,
     pub readonly: bool,
+    /// The daemon's Docker accounting-proxy directory (#358), bound read-write
+    /// at the **same** absolute path inside the container. A task reaches its
+    /// per-job proxy socket there through `DOCKER_HOST`, and because the path
+    /// is identical on the host, a sibling container (act's job container)
+    /// that bind-mounts that socket gets the same proxy. Daemon-derived, never
+    /// manifest-selected.
+    pub proxy_dir: Option<String>,
 }
 
 /// A finite KVM-backed macOS guest shape derived solely from a legacy Bosn

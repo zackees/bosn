@@ -238,6 +238,19 @@ pub trait ManifestAppTaskSessionRecorder: Send + Sync {
         &'a self,
         outcome: &'static str,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+    /// The runner slot and accounting record the daemon assigned this job
+    /// (#358). Test recorders have none, and run without limits or proxy.
+    fn run_context(&self) -> Option<&RunContext> {
+        None
+    }
+}
+
+/// What a running task job holds; see [`runners`].
+#[derive(Clone)]
+pub struct RunContext {
+    pub runners: Arc<runners::Runners>,
+    pub record: runners::RunRecord,
+    pub activity: Arc<docker_proxy::Activity>,
 }
 
 /// Narrow test seam for the two fixed guest transports. The daemon supplies

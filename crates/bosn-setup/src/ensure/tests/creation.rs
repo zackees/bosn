@@ -290,3 +290,38 @@ fn reuse_and_adoption_refuse_local_volume_bind_options_or_source_mismatch() {
         }
     }
 }
+
+#[test]
+fn a_workdir_at_the_mount_root_survives_docker_29_path_cleaning() {
+    // Docker 29 stores WorkingDir through path.Clean, so the derived
+    // `<target>/.` reads back as `<target>`: the container Bosn just
+    // created must still be adopted. A different directory never is.
+    let workspace = tempfile::tempdir().unwrap();
+    let mut plan = plan(workspace.path());
+    plan.app.workdir = Some(".".into());
+    let derived = derive_creation(&plan, workspace.path(), &prepared(&plan)).unwrap();
+    assert_eq!(derived.workdir.as_deref(), Some("/workspace/."));
+    let mut observed = observed(&plan, true);
+    for (cleaned, ok) in [
+        ("/workspace/.", true),
+        ("/workspace", true),
+        ("/workspace/", true),
+        ("/", false),
+        ("/workspace/src", false),
+        ("/workspace/..", false),
+        ("/workspacex", false),
+    ] {
+        *observed
+            .configuration
+            .pointer_mut("/Config/WorkingDir")
+            .unwrap() = serde_json::json!(cleaned);
+        assert_eq!(
+            verify_actual_configuration(&observed, &derived, &fixture_image()).is_ok(),
+            ok,
+            "{cleaned}"
+        );
+    }
+    assert_eq!(lexical_container_path("/a/./b//c/."), "/a/b/c");
+    assert_eq!(lexical_container_path("/a/../b"), "/a/../b");
+    assert_eq!(lexical_container_path(""), "");
+}

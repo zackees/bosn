@@ -724,3 +724,213 @@ fn setup_task_wire_validation_bounds_and_rejects_nonsemantic_names() {
         );
     }
 }
+
+/// Runs until cancelled; with `tick`, logs a line every `tick` (#358).
+struct TickingManifestAppTaskExecutor {
+    started: async_engine::Sender<String>,
+    tick: Option<Duration>,
+}
+impl ManifestAppTaskExecutor for TickingManifestAppTaskExecutor {
+    fn execute<'a>(
+        &'a self,
+        request: ManifestAppTaskJobRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a async_engine::Sender<String>,
+        _session: &'a dyn ManifestAppTaskSessionRecorder,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = self
+                .started
+                .send(request.workspace.to_string_lossy().into_owned())
+                .await;
+            loop {
+                let wait = self.tick.unwrap_or(Duration::from_secs(3600));
+                if async_engine::cancellable(cancellation, async_engine::sleep(wait))
+                    .await
+                    .is_err()
+                {
+                    return Err("cancelled".into());
+                }
+                let _ = logs.send("tick".into()).await;
+            }
+        })
+    }
+}
+
+fn test_capacity(slots: usize, stall: Option<Duration>) -> capacity::RunnerCapacity {
+    capacity::RunnerCapacity {
+        runner_slots: slots,
+        control_slots: 2,
+        cpus_per_slot: 4.0,
+        memory_per_slot: None,
+        stall_after: stall,
+        docker_proxy: false,
+    }
+}
+
+fn app_task(workspace: &str) -> ManifestAppTaskJobRequest {
+    ManifestAppTaskJobRequest {
+        workspace: PathBuf::from(workspace),
+        manifest: "bosn.toml".into(),
+        stack: "act".into(),
+        task_name: "act-ci".into(),
+        deadline: Duration::from_secs(600),
+        output_limit: 4096,
+    }
+}
+
+/// #358 RED -> GREEN: under `Jobs::new(1)` workspace B's task stayed
+/// Queued while A's ran. Distinct workspaces now run in parallel up to
+/// the runner slots; beyond them a job queues, and starts when a slot
+/// frees. `bosn jobs` accounts for all of it.
+#[test]
+fn app_tasks_from_distinct_workspaces_run_in_parallel_up_to_the_slots() {
+    let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+    let state = temporary.path().join("state");
+    let (started, mut started_wait) = async_engine::channel(8);
+    let fake = Arc::new(TickingManifestAppTaskExecutor {
+        started,
+        tick: None,
+    });
+    RuntimeBuilder::multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .run(async {
+            let server = async_engine::launch(
+                Service::new(state.clone())
+                    .with_manifest_app_task_executor(fake.clone())
+                    .with_runner_capacity(test_capacity(2, None))
+                    .serve(),
+            );
+            let client = wait_for_client(&state).await;
+            let a = client
+                .submit_manifest_app_task(app_task("/w/a"))
+                .await
+                .unwrap();
+            let b = client
+                .submit_manifest_app_task(app_task("/w/b"))
+                .await
+                .unwrap();
+            let mut seen = vec![
+                next_task_start(&mut started_wait).await,
+                next_task_start(&mut started_wait).await,
+            ];
+            seen.sort();
+            assert_eq!(seen, vec!["/w/a", "/w/b"], "B starts while A runs");
+            let c = client
+                .submit_manifest_app_task(app_task("/w/c"))
+                .await
+                .unwrap();
+            async_engine::sleep(Duration::from_millis(300)).await;
+            assert_eq!(client.job_status(c).await.unwrap().state, "Queued");
+
+            let view = client.jobs().await.unwrap();
+            assert_eq!(view["capacity"]["runner_slots"], 2);
+            assert_eq!(view["capacity"]["cpus_per_slot"], 4.0);
+            assert_eq!(view["lanes"]["runner"]["running"], 2);
+            assert_eq!(view["lanes"]["runner"]["queued"], 1);
+            let jobs = view["jobs"].as_array().unwrap();
+            let entry = |id: u64| jobs.iter().find(|j| j["id"] == id).unwrap().clone();
+            let mut slots = vec![entry(a)["slot"].as_u64(), entry(b)["slot"].as_u64()];
+            slots.sort();
+            assert_eq!(slots, vec![Some(0), Some(1)]);
+            assert_eq!(entry(c)["state"], "queued");
+            assert_eq!(entry(a)["class"], "runner");
+            assert_eq!(entry(a)["run"]["task"], "act-ci", "accounting record");
+            assert_eq!(entry(a)["run"]["nano_cpus"], 4_000_000_000_i64);
+
+            // Freeing a slot admits the queued job into it.
+            client.cancel_job(a).await.unwrap();
+            wait_for_job_state(&client, a, "Cancelled").await;
+            assert_eq!(next_task_start(&mut started_wait).await, "/w/c");
+            let view = client.jobs().await.unwrap();
+            let jobs = view["jobs"].as_array().unwrap();
+            let c_entry = jobs.iter().find(|j| j["id"] == c).unwrap();
+            assert_eq!(c_entry["slot"], entry(a)["slot"]);
+            assert!(
+                state.join("runners/active.json").exists(),
+                "running tasks are in the ledger"
+            );
+            for id in [b, c] {
+                client.cancel_job(id).await.unwrap();
+                wait_for_job_state(&client, id, "Cancelled").await;
+            }
+            let ledger = std::fs::read_to_string(state.join("runners/active.json")).unwrap();
+            assert_eq!(ledger.trim(), "[]", "finished runs leave the ledger");
+            client.shutdown().await.unwrap();
+            stopped(server).await;
+        });
+}
+
+/// A running task with no output (and no Docker activity) for longer
+/// than the stall timeout is torn down; a chatty one is left alone.
+#[test]
+fn a_silent_task_is_torn_down_as_stalled_and_a_chatty_one_is_not() {
+    let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+    let state = temporary.path().join("state");
+    let (started, mut started_wait) = async_engine::channel(8);
+    let silent = Arc::new(TickingManifestAppTaskExecutor {
+        started: started.clone(),
+        tick: None,
+    });
+    RuntimeBuilder::multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .run(async {
+            let server = async_engine::launch(
+                Service::new(state.clone())
+                    .with_manifest_app_task_executor(silent.clone())
+                    .with_runner_capacity(test_capacity(4, Some(Duration::from_secs(1))))
+                    .serve(),
+            );
+            let client = wait_for_client(&state).await;
+            let id = client
+                .submit_manifest_app_task(app_task("/w/quiet"))
+                .await
+                .unwrap();
+            next_task_start(&mut started_wait).await;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while client.job_status(id).await.unwrap().state != "Cancelled" {
+                assert!(Instant::now() < deadline, "a silent task is torn down");
+                async_engine::sleep(Duration::from_millis(50)).await;
+            }
+            let page = client.job_logs(id, 0, 64).await.unwrap();
+            assert!(
+                page.records.iter().any(|r| r.line.contains("stalled")),
+                "the job log says why it was torn down"
+            );
+            client.shutdown().await.unwrap();
+            stopped(server).await;
+        });
+    let chatty = Arc::new(TickingManifestAppTaskExecutor {
+        started,
+        tick: Some(Duration::from_millis(200)),
+    });
+    let state = temporary.path().join("state2");
+    RuntimeBuilder::multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .run(async {
+            let server = async_engine::launch(
+                Service::new(state.clone())
+                    .with_manifest_app_task_executor(chatty.clone())
+                    .with_runner_capacity(test_capacity(4, Some(Duration::from_secs(1))))
+                    .serve(),
+            );
+            let client = wait_for_client(&state).await;
+            let id = client
+                .submit_manifest_app_task(app_task("/w/chatty"))
+                .await
+                .unwrap();
+            next_task_start(&mut started_wait).await;
+            async_engine::sleep(Duration::from_secs(3)).await;
+            assert_eq!(client.job_status(id).await.unwrap().state, "Running");
+            client.cancel_job(id).await.unwrap();
+            wait_for_job_state(&client, id, "Cancelled").await;
+            client.shutdown().await.unwrap();
+            stopped(server).await;
+        });
+}

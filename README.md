@@ -83,6 +83,23 @@ The binding exposes typed request and observation operations only. It does not
 accept Docker command arguments, container identifiers, mounts, or arbitrary
 commands from callers.
 
+## Concurrent runs
+
+The daemon runs task jobs (`bosn run --task ...`) from different checkouts in
+parallel, `max(1, ncpu * 2)` runner slots by default, each limited to 4 CPUs.
+Stack ensures run in their own lane, so they never wait behind long tasks.
+`bosn jobs` (or the `bosn_jobs` MCP tool) shows what is running, in which slot,
+with which containers and caches. A task that goes silent is torn down, and a
+daemon restart reaps what its predecessor left running. For stacks that drive
+the host Docker engine (act), a per-job proxy labels, limits, isolates and
+removes the job's containers, and maps cache volumes into act's job
+containers. See [docs/runners.md](docs/runners.md).
+
+```bash
+bosn jobs                                  # what is running now
+bosn daemon serve --state-dir "$HOME/.local/state/bosn" --runner-slots 8 --runner-cpus 4
+```
+
 ## MCP / Hermes
 
 Run `bosn mcp` over stdio. A typical Hermes registration is:

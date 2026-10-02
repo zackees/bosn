@@ -92,6 +92,17 @@ pub(crate) async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Re
                     ..Default::default()
                 },
             },
+            37 => match jobs.list().await {
+                Ok(json) => ReplyWire {
+                    code: 220,
+                    jobs_json: json,
+                    ..Default::default()
+                },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
             5 => match jobs.status(r.job_id).await {
                 Ok(job) => ReplyWire {
                     code: 50,

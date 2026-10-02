@@ -83,7 +83,7 @@ fn typed_macos_guest_emits_only_its_fixed_privileged_runtime_shape() {
         mounts: Vec::new(),
         volumes: Vec::new(),
         tmpfs: Vec::new(),
-        host_docker_socket: None,
+        host_docker_socket: Box::new(None),
         environment: BTreeMap::new(),
         workdir: None,
         command: Some("must-not-be-emitted".into()),

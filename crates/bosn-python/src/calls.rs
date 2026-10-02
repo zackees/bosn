@@ -318,6 +318,19 @@ pub(crate) fn submit_manifest_app_task(
     })
 }
 
+pub(crate) fn jobs_json(state_dir: &Path) -> Result<String, bosn_service::Error> {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+    runtime.run(async {
+        ServiceClient::for_state(state_dir)?
+            .jobs()
+            .await
+            .map(|view| view.to_string())
+    })
+}
+
 pub(crate) fn job_status(
     state_dir: &Path,
     job_id: u64,

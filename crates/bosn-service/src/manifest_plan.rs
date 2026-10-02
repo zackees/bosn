@@ -95,8 +95,9 @@ pub(crate) async fn manifest_stack_plan(
     // are siblings). It is typed, never a generic host path.
     let mut mounts = Vec::new();
     let mut host_docker_socket = None;
+    let proxy_dir = manifest_docker_proxy_dir(state_dir, stack.kind.is_some())?;
     for mount in &stack.mounts {
-        if let Some(socket) = manifest_host_docker_socket(mount)? {
+        if let Some(socket) = manifest_host_docker_socket(mount, proxy_dir.clone())? {
             if host_docker_socket.is_some() {
                 return Err("manifest declares the host Docker socket more than once".into());
             }
@@ -270,6 +271,7 @@ pub(crate) async fn manifest_stack_plan(
             });
         }
     }
+    let job_caches = manifest_job_caches(stack, host_docker_socket.is_some());
     let task_names = tasks.keys().cloned().collect();
     let workspace_string = workspace.to_string_lossy().into_owned();
     let volumes = manifest_named_volumes(stack, &workspace_string, &generation)?;
@@ -327,7 +329,71 @@ pub(crate) async fn manifest_stack_plan(
         guest_task,
         secrets,
         github_api_proxy,
+        job_caches,
     })
+}
+
+/// Whether this daemon routes tasks' Docker calls through its accounting
+/// proxy; set once by [`Service::serve`] from the runner capacity. Plans
+/// derived outside a serving daemon (tests, previews) never bind it.
+pub(crate) static DOCKER_PROXY_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The proxy directory bound into a host-socket stack's container, when the
+/// proxy is enabled. It is created here, because Docker refuses to bind a
+/// missing source.
+fn manifest_docker_proxy_dir(
+    state_dir: Option<&Path>,
+    guest: bool,
+) -> Result<Option<String>, String> {
+    let Some(state_dir) = state_dir else {
+        return Ok(None);
+    };
+    if guest || !DOCKER_PROXY_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(None);
+    }
+    let dir = runners::proxy_dir(state_dir);
+    runners::ensure_proxy_dir(&dir)
+        .map_err(|error| format!("docker proxy directory unavailable: {error}"))?;
+    dir.to_str()
+        .map(|dir| Some(dir.to_owned()))
+        .ok_or_else(|| "docker proxy directory is not UTF-8".to_owned())
+}
+
+fn manifest_job_caches(
+    stack: &bosn_core::manifest::Stack,
+    host_docker_socket: bool,
+) -> Vec<runners::CacheRule> {
+    if !host_docker_socket {
+        return Vec::new();
+    }
+    let mut rules: Vec<runners::CacheRule> = stack
+        .job_caches
+        .iter()
+        .map(|cache| runners::CacheRule {
+            name: cache.name.clone(),
+            volume: cache.volume.clone(),
+            destination: cache.destination.clone(),
+            scope: match cache.scope.as_str() {
+                "machine" => runners::CacheScope::Machine,
+                "workspace" => runners::CacheScope::Workspace,
+                _ => runners::CacheScope::Repo,
+            },
+            mode: if cache.mode == "shared" {
+                runners::CacheMode::Shared
+            } else {
+                runners::CacheMode::Exclusive
+            },
+            replicas: cache.replicas as usize,
+        })
+        .collect();
+    if !rules
+        .iter()
+        .any(|rule| rule.volume.as_deref() == Some("act-toolcache"))
+    {
+        rules.push(runners::CacheRule::act_toolcache());
+    }
+    rules
 }
 
 /// Open a bounded local manifest exactly once for a native operation. The
@@ -404,6 +470,10 @@ pub(crate) struct ManifestRuntimePlan {
     pub(crate) secrets: Vec<String>,
     /// The task declared `github_api = "proxy"`.
     pub(crate) github_api_proxy: bool,
+    /// Cache mappings for the containers this stack's tasks start through
+    /// the Docker proxy (#358): the manifest's `job_caches`, plus act's
+    /// toolcache as an exclusive machine cache unless the manifest maps it.
+    pub(crate) job_caches: Vec<runners::CacheRule>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

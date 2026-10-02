@@ -52,6 +52,26 @@ pub struct Stack {
     pub kind: Option<String>,
     pub guest: Option<Guest>,
     pub acknowledge_macos_license: bool,
+    /// `[stack.<name>.job_caches.<cache>]` (#358): cache volumes for the
+    /// containers a task of this stack starts through the host Docker socket
+    /// (act's job containers). They do not change the stack's own container.
+    pub job_caches: Vec<JobCache>,
+}
+/// One cache mapping for a task's sibling containers; see `JobCache` docs in
+/// `docs/runners.md`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JobCache {
+    pub name: String,
+    /// Map this named volume wherever a job container references it.
+    pub volume: Option<String>,
+    /// Mount the cache here in every job container with nothing there.
+    pub destination: Option<String>,
+    /// `machine`, `repo` (default) or `workspace`.
+    pub scope: String,
+    /// `exclusive` (default: per-key lock over replicas) or `shared`.
+    pub mode: String,
+    /// Exclusive replicas, 1..=64 (default 4).
+    pub replicas: u32,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Volume {
@@ -262,6 +282,7 @@ fn parse_stack(
             "kind",
             "guest",
             "acknowledge_macos_license",
+            "job_caches",
         ],
         &where_,
     )?;
@@ -314,6 +335,12 @@ fn parse_stack(
             "[stack.{name}.mounts] guest cannot see host bind mounts"
         ));
     }
+    let job_caches = parse_job_caches(name, optional_table(body, "job_caches", &where_)?)?;
+    if kind.is_some() && !job_caches.is_empty() {
+        return err(format!(
+            "[stack.{name}.job_caches] a guest stack starts no job containers"
+        ));
+    }
     let is_guest = kind.is_some();
     Ok(Stack {
         name: name.into(),
@@ -333,7 +360,95 @@ fn parse_stack(
             None
         },
         acknowledge_macos_license,
+        job_caches,
     })
+}
+
+fn parse_job_caches(
+    stack: &str,
+    raw: &toml::map::Map<String, toml::Value>,
+) -> Result<Vec<JobCache>, ManifestError> {
+    let mut caches: Vec<JobCache> = Vec::new();
+    for (name, v) in raw {
+        let where_ = format!("stack.{stack}.job_caches.{name}");
+        let t = table_value(v, "job cache")?;
+        reject_unknown(
+            t,
+            &["volume", "destination", "scope", "mode", "replicas"],
+            &where_,
+        )?;
+        let safe = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 64
+                && value.as_bytes()[0].is_ascii_alphanumeric()
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+        };
+        if !safe(name) {
+            return err(format!(
+                "[{where_}] cache name must be 1-64 of [A-Za-z0-9_.-], starting alphanumeric"
+            ));
+        }
+        let volume = optional_string(t, "volume", &where_)?;
+        if volume.as_deref().is_some_and(|v| !safe(v)) {
+            return err(format!("[{where_}] `volume` must be a Docker volume name"));
+        }
+        let destination = optional_string(t, "destination", &where_)?
+            .map(|d| destination(&d, "job cache", name))
+            .transpose()?;
+        if volume.is_none() && destination.is_none() {
+            return err(format!(
+                "[{where_}] must set `volume`, `destination`, or both"
+            ));
+        }
+        let scope = optional_string(t, "scope", &where_)?.unwrap_or_else(|| "repo".into());
+        if !["machine", "repo", "workspace"].contains(&scope.as_str()) {
+            return err(format!(
+                "[{where_}] `scope` must be machine, repo or workspace, not {scope:?}"
+            ));
+        }
+        let mode = optional_string(t, "mode", &where_)?.unwrap_or_else(|| "exclusive".into());
+        if !["exclusive", "shared"].contains(&mode.as_str()) {
+            return err(format!(
+                "[{where_}] `mode` must be exclusive or shared, not {mode:?}"
+            ));
+        }
+        let replicas = match t.get("replicas") {
+            None => 4,
+            Some(value) => match value.as_integer() {
+                Some(n @ 1..=64) if mode == "exclusive" => n as u32,
+                Some(_) if mode == "shared" => {
+                    return err(format!(
+                        "[{where_}] `replicas` applies only to exclusive caches"
+                    ));
+                }
+                _ => {
+                    return err(format!(
+                        "[{where_}] `replicas` must be an integer in 1..=64"
+                    ));
+                }
+            },
+        };
+        if let Some(previous) = caches.iter().find(|c| {
+            (volume.is_some() && c.volume == volume)
+                || (destination.is_some() && c.destination == destination)
+        }) {
+            return err(format!(
+                "[{where_}] maps the same volume or destination as job cache {:?}",
+                previous.name
+            ));
+        }
+        caches.push(JobCache {
+            name: name.clone(),
+            volume,
+            destination,
+            scope,
+            mode,
+            replicas,
+        });
+    }
+    Ok(caches)
 }
 
 fn parse_volumes(

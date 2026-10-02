@@ -44,7 +44,7 @@ use kernal_api::{
 use prost::Message;
 use secrets::{MaskStream, SecretMasker};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
@@ -59,11 +59,14 @@ pub mod act_image;
 pub mod act_registry;
 pub mod act_runtime;
 pub mod autostart;
+pub mod capacity;
 pub mod ci;
 mod client;
 mod diagnostics;
 mod diagnostics_validate;
 mod dispatch;
+pub mod docker_api;
+pub mod docker_proxy;
 mod executors;
 mod gc_apply;
 pub mod github_proxy;
@@ -79,11 +82,13 @@ pub mod mcp;
 mod registry_actor;
 mod registry_api;
 mod registry_records;
+pub mod runners;
 pub mod secrets;
 mod service;
 mod setup_adopt;
 mod setup_executors;
 mod task_executors;
+mod task_runner;
 mod transport;
 pub mod unmanaged;
 mod wire;

@@ -19,7 +19,7 @@ fn typed_tmpfs_is_emitted_without_a_raw_option_channel() {
             exec: None,
             mode: None,
         }],
-        host_docker_socket: None,
+        host_docker_socket: Box::new(None),
         environment: BTreeMap::new(),
         workdir: None,
         command: None,
@@ -49,11 +49,12 @@ fn typed_tmpfs_exec_mode_and_host_docker_socket_are_emitted_from_typed_fields() 
             exec: Some(true),
             mode: Some(0o1777),
         }],
-        host_docker_socket: Some(crate::SetupHostDockerSocket {
+        host_docker_socket: Box::new(Some(crate::SetupHostDockerSocket {
             source: crate::SetupHostDockerSocketSource::VarRun,
             target: "/var/run/docker.sock".into(),
             readonly: false,
-        }),
+            proxy_dir: None,
+        })),
         environment: BTreeMap::new(),
         workdir: None,
         command: None,
@@ -87,6 +88,7 @@ fn host_docker_socket_target_cannot_collide_or_enter_a_guest() {
         source: crate::SetupHostDockerSocketSource::Run,
         target: plan.app.mounts[0].target.clone(),
         readonly: false,
+        proxy_dir: None,
     });
     assert!(matches!(
         validate_plan_shape(&plan),
@@ -98,6 +100,7 @@ fn host_docker_socket_target_cannot_collide_or_enter_a_guest() {
         source: crate::SetupHostDockerSocketSource::Run,
         target: "/var/run/docker.sock".into(),
         readonly: false,
+        proxy_dir: None,
     });
     assert!(validate_plan_shape(&plan).is_ok());
 
@@ -143,4 +146,42 @@ fn tmpfs_target_cannot_collide_with_a_bind_or_be_modified() {
         ))
     ));
     assert!(engine.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn the_docker_proxy_dir_is_bound_at_its_own_path_and_proven_on_reuse() {
+    let temporary = tempfile::tempdir().unwrap();
+    let mut plan = plan(temporary.path());
+    let dir = "/tmp/bosn-1000/dp-0123456789abcdef".to_owned();
+    plan.host_docker_socket = Some(crate::SetupHostDockerSocket {
+        source: crate::SetupHostDockerSocketSource::VarRun,
+        target: "/var/run/docker.sock".into(),
+        readonly: false,
+        proxy_dir: Some(dir.clone()),
+    });
+    assert!(validate_plan_shape(&plan).is_ok());
+    let derived = derive_creation(&plan, &plan.workspace_root, &prepared(&plan)).unwrap();
+    let args = derived.create_command().docker_args();
+    assert!(args.windows(2).any(
+        |pair| pair[0] == "--mount" && pair[1] == format!("type=bind,src={dir},dst={dir}")
+    ));
+    // The bind is part of the creation profile: a container without it
+    // has another name and is never adopted as this one.
+    let mut without = plan.clone();
+    without.host_docker_socket.as_mut().unwrap().proxy_dir = None;
+    let plain = derive_creation(&without, &without.workspace_root, &prepared(&without)).unwrap();
+    assert_ne!(plain.container_name, derived.container_name);
+    let observed = observed(&plan, true);
+    assert!(verify_actual_configuration(&observed, &derived, &fixture_image()).is_ok());
+    let mut missing = observed.clone();
+    let mounts = missing.configuration["Mounts"].as_array_mut().unwrap();
+    mounts.retain(|m| m["Destination"] != serde_json::json!(dir));
+    assert!(verify_actual_configuration(&missing, &derived, &fixture_image()).is_err());
+    // A proxy dir may not be `/`, collide with another target, or carry
+    // a comma that would split Docker's --mount value.
+    for bad in ["/", "/workspace", "/tmp/a,b", "relative"] {
+        let mut shaped = plan.clone();
+        shaped.host_docker_socket.as_mut().unwrap().proxy_dir = Some(bad.into());
+        assert!(validate_plan_shape(&shaped).is_err(), "{bad}");
+    }
 }

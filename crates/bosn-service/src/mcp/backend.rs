@@ -6,6 +6,10 @@ pub(crate) trait Backend {
     /// The CI tools' daemon view (see [`crate::ci::mcp`]).
     fn ci(&mut self) -> Box<dyn crate::ci::mcp::CiBackend + '_>;
     fn status(&mut self) -> Result<Status, Error>;
+    /// The runner accounting view (#358); see [`Client::jobs`].
+    fn jobs(&mut self) -> Result<Value, Error> {
+        Err(Error::Protocol("jobs view unavailable"))
+    }
     fn doctor(&mut self) -> Result<DoctorReport, Error>;
     fn registry_resources(&mut self, after: u64, limit: u32)
     -> Result<RegistryResourcePage, Error>;
@@ -111,6 +115,9 @@ impl Backend for DaemonBackend<'_> {
     }
     fn status(&mut self) -> Result<Status, Error> {
         self.runtime.run(self.client.status())
+    }
+    fn jobs(&mut self) -> Result<Value, Error> {
+        self.runtime.run(self.client.jobs())
     }
     fn doctor(&mut self) -> Result<DoctorReport, Error> {
         self.runtime.run(self.client.doctor())

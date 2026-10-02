@@ -37,8 +37,12 @@ impl SetupAppTaskSessionRecorder for ActorSetupAppTaskSessionRecorder {
 pub(crate) struct ActorManifestAppTaskSessionRecorder {
     pub(crate) actor: RegistryActor,
     pub(crate) job_id: u64,
+    pub(crate) run: Option<RunContext>,
 }
 impl ManifestAppTaskSessionRecorder for ActorManifestAppTaskSessionRecorder {
+    fn run_context(&self) -> Option<&RunContext> {
+        self.run.as_ref()
+    }
     fn begin<'a>(
         &'a self,
         managed_container_identity: String,

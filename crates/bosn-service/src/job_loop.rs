@@ -17,18 +17,55 @@ pub(crate) async fn job_actor(
     let mut cancellations: BTreeMap<u64, CancellationSource> = BTreeMap::new();
     let mut tasks = async_engine::TaskGroup::new();
     let mut stopping: Option<async_engine::OneshotSender<()>> = None;
+    let mut next_sweep = Instant::now();
     loop {
         // Wake at least once per sweep interval so a job whose follower
         // vanished is cancelled even when no other command arrives.
-        let command = match async_engine::timeout(LEASE_SWEEP_INTERVAL, receiver.recv()).await {
+        let wait = next_sweep.saturating_duration_since(Instant::now());
+        let command = match async_engine::timeout(wait, receiver.recv()).await {
             Ok(Some(command)) => Some(command),
             Ok(None) => break,
             Err(_) => None,
         };
-        while matches!(
-            async_engine::timeout(Duration::ZERO, tasks.join_next()).await,
-            Ok(Some(_))
-        ) {}
+        // Reaping finished tasks and the stall sweep run once per interval,
+        // not once per command: a zero-length timeout still waits for a
+        // timer tick (about a millisecond), which capped the whole daemon at
+        // about a thousand commands a second and serialized every concurrent
+        // job's log stream behind it (#358).
+        let sweep = Instant::now() >= next_sweep;
+        if sweep {
+            next_sweep = Instant::now() + LEASE_SWEEP_INTERVAL;
+            while matches!(
+                async_engine::timeout(Duration::ZERO, tasks.join_next()).await,
+                Ok(Some(_))
+            ) {}
+        }
+        if sweep
+            && stopping.is_none()
+            && let Some(runners) = &executors.runners
+            && let Some(after) = runners.capacity().stall_after
+        {
+            for id in jobs.stalled(Instant::now(), after, |id| runners.activity(id)) {
+                let line = format!(
+                    "[bosn] stalled: no output and no Docker activity for {}s; tearing down this job (stall_seconds)",
+                    after.as_secs()
+                );
+                eprintln!("bosn: job {id} {}", &line[7..]);
+                let _ = jobs.log(id, line);
+                let _ = cancel_job_in_actor(
+                    id,
+                    &mut jobs,
+                    &mut requests,
+                    &mut setup_kinds,
+                    &cancellations,
+                    &registry,
+                )
+                .await;
+            }
+        }
+        // Leases are checked on every command (a map scan, no timer), so a
+        // lapsed follower's queued job is cancelled before a slot it was
+        // waiting for is handed to it.
         if stopping.is_none() {
             for id in jobs.expired_leases(Instant::now()) {
                 let _ = jobs.log(
@@ -146,7 +183,7 @@ pub(crate) async fn job_actor(
                 let digest = setup_task_digest(&request);
                 let workspace = request.workspace.to_string_lossy().into_owned();
                 let result = jobs
-                    .submit(&workspace, "setup-task", &digest)
+                    .submit_class(&workspace, "setup-task", &digest, jobs::JobClass::Runner)
                     .map(|submission| match submission {
                         Submission::Started(id) | Submission::Queued(id) => {
                             requests.insert(id, SetupJobRequest::Task(request));
@@ -174,7 +211,12 @@ pub(crate) async fn job_actor(
                 let digest = setup_app_task_digest(&request);
                 let workspace = request.workspace.to_string_lossy().into_owned();
                 let result = jobs
-                    .submit(&workspace, "setup-app-task", &digest)
+                    .submit_class(
+                        &workspace,
+                        "setup-app-task",
+                        &digest,
+                        jobs::JobClass::Runner,
+                    )
                     .map(|submission| match submission {
                         Submission::Started(id) | Submission::Queued(id) => {
                             requests.insert(id, SetupJobRequest::AppTask(request));
@@ -340,7 +382,7 @@ pub(crate) async fn job_actor(
                 let workspace = request.workspace.to_string_lossy().into_owned();
                 let job_stack = format!("manifest-app-task:{}", request.stack);
                 let result = jobs
-                    .submit(&workspace, &job_stack, &digest)
+                    .submit_class(&workspace, &job_stack, &digest, jobs::JobClass::Runner)
                     .map(|submission| match submission {
                         Submission::Started(id) | Submission::Queued(id) => {
                             requests.insert(id, SetupJobRequest::ManifestAppTask(request));
@@ -448,13 +490,22 @@ pub(crate) async fn job_actor(
                 };
                 let _ = reply.send(result);
             }
-            JobCommand::Log { id, line } => {
+            JobCommand::Log { id, lines } => {
                 // A full log record is never permitted to block daemon IPC;
                 // bounded engine output instead applies back-pressure upstream.
-                let _ = jobs.log(id, bounded_log_line(&line));
+                for line in lines {
+                    let _ = jobs.log(id, bounded_log_line(&line));
+                }
+            }
+            JobCommand::List { reply } => {
+                let view = jobs_view(&jobs, executors.runners.as_deref());
+                let _ = reply.send(view.to_string());
             }
             JobCommand::Completed { id, kind, result } => {
                 cancellations.remove(&id);
+                if let Some(runners) = &executors.runners {
+                    runners.finish(id);
+                }
                 let terminal_outcome = if matches!(kind, SetupJobKind::Ensure) {
                     let cancelled = jobs
                         .job(id)
@@ -564,6 +615,8 @@ pub(crate) async fn job_actor(
 
 /// How often the job actor checks follow leases when no command arrives.
 const LEASE_SWEEP_INTERVAL: Duration = Duration::from_millis(500);
+/// Most output lines one forwarded log command carries.
+const LOG_BATCH_LINES: usize = 256;
 
 /// Cancel one job: a queued job ends now, a running one is signalled and
 /// settles when its executor completes. Shared by `bosn job cancel` and the
@@ -625,9 +678,28 @@ pub(crate) fn launch_started_setup_jobs(
         let ensure_executor = Arc::clone(&executors.ensure);
         let manifest_ensure_executor = Arc::clone(&executors.manifest_ensure);
         let manifest_app_task_executor = Arc::clone(&executors.manifest_app_task);
+        let run = match (&request, &executors.runners) {
+            (SetupJobRequest::ManifestAppTask(request), Some(runners)) => {
+                let slot = jobs.job(id).ok().and_then(|job| job.slot);
+                let (record, activity) = runners.begin(
+                    id,
+                    &request.workspace.to_string_lossy(),
+                    &request.stack,
+                    &request.task_name,
+                    slot,
+                );
+                Some(RunContext {
+                    runners: Arc::clone(runners),
+                    record,
+                    activity,
+                })
+            }
+            _ => None,
+        };
         let manifest_session_recorder = ActorManifestAppTaskSessionRecorder {
             actor: registry.clone(),
             job_id: id,
+            run,
         };
         let manifest_registry = registry.clone();
         tasks.spawn(async move {
@@ -635,7 +707,18 @@ pub(crate) fn launch_started_setup_jobs(
             let log_sender = task_sender.clone();
             let forwarder = async_engine::launch(async move {
                 while let Some(line) = log_receiver.recv().await {
-                    if log_sender.send(JobCommand::Log { id, line }).await.is_err() {
+                    let mut lines = vec![line];
+                    while lines.len() < LOG_BATCH_LINES {
+                        match log_receiver.try_recv() {
+                            Ok(line) => lines.push(line),
+                            Err(_) => break,
+                        }
+                    }
+                    if log_sender
+                        .send(JobCommand::Log { id, lines })
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
