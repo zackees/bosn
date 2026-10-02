@@ -145,10 +145,11 @@ jobs:
           toolchain: "1.95.0"
           prebuild-deps: none
 
-      - name: Restore Cargo build cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: rust-workspace-v1
+      # No hand-keyed target cache (#361 phase 3): the former
+      # Swatinem/rust-cache `rust-workspace-v1` key was invalidated by hand.
+      # Compiled artifacts come from setup-soldr's content-keyed zccache
+      # build cache above (nearest-ancestor restore per zackees/ci.yml
+      # CACHE-024), and an attested PR head skips this job altogether.
 
       - name: Install native build dependencies
         run: |
@@ -171,7 +172,7 @@ jobs:
 
   linux:
     name: Linux (lint + unit + docker)
-    if: always()
+    if: ${{ !cancelled() }}
     needs: [select-tier]
     runs-on: ubuntu-latest
     steps:
@@ -229,7 +230,7 @@ jobs:
 
   native-wheel:
     name: Native wheel (${{ matrix.os }})
-    if: always()
+    if: ${{ !cancelled() }}
     needs: [select-tier]
     runs-on: ${{ matrix.os }}
     strategy:
@@ -315,7 +316,7 @@ jobs:
 
   darwin-cross-wheel:
     name: Darwin wheel (${{ matrix.target }}, Linux-hosted Soldr)
-    if: always()
+    if: ${{ !cancelled() }}
     needs: [select-tier]
     runs-on: ubuntu-latest
     strategy:
@@ -446,7 +447,7 @@ jobs:
   # (ci/lint_no_webview_in_core.py); it builds alone, on the full tier only.
   widget:
     name: Desktop widget (Linux, WebKitGTK)
-    if: always() && needs.select-tier.outputs.full == 'true'
+    if: ${{ !cancelled() && needs.select-tier.outputs.full == 'true' }}
     needs: [select-tier]
     runs-on: ubuntu-latest
     steps:
@@ -472,7 +473,7 @@ jobs:
 
   full-coverage:
     name: Full CI coverage (exact candidate SHA)
-    if: always() && needs.select-tier.outputs.full == 'true'
+    if: ${{ !cancelled() && needs.select-tier.outputs.full == 'true' }}
     needs: [select-tier, lint-no-macos-runners, rust, linux, native-wheel, darwin-cross-wheel, darwin-hosted-smoke, widget]
     runs-on: ubuntu-latest
     permissions:
@@ -498,7 +499,7 @@ jobs:
   # capacity is an account-level condition, not a Bosn defect.
   ci-queue-timing:
     name: CI queue timing
-    if: always()
+    if: ${{ !cancelled() }}
     needs: [select-tier, lint-no-macos-runners, rust, linux, native-wheel, darwin-cross-wheel, darwin-hosted-smoke, widget, full-coverage]
     runs-on: ubuntu-latest
     permissions:
