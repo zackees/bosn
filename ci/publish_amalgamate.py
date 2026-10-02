@@ -100,15 +100,7 @@ def prepare_bosn_crate_for_publish(
             target.write_text(text, encoding="utf-8")
             relocate_includes(target, original=original, crate_dir=crate_dir, facade=facade)
 
-    cli = facade_src / "bin" / CLI_BINARY.name
-    cli.parent.mkdir(parents=True, exist_ok=True)
-    cli.write_text(
-        rewrite_binary_source(
-            (root / "crates" / CLI_CRATE / CLI_BINARY).read_text(encoding="utf-8"),
-            module_map=module_map,
-        ),
-        encoding="utf-8",
-    )
+    copy_cli_binary(root / "crates" / CLI_CRATE / CLI_BINARY, facade_src / "bin", module_map)
 
     write_publish_lib_rs(facade_src, modules)
     rewrite_bosn_manifest(facade / "Cargo.toml", module_map)
@@ -141,6 +133,23 @@ def rewrite_rust_source_for_amalgamation(
         text = re.sub(rf"\b{re.escape(ident)}::", f"crate::{target}::", text)
         text = re.sub(rf"\b{re.escape(ident)}\b", f"crate::{target}", text)
     return text
+
+
+def copy_cli_binary(source: Path, target_bin: Path, module_map: dict[str, str]) -> None:
+    """Carry the CLI and its `#[path = "<stem>/..."]` submodule directory across."""
+
+    submodules = source.parent / source.stem
+    shipped = target_bin / source.stem
+    if shipped.exists():
+        shutil.rmtree(shipped)
+    files = [source, *sorted(submodules.rglob("*.rs"))] if submodules.is_dir() else [source]
+    for path in files:
+        target = target_bin / path.relative_to(source.parent)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            rewrite_binary_source(path.read_text(encoding="utf-8"), module_map=module_map),
+            encoding="utf-8",
+        )
 
 
 def rewrite_binary_source(text: str, *, module_map: dict[str, str]) -> str:

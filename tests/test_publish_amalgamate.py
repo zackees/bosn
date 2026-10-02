@@ -170,6 +170,17 @@ def test_the_real_tree_amalgamates_into_one_crate(amalgamated: Path) -> None:
         assert not re.search(rf"^{re.escape(crate)}\s*=", manifest, re.MULTILINE)
 
 
+def test_every_cli_submodule_ships_with_the_cli(amalgamated: Path) -> None:
+    """`bosn.rs` declares `#[path = "bosn/x.rs"] mod x;`; each must resolve (#326)."""
+    cli = amalgamated / "src" / "bin" / "bosn.rs"
+    declared = re.findall(r'#\[path = "([^"]+)"\]', cli.read_text(encoding="utf-8"))
+    assert declared, "the CLI has path-declared submodules"
+    for relative in declared:
+        module = cli.parent / relative
+        assert module.is_file(), module
+        assert "bosn_service" not in module.read_text(encoding="utf-8"), module
+
+
 def test_every_include_in_the_real_tree_still_resolves(amalgamated: Path) -> None:
     includes = 0
     for source in (amalgamated / "src").rglob("*.rs"):
