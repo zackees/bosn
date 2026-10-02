@@ -809,7 +809,7 @@ pub async fn run_registered_act(
             format!("{INPUTS}/source"),
         ])
         .await?;
-        control(vec![
+        let load_output = control(vec![
             "exec".into(),
             id.clone(),
             "docker".into(),
@@ -818,13 +818,14 @@ pub async fn run_registered_act(
             format!("{INPUTS}/act.oci.tar"),
         ])
         .await?;
+        private_file(&evidence.join("image-load.stdout"), &load_output)?;
         let loaded = control(vec![
             "exec".into(),
             id.clone(),
             "docker".into(),
             "image".into(),
             "inspect".into(),
-            "bosn-act".into(),
+            request.package.manifest_digest.clone(),
         ])
         .await?;
         let image_id = verify_loaded_image(
@@ -840,7 +841,7 @@ pub async fn run_registered_act(
             "docker".into(),
             "image".into(),
             "inspect".into(),
-            "bosn-act-runner".into(),
+            request.package.runner_manifest_digest.clone(),
         ])
         .await?;
         if request.package.runner_manifest_digest != request.intent.runner_image_digest {
@@ -1036,8 +1037,10 @@ elif args[:3]==['exec',record['engine_id'],'sha256sum']:
 elif args[:4]==['exec',record['engine_id'],'docker','load']:
  if mode=='load-failed': sys.exit(7)
 elif args[:5]==['exec',record['engine_id'],'docker','image','inspect']:
- value=json.load(open(image))['runner' if args[-1]=='bosn-act-runner' else 'act']
- if mode=='missing-runner' and args[-1]=='bosn-act-runner': sys.exit(7)
+ images=json.load(open(image));is_runner=args[-1]==record['intent']['runner_image_digest']
+ assert args[-1]==images['runner' if is_runner else 'act'][0]['Id']
+ value=images['runner' if is_runner else 'act']
+ if mode=='missing-runner' and is_runner: sys.exit(7)
  if mode=='foreign-image': value[0]['Descriptor']['digest']='sha256:'+'f'*64
  print(json.dumps(value))
 elif args[:4]==['exec',record['engine_id'],'docker','run']:
