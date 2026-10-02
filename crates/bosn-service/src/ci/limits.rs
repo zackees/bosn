@@ -17,6 +17,7 @@
 //! storage_gib = 10  # its private storage tmpfs (counts against memory)
 //! cpus = 4
 //! pids = 4096
+//! spares = 0        # opt out of the prepared spare engine (#410; default 1)
 //! ```
 //!
 //! Pinning only `storage_gib` grows a sized memory limit to fit it (by the
@@ -112,6 +113,9 @@ pub struct EngineConfig {
     pub storage_gib: Option<u64>,
     pub cpus: Option<u64>,
     pub pids: Option<u64>,
+    /// Prepared spare engines kept (#410); `spares = 0` opts out.
+    #[serde(default)]
+    pub spares: super::spare::Spares,
 }
 
 /// The limits for one engine on `host` under `config`. Pure: the same host
@@ -235,6 +239,7 @@ mod tests {
             storage_gib: Some(6),
             cpus: Some(3),
             pids: Some(2048),
+            ..EngineConfig::default()
         };
         let limits = size_engine(host(4, 1, 1), pinned).unwrap();
         assert_eq!(
@@ -290,6 +295,7 @@ mod tests {
             engine_image_digest: crate::act_engine::ENGINE_MANIFEST.into(),
             runner_image_digest: format!("sha256:{}", "f".repeat(64)),
             created_at: 1.0,
+            spare: false,
             creation_profile: Some(profile),
         };
         // What the registry stores is what recovery reads back.

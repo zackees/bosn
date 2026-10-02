@@ -37,7 +37,11 @@ impl CiRuntime {
             limit: state.scheduler.limit(),
             drained: state.scheduler.drained(),
         });
-        let status = runner_status(&state.scheduler, self.widget_presence());
+        let status = runner_status(
+            &state.scheduler,
+            self.widget_presence(),
+            self.spares.status(),
+        );
         drop(state);
         self.kick();
         Ok(RunnersReply {
@@ -71,6 +75,8 @@ impl CiRuntime {
             }
             state.clearing_cache = true;
         }
+        // The spare engine mounts the volume: retire it first.
+        self.spares.retire_all().await;
         let removed = self.backend.remove_cache(CACHE_VOLUME).await;
         self.lock().clearing_cache = false;
         self.kick();

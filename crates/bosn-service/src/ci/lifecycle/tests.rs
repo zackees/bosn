@@ -8,317 +8,8 @@ use std::{
     time::Duration,
 };
 
-/// Fault points for the synthetic engine.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Faults {
-    pub create: bool,
-    /// Create the container, then report failure (partial creation).
-    pub create_after_side_effect: bool,
-    pub prepare: bool,
-    pub exit_code: i32,
-    pub hang: bool,
-    pub remove: bool,
-    pub inspect: bool,
-    /// Resolving the engine image never finishes (a stuck pull).
-    pub slow_image: bool,
-    /// Saving the tool cache fails.
-    pub save: bool,
-}
-
-/// In-memory engine host: name -> observation. Creation and retirement
-/// drive the real registry actor through the same commands, in the same
-/// order, as the owned-engine layer does on Docker.
-#[derive(Default)]
-pub struct FakeBackend {
-    pub engines: Mutex<BTreeMap<String, ActEngineObservation>>,
-    pub faults: Mutex<Faults>,
-    pub executions: Mutex<u32>,
-    /// Whether the cache volume exists.
-    pub cache: Mutex<bool>,
-    /// Tool-cache saves that found their engine still present.
-    pub saved_while_live: Mutex<u32>,
-    /// What sampling the engine's storage reports; `None` fails the sample.
-    pub storage: Mutex<Option<crate::ci::storage::StorageUsage>>,
-    next: Mutex<u64>,
-}
-impl FakeBackend {
-    pub fn with(faults: Faults) -> Self {
-        let backend = Self::default();
-        *backend.faults.lock().unwrap() = faults;
-        backend
-    }
-    fn faults(&self) -> Faults {
-        *self.faults.lock().unwrap()
-    }
-    pub fn live(&self) -> usize {
-        self.engines.lock().unwrap().len()
-    }
-    fn insert(
-        &self,
-        name: &str,
-        image: &str,
-        labels: BTreeMap<String, String>,
-    ) -> ActEngineObservation {
-        let mut next = self.next.lock().unwrap();
-        *next += 1;
-        let observed = ActEngineObservation {
-            name: name.into(),
-            engine_id: format!("{:064x}", *next),
-            image_digest: image.into(),
-            labels,
-        };
-        self.engines
-            .lock()
-            .unwrap()
-            .insert(name.into(), observed.clone());
-        observed
-    }
-    fn live_id(&self, engine_id: &str) -> bool {
-        self.engines
-            .lock()
-            .unwrap()
-            .values()
-            .any(|engine| engine.engine_id == engine_id)
-    }
-}
-pub const LISTING: &str = "Stage  Job ID  Job name  Workflow name  Workflow file  Events\n\
-                           0      a       a         w              ci.yml         push\n";
-/// The machine the fake host engine reports.
-pub const FAKE_HOST: super::super::limits::HostResources = super::super::limits::HostResources {
-    total_memory: 16 << 30,
-    available_memory: 12 << 30,
-    cpus: 2,
-};
-fn later(record: &ActEngineRecord) -> f64 {
-    now_seconds().max(record.updated_at)
-}
-impl ActEngineBackend for FakeBackend {
-    fn ensure_engine_image(&self) -> super::super::engine::BoxFuture<'_, Result<(), String>> {
-        Box::pin(async move {
-            if self.faults().slow_image {
-                std::future::pending::<()>().await;
-            }
-            Ok(())
-        })
-    }
-    fn host_resources(
-        &self,
-    ) -> super::super::engine::BoxFuture<'_, Result<super::super::limits::HostResources, String>>
-    {
-        Box::pin(async { Ok(FAKE_HOST) })
-    }
-    fn ensure_cache<'a>(
-        &'a self,
-        _cache: &'a CacheVolume,
-    ) -> super::super::engine::BoxFuture<'a, Result<(), String>> {
-        *self.cache.lock().unwrap() = true;
-        Box::pin(async { Ok(()) })
-    }
-    fn cache_bytes<'a>(
-        &'a self,
-        _volume: &'a str,
-    ) -> super::super::engine::BoxFuture<'a, Result<Option<u64>, String>> {
-        let exists = *self.cache.lock().unwrap();
-        Box::pin(async move { Ok(exists.then_some(4096)) })
-    }
-    fn storage_usage<'a>(
-        &'a self,
-        _engine: &'a str,
-    ) -> super::super::engine::BoxFuture<'a, Result<crate::ci::storage::StorageUsage, String>> {
-        let usage = *self.storage.lock().unwrap();
-        Box::pin(async move { usage.ok_or_else(|| "df: not sampled".to_string()) })
-    }
-    fn save_toolcache<'a>(
-        &'a self,
-        engine: &'a str,
-    ) -> super::super::engine::BoxFuture<'a, Result<(), String>> {
-        if self.live_id(engine) {
-            *self.saved_while_live.lock().unwrap() += 1;
-        }
-        let fails = self.faults().save;
-        Box::pin(async move {
-            if fails {
-                Err("disk full".into())
-            } else {
-                Ok(())
-            }
-        })
-    }
-    fn remove_cache<'a>(
-        &'a self,
-        _volume: &'a str,
-    ) -> super::super::engine::BoxFuture<'a, Result<(), String>> {
-        *self.cache.lock().unwrap() = false;
-        Box::pin(async { Ok(()) })
-    }
-    fn create<'a>(
-        &'a self,
-        registry: &'a RegistryActor,
-        intent: &'a ActEngineIntent,
-        owner: &'a str,
-        at: f64,
-    ) -> super::super::engine::BoxFuture<'a, Result<ActEngineObservation, String>> {
-        Box::pin(async move {
-            let f = self.faults();
-            commit(registry, ActRegistryCommand::Begin(intent.clone())).await?;
-            if f.create {
-                return Err("synthetic create failure".into());
-            }
-            let labels = intent.required_labels(owner).map_err(|e| e.to_string())?;
-            let observed = self.insert(&intent.engine_name(), &intent.engine_image_digest, labels);
-            if f.create_after_side_effect {
-                return Err("synthetic create failure after side effect".into());
-            }
-            commit(
-                registry,
-                ActRegistryCommand::Register {
-                    run: intent.run_id.clone(),
-                    observed: observed.clone(),
-                    at,
-                },
-            )
-            .await?;
-            Ok(observed)
-        })
-    }
-    fn retire<'a>(
-        &'a self,
-        registry: &'a RegistryActor,
-        owner: &'a str,
-        record: &'a ActEngineRecord,
-        _budget: Duration,
-    ) -> super::super::engine::BoxFuture<'a, Result<(), String>> {
-        Box::pin(async move {
-            let f = self.faults();
-            if f.inspect {
-                return Err("synthetic inspect failure".into());
-            }
-            let run = record.intent.run_id.clone();
-            let name = record.intent.engine_name();
-            let found = self.engines.lock().unwrap().get(&name).cloned();
-            let engine_id = match found {
-                None => record.engine_id.clone(),
-                Some(observed) => {
-                    let required = record
-                        .intent
-                        .required_labels(owner)
-                        .map_err(|e| e.to_string())?;
-                    if observed.labels != required {
-                        return Err(format!("engine {name} is not provably ours"));
-                    }
-                    if record.engine_id.is_none() {
-                        commit(
-                            registry,
-                            ActRegistryCommand::Recover {
-                                run: run.clone(),
-                                observed: observed.clone(),
-                                at: later(record),
-                            },
-                        )
-                        .await?;
-                    }
-                    let reply = registry
-                        .act_registry(ActRegistryCommand::Authorize {
-                            run: run.clone(),
-                            observed: observed.clone(),
-                        })
-                        .await
-                        .map_err(|e| format!("cleanup not authorized: {e}"))?;
-                    if !matches!(reply, ActRegistryReply::Authorized(_)) {
-                        return Err("cleanup not authorized".into());
-                    }
-                    if f.remove {
-                        return Err("synthetic removal failure".into());
-                    }
-                    self.engines.lock().unwrap().remove(&name);
-                    Some(observed.engine_id)
-                }
-            };
-            commit(
-                registry,
-                ActRegistryCommand::Finalize {
-                    run,
-                    proof: ActEngineRemovalProof { name, engine_id },
-                    at: later(record),
-                },
-            )
-            .await
-        })
-    }
-    fn prepare<'a>(
-        &'a self,
-        engine: &'a str,
-        _source: &'a std::path::Path,
-        _event: &'a std::path::Path,
-        _act: ActArtifact,
-    ) -> super::super::engine::BoxFuture<'a, Result<(), String>> {
-        Box::pin(async move {
-            assert!(self.live_id(engine), "prepare addresses the engine by ID");
-            if self.faults().prepare {
-                return Err("synthetic prepare failure".into());
-            }
-            Ok(())
-        })
-    }
-    fn list<'a>(
-        &'a self,
-        _engine: &'a str,
-        _workflow: &'a str,
-    ) -> super::super::engine::BoxFuture<'a, Result<String, String>> {
-        Box::pin(async { Ok(LISTING.to_string()) })
-    }
-    fn execute<'a>(
-        &'a self,
-        _engine: &'a str,
-        _invocation: &'a ActInvocation,
-        deadline: Duration,
-        cancellation: &'a CancellationToken,
-        lines: &'a async_engine::Sender<EngineLine>,
-    ) -> super::super::engine::BoxFuture<'a, Result<ExecEnd, String>> {
-        Box::pin(async move {
-            *self.executions.lock().unwrap() += 1;
-            let f = self.faults();
-            let _ = lines
-                .send(EngineLine::Stdout(
-                    r#"{"job":"w/a","jobID":"a","msg":"⭐ Run Main x","stage":"Main","stepID":["0"]}"#.into(),
-                ))
-                .await;
-            let _ = lines
-                .send(EngineLine::Stderr("act: warning on stderr".into()))
-                .await;
-            if f.hang {
-                return match async_engine::timeout(
-                    deadline,
-                    async_engine::cancellable(
-                        cancellation,
-                        async_engine::sleep(Duration::from_secs(3600)),
-                    ),
-                )
-                .await
-                {
-                    Err(_) => Ok(ExecEnd::TimedOut),
-                    Ok(_) => Ok(ExecEnd::Cancelled),
-                };
-            }
-            let result = if f.exit_code == 0 {
-                "success"
-            } else {
-                "failure"
-            };
-            let _ = lines
-                .send(EngineLine::Stdout(format!(
-                    r#"{{"job":"w/a","jobID":"a","msg":"done","stage":"Main","stepID":["0"],"stepResult":"{result}"}}"#
-                )))
-                .await;
-            let _ = lines
-                .send(EngineLine::Stdout(format!(
-                    r#"{{"job":"w/a","jobID":"a","msg":"🏁","jobResult":"{result}"}}"#
-                )))
-                .await;
-            Ok(ExecEnd::Exited(f.exit_code))
-        })
-    }
-}
+mod fake;
+pub use fake::*;
 
 #[derive(Default)]
 pub struct Collect {
@@ -350,6 +41,7 @@ pub fn intent(run: &str) -> ActEngineIntent {
         engine_image_digest: crate::act_engine::ENGINE_MANIFEST.into(),
         runner_image_digest: format!("sha256:{}", "f".repeat(64)),
         created_at: 1.0,
+        spare: false,
         creation_profile: Some(
             crate::act_engine::creation_profile_with_cache(
                 super::super::limits::size_engine(FAKE_HOST, Default::default()).unwrap(),
@@ -359,7 +51,7 @@ pub fn intent(run: &str) -> ActEngineIntent {
         ),
     }
 }
-fn plan(run: &str, deadline: Duration) -> EnginePlan {
+pub fn plan(run: &str, deadline: Duration) -> EnginePlan {
     EnginePlan {
         intent: intent(run),
         act: super::super::engine::act_artifact("x86_64").unwrap(),
@@ -374,9 +66,10 @@ fn plan(run: &str, deadline: Duration) -> EnginePlan {
         },
         cache: test_cache(),
         deadline: async_engine::Deadline::after(deadline),
+        spare: None,
     }
 }
-fn test_cache() -> CacheVolume {
+pub fn test_cache() -> CacheVolume {
     CacheVolume {
         name: "bosn-ci-cache-test".into(),
         labels: BTreeMap::new(),
@@ -386,7 +79,7 @@ pub fn run_id(n: u32) -> String {
     format!("aaaaaaaa-bbbb-4ccc-8ddd-{n:012x}")
 }
 
-const OWNER: &str = "11111111-2222-4333-8444-555555555555";
+pub const OWNER: &str = "11111111-2222-4333-8444-555555555555";
 
 /// One daemon's sole registry writer over a registry file.
 pub struct Daemon {
@@ -436,7 +129,7 @@ where
 /// ([`crate::act_runtime::recover_startup_act_engines`]), over the fake
 /// engine host: interrupt every non-terminal record, retire its engine,
 /// then seal the startup window.
-async fn startup_recovery(
+pub async fn startup_recovery(
     registry: &RegistryActor,
     backend: &FakeBackend,
 ) -> (Vec<String>, Vec<(String, String)>) {
@@ -484,7 +177,7 @@ async fn startup_recovery(
     (retired, failed)
 }
 
-async fn record_of(registry: &RegistryActor, run: &str) -> ActEngineRecord {
+pub async fn record_of(registry: &RegistryActor, run: &str) -> ActEngineRecord {
     match registry
         .act_registry(ActRegistryCommand::Get { run: run.into() })
         .await
@@ -499,7 +192,7 @@ async fn record(registry: &RegistryActor, _dir: &std::path::Path, run: &str) -> 
     record_of(registry, run).await
 }
 
-fn terminal(record: &ActEngineRecord, outcome: ActRunOutcome) {
+pub fn terminal(record: &ActEngineRecord, outcome: ActRunOutcome) {
     assert_eq!(record.state, ActEngineState::Terminal, "{record:?}");
     assert_eq!(record.outcome, Some(outcome));
     assert!(record.removal.is_some(), "removal receipt");
@@ -697,7 +390,7 @@ fn cancellation_mid_run_is_cancelled_and_cleaned() {
 }
 
 /// Restart the daemon over the same registry and run its startup recovery.
-async fn restarted(
+pub async fn restarted(
     path: &std::path::Path,
     backend: &FakeBackend,
 ) -> (Daemon, Vec<String>, Vec<(String, String)>) {
@@ -706,7 +399,7 @@ async fn restarted(
     (daemon, retired, failed)
 }
 
-fn with_daemon<F, Fut>(body: F)
+pub fn with_daemon<F, Fut>(body: F)
 where
     F: FnOnce(Daemon, std::path::PathBuf) -> Fut,
     Fut: std::future::Future<Output = ()>,

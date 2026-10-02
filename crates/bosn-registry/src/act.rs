@@ -8,6 +8,9 @@ use super::*;
 use bosn_core::ResourceLabels;
 use serde::{Deserialize, Serialize};
 
+mod spare;
+pub use spare::ActEngineBinding;
+
 const PREFIX: &str = "act.engine.v1:";
 /// Frozen producer policy, not client-selected Docker options.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +134,12 @@ pub struct ActEngineIntent {
     pub created_at: f64,
     #[serde(default)]
     pub creation_profile: Option<ActEngineCreationProfile>,
+    /// A spare (#410): created and prepared before any run exists, so its
+    /// run-bound fields are [`ActEngineBinding::spare`]'s. The run that
+    /// claims it is bound by the claim ([`ActEngineRecord::binding`]).
+    /// Omitted when false, so earlier intents and their labels are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub spare: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -162,6 +171,10 @@ pub struct ActEngineRecord {
     pub outcome: Option<ActRunOutcome>,
     pub updated_at: f64,
     pub removal: Option<ActEngineRemovalProof>,
+    /// The run a spare engine was claimed for; set by the claim that hands
+    /// the spare over ([`Immediate::claim_act_spare`]), never otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<ActEngineBinding>,
 }
 /// Keyset page ordered by immutable canonical run UUID, independent of state.
 #[derive(Clone, Debug, PartialEq)]
@@ -205,6 +218,12 @@ impl ActEngineIntent {
         canonical_run(&self.run_id)?;
         if let Some(profile) = &self.creation_profile {
             profile.validate()?;
+        }
+        if self.spare
+            && (self.creation_profile.is_none()
+                || self.binding() != ActEngineBinding::spare(&self.run_id, &self.workspace))
+        {
+            return Err(Error::BadRow("act spare intent"));
         }
         if self.workspace.is_empty()
             || self.workspace.len() > 4096
@@ -266,6 +285,9 @@ impl ActEngineIntent {
         ] {
             labels.insert(format!("com.zackees.bosn.act.{key}"), value.into());
         }
+        if self.spare {
+            labels.insert("com.zackees.bosn.act.spare".into(), "true".into());
+        }
         if let Some(profile) = &self.creation_profile {
             labels.insert(
                 "com.zackees.bosn.act.creation-profile-sha256".into(),
@@ -315,6 +337,9 @@ impl ActEngineRecord {
             ) && self.outcome.is_none())
             || (self.outcome == Some(ActRunOutcome::Passed)
                 && (self.engine_id.is_none() || self.execution != Some(ActRunOutcome::Passed)))
+            || self.binding.as_ref().is_some_and(|binding| {
+                !self.intent.spare || self.execution_claim.is_none() || binding.validate().is_err()
+            })
         {
             return Err(Error::BadRow("act state snapshot"));
         }
@@ -404,6 +429,7 @@ impl Immediate<'_> {
             outcome: None,
             removal: None,
             updated_at: intent.created_at,
+            binding: None,
         })
     }
     /// Exact ownership predicate for both registration and pending-intent

@@ -111,6 +111,27 @@ pub struct RunnerStatus {
     pub act_version: String,
     /// Whether the desktop widget is running.
     pub widget: super::widget::WidgetPresence,
+    /// The prepared spare engine (#410), when one is kept or being prepared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spare: Option<SpareStatus>,
+}
+
+/// A spare engine: prepared before any run, claimed by the next one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SpareStatus {
+    /// Its container name on the host engine.
+    pub engine: String,
+    pub state: SpareState,
+    /// Bytes of its RAM-backed private storage in use once prepared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_used: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SpareState {
+    Preparing,
+    Ready,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]

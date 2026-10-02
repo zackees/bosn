@@ -27,6 +27,7 @@ pub(super) fn real_startup_retires_claimed_engine_before_ping() {
             engine_image_digest: ENGINE.into(),
             runner_image_digest: crate::ci::pins::runner_manifest().into(),
             created_at: at(),
+            spare: false,
             creation_profile: Some(crate::act_engine::creation_profile(limits()).unwrap()),
         };
         retain(&root.join("intent.json"), &serde_json::to_vec_pretty(&intent).unwrap()).unwrap();

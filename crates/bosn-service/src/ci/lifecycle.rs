@@ -3,14 +3,20 @@
 //! Order of effects (each registry step is durable before the next engine
 //! call): intent (with its frozen creation profile) -> create -> observe +
 //! register -> start (the owned-engine layer, [`crate::act_engine`]) ->
-//! exclusive execution claim -> prepare -> execute (each verified against the
-//! claim; the engine's storage sampled throughout) -> execution outcome ->
+//! exclusive execution claim -> prepare the engine -> prepare the run ->
+//! execute (each verified against the claim; the engine's storage sampled
+//! throughout) -> execution outcome ->
 //! owner cleanup request -> retire (authorize, remove, proven absence,
 //! terminal record). Cleanup is part of success: a
 //! run whose engine could not be proven gone is never reported as passing,
 //! and its record stays `cleanup_required` for the next daemon's startup
 //! recovery ([`crate::act_runtime::recover_startup_act_engines`]), the only
 //! recovery there is.
+//!
+//! A run whose plan holds a prepared spare ([`super::spare`], #410) skips
+//! everything up to and including preparing the engine: its claim takes the
+//! spare over from the daemon's claim, atomically and once. A spare that
+//! cannot be claimed is retired and the run creates its own engine.
 
 use std::{
     path::PathBuf,
@@ -18,12 +24,14 @@ use std::{
 };
 
 use bosn_registry::act::{
-    ActEngineIntent, ActEngineObservation, ActEngineRecord, ActEngineState, ActRunOutcome,
+    ActEngineBinding, ActEngineIntent, ActEngineObservation, ActEngineRecord, ActEngineState,
+    ActRunOutcome,
 };
 use kernal_api::async_engine::{self, CancellationToken};
 
 use super::{
     engine::{ActArtifact, ActEngineBackend, ActInvocation, CacheVolume, EngineLine, ExecEnd},
+    spare::Spare,
     storage::{self, StoragePeak, StorageUsage},
 };
 use crate::{
@@ -46,6 +54,9 @@ pub struct EnginePlan {
     /// The run's deadline, fixed when the run started: planning, prepare,
     /// the job listing and execution all count against it.
     pub deadline: async_engine::Deadline,
+    /// A prepared spare engine to take over instead of creating one; only
+    /// ever one whose intent is [`ActEngineIntent::same_engine`] as `intent`.
+    pub spare: Option<Spare>,
 }
 
 /// How the workflow execution itself ended.
@@ -157,9 +168,9 @@ async fn sample_storage(
 const TOOLCACHE_SAVE_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Registry transition times must never go backwards.
-struct Clock(f64);
+pub(super) struct Clock(pub(super) f64);
 impl Clock {
-    fn now(&mut self) -> f64 {
+    pub(super) fn now(&mut self) -> f64 {
         let wall = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0.0, |d| d.as_secs_f64());
@@ -193,7 +204,7 @@ async fn record(registry: &RegistryActor, run: &str) -> Result<Option<ActEngineR
 }
 
 /// The registry this daemon owns engines for.
-async fn registry_owner(registry: &RegistryActor) -> Result<String, String> {
+pub(super) async fn registry_owner(registry: &RegistryActor) -> Result<String, String> {
     registry
         .status()
         .await
@@ -215,14 +226,15 @@ async fn claim_token() -> Result<String, String> {
 /// The run's exclusive execution claim on its registered engine. Every
 /// in-engine step re-verifies it, so an engine whose claim was withdrawn
 /// (or whose observation no longer matches) is never driven further.
-struct Claim<'a> {
+pub(super) struct Claim<'a> {
     registry: &'a RegistryActor,
+    /// The engine's registry key: the run's own UUID, or a spare's.
     run: String,
-    observed: ActEngineObservation,
-    token: String,
+    pub(super) observed: ActEngineObservation,
+    pub(super) token: String,
 }
 impl<'a> Claim<'a> {
-    async fn commit(
+    pub(super) async fn commit(
         registry: &'a RegistryActor,
         intent: &ActEngineIntent,
         observed: ActEngineObservation,
@@ -249,8 +261,39 @@ impl<'a> Claim<'a> {
         }
     }
 
+    /// Take a prepared spare over from the daemon's claim, binding it to
+    /// `binding`'s run. Exactly one claim can do this.
+    async fn take_spare(
+        registry: &'a RegistryActor,
+        spare: &Spare,
+        binding: ActEngineBinding,
+        at: f64,
+    ) -> Result<Self, String> {
+        let token = claim_token().await?;
+        match registry
+            .act_registry(ActRegistryCommand::ClaimSpare {
+                spare: spare.intent.run_id.clone(),
+                observed: spare.observed.clone(),
+                from: spare.token.clone(),
+                token: token.clone(),
+                binding,
+                at,
+            })
+            .await
+            .map_err(|e| format!("registry: {e}"))?
+        {
+            ActRegistryReply::Claimed(_) => Ok(Self {
+                registry,
+                run: spare.intent.run_id.clone(),
+                observed: spare.observed.clone(),
+                token,
+            }),
+            _ => Err("registry did not hand the spare over".into()),
+        }
+    }
+
     /// The claim still holds for this exact engine and nothing has executed.
-    async fn verify(&self) -> Result<(), String> {
+    pub(super) async fn verify(&self) -> Result<(), String> {
         match self
             .registry
             .act_registry(ActRegistryCommand::VerifyClaimed {
@@ -270,9 +313,66 @@ impl<'a> Claim<'a> {
         }
     }
 
-    fn engine(&self) -> &str {
+    pub(super) fn engine(&self) -> &str {
         &self.observed.engine_id
     }
+}
+
+/// The run's engine under its claim, and whether it is already prepared.
+struct Acquired<'a> {
+    claim: Claim<'a>,
+    prepared: bool,
+}
+
+/// Claim the plan's spare (retiring it and falling back to a new engine when
+/// it cannot be claimed), or create and claim a new engine. `engine_id` is
+/// set as soon as an engine is known to exist.
+async fn acquire<'a>(
+    registry: &'a RegistryActor,
+    backend: &dyn ActEngineBackend,
+    owner: &str,
+    plan: &EnginePlan,
+    clock: &mut Clock,
+    engine_id: &mut Option<String>,
+    observer: &mut dyn EngineObserver,
+) -> Result<Acquired<'a>, String> {
+    if let Some(spare) = &plan.spare {
+        observer.note(&format!(
+            "claiming prepared spare engine {}",
+            spare.intent.engine_name()
+        ));
+        match Claim::take_spare(registry, spare, plan.intent.binding(), clock.now()).await {
+            Ok(claim) => {
+                *engine_id = Some(claim.observed.engine_id.clone());
+                return Ok(Acquired {
+                    claim,
+                    prepared: true,
+                });
+            }
+            Err(error) => {
+                let retired = super::spare::retire(registry, backend, spare).await;
+                observer.note(&format!(
+                    "spare engine not claimed ({error}); {}",
+                    retired
+                        .err()
+                        .map_or("retired".into(), |e| format!("its removal failed: {e}"))
+                ));
+            }
+        }
+    }
+    // A spare already mounts the cache volume; a new engine needs it to exist.
+    backend.ensure_cache(&plan.cache).await?;
+    observer.note("creating isolated engine");
+    // The intent is durable before anything exists on the host engine.
+    let observed = backend
+        .create(registry, &plan.intent, owner, clock.now())
+        .await?;
+    *engine_id = Some(observed.engine_id.clone());
+    let claim = Claim::commit(registry, &plan.intent, observed, clock.now()).await?;
+    Ok(Acquired {
+        claim,
+        prepared: false,
+    })
 }
 
 /// How long the in-run cleanup may take to prove an engine gone.
@@ -305,40 +405,47 @@ pub async fn run_on_engine(
     let mut laps = Laps::new();
     let mut peak = StoragePeak::default();
     let execution = 'run: {
-        if let Err(error) = backend.ensure_cache(&plan.cache).await {
-            break 'run ExecutionEnd::EngineFailed(error);
-        }
-        observer.note("creating isolated engine");
-        // The intent is durable before anything exists on the host engine.
-        let observed = match backend
-            .create(registry, &plan.intent, &owner, clock.now())
-            .await
+        let acquired = match acquire(
+            registry,
+            backend,
+            &owner,
+            plan,
+            &mut clock,
+            &mut engine_id,
+            observer,
+        )
+        .await
         {
-            Ok(observed) => observed,
+            Ok(acquired) => acquired,
             Err(error) => break 'run ExecutionEnd::EngineFailed(error),
         };
-        engine_id = Some(observed.engine_id.clone());
-        observer.note(&format!("engine created in {}", laps.lap()));
-        let held = match Claim::commit(registry, &plan.intent, observed, clock.now()).await {
-            Ok(held) => claim.insert(held),
-            Err(error) => break 'run ExecutionEnd::EngineFailed(error),
+        let held = claim.insert(acquired.claim);
+        let how = if acquired.prepared {
+            "spare engine claimed"
+        } else {
+            "engine created"
         };
+        observer.note(&format!("{how} in {}", laps.lap()));
         if cancellation.is_cancelled() {
             break 'run ExecutionEnd::Cancelled;
         }
         let deadline = plan.deadline;
-        observer.note("preparing engine: act, frozen source, runner image");
         if let Err(error) = held.verify().await {
             break 'run ExecutionEnd::EngineFailed(error);
         }
-        let prepared = async_engine::timeout_at(
-            deadline,
-            async_engine::cancellable(
-                cancellation,
-                backend.prepare(held.engine(), &plan.source, &plan.event, plan.act),
-            ),
-        )
-        .await;
+        let prepare = async {
+            if !acquired.prepared {
+                observer.note("preparing engine: act, runner image");
+                backend.prepare_engine(held.engine(), plan.act).await?;
+            }
+            observer.note("preparing run: tool cache, frozen source");
+            backend
+                .prepare_run(held.engine(), &plan.source, &plan.event)
+                .await
+        };
+        let prepared =
+            async_engine::timeout_at(deadline, async_engine::cancellable(cancellation, prepare))
+                .await;
         match prepared {
             Err(_) => break 'run ExecutionEnd::TimedOut,
             Ok(Err(_)) => break 'run ExecutionEnd::Cancelled,
@@ -412,7 +519,7 @@ pub async fn run_on_engine(
         if let Err(error) = commit(
             registry,
             ActRegistryCommand::Execution {
-                run: run.clone(),
+                run: held.run.clone(),
                 token: held.token.clone(),
                 outcome: registry_outcome(&end),
                 at: clock.now(),
@@ -426,6 +533,8 @@ pub async fn run_on_engine(
     };
     let outcome = registry_outcome(&execution);
     let token = claim.as_ref().map(|held| held.token.clone());
+    // The claimed engine's key: a spare's own UUID once one was claimed.
+    let run = claim.as_ref().map_or(run, |held| held.run.clone());
     observer.note("removing isolated engine");
     let cleanup = match cleanup(
         registry,
@@ -467,7 +576,7 @@ fn registry_outcome(end: &ExecutionEnd) -> ActRunOutcome {
 /// Request cleanup (as the claim's owner when the run held one) unless the
 /// creation path already did, then retire the engine. A run whose intent
 /// never committed has nothing to clean up.
-async fn cleanup(
+pub(super) async fn cleanup(
     registry: &RegistryActor,
     backend: &dyn ActEngineBackend,
     owner: &str,

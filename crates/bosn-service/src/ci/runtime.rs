@@ -9,16 +9,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bosn_registry::act::ActEngineIntent;
 use kernal_api::async_engine::{self, CancellationSource};
 use serde_json::Value;
 
 use super::{
     config::WidgetConfig,
-    engine::{
-        ACT_VERSION, ActEngineBackend, ActInvocation, CACHE_VOLUME, CacheVolume, EngineLine,
-        SecretEnv, act_artifact,
-    },
+    engine::{ACT_VERSION, ActEngineBackend, CACHE_VOLUME, EngineLine, SecretEnv},
     events::Feed,
     lifecycle::{self, CleanupEnd, EngineObserver, EnginePlan, EngineReport, ExecutionEnd},
     model::{ActParser, LogRecord, RunTree, parse_act_list, select_jobs},
@@ -26,6 +22,7 @@ use super::{
     reply::*,
     report,
     scheduler::{Admission, Scheduler},
+    spare::SpareKeeper,
     store::{INDEX_STRIDE, LogFilter, LogQuery, LogWriter, Settings, Store},
     ui::UiHandle,
     widget::{LaunchTrigger, WidgetPresence, WidgetState},
@@ -35,7 +32,9 @@ use super::{
 use crate::{RegistryActor, secrets::SecretMasker};
 mod observer;
 mod persist;
+mod plan;
 mod runners;
+mod spare;
 mod widget;
 use observer::*;
 use persist::{RecordWriter, Save};
@@ -107,6 +106,8 @@ pub struct CiRuntime {
     kick: async_engine::Sender<()>,
     registry: RegistryActor,
     backend: Arc<dyn ActEngineBackend>,
+    /// The one prepared spare engine (#410).
+    spares: Arc<SpareKeeper>,
     feed: Feed,
     /// Set once when the opt-in UI listener is serving.
     ui: Arc<OnceLock<Arc<UiHandle>>>,
@@ -155,6 +156,7 @@ impl CiRuntime {
             store,
             state: Arc::new(Mutex::new(state)),
             kick,
+            spares: Arc::new(SpareKeeper::new(registry.clone(), Arc::clone(&backend))),
             registry,
             backend,
             feed: Feed::new(),
@@ -371,6 +373,8 @@ impl CiRuntime {
         };
         match admitted {
             Admitted::Queued(reply) => {
+                // This daemon runs CI: keep a spare engine from now on.
+                self.spares.want();
                 self.kick();
                 self.maybe_launch_widget(LaunchTrigger::Activity);
                 Ok(reply)
@@ -407,7 +411,11 @@ impl CiRuntime {
             .collect();
         ListReply {
             runs,
-            runners: runner_status(&state.scheduler, self.widget_presence()),
+            runners: runner_status(
+                &state.scheduler,
+                self.widget_presence(),
+                self.spares.status(),
+            ),
         }
     }
 
@@ -572,6 +580,7 @@ impl CiRuntime {
             })
             .detach();
         }
+        self.maybe_prepare_spare();
     }
 
     async fn execute(&self, record: RunRecord, cancel: CancellationSource) {
@@ -664,7 +673,9 @@ impl CiRuntime {
     ) -> Result<EngineReport, String> {
         self.localize_checkouts(record, observer);
         let deadline = async_engine::Deadline::after(Duration::from_secs(record.timeout_secs));
-        let Ok(plan) = async_engine::timeout_at(deadline, self.plan(record, deadline)).await else {
+        let token = cancel.token();
+        let planned = self.plan(record, deadline, &token);
+        let Ok(plan) = async_engine::timeout_at(deadline, planned).await else {
             // Nothing exists on the host yet: an engine is only created
             // once the plan is complete.
             return Ok(EngineReport {
@@ -765,60 +776,13 @@ impl CiRuntime {
             Err(error) => observer.note(&format!("workflow left as written: {error}")),
         }
     }
-
-    /// The immutable engine intent and act invocation for a record.
-    async fn plan(
-        &self,
-        record: &RunRecord,
-        deadline: async_engine::Deadline,
-    ) -> Result<EnginePlan, String> {
-        let artifact = act_artifact(std::env::consts::ARCH)
-            .ok_or("no pinned act build or engine image for this host architecture")?;
-        let registry_id = self
-            .registry
-            .status()
-            .await
-            .map_err(|e| format!("registry: {e}"))?
-            .registry_id;
-        self.backend.ensure_engine_image().await?;
-        let limits = super::limits::size_engine(
-            self.backend.host_resources().await?,
-            super::config::load(&self.state_dir)?.engine,
-        )?;
-        let cache = CacheVolume::machine(&registry_id, lifecycle::now_seconds())?;
-        let profile = crate::act_engine::creation_profile_with_cache(limits, Some(cache.mount()))
-            .map_err(|e| e.to_string())?;
-        Ok(EnginePlan {
-            act: artifact,
-            intent: ActEngineIntent {
-                run_id: record.id.clone(),
-                workspace: record.workspace.clone(),
-                candidate_sha: record.sha.clone(),
-                payload_sha256: record.payload_sha256.clone(),
-                snapshot_sha256: record.tree_digest.clone(),
-                act_version: ACT_VERSION.into(),
-                act_image_digest: format!("sha256:{}", artifact.sha256),
-                engine_image_digest: crate::act_engine::ENGINE_MANIFEST.into(),
-                runner_image_digest: super::pins::runner_manifest().into(),
-                created_at: lifecycle::now_seconds(),
-                creation_profile: Some(profile),
-            },
-            source: self.store.source(&record.id),
-            event: self.store.event(&record.id),
-            invocation: ActInvocation {
-                event: record.event.clone(),
-                workflow: record.workflow.clone(),
-                job: record.job.clone(),
-                cache_namespace: record.cache_namespace(),
-                secrets: self.secrets(record)?,
-            },
-            cache,
-            deadline,
-        })
-    }
 }
 
-fn runner_status(scheduler: &Scheduler, widget: WidgetPresence) -> RunnerStatus {
+fn runner_status(
+    scheduler: &Scheduler,
+    widget: WidgetPresence,
+    spare: Option<SpareStatus>,
+) -> RunnerStatus {
     RunnerStatus {
         limit: scheduler.limit(),
         running: scheduler.running(),
@@ -827,6 +791,7 @@ fn runner_status(scheduler: &Scheduler, widget: WidgetPresence) -> RunnerStatus 
         engine: "act".into(),
         act_version: ACT_VERSION.into(),
         widget,
+        spare,
     }
 }
 
