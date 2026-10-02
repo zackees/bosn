@@ -310,3 +310,51 @@ fn a_paused_feed_reader_never_delays_publishing_or_other_clients() {
         );
     });
 }
+
+#[test]
+fn malformed_oversized_and_slow_clients_stay_within_limits() {
+    with_registry(|registry, dir| async move {
+        let (ci, _server, port) = listener(&dir, registry).await;
+        let cookie = sign_in(&ci, port).await;
+        let host = format!("127.0.0.1:{port}");
+        // Garbage, an oversized header and an oversized body never panic the
+        // listener; each gets a 4xx or a closed connection.
+        let huge_header = format!(
+            "GET /v1/runs HTTP/1.1\r\nHost: {host}\r\nX-Big: {}\r\nConnection: close\r\n\r\n",
+            "a".repeat(64 * 1024)
+        );
+        let huge_body = post(
+            port,
+            "/v1/runners",
+            &cookie,
+            Some(&format!("http://{host}")),
+            &"x".repeat(200 * 1024),
+        );
+        for request in [
+            "\x00\x01\x02 not http\r\n\r\n".to_string(),
+            "GET /v1/runs HTTP/9.9\r\n\r\n".to_string(),
+            huge_header,
+            huge_body,
+        ] {
+            let reply = raw(port, request).await;
+            assert!(
+                reply.status == 0 || (400..500).contains(&reply.status),
+                "{}",
+                reply.status
+            );
+        }
+        // Slow-drip clients hold connections but never block a healthy one.
+        let drips: Vec<TcpStream> = (0..8)
+            .map(|_| {
+                let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                s.write_all(b"GET /v1/runs HTTP/1.1\r\nHo").unwrap();
+                s
+            })
+            .collect();
+        let started = Instant::now();
+        let healthy = raw(port, get(port, "/v1/runners", &host, Some(&cookie))).await;
+        assert_eq!(healthy.status, 200);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        drop(drips);
+    });
+}
