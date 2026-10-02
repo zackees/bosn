@@ -2141,6 +2141,110 @@ mod tests {
         assert_eq!(name(first.path()), name(first.path()));
     }
 
+    /// #314: two checkouts with an identical setup document must never share
+    /// a container, and a container carrying checkout A's name whose bind
+    /// mounts actually point at sibling checkout B (the pre-#349 shape, or a
+    /// stale/forged one) must not be adopted, so no task is ever exec'd into
+    /// another tree. The check covers both the actual `.Mounts[].Source` and
+    /// the declared `HostConfig.Mounts[].Source`, and neither adoption nor
+    /// ensure may mutate the foreign container.
+    #[test]
+    fn issue_314_sibling_checkout_never_shares_or_adopts_a_container() {
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout_a = temporary.path().join("soldr-p2");
+        let checkout_b = temporary.path().join("nixos-linker");
+        for checkout in [&checkout_a, &checkout_b] {
+            std::fs::create_dir_all(checkout.join("src")).unwrap();
+        }
+        let plan_a = plan(&checkout_a);
+        let plan_b = plan(&checkout_b);
+        assert_eq!(plan_a.content_sha256, plan_b.content_sha256);
+        let image_a = prepared(&plan_a);
+        let image_b = prepared(&plan_b);
+        assert_eq!(image_a.observed_identity, image_b.observed_identity);
+        let name_a = setup_container_name(&plan_a, &plan_a.workspace_root, &image_a).unwrap();
+        let name_b = setup_container_name(&plan_b, &plan_b.workspace_root, &image_b).unwrap();
+        assert_ne!(
+            name_a, name_b,
+            "identical manifests must not share a container"
+        );
+
+        // A container labelled and named for checkout A, but bound to B.
+        let root_a = plan_a.workspace_root.to_str().unwrap().to_owned();
+        let root_b = plan_b.workspace_root.to_str().unwrap().to_owned();
+        let mut foreign = observed(&plan_a, true);
+        assert_eq!(foreign.labels[LABEL_CONTAINER_NAME], name_a);
+        let mut rebound = 0;
+        for pointer in ["/Mounts", "/HostConfig/Mounts"] {
+            for mount in foreign
+                .configuration
+                .pointer_mut(pointer)
+                .and_then(serde_json::Value::as_array_mut)
+                .unwrap()
+            {
+                if mount["Type"] == "bind" && mount["Source"] == root_a.as_str() {
+                    mount["Source"] = root_b.clone().into();
+                    rebound += 1;
+                }
+            }
+        }
+        assert_eq!(
+            rebound, 2,
+            "fixture must rebind actual and declared /workspace"
+        );
+        let derived = derive_creation(&plan_a, &plan_a.workspace_root, &image_a).unwrap();
+        assert!(matches!(
+            verify_actual_configuration(&foreign, &derived, &fixture_image()),
+            Err(SetupEnsureError::OwnershipMismatch)
+        ));
+
+        let options = RunOptions::streaming(Duration::from_secs(2), 4096);
+        let read_only = |engine: &FakeEngine| {
+            engine.calls.lock().unwrap().iter().all(|call| {
+                matches!(
+                    call,
+                    SetupEnsureCommand::Inspect { container_name } if container_name == &name_a
+                ) || matches!(call, SetupEnsureCommand::ImageInspect { .. })
+            })
+        };
+        // Adoption is the proof the daemon runs immediately before every
+        // manifest task exec; it must refuse.
+        let engine = FakeEngine::with_results([Ok(SetupEnsureResponse::Inspection(
+            Some(foreign.clone()),
+            result(0, [], []),
+        ))]);
+        let cancellation = CancellationSource::new();
+        assert!(matches!(
+            run_adopt(
+                &engine,
+                &plan_a,
+                &checkout_a,
+                &image_a,
+                &cancellation.token(),
+                options
+            ),
+            Err(SetupEnsureError::OwnershipMismatch)
+        ));
+        assert!(read_only(&engine));
+        // Ensure must refuse too, before any create/start/remove.
+        let engine = FakeEngine::with_results([Ok(SetupEnsureResponse::Inspection(
+            Some(foreign),
+            result(0, [], []),
+        ))]);
+        assert!(
+            run(
+                &engine,
+                &plan_a,
+                &checkout_a,
+                &image_a,
+                &cancellation.token(),
+                options
+            )
+            .is_err()
+        );
+        assert!(read_only(&engine));
+    }
+
     #[derive(Default)]
     struct FakeEngine {
         calls: Mutex<Vec<SetupEnsureCommand>>,
