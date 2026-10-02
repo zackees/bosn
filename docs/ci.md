@@ -204,6 +204,24 @@ job succeeded, or when its engine could not be proven removed.
   read-only root, a private cgroup namespace, bounded memory, CPUs and
   processes, and its Docker storage on a private tmpfs. It carries the
   registry's ownership labels and a frozen creation profile.
+  - Its limits are sized from the host engine's machine (`docker info`, plus
+    `/proc/meminfo` when that is the same machine): memory is half the total,
+    at most three quarters of what is available, held between 4 and 28 GiB;
+    the storage tmpfs, which is RAM and counts against that memory, is five
+    sevenths of it, always leaving 2 GiB; CPUs are min(cores, 8); 4096
+    processes. Any of them can be pinned in `<state>/config.toml`:
+
+    ```toml
+    [engine]
+    memory_gib = 16
+    storage_gib = 10
+    cpus = 4
+    pids = 4096
+    ```
+
+    The chosen limits are frozen into the creation profile; creation and every
+    observation verify the engine against it exactly, so a later host or
+    config change never alters an existing run's engine.
   - Its one named mount is the machine-wide cache volume (below), frozen into
     the creation profile, verified before creation and on every observation.
     No host path or socket is mounted.
