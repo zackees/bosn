@@ -627,6 +627,7 @@ impl CiRuntime {
         cancel: &CancellationSource,
         observer: &mut RunObserver,
     ) -> Result<EngineReport, String> {
+        self.localize_checkouts(record, observer);
         let plan = self.plan(record).await?;
         observer.masker = SecretMasker::new(plan.invocation.secrets.0.iter().map(|(_, v)| v));
         observer.note(&format!(
@@ -666,6 +667,18 @@ impl CiRuntime {
             }
         }
         Ok(SecretEnv(env))
+    }
+
+    /// Serve own-repository checkouts from the snapshot (#335) and say so.
+    fn localize_checkouts(&self, record: &RunRecord, observer: &mut RunObserver) {
+        let workflow = self.store.source(&record.id).join(&record.workflow);
+        match super::checkout::localize(&workflow, &record.repository) {
+            Ok(0) => {}
+            Ok(changed) => observer.note(&format!(
+                "{changed} actions/checkout step(s) of this repository are served from the frozen snapshot"
+            )),
+            Err(error) => observer.note(&format!("workflow left as written: {error}")),
+        }
     }
 
     /// The immutable engine intent and act invocation for a record.

@@ -51,6 +51,7 @@ mod vocabulary {
 }
 }
 
+pub mod checkout;
 pub mod client;
 pub mod engine;
 pub mod events;
