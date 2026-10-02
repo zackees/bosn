@@ -62,7 +62,9 @@ execution or the required real PR label-triggered runs.
 on a daemon-owned isolated engine whose whole lifecycle and storage are tracked
 by the registry. act never sees the host Docker socket. `bosn act plan` and
 `bosn act payload` keep working for one release and print a deprecation notice
-on stderr.
+on stderr. `bosn act plan --adapter` is likewise a deprecated spelling of
+`bosn ci plan --adapter` (see [docs/ci.md](ci.md)), with the same JSON on
+stdout.
 
 `bosn ci` does not require a clean worktree. It snapshots uncommitted work and
 records the run as `sha + dirty: <tree digest>`. Only `--trigger release`

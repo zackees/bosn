@@ -283,3 +283,188 @@ fn a_command_right_after_daemon_stop_reaches_a_fresh_daemon() {
         );
     }
 }
+
+/// A checkout holding a fleet adapter V1 declaration and the workflow it
+/// names, committed clean; returns its HEAD.
+fn adapter_repo(root: &Path) -> String {
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let adapter = serde_json::json!({
+        "schema_version":1,"repository":{"owner":"example","name":"demo"},"default_branch":"main",
+        "pins":{"interface_schema":1,"act_version":"0.2.88","act_binary_digest":digest,"engine_manifest_digest":digest,"engine_config_digest":digest,"runner_manifest_digest":digest,"runner_config_digest":digest},
+        "workflows":{"pull_request":[".github/workflows/ci.yml"],"push":[".github/workflows/ci.yml"],"release":[".github/workflows/ci.yml"]},
+        "cells":[{"id":"lint","workflow":".github/workflows/ci.yml","job":"lint","runner":"ubuntu-latest","proof_scope":"local_linux"},{"id":"unit","workflow":".github/workflows/ci.yml","job":"unit","runner":"ubuntu-22.04","proof_scope":"local_linux"},{"id":"win","workflow":".github/workflows/ci.yml","job":"windows","runner":"windows-2022","proof_scope":"github_only"}],
+        "tiers":{"minimal":["lint"],"test":["lint","unit"],"full":["lint","unit","win"]},
+        "release_inputs":{"candidate_sha":"candidate","full_mode":"coverage","full_mode_value":"full","version":null},"permitted_secrets":[]
+    });
+    std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+    std::fs::write(
+        root.join(".github/workflows/ci.yml"),
+        "on: [push]\njobs: {}\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("adapter.json"), adapter.to_string()).unwrap();
+    git(root, &["init", "-q", "-b", "main"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "adapter"]);
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    String::from_utf8(head.stdout).unwrap().trim().to_owned()
+}
+
+fn adapter_plan(spelling: &[&str], options: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_bosn"))
+        .args(spelling)
+        .args(options)
+        .output()
+        .unwrap()
+}
+
+/// `bosn ci plan --adapter` is the fleet adapter V1 plan (soldr#3345);
+/// `bosn act plan --adapter` is its deprecated spelling: stdout is the same
+/// JSON byte for byte, and the notice goes to stderr only.
+#[test]
+fn ci_plan_adapter_matches_the_deprecated_act_spelling_byte_for_byte() {
+    let root = tempfile::tempdir().unwrap();
+    let sha = adapter_repo(root.path());
+    let workspace = root.path().to_str().unwrap();
+    for (event, mode, extra) in [
+        ("push", "minimal", &[][..]),
+        ("release", "full", &[][..]),
+        (
+            "pull_request",
+            "full",
+            &[
+                "--pr-number",
+                "12",
+                "--head-owner",
+                "external",
+                "--head-name",
+                "fork",
+                "--head-ref",
+                "work",
+                "--base-ref",
+                "main",
+                "--author-login",
+                "contributor",
+            ][..],
+        ),
+    ] {
+        let mut options = vec![
+            "--adapter",
+            "adapter.json",
+            "--workspace",
+            workspace,
+            "--event",
+            event,
+            "--mode",
+            mode,
+            "--sha",
+            &sha,
+            "--repo-owner",
+            "example",
+            "--repo-name",
+            "demo",
+            "--base-sha",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ];
+        options.extend_from_slice(extra);
+        let ci = adapter_plan(&["ci", "plan"], &options);
+        assert!(
+            ci.status.success(),
+            "{}",
+            String::from_utf8_lossy(&ci.stderr)
+        );
+        assert!(
+            ci.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&ci.stderr)
+        );
+        let act = adapter_plan(&["act", "plan"], &options);
+        assert!(
+            act.status.success(),
+            "{}",
+            String::from_utf8_lossy(&act.stderr)
+        );
+        assert_eq!(ci.stdout, act.stdout, "{event}/{mode}: stdout differs");
+        assert!(
+            String::from_utf8_lossy(&act.stderr)
+                .contains("`bosn act plan --adapter` is deprecated"),
+            "{}",
+            String::from_utf8_lossy(&act.stderr)
+        );
+        let receipt: Value = serde_json::from_slice(&ci.stdout).unwrap();
+        assert_eq!(receipt["action"], "act_adapter_plan");
+        assert_eq!(receipt["schema_version"], 1);
+        assert_eq!(receipt["executable"], false);
+        assert_eq!(receipt["plan"]["declaration_only"], true);
+        let cells = if mode == "full" { 3 } else { 1 };
+        assert_eq!(
+            receipt["plan"]["required_cells"].as_array().unwrap().len(),
+            cells,
+            "{event}/{mode}"
+        );
+    }
+}
+
+/// The same refusals under both spellings; `bosn ci` maps them to its
+/// refused exit code (3), `bosn act` keeps its own (2). Nothing on stdout.
+#[test]
+fn ci_plan_adapter_refusals_match_act_and_exit_3() {
+    let root = tempfile::tempdir().unwrap();
+    let sha = adapter_repo(root.path());
+    let workspace = root.path().to_str().unwrap();
+    let wrong_sha = "0".repeat(40);
+    for options in [
+        vec!["--adapter", "adapter.json", "--workspace", workspace],
+        vec!["--adapter", "a", "--adapter", "b"],
+        vec!["--adapter", "adapter.json", "--act-bin", "act"],
+        vec![
+            "--adapter",
+            "adapter.json",
+            "--workspace",
+            workspace,
+            "--event",
+            "push",
+            "--mode",
+            "full",
+            "--sha",
+            &sha,
+            "--repo-owner",
+            "example",
+            "--repo-name",
+            "demo",
+        ],
+        vec![
+            "--adapter",
+            "adapter.json",
+            "--workspace",
+            workspace,
+            "--event",
+            "push",
+            "--mode",
+            "minimal",
+            "--sha",
+            &wrong_sha,
+            "--repo-owner",
+            "example",
+            "--repo-name",
+            "demo",
+        ],
+    ] {
+        let ci = adapter_plan(&["ci", "plan"], &options);
+        let act = adapter_plan(&["act", "plan"], &options);
+        assert_eq!(ci.status.code(), Some(3), "{options:?}");
+        assert_eq!(act.status.code(), Some(2), "{options:?}");
+        assert!(ci.stdout.is_empty() && act.stdout.is_empty());
+        let reason = String::from_utf8_lossy(&ci.stderr);
+        let reason = reason.trim().strip_prefix("bosn ci: ").unwrap();
+        let act_stderr = String::from_utf8_lossy(&act.stderr);
+        assert!(
+            act_stderr.contains(&format!("bosn act: {reason}")),
+            "{options:?}: {act_stderr}"
+        );
+    }
+}

@@ -22,6 +22,7 @@ use bosn_service::{
 use kernal_api::async_engine::{Runtime, RuntimeBuilder};
 
 pub const USAGE: &str = "usage: bosn ci plan [--workspace P] [--provider github] [--workflow F] [--job J] [--trigger pr|push|release] [--mode minimal|test|full] [--sha S] [--json]
+   or: bosn ci plan --adapter RELATIVE_JSON --workspace P --event pull_request|push|release --mode minimal|test|full --sha 40_HEX --repo-owner O --repo-name N [--base-sha S] [--pr-number N --head-owner O --head-name N --head-ref R --base-ref R --author-login L] [--json]  (fleet adapter V1 plan, JSON on stdout)
    or: bosn ci run <plan options> [--engine act] [--pr-number N] [--timeout-secs N] [--github-token] [--wait [--deadline-ms N]] [--json]
    or: bosn ci list [--workspace P] [--state queued|running|done] [--limit N] [--json]
    or: bosn ci show RUN [--json]
@@ -33,6 +34,9 @@ pub const USAGE: &str = "usage: bosn ci plan [--workspace P] [--provider github]
    or: bosn ci runners [list|drain|resume|set-limit N|prune-cache [--older-than-secs N] [--max-bytes N]|cache|clear-cache] [--json]
    or: bosn ui [--path /ci/runs/RUN] [--print|--browser]  (the widget when installed, else the browser; needs `[ui] enabled = true` in <state>/config.toml)
    (every verb accepts --state-dir STATE_DIR)";
+
+#[path = "ci/adapter.rs"]
+pub mod adapter;
 
 const EXIT_REFUSED: i32 = 3;
 /// `wait` reached its deadline, or `report` on a run still in progress.
@@ -252,7 +256,16 @@ fn print<T: JsonReply>(reply: &T, json: bool, text: impl FnOnce(&T)) {
 }
 
 fn plan(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
-    let flags = Flags::parse(arguments, PLAN_FLAGS, &["--json", "--github-token"])?;
+    let arguments: Vec<OsString> = arguments.collect();
+    if adapter::requested(&arguments) {
+        println!("{}", adapter::plan(arguments)?);
+        return Ok(0);
+    }
+    let flags = Flags::parse(
+        arguments.into_iter(),
+        PLAN_FLAGS,
+        &["--json", "--github-token"],
+    )?;
     let plan = bosn_service::ci::plan(&submit_options(&flags)?).map_err(describe)?;
     print(&plan, flags.json(), |p| {
         println!("provider: {}", p.provider.as_str());

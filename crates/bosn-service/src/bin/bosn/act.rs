@@ -1,16 +1,17 @@
-//! Deprecated `bosn act` spelling. `run` and `report` route to `bosn ci`;
+//! Deprecated `bosn act` spelling. `run` and `report` route to `bosn ci`,
+//! `plan --adapter` to `bosn ci plan --adapter`'s shared implementation;
 //! `plan` and `payload` keep their read-only receipts for one release.
 
 use std::{
     ffi::OsString,
-    io::Read,
     path::{Path, PathBuf},
     process::Command,
-    sync::mpsc::{self, RecvTimeoutError},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use serde_json::{Value, json};
+
+use super::ci::adapter::{self, adapter_checkout, committed_adapter_file};
 
 pub fn run(mut arguments: impl Iterator<Item = OsString>) {
     let Some(verb) = arguments.next() else {
@@ -21,10 +22,14 @@ pub fn run(mut arguments: impl Iterator<Item = OsString>) {
         return super::ci::run(std::iter::once(verb).chain(arguments), Some(&alias));
     }
     let remaining: Vec<OsString> = arguments.collect();
-    // The adapter plan (soldr#3345) is not deprecated until `bosn ci plan
-    // --adapter` exists.
-    if verb == "plan" && remaining.iter().any(|flag| flag == "--adapter") {
-        return adapter_plan(remaining);
+    if verb == "plan" && adapter::requested(&remaining) {
+        // The adapter plan moved to `bosn ci plan --adapter` (#375); stdout
+        // stays the same receipt, byte for byte.
+        eprintln!(
+            "bosn: `bosn act plan --adapter` is deprecated and will be removed after one release; use `bosn ci plan --adapter`"
+        );
+        let receipt = adapter::plan(remaining).unwrap_or_else(|error| fail(error));
+        return println!("{receipt}");
     }
     let mut arguments = remaining.into_iter();
     eprintln!(
@@ -365,7 +370,7 @@ fn sterile_act_output(
             .env("LC_ALL", "C")
             .env("ACT_DISABLE_VERSION_CHECK", "1")
             .stdin(std::process::Stdio::null());
-        let result = bounded_act_output(&mut command, deadline, limit);
+        let result = crate::bounded_output::bounded_output(&mut command, deadline, limit);
         control
             .cleanup()
             .map_err(|_| "act control directory cleanup failed")?;
@@ -373,101 +378,6 @@ fn sterile_act_output(
     })();
     // Drop the control directory before fail() exits the CLI without unwinding.
     result.unwrap_or_else(|message| fail(message))
-}
-
-/// Run only the two non-executing Act queries. Pipe readers drain concurrently
-/// so neither stdout nor stderr can block the child before the deadline.
-fn bounded_act_output(
-    command: &mut Command,
-    deadline: Duration,
-    limit: usize,
-) -> Result<Vec<u8>, &'static str> {
-    let mut child = command
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|_| "act executable is unavailable")?;
-    let (tx, rx) = mpsc::sync_channel::<Option<(bool, Vec<u8>)>>(8);
-    for (is_stdout, mut pipe) in [
-        (
-            true,
-            Box::new(child.stdout.take().unwrap()) as Box<dyn Read + Send>,
-        ),
-        (
-            false,
-            Box::new(child.stderr.take().unwrap()) as Box<dyn Read + Send>,
-        ),
-    ] {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            let mut chunk = [0_u8; 8192];
-            loop {
-                match pipe.read(&mut chunk) {
-                    Ok(0) | Err(_) => {
-                        let _ = tx.send(None);
-                        break;
-                    }
-                    Ok(n) => {
-                        if tx.send(Some((is_stdout, chunk[..n].to_vec()))).is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-    }
-    drop(tx);
-    let start = Instant::now();
-    let mut stdout = Vec::new();
-    let mut used = 0_usize;
-    let mut eof = 0;
-    while eof < 2 {
-        let Some(remaining) = deadline.checked_sub(start.elapsed()) else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("act query timed out");
-        };
-        match rx.recv_timeout(remaining.min(Duration::from_millis(50))) {
-            Ok(None) => eof += 1,
-            Ok(Some((is_stdout, bytes))) => {
-                used = used.saturating_add(bytes.len());
-                if used > limit {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err("act query output limit exceeded");
-                }
-                if is_stdout {
-                    stdout.extend_from_slice(&bytes)
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("act query output ended unexpectedly");
-            }
-        }
-    }
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if start.elapsed() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("act query timed out");
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("act query could not be reaped");
-            }
-        }
-    };
-    if !status.success() {
-        return Err("act query failed");
-    }
-    Ok(stdout)
 }
 
 fn parse_list(output: &str) -> Vec<Value> {
@@ -507,7 +417,3 @@ fn fail(message: &str) -> ! {
     eprintln!("bosn act: {message}");
     std::process::exit(2)
 }
-
-#[path = "act/adapter.rs"]
-mod adapter;
-use adapter::*;

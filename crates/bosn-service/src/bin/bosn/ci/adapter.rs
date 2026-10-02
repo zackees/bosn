@@ -1,12 +1,29 @@
-//! `bosn act plan --adapter` (soldr#3345): the declared adapter plan, read-only.
-//! It stays, without a deprecation warning, until `bosn ci plan --adapter` exists.
+//! `bosn ci plan --adapter` (soldr#3345): the declared adapter plan, read-only.
+//! The one implementation behind both `bosn ci plan --adapter` and its
+//! deprecated spelling `bosn act plan --adapter` (#375); each caller only
+//! chooses how a refusal is reported.
 
-use super::*;
+use std::{
+    ffi::OsString,
+    io::Read,
+    path::{Path, PathBuf},
+    process::Command,
+    time::Duration,
+};
+
+use serde_json::{Value, json};
+
+use crate::bounded_output::bounded_output;
+
+/// Whether a `plan` invocation asks for the adapter plan.
+pub fn requested(arguments: &[OsString]) -> bool {
+    arguments.iter().any(|flag| flag == "--adapter")
+}
 
 // This entry point only describes operator-requested plans. CLI metadata is
 // unverified, unlike authenticated producer observations; it confers no runtime
 // authorization, merged-candidate proof, binary-pin proof, or graph acceptance.
-pub(super) fn adapter_options(
+fn adapter_options(
     arguments: impl IntoIterator<Item = impl Into<String>>,
 ) -> Result<std::collections::BTreeMap<String, String>, &'static str> {
     let mut arguments = arguments.into_iter().map(Into::into);
@@ -45,7 +62,7 @@ pub(super) fn adapter_options(
     }
     Ok(values)
 }
-pub(super) fn option<'a>(
+fn option<'a>(
     values: &'a std::collections::BTreeMap<String, String>,
     name: &str,
 ) -> Result<&'a str, &'static str> {
@@ -54,7 +71,7 @@ pub(super) fn option<'a>(
         .map(String::as_str)
         .ok_or("missing required adapter plan option")
 }
-pub(super) fn declared_adapter_plan(
+fn declared_adapter_plan(
     adapter: &bosn_core::act::ActAdapterV1,
     values: &std::collections::BTreeMap<String, String>,
     actual_sha: &str,
@@ -116,10 +133,10 @@ pub(super) fn declared_adapter_plan(
         json!({"action":"act_adapter_plan", "schema_version":1, "plan":plan, "source_metadata_verified":false, "source_metadata_scope":"operator-supplied repository and PR metadata; only checkout HEAD and cleanliness observed", "merged_candidate_verified":false, "fleet_pin_verified":false, "binary_pin_verified":false, "executable":false, "docker_resources_tracked":false, "reason":"declarations require authenticated metadata, actual graph matching, and runtime ownership before execution"}),
     )
 }
-pub(super) fn adapter_git(root: &Path, args: &[&str]) -> Result<Vec<u8>, &'static str> {
+fn adapter_git(root: &Path, args: &[&str]) -> Result<Vec<u8>, &'static str> {
     adapter_git_bounded(root, args, Duration::from_secs(2), 1 << 20)
 }
-pub(super) fn adapter_git_bounded(
+fn adapter_git_bounded(
     root: &Path,
     args: &[&str],
     deadline: Duration,
@@ -136,10 +153,10 @@ pub(super) fn adapter_git_bounded(
         .stdin(std::process::Stdio::null());
     // The existing concurrent pipe reader bounds both streams and kills/waits
     // this child on deadline or overflow. No unbounded Command::output capture.
-    bounded_act_output(&mut command, deadline, limit)
+    bounded_output(&mut command, deadline, limit)
         .map_err(|_| "workspace Git observation refused, timed out, or exceeded output ceiling")
 }
-pub(super) fn adapter_checkout(root: &Path, sha: &str) -> Result<(), &'static str> {
+pub fn adapter_checkout(root: &Path, sha: &str) -> Result<(), &'static str> {
     let top = adapter_git(root, &["rev-parse", "--show-toplevel"])?;
     let top = std::str::from_utf8(&top)
         .map_err(|_| "invalid Git root")?
@@ -172,7 +189,7 @@ pub(super) fn adapter_checkout(root: &Path, sha: &str) -> Result<(), &'static st
     }
     Ok(())
 }
-pub(super) fn committed_adapter_file(root: &Path, relative: &str) -> Result<Vec<u8>, &'static str> {
+pub fn committed_adapter_file(root: &Path, relative: &str) -> Result<Vec<u8>, &'static str> {
     let relative_path = Path::new(relative);
     if relative_path.is_absolute()
         || relative_path
@@ -241,24 +258,24 @@ pub(super) fn committed_adapter_file(root: &Path, relative: &str) -> Result<Vec<
     }
     Ok(bytes)
 }
-pub(super) fn adapter_plan(arguments: Vec<OsString>) {
-    let values = adapter_options(arguments.into_iter().map(|arg| {
-        arg.into_string()
-            .unwrap_or_else(|_| fail("adapter options must be UTF-8"))
-    }))
-    .unwrap_or_else(|error| fail(error));
-    let root = PathBuf::from(option(&values, "--workspace").unwrap_or_else(|error| fail(error)))
+/// The adapter plan receipt for `arguments` (the options after `plan`), or
+/// the refusal. Reads only the committed checkout; executes nothing.
+pub fn plan(arguments: Vec<OsString>) -> Result<Value, &'static str> {
+    let arguments = arguments
+        .into_iter()
+        .map(|arg| {
+            arg.into_string()
+                .map_err(|_| "adapter options must be UTF-8")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let values = adapter_options(arguments)?;
+    let root = PathBuf::from(option(&values, "--workspace")?)
         .canonicalize()
-        .unwrap_or_else(|_| fail("workspace unavailable"));
-    let sha = option(&values, "--sha").unwrap_or_else(|error| fail(error));
-    adapter_checkout(&root, sha).unwrap_or_else(|error| fail(error));
-    let bytes = committed_adapter_file(
-        &root,
-        option(&values, "--adapter").unwrap_or_else(|error| fail(error)),
-    )
-    .unwrap_or_else(|error| fail(error));
-    let adapter =
-        bosn_core::act::parse_act_adapter_json(&bytes).unwrap_or_else(|error| fail(error.0));
+        .map_err(|_| "workspace unavailable")?;
+    let sha = option(&values, "--sha")?;
+    adapter_checkout(&root, sha)?;
+    let bytes = committed_adapter_file(&root, option(&values, "--adapter")?)?;
+    let adapter = bosn_core::act::parse_act_adapter_json(&bytes).map_err(|error| error.0)?;
     for workflow in adapter
         .workflows
         .pull_request
@@ -266,11 +283,11 @@ pub(super) fn adapter_plan(arguments: Vec<OsString>) {
         .chain(&adapter.workflows.push)
         .chain(&adapter.workflows.release)
     {
-        committed_adapter_file(&root, workflow).unwrap_or_else(|error| fail(error));
+        committed_adapter_file(&root, workflow)?;
     }
-    let result = declared_adapter_plan(&adapter, &values, sha).unwrap_or_else(|error| fail(error));
-    adapter_checkout(&root, sha).unwrap_or_else(|error| fail(error));
-    println!("{result}");
+    let result = declared_adapter_plan(&adapter, &values, sha)?;
+    adapter_checkout(&root, sha)?;
+    Ok(result)
 }
 
 #[cfg(test)]
