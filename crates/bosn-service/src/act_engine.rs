@@ -13,6 +13,23 @@ use bosn_registry::act::{
 use serde_json::Value;
 use std::{collections::BTreeMap, fmt};
 
+/// Publisher bytes shipped with this daemon, independently pinned from Docker
+/// inspection and persistent intent data. Unknown historical images remain
+/// cleanup-required until their publisher proof is available.
+pub(crate) fn bundled_engine_manifests()
+-> Result<BTreeMap<String, VerifiedEngineManifest>, ActEngineError> {
+    const MANIFEST: &str =
+        "sha256:6acc6aaf783ac1c1100822e542534c3dab3f1d38782760b0bdcb688280574d9e";
+    const CONFIG: &str = "sha256:8cdb6d492106752d557cda50e628b88e7bb303a7eaea91a10bdf672b95ad4f52";
+    let proof = VerifiedEngineManifest::verify(
+        include_bytes!("act_engine_data/engine-manifest.json"),
+        MANIFEST,
+        include_bytes!("act_engine_data/engine-config.json"),
+        CONFIG,
+    )?;
+    Ok(BTreeMap::from([(MANIFEST.into(), proof)]))
+}
+
 /// Produced only by a successful image inspection bound to the pinned manifest.
 /// Docker classic uses the config digest as its ID; containerd may use manifest.
 #[derive(Clone, Debug)]

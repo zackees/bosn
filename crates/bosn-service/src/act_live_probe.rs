@@ -1133,6 +1133,72 @@ fn timed_operation_stops_and_joins_owned_observer() {
         });
 }
 
+/// The production service must expire a prior writer's execution claim and
+/// remove only its verified engine before acknowledging authenticated requests.
+#[test]
+#[ignore = "real pinned Docker startup recovery; owned private input directory required"]
+fn real_startup_retires_claimed_engine_before_ping() {
+    async_engine::RuntimeBuilder::multi_thread().enable_all().build().unwrap().run(async {
+        let input = PathBuf::from(std::env::var_os("BOSN_ACT_PROBE_INPUT_DIR").unwrap()).canonicalize().unwrap();
+        assert!(input.starts_with("/tmp"));
+        let metadata = std::fs::metadata(&input).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o077, 0);
+        assert_eq!(metadata.uid(), std::fs::metadata("/proc/self").unwrap().uid());
+        let root = input.join(format!("startup-{}", random_uuid().await.unwrap()));
+        private_dir(&root).unwrap();
+        let owner = random_uuid().await.unwrap();
+        let intent = ActEngineIntent {
+            run_id: random_uuid().await.unwrap(),
+            workspace: root.to_string_lossy().into_owned(),
+            candidate_sha: "1".repeat(40),
+            payload_sha256: "2".repeat(64),
+            snapshot_sha256: "3".repeat(64),
+            act_version: "0.2.88".into(),
+            act_image_digest: "sha256:525269093be45f019646c470b2e90083790350cea112dd4715a9cc2a332b2f80".into(),
+            engine_image_digest: ENGINE.into(),
+            runner_image_digest: RUNNER.into(),
+            created_at: at(),
+            creation_profile: Some(crate::act_engine::creation_profile(limits()).unwrap()),
+        };
+        retain(&root.join("intent.json"), &serde_json::to_vec_pretty(&intent).unwrap()).unwrap();
+        retain(&root.join("owner.json"), &serde_json::to_vec(&owner).unwrap()).unwrap();
+        let db = root.join("registry.sqlite3");
+        let writer = Registry::create_writer(&db, &owner).unwrap();
+        let (sender, receiver) = async_engine::channel(16);
+        let actor = RegistryActor { sender };
+        let writer_task = async_engine::launch(registry_actor(writer, receiver, None));
+        let proofs = crate::act_engine::bundled_engine_manifests().unwrap();
+        let observed = create_owned_engine_from_manifest(&actor, &DockerEngine::docker(), intent.clone(), &owner, &proofs[ENGINE], limits(), at()).await.unwrap();
+        let token = random_uuid().await.unwrap();
+        actor.act_registry(ActRegistryCommand::Claim { intent: intent.clone(), observed: observed.clone(), token, at: at() }).await.unwrap();
+        actor.stop().await;
+        writer_task.await.unwrap();
+        // Reopen through the real service, not a test-only recovery entrypoint.
+        let service = Service::new(root.clone());
+        let stop = service.stop.clone();
+        let service_task = async_engine::launch(service.serve());
+        let client = Client::for_state(&root).unwrap();
+        async_engine::timeout(Duration::from_secs(130), async {
+            loop {
+                if client.ping().await.is_ok() { break; }
+                async_engine::sleep(Duration::from_millis(25)).await;
+            }
+        }).await.unwrap();
+        stop.cancel();
+        service_task.await.unwrap().unwrap();
+        let writer = Registry::open_writer(&db).unwrap();
+        let record = writer.act_engine(&intent.run_id).unwrap().unwrap();
+        assert_eq!(record.state, ActEngineState::Terminal);
+        assert_eq!(record.outcome, Some(ActRunOutcome::Interrupted));
+        assert!(record.execution.is_none(), "startup may not fabricate execution");
+        for filter in [format!("id={}", observed.engine_id), format!("name=^/{}$", observed.name)] {
+            let absence = docker(&DockerEngine::docker(), vec!["container".into(), "ls".into(), "--all".into(), "--no-trunc".into(), "--filter".into(), filter, "--format".into(), "{{.ID}}".into()]).await.unwrap();
+            assert!(absence.iter().all(u8::is_ascii_whitespace));
+        }
+        retain(&root.join("startup-result.json"), &serde_json::to_vec_pretty(&json!({"scope":"real private engine startup through Service::serve; no Act execution or fleet workflow proof", "run_id":intent.run_id,"engine_id":observed.engine_id,"owner":owner,"authenticated_ping":true,"state":"terminal","outcome":"interrupted","execution":null,"exact_id_and_name_absent":true})).unwrap()).unwrap();
+    });
+}
+
 /// Explicit recovery of one retained failed probe, never discovery or creation.
 #[test]
 #[ignore = "explicit retained-probe recovery; root review and exact owned identity required"]
