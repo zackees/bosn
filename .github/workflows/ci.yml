@@ -461,6 +461,9 @@ jobs:
           version: "0.9.27"
           toolchain: "1.95.0"
           prebuild-deps: none
+          # clippy is installed on demand after setup; a restored solo
+          # toolchain snapshot lacks it ("cargo-clippy is not applicable").
+          solo-toolchain-cache: "false"
 
       - name: Install WebKitGTK development packages
         run: |
