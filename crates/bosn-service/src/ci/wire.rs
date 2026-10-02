@@ -70,6 +70,10 @@ pub struct SubmitRequest {
     pub branch: Option<String>,
     pub tree_digest: String,
     pub dirty: bool,
+    /// The synthetic commit holding the uncommitted work (dirty runs only):
+    /// the job checks it out, and the event payload names it.
+    #[serde(default)]
+    pub commit: Option<String>,
     pub origin: Option<String>,
     pub pr_number: Option<u64>,
     pub timeout_secs: Option<u64>,
@@ -88,6 +92,13 @@ impl SubmitRequest {
         }
         if !valid_sha(&self.sha) || !valid_hex(&self.tree_digest, 64) {
             return refuse("invalid SHA or tree digest");
+        }
+        if self
+            .commit
+            .as_deref()
+            .is_some_and(|c| !self.dirty || !valid_sha(c))
+        {
+            return refuse("a synthetic commit is a SHA, and only for a dirty tree");
         }
         provider::require_supported(self.provider).map_err(CiError::refused)?;
         if self.engine != "act" {
@@ -239,6 +250,10 @@ pub struct RunRecord {
     pub branch: Option<String>,
     /// Tree digest when the run used uncommitted work (`sha + dirty`).
     pub dirty: Option<String>,
+    /// The synthetic commit the job checked out when `dirty`: `sha` plus the
+    /// uncommitted work, so a workflow cleaning its tree still builds it.
+    #[serde(default)]
+    pub commit: Option<String>,
     pub tree_digest: String,
     pub workflow: String,
     pub job: Option<String>,
@@ -282,6 +297,7 @@ impl RunRecord {
             sha: request.sha.clone(),
             branch: request.branch.clone(),
             dirty: request.dirty.then(|| request.tree_digest.clone()),
+            commit: request.commit.clone(),
             tree_digest: request.tree_digest.clone(),
             workflow: request.workflow.clone(),
             job: request.job.clone(),

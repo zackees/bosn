@@ -301,10 +301,12 @@ impl CiRuntime {
             if !staging.join("source").is_dir() {
                 return Err(CiError::refused("staged snapshot is missing"));
             }
+            // The job checks out the synthetic commit of a dirty tree, so
+            // the payload names it (`pull_request.head.sha`, `after`).
             let (event, payload) = provider::github_event(
                 request.trigger,
                 request.mode,
-                &request.sha,
+                request.commit.as_deref().unwrap_or(&request.sha),
                 request.branch.as_deref(),
                 &provider::repository(request.origin.as_deref()),
                 request.pr_number.unwrap_or(1),
@@ -673,13 +675,18 @@ impl CiRuntime {
         let plan = plan?;
         observer.masker = SecretMasker::new(plan.invocation.secrets.0.iter().map(|(_, v)| v));
         observer.note(&format!(
-            "run {} sha {}{} workflow {} trigger {} mode {} actor {}",
+            "run {} sha {}{}{} workflow {} trigger {} mode {} actor {}",
             record.id,
             record.sha,
             record
                 .dirty
                 .as_ref()
                 .map(|d| format!(" +dirty:{}", &d[..12]))
+                .unwrap_or_default(),
+            record
+                .commit
+                .as_ref()
+                .map(|c| format!(" (checked out as commit {})", &c[..12]))
                 .unwrap_or_default(),
             record.workflow,
             record.trigger.as_str(),
@@ -712,11 +719,17 @@ impl CiRuntime {
     }
 
     /// Serve checkouts without a token (#335) and say how, naming every
-    /// repository fetched from GitHub.
+    /// repository fetched from GitHub. The rewrites are hidden from the
+    /// snapshot's Git index, so the job still sees a clean checkout (#394).
     fn localize_checkouts(&self, record: &RunRecord, observer: &mut RunObserver) {
         let source = self.store.source(&record.id);
         match super::checkout::localize_tree(&source, &record.repository) {
             Ok(localized) => {
+                if let Err(error) = super::snapshot::hide_from_git(&source, &localized.files) {
+                    observer.note(&format!(
+                        "rewritten workflows show as edits to git: {error}"
+                    ));
+                }
                 if localized.own > 0 {
                     observer.note(&format!(
                         "{} actions/checkout step(s) of this repository are served from the frozen snapshot",

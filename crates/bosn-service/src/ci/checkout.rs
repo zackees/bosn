@@ -19,9 +19,14 @@
 //! without a token rather than silently testing something else.
 //!
 //! Every file act may run is rewritten: the workflows (reusable ones
-//! included) and the repository's own composite actions.
+//! included) and the repository's own composite actions. The run then hides
+//! the rewritten [`Localized::files`] from Git, so the job's checkout still
+//! looks clean and a workflow's `git restore` does not undo them (#394).
 
-use std::{fmt, io, path::Path};
+use std::{
+    fmt, io,
+    path::{Path, PathBuf},
+};
 
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
@@ -34,6 +39,8 @@ pub struct Localized {
     /// `owner/name@commit` of each pinned checkout of another repository,
     /// now fetched anonymously.
     pub pinned: Vec<String>,
+    /// The workflow and action files rewritten.
+    pub files: Vec<PathBuf>,
 }
 
 /// Rewrite checkout steps in every workflow under `.github/workflows/` and
@@ -63,25 +70,29 @@ pub fn localize_tree(root: &Path, repository: &str) -> io::Result<Localized> {
     files.sort();
     let mut localized = Localized::default();
     for file in files {
-        localize(&file, repository, &mut localized)?;
+        if localize(&file, repository, &mut localized)? {
+            localized.files.push(file);
+        }
     }
     Ok(localized)
 }
 
 /// Rewrite the checkout steps of one workflow or action file, adding what
-/// changed to `localized`; the file is rewritten only when something did.
-pub fn localize(workflow: &Path, repository: &str, localized: &mut Localized) -> io::Result<()> {
+/// changed to `localized`; the file is rewritten (and `true` returned) only
+/// when something did.
+pub fn localize(workflow: &Path, repository: &str, localized: &mut Localized) -> io::Result<bool> {
     let text = std::fs::read_to_string(workflow)?;
     let mut document: Value = serde_yaml::from_str(&text).map_err(io::Error::other)?;
     let mut changes = Localized::default();
     localize_document(&mut document, repository, &mut changes);
-    if changes != Localized::default() {
+    let changed = changes != Localized::default();
+    if changed {
         let rewritten = serde_yaml::to_string(&document).map_err(io::Error::other)?;
         std::fs::write(workflow, rewritten)?;
     }
     localized.own += changes.own;
     localized.pinned.extend(changes.pinned);
-    Ok(())
+    Ok(changed)
 }
 
 /// Steps live under `jobs.<id>.steps` in a workflow and under `runs.steps`
@@ -447,6 +458,38 @@ mod tests {
             std::fs::read_to_string(root.join(".github/workflows/other.yml")).unwrap(),
             other,
             "another repository's checkout is untouched"
+        );
+    }
+
+    /// #394: bosn's rewrites must not look like edits to the job, so a
+    /// workflow that cleans its tree neither sees nor reverts them.
+    #[cfg(unix)]
+    #[test]
+    fn rewrites_are_hidden_from_git_and_survive_a_restore() {
+        use crate::ci::snapshot::tests::{git_in, sh};
+        let dir = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let root = dir.path();
+        let workflow = root.join(".github/workflows/ci.yml");
+        std::fs::create_dir_all(workflow.parent().unwrap()).unwrap();
+        std::fs::write(
+            &workflow,
+            "on: [push]\njobs:\n  a:\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          ref: ${{ github.sha }}\n",
+        )
+        .unwrap();
+        sh(
+            root,
+            "printf 'x\\n' > README && git init -q -b main . && git add -A && git commit -qm init",
+        );
+        let localized = localize_tree(root, "example/demo").unwrap();
+        assert_eq!(localized.own, 1);
+        assert_eq!(localized.files, vec![workflow.clone()]);
+        crate::ci::snapshot::hide_from_git(root, &localized.files).unwrap();
+        assert_eq!(git_in(root, &["status", "--porcelain"]), "", "looks clean");
+        git_in(root, &["restore", "--staged", "--worktree", "--", "."]);
+        git_in(root, &["reset", "--hard", "--quiet"]);
+        assert!(
+            !std::fs::read_to_string(&workflow).unwrap().contains("ref:"),
+            "the rewrite stays"
         );
     }
 

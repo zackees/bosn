@@ -32,6 +32,7 @@ fn request(staging: &str, sha_byte: char) -> SubmitRequest {
         branch: Some("main".into()),
         tree_digest: "d".repeat(64),
         dirty: false,
+        commit: None,
         origin: Some("https://github.com/o/r.git".into()),
         pr_number: None,
         timeout_secs: Some(5),

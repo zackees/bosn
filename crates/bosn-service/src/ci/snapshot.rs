@@ -8,6 +8,12 @@
 //!
 //! The digest is stable across snapshots of an unchanged tree and covers
 //! every path, type, mode bit and byte; a one-byte edit changes it.
+//!
+//! The copy is also a Git repository holding the `HEAD` commit. A dirty tree
+//! is committed on top of it (a synthetic commit, #394), so the job sees the
+//! work under test as a clean checkout of `HEAD`, and a workflow that cleans
+//! its tree (`git restore`, `git reset --hard`) cannot silently build the
+//! last commit instead. The run record still says `sha + dirty`.
 
 use std::{
     io,
@@ -33,22 +39,38 @@ pub struct SnapshotReceipt {
     /// True when the tree differs from `HEAD` (tracked edits, deletions or
     /// untracked files). Receipts then record `sha + dirty: tree_digest`.
     pub dirty: bool,
+    /// The synthetic commit the run checks out when `dirty`: `HEAD` plus the
+    /// uncommitted work, so a workflow that cleans its tree (`git restore`,
+    /// `git reset --hard`) still builds what is under test (#394).
+    pub commit: Option<String>,
     pub files: u64,
     pub bytes: u64,
     /// `origin` URL, used for the runner's repository identity.
     pub origin: Option<String>,
 }
 
+/// Who the synthetic commit is by; its dates are the base commit's.
+const SYNTHETIC_IDENTITY: [(&str, &str); 4] = [
+    ("GIT_AUTHOR_NAME", "bosn"),
+    ("GIT_AUTHOR_EMAIL", "bosn@localhost"),
+    ("GIT_COMMITTER_NAME", "bosn"),
+    ("GIT_COMMITTER_EMAIL", "bosn@localhost"),
+];
+const SYNTHETIC_MESSAGE: &str = "bosn: uncommitted work under test";
+
 fn git(dir: &Path, args: &[&str]) -> io::Result<Vec<u8>> {
-    let spec = args.iter().fold(
-        SpawnSpec::new("git")
-            .current_dir(dir)
-            .stdin(StreamMode::Null)
-            .stdout(StreamMode::Piped)
-            .stderr(StreamMode::Piped)
-            .env("GIT_OPTIONAL_LOCKS", "0"),
-        |spec, arg| spec.arg(*arg),
-    );
+    git_env(dir, &[], args)
+}
+
+fn git_env(dir: &Path, env: &[(&str, &str)], args: &[&str]) -> io::Result<Vec<u8>> {
+    let spec = SpawnSpec::new("git")
+        .current_dir(dir)
+        .stdin(StreamMode::Null)
+        .stdout(StreamMode::Piped)
+        .stderr(StreamMode::Piped)
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    let spec = env.iter().fold(spec, |spec, (k, v)| spec.env(*k, *v));
+    let spec = args.iter().fold(spec, |spec, arg| spec.arg(*arg));
     let output = kernal_api::run_bounded_command(spec, GIT_DEADLINE, GIT_OUTPUT_LIMIT)
         .map_err(|e| io::Error::other(format!("git {}: {e}", args.join(" "))))?;
     if output.exit.raw_code() != 0 {
@@ -156,8 +178,8 @@ pub fn head(workspace: &Path) -> io::Result<Head> {
 /// Copy the working tree of `workspace` (a Git checkout root) into `dest`,
 /// which must not exist yet, and make it a Git repository holding only the
 /// `HEAD` commit (refs, remote, a depth-1 pack and an index), so the runner
-/// and the workflow's own `git` commands see the right commit, with the
-/// uncommitted work on top.
+/// and the workflow's own `git` commands see the right commit. A dirty tree
+/// is then committed on top of `HEAD` ([`commit_working_tree`]).
 pub fn snapshot(workspace: &Path, dest: &Path) -> io::Result<SnapshotReceipt> {
     let Head {
         root,
@@ -216,11 +238,17 @@ pub fn snapshot(workspace: &Path, dest: &Path) -> io::Result<SnapshotReceipt> {
     let dirty = dirty || after.dirty;
     write_git_metadata(dest, &sha, branch.as_deref(), origin.as_deref())?;
     write_head_objects(&root, dest, &sha)?;
+    let commit = if dirty {
+        commit_working_tree(dest, &sha)?
+    } else {
+        None
+    };
     Ok(SnapshotReceipt {
         sha,
         branch,
         tree_digest: hasher.finalize().to_hex(),
         dirty,
+        commit,
         files,
         bytes,
         origin,
@@ -229,6 +257,12 @@ pub fn snapshot(workspace: &Path, dest: &Path) -> io::Result<SnapshotReceipt> {
 
 /// The `.git` refs, `HEAD` and remote act's revision/ref/remote probes read;
 /// [`write_head_objects`] then adds the `HEAD` commit itself.
+///
+/// `refs/bosn/base` always names the commit the snapshot was taken from
+/// (`git diff refs/bosn/base` shows the uncommitted work under test). It
+/// also keeps `refs/` from being empty: act copies files, not empty
+/// directories, and without `refs/` a detached `HEAD`'s copy is not a Git
+/// repository at all (#393).
 fn write_git_metadata(
     dest: &Path,
     sha: &str,
@@ -236,9 +270,16 @@ fn write_git_metadata(
     origin: Option<&str>,
 ) -> io::Result<()> {
     let git = dest.join(".git");
-    for dir in ["objects/info", "objects/pack", "refs/heads", "refs/tags"] {
+    for dir in [
+        "objects/info",
+        "objects/pack",
+        "refs/heads",
+        "refs/tags",
+        "refs/bosn",
+    ] {
         std::fs::create_dir_all(git.join(dir))?;
     }
+    std::fs::write(git.join("refs/bosn/base"), format!("{sha}\n"))?;
     match branch {
         Some(branch) if !branch.contains("..") && !branch.starts_with('/') => {
             let reference = git.join("refs/heads").join(branch);
@@ -290,6 +331,66 @@ fn write_head_objects(root: &Path, dest: &Path, sha: &str) -> io::Result<()> {
     git(dest, &["read-tree", "HEAD"]).map(|_| ())
 }
 
+/// Commit the copied working tree on top of `base` and move `HEAD` (its
+/// branch when attached) to it, so the job sees the work under test as a
+/// clean checkout. Identity and dates are fixed (the dates are `base`'s), so
+/// the same tree on the same base is always the same commit and identical
+/// dirty runs still coalesce. `None` when the tree is `base`'s after all.
+fn commit_working_tree(dest: &Path, base: &str) -> io::Result<Option<String>> {
+    git(dest, &["add", "--all"])?;
+    let tree = text(git(dest, &["write-tree"])?)?;
+    if tree == text(git(dest, &["rev-parse", &format!("{base}^{{tree}}")])?)? {
+        return Ok(None);
+    }
+    let date = format!(
+        "@{} +0000",
+        text(git(dest, &["show", "-s", "--format=%ct", base])?)?
+    );
+    let env: Vec<(&str, &str)> = SYNTHETIC_IDENTITY
+        .into_iter()
+        .chain([("GIT_AUTHOR_DATE", &*date), ("GIT_COMMITTER_DATE", &*date)])
+        .collect();
+    let commit = text(git_env(
+        dest,
+        &env,
+        &[
+            "commit-tree",
+            "--no-gpg-sign",
+            &tree,
+            "-p",
+            base,
+            "-m",
+            SYNTHETIC_MESSAGE,
+        ],
+    )?)?;
+    git(dest, &["update-ref", "HEAD", &commit, base])?;
+    Ok(Some(commit))
+}
+
+/// Mark `paths` (relative to the snapshot `root`) skip-worktree, so bosn's
+/// own rewrites of them neither show as edits nor are reverted by a
+/// workflow's `git restore`/`git reset --hard`; the job then sees a clean
+/// checkout of the commit under test.
+pub fn hide_from_git(root: &Path, paths: &[PathBuf]) -> io::Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let relative: Vec<String> = paths
+        .iter()
+        .map(|p| {
+            p.strip_prefix(root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    let args: Vec<&str> = ["update-index", "--skip-worktree", "--"]
+        .into_iter()
+        .chain(relative.iter().map(String::as_str))
+        .collect();
+    git(root, &args).map(|_| ())
+}
+
 #[cfg(unix)]
 fn symlink(target: &Path, link: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(target, link)
@@ -322,11 +423,11 @@ fn set_mode(_path: &Path, _executable: bool) -> io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use kernal_api::platform::fs::TemporaryDirectory;
 
-    fn sh(dir: &Path, script: &str) {
+    pub(crate) fn sh(dir: &Path, script: &str) {
         let out = kernal_api::run_bounded_command(
             SpawnSpec::new("sh")
                 .arg("-c")
@@ -425,10 +526,13 @@ mod tests {
             Some("https://github.com/example/repo.git")
         );
         assert_eq!(
-            std::fs::read_to_string(s.join(".git/refs/heads/main"))
-                .unwrap()
-                .trim(),
-            dirty.sha
+            Some(
+                std::fs::read_to_string(s.join(".git/refs/heads/main"))
+                    .unwrap()
+                    .trim()
+            ),
+            dirty.commit.as_deref(),
+            "the branch names the commit under test"
         );
 
         // One byte changes the digest; editing the workspace after the
@@ -476,37 +580,58 @@ mod tests {
         assert!(snapshot(&ws.join("nested"), &tmp.path().join("x")).is_err());
     }
 
+    /// `git` in `dir`, which must succeed; stdout with the end trimmed
+    /// (porcelain status starts with a meaningful space).
+    pub(crate) fn git_in(dir: &Path, args: &[&str]) -> String {
+        let out = kernal_api::run_bounded_command(
+            args.iter()
+                .fold(SpawnSpec::new("git").current_dir(dir), |s, a| s.arg(*a))
+                .stdin(StreamMode::Null)
+                .stdout(StreamMode::Piped)
+                .stderr(StreamMode::Piped),
+            Duration::from_secs(30),
+            1 << 20,
+        )
+        .unwrap();
+        assert_eq!(
+            out.exit.raw_code(),
+            0,
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+    }
+
+    /// What act puts in the job container: files and links, without the
+    /// empty directories.
+    #[cfg(unix)]
+    fn copy_files_only(from: &Path, to: &Path) {
+        for entry in std::fs::read_dir(from).unwrap().map(Result::unwrap) {
+            let (source, target) = (entry.path(), to.join(entry.file_name()));
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                copy_files_only(&source, &target);
+                continue;
+            }
+            std::fs::create_dir_all(to).unwrap();
+            if kind.is_symlink() {
+                symlink(&std::fs::read_link(&source).unwrap(), &target).unwrap();
+            } else {
+                std::fs::copy(&source, &target).unwrap();
+            }
+        }
+    }
+
     #[test]
     fn the_snapshot_is_a_real_repository_holding_only_the_head_commit() {
         let tmp = TemporaryDirectory::new().unwrap();
         let ws = repo(tmp.path());
-        sh(
-            &ws,
-            "printf 'b\\n' > tracked.txt && git commit -qam second && \
-             printf 'edit\\n' >> tracked.txt && printf 'new\\n' > untracked.txt",
-        );
+        sh(&ws, "printf 'b\\n' > tracked.txt && git commit -qam second");
         let dest = tmp.path().join("s");
         let receipt = snapshot(&ws, &dest).unwrap();
-        let git = |args: &[&str]| {
-            let out = kernal_api::run_bounded_command(
-                args.iter()
-                    .fold(SpawnSpec::new("git").current_dir(&dest), |s, a| s.arg(*a))
-                    .stdin(StreamMode::Null)
-                    .stdout(StreamMode::Piped)
-                    .stderr(StreamMode::Piped),
-                Duration::from_secs(30),
-                1 << 20,
-            )
-            .unwrap();
-            assert_eq!(
-                out.exit.raw_code(),
-                0,
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            // Porcelain status starts with a meaningful space: trim the end only.
-            String::from_utf8_lossy(&out.stdout).trim_end().to_string()
-        };
+        let git = |args: &[&str]| git_in(&dest, args);
+        assert!(!receipt.dirty);
+        assert_eq!(receipt.commit, None, "a clean tree is the commit itself");
         assert_eq!(
             git(&["rev-parse", "HEAD"]),
             receipt.sha,
@@ -518,18 +643,93 @@ mod tests {
             "1",
             "no history beyond HEAD"
         );
-        let status = git(&["status", "--porcelain"]);
-        assert!(
-            status.contains(" M tracked.txt"),
-            "uncommitted edits show: {status}"
+        assert_eq!(git(&["status", "--porcelain"]), "");
+        assert_eq!(
+            git(&["rev-parse", "refs/bosn/base"]),
+            receipt.sha,
+            "the commit the snapshot was taken from is named"
         );
-        assert!(status.contains("?? untracked.txt"), "{status}");
-        assert!(!status.contains("deleted.txt"), "{status}");
         // act copies files, not empty directories: objects must hold a file.
         let objects = std::fs::read_dir(dest.join(".git/objects/pack"))
             .unwrap()
             .count();
         assert!(objects > 0, "the HEAD commit's objects are packed");
+    }
+
+    /// #394: a workflow that cleans its tree (`git restore`, `git reset
+    /// --hard`) must still build the uncommitted work under test.
+    #[test]
+    fn a_dirty_snapshot_is_a_synthetic_commit_on_top_of_head() {
+        let tmp = TemporaryDirectory::new().unwrap();
+        let ws = repo(tmp.path());
+        sh(
+            &ws,
+            "printf 'edit\\n' >> tracked.txt && rm deleted.txt && printf 'new\\n' > untracked.txt",
+        );
+        let dest = tmp.path().join("s");
+        let receipt = snapshot(&ws, &dest).unwrap();
+        let git = |args: &[&str]| git_in(&dest, args);
+        assert!(receipt.dirty, "the receipt still says sha + dirty");
+        let commit = receipt.commit.clone().expect("a dirty tree is committed");
+        assert_ne!(commit, receipt.sha);
+        assert_eq!(
+            git(&["rev-parse", "HEAD"]),
+            commit,
+            "the job sees it as HEAD"
+        );
+        assert_eq!(git(&["rev-parse", "HEAD^"]), receipt.sha, "on top of HEAD");
+        assert_eq!(git(&["rev-parse", "refs/heads/main"]), commit);
+        assert_eq!(git(&["rev-parse", "refs/bosn/base"]), receipt.sha);
+        assert_eq!(git(&["status", "--porcelain"]), "", "a clean checkout");
+        assert_eq!(
+            git(&["diff", "--name-status", "refs/bosn/base", "HEAD"]),
+            "D\tdeleted.txt\nM\ttracked.txt\nA\tuntracked.txt",
+            "the commit holds exactly the uncommitted work"
+        );
+        git(&["restore", "--staged", "--worktree", "--", "."]);
+        git(&["reset", "--hard", "--quiet"]);
+        assert_eq!(
+            std::fs::read_to_string(dest.join("tracked.txt")).unwrap(),
+            "a\nedit\n",
+            "cleaning the tree keeps the work under test"
+        );
+        assert!(dest.join("untracked.txt").exists());
+        let again = snapshot(&ws, &tmp.path().join("s2")).unwrap();
+        assert_eq!(
+            again.commit, receipt.commit,
+            "the same tree gives the same commit, so identical runs coalesce"
+        );
+    }
+
+    /// #393: a detached `HEAD` (a worktree created at a SHA) gives the job
+    /// the same repository, `HEAD` naming the commit directly, even after
+    /// act drops the empty directories.
+    #[cfg(unix)]
+    #[test]
+    fn a_detached_head_survives_a_copy_without_empty_directories() {
+        let tmp = TemporaryDirectory::new().unwrap();
+        let ws = repo(tmp.path());
+        for (name, setup) in [
+            ("clean", "git checkout -q --detach"),
+            ("dirty", "printf 'edit\\n' >> tracked.txt"),
+        ] {
+            sh(&ws, setup);
+            let dest = tmp.path().join(name);
+            let receipt = snapshot(&ws, &dest).unwrap();
+            assert_eq!(receipt.branch, None, "{name}");
+            let job = tmp.path().join(format!("{name}-job"));
+            copy_files_only(&dest, &job);
+            let head = receipt.commit.as_deref().unwrap_or(&receipt.sha);
+            assert_eq!(git_in(&job, &["rev-parse", "HEAD"]), head, "{name}");
+            assert_eq!(
+                std::fs::read_to_string(job.join(".git/HEAD"))
+                    .unwrap()
+                    .trim(),
+                head,
+                "{name}: HEAD stays detached"
+            );
+            assert_eq!(git_in(&job, &["status", "--porcelain"]), "", "{name}");
+        }
     }
 
     /// Opt-in (writes about 4 GiB to the temp directory):
