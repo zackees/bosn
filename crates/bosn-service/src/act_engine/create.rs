@@ -39,7 +39,10 @@ pub(crate) fn engine_command() -> Vec<String> {
         "bosn-act-engine-init",
         "dockerd",
         "--feature=containerd-snapshotter=true",
-        "--storage-driver=native",
+        // overlayfs on the private tmpfs: a new container shares the image's
+        // layers instead of copying them, as `native` did (~5 s and ~5 GiB
+        // of RAM-backed storage per job container, plus a slower image load).
+        "--storage-driver=overlayfs",
         "--data-root=/var/lib/docker",
         "--exec-root=/run/docker",
         "--host=unix:///var/run/docker.sock",
@@ -90,7 +93,7 @@ impl ActEngineLimits {
         ]
         .into_iter()
         // Docker 29.7.2 daemon/oci_linux.go defaults user tmpfs to noexec.
-        // Native snapshots must execute container binaries; only their private
+        // Snapshots must execute container binaries; only their private
         // storage mount clears that default. /run and /tmp remain noexec.
         .map(|(path, bytes)| {
             let execution = if path == "/var/lib/docker" {
