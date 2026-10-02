@@ -5,7 +5,7 @@ use std::{
     io::{Read, Write},
     net::TcpStream,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use super::*;
@@ -267,6 +267,60 @@ fn disabled_means_no_listener_and_grants_are_refused() {
     });
 }
 
+/// How long a step that must happen may take before the test calls it hung.
+/// A liveness guard for a loaded machine, never a speed assertion (#412).
+const HUNG: Duration = Duration::from_secs(60);
+
+/// Subscribe to the live feed and return once the daemon holds the
+/// subscription: `events` takes its receiver before the response head is
+/// written, so reading the head is the barrier.
+async fn subscribed_feed(port: u16, cookie: &str) -> TcpStream {
+    let request = get(
+        port,
+        "/v1/events",
+        &format!("127.0.0.1:{port}"),
+        Some(cookie),
+    );
+    async_engine::launch_blocking(move || {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream.set_read_timeout(Some(HUNG)).unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream
+                .read_exact(&mut byte)
+                .expect("the feed's response head");
+            head.push(byte[0]);
+        }
+        assert!(
+            head.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&head)
+        );
+        stream
+    })
+    .await
+    .unwrap()
+}
+
+/// Events that must overflow a stalled reader: its socket buffers (the
+/// kernel's largest send plus receive buffer, and a margin for the server's
+/// own write buffer) full of events, plus everything the feed retains. Only
+/// then is the reader guaranteed to lag, whatever the scheduler does.
+fn events_that_overflow_a_stalled_reader(event: &RunEvent) -> usize {
+    let max_buffer = |sysctl: &str| -> usize {
+        std::fs::read_to_string(sysctl)
+            .ok()
+            .and_then(|v| v.split_whitespace().nth(2)?.parse().ok())
+            .unwrap_or(32 << 20)
+    };
+    let buffered = max_buffer("/proc/sys/net/ipv4/tcp_wmem")
+        + max_buffer("/proc/sys/net/ipv4/tcp_rmem")
+        + (1 << 20);
+    buffered / event.to_json().len() + 2 * crate::ci::events::FEED_CAPACITY
+}
+
 #[test]
 fn a_paused_feed_reader_never_delays_publishing_or_other_clients() {
     with_registry(|registry, dir| async move {
@@ -274,15 +328,9 @@ fn a_paused_feed_reader_never_delays_publishing_or_other_clients() {
         let cookie = sign_in(&ci, port).await;
         let host = format!("127.0.0.1:{port}");
         // A reader that subscribes and then never reads.
-        let mut paused = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        paused
-            .write_all(get(port, "/v1/events", &host, Some(&cookie)).as_bytes())
-            .unwrap();
+        let mut paused = subscribed_feed(port, &cookie).await;
         // A second reader that keeps up: it reports when it sees a marker.
-        let mut active = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        active
-            .write_all(get(port, "/v1/events", &host, Some(&cookie)).as_bytes())
-            .unwrap();
+        let mut active = subscribed_feed(port, &cookie).await;
         let marker = "aaaaaaaa-bbbb-4ccc-8ddd-0000000000ff";
         let (seen_tx, seen_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -294,7 +342,7 @@ fn a_paused_feed_reader_never_delays_publishing_or_other_clients() {
                 }
                 text.push_str(&String::from_utf8_lossy(&buf[..n]));
                 if text.contains(marker) {
-                    let _ = seen_tx.send(Instant::now());
+                    let _ = seen_tx.send(());
                     break;
                 }
                 // Keep only a tail, so a split marker is still found.
@@ -303,46 +351,37 @@ fn a_paused_feed_reader_never_delays_publishing_or_other_clients() {
                 }
             }
         });
-        async_engine::sleep(Duration::from_millis(100)).await;
+        // Far more events than a reader retains, while one reader is
+        // stalled: publishing returns, because it never waits for readers.
         let fake = fake_record();
-        let started = Instant::now();
-        for _ in 0..20_000 {
-            ci.feed().publish(&fake);
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "publishing never waits"
-        );
-        let other = Instant::now();
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        let feed = ci.feed().clone();
+        let flood = fake.clone();
+        let events = events_that_overflow_a_stalled_reader(&RunEvent::of(&fake));
+        std::thread::spawn(move || {
+            for _ in 0..events {
+                feed.publish(&flood);
+            }
+            let _ = published_tx.send(());
+        });
+        published_rx
+            .recv_timeout(HUNG)
+            .expect("publishing never waits for a stalled reader");
+        // Other clients are served while the paused reader is stalled.
         let reply = raw(port, get(port, "/v1/runners", &host, Some(&cookie))).await;
-        assert_eq!(reply.status, 200);
-        assert!(
-            other.elapsed() < Duration::from_millis(500),
-            "other clients unaffected"
-        );
-        // With the paused reader still stalled, a fresh event reaches the
-        // reader that keeps up within 100 ms.
-        async_engine::sleep(Duration::from_millis(300)).await;
+        assert_eq!(reply.status, 200, "other clients unaffected");
+        // The newest event reaches the reader that keeps up, though the
+        // paused reader has still not read a byte of the feed.
         let mut marked = fake.clone();
         marked.id = marker.into();
-        let published = Instant::now();
         ci.feed().publish(&marked);
-        let seen = seen_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the active reader receives the event");
-        assert!(
-            seen.duration_since(published) < Duration::from_millis(100),
-            "event latency {:?} with a stalled reader",
-            seen.duration_since(published)
-        );
+        seen_rx
+            .recv_timeout(HUNG)
+            .expect("the active reader receives the event despite the stalled reader");
         // The paused reader resumes with a resync rather than a backlog.
-        paused
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
         let mut seen = String::new();
         let mut buf = [0u8; 65536];
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline && !seen.contains("resync") {
+        while !seen.contains("resync") {
             match paused.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => seen.push_str(&String::from_utf8_lossy(&buf[..n])),
@@ -395,11 +434,27 @@ fn malformed_oversized_and_slow_clients_stay_within_limits() {
                 s
             })
             .collect();
-        let started = Instant::now();
         let healthy = raw(port, get(port, "/v1/runners", &host, Some(&cookie))).await;
         assert_eq!(healthy.status, 200);
-        assert!(started.elapsed() < Duration::from_millis(500));
-        drop(drips);
+        // Every drip was still held open when the healthy client was served
+        // (each now completes its own request), so it never waited for one
+        // to give up (#417).
+        let rest = format!("st: {host}\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n");
+        let statuses = async_engine::launch_blocking(move || {
+            drips
+                .into_iter()
+                .map(|mut drip| {
+                    drip.set_read_timeout(Some(HUNG)).unwrap();
+                    drip.write_all(rest.as_bytes()).unwrap();
+                    let mut reply = String::new();
+                    let _ = drip.read_to_string(&mut reply);
+                    reply.split(' ').nth(1).unwrap_or_default().to_string()
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap();
+        assert_eq!(statuses, vec!["200"; 8], "every drip was still connected");
     });
 }
 
