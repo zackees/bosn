@@ -441,4 +441,40 @@ mod tests {
         std::fs::create_dir(ws.join("nested")).unwrap();
         assert!(snapshot(&ws.join("nested"), &tmp.path().join("x")).is_err());
     }
+
+    /// Opt-in (writes about 4 GiB to the temp directory):
+    /// `cargo test -p bosn-service --lib -- --ignored a_2_gib_file`.
+    #[test]
+    #[ignore = "writes about 4 GiB; run on request"]
+    fn a_2_gib_file_is_copied_whole_and_one_byte_changes_the_digest() {
+        use std::io::{Seek, SeekFrom, Write};
+        const SIZE: u64 = 2 << 30;
+        let tmp = TemporaryDirectory::new().unwrap();
+        let ws = repo(tmp.path());
+        let big = ws.join("big.bin");
+        std::fs::File::create(&big).unwrap().set_len(SIZE).unwrap();
+        let first = snapshot(&ws, &tmp.path().join("s0")).unwrap();
+        assert!(first.dirty, "an untracked file makes the tree dirty");
+        assert!(first.bytes >= SIZE, "{} bytes", first.bytes);
+        let copied = tmp.path().join("s0").join("big.bin");
+        assert_eq!(std::fs::metadata(&copied).unwrap().len(), SIZE);
+        std::fs::remove_dir_all(tmp.path().join("s0")).unwrap();
+
+        let again = snapshot(&ws, &tmp.path().join("s1")).unwrap();
+        assert_eq!(
+            first.tree_digest, again.tree_digest,
+            "stable when unchanged"
+        );
+        std::fs::remove_dir_all(tmp.path().join("s1")).unwrap();
+
+        let mut file = std::fs::OpenOptions::new().write(true).open(&big).unwrap();
+        file.seek(SeekFrom::Start(SIZE - 1)).unwrap();
+        file.write_all(b"x").unwrap();
+        drop(file);
+        let edited = snapshot(&ws, &tmp.path().join("s2")).unwrap();
+        assert_ne!(
+            first.tree_digest, edited.tree_digest,
+            "the last byte counts"
+        );
+    }
 }
