@@ -271,7 +271,20 @@ impl ActEngineLimits {
             ("/tmp", 64 << 20),
         ]
         .into_iter()
-        .map(|(path, bytes)| (path.into(), format!("rw,nosuid,nodev,size={bytes}")))
+        // Docker 29.7.2 daemon/oci_linux.go defaults user tmpfs to noexec.
+        // Native snapshots must execute container binaries; only their private
+        // storage mount clears that default. /run and /tmp remain noexec.
+        .map(|(path, bytes)| {
+            let execution = if path == "/var/lib/docker" {
+                ",exec"
+            } else {
+                ""
+            };
+            (
+                path.into(),
+                format!("rw{execution},nosuid,nodev,size={bytes}"),
+            )
+        })
         .collect()
     }
 }
@@ -1072,9 +1085,10 @@ mod tests {
     #[test]
     fn engine_arguments_override_image_volume_without_any_host_bind() {
         let args = create_arguments(&intent(), OWNER, limits()).unwrap();
-        assert!(args.windows(2).any(
-            |p| p[0] == "--tmpfs" && p[1] == "/var/lib/docker:rw,nosuid,nodev,size=4294967296"
-        ));
+        assert!(
+            args.windows(2).any(|p| p[0] == "--tmpfs"
+                && p[1] == "/var/lib/docker:rw,exec,nosuid,nodev,size=4294967296")
+        );
         assert!(!args.iter().any(|v| matches!(
             v.as_str(),
             "--volume" | "-v" | "--mount" | "--publish" | "-p" | "--rm"
@@ -1091,6 +1105,37 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn snapshot_storage_exec_is_required_but_other_tmpfs_cannot_gain_exec() {
+        let declared = limits().tmpfs();
+        assert_eq!(
+            declared["/var/lib/docker"],
+            "rw,exec,nosuid,nodev,size=4294967296"
+        );
+        for path in ["/run", "/tmp"] {
+            assert!(!declared[path].split(',').any(|option| option == "exec"));
+        }
+        for (path, value) in [
+            ("/var/lib/docker", "rw,nosuid,nodev,size=4294967296"),
+            ("/run", "rw,exec,nosuid,nodev,size=16777216"),
+            ("/tmp", "rw,exec,nosuid,nodev,size=67108864"),
+        ] {
+            let mut observed = document();
+            observed[0]["HostConfig"]["Tmpfs"][path] = json!(value);
+            assert!(
+                observe_engine(
+                    &serde_json::to_vec(&observed).unwrap(),
+                    &intent(),
+                    OWNER,
+                    &classic_identity(),
+                    limits()
+                )
+                .is_err(),
+                "unexpected execution policy at {path}"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
