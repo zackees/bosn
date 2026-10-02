@@ -198,32 +198,42 @@ job succeeded, or when its engine could not be proven removed.
   area.
   - The run records `sha` plus `dirty: <tree digest>`, never only the bare SHA.
   - Editing the checkout during a run does not change what the run sees.
-- **Isolation.** Each run gets one privileged `docker:dind` container on the
-  host engine: the *engine*, pinned by digest and named `bosn-act-<run>`. It
-  carries the registry's ownership labels.
-  - act is downloaded inside the engine from the pinned release URL and checked
-    against its pinned sha256. It runs there through `docker exec`, so it only
-    sees the engine's private socket. The host socket is never mounted.
+- **Isolation.** Each run gets one owned Act engine on the host engine
+  (`crates/bosn-service/src/act_engine`, #349): a privileged container of the
+  pinned `docker:29.7.2` publisher manifest, named `bosn-act-<run>`, with a
+  read-only root, a private cgroup namespace, bounded memory, CPUs and
+  processes, and its Docker storage on a private tmpfs. It carries the
+  registry's ownership labels and a frozen creation profile.
+  - Its one named mount is the machine-wide cache volume (below), frozen into
+    the creation profile, verified before creation and on every observation.
+    No host path or socket is mounted.
+  - act is downloaded into the cache volume from the pinned release URL and
+    checked against its pinned sha256. It runs inside the engine through
+    `docker exec`, so it only sees the engine's private socket. The source
+    snapshot and event payload are streamed in on `docker exec`'s stdin.
   - Every job container, network, volume and image act creates lives in the
-    engine's own storage, which `docker rm -f -v <engine id>` removes with it.
+    engine's private storage, which goes with the engine.
   - **This isolates resource ownership and cleanup, not untrusted code.** The
     engine is privileged, and jobs can reach its Docker socket, so a hostile
     workflow can escape to the host. Run only workflows you would run on this
     machine directly.
 - **Lifecycle.** Each step goes through the registry (`docs/rust-registry.md`):
-  1. A durable intent is recorded.
-  2. The engine is created.
-  3. It is observed and registered.
+  1. A durable intent, with its frozen creation profile, is recorded.
+  2. The engine is created, observed and registered, then started.
+  3. The run takes an exclusive execution claim; every in-engine step
+     re-verifies it.
   4. act runs.
-  5. The outcome is recorded.
-  6. Cleanup is requested and authorized.
+  5. The outcome is recorded under the claim.
+  6. The claim's owner requests cleanup; removal is authorized.
   7. The engine is removed.
   8. Its absence is proven.
   9. The record becomes terminal.
 
-  On daemon start, every non-terminal record is reconciled and marked
-  `interrupted`. A container that holds an engine name without the exact
-  ownership labels is never removed.
+  A run whose cleanup fails stays `cleanup_required`. On daemon start, before
+  any request is admitted, every non-terminal record is marked `interrupted`
+  and its engine retired (`act_runtime::recover_startup_act_engines`); the
+  window then seals. A container that holds an engine name without the exact
+  ownership and isolation identity is never removed.
 - **Scheduling.** There is one machine-wide FIFO queue with a live concurrency
   limit, which defaults to cores / 4 and is changed with
   `bosn ci runners set-limit N`.
