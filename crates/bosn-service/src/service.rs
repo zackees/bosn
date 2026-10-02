@@ -170,10 +170,15 @@ impl Service {
             ),
         );
         // The opt-in dashboard listener lives as long as the daemon.
-        let _ui = match ci::ui::config::load(&self.state_dir) {
-            Ok(config) => match ci::ui::start(config, ci.clone()).await {
+        let config = ci::config::load(&self.state_dir);
+        if let Ok(config) = &config {
+            ci.configure_widget(config.widget.clone());
+        }
+        let _ui = match config {
+            Ok(config) => match ci::ui::start(config.ui, ci.clone()).await {
                 Ok(Some(server)) => {
                     ci.attach_ui(Arc::clone(&server.handle));
+                    ci.maybe_launch_widget(ci::widget::LaunchTrigger::DaemonStart);
                     eprintln!("bosn ci: dashboard listening on {}", server.handle.origin);
                     Some(server)
                 }

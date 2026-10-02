@@ -450,6 +450,7 @@ mod tests {
                     drained: false,
                     engine: "act".into(),
                     act_version: "0.2.88".into(),
+                    widget: crate::ci::widget::WidgetPresence::Absent,
                 },
             })
         }

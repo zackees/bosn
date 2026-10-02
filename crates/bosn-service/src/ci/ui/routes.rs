@@ -5,7 +5,7 @@
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 
-use crate::ci::{CiRequest, RunnerAction, wire::RunState};
+use crate::ci::{CiRequest, RunnerAction, widget::WidgetCommand, wire::RunState};
 
 #[derive(Debug, PartialEq)]
 pub enum Route {
@@ -37,7 +37,9 @@ impl Route {
             return false;
         };
         match request.as_ref() {
-            CiRequest::Cancel { .. } | CiRequest::Retry { .. } => true,
+            CiRequest::Cancel { .. }
+            | CiRequest::Retry { .. }
+            | CiRequest::WidgetCommand { .. } => true,
             CiRequest::Runners { action } => *action != RunnerAction::List,
             _ => false,
         }
@@ -60,6 +62,22 @@ impl Route {
         let route = match (segments.as_slice(), get, post) {
             ([""] | ["app.js"] | ["app.css"], true, _) => Route::Page,
             (["ci", ..], true, _) => Route::Page,
+            (["widget", "bubble" | "panel" | "widget.js" | "widget.css"], true, _) => Route::Page,
+            (["v1", "widget", "toggle"], _, true) => Route::api(CiRequest::WidgetCommand {
+                command: WidgetCommand::Toggle,
+            }),
+            (["v1", "widget", "open"], _, true) => {
+                let body: OpenBody = typed_body(body)?;
+                Route::api(CiRequest::WidgetCommand {
+                    command: WidgetCommand::Open { path: body.path },
+                })
+            }
+            (["v1", "widget", "open-external"], _, true) => {
+                let body: ExternalBody = typed_body(body)?;
+                Route::api(CiRequest::WidgetCommand {
+                    command: WidgetCommand::OpenExternal { url: body.url },
+                })
+            }
             (["auth"], true, _) => {
                 let q: RedeemQuery = typed_query(query)?;
                 let next = q.next.unwrap_or_else(|| "/".into());
@@ -127,6 +145,8 @@ impl Route {
                 | ["app.js"]
                 | ["app.css"]
                 | ["ci", ..]
+                | ["widget", ..]
+                | ["v1", "widget", "toggle" | "open" | "open-external"]
                 | ["auth"]
                 | ["v1", "events"]
                 | ["v1", "runs"]
@@ -212,6 +232,18 @@ struct LogsQuery {
 #[serde(deny_unknown_fields)]
 struct ReportQuery {
     tail: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenBody {
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalBody {
+    url: String,
 }
 
 #[derive(Deserialize)]
@@ -341,6 +373,20 @@ mod tests {
 
     #[test]
     fn writes_need_origin_and_unknown_inputs_are_refused() {
+        let toggle = parse("POST", "/v1/widget/toggle", &[], "").unwrap();
+        assert!(toggle.is_write(), "widget commands are writes");
+        assert_eq!(
+            parse("GET", "/widget/bubble", &[], "").unwrap(),
+            Route::Page
+        );
+        assert_eq!(
+            parse("GET", "/v1/widget/toggle", &[], ""),
+            Err(RouteError::MethodNotAllowed)
+        );
+        assert!(matches!(
+            parse("POST", "/v1/widget/open", &[], r#"{"path":"/","extra":1}"#),
+            Err(RouteError::BadRequest(_))
+        ));
         let cancel = parse("POST", &format!("/v1/runs/{RUN}/cancel"), &[], "").unwrap();
         assert!(cancel.is_write() && cancel.needs_session());
         assert!(!parse("GET", "/v1/runners", &[], "").unwrap().is_write());

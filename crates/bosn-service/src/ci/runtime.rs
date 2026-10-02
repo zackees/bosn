@@ -14,6 +14,7 @@ use kernal_api::async_engine::{self, CancellationSource};
 use serde_json::Value;
 
 use super::{
+    config::WidgetConfig,
     engine::{
         ACT_VERSION, ActEngineBackend, ActInvocation, CacheVolume, EngineLine, RUNNER_IMAGE,
         SecretEnv, act_artifact,
@@ -27,11 +28,13 @@ use super::{
     scheduler::{Admission, Scheduler},
     store::{INDEX_STRIDE, LogFilter, LogQuery, LogWriter, Settings, Store},
     ui::UiHandle,
+    widget::{LaunchTrigger, WidgetPresence, WidgetState},
     wire::*,
     workflow,
 };
 use crate::{RegistryActor, secrets::SecretMasker};
 mod observer;
+mod widget;
 use observer::*;
 
 /// Finished runs kept, and how many of them keep their source for retry.
@@ -86,6 +89,8 @@ pub struct CiRuntime {
     feed: Feed,
     /// Set once when the opt-in UI listener is serving.
     ui: Arc<OnceLock<Arc<UiHandle>>>,
+    widget: Arc<Mutex<WidgetState>>,
+    widget_config: Arc<Mutex<WidgetConfig>>,
 }
 
 impl CiRuntime {
@@ -130,6 +135,8 @@ impl CiRuntime {
             backend,
             feed: Feed::new(),
             ui: Arc::new(OnceLock::new()),
+            widget: Arc::new(Mutex::new(WidgetState::default())),
+            widget_config: Arc::new(Mutex::new(WidgetConfig::default())),
         };
         let dispatcher = runtime.clone();
         async_engine::launch(async move {
@@ -202,6 +209,14 @@ impl CiRuntime {
             ),
             CiRequest::Runners { action } => wire(self.runners(action).await),
             CiRequest::UiGrant { path } => wire(self.ui_grant(path).await),
+            CiRequest::WidgetHello {
+                pid,
+                session,
+                explicit,
+            } => wire(Ok(self.widget_hello(pid, &session, explicit))),
+            CiRequest::WidgetPoll { pid } => wire(Ok(self.widget_poll(pid))),
+            CiRequest::WidgetDismiss { session } => wire(Ok(self.widget_dismiss(&session))),
+            CiRequest::WidgetCommand { command } => wire(self.widget_command(command)),
         }
     }
 
@@ -326,6 +341,7 @@ impl CiRuntime {
         let queue_position = state.scheduler.queue_position(&id);
         drop(state);
         self.kick();
+        self.maybe_launch_widget(LaunchTrigger::Activity);
         Ok(SubmitReply {
             run: id,
             coalesced: false,
@@ -348,7 +364,7 @@ impl CiRuntime {
             .collect();
         ListReply {
             runs,
-            runners: runner_status(&state.scheduler),
+            runners: runner_status(&state.scheduler, self.widget_presence()),
         }
     }
 
@@ -492,7 +508,7 @@ impl CiRuntime {
             limit: state.scheduler.limit(),
             drained: state.scheduler.drained(),
         });
-        let status = runner_status(&state.scheduler);
+        let status = runner_status(&state.scheduler, self.widget_presence());
         drop(state);
         self.kick();
         Ok(RunnersReply {
@@ -723,7 +739,7 @@ impl CiRuntime {
     }
 }
 
-fn runner_status(scheduler: &Scheduler) -> RunnerStatus {
+fn runner_status(scheduler: &Scheduler, widget: WidgetPresence) -> RunnerStatus {
     RunnerStatus {
         limit: scheduler.limit(),
         running: scheduler.running(),
@@ -731,6 +747,7 @@ fn runner_status(scheduler: &Scheduler) -> RunnerStatus {
         drained: scheduler.drained(),
         engine: "act".into(),
         act_version: ACT_VERSION.into(),
+        widget,
     }
 }
 

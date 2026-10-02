@@ -358,3 +358,88 @@ fn malformed_oversized_and_slow_clients_stay_within_limits() {
         drop(drips);
     });
 }
+
+#[test]
+fn the_dashboard_drives_the_widget_only_through_queued_allowlisted_commands() {
+    with_registry(|registry, dir| async move {
+        let (ci, _server, port) = listener(&dir, registry).await;
+        let cookie = sign_in(&ci, port).await;
+        let origin = format!("http://127.0.0.1:{port}");
+        // A widget process registers over the owner-only socket.
+        let hello: crate::ci::WidgetReply = serde_json::from_value(
+            ci.handle(CiRequest::WidgetHello {
+                pid: 42,
+                session: "s1".into(),
+                explicit: false,
+            })
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(hello.allowed);
+        assert_eq!(hello.presence, crate::ci::widget::WidgetPresence::Connected);
+        let allowed = raw(
+            port,
+            post(
+                port,
+                "/v1/widget/open-external",
+                &cookie,
+                Some(&origin),
+                r#"{"url":"https://github.com/zackees/bosn"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(allowed.status, 200, "{}", allowed.body);
+        let refused = raw(
+            port,
+            post(
+                port,
+                "/v1/widget/open-external",
+                &cookie,
+                Some(&origin),
+                r#"{"url":"https://evil.example/x"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(refused.status, 400, "non-allowlisted links are refused");
+        assert_eq!(
+            raw(
+                port,
+                post(port, "/v1/widget/toggle", &cookie, Some(&origin), "")
+            )
+            .await
+            .status,
+            200
+        );
+        let page = raw(
+            port,
+            get(
+                port,
+                "/widget/bubble",
+                &format!("127.0.0.1:{port}"),
+                Some(&cookie),
+            ),
+        )
+        .await;
+        assert_eq!(page.status, 200);
+        assert!(page.body.contains("/widget/widget.js"));
+        let poll: crate::ci::WidgetReply =
+            serde_json::from_value(ci.handle(CiRequest::WidgetPoll { pid: 42 }).await.unwrap())
+                .unwrap();
+        use crate::ci::widget::WidgetCommand;
+        assert_eq!(
+            poll.commands,
+            [
+                WidgetCommand::OpenExternal {
+                    url: "https://github.com/zackees/bosn".into()
+                },
+                WidgetCommand::Toggle,
+            ]
+        );
+        let listed = ci.listing();
+        assert_eq!(
+            listed.runners.widget,
+            crate::ci::widget::WidgetPresence::Connected
+        );
+    });
+}

@@ -4,7 +4,6 @@
 //! for the closed route set (every API route is a typed CI request).
 
 pub mod auth;
-pub mod config;
 mod page;
 pub mod routes;
 
@@ -19,9 +18,9 @@ use kernal_api::{async_engine, http_server};
 
 use self::{
     auth::Auth,
-    config::UiConfig,
     routes::{Route, RouteError},
 };
+use super::config::UiConfig;
 use super::{CiError, CiRuntime, events::RunEvent, reply::JsonReply};
 
 /// What the CI runtime needs to issue grants: the listener's origin and auth.

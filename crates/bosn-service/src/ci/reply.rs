@@ -24,6 +24,15 @@ impl<T: Serialize> JsonReply for T {
     }
 }
 
+/// The daemon's answer to a widget request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WidgetReply {
+    pub presence: super::widget::WidgetPresence,
+    /// False when an auto-launched widget should exit (dismissed session).
+    pub allowed: bool,
+    pub commands: Vec<super::widget::WidgetCommand>,
+}
+
 /// A single-use link that signs a browser in to the dashboard.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct UiGrantReply {
@@ -100,6 +109,8 @@ pub struct RunnerStatus {
     pub drained: bool,
     pub engine: String,
     pub act_version: String,
+    /// Whether the desktop widget is running.
+    pub widget: super::widget::WidgetPresence,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]

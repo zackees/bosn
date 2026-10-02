@@ -7,7 +7,7 @@ use serde_json::{Map, Value, json};
 
 use super::{
     CancelReply, CiRequest, ErrorReply, ListReply, LogsReply, Plan, RunReport, RunView,
-    RunnersReply, SubmitReply, UiGrantReply, events::RunEvent,
+    RunnersReply, SubmitReply, UiGrantReply, WidgetReply, events::RunEvent,
 };
 
 fn sub<T: JsonSchema>(generator: &mut SchemaGenerator) -> Value {
@@ -29,6 +29,7 @@ pub fn document() -> Value {
         "runners": sub::<RunnersReply>(&mut generator),
         "ui_grant": sub::<UiGrantReply>(&mut generator),
         "plan": sub::<Plan>(&mut generator),
+        "widget": sub::<WidgetReply>(&mut generator),
     });
     let request = sub::<CiRequest>(&mut generator);
     let event = sub::<RunEvent>(&mut generator);

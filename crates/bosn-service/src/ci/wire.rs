@@ -177,6 +177,24 @@ pub enum CiRequest {
     Runners {
         action: RunnerAction,
     },
+    /// A widget process starting (`explicit` = typed by the user).
+    WidgetHello {
+        pid: u32,
+        session: String,
+        explicit: bool,
+    },
+    /// The widget's heartbeat; the reply carries its pending commands.
+    WidgetPoll {
+        pid: u32,
+    },
+    /// A deliberate quit from the widget's menu.
+    WidgetDismiss {
+        session: String,
+    },
+    /// Queue a command for the widget (from the dashboard or `bosn ui`).
+    WidgetCommand {
+        command: super::widget::WidgetCommand,
+    },
     /// A single-use dashboard link (only from the owner-only socket).
     UiGrant {
         path: Option<String>,

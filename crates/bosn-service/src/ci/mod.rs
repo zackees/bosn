@@ -53,6 +53,7 @@ mod vocabulary {
 
 pub mod checkout;
 pub mod client;
+pub mod config;
 pub mod engine;
 pub mod events;
 pub mod lifecycle;
@@ -67,6 +68,7 @@ pub mod schema;
 pub mod snapshot;
 pub mod store;
 pub mod ui;
+pub mod widget;
 pub mod wire;
 pub mod workflow;
 

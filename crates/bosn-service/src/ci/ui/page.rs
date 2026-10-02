@@ -7,11 +7,19 @@ use kernal_api::http_server::Response;
 const HTML: &str = include_str!("assets/index.html");
 const SCRIPT: &str = include_str!("assets/app.js");
 const STYLE: &str = include_str!("assets/app.css");
+const BUBBLE: &str = include_str!("assets/bubble.html");
+const PANEL: &str = include_str!("assets/panel.html");
+const WIDGET_SCRIPT: &str = include_str!("assets/widget.js");
+const WIDGET_STYLE: &str = include_str!("assets/widget.css");
 
 pub fn response(path: &str) -> Response {
     let (body, kind) = match path {
         "/app.js" => (SCRIPT, "text/javascript; charset=utf-8"),
         "/app.css" => (STYLE, "text/css; charset=utf-8"),
+        "/widget/bubble" => (BUBBLE, "text/html; charset=utf-8"),
+        "/widget/panel" => (PANEL, "text/html; charset=utf-8"),
+        "/widget/widget.js" => (WIDGET_SCRIPT, "text/javascript; charset=utf-8"),
+        "/widget/widget.css" => (WIDGET_STYLE, "text/css; charset=utf-8"),
         _ => (HTML, "text/html; charset=utf-8"),
     };
     Response::new(200, body.as_bytes().to_vec())

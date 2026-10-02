@@ -236,6 +236,90 @@
         },
         {
           "additionalProperties": false,
+          "description": "A widget process starting (`explicit` = typed by the user).",
+          "properties": {
+            "explicit": {
+              "type": "boolean"
+            },
+            "op": {
+              "const": "widget_hello",
+              "type": "string"
+            },
+            "pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "session": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "pid",
+            "session",
+            "explicit"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The widget's heartbeat; the reply carries its pending commands.",
+          "properties": {
+            "op": {
+              "const": "widget_poll",
+              "type": "string"
+            },
+            "pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "op",
+            "pid"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A deliberate quit from the widget's menu.",
+          "properties": {
+            "op": {
+              "const": "widget_dismiss",
+              "type": "string"
+            },
+            "session": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "session"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Queue a command for the widget (from the dashboard or `bosn ui`).",
+          "properties": {
+            "command": {
+              "$ref": "#/$defs/WidgetCommand"
+            },
+            "op": {
+              "const": "widget_command",
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "command"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "A single-use dashboard link (only from the owner-only socket).",
           "properties": {
             "op": {
@@ -1204,6 +1288,10 @@
           "format": "uint",
           "minimum": 0,
           "type": "integer"
+        },
+        "widget": {
+          "$ref": "#/$defs/WidgetPresence",
+          "description": "Whether the desktop widget is running."
         }
       },
       "required": [
@@ -1212,7 +1300,8 @@
         "queued",
         "drained",
         "engine",
-        "act_version"
+        "act_version",
+        "widget"
       ],
       "type": "object"
     },
@@ -1446,6 +1535,108 @@
         "url"
       ],
       "type": "object"
+    },
+    "WidgetCommand": {
+      "description": "What the widget process should do next.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Show or hide the panel.",
+          "properties": {
+            "command": {
+              "const": "toggle",
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Show the bubble (a second `bosn widget` asked for it).",
+          "properties": {
+            "command": {
+              "const": "show",
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Open or focus the full-view window on a dashboard path.",
+          "properties": {
+            "command": {
+              "const": "open",
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command",
+            "path"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Open an allowlisted external URL with the OS opener.",
+          "properties": {
+            "command": {
+              "const": "open_external",
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command",
+            "url"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "WidgetPresence": {
+      "description": "Whether a widget is running, gone, or deliberately quit.",
+      "enum": [
+        "connected",
+        "absent",
+        "dismissed"
+      ],
+      "type": "string"
+    },
+    "WidgetReply": {
+      "description": "The daemon's answer to a widget request.",
+      "properties": {
+        "allowed": {
+          "description": "False when an auto-launched widget should exit (dismissed session).",
+          "type": "boolean"
+        },
+        "commands": {
+          "items": {
+            "$ref": "#/$defs/WidgetCommand"
+          },
+          "type": "array"
+        },
+        "presence": {
+          "$ref": "#/$defs/WidgetPresence"
+        }
+      },
+      "required": [
+        "presence",
+        "allowed",
+        "commands"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1488,6 +1679,9 @@
         },
         "ui_grant": {
           "$ref": "#/$defs/UiGrantReply"
+        },
+        "widget": {
+          "$ref": "#/$defs/WidgetReply"
         }
       },
       "type": "object"
