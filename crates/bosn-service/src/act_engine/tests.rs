@@ -312,12 +312,15 @@ fn private_cgroup_init_reparents_and_refuses_unavailable_or_foreign_roots() {
     eprintln!("retained cgroup fixture {}", root.display());
 }
 #[test]
-fn native_containerd_content_and_runtime_remain_under_bounded_roots() {
+fn overlay_containerd_content_and_runtime_remain_under_bounded_roots() {
+    // overlayfs, not native: native copies the whole image into every new
+    // snapshot, so each job container cost ~5 s and ~5 GiB of the engine's
+    // RAM-backed storage (#323 Step 2 gate measurements).
     let args = create_arguments(&intent(), OWNER, limits()).unwrap();
     let expected = [
         "dockerd",
         "--feature=containerd-snapshotter=true",
-        "--storage-driver=native",
+        "--storage-driver=overlayfs",
         "--data-root=/var/lib/docker",
         "--exec-root=/run/docker",
         "--host=unix:///var/run/docker.sock",
