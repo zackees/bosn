@@ -22,6 +22,9 @@
 //! included) and the repository's own composite actions. The run then hides
 //! the rewritten [`Localized::files`] from Git, so the job's checkout still
 //! looks clean and a workflow's `git restore` does not undo them (#394).
+//!
+//! The same pass gives every POSIX-shell `run:` step the end-of-output trap
+//! of [`super::flush`] (#398), so the files are read and written once.
 
 use std::{
     fmt, io,
@@ -39,11 +42,13 @@ pub struct Localized {
     /// `owner/name@commit` of each pinned checkout of another repository,
     /// now fetched anonymously.
     pub pinned: Vec<String>,
+    /// `run:` steps given the end-of-output trap ([`super::flush`]).
+    pub trapped: usize,
     /// The workflow and action files rewritten.
     pub files: Vec<PathBuf>,
 }
 
-/// Rewrite checkout steps in every workflow under `.github/workflows/` and
+/// Rewrite checkout and `run:` steps in every workflow under `.github/workflows/` and
 /// every composite action under `.github/actions/` of the snapshot at `root`.
 pub fn localize_tree(root: &Path, repository: &str) -> io::Result<Localized> {
     let yaml = |path: &Path| path.extension().is_some_and(|e| e == "yml" || e == "yaml");
@@ -77,7 +82,7 @@ pub fn localize_tree(root: &Path, repository: &str) -> io::Result<Localized> {
     Ok(localized)
 }
 
-/// Rewrite the checkout steps of one workflow or action file, adding what
+/// Rewrite the checkout and `run:` steps of one workflow or action file, adding what
 /// changed to `localized`; the file is rewritten (and `true` returned) only
 /// when something did.
 pub fn localize(workflow: &Path, repository: &str, localized: &mut Localized) -> io::Result<bool> {
@@ -85,6 +90,7 @@ pub fn localize(workflow: &Path, repository: &str, localized: &mut Localized) ->
     let mut document: Value = serde_yaml::from_str(&text).map_err(io::Error::other)?;
     let mut changes = Localized::default();
     localize_document(&mut document, repository, &mut changes);
+    changes.trapped = super::flush::add_traps(&mut document);
     let changed = changes != Localized::default();
     if changed {
         let rewritten = serde_yaml::to_string(&document).map_err(io::Error::other)?;
@@ -92,6 +98,7 @@ pub fn localize(workflow: &Path, repository: &str, localized: &mut Localized) ->
     }
     localized.own += changes.own;
     localized.pinned.extend(changes.pinned);
+    localized.trapped += changes.trapped;
     Ok(changed)
 }
 
@@ -473,7 +480,7 @@ mod tests {
         std::fs::create_dir_all(workflow.parent().unwrap()).unwrap();
         std::fs::write(
             &workflow,
-            "on: [push]\njobs:\n  a:\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          ref: ${{ github.sha }}\n",
+            "on: [push]\njobs:\n  a:\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          ref: ${{ github.sha }}\n      - run: make test\n",
         )
         .unwrap();
         sh(
@@ -482,6 +489,7 @@ mod tests {
         );
         let localized = localize_tree(root, "example/demo").unwrap();
         assert_eq!(localized.own, 1);
+        assert_eq!(localized.trapped, 1, "the run: step ends its output");
         assert_eq!(localized.files, vec![workflow.clone()]);
         crate::ci::snapshot::hide_from_git(root, &localized.files).unwrap();
         assert_eq!(git_in(root, &["status", "--porcelain"]), "", "looks clean");

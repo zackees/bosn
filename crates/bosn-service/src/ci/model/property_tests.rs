@@ -146,7 +146,11 @@ fn every_record_lands_in_exactly_one_section_and_ranges_never_overlap() {
         let records: Vec<LogRecord> = lines
             .iter()
             .enumerate()
-            .map(|(i, line)| parser.feed(i as u64 + 1, &line.text))
+            .map(|(i, line)| {
+                parser
+                    .feed(i as u64 + 1, &line.text)
+                    .expect("generated lines never carry bosn's mark")
+            })
             .collect();
         assert_eq!(parser.tree.malformed_lines, malformed as u64, "seed {seed}");
         for (record, line) in records.iter().zip(&lines) {

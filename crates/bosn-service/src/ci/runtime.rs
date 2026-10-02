@@ -722,6 +722,7 @@ impl CiRuntime {
     /// Serve checkouts without a token (#335) and say how, naming every
     /// repository fetched from GitHub. The rewrites are hidden from the
     /// snapshot's Git index, so the job still sees a clean checkout (#394).
+    /// The same pass ends each POSIX `run:` step's output with a newline (#398).
     fn localize_checkouts(&self, record: &RunRecord, observer: &mut RunObserver) {
         let source = self.store.source(&record.id);
         match super::checkout::localize_tree(&source, &record.repository) {
@@ -735,6 +736,12 @@ impl CiRuntime {
                     observer.note(&format!(
                         "{} actions/checkout step(s) of this repository are served from the frozen snapshot",
                         localized.own
+                    ));
+                }
+                if localized.trapped > 0 {
+                    observer.note(&format!(
+                        "{} run: step(s) end their output with a newline, so a last line without one still reaches the log",
+                        localized.trapped
                     ));
                 }
                 for pinned in &localized.pinned {

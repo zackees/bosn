@@ -57,6 +57,7 @@ pub mod client;
 pub mod config;
 pub mod engine;
 pub mod events;
+pub mod flush;
 pub mod lifecycle;
 pub mod limits;
 pub mod mcp;
