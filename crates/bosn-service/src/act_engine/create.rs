@@ -68,7 +68,7 @@ impl fmt::Display for ActEngineError {
 impl std::error::Error for ActEngineError {}
 
 impl ActEngineLimits {
-    pub(super) fn validate(self) -> Result<(), ActEngineError> {
+    pub(crate) fn validate(self) -> Result<(), ActEngineError> {
         if self.storage_bytes < 1 << 20
             || self.memory_bytes.saturating_sub(self.storage_bytes) < 512 << 20
             || self.memory_bytes > i64::MAX as u64

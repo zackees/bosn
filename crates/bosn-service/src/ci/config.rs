@@ -8,6 +8,9 @@
 //! [widget]
 //! auto_launch = "always"              # "always" | "on-activity" | "never"
 //! external_hosts = ["git.example.org"] # beyond github.com and gitlab.com
+//!
+//! [engine]          # each run's engine limits; see [`super::limits`]
+//! memory_gib = 16   # default: sized from the host
 //! ```
 
 use std::path::Path;
@@ -39,6 +42,8 @@ pub struct CiConfig {
     pub ui: UiConfig,
     #[serde(default)]
     pub widget: WidgetConfig,
+    #[serde(default)]
+    pub engine: super::limits::EngineConfig,
 }
 
 /// Read the config; a missing file means the defaults (no listener). A
@@ -84,6 +89,21 @@ mod tests {
             load(dir.path()).unwrap().widget.auto_launch,
             super::super::widget::AutoLaunch::OnActivity
         );
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[engine]\nmemory_gib = 12\ncpus = 2\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load(dir.path()).unwrap().engine,
+            super::super::limits::EngineConfig {
+                memory_gib: Some(12),
+                cpus: Some(2),
+                ..Default::default()
+            }
+        );
+        std::fs::write(dir.path().join("config.toml"), "[engine]\nmemory = 12\n").unwrap();
+        assert!(load(dir.path()).unwrap_err().contains("memory"));
         std::fs::write(dir.path().join("config.toml"), "[ui]\nenabeld = true\n").unwrap();
         assert!(load(dir.path()).unwrap_err().contains("enabeld"));
     }

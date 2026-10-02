@@ -17,7 +17,7 @@ use super::{
     config::WidgetConfig,
     engine::{
         ACT_VERSION, ActEngineBackend, ActInvocation, CACHE_VOLUME, CacheVolume, EngineLine,
-        RUNNER_IMAGE, SecretEnv, act_artifact, engine_limits,
+        RUNNER_IMAGE, SecretEnv, act_artifact,
     },
     events::Feed,
     lifecycle::{self, CleanupEnd, EngineObserver, EnginePlan, EngineReport, ExecutionEnd},
@@ -741,14 +741,13 @@ impl CiRuntime {
             .map_err(|e| format!("registry: {e}"))?
             .registry_id;
         self.backend.ensure_engine_image().await?;
+        let limits = super::limits::size_engine(
+            self.backend.host_resources().await?,
+            super::config::load(&self.state_dir)?.engine,
+        )?;
         let cache = CacheVolume::machine(&registry_id, lifecycle::now_seconds())?;
-        let profile = crate::act_engine::creation_profile_with_cache(
-            engine_limits(
-                std::thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get),
-            ),
-            Some(cache.mount()),
-        )
-        .map_err(|e| e.to_string())?;
+        let profile = crate::act_engine::creation_profile_with_cache(limits, Some(cache.mount()))
+            .map_err(|e| e.to_string())?;
         Ok(EnginePlan {
             act: artifact,
             intent: ActEngineIntent {

@@ -81,6 +81,12 @@ impl FakeBackend {
 }
 pub const LISTING: &str = "Stage  Job ID  Job name  Workflow name  Workflow file  Events\n\
                            0      a       a         w              ci.yml         push\n";
+/// The machine the fake host engine reports.
+pub const FAKE_HOST: super::super::limits::HostResources = super::super::limits::HostResources {
+    total_memory: 16 << 30,
+    available_memory: 12 << 30,
+    cpus: 2,
+};
 fn later(record: &ActEngineRecord) -> f64 {
     now_seconds().max(record.updated_at)
 }
@@ -92,6 +98,12 @@ impl ActEngineBackend for FakeBackend {
             }
             Ok(())
         })
+    }
+    fn host_resources(
+        &self,
+    ) -> super::super::engine::BoxFuture<'_, Result<super::super::limits::HostResources, String>>
+    {
+        Box::pin(async { Ok(FAKE_HOST) })
     }
     fn ensure_cache<'a>(
         &'a self,
@@ -331,7 +343,7 @@ pub fn intent(run: &str) -> ActEngineIntent {
         created_at: 1.0,
         creation_profile: Some(
             crate::act_engine::creation_profile_with_cache(
-                super::super::engine::engine_limits(2),
+                super::super::limits::size_engine(FAKE_HOST, Default::default()).unwrap(),
                 Some(test_cache().mount()),
             )
             .unwrap(),

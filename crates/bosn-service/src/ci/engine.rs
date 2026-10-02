@@ -69,19 +69,6 @@ pub fn act_artifact(architecture: &str) -> Option<ActArtifact> {
     }
 }
 
-/// The bounds of one run's engine: memory (which its private storage tmpfs
-/// counts against), that storage, CPUs and processes. Frozen into the
-/// intent's creation profile.
-pub fn engine_limits(cpus: usize) -> act_engine::ActEngineLimits {
-    let cpus = cpus.clamp(1, 8) as u64;
-    act_engine::ActEngineLimits {
-        memory_bytes: 28 << 30,
-        storage_bytes: 20 << 30,
-        nano_cpus: cpus * 1_000_000_000,
-        pids: 4096,
-    }
-}
-
 /// The machine-wide CI cache: a bosn-labelled named volume holding the act
 /// release, the runner image tar, action checkouts, the tool cache and the
 /// per-repository act cache-server stores. A volume (not a host directory)
@@ -200,6 +187,9 @@ pub trait ActEngineBackend: Send + Sync {
     /// Make the pinned engine image present on the host engine (pulled by
     /// its manifest digest when missing).
     fn ensure_engine_image(&self) -> BoxFuture<'_, Result<(), String>>;
+    /// What the host engine's machine offers, for sizing a new engine
+    /// ([`super::limits::size_engine`]).
+    fn host_resources(&self) -> BoxFuture<'_, Result<super::limits::HostResources, String>>;
     /// Create the machine-wide cache volume unless it exists.
     fn ensure_cache<'a>(&'a self, cache: &'a CacheVolume) -> BoxFuture<'a, Result<(), String>>;
     /// Commit `intent`, then create, verify, register and start its engine.
@@ -506,6 +496,20 @@ impl ActEngineBackend for DockerActBackend {
             )
             .await
             .map(|_| ())
+        })
+    }
+
+    fn host_resources(&self) -> BoxFuture<'_, Result<super::limits::HostResources, String>> {
+        Box::pin(async move {
+            let info = self
+                .checked(
+                    "docker info",
+                    owned(&["info", "--format", "{{.MemTotal}} {{.NCPU}}"]),
+                    CONTROL_DEADLINE,
+                )
+                .await?;
+            let meminfo = std::fs::read_to_string("/proc/meminfo").ok();
+            super::limits::HostResources::parse(&info, meminfo.as_deref())
         })
     }
 

@@ -57,6 +57,7 @@ pub mod config;
 pub mod engine;
 pub mod events;
 pub mod lifecycle;
+pub mod limits;
 pub mod mcp;
 pub mod model;
 pub mod provider;
