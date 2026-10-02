@@ -23,6 +23,7 @@ def test_soldr_environment_exists(monkeypatch):
     spec = importlib.util.spec_from_file_location(
         "bosn_build_backend_test", Path(__file__).parents[1] / "bosn_build_backend.py"
     )
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
@@ -54,6 +55,7 @@ def backend(monkeypatch, tmp_path):
     spec = importlib.util.spec_from_file_location(
         "backend_fixture", Path(__file__).parents[1] / "bosn_build_backend.py"
     )
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
