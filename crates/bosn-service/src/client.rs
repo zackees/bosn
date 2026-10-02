@@ -826,7 +826,11 @@ impl Client {
     pub async fn ci_submit(&self, options: ci::SubmitOptions) -> Result<ci::SubmitReply, Error> {
         let request = ci::stage_submission(&self.state_dir, options).await?;
         let staging = ci::staging_root(&self.state_dir).join(&request.staging);
-        let result = self.ci_call(ci::CiRequest::Submit { request }).await;
+        let result = self
+            .ci_call(ci::CiRequest::Submit {
+                request: Box::new(request),
+            })
+            .await;
         // Only a refusal proves the daemon will not use the snapshot; after a
         // lost reply it may have queued the run, and its startup sweep drops
         // abandoned staging anyway.

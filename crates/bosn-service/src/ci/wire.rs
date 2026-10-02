@@ -159,7 +159,7 @@ pub enum RunnerAction {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CiRequest {
     Submit {
-        request: SubmitRequest,
+        request: Box<SubmitRequest>,
     },
     List {
         workspace: Option<String>,

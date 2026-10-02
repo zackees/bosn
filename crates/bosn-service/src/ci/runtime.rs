@@ -177,7 +177,7 @@ impl CiRuntime {
     /// (see [`super::reply`]) serialized for the wire.
     pub async fn handle(&self, request: CiRequest) -> Result<Value, CiError> {
         match request {
-            CiRequest::Submit { request } => wire(self.submit(request).await),
+            CiRequest::Submit { request } => wire(self.submit(*request).await),
             CiRequest::List {
                 workspace,
                 state,
