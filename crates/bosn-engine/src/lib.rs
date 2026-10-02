@@ -389,7 +389,11 @@ impl DockerEngine {
     pub fn docker() -> Self {
         Self::from_parts("docker", std::iter::empty::<OsString>())
     }
-    #[cfg(feature = "native-test-helper")]
+    /// A test seam: an engine that runs `binary` with `prefix` instead of
+    /// Docker. Other crates' tests enable it through the `native-test-helper`
+    /// feature; `cfg(test)` keeps it for the amalgamated crates.io `bosn`,
+    /// whose unit tests have no dev-dependency to enable a feature (#380).
+    #[cfg(any(test, feature = "native-test-helper"))]
     #[doc(hidden)]
     #[must_use]
     pub fn synthetic_for_test(
