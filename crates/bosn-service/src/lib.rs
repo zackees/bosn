@@ -13953,11 +13953,15 @@ fi
 
     struct FakeManifestAppTaskExecutor {
         observed: Mutex<Vec<ManifestAppTaskJobRequest>>,
+        entered: async_engine::Sender<()>,
+        release: Mutex<Option<async_engine::Receiver<()>>>,
     }
     impl FakeManifestAppTaskExecutor {
-        fn new() -> Self {
+        fn new(entered: async_engine::Sender<()>, release: async_engine::Receiver<()>) -> Self {
             Self {
                 observed: Mutex::new(Vec::new()),
+                entered,
+                release: Mutex::new(Some(release)),
             }
         }
     }
@@ -13972,6 +13976,20 @@ fi
             Box::pin(async move {
                 self.observed.lock().unwrap().push(request.clone());
                 session.begin("bosn-setup-manifest-identity".into()).await?;
+                self.entered
+                    .send(())
+                    .await
+                    .map_err(|_| "test entry observer closed".to_owned())?;
+                let mut release = self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| "test task executed twice".to_owned())?;
+                release
+                    .recv()
+                    .await
+                    .ok_or_else(|| "test release closed".to_owned())?;
                 logs.send("[fake] manifest declared task executed".into())
                     .await
                     .map_err(|_| "fake log consumer closed".to_owned())?;
@@ -15193,7 +15211,9 @@ fi
         let state = temporary.path().join("state");
         let workspace = temporary.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
-        let fake = Arc::new(FakeManifestAppTaskExecutor::new());
+        let (entered, mut entered_wait) = async_engine::channel(1);
+        let (release, release_wait) = async_engine::channel(1);
+        let fake = Arc::new(FakeManifestAppTaskExecutor::new(entered, release_wait));
         RuntimeBuilder::multi_thread()
             .enable_all()
             .build()
@@ -15217,10 +15237,17 @@ fi
                     .submit_manifest_app_task(request.clone())
                     .await
                     .unwrap();
+                // Coalescing covers active jobs: keep this executor active
+                // until the second IPC request has joined the first one.
+                async_engine::timeout(Duration::from_secs(2), entered_wait.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(
                     first,
                     client.submit_manifest_app_task(request).await.unwrap()
                 );
+                release.send(()).await.unwrap();
                 wait_for_job_state(&client, first, "Succeeded").await;
                 assert_eq!(fake.observed.lock().unwrap().len(), 1);
                 assert_eq!(client.status().await.unwrap().sessions, 0);
