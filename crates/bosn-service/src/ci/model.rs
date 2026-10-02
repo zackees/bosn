@@ -429,7 +429,7 @@ impl ActParser {
                 Some(i) => i,
                 None => {
                     job.sections.push(Section {
-                        name: act.step.clone().unwrap_or_else(|| step.id.clone()),
+                        name: section_name(act.step.as_deref(), &step.id),
                         id: step.id,
                         stage: step.stage,
                         status: ItemStatus::Queued,
@@ -467,6 +467,16 @@ impl ActParser {
             owned.then(|| format!("{}:{}", section.stage, section.id))
         });
         record(Some(key), section, text)
+    }
+}
+
+/// A section's display name: act's step name, plus the sub-path for a step
+/// nested in a composite action (act repeats the parent's name for those).
+fn section_name(step: Option<&str>, id: &str) -> String {
+    let name = step.unwrap_or(id);
+    match id.split_once('/') {
+        Some((_, nested)) => format!("{name} › {nested}"),
+        None => name.to_string(),
     }
 }
 
@@ -721,6 +731,7 @@ mod tests {
         assert_eq!(by_id("0").duration_ms, Some(2));
         assert_eq!(by_id("1").conclusion, Some(ItemConclusion::Skipped));
         assert_eq!(by_id("2/0").conclusion, Some(ItemConclusion::Failure));
+        assert_eq!(by_id("2/0").name, "2/0 › 0", "nested steps show their sub-path");
         assert_eq!(records[2].section, None, "pre-start noise is not a section");
         assert_eq!(records[6].text, r#"{"truncated":"#);
     }
