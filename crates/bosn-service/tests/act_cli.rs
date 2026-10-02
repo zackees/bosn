@@ -194,10 +194,10 @@ fn act_run_is_a_deprecated_alias_of_ci_run_and_refuses_outside_a_checkout() {
     assert!(result.stdout.is_empty(), "the notice goes to stderr only");
 }
 
-/// `bosn act plan --adapter` (soldr#3345) is not deprecated: it stays,
-/// without a warning, until `bosn ci plan --adapter` exists.
+/// `bosn act plan --adapter` (soldr#3345) is a deprecated spelling of
+/// `bosn ci plan --adapter` (#375): the notice is on stderr even on refusal.
 #[test]
-fn act_plan_adapter_is_not_deprecated() {
+fn act_plan_adapter_is_deprecated() {
     let root = tempfile::tempdir().unwrap();
     let result = Command::new(env!("CARGO_BIN_EXE_bosn"))
         .args(["act", "plan", "--adapter", "--workspace"])
@@ -208,8 +208,13 @@ fn act_plan_adapter_is_not_deprecated() {
         !result.status.success(),
         "incomplete adapter options refuse"
     );
+    assert!(result.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&result.stderr);
-    assert!(!stderr.contains("deprecated"), "{stderr}");
+    assert!(
+        stderr.contains("`bosn act plan --adapter` is deprecated")
+            && stderr.contains("bosn ci plan --adapter"),
+        "{stderr}"
+    );
 }
 
 #[test]

@@ -167,6 +167,32 @@ skippager=true
 skippagerrule=2
 ```
 
+## Fleet adapter plan (`bosn ci plan --adapter`)
+
+`bosn ci plan --adapter RELATIVE_JSON` prints the fleet adapter V1 plan
+(zackees/soldr#3345) as one JSON object on stdout (`"action":
+"act_adapter_plan"`). It is read-only: it observes the checkout's HEAD and
+cleanliness, reads the committed adapter declaration and the workflows it names,
+and resolves the requested event into its declared cells and event payload. It
+executes nothing and starts no daemon.
+
+```sh
+bosn ci plan --adapter RELATIVE_JSON --workspace . \
+  --event pull_request|push|release --mode minimal|test|full --sha 40_HEX \
+  --repo-owner OWNER --repo-name NAME [--base-sha 40_HEX] \
+  [--pr-number N --head-owner O --head-name N --head-ref R --base-ref R --author-login L] [--json]
+```
+
+`--workspace` must be the clean checkout root at exactly `--sha`. Pull requests
+need `--base-sha` and every PR identity option; other events refuse them.
+Repository and PR metadata are operator-supplied and reported as unverified.
+A refusal prints `bosn ci: <reason>` on stderr and exits 3.
+
+`bosn act plan --adapter` is the deprecated spelling of the same
+implementation: identical options, the same JSON byte for byte on stdout, and
+the same refusal reasons (`bosn act: <reason>`, exit 2). It prints a
+deprecation notice on stderr and is removed after one release.
+
 ## Exit codes
 
 | Code | Meaning |

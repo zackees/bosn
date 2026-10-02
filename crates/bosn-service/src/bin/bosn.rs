@@ -34,6 +34,8 @@ use serde_json::json;
 mod act;
 #[path = "bosn/args.rs"]
 mod args;
+#[path = "bosn/bounded_output.rs"]
+mod bounded_output;
 #[path = "bosn/ci.rs"]
 mod ci;
 #[path = "bosn/daemon.rs"]
@@ -190,7 +192,9 @@ fn usage() -> ! {
     eprintln!(
         "   or: bosn act plan --workspace WORKSPACE --workflow RELATIVE_YML --event pull_request|push|release --mode minimal|test|full --sha 40_HEX --act-version VERSION [--act-bin PATH] [--job ID] [--json]"
     );
-    eprintln!("   or: bosn act run|report (deprecated alias of bosn ci run|report)");
+    eprintln!(
+        "   or: bosn act run|report|plan --adapter (deprecated aliases of bosn ci run|report|plan --adapter)"
+    );
     eprintln!("   or: {}", ci::USAGE.trim_start_matches("usage: "));
     eprintln!("   or: {}", widget::USAGE.trim_start_matches("usage: "));
     eprintln!("usage: bosn mcp [--state-dir STATE_DIR]");
