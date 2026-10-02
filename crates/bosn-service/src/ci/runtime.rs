@@ -668,6 +668,7 @@ impl CiRuntime {
                 execution: ExecutionEnd::TimedOut,
                 cleanup: CleanupEnd::Removed,
                 engine_id: None,
+                storage: None,
             });
         };
         let plan = plan?;

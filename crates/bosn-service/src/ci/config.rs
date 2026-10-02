@@ -11,6 +11,7 @@
 //!
 //! [engine]          # each run's engine limits; see [`super::limits`]
 //! memory_gib = 16   # default: sized from the host
+//! storage_gib = 32  # default: sized from memory (grows it when pinned alone)
 //! ```
 
 use std::path::Path;

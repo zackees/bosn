@@ -316,6 +316,7 @@ fn conclusion_never_passes_partial_coverage_or_failed_cleanup() {
             execution,
             cleanup,
             engine_id: None,
+            storage: None,
         })
     };
     let mut tree = RunTree::declared(&parse_act_list(super::lifecycle::tests::LISTING));
@@ -371,12 +372,68 @@ fn conclusion_never_passes_partial_coverage_or_failed_cleanup() {
 }
 
 #[test]
+fn a_failed_run_on_nearly_full_storage_says_why_in_its_reason() {
+    const GIB: u64 = 1 << 30;
+    let low = super::storage::StorageUsage {
+        size: 20 * GIB,
+        used: 16 * GIB,
+        available: 4 * GIB,
+    };
+    let outcome = |execution, storage| {
+        Ok(lifecycle::EngineReport {
+            execution,
+            cleanup: CleanupEnd::Removed,
+            engine_id: None,
+            storage,
+        })
+    };
+    let declared = RunTree::declared(&parse_act_list(super::lifecycle::tests::LISTING));
+    let (conclusion, reason) = report::conclude(
+        &outcome(ExecutionEnd::Exited(1), Some(low)),
+        &mut declared.clone(),
+        &Default::default(),
+    );
+    assert_eq!(conclusion, Conclusion::Failure);
+    let reason = reason.expect("a storage-starved failure explains itself");
+    assert!(reason.contains("storage ran low"), "{reason}");
+    assert!(reason.contains("storage_gib"), "{reason}");
+    // An engine failure keeps its own error first.
+    let (_, reason) = report::conclude(
+        &outcome(ExecutionEnd::EngineFailed("runner load".into()), Some(low)),
+        &mut declared.clone(),
+        &Default::default(),
+    );
+    let reason = reason.unwrap();
+    assert!(reason.starts_with("runner load; "), "{reason}");
+    assert!(reason.contains("storage ran low"), "{reason}");
+    // Roomy storage, or a run that did not fail, adds nothing.
+    let roomy = super::storage::StorageUsage {
+        size: 36 * GIB,
+        used: 16 * GIB,
+        available: 20 * GIB,
+    };
+    let (_, reason) = report::conclude(
+        &outcome(ExecutionEnd::Exited(1), Some(roomy)),
+        &mut declared.clone(),
+        &Default::default(),
+    );
+    assert_eq!(reason, None);
+    let (_, reason) = report::conclude(
+        &outcome(ExecutionEnd::Cancelled, Some(low)),
+        &mut declared.clone(),
+        &Default::default(),
+    );
+    assert_eq!(reason, None);
+}
+
+#[test]
 fn a_run_where_every_declared_job_was_skipped_is_not_success() {
     let mut tree = RunTree::declared(&parse_act_list(super::lifecycle::tests::LISTING));
     let outcome = Ok(lifecycle::EngineReport {
         execution: ExecutionEnd::Exited(0),
         cleanup: CleanupEnd::Removed,
         engine_id: None,
+        storage: None,
     });
     let (conclusion, reason) = report::conclude(&outcome, &mut tree, &Default::default());
     assert_eq!(conclusion, Conclusion::Incomplete, "{reason:?}");
@@ -462,6 +519,7 @@ fn steps_act_never_mentioned_are_listed_as_skipped_in_jobs_that_ran() {
             execution: ExecutionEnd::Exited(0),
             cleanup: CleanupEnd::Removed,
             engine_id: None,
+            storage: None,
         }),
         &mut tree,
         &declared,

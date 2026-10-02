@@ -10,7 +10,8 @@
 //! - [`store`]: on-disk run records, logs and sources;
 //! - [`lifecycle`] / [`engine`]: one run on one isolated engine;
 //! - [`model`]: the run tree and the act `--json` parser;
-//! - [`provider`], [`scheduler`], [`snapshot`]: pure policy and copying.
+//! - [`provider`], [`scheduler`], [`snapshot`]: pure policy and copying;
+//! - [`limits`], [`storage`]: sizing an engine and reporting how full it got.
 //!
 //! Trust: requests arrive over the owner-only daemon socket, so the client is
 //! the same user. Clients name a staging directory only by UUID; the daemon
@@ -68,6 +69,7 @@ pub mod runtime;
 pub mod scheduler;
 pub mod schema;
 pub mod snapshot;
+pub mod storage;
 pub mod store;
 pub mod ui;
 pub mod widget;

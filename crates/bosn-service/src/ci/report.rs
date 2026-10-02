@@ -5,6 +5,7 @@ use super::{
     lifecycle::{CleanupEnd, EngineReport, ExecutionEnd},
     model::{ItemConclusion, RunTree},
     reply::{FailureReport, JobOutcomes, RunReport},
+    storage,
     wire::{Conclusion, RunRecord, SCHEMA_VERSION},
     workflow::DeclaredSteps,
 };
@@ -65,17 +66,28 @@ pub fn conclude(
             (Conclusion::Error, Some(error.clone()))
         }
     };
+    // A failure on nearly full storage says so: the step that tripped over
+    // it (a free-space guard, ENOSPC) often explains nothing itself (#392).
+    if matches!(conclusion, Conclusion::Failure | Conclusion::Error)
+        && let Some(low) = report.storage.and_then(storage::failure_reason)
+    {
+        reason = Some(joined(reason, low));
+    }
     if let CleanupEnd::Failed(error) = &report.cleanup {
         if matches!(conclusion, Conclusion::Success | Conclusion::Incomplete) {
             conclusion = Conclusion::Error;
         }
-        let cleanup = format!("engine cleanup failed: {error}");
-        reason = Some(match reason {
-            Some(first) => format!("{first}; {cleanup}"),
-            None => cleanup,
-        });
+        reason = Some(joined(reason, format!("engine cleanup failed: {error}")));
     }
     (conclusion, reason)
+}
+
+/// `next` after any earlier reason.
+fn joined(reason: Option<String>, next: String) -> String {
+    match reason {
+        Some(first) => format!("{first}; {next}"),
+        None => next,
+    }
 }
 
 /// The `ci report --json` agent contract. `tail(job, section)` returns the
