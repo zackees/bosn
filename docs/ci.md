@@ -277,7 +277,10 @@ All runtime state is under the daemon state directory (`ci/`):
 - `log.jsonl` holds seq-ordered log records. Each has `stream`, `job` and
   `section`.
 - `event.json` is the event payload.
-- `source/` is the frozen snapshot. It is kept for the newest 10 runs so they
+- `source/` is the frozen snapshot: the working tree, uncommitted work
+  included, in a Git repository holding only the `HEAD` commit (depth 1), so
+  a workflow's `git rev-parse HEAD`, `git diff` and `git status` behave as in
+  a real checkout. It is kept for the newest 10 runs so they
   can be retried.
 
 `runners cache` reports the size of the machine-wide cache volume, and
@@ -304,8 +307,9 @@ They check four things:
   failing step's tail.
 - A second run restores `actions/cache`.
 
-The leak check compares the whole host engine, so run it while nothing else
-creates Docker resources.
+The leak check compares everything bosn owns on the host engine (its
+ownership label and `bosn-act-` engines), so other tools using Docker at the
+same time do not disturb it.
 
 ## Not yet
 

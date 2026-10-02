@@ -9,12 +9,47 @@
 //! `ref:` (and a `repository:` naming the run's own repository) from
 //! own-repository checkout steps in the run's copy of the workflow; the
 //! snapshot *is* that ref. Checkouts of other repositories are untouched.
+//! Every file act may run is rewritten: the workflows (reusable ones
+//! included) and the repository's own composite actions.
 
 use std::{io, path::Path};
 
 use serde_yaml::{Mapping, Value};
 
-/// Rewrite own-repository checkout steps of the workflow file in place.
+/// Rewrite own-repository checkout steps in every workflow under
+/// `.github/workflows/` and every composite action under `.github/actions/`
+/// of the snapshot at `root`. Returns how many steps were changed.
+pub fn localize_tree(root: &Path, repository: &str) -> io::Result<usize> {
+    let yaml = |path: &Path| path.extension().is_some_and(|e| e == "yml" || e == "yaml");
+    let mut files: Vec<_> = match std::fs::read_dir(root.join(".github/workflows")) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && yaml(p))
+            .collect(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    let actions = root.join(".github/actions");
+    if actions.is_dir() {
+        files.extend(
+            kernal_api::platform::fs::DirectoryWalk::new(actions)
+                .walk()
+                .filter_map(Result::ok)
+                .filter(|e| e.is_file())
+                .map(|e| e.path().to_path_buf())
+                .filter(|p| p.file_stem().is_some_and(|s| s == "action") && yaml(p)),
+        );
+    }
+    files.sort();
+    let mut changed = 0;
+    for file in files {
+        changed += localize(&file, repository)?;
+    }
+    Ok(changed)
+}
+
+/// Rewrite own-repository checkout steps of one workflow or action file.
 /// Returns how many steps were changed; the file is rewritten only then.
 pub fn localize(workflow: &Path, repository: &str) -> io::Result<usize> {
     let text = std::fs::read_to_string(workflow)?;
@@ -27,13 +62,35 @@ pub fn localize(workflow: &Path, repository: &str) -> io::Result<usize> {
     Ok(changed)
 }
 
+/// Steps live under `jobs.<id>.steps` in a workflow and under `runs.steps`
+/// in a composite action.
 fn localize_document(document: &mut Value, repository: &str) -> usize {
-    let Some(jobs) = document.get_mut("jobs").and_then(Value::as_mapping_mut) else {
+    let mut steps: Vec<&mut Value> = Vec::new();
+    let Some(document) = document.as_mapping_mut() else {
         return 0;
     };
-    jobs.iter_mut()
-        .filter_map(|(_, job)| job.get_mut("steps").and_then(Value::as_sequence_mut))
-        .flatten()
+    for (key, value) in document.iter_mut() {
+        match key.as_str() {
+            Some("jobs") => {
+                if let Some(jobs) = value.as_mapping_mut() {
+                    steps.extend(
+                        jobs.iter_mut()
+                            .filter_map(|(_, job)| job.get_mut("steps"))
+                            .filter_map(Value::as_sequence_mut)
+                            .flatten(),
+                    );
+                }
+            }
+            Some("runs") => {
+                if let Some(list) = value.get_mut("steps").and_then(Value::as_sequence_mut) {
+                    steps.extend(list.iter_mut());
+                }
+            }
+            _ => {}
+        }
+    }
+    steps
+        .into_iter()
         .map(|step| usize::from(localize_step(step, repository)))
         .sum()
 }
@@ -61,16 +118,47 @@ fn localize_step(step: &mut Value, repository: &str) -> bool {
     changed
 }
 
-/// `repository:` absent, equal to the run's repository, or the
-/// `${{ github.repository }}` expression.
+/// Context references that name the run's own repository in bosn's payload
+/// (a local pull request is from this repository to itself).
+const OWN_REPOSITORY_REFS: [&str; 4] = [
+    "github.repository",
+    "github.event.repository.full_name",
+    "github.event.pull_request.head.repo.full_name",
+    "github.event.pull_request.base.repo.full_name",
+];
+
+/// `repository:` absent, the run's repository, or an expression whose every
+/// possible value is: in `${{ a == 'x' && v1 || v2 }}` the comparisons are
+/// conditions and `v1`, `v2` are the values. Anything this does not parse
+/// (parentheses, functions) is treated as another repository.
 fn names_own_repository(with: &Mapping, repository: &str) -> bool {
-    match with.get("repository").and_then(Value::as_str) {
-        None => true,
-        Some(named) => {
-            named.eq_ignore_ascii_case(repository)
-                || named.replace(' ', "") == "${{github.repository}}"
-        }
+    let Some(named) = with.get("repository").and_then(Value::as_str) else {
+        return true;
+    };
+    let names_this = |value: &str| {
+        value.eq_ignore_ascii_case(repository)
+            || value
+                .strip_prefix('\'')
+                .and_then(|v| v.strip_suffix('\''))
+                .is_some_and(|v| v.eq_ignore_ascii_case(repository))
+            || OWN_REPOSITORY_REFS.contains(&value)
+    };
+    let Some(expression) = named
+        .trim()
+        .strip_prefix("${{")
+        .and_then(|e| e.strip_suffix("}}"))
+    else {
+        return names_this(named.trim());
+    };
+    if expression.contains(['(', ')']) {
+        return false;
     }
+    expression
+        .split("||")
+        .flat_map(|alternative| alternative.split("&&"))
+        .map(str::trim)
+        .filter(|operand| !operand.contains("==") && !operand.contains("!="))
+        .all(names_this)
 }
 
 #[cfg(test)]
@@ -100,6 +188,77 @@ mod tests {
             "only checkout steps change"
         );
         assert_eq!(document["on"][0], "push", "`on` stays a key, not a boolean");
+    }
+
+    #[test]
+    fn a_pr_aware_repository_expression_naming_only_this_repository_is_own() {
+        let own = |expr: &str| {
+            let mut with = Mapping::new();
+            with.insert("repository".into(), expr.into());
+            names_own_repository(&with, "example/demo")
+        };
+        // The fleet's checkout: the PR head repository, else this one.
+        assert!(own(
+            "${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}"
+        ));
+        assert!(own("${{ github.event.repository.full_name }}"));
+        assert!(
+            !own("${{ inputs.fork && 'example/demo' || github.repository }}"),
+            "a bare operand counts as a value, and `inputs.fork` names no repository"
+        );
+        assert!(!own(
+            "${{ github.event_name == 'push' && 'someone/else' || github.repository }}"
+        ));
+        assert!(!own("${{ inputs.repository || github.repository }}"));
+        assert!(
+            !own("${{ (github.repository) }}"),
+            "parentheses are not parsed"
+        );
+        assert!(own("example/demo"));
+        assert!(!own("someone/else"));
+    }
+
+    #[test]
+    fn reusable_workflows_and_composite_actions_are_localized_too() {
+        let dir = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let root = dir.path();
+        let fleet = "      - uses: actions/checkout@v4\n        with:\n          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}\n          ref: ${{ inputs.source_ref || github.sha }}\n";
+        let write = |relative: &str, text: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(
+            ".github/workflows/ci.yml",
+            &format!("on: [push]\njobs:\n  a:\n    steps:\n{fleet}"),
+        );
+        write(
+            ".github/workflows/_build.yaml",
+            &format!("on: workflow_call\njobs:\n  b:\n    steps:\n{fleet}"),
+        );
+        write(
+            ".github/actions/setup/action.yml",
+            &format!(
+                "runs:\n  using: composite\n  steps:\n{}",
+                fleet.replace("      ", "    ")
+            ),
+        );
+        let other = "on: [push]\njobs:\n  c:\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          repository: someone/else\n          ref: v1\n";
+        write(".github/workflows/other.yml", other);
+        assert_eq!(localize_tree(root, "example/demo").unwrap(), 3);
+        for relative in [
+            ".github/workflows/ci.yml",
+            ".github/workflows/_build.yaml",
+            ".github/actions/setup/action.yml",
+        ] {
+            let text = std::fs::read_to_string(root.join(relative)).unwrap();
+            assert!(!text.contains("ref:"), "{relative}: {text}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join(".github/workflows/other.yml")).unwrap(),
+            other,
+            "another repository's checkout is untouched"
+        );
     }
 
     #[test]

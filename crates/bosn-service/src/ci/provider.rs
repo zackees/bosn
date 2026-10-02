@@ -169,8 +169,8 @@ pub fn github_event(
                     "repository": repo,
                     "pull_request": {
                         "number": pr_number,
-                        "head": {"sha": sha, "ref": branch},
-                        "base": {"ref": "main"},
+                        "head": {"sha": sha, "ref": branch, "repo": repo},
+                        "base": {"ref": "main", "repo": repo},
                         "labels": labels,
                     },
                 }),
@@ -270,6 +270,9 @@ mod tests {
         assert_eq!(event, "pull_request");
         assert_eq!(payload["pull_request"]["labels"][0]["name"], "ci-test");
         assert_eq!(payload["pull_request"]["head"]["sha"], sha.as_str());
+        // A local PR is from this repository to itself.
+        assert_eq!(payload["pull_request"]["head"]["repo"]["full_name"], "o/r");
+        assert_eq!(payload["pull_request"]["base"]["repo"]["full_name"], "o/r");
         let (_, full) = github_event(Trigger::Pr, Mode::Full, &sha, None, "o/r", 7);
         assert_eq!(full["pull_request"]["labels"][0]["name"], "ci-full");
         let (_, minimal) = github_event(Trigger::Pr, Mode::Minimal, &sha, None, "o/r", 7);

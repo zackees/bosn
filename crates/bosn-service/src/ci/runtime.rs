@@ -727,8 +727,8 @@ impl CiRuntime {
 
     /// Serve own-repository checkouts from the snapshot (#335) and say so.
     fn localize_checkouts(&self, record: &RunRecord, observer: &mut RunObserver) {
-        let workflow = self.store.source(&record.id).join(&record.workflow);
-        match super::checkout::localize(&workflow, &record.repository) {
+        let source = self.store.source(&record.id);
+        match super::checkout::localize_tree(&source, &record.repository) {
             Ok(0) => {}
             Ok(changed) => observer.note(&format!(
                 "{changed} actions/checkout step(s) of this repository are served from the frozen snapshot"

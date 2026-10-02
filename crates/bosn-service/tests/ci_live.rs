@@ -12,8 +12,9 @@
 //! Run with:
 //! `cargo test -p bosn-service --test ci_live -- --ignored --test-threads 1`
 //! It needs Docker and network access (runner image, `actions/cache`).
-//! The leak check compares the whole host engine, so run it on a host where
-//! nothing else is creating Docker resources at the same time.
+//! The leak check compares what bosn owns on the host engine (its ownership
+//! label and engine names), so other tools using Docker concurrently do not
+//! disturb it.
 
 use std::{
     collections::BTreeSet,
@@ -195,7 +196,14 @@ fn docker(args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// Everything on the host engine a run could leave behind.
+/// The bosn ownership label every engine, cache volume and network carries.
+const OWNED: &str = "label=com.zackees.bosn.registry";
+
+/// Everything on the host engine a run could leave behind: what bosn owns
+/// (its label, its `bosn-act-` engine names) and the engine image's
+/// repository. Other tools' resources are ignored, so the check holds on a
+/// machine where something else uses Docker at the same time; the isolation
+/// assertions prove act never reaches the host engine at all.
 #[derive(Debug, PartialEq, Eq)]
 struct HostSnapshot {
     containers: BTreeSet<String>,
@@ -207,11 +215,19 @@ struct HostSnapshot {
 impl HostSnapshot {
     fn take() -> Self {
         let set = |args: &[&str]| docker(args).lines().map(str::to_string).collect();
+        let mut containers: BTreeSet<String> = set(&["ps", "-aq", "--no-trunc", "--filter", OWNED]);
+        containers.extend(set(&[
+            "ps",
+            "-aq",
+            "--no-trunc",
+            "--filter",
+            "name=bosn-act-",
+        ]));
         Self {
-            containers: set(&["ps", "-aq", "--no-trunc"]),
-            networks: set(&["network", "ls", "-q", "--no-trunc"]),
-            volumes: set(&["volume", "ls", "-q"]),
-            images: set(&["images", "-aq", "--no-trunc"]),
+            containers,
+            networks: set(&["network", "ls", "-q", "--no-trunc", "--filter", OWNED]),
+            volumes: set(&["volume", "ls", "-q", "--filter", OWNED]),
+            images: set(&["images", "-aq", "--no-trunc", "docker"]),
         }
     }
 

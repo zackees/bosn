@@ -154,8 +154,10 @@ pub fn head(workspace: &Path) -> io::Result<Head> {
 }
 
 /// Copy the working tree of `workspace` (a Git checkout root) into `dest`,
-/// which must not exist yet, and write minimal Git metadata naming `HEAD` so
-/// the runner sees the right commit and repository.
+/// which must not exist yet, and make it a Git repository holding only the
+/// `HEAD` commit (refs, remote, a depth-1 pack and an index), so the runner
+/// and the workflow's own `git` commands see the right commit, with the
+/// uncommitted work on top.
 pub fn snapshot(workspace: &Path, dest: &Path) -> io::Result<SnapshotReceipt> {
     let Head {
         root,
@@ -213,6 +215,7 @@ pub fn snapshot(workspace: &Path, dest: &Path) -> io::Result<SnapshotReceipt> {
     }
     let dirty = dirty || after.dirty;
     write_git_metadata(dest, &sha, branch.as_deref(), origin.as_deref())?;
+    write_head_objects(&root, dest, &sha)?;
     Ok(SnapshotReceipt {
         sha,
         branch,
@@ -224,8 +227,8 @@ pub fn snapshot(workspace: &Path, dest: &Path) -> io::Result<SnapshotReceipt> {
     })
 }
 
-/// Just enough of a `.git` for act's revision/ref/remote probes. It holds no
-/// objects, so nothing in the run can read history it was not given.
+/// The `.git` refs, `HEAD` and remote act's revision/ref/remote probes read;
+/// [`write_head_objects`] then adds the `HEAD` commit itself.
 fn write_git_metadata(
     dest: &Path,
     sha: &str,
@@ -254,6 +257,37 @@ fn write_git_metadata(
         ));
     }
     std::fs::write(git.join("config"), config)
+}
+
+/// Fetch exactly the `HEAD` commit's objects (depth 1: no history the run
+/// was not given) and build an index matching it, so a workflow's
+/// `git rev-parse`, `git diff` and `git status` see a real checkout with the
+/// uncommitted work on top. Always one pack (`fetch.unpackLimit=1`): act
+/// copies files, not empty directories, and one pack copies faster than
+/// thousands of loose objects.
+fn write_head_objects(root: &Path, dest: &Path, sha: &str) -> io::Result<()> {
+    let url = format!("file://{}", root.display()).replace(' ', "%20");
+    git(
+        dest,
+        &[
+            "-c",
+            "fetch.unpackLimit=1",
+            "fetch",
+            "--quiet",
+            "--depth",
+            "1",
+            "--no-tags",
+            &url,
+            "HEAD",
+        ],
+    )?;
+    let fetched = text(git(dest, &["rev-parse", "FETCH_HEAD"])?)?;
+    // FETCH_HEAD names the host path; the run does not need it.
+    let _ = std::fs::remove_file(dest.join(".git/FETCH_HEAD"));
+    if fetched != sha {
+        return Err(io::Error::other("HEAD moved while the snapshot was taken"));
+    }
+    git(dest, &["read-tree", "HEAD"]).map(|_| ())
 }
 
 #[cfg(unix)]
@@ -440,6 +474,62 @@ mod tests {
         let ws = repo(tmp.path());
         std::fs::create_dir(ws.join("nested")).unwrap();
         assert!(snapshot(&ws.join("nested"), &tmp.path().join("x")).is_err());
+    }
+
+    #[test]
+    fn the_snapshot_is_a_real_repository_holding_only_the_head_commit() {
+        let tmp = TemporaryDirectory::new().unwrap();
+        let ws = repo(tmp.path());
+        sh(
+            &ws,
+            "printf 'b\\n' > tracked.txt && git commit -qam second && \
+             printf 'edit\\n' >> tracked.txt && printf 'new\\n' > untracked.txt",
+        );
+        let dest = tmp.path().join("s");
+        let receipt = snapshot(&ws, &dest).unwrap();
+        let git = |args: &[&str]| {
+            let out = kernal_api::run_bounded_command(
+                args.iter()
+                    .fold(SpawnSpec::new("git").current_dir(&dest), |s, a| s.arg(*a))
+                    .stdin(StreamMode::Null)
+                    .stdout(StreamMode::Piped)
+                    .stderr(StreamMode::Piped),
+                Duration::from_secs(30),
+                1 << 20,
+            )
+            .unwrap();
+            assert_eq!(
+                out.exit.raw_code(),
+                0,
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            // Porcelain status starts with a meaningful space: trim the end only.
+            String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+        };
+        assert_eq!(
+            git(&["rev-parse", "HEAD"]),
+            receipt.sha,
+            "workflows check HEAD"
+        );
+        git(&["cat-file", "-e", "HEAD^{tree}"]);
+        assert_eq!(
+            git(&["rev-list", "--count", "HEAD"]),
+            "1",
+            "no history beyond HEAD"
+        );
+        let status = git(&["status", "--porcelain"]);
+        assert!(
+            status.contains(" M tracked.txt"),
+            "uncommitted edits show: {status}"
+        );
+        assert!(status.contains("?? untracked.txt"), "{status}");
+        assert!(!status.contains("deleted.txt"), "{status}");
+        // act copies files, not empty directories: objects must hold a file.
+        let objects = std::fs::read_dir(dest.join(".git/objects/pack"))
+            .unwrap()
+            .count();
+        assert!(objects > 0, "the HEAD commit's objects are packed");
     }
 
     /// Opt-in (writes about 4 GiB to the temp directory):
