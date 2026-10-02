@@ -43,6 +43,304 @@ fn now() -> f64 {
 fn error(message: impl Into<String>) -> std::io::Error {
     std::io::Error::other(message.into())
 }
+/// Startup-only limits. The daemon must call this before accepting requests.
+#[derive(Clone, Copy, Debug)]
+pub struct ActStartupRecoveryOptions {
+    pub page_size: usize,
+    pub max_runs: usize,
+    pub deadline: Duration,
+}
+#[derive(Debug, Default)]
+pub struct ActStartupRecoveryReport {
+    pub runs: Vec<ActStartupRecoveryResult>,
+}
+#[derive(Debug)]
+pub struct ActStartupRecoveryResult {
+    pub run_id: String,
+    pub engine_removed: bool,
+    /// A refusal leaves durable cleanup pending; it is not execution evidence.
+    pub deferred_reason: Option<String>,
+}
+struct StartupSealGuard(Option<RegistryActor>);
+impl Drop for StartupSealGuard {
+    fn drop(&mut self) {
+        if let Some(registry) = self.0.take() {
+            async_engine::launch(async move {
+                // Lost callers cannot keep recovery authority open. Admission
+                // must still depend on the explicit successful seal below.
+                let _ = async_engine::timeout(
+                    Duration::from_secs(5),
+                    registry.act_registry(ActRegistryCommand::SealStartup),
+                )
+                .await;
+            })
+            .detach();
+        }
+    }
+}
+
+/// Interrupt and retire stale owned engines; never resume an old execution.
+/// Image proofs must come from server-owned verified publisher bytes.
+/// A successful return includes a durable seal; errors must prevent admission.
+pub async fn recover_startup_act_engines(
+    registry: &RegistryActor,
+    engine: &DockerEngine,
+    owner: &str,
+    proofs: &BTreeMap<String, crate::act_engine::VerifiedEngineManifest>,
+    options: ActStartupRecoveryOptions,
+    cancellation: &async_engine::CancellationToken,
+) -> std::io::Result<ActStartupRecoveryReport> {
+    let mut seal = StartupSealGuard(Some(registry.clone()));
+    let work = async {
+        if options.page_size == 0
+            || options.page_size > 1000
+            || options.max_runs == 0
+            || options.max_runs > 10000
+            || options.deadline <= Duration::from_secs(5)
+        {
+            return Err(error("invalid bounded startup recovery options"));
+        }
+        let started = Instant::now();
+        let budget = options.deadline - Duration::from_secs(5);
+        let mut report = ActStartupRecoveryReport::default();
+        let mut cursor = None;
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(error("startup recovery cancelled"));
+            }
+            let reply = registry
+                .act_registry(ActRegistryCommand::Pending {
+                    after_run_id: cursor.clone(),
+                    limit: options.page_size,
+                })
+                .await
+                .map_err(|e| error(e.to_string()))?;
+            let ActRegistryReply::Recovery(page) = reply else {
+                return Err(error("startup recovery page reply mismatch"));
+            };
+            if report.runs.len().saturating_add(page.items.len()) > options.max_runs {
+                return Err(error("startup recovery active-run ceiling exceeded"));
+            }
+            for record in page.items {
+                registry
+                    .act_registry(ActRegistryCommand::StartupInterrupt {
+                        run: record.intent.run_id.clone(),
+                        at: now().max(record.updated_at),
+                    })
+                    .await
+                    .map_err(|e| error(e.to_string()))?;
+                let remaining = budget.saturating_sub(started.elapsed());
+                let result = recover_startup_engine(
+                    registry,
+                    engine,
+                    owner,
+                    proofs,
+                    &record,
+                    remaining,
+                    cancellation,
+                )
+                .await;
+                report.runs.push(ActStartupRecoveryResult {
+                    run_id: record.intent.run_id,
+                    engine_removed: result.is_ok(),
+                    deferred_reason: result.err().map(|e| e.to_string()),
+                });
+            }
+            match page.next_run_id {
+                Some(next) if cursor.as_ref().is_none_or(|old| old < &next) => cursor = Some(next),
+                Some(_) => return Err(error("startup recovery cursor did not advance")),
+                None => return Ok(report),
+            }
+        }
+    };
+    let result = async_engine::timeout(
+        options.deadline.saturating_sub(Duration::from_secs(5)),
+        work,
+    )
+    .await
+    .map_err(|_| error("startup recovery deadline exceeded"))
+    .and_then(|r| r);
+    let sealed = async_engine::timeout(
+        Duration::from_secs(5),
+        registry.act_registry(ActRegistryCommand::SealStartup),
+    )
+    .await
+    .map_err(|_| error("startup recovery seal deadline exceeded"))?
+    .map_err(|e| error(format!("startup recovery seal failed: {e}")))?;
+    if !matches!(sealed, ActRegistryReply::Committed) {
+        return Err(error("startup recovery seal reply mismatch"));
+    }
+    seal.0 = None;
+    result
+}
+async fn recovery_control(
+    engine: &DockerEngine,
+    args: Vec<String>,
+    deadline: Instant,
+    cancellation: &async_engine::CancellationToken,
+) -> std::io::Result<Vec<u8>> {
+    if cancellation.is_cancelled() {
+        return Err(error("startup recovery cancelled"));
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(error("startup recovery deadline exceeded"));
+    }
+    let output = engine
+        .with_args(args)
+        .capture_async(RunOptions::bounded(
+            remaining.min(Duration::from_secs(10)),
+            2 << 20,
+        ))
+        .await
+        .map_err(|e| error(e.to_string()))?;
+    if output.exit_code != 0 {
+        return Err(error(format!(
+            "startup engine probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(output.stdout)
+}
+async fn recover_startup_engine(
+    registry: &RegistryActor,
+    engine: &DockerEngine,
+    owner: &str,
+    proofs: &BTreeMap<String, crate::act_engine::VerifiedEngineManifest>,
+    record: &bosn_registry::act::ActEngineRecord,
+    remaining: Duration,
+    cancellation: &async_engine::CancellationToken,
+) -> std::io::Result<()> {
+    use crate::act_engine::{
+        frozen_limits, observe_engine, observe_engine_image_from_manifest, remove_owned_engine,
+    };
+    let intent = &record.intent;
+    if record.registry_id != owner {
+        return Err(error("startup recovery registry owner mismatch"));
+    }
+    let limits = frozen_limits(intent).map_err(|e| error(e.to_string()))?;
+    let proof = proofs
+        .get(&intent.engine_image_digest)
+        .ok_or_else(|| error("startup recovery missing trusted engine image proof"))?;
+    let deadline = Instant::now()
+        .checked_add(remaining)
+        .ok_or_else(|| error("invalid recovery deadline"))?;
+    // Successful exact-name/ID lists establish absence. Inspect errors never do.
+    let name = intent.engine_name();
+    let mut named = Vec::new();
+    for filter in std::iter::once(format!("name=^/{name}$"))
+        .chain(record.engine_id.as_ref().map(|id| format!("id={id}")))
+    {
+        let bytes = recovery_control(
+            engine,
+            vec![
+                "container".into(),
+                "ls".into(),
+                "--all".into(),
+                "--no-trunc".into(),
+                "--filter".into(),
+                filter,
+                "--format".into(),
+                "{{.ID}}".into(),
+            ],
+            deadline,
+            cancellation,
+        )
+        .await?;
+        let ids = std::str::from_utf8(&bytes)
+            .map_err(|_| error("invalid engine list encoding"))?
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if ids.len() > 1
+            || ids.iter().any(|id| {
+                id.len() != 64
+                    || !id
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+        {
+            return Err(error("ambiguous startup engine identity"));
+        }
+        named.push(ids);
+    }
+    if named.iter().all(Vec::is_empty) {
+        registry
+            .act_registry(ActRegistryCommand::Finalize {
+                run: intent.run_id.clone(),
+                proof: bosn_registry::act::ActEngineRemovalProof {
+                    name,
+                    engine_id: record.engine_id.clone(),
+                },
+                at: now().max(record.updated_at),
+            })
+            .await
+            .map_err(|e| error(e.to_string()))?;
+        return Ok(());
+    }
+    let id = named[0]
+        .first()
+        .ok_or_else(|| error("engine ID exists with unexpected name"))?;
+    if record
+        .engine_id
+        .as_ref()
+        .is_some_and(|expected| expected != id)
+        || named.get(1).is_some_and(|ids| ids.first() != Some(id))
+    {
+        return Err(error("startup engine name/ID mismatch"));
+    }
+    let image = recovery_control(
+        engine,
+        vec![
+            "image".into(),
+            "inspect".into(),
+            format!("docker.io/library/docker@{}", intent.engine_image_digest),
+        ],
+        deadline,
+        cancellation,
+    )
+    .await?;
+    let image = observe_engine_image_from_manifest(&image, intent, proof)
+        .map_err(|e| error(e.to_string()))?;
+    let bytes = recovery_control(
+        engine,
+        vec!["container".into(), "inspect".into(), id.clone()],
+        deadline,
+        cancellation,
+    )
+    .await?;
+    let observed =
+        observe_engine(&bytes, intent, owner, &image, limits).map_err(|e| error(e.to_string()))?;
+    if record.engine_id.is_none() {
+        registry
+            .act_registry(ActRegistryCommand::Recover {
+                run: intent.run_id.clone(),
+                observed: observed.clone(),
+                at: now().max(record.updated_at),
+            })
+            .await
+            .map_err(|e| error(e.to_string()))?;
+    }
+    // The existing remover has three 30-second commands plus persistence.
+    // Refuse rather than start a removal that cannot fit the lifecycle budget.
+    if cancellation.is_cancelled()
+        || deadline.saturating_duration_since(Instant::now()) < Duration::from_secs(95)
+    {
+        return Err(error(
+            "startup removal deferred: insufficient reserved cleanup budget",
+        ));
+    }
+    remove_owned_engine(
+        registry,
+        engine,
+        &intent.run_id,
+        observed,
+        now().max(record.updated_at),
+    )
+    .await
+    .map_err(|e| error(e.to_string()))
+}
+
 /// These bytes and observations are trusted daemon inputs, never client proof.
 pub struct ActRuntimeRequest<'a> {
     pub intent: &'a ActEngineIntent,
@@ -1687,5 +1985,272 @@ else: raise Exception('unexpected args '+repr(args))
         )
         .unwrap();
         assert_eq!(missing[0].outcome, "incomplete");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod startup_recovery_tests {
+    use super::*;
+    use bosn_registry::{Registry, act::ActEngineState};
+
+    #[test]
+    fn startup_recovery_cannot_succeed_without_seal() {
+        let runtime = async_engine::RuntimeBuilder::multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.run(async {
+            let (sender, receiver) = async_engine::channel(1);
+            drop(receiver);
+            let actor = RegistryActor { sender };
+            let engine = DockerEngine::synthetic_for_test("never-execute", Vec::<String>::new());
+            let cancellation = async_engine::CancellationSource::new();
+            let failure = recover_startup_act_engines(
+                &actor,
+                &engine,
+                "owner",
+                &BTreeMap::new(),
+                ActStartupRecoveryOptions {
+                    page_size: 1,
+                    max_runs: 1,
+                    deadline: Duration::from_secs(10),
+                },
+                &cancellation.token(),
+            )
+            .await
+            .unwrap_err();
+            assert!(failure.to_string().contains("seal failed"));
+        });
+    }
+
+    #[test]
+    fn startup_recovery_absence_faults_pages_and_seal() {
+        const OWNER: &str = "11111111-2222-4333-8444-555555555555";
+        for mode in [
+            "absent",
+            "failed-list",
+            "foreign",
+            "missing-proof",
+            "legacy",
+            "deadline",
+            "dropped",
+            "ceiling",
+            "cancelled",
+            "invalid",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("registry.sqlite3");
+            let mut registry = Registry::create_writer(&db, OWNER).unwrap();
+            let proofs = crate::act_engine::bundled_engine_manifests().unwrap();
+            let pin = proofs.keys().next().unwrap().clone();
+            let mut intents = Vec::new();
+            for n in 1..=3 {
+                let intent = ActEngineIntent {
+                    run_id: format!("00000000-0000-4000-8000-{n:012}"),
+                    workspace: "/private/source".into(),
+                    candidate_sha: "a".repeat(40),
+                    payload_sha256: "b".repeat(64),
+                    snapshot_sha256: "c".repeat(64),
+                    act_version: "0.2.88".into(),
+                    act_image_digest: format!("sha256:{}", "d".repeat(64)),
+                    engine_image_digest: pin.clone(),
+                    runner_image_digest: format!("sha256:{}", "f".repeat(64)),
+                    created_at: 1.0,
+                    creation_profile: Some(
+                        crate::act_engine::creation_profile(crate::act_engine::ActEngineLimits {
+                            memory_bytes: 6 << 30,
+                            storage_bytes: 4 << 30,
+                            nano_cpus: 1_000_000_000,
+                            pids: 256,
+                        })
+                        .unwrap(),
+                    ),
+                };
+                let mut tx = registry.begin_immediate().unwrap();
+                tx.begin_act_engine(&intent).unwrap();
+                if n == 2 {
+                    let observed = ActEngineObservation {
+                        name: intent.engine_name(),
+                        engine_id: "1".repeat(64),
+                        image_digest: pin.clone(),
+                        labels: intent.required_labels(OWNER).unwrap(),
+                    };
+                    tx.register_act_engine(&intent.run_id, &observed, 2.0)
+                        .unwrap();
+                    tx.claim_act_execution(
+                        &intent,
+                        &observed,
+                        "12345678-1234-4234-8234-123456789abc",
+                        3.0,
+                    )
+                    .unwrap();
+                }
+                tx.commit().unwrap();
+                intents.push(intent);
+            }
+            if mode == "legacy" {
+                for intent in &intents {
+                    let mut old =
+                        serde_json::to_value(registry.act_engine(&intent.run_id).unwrap().unwrap())
+                            .unwrap();
+                    old["schema_version"] = json!(2);
+                    old["intent"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("creation_profile");
+                    let mut tx = registry.begin_immediate().unwrap();
+                    tx.append_event(
+                        3.0,
+                        &format!("act.engine.v1:{}", intent.run_id),
+                        &serde_json::to_string(&old).unwrap(),
+                    )
+                    .unwrap();
+                    tx.commit().unwrap();
+                }
+            }
+            let script = dir.path().join("engine.py");
+            let log = dir.path().join("commands");
+            std::fs::write(
+                &script,
+                r#"import sys,json
+mode,log,db=sys.argv[1:4];args=sys.argv[4:]
+import sqlite3
+filter=args[args.index('--filter')+1]
+if filter.startswith('name=^/bosn-act-'):
+ run=filter[len('name=^/bosn-act-'):-1]
+ with sqlite3.connect(db) as conn:
+  record=json.loads(conn.execute('SELECT detail FROM events WHERE kind=? ORDER BY id DESC LIMIT 1',('act.engine.v1:'+run,)).fetchone()[0])
+ assert record['state']=='cleanup_required' and record['outcome']=='interrupted'
+ assert record['execution']!='passed' 
+with open(log,'a') as f:f.write(json.dumps(args)+'\n')
+assert args[:4]==['container','ls','--all','--no-trunc']
+if mode=='failed-list':sys.exit(7)
+if mode=='deadline':
+ import time;time.sleep(3)
+if mode=='foreign':print('f'*64)
+"#,
+            )
+            .unwrap();
+            let engine = DockerEngine::synthetic_for_test(
+                "uv",
+                [
+                    "run".into(),
+                    "--no-project".into(),
+                    "python".into(),
+                    script.to_string_lossy().into_owned(),
+                    mode.into(),
+                    log.to_string_lossy().into_owned(),
+                    db.to_string_lossy().into_owned(),
+                ],
+            );
+            let runtime = async_engine::RuntimeBuilder::multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.run(async {
+                let (sender, receiver) = async_engine::channel(16);
+                let actor = RegistryActor { sender };
+                let task = async_engine::launch(async move {
+                    if mode == "dropped" {
+                        async_engine::sleep(Duration::from_millis(200)).await;
+                    }
+                    crate::registry_actor(registry, receiver, None).await
+                });
+                let cancel = async_engine::CancellationSource::new();
+                if mode == "cancelled" {
+                    cancel.cancel();
+                }
+                let selected = if mode == "missing-proof" {
+                    BTreeMap::new()
+                } else {
+                    proofs
+                };
+                let token = cancel.token();
+                let recovery = recover_startup_act_engines(
+                    &actor,
+                    &engine,
+                    OWNER,
+                    &selected,
+                    ActStartupRecoveryOptions {
+                        page_size: if mode == "invalid" { 0 } else { 1 },
+                        max_runs: if mode == "ceiling" { 1 } else { 3 },
+                        deadline: Duration::from_secs(if mode == "deadline" { 6 } else { 20 }),
+                    },
+                    &token,
+                );
+                let result = if mode == "dropped" {
+                    let timed = async_engine::timeout(Duration::from_millis(20), recovery).await;
+                    assert!(timed.is_err());
+                    async_engine::sleep(Duration::from_millis(300)).await;
+                    Err(error("caller dropped"))
+                } else {
+                    recovery.await
+                };
+                if matches!(
+                    mode,
+                    "ceiling" | "cancelled" | "invalid" | "deadline" | "dropped"
+                ) {
+                    assert!(result.is_err(), "{mode}");
+                } else {
+                    let report = result.unwrap();
+                    assert_eq!(report.runs.len(), 3);
+                    assert_eq!(
+                        report.runs.iter().all(|r| r.engine_removed),
+                        mode == "absent"
+                    );
+                    assert_eq!(
+                        report.runs.iter().all(|r| r.deferred_reason.is_some()),
+                        mode != "absent"
+                    );
+                }
+                assert!(
+                    actor
+                        .act_registry(ActRegistryCommand::StartupInterrupt {
+                            run: intents[0].run_id.clone(),
+                            at: now()
+                        })
+                        .await
+                        .is_err()
+                );
+                actor.stop().await;
+                task.await.unwrap();
+            });
+            let reopened = Registry::open_writer(&db).unwrap();
+            for intent in &intents {
+                let record = reopened.act_engine(&intent.run_id).unwrap().unwrap();
+                if mode == "absent" {
+                    assert_eq!(record.state, ActEngineState::Terminal);
+                    assert_eq!(record.outcome, Some(ActRunOutcome::Interrupted));
+                    assert_ne!(record.execution, Some(ActRunOutcome::Passed));
+                } else if !matches!(
+                    mode,
+                    "cancelled" | "invalid" | "ceiling" | "deadline" | "dropped"
+                ) {
+                    assert_eq!(record.state, ActEngineState::CleanupRequired);
+                    assert!(record.removal.is_none());
+                }
+            }
+            if matches!(
+                mode,
+                "missing-proof" | "legacy" | "cancelled" | "invalid" | "dropped"
+            ) {
+                assert!(!log.exists());
+            }
+            if mode == "deadline" {
+                assert_eq!(
+                    reopened
+                        .act_engine(&intents[0].run_id)
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    ActEngineState::CleanupRequired
+                );
+            }
+            if mode == "absent" {
+                let commands = std::fs::read_to_string(log).unwrap();
+                assert_eq!(commands.lines().count(), 4);
+                assert!(commands.contains("id=111111"));
+            }
+        }
     }
 }
