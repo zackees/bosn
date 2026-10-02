@@ -152,6 +152,9 @@ pub fn run(mut arguments: impl Iterator<Item = OsString>) {
             root.clone().into_os_string(),
             OsString::from("-W"),
             path.clone().into_os_string(),
+            // Act 0.2.88 discovers gh credentials only when this key is absent.
+            OsString::from("--secret"),
+            OsString::from("GITHUB_TOKEN="),
         ],
         Duration::from_secs(2),
         1024 * 1024,
@@ -631,6 +634,7 @@ fn sterile_act_output(
             .env("TMP", control.root.join("tmp"))
             .env("TEMP", control.root.join("tmp"))
             .env("LC_ALL", "C")
+            .env("ACT_DISABLE_VERSION_CHECK", "1")
             .stdin(std::process::Stdio::null());
         let result = bounded_act_output(&mut command, deadline, limit);
         control

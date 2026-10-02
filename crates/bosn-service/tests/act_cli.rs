@@ -648,10 +648,12 @@ fn check_sterile_act_queries(with_config: bool) {
 printf '%s\n%s\n%s\n' "$PWD" "$HOME" "$XDG_CONFIG_HOME" >> "$(dirname "$0")/query-audit"
 if [ -f .actrc ] || [ -f "$HOME/.actrc" ] || [ -f "$XDG_CONFIG_HOME/act/actrc" ]; then echo 'inherited actrc' >&2; exit 21; fi
 if [ -n "$HOST_TOKEN$GITHUB_TOKEN$GH_TOKEN$AWS_SECRET_ACCESS_KEY$DOCKER_HOST$LD_PRELOAD$BOSN_FAKE_ACT_MODE" ]; then echo 'inherited credential or configuration' >&2; exit 22; fi
+[ "$ACT_DISABLE_VERSION_CHECK" = 1 ] || { echo 'version lookup not disabled' >&2; exit 26; }
 [ -d "$HOME" ] && [ -d "$XDG_CONFIG_HOME" ] || exit 23
 [ "$PWD" != "$(dirname "$(dirname "$0")")" ] || exit 24
 if [ "$1" = --version ]; then echo 'act version 0.2.88'; exit 0; fi
 [ "$1" = -l ] && [ "$2" = -C ] && [ "$3" = "$(dirname "$(dirname "$0")")" ] && [ "$4" = -W ] && [ "$5" = "$3/ci.yml" ] || { echo 'wrong explicit source/workflow arguments' >&2; exit 25; }
+[ "$#" = 7 ] && [ "$6" = --secret ] && [ "$7" = GITHUB_TOKEN= ] || { echo 'credential helper discovery not suppressed' >&2; exit 27; }
 printf 'Stage  Job ID  Job name\n0  lint  Lint\n'
 "#).unwrap();
     fs::set_permissions(&act, fs::Permissions::from_mode(0o700)).unwrap();
@@ -681,6 +683,7 @@ printf 'Stage  Job ID  Job name\n0  lint  Lint\n'
         .env("AWS_SECRET_ACCESS_KEY", "cloud secret")
         .env("DOCKER_HOST", "tcp://secret.invalid:2375")
         .env("BOSN_FAKE_ACT_MODE", "ambient")
+        .env("ACT_DISABLE_VERSION_CHECK", "0")
         .output()
         .unwrap();
     assert!(
