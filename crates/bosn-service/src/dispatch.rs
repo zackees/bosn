@@ -14,6 +14,9 @@ pub(crate) struct ConnectionContext {
     pub(crate) ci: ci::CiRuntime,
 }
 
+/// How long stopping the daemon waits for its spare engine to be removed.
+pub(crate) const SPARE_CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
 pub(crate) fn ci_error_wire(code: &str, message: String) -> ReplyWire {
     let reply = ci::ErrorReply {
         code: code.into(),
@@ -75,6 +78,9 @@ pub(crate) async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Re
                 }
             }
             3 => {
+                // The spare engine (#410) goes before the daemon stops
+                // answering, so `bosn daemon stop` returns with it removed.
+                let _ = async_engine::timeout(SPARE_CLOSE_DEADLINE, ci.close_spares()).await;
                 stop.cancel();
                 ReplyWire {
                     code: 30,

@@ -418,8 +418,11 @@ impl Client {
             _ => Err(Error::Protocol("unexpected setup adopt response")),
         }
     }
+    /// Stop the daemon. It removes its spare CI engine (#410) before it
+    /// replies, so the reply may take up to that removal's deadline.
     pub async fn shutdown(&self) -> Result<(), Error> {
-        match self.call(Request::operation(3)).await? {
+        let deadline = crate::dispatch::SPARE_CLOSE_DEADLINE + IO_DEADLINE;
+        match self.call_within(Request::operation(3), deadline).await? {
             Reply::Shutdown => Ok(()),
             _ => Err(Error::Protocol("unexpected shutdown response")),
         }

@@ -72,6 +72,7 @@ pub mod runtime;
 pub mod scheduler;
 pub mod schema;
 pub mod snapshot;
+pub mod spare;
 pub mod storage;
 pub mod store;
 pub mod ui;

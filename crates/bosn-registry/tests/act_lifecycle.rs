@@ -29,6 +29,7 @@ fn intent() -> ActEngineIntent {
         engine_image_digest: format!("sha256:{}", "e".repeat(64)),
         runner_image_digest: format!("sha256:{}", "f".repeat(64)),
         created_at: 1.0,
+        spare: false,
         creation_profile: Some(profile()),
     }
 }

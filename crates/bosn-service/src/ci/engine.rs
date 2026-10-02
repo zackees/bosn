@@ -29,7 +29,11 @@ use kernal_api::async_engine::{self, CancellationToken};
 
 use crate::{RegistryActor, act_engine};
 
+mod lines;
 mod toolcache;
+use lines::LineBuffer;
+#[cfg(test)]
+use lines::MAX_LINE;
 use toolcache::{save_toolcache_script, seed_toolcache_script};
 
 pub use super::pins::{ACT_VERSION, ActArtifact, RUNNER_IMAGE, act_artifact, runner_tag};
@@ -192,15 +196,24 @@ pub trait ActEngineBackend: Send + Sync {
         record: &'a ActEngineRecord,
         budget: Duration,
     ) -> BoxFuture<'a, Result<(), String>>;
-    /// Wait for the nested engine, install act, seed the tool cache, stream
-    /// in the frozen source and event payload, and load the runner image.
-    /// The artifact must be the one the intent recorded.
-    fn prepare<'a>(
+    /// What every run's engine needs, whichever run it serves: wait for the
+    /// nested engine, install act and load the runner image (each proven to
+    /// be its pin). Only bosn's own fixed scripts run, so a spare engine
+    /// (#410) is prepared this far before any run claims it. The artifact
+    /// must be the one the intent recorded.
+    fn prepare_engine<'a>(
+        &'a self,
+        engine: &'a str,
+        act: ActArtifact,
+    ) -> BoxFuture<'a, Result<(), String>>;
+    /// What one run needs on a prepared engine: seed act's tool cache from
+    /// the machine-wide store as of now, and stream in the frozen source and
+    /// event payload.
+    fn prepare_run<'a>(
         &'a self,
         engine: &'a str,
         source: &'a Path,
         event: &'a Path,
-        act: ActArtifact,
     ) -> BoxFuture<'a, Result<(), String>>;
     /// `act -l` for the workflow (declared jobs and their stages).
     fn list<'a>(
@@ -659,11 +672,9 @@ impl ActEngineBackend for DockerActBackend {
         })
     }
 
-    fn prepare<'a>(
+    fn prepare_engine<'a>(
         &'a self,
         engine: &'a str,
-        source: &'a Path,
-        event: &'a Path,
         act: ActArtifact,
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
@@ -675,14 +686,24 @@ impl ActEngineBackend for DockerActBackend {
             )
             .await?;
             self.install_act(engine, act).await?;
+            self.load_runner(engine).await
+        })
+    }
+
+    fn prepare_run<'a>(
+        &'a self,
+        engine: &'a str,
+        source: &'a Path,
+        event: &'a Path,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
             self.checked(
                 "tool cache seed",
                 Self::exec(engine, &seed_toolcache_script()),
                 PULL_DEADLINE,
             )
             .await?;
-            self.copy_inputs(engine, source, event).await?;
-            self.load_runner(engine).await
+            self.copy_inputs(engine, source, event).await
         })
     }
 
@@ -827,37 +848,6 @@ fn reload_runner_script() -> String {
         tag = runner_tag(),
         load = load_runner_script(),
     )
-}
-
-/// Splits a byte stream into bounded UTF-8 lines.
-#[derive(Default)]
-struct LineBuffer {
-    pending: Vec<u8>,
-}
-const MAX_LINE: usize = 64 * 1024;
-impl LineBuffer {
-    fn push(&mut self, bytes: &[u8]) {
-        self.pending.extend_from_slice(bytes);
-    }
-    fn drain_lines(&mut self) -> Vec<String> {
-        let mut out = Vec::new();
-        while let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
-            let line: Vec<u8> = self.pending.drain(..=end).collect();
-            out.push(String::from_utf8_lossy(&line[..line.len() - 1]).into_owned());
-        }
-        if self.pending.len() > MAX_LINE {
-            let line: Vec<u8> = self.pending.drain(..MAX_LINE).collect();
-            out.push(String::from_utf8_lossy(&line).into_owned());
-        }
-        out
-    }
-    fn finish(&mut self) -> Vec<String> {
-        let mut out = self.drain_lines();
-        if !self.pending.is_empty() {
-            out.push(String::from_utf8_lossy(&std::mem::take(&mut self.pending)).into_owned());
-        }
-        out
-    }
 }
 
 #[cfg(test)]

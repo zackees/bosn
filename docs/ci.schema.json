@@ -1401,6 +1401,17 @@
           "minimum": 0,
           "type": "integer"
         },
+        "spare": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpareStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The prepared spare engine (#410), when one is kept or being prepared."
+        },
         "widget": {
           "$ref": "#/$defs/WidgetPresence",
           "description": "Whether the desktop widget is running."
@@ -1513,6 +1524,39 @@
         "name",
         "stage",
         "status"
+      ],
+      "type": "object"
+    },
+    "SpareState": {
+      "enum": [
+        "preparing",
+        "ready"
+      ],
+      "type": "string"
+    },
+    "SpareStatus": {
+      "description": "A spare engine: prepared before any run, claimed by the next one.",
+      "properties": {
+        "engine": {
+          "description": "Its container name on the host engine.",
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/SpareState"
+        },
+        "storage_used": {
+          "description": "Bytes of its RAM-backed private storage in use once prepared.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "engine",
+        "state"
       ],
       "type": "object"
     },

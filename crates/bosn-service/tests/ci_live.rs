@@ -7,7 +7,9 @@
 //!   socket inside it belongs to the nested daemon;
 //! - the recorded matrix/`needs:`/failure fixture yields the right tree,
 //!   exit 1, and a report holding only the failing step's tail;
-//! - a second run restores `actions/cache` from the local cache server.
+//! - a second run restores `actions/cache` from the local cache server;
+//! - a run claims the prepared spare engine (#410), a new one is prepared,
+//!   and stopping the daemon leaves nothing it owned on the host.
 //!
 //! Run with:
 //! `cargo test -p bosn-service --test ci_live -- --ignored --test-threads 1`
@@ -54,7 +56,12 @@ struct Live {
 }
 
 impl Live {
+    /// A daemon without a spare engine: one engine per run, named after it.
     fn new() -> Self {
+        Self::with_spares(false)
+    }
+
+    fn with_spares(spares: bool) -> Self {
         let base = std::env::temp_dir();
         let base = if base.as_os_str().len() > 40 {
             PathBuf::from(std::env::var("HOME").unwrap()).join(".cache")
@@ -71,8 +78,15 @@ impl Live {
         git(&repo, &["init", "-q", "-b", "main"]);
         git(&repo, &["add", "-A"]);
         git(&repo, &["commit", "-qm", "init"]);
+        let state = root.path().join("s");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            state.join("config.toml"),
+            format!("[engine]\nspares = {}\n", u8::from(spares)),
+        )
+        .unwrap();
         let mut live = Self {
-            state: root.path().join("s"),
+            state,
             repo,
             _root: root,
             daemon: None,
@@ -100,6 +114,24 @@ impl Live {
         let mut child = self.daemon.take().unwrap();
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    /// `bosn daemon stop`, then wait for the process to exit.
+    fn stop_daemon(&mut self) {
+        assert!(self.cli(&["daemon", "stop"]).status.success());
+        let mut child = self.daemon.take().unwrap();
+        child.wait().unwrap();
+    }
+
+    /// Until the daemon reports a ready spare engine other than `not`; its name.
+    fn spare_ready(&self, not: Option<&str>, limit: Duration) -> String {
+        let mut name = String::new();
+        wait_until("a spare engine is ready", limit, || {
+            let spare = &self.json(&["ci", "runners", "--json"]).1["runners"]["spare"];
+            name = spare["engine"].as_str().unwrap_or_default().to_string();
+            spare["state"] == "ready" && Some(name.as_str()) != not
+        });
+        name
     }
 
     fn workflow(&self, text: &str) {
@@ -442,4 +474,87 @@ fn a_second_run_restores_actions_cache_from_the_local_server() {
         "{}",
         live.logs(&second)
     );
+}
+
+/// A container's or volume's labels and immutable ID.
+fn inspect(target: &str, format: &str) -> String {
+    docker(&["inspect", "--format", format, target])
+}
+
+/// What one registry owns on the host engine: its containers, networks and
+/// volumes (the machine-wide cache volume may carry another registry's
+/// label, and outlives every daemon by design).
+fn owned_by(registry: &str) -> (String, String, String) {
+    let filter = format!("label=com.zackees.bosn.registry={registry}");
+    (
+        docker(&["ps", "-aq", "--no-trunc", "--filter", &filter]),
+        docker(&["network", "ls", "-q", "--filter", &filter]),
+        docker(&["volume", "ls", "-q", "--filter", &filter]),
+    )
+}
+
+#[test]
+#[ignore = "needs Docker; see the module docs"]
+fn a_run_claims_the_spare_a_new_one_is_prepared_and_stop_removes_it() {
+    let images = docker(&["images", "-aq", "--no-trunc", "docker"]);
+    let mut live = Live::with_spares(true);
+    // A daemon keeps a spare once it runs CI; the first run may pull images.
+    let warm = live.submit(&[]);
+    let (code, view) = live.wait(&warm);
+    assert_eq!(code, Some(0), "{view}\n{}", live.logs(&warm));
+    let first = live.spare_ready(None, Duration::from_secs(600));
+    let registry = inspect(
+        &first,
+        "{{index .Config.Labels \"com.zackees.bosn.registry\"}}",
+    );
+    let first_id = inspect(&first, "{{.Id}}");
+    assert_eq!(
+        inspect(
+            &first,
+            "{{index .Config.Labels \"com.zackees.bosn.act.spare\"}}"
+        ),
+        "true"
+    );
+    let run = live.submit(&[]);
+    let (code, view) = live.wait(&run);
+    assert_eq!(
+        (code, &view["conclusion"]),
+        (Some(0), &Value::from("success")),
+        "{view}"
+    );
+    assert_eq!(
+        view["engine_id"],
+        Value::from(first_id.as_str()),
+        "the run ran on the spare"
+    );
+    let logs = live.logs(&run);
+    assert!(
+        logs.contains(&format!("claiming prepared spare engine {first}")),
+        "{logs}"
+    );
+    assert!(logs.contains("spare engine claimed in"), "{logs}");
+    assert!(!logs.contains("creating isolated engine"), "{logs}");
+    assert!(!logs.contains("preparing engine"), "{logs}");
+    if let Some(prepared) = logs
+        .lines()
+        .find(|line| line.contains("engine prepared in"))
+    {
+        eprintln!("spare run: {prepared}");
+    }
+    // A replacement is prepared; the claimed spare is gone with its run.
+    let second = live.spare_ready(Some(&first), Duration::from_secs(300));
+    assert_ne!(second, first);
+    let (containers, _, _) = owned_by(&registry);
+    assert_eq!(
+        containers,
+        inspect(&second, "{{.Id}}"),
+        "only the new spare"
+    );
+    // Stopping the daemon removes it: nothing this daemon owned is left.
+    live.stop_daemon();
+    assert_eq!(
+        owned_by(&registry),
+        (String::new(), String::new(), String::new())
+    );
+    assert_eq!(docker(&["images", "-aq", "--no-trunc", "docker"]), images);
 }

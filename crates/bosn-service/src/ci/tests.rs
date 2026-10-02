@@ -810,3 +810,5 @@ fn the_cache_volume_is_measured_and_cleared_only_while_nothing_runs() {
         assert_eq!(cleared.cache.unwrap().bytes, None, "the volume is gone");
     });
 }
+
+mod spare;

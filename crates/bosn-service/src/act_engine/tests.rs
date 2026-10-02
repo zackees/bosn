@@ -16,6 +16,7 @@ fn intent() -> ActEngineIntent {
         runner_image_digest: format!("sha256:{}", "f".repeat(64)),
         creation_profile: Some(creation_profile(limits()).unwrap()),
         created_at: 1.0,
+        spare: false,
     }
 }
 const OWNER: &str = "11111111-2222-4333-8444-555555555555";

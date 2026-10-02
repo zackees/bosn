@@ -4,8 +4,8 @@ use crate::{DbCommand, Error, RegistryActor};
 use bosn_registry::{
     Registry,
     act::{
-        ActEngineIntent, ActEngineObservation, ActEngineRecord, ActEngineRecoveryPage,
-        ActEngineRemovalProof, ActRunOutcome,
+        ActEngineBinding, ActEngineIntent, ActEngineObservation, ActEngineRecord,
+        ActEngineRecoveryPage, ActEngineRemovalProof, ActRunOutcome,
     },
 };
 use kernal_api::async_engine;
@@ -35,6 +35,16 @@ pub enum ActRegistryCommand {
         intent: ActEngineIntent,
         observed: ActEngineObservation,
         token: String,
+        at: f64,
+    },
+    /// Hand a prepared spare (#410) from the daemon's claim `from` to one
+    /// run's claim `token`, recording the run it now serves.
+    ClaimSpare {
+        spare: String,
+        observed: ActEngineObservation,
+        from: String,
+        token: String,
+        binding: ActEngineBinding,
         at: f64,
     },
     VerifyClaimed {
@@ -123,6 +133,7 @@ pub(crate) fn apply(
         &command,
         ActRegistryCommand::Begin(_)
             | ActRegistryCommand::Claim { .. }
+            | ActRegistryCommand::ClaimSpare { .. }
             | ActRegistryCommand::SealStartup
     ) {
         *startup_open = false;
@@ -205,6 +216,16 @@ pub(crate) fn apply(
         } => ActRegistryReply::Claimed(Box::new(
             transaction.claim_act_execution(&intent, &observed, &token, at)?,
         )),
+        ActRegistryCommand::ClaimSpare {
+            spare,
+            observed,
+            from,
+            token,
+            binding,
+            at,
+        } => ActRegistryReply::Claimed(Box::new(
+            transaction.claim_act_spare(&spare, &observed, &from, &token, &binding, at)?,
+        )),
         ActRegistryCommand::VerifyClaimed {
             run,
             observed,
@@ -279,6 +300,7 @@ mod tests {
             engine_image_digest: format!("sha256:{}", "e".repeat(64)),
             runner_image_digest: format!("sha256:{}", "f".repeat(64)),
             created_at: 1.0,
+            spare: false,
             creation_profile: Some(bosn_registry::act::ActEngineCreationProfile {
                 memory_bytes: 28 << 30,
                 storage_bytes: 20 << 30,
@@ -411,6 +433,7 @@ mod tests {
             engine_image_digest: format!("sha256:{}", "e".repeat(64)),
             runner_image_digest: format!("sha256:{}", "f".repeat(64)),
             created_at: 1.0,
+            spare: false,
             creation_profile: Some(bosn_registry::act::ActEngineCreationProfile {
                 memory_bytes: 28 << 30,
                 storage_bytes: 20 << 30,

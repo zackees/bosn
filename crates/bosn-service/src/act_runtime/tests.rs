@@ -128,6 +128,7 @@ mod startup_recovery {
                     engine_image_digest: pin.clone(),
                     runner_image_digest: format!("sha256:{}", "f".repeat(64)),
                     created_at: 1.0,
+                    spare: false,
                     creation_profile: Some(
                         crate::act_engine::creation_profile(crate::act_engine::ActEngineLimits {
                             memory_bytes: 6 << 30,

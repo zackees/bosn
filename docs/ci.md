@@ -311,6 +311,7 @@ is not local evidence. Declare a job this way rather than guarding it with
     storage_gib = 10
     cpus = 4
     pids = 4096
+    spares = 0   # no prepared spare engine (default 1)
     ```
 
     The chosen limits are frozen into the creation profile; creation and every
@@ -322,6 +323,31 @@ is not local evidence. Declare a job this way rather than guarding it with
     in its `reason` (`bosn ci report`), naming `storage_gib`. A step that a
     free-space guard refused (soldr will not build under 5 GiB) or that hit
     ENOSPC is explained rather than failing silently (#392).
+  - **One prepared spare engine (#410).** Once a daemon has taken its first
+    `bosn ci` run, whenever nothing is queued and a run slot is free, it
+    creates one engine with no run and prepares it
+    as far as bosn's own fixed scripts go: ready, act installed and verified,
+    runner image loaded and proven. The next run claims it instead of
+    creating and preparing its own (about 15 s), then seeds the tool cache
+    and streams in its source as usual; a new spare is prepared behind it.
+    - It is an ordinary owned engine (`bosn-act-<spare>`, labelled
+      `com.zackees.bosn.act.spare=true`): its intent and frozen creation
+      profile are durable before it exists, and the daemon holds it under its
+      own execution claim. A run takes it over in one registry transaction
+      that replaces that claim with the run's and records the run it serves;
+      only one claim can. From then on it is that run's engine, removed with
+      proof when the run ends.
+    - A run claims a spare only when its intent would create exactly the same
+      engine (pins and creation profile); a spare made for other limits or
+      pins is retired, never claimed. Startup recovery retires a spare a dead
+      daemon left, prepared or half-created, like any other engine, and
+      `bosn daemon stop` removes it before the daemon stops answering.
+    - At most one is kept. It counts against the run concurrency limit (it is
+      only prepared while a slot is free) and is a registered owned resource.
+      It is kept only when the host has 16 GiB of memory available, since an
+      idle spare holds its runner image (about 2 GiB) in its RAM-backed
+      storage; `bosn ci runners --json` shows it with that usage. Clearing
+      the cache volume retires it first. Opt out with `[engine] spares = 0`.
   - Its one named mount is the machine-wide cache volume (below), frozen into
     the creation profile, verified before creation and on every observation.
     No host path or socket is mounted.
