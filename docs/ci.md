@@ -137,7 +137,9 @@ bosn widget install      # systemd user unit, started with the graphical session
 - `bosn ci run` and `bosn ui` start it detached themselves when the daemon
   reports none and the terminal has a desktop.
 
-**Quitting.** Closing the bubble is a deliberate quit. It suppresses
+**Quitting.** Closing the bubble is a deliberate quit. The bubble has no
+title bar, so close it from the window manager (Alt+F4 while it has focus);
+a panel Quit button is #409. Quitting suppresses
 auto-launch until the next login (a new graphical session) or an explicit
 `bosn widget`. A crash is not a quit: systemd restarts it, backing off after
 five failures in a minute.
@@ -146,26 +148,47 @@ five failures in a minute.
 run, and for the completion of runs a human started. Agent successes stay
 silent.
 
-**KDE Plasma on Wayland.** The window app id is `bosn-widget`. Until
-kernal-api#384 adds keep-above and undecorated windows, a KWin rule does the
-placement. Declare it in the desktop configuration (zackees/nixos):
+**Windows.** Every window carries the app id `dev.bosn.widget`. Each is
+opened once, at its final size, and then reused:
 
-```ini
-[bosn widget bubble]
-Description=bosn widget bubble
-wmclass=bosn-widget
-wmclassmatch=1
-title=bosn
-titlematch=1
-above=true
-aboverule=2
-noborder=true
-noborderrule=2
-skiptaskbar=true
-skiptaskbarrule=2
-skippager=true
-skippagerrule=2
+- The bubble is undecorated and transparent, and asks to stay above other
+  windows and out of the taskbar. On X11, Windows and macOS it also asks for a
+  fixed spot near the top-left corner, because kernal-api cannot report the
+  work area yet (zackees/kernal-api#393). On macOS, leaving the taskbar puts the
+  whole widget process in the accessory policy, with no Dock icon or menu bar.
+- The panel is shown and hidden; it is not closed and reopened.
+- The full view navigates to the new page and takes focus, so there is only
+  ever one.
+
+**KDE Plasma on Wayland.** The compositor decides stacking, the taskbar and
+placement, so the bubble's requests do nothing there. A KWin rule supplies
+them. It matches the app id and the bubble's title, `bosn bubble`; the panel
+(`bosn panel`) and the full view (`bosn`) stay ordinary windows. Set
+`position` to the bottom-right corner of your work area, minus the 72 px bubble
+and a margin. Then apply the rule, or declare the same keys in the desktop
+configuration (zackees/nixos, plasma-manager `window-rules`):
+
+```sh
+g=bosn-widget-bubble
+k() { kwriteconfig6 --file kwinrulesrc --group "$g" --key "$1" "$2"; }
+k Description "bosn widget bubble"
+k wmclass dev.bosn.widget; k wmclassmatch 1        # 1 = exact match
+k title "bosn bubble";     k titlematch 1
+k above true;              k aboverule 2           # 2 = force
+k noborder true;           k noborderrule 2
+k skiptaskbar true;        k skiptaskbarrule 2
+k skippager true;          k skippagerrule 2
+k skipswitcher true;       k skipswitcherrule 2
+k position "3887,1399";    k positionrule 2
+# With other rules already present, list them all here and count them.
+kwriteconfig6 --file kwinrulesrc --group General --key count 1
+kwriteconfig6 --file kwinrulesrc --group General --key rules "$g"
+qdbus org.kde.KWin /KWin reconfigure
 ```
+
+On Wayland, size every window when it opens. A later resize is not applied on
+some hosts (zackees/kernal-api#390). Compositor-anchored placement without a
+rule is zackees/kernal-api#389.
 
 ## Fleet adapter plan (`bosn ci plan --adapter`)
 
@@ -427,5 +450,5 @@ These are tracked in #323:
 
 - Cross-repository sharing of compiler caches (zccache/soldr) outside
   `actions/cache`.
-- Transparent, compositor-anchored widget windows (zackees/kernal-api#384; KWin rules cover keep-above today).
+- Compositor-anchored widget placement without a KWin rule (zackees/kernal-api#389), and a bottom-right default placement elsewhere (zackees/kernal-api#393).
 - GitLab.

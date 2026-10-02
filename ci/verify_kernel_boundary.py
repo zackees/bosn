@@ -15,7 +15,7 @@ from pathlib import Path
 
 import tomllib
 
-EXPECTED_KERNEL_VERSION = "=0.1.14"
+EXPECTED_KERNEL_VERSION = "=0.1.24"
 CRATES_IO_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
 # These effects belong behind kernal-api.  Bosn may depend on application
 # libraries (for example prost and serde), but must not add a second OS,

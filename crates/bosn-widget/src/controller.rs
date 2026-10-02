@@ -11,10 +11,14 @@ use bosn_service::{
 use kernal_api::{
     async_engine,
     platform::fs::OwnedFileLock,
-    webview::{ExternalWebviewClient, WebviewHandle, WebviewPermissions, WebviewWindowOptions},
+    webview::{ExternalWebviewClient, WebviewHandle, WebviewPermissions, WebviewUrlGrant},
 };
 
-use crate::notify::Notifier;
+use crate::{
+    layout::{Layout, Presence, Step},
+    notify::Notifier,
+    windows::Window,
+};
 
 const POLL: Duration = Duration::from_secs(1);
 
@@ -58,33 +62,117 @@ fn session_id() -> String {
         .unwrap_or_else(|_| "default".into())
 }
 
-/// The three windows this process owns.
+/// The three windows this process owns, and what each is doing.
 #[derive(Default)]
 struct Windows {
+    layout: Layout,
     bubble: Option<WebviewHandle>,
     panel: Option<WebviewHandle>,
     full: Option<WebviewHandle>,
 }
 
-/// Open a daemon page through a fresh single-use grant (views are
-/// incognito, so each window signs in on its own).
-async fn open(
-    views: &ExternalWebviewClient,
-    client: &Client,
-    path: &str,
-    title: &str,
-    size: (u32, u32),
-) -> Option<WebviewHandle> {
-    let grant = client.ci_ui_grant(Some(path.into())).await.ok()?;
-    let options = WebviewWindowOptions::new(title, size.0, size.1).ok()?;
+impl Windows {
+    fn slot(&mut self, window: Window) -> &mut Option<WebviewHandle> {
+        match window {
+            Window::Bubble => &mut self.bubble,
+            Window::Panel => &mut self.panel,
+            Window::Full => &mut self.full,
+        }
+    }
+
+    /// Drop a window that is gone; the next command that needs it reopens it.
+    fn forget(&mut self, window: Window) {
+        *self.slot(window) = None;
+        self.layout.lost(window);
+    }
+
+    /// Forget a panel or full view the user closed with its title bar.
+    async fn forget_closed(&mut self) {
+        for window in [Window::Panel, Window::Full] {
+            if let Some(handle) = self.slot(window).as_ref()
+                && closed(handle).await
+            {
+                self.forget(window);
+            }
+        }
+    }
+
+    /// Carry out one daemon command: plan it, run each step, and stop at the
+    /// first failure (that window is forgotten and reopens next time).
+    async fn apply(&mut self, command: WidgetCommand, views: &ExternalWebviewClient, client: &Client) {
+        self.forget_closed().await;
+        for step in self.layout.plan(command) {
+            if self.execute(&step, views, client).await {
+                self.layout.record(&step);
+            } else {
+                if let Some(window) = step.window() {
+                    self.forget(window);
+                }
+                return;
+            }
+        }
+    }
+
+    /// Run one step; `false` when it did not take effect.
+    async fn execute(&mut self, step: &Step, views: &ExternalWebviewClient, client: &Client) -> bool {
+        match step {
+            Step::Open { window, path } => {
+                let opened = open(views, client, *window, path).await;
+                let ok = opened.is_some();
+                *self.slot(*window) = opened;
+                ok
+            }
+            Step::Show(window) => match self.slot(*window) {
+                Some(handle) => handle.show().await.is_ok(),
+                None => false,
+            },
+            Step::Hide(window) => match self.slot(*window) {
+                Some(handle) => handle.hide().await.is_ok(),
+                None => false,
+            },
+            Step::Focus(window) => match self.slot(*window) {
+                Some(handle) => handle.focus().await.is_ok(),
+                None => false,
+            },
+            Step::Navigate { path } => match (&self.full, grant(client, path).await) {
+                (Some(full), Some(grant)) => full.navigate(&grant).await.is_ok(),
+                _ => false,
+            },
+            Step::External { url } => {
+                crate::notify::open_external(url);
+                true
+            }
+        }
+    }
+}
+
+/// A daemon page's URL with a fresh single-use sign-in token (views are
+/// incognito, so each window, and each navigation, signs in on its own).
+async fn page_url(client: &Client, path: &str) -> Option<String> {
+    client.ci_ui_grant(Some(path.into())).await.ok().map(|grant| grant.url)
+}
+
+async fn grant(client: &Client, path: &str) -> Option<WebviewUrlGrant> {
+    WebviewUrlGrant::new(&page_url(client, path).await?).ok()
+}
+
+/// Open `window` on a daemon page, presented for this display.
+async fn open(views: &ExternalWebviewClient, client: &Client, window: Window, path: &str) -> Option<WebviewHandle> {
+    let url = page_url(client, path).await?;
+    let options = window.options(views.window_support()).ok()?;
     views
-        .open_webview_with_options(&grant.url, options, WebviewPermissions::deny_all())
+        .open_webview_with_options(&url, options, WebviewPermissions::deny_all())
         .await
         .ok()
 }
 
+/// Whether the window is gone. Races the untimed terminal wait against a
+/// short timer: dropping that wait leaves the window alive, whereas a timed
+/// `wait_until_terminal` revokes (closes) the window when its timeout lapses.
 async fn closed(handle: &WebviewHandle) -> bool {
-    handle.wait_until_terminal(Duration::from_millis(1)).await.is_ok()
+    async_engine::timeout(Duration::from_millis(1), handle.wait_for_terminal())
+        .await
+        .is_ok()
 }
 
 pub async fn run(views: ExternalWebviewClient, state_dir: std::path::PathBuf, explicit: bool) {
@@ -115,21 +203,24 @@ pub async fn run(views: ExternalWebviewClient, state_dir: std::path::PathBuf, ex
     let mut windows = Windows::default();
     let mut notifier = Notifier::default();
     loop {
-        if windows.bubble.is_none() {
-            windows.bubble = open(&views, &client, "/widget/bubble", "bosn", (72, 72)).await;
+        if windows.layout.presence(Window::Bubble) == Presence::Absent {
+            windows.apply(WidgetCommand::Show, &views, &client).await;
         }
         if let Some(bubble) = &windows.bubble
             && closed(bubble).await
         {
             // Closing the bubble is the deliberate "quit".
-            let _ = widget(&client, CiRequest::WidgetDismiss { session: session.clone() }).await;
+            let _ = widget(&client, CiRequest::WidgetDismiss {
+                session: session.clone(),
+            })
+            .await;
             let _ = views.request_exit();
             return;
         }
         match widget(&client, CiRequest::WidgetPoll { pid }).await {
             Ok(reply) => {
                 for command in reply.commands {
-                    apply(command, &views, &client, &mut windows).await;
+                    windows.apply(command, &views, &client).await;
                 }
             }
             // A daemon restart: re-register once it answers again.
@@ -144,37 +235,5 @@ pub async fn run(views: ExternalWebviewClient, state_dir: std::path::PathBuf, ex
         }
         notifier.check(&client).await;
         async_engine::sleep(POLL).await;
-    }
-}
-
-async fn apply(
-    command: WidgetCommand,
-    views: &ExternalWebviewClient,
-    client: &Client,
-    windows: &mut Windows,
-) {
-    match command {
-        WidgetCommand::Toggle => match windows.panel.take() {
-            Some(panel) if !closed(&panel).await => {
-                let _ = panel.close().await;
-            }
-            _ => {
-                windows.panel = open(views, client, "/widget/panel", "bosn panel", (420, 640)).await;
-            }
-        },
-        WidgetCommand::Show => {
-            if let Some(bubble) = windows.bubble.take() {
-                let _ = bubble.close().await;
-            }
-            windows.bubble = open(views, client, "/widget/bubble", "bosn", (72, 72)).await;
-        }
-        WidgetCommand::Open { path } => {
-            // Exactly one full-view window: replace it on the new page.
-            if let Some(full) = windows.full.take() {
-                let _ = full.close().await;
-            }
-            windows.full = open(views, client, &path, "bosn", (1280, 800)).await;
-        }
-        WidgetCommand::OpenExternal { url } => crate::notify::open_external(&url),
     }
 }
