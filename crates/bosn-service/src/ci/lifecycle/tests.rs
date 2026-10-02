@@ -5,6 +5,7 @@ use kernal_api::async_engine::{CancellationSource, RuntimeBuilder};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 /// Fault points for the synthetic engine.

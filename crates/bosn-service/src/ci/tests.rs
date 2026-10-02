@@ -623,3 +623,43 @@ fn a_run_whose_client_went_away_still_ends_and_is_cleaned() {
         assert_eq!(backend.live(), 0, "the engine is removed with no client");
     });
 }
+
+#[test]
+fn a_silent_step_still_shows_its_progress_while_it_runs() {
+    with_registry(|registry, dir| async move {
+        // Two lines, then silence until the timeout.
+        let backend = Arc::new(FakeBackend::with(Faults {
+            hang: true,
+            ..Faults::default()
+        }));
+        let runtime = CiRuntime::start(&dir, registry, backend, 1);
+        let staging = new_uuid().await.unwrap();
+        staged(&runtime, &staging);
+        let mut submission = request(&staging, 'e');
+        submission.timeout_secs = Some(10);
+        let run = call::<SubmitReply>(
+            &runtime,
+            CiRequest::Submit {
+                request: submission,
+            },
+        )
+        .await
+        .run;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let record = runtime.record(&run).unwrap();
+            assert_eq!(record.state, RunState::Running, "still running");
+            let shown = record.tree.jobs().any(|j| !j.sections.is_empty());
+            if shown {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the running step never became visible: {record:?}"
+            );
+            async_engine::sleep(Duration::from_millis(50)).await;
+        }
+        let _: CancelReply = call(&runtime, CiRequest::Cancel { run: run.clone() }).await;
+        wait_done(&runtime, &run).await;
+    });
+}

@@ -67,6 +67,11 @@ impl EngineObserver for RunObserver {
         self.parser = ActParser::new(RunTree::declared(&jobs));
         self.publish();
     }
+    fn tick(&mut self) {
+        if self.last_publish.elapsed() > PUBLISH_INTERVAL {
+            self.publish();
+        }
+    }
     fn line(&mut self, line: EngineLine) {
         let seq = self.next_seq();
         let record = match line {

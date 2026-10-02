@@ -68,7 +68,13 @@ pub trait EngineObserver: Send {
     fn note(&mut self, text: &str);
     fn declared(&mut self, listing: &str);
     fn line(&mut self, line: EngineLine);
+    /// Called every [`PROGRESS_TICK`] while no line arrives, so a silent
+    /// step's progress still becomes visible.
+    fn tick(&mut self) {}
 }
+
+/// How often a quiet execution gives the observer a chance to publish.
+pub const PROGRESS_TICK: Duration = Duration::from_millis(250);
 
 /// Registry transition times must never go backwards.
 struct Clock(f64);
@@ -197,8 +203,12 @@ pub async fn run_on_engine(
             end
         };
         let drain = async {
-            while let Some(line) = receiver.recv().await {
-                observer.line(line);
+            loop {
+                match async_engine::timeout(PROGRESS_TICK, receiver.recv()).await {
+                    Ok(Some(line)) => observer.line(line),
+                    Ok(None) => break,
+                    Err(_) => observer.tick(),
+                }
             }
         };
         let (end, ()) = async_engine::join(execute, drain).await;

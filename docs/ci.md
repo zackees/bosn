@@ -270,6 +270,26 @@ All runtime state is under the daemon state directory (`ci/`):
 The newest 200 finished runs are kept; `runners prune-cache --older-than-secs N
 --max-bytes N` prunes further.
 
+## Live tests
+
+The Docker-backed tests are opt-in (`#[ignore]`):
+
+```sh
+cargo test -p bosn-service --test ci_live --test ci_agent_live -- --ignored --test-threads 1
+```
+
+They check four things:
+
+- The host engine's containers, networks, volumes and images are unchanged
+  after success, failure, timeout, a killed client and a killed daemon.
+- The engine has no bind mount and its socket belongs to the nested daemon.
+- The recorded matrix/`needs:` fixture yields its tree, exit 1 and the
+  failing step's tail.
+- A second run restores `actions/cache`.
+
+The leak check compares the whole host engine, so run it while nothing else
+creates Docker resources.
+
 ## Not yet
 
 These are tracked in #323:
