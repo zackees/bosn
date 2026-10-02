@@ -65,6 +65,8 @@ pub struct ActRequiredCell {
     pub job: String,
     pub runner: String,
     pub proof_scope: ActProofScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matrix: Option<crate::act_coverage::ActMatrixTuple>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -234,7 +236,19 @@ impl ActAdapterV1 {
             return Err(refuse("empty or oversized required cell inventory"));
         }
         let mut ids = BTreeSet::new();
+        let mut tuples = BTreeSet::new();
         for cell in &self.cells {
+            if let Some(matrix) = &cell.matrix {
+                matrix.validate().map_err(refuse)?;
+                if !tuples.insert((
+                    &cell.workflow,
+                    &cell.job,
+                    &cell.runner,
+                    matrix.canonical_json(),
+                )) {
+                    return Err(refuse("duplicate required physical tuple"));
+                }
+            }
             if !identifier(&cell.id)
                 || !identifier(&cell.job)
                 || !identifier(&cell.runner)
