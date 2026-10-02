@@ -43,11 +43,13 @@ pub use prepare::{
     prepare_setup_image,
 };
 
+mod creation;
 mod ensure;
 pub use ensure::{
     SetupEnsureCommand, SetupEnsureEngine, SetupEnsureError, SetupEnsureMacosGuest,
     SetupEnsureMount, SetupEnsureObservedContainer, SetupEnsureRequest, SetupEnsureResponse,
-    SetupEnsureResult, SetupEnsureTmpfs, adopt_setup_app, ensure_setup_app,
+    SetupEnsureResult, SetupEnsureTmpfs, adopt_setup_app, ensure_setup_app, setup_container_name,
+    verify_setup_observation,
 };
 
 mod shell;

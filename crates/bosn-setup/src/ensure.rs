@@ -25,6 +25,7 @@ const LABEL_MANAGED: &str = "com.zackees.bosn.setup-managed";
 const LABEL_CONTENT_SHA256: &str = "com.zackees.bosn.setup-content-sha256";
 const LABEL_CONTAINER_NAME: &str = "com.zackees.bosn.setup-container";
 const MANAGED_VALUE: &str = "v1";
+const LABEL_CREATION_PROFILE: &str = "com.zackees.bosn.setup-creation-profile";
 
 /// A document-derived workspace bind mount for a persistent setup app.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -82,6 +83,9 @@ pub enum SetupEnsureCommand {
     Inspect {
         container_name: String,
     },
+    ImageInspect {
+        image_identity: String,
+    },
     Create {
         container_name: String,
         image_identity: String,
@@ -109,9 +113,7 @@ impl SetupEnsureCommand {
                 "volume".into(),
                 "inspect".into(),
                 "--format".into(),
-                format!(
-                    "{{{{index .Labels \"{LABEL_MANAGED}\"}}}}\t{{{{index .Labels \"{LABEL_CONTENT_SHA256}\"}}}}\t{{{{index .Labels \"{LABEL_CONTAINER_NAME}\"}}}}"
-                ),
+                "{{json .}}".into(),
                 volume_name.clone(),
             ],
             Self::VolumeCreate { volume } => {
@@ -127,10 +129,15 @@ impl SetupEnsureCommand {
                 "container".into(),
                 "inspect".into(),
                 "--format".into(),
-                format!(
-                    "{{{{.Id}}}}\t{{{{.State.Running}}}}\t{{{{.Image}}}}\t{{{{index .Config.Labels \"{LABEL_MANAGED}\"}}}}\t{{{{index .Config.Labels \"{LABEL_CONTENT_SHA256}\"}}}}\t{{{{index .Config.Labels \"{LABEL_CONTAINER_NAME}\"}}}}"
-                ),
+                "{{json .}}".into(),
                 container_name.clone(),
+            ],
+            Self::ImageInspect { image_identity } => vec![
+                "image".into(),
+                "inspect".into(),
+                "--format".into(),
+                "{{json .}}".into(),
+                image_identity.clone(),
             ],
             Self::Create {
                 container_name,
@@ -245,6 +252,9 @@ pub struct SetupEnsureObservedContainer {
     pub running: bool,
     pub image_identity: String,
     pub labels: BTreeMap<String, String>,
+    /// Bounded actual Docker Config, HostConfig and Mounts evidence. Labels
+    /// alone are insufficient to authorize reuse.
+    pub configuration: serde_json::Value,
 }
 
 /// Typed response corresponding to one [`SetupEnsureCommand`].
@@ -284,7 +294,16 @@ impl SetupEnsureEngine for DockerEngine {
     ) -> Self::StreamFuture<'a> {
         let engine = self.with_args(command.docker_args());
         Box::pin(async move {
-            let result = engine.stream(options, Some(cancellation), events).await?;
+            let result = if matches!(
+                command,
+                SetupEnsureCommand::Inspect { .. }
+                    | SetupEnsureCommand::ImageInspect { .. }
+                    | SetupEnsureCommand::VolumeInspect { .. }
+            ) {
+                private_observation(&engine, options, cancellation).await?
+            } else {
+                engine.stream(options, Some(cancellation), events).await?
+            };
             if !matches!(command, SetupEnsureCommand::Inspect { .. }) {
                 return Ok(SetupEnsureResponse::Command(result));
             }
@@ -298,6 +317,24 @@ impl SetupEnsureEngine for DockerEngine {
             Ok(SetupEnsureResponse::Inspection(Some(observed), result))
         })
     }
+}
+
+/// Raw Config/Env is verifier input, never job-log output. Keep the same
+/// cancellation/deadline/reap path while draining an owned private channel.
+async fn private_observation(
+    engine: &DockerEngine,
+    options: RunOptions,
+    cancellation: &CancellationToken,
+) -> Result<CommandResult, CommandError> {
+    let (events, mut receiver) = kernal_api::async_engine::channel(32);
+    let drain =
+        kernal_api::async_engine::launch(async move { while receiver.recv().await.is_some() {} });
+    let result = engine.stream(options, Some(cancellation), &events).await;
+    drop(events);
+    drain
+        .await
+        .map_err(|e| CommandError::Io(std::io::Error::other(e.to_string())))?;
+    result
 }
 
 /// All validated inputs for one ownership-safe setup app ensure.
@@ -424,18 +461,33 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
                 ));
             }
             if result.exit_code != 0 && result.exit_code != 1 {
-                return Err(action_failed("container inspect", &result));
+                return Err(SetupEnsureError::ActionFailed {
+                    action: "container inspect",
+                    detail: "private container observation failed".into(),
+                });
             }
             observed
         }
         SetupEnsureResponse::Command(result) => {
             consume_output(&result, &mut remaining_output, request.options.output_limit)?;
-            return Err(action_failed("container inspect", &result));
+            return Err(SetupEnsureError::ActionFailed {
+                action: "container inspect",
+                detail: "private container observation failed".into(),
+            });
         }
     };
 
     if let Some(observed) = observed {
         validate_observed(&observed, &derived)?;
+        verify_configuration(
+            engine,
+            &observed,
+            &derived,
+            &deadline,
+            &mut remaining_output,
+            &request,
+        )
+        .await?;
         if observed.running {
             return Ok(SetupEnsureResult {
                 container_name: derived.container_name,
@@ -473,9 +525,8 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
     }
 
     // The daemon wrote durable volume intents before this primitive was
-    // invoked. A matching existing container already proves that its mounts
-    // were created from this immutable plan, so do not mutate or re-inspect
-    // volumes on its reuse path. For a new container, create/reuse every exact
+    // invoked. A matching existing container has now passed actual mount and
+    // configuration and volume-metadata verification. For a new container, create/reuse every exact
     // labelled volume before the container itself, leaving only recoverable
     // intent-backed volume state if an attempt is interrupted.
     for volume in &derived.volumes {
@@ -496,22 +547,9 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
         };
         consume_output(&result, &mut remaining_output, request.options.output_limit)?;
         if result.ok() {
-            let observed = std::str::from_utf8(&result.stdout).unwrap_or("").trim();
-            let expected = [
-                volume.labels.get(LABEL_MANAGED).map_or("", String::as_str),
-                volume
-                    .labels
-                    .get(LABEL_CONTENT_SHA256)
-                    .map_or("", String::as_str),
-                volume
-                    .labels
-                    .get(LABEL_CONTAINER_NAME)
-                    .map_or("", String::as_str),
-            ]
-            .join("\t");
-            if observed != expected {
-                return Err(SetupEnsureError::OwnershipMismatch);
-            }
+            let observed = crate::creation::bounded_json(&result.stdout)
+                .map_err(|_| SetupEnsureError::OwnershipMismatch)?;
+            verify_volume_observation(volume, &observed, None)?;
         } else if result.exit_code == 1 {
             let response = invoke(
                 engine,
@@ -530,7 +568,9 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
                 request.options.output_limit,
             )?;
         } else {
-            return Err(action_failed("volume inspect", &result));
+            return Err(SetupEnsureError::EngineProtocol(
+                "private volume inspect failed",
+            ));
         }
     }
 
@@ -549,6 +589,33 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
         request.options.output_limit,
     )?;
     let container_id = parse_created_id(&created.stdout)?;
+    let response = invoke(
+        engine,
+        SetupEnsureCommand::Inspect {
+            container_name: derived.container_name.clone(),
+        },
+        &deadline,
+        &mut remaining_output,
+        &request,
+    )
+    .await?;
+    let SetupEnsureResponse::Inspection(Some(observed), result) = response else {
+        return Err(SetupEnsureError::OwnershipMismatch);
+    };
+    consume_output(&result, &mut remaining_output, request.options.output_limit)?;
+    if !result.ok() || observed.container_id != container_id {
+        return Err(SetupEnsureError::OwnershipMismatch);
+    }
+    validate_observed(&observed, &derived)?;
+    verify_configuration(
+        engine,
+        &observed,
+        &derived,
+        &deadline,
+        &mut remaining_output,
+        &request,
+    )
+    .await?;
     let response = invoke(
         engine,
         SetupEnsureCommand::Start {
@@ -625,9 +692,23 @@ pub async fn adopt_setup_app<E: SetupEnsureEngine>(
                 "absent inspection has a successful result",
             ));
         }
-        None => return Err(action_failed("container inspect", &result)),
+        None => {
+            return Err(SetupEnsureError::ActionFailed {
+                action: "container inspect",
+                detail: "private container observation failed".into(),
+            });
+        }
     };
     validate_observed(&observed, &derived)?;
+    verify_configuration(
+        engine,
+        &observed,
+        &derived,
+        &deadline,
+        &mut remaining_output,
+        &request,
+    )
+    .await?;
     Ok(SetupEnsureResult {
         container_name: derived.container_name,
         container_id: observed.container_id,
@@ -659,14 +740,541 @@ async fn invoke<E: SetupEnsureEngine>(
     if remaining.is_zero() {
         return Err(SetupEnsureError::Deadline);
     }
+    let output_limit = if matches!(
+        command,
+        SetupEnsureCommand::Inspect { .. }
+            | SetupEnsureCommand::ImageInspect { .. }
+            | SetupEnsureCommand::VolumeInspect { .. }
+    ) {
+        (*remaining_output).min(crate::creation::MAX_OBSERVATION_BYTES)
+    } else {
+        *remaining_output
+    };
     Ok(engine
         .stream(
             command,
-            RunOptions::streaming(remaining, *remaining_output),
+            RunOptions::streaming(remaining, output_limit),
             request.cancellation,
             request.events,
         )
         .await?)
+}
+
+async fn verify_configuration<E: SetupEnsureEngine>(
+    engine: &E,
+    observed: &SetupEnsureObservedContainer,
+    expected: &DerivedEnsure,
+    deadline: &Deadline,
+    remaining_output: &mut usize,
+    request: &SetupEnsureRequest<'_>,
+) -> Result<(), SetupEnsureError> {
+    let response = invoke(
+        engine,
+        SetupEnsureCommand::ImageInspect {
+            image_identity: expected.image_identity.clone(),
+        },
+        deadline,
+        remaining_output,
+        request,
+    )
+    .await?;
+    let SetupEnsureResponse::Command(result) = response else {
+        return Err(SetupEnsureError::EngineProtocol(
+            "image configuration observation protocol mismatch",
+        ));
+    };
+    consume_output(&result, remaining_output, request.options.output_limit)?;
+    if !result.ok() {
+        return Err(SetupEnsureError::EngineProtocol(
+            "private image configuration inspect failed",
+        ));
+    }
+    let image = crate::creation::bounded_json(&result.stdout)
+        .map_err(|_| SetupEnsureError::OwnershipMismatch)?;
+    verify_actual_configuration(observed, expected, &image)?;
+    for volume in &expected.volumes {
+        let response = invoke(
+            engine,
+            SetupEnsureCommand::VolumeInspect {
+                volume_name: volume.name.clone(),
+            },
+            deadline,
+            remaining_output,
+            request,
+        )
+        .await?;
+        let SetupEnsureResponse::Command(result) = response else {
+            return Err(SetupEnsureError::EngineProtocol(
+                "private volume observation protocol mismatch",
+            ));
+        };
+        consume_output(&result, remaining_output, request.options.output_limit)?;
+        if !result.ok() {
+            return Err(SetupEnsureError::OwnershipMismatch);
+        }
+        let receipt = crate::creation::bounded_json(&result.stdout)
+            .map_err(|_| SetupEnsureError::OwnershipMismatch)?;
+        verify_volume_observation(
+            volume,
+            &receipt,
+            Some(container_volume_source(observed, volume)?),
+        )?;
+    }
+    Ok(())
+}
+
+fn container_volume_source<'a>(
+    observed: &'a SetupEnsureObservedContainer,
+    expected: &SetupEnsureVolume,
+) -> Result<&'a str, SetupEnsureError> {
+    observed
+        .configuration
+        .get("Mounts")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|mounts| {
+            mounts.iter().find(|m| {
+                m.get("Destination").and_then(serde_json::Value::as_str)
+                    == Some(expected.target.as_str())
+                    && m.get("Name").and_then(serde_json::Value::as_str)
+                        == Some(expected.name.as_str())
+            })
+        })
+        .and_then(|m| m.get("Source").and_then(serde_json::Value::as_str))
+        .ok_or(SetupEnsureError::OwnershipMismatch)
+}
+
+fn verify_volume_observation(
+    expected: &SetupEnsureVolume,
+    observed: &serde_json::Value,
+    source: Option<&str>,
+) -> Result<(), SetupEnsureError> {
+    use serde_json::Value;
+    let mismatch = || SetupEnsureError::OwnershipMismatch;
+    if observed.get("Name").and_then(Value::as_str) != Some(expected.name.as_str())
+        || observed.get("Driver").and_then(Value::as_str) != Some("local")
+        || observed.get("Scope").and_then(Value::as_str) != Some("local")
+    {
+        return Err(mismatch());
+    }
+    match observed.get("Options") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(options)) if options.is_empty() => {}
+        _ => return Err(mismatch()),
+    }
+    for (key, value) in &expected.labels {
+        if observed
+            .get("Labels")
+            .and_then(|v| v.get(key))
+            .and_then(Value::as_str)
+            != Some(value.as_str())
+        {
+            return Err(mismatch());
+        }
+    }
+    let mountpoint = observed
+        .get("Mountpoint")
+        .and_then(Value::as_str)
+        .ok_or_else(mismatch)?;
+    // Docker's daemon-side path is not a host-client filesystem path (notably
+    // on Desktop). Require bounded normalized absolute spelling and exact
+    // agreement with the container attachment, never guess a daemon root.
+    if mountpoint == "/"
+        || validate_container_path(mountpoint).is_err()
+        || source.is_some_and(|source| source != mountpoint)
+    {
+        return Err(mismatch());
+    }
+    Ok(())
+}
+
+fn verify_actual_configuration(
+    observed: &SetupEnsureObservedContainer,
+    expected: &DerivedEnsure,
+    image: &serde_json::Value,
+) -> Result<(), SetupEnsureError> {
+    use serde_json::Value;
+    let fail = || SetupEnsureError::OwnershipMismatch;
+    if image.get("Id").and_then(Value::as_str) != Some(expected.image_identity.as_str()) {
+        return Err(fail());
+    }
+    let actual = &observed.configuration;
+    if actual.get("Id").and_then(Value::as_str) != Some(observed.container_id.as_str())
+        || actual.get("Image").and_then(Value::as_str) != Some(expected.image_identity.as_str())
+        || actual.get("Name").and_then(Value::as_str)
+            != Some(format!("/{}", expected.container_name).as_str())
+        || actual.pointer("/State/Running").and_then(Value::as_bool) != Some(observed.running)
+    {
+        return Err(fail());
+    }
+    let base = image
+        .get("Config")
+        .and_then(Value::as_object)
+        .ok_or_else(fail)?;
+    let config = actual
+        .get("Config")
+        .and_then(Value::as_object)
+        .ok_or_else(fail)?;
+    let host = actual
+        .get("HostConfig")
+        .and_then(Value::as_object)
+        .ok_or_else(fail)?;
+    for (key, value) in &expected.labels {
+        if config
+            .get("Labels")
+            .and_then(|v| v.get(key))
+            .and_then(Value::as_str)
+            != Some(value.as_str())
+        {
+            return Err(fail());
+        }
+    }
+    for key in ["Healthcheck", "StopSignal"] {
+        if config.get(key).filter(|v| !v.is_null()) != base.get(key).filter(|v| !v.is_null()) {
+            return Err(fail());
+        }
+    }
+    for key in ["Tty", "OpenStdin", "StdinOnce", "AttachStdin"] {
+        if config.get(key).and_then(Value::as_bool) != Some(false) {
+            return Err(fail());
+        }
+    }
+    let strings = |value: Option<&Value>| -> Result<Vec<String>, SetupEnsureError> {
+        match value {
+            None | Some(Value::Null) => Ok(vec![]),
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .filter(|s| s.len() <= 16 * 1024 && !s.contains('\0'))
+                        .map(str::to_owned)
+                        .ok_or_else(fail)
+                })
+                .collect(),
+            _ => Err(fail()),
+        }
+    };
+    let scalar = |value: Option<&Value>| -> Result<String, SetupEnsureError> {
+        match value {
+            None | Some(Value::Null) => Ok(String::new()),
+            Some(Value::String(s)) if s.len() <= 16 * 1024 && !s.contains('\0') => Ok(s.clone()),
+            _ => Err(fail()),
+        }
+    };
+    // Every inherited VOLUME must be overridden by an explicit verified
+    // attachment (notably dockurr's /storage). Never accept anonymous storage.
+    let volume_keys = |value: Option<&Value>| -> Result<BTreeSet<String>, SetupEnsureError> {
+        match value {
+            None | Some(Value::Null) => Ok(BTreeSet::new()),
+            Some(Value::Object(entries))
+                if entries
+                    .values()
+                    .all(|v| v.as_object().is_some_and(|v| v.is_empty())) =>
+            {
+                Ok(entries.keys().cloned().collect())
+            }
+            _ => Err(fail()),
+        }
+    };
+    let inherited_volumes = volume_keys(base.get("Volumes"))?;
+    if volume_keys(config.get("Volumes"))? != inherited_volumes {
+        return Err(fail());
+    }
+    for target in inherited_volumes {
+        if !expected.mounts.iter().any(|m| m.target == target)
+            && !expected.volumes.iter().any(|v| v.target == target)
+            && !expected.tmpfs.iter().any(|m| m.target == target)
+            && expected
+                .host_docker_socket
+                .as_ref()
+                .is_none_or(|s| s.target != target)
+        {
+            return Err(fail());
+        }
+    }
+    let mut environment = BTreeMap::new();
+    for item in strings(base.get("Env"))? {
+        let (key, value) = item.split_once('=').ok_or_else(fail)?;
+        if environment
+            .insert(key.to_owned(), value.to_owned())
+            .is_some()
+        {
+            return Err(fail());
+        }
+    }
+    environment.extend(expected.environment.clone());
+    if let Some(guest) = &expected.macos_guest {
+        environment.extend([
+            ("VERSION".into(), guest.version.clone()),
+            ("RAM_SIZE".into(), guest.ram_size.clone()),
+            ("DISK_SIZE".into(), guest.disk_size.clone()),
+            ("CPU_CORES".into(), guest.cpu_cores.to_string()),
+        ]);
+    }
+    let mut actual_env = BTreeMap::new();
+    for item in strings(config.get("Env"))? {
+        let (key, value) = item.split_once('=').ok_or_else(fail)?;
+        if actual_env
+            .insert(key.to_owned(), value.to_owned())
+            .is_some()
+        {
+            return Err(fail());
+        }
+    }
+    let expected_cmd = match (&expected.command, &expected.macos_guest) {
+        (Some(command), None) => crate::shell::login_shell_args(command).to_vec(),
+        _ => strings(base.get("Cmd"))?,
+    };
+    if environment != actual_env
+        || strings(config.get("Cmd"))? != expected_cmd
+        || strings(config.get("Entrypoint"))? != strings(base.get("Entrypoint"))?
+        || scalar(config.get("User"))? != scalar(base.get("User"))?
+        || scalar(config.get("WorkingDir"))?
+            != expected
+                .workdir
+                .clone()
+                .unwrap_or(scalar(base.get("WorkingDir"))?)
+    {
+        return Err(fail());
+    }
+    if host.get("Privileged").and_then(Value::as_bool) != Some(false)
+        || host
+            .get("NetworkMode")
+            .and_then(Value::as_str)
+            .is_none_or(|v| !["default", "bridge"].contains(&v))
+    {
+        return Err(fail());
+    }
+    for field in [
+        "Binds",
+        "VolumesFrom",
+        "DeviceRequests",
+        "SecurityOpt",
+        "GroupAdd",
+        "DeviceCgroupRules",
+    ] {
+        if !matches!(host.get(field), Some(Value::Null))
+            && !host
+                .get(field)
+                .is_some_and(|v| v.as_array().is_some_and(Vec::is_empty))
+        {
+            return Err(fail());
+        }
+    }
+    if host.get("ReadonlyRootfs").and_then(Value::as_bool) != Some(false) {
+        return Err(fail());
+    }
+    if host.get("PublishAllPorts").and_then(Value::as_bool) != Some(false) {
+        return Err(fail());
+    }
+    if host.get("AutoRemove").and_then(Value::as_bool) != Some(false)
+        || host.get("CgroupnsMode").and_then(Value::as_str) != Some("private")
+        || host.get("RestartPolicy")
+            != Some(&serde_json::json!({"Name":"no","MaximumRetryCount":0}))
+    {
+        return Err(fail());
+    }
+    for field in ["PidMode", "UTSMode", "UsernsMode"] {
+        if host.get(field).and_then(Value::as_str) != Some("") {
+            return Err(fail());
+        }
+    }
+    if host
+        .get("IpcMode")
+        .and_then(Value::as_str)
+        .is_none_or(|v| !["private", ""].contains(&v))
+    {
+        return Err(fail());
+    }
+    let mut wanted = BTreeMap::new();
+    for mount in &expected.mounts {
+        wanted.insert(
+            mount.target.clone(),
+            (
+                "bind".to_owned(),
+                mount.source.to_string_lossy().into_owned(),
+                !mount.readonly,
+            ),
+        );
+    }
+    for volume in &expected.volumes {
+        wanted.insert(
+            volume.target.clone(),
+            ("volume".to_owned(), volume.name.clone(), true),
+        );
+    }
+    if let Some(socket) = &expected.host_docker_socket {
+        wanted.insert(
+            socket.target.clone(),
+            (
+                "bind".into(),
+                socket.source.host_path().into(),
+                !socket.readonly,
+            ),
+        );
+    }
+    let mut seen = BTreeMap::new();
+    let mut seen_tmpfs = BTreeSet::new();
+    for mount in actual
+        .get("Mounts")
+        .and_then(Value::as_array)
+        .ok_or_else(fail)?
+    {
+        let kind = mount.get("Type").and_then(Value::as_str).ok_or_else(fail)?;
+        let target = mount
+            .get("Destination")
+            .and_then(Value::as_str)
+            .ok_or_else(fail)?;
+        if kind == "tmpfs" {
+            let wanted = expected
+                .tmpfs
+                .iter()
+                .find(|m| m.target == target)
+                .ok_or_else(fail)?;
+            if !seen_tmpfs.insert(target)
+                || mount.get("RW").and_then(Value::as_bool) != Some(!wanted.readonly)
+            {
+                return Err(fail());
+            }
+            continue;
+        }
+        let source = mount
+            .get(if kind == "volume" { "Name" } else { "Source" })
+            .and_then(Value::as_str)
+            .ok_or_else(fail)?;
+        if (kind == "bind" && mount.get("Propagation").and_then(Value::as_str) != Some("rprivate"))
+            || (kind == "volume" && mount.get("Driver").and_then(Value::as_str) != Some("local"))
+        {
+            return Err(fail());
+        }
+        let rw = mount.get("RW").and_then(Value::as_bool).ok_or_else(fail)?;
+        if seen
+            .insert(target.to_owned(), (kind.to_owned(), source.to_owned(), rw))
+            .is_some()
+        {
+            return Err(fail());
+        }
+    }
+    if seen != wanted {
+        return Err(fail());
+    }
+    // Verify declared mount options too: actual attachments alone do not
+    // exclude a latent subpath, propagation or volume-driver substitution.
+    let mut declared = BTreeMap::new();
+    let declared_mounts = match host.get("Mounts") {
+        Some(Value::Array(items)) => items.as_slice(),
+        None | Some(Value::Null) if wanted.is_empty() => &[],
+        _ => return Err(fail()),
+    };
+    for mount in declared_mounts {
+        let object = mount.as_object().ok_or_else(fail)?;
+        if object
+            .keys()
+            .any(|k| !["Type", "Source", "Target", "ReadOnly"].contains(&k.as_str()))
+        {
+            return Err(fail());
+        }
+        let text = |key| object.get(key).and_then(Value::as_str).ok_or_else(fail);
+        let readonly = match object.get("ReadOnly") {
+            None => false,
+            Some(Value::Bool(v)) => *v,
+            _ => return Err(fail()),
+        };
+        if declared
+            .insert(
+                text("Target")?.to_owned(),
+                (
+                    text("Type")?.to_owned(),
+                    text("Source")?.to_owned(),
+                    !readonly,
+                ),
+            )
+            .is_some()
+        {
+            return Err(fail());
+        }
+    }
+    if declared != wanted || host.get("VolumeDriver").and_then(Value::as_str) != Some("") {
+        return Err(fail());
+    }
+    let tmpfs = match host.get("Tmpfs") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(entries)) => Some(entries),
+        _ => return Err(fail()),
+    };
+    let wanted_tmpfs: BTreeMap<_, _> = expected
+        .tmpfs
+        .iter()
+        .map(|m| {
+            let value = tmpfs_docker_value(m);
+            let (_, options) = value.split_once(':').expect("tmpfs options");
+            (m.target.clone(), Value::String(options.into()))
+        })
+        .collect();
+    if tmpfs
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default()
+        != wanted_tmpfs
+    {
+        return Err(fail());
+    }
+    // Host-only guest grants must never leak into ordinary Linux profiles.
+    if expected.macos_guest.is_none() {
+        for field in ["Devices", "CapAdd", "CapDrop"] {
+            if !matches!(host.get(field), Some(Value::Null))
+                && !host
+                    .get(field)
+                    .is_some_and(|v| v.as_array().is_some_and(Vec::is_empty))
+            {
+                return Err(fail());
+            }
+        }
+        if !host
+            .get("PortBindings")
+            .is_some_and(|v| v.is_null() || v.as_object().is_some_and(|m| m.is_empty()))
+        {
+            return Err(fail());
+        }
+    } else if let Some(guest) = &expected.macos_guest {
+        if strings(host.get("CapAdd"))? != ["NET_ADMIN"]
+            || !strings(host.get("CapDrop"))?.is_empty()
+        {
+            return Err(fail());
+        }
+        let devices = host
+            .get("Devices")
+            .and_then(Value::as_array)
+            .ok_or_else(fail)?;
+        let mut paths = BTreeSet::new();
+        for device in devices {
+            let source = device
+                .get("PathOnHost")
+                .and_then(Value::as_str)
+                .ok_or_else(fail)?;
+            if device.get("PathInContainer").and_then(Value::as_str) != Some(source)
+                || device.get("CgroupPermissions").and_then(Value::as_str) != Some("rwm")
+                || !paths.insert(source)
+            {
+                return Err(fail());
+            }
+        }
+        if paths != BTreeSet::from(["/dev/kvm", "/dev/net/tun"]) {
+            return Err(fail());
+        }
+        let ports = serde_json::json!({
+            "22/tcp": [{"HostIp":"127.0.0.1", "HostPort":guest.ssh_port.to_string()}],
+            "8006/tcp": [{"HostIp":"127.0.0.1", "HostPort":guest.web_port.to_string()}]
+        });
+        if host.get("PortBindings") != Some(&ports)
+            || config.get("StopTimeout").and_then(Value::as_u64) != Some(120)
+        {
+            return Err(fail());
+        }
+    }
+    Ok(())
 }
 
 fn require_action_success(
@@ -746,23 +1354,79 @@ impl DerivedEnsure {
 }
 
 fn derive_command(request: &SetupEnsureRequest<'_>) -> Result<DerivedEnsure, SetupEnsureError> {
-    validate_plan_shape(request.plan)?;
-    let workspace_root = canonical_workspace(&request.workspace_root)?;
-    if workspace_root != request.plan.workspace_root {
+    derive_creation(
+        request.plan,
+        &request.workspace_root,
+        request.prepared_image,
+    )
+}
+
+/// The sole container identity derivation shared by ensure, adoption and task execution.
+pub fn setup_container_name(
+    plan: &SetupPlan,
+    workspace: &Path,
+    image: &PreparedImage,
+) -> Result<String, SetupEnsureError> {
+    Ok(derive_creation(plan, workspace, image)?.container_name)
+}
+
+/// Pure verification for trusted engine adapters. These supplied observations
+/// are data, not authentication; public clients cannot confer engine authority.
+pub fn verify_setup_observation(
+    plan: &SetupPlan,
+    image: &PreparedImage,
+    observed: &SetupEnsureObservedContainer,
+    image_configuration: &serde_json::Value,
+    volume_observations: &BTreeMap<String, serde_json::Value>,
+) -> Result<(), SetupEnsureError> {
+    let expected = derive_creation(plan, &plan.workspace_root, image)?;
+    validate_observed(observed, &expected)?;
+    verify_actual_configuration(observed, &expected, image_configuration)?;
+    if volume_observations.len() != expected.volumes.len() {
+        return Err(SetupEnsureError::OwnershipMismatch);
+    }
+    for volume in &expected.volumes {
+        let receipt = volume_observations
+            .get(&volume.name)
+            .ok_or(SetupEnsureError::OwnershipMismatch)?;
+        verify_volume_observation(
+            volume,
+            receipt,
+            Some(container_volume_source(observed, volume)?),
+        )?;
+    }
+    Ok(())
+}
+
+fn derive_creation(
+    plan: &SetupPlan,
+    workspace: &Path,
+    image: &PreparedImage,
+) -> Result<DerivedEnsure, SetupEnsureError> {
+    validate_plan_shape(plan)?;
+    let workspace_root = canonical_workspace(workspace)?;
+    if workspace_root.to_str().is_none() {
+        return Err(SetupEnsureError::InvalidRequest("workspace is not UTF-8"));
+    }
+    if workspace_root != plan.workspace_root {
         return Err(SetupEnsureError::InvalidRequest(
             "workspace is not the plan's canonical workspace root",
         ));
     }
-    validate_prepared_image(request.plan, request.prepared_image)?;
-    let mounts = derive_mounts(&workspace_root, request.plan)?;
-    let workdir = request
-        .plan
+    if plan.app.mounts.len() > 128 || plan.named_volumes.len() > 128 || plan.tmpfs.len() > 128 {
+        return Err(SetupEnsureError::InvalidRequest(
+            "creation mount inventory exceeds 128 entries per kind",
+        ));
+    }
+    validate_prepared_image(plan, image)?;
+    let mounts = derive_mounts(&workspace_root, plan)?;
+    let workdir = plan
         .app
         .workdir
         .as_deref()
-        .map(|value| resolve_workdir(value, &request.plan.app.mounts, &workspace_root))
+        .map(|value| resolve_workdir(value, &plan.app.mounts, &workspace_root))
         .transpose()?;
-    let command = request.plan.app.command.clone();
+    let command = plan.app.command.clone();
     if command
         .as_deref()
         .is_some_and(|value| value.is_empty() || value.len() > 16 * 1024 || value.contains('\0'))
@@ -771,19 +1435,9 @@ fn derive_command(request: &SetupEnsureRequest<'_>) -> Result<DerivedEnsure, Set
             "declared app command is invalid",
         ));
     }
-    let container_name = format!("bosn-setup-{}", request.plan.content_sha256);
-    let labels = BTreeMap::from([
-        (LABEL_MANAGED.into(), MANAGED_VALUE.into()),
-        (
-            LABEL_CONTENT_SHA256.into(),
-            request.plan.content_sha256.clone(),
-        ),
-        (LABEL_CONTAINER_NAME.into(), container_name.clone()),
-    ]);
-    let volumes = derive_volumes(request.plan)?;
-    let tmpfs = derive_tmpfs(request.plan)?;
-    let macos_guest = request
-        .plan
+    let volumes = derive_volumes(plan)?;
+    let tmpfs = derive_tmpfs(plan)?;
+    let macos_guest = plan
         .macos_guest
         .as_ref()
         .map(|guest| SetupEnsureMacosGuest {
@@ -794,19 +1448,48 @@ fn derive_command(request: &SetupEnsureRequest<'_>) -> Result<DerivedEnsure, Set
             disk_size: guest.disk_size.clone(),
             cpu_cores: guest.cpu_cores,
         });
-    Ok(DerivedEnsure {
-        container_name,
-        image_identity: request.prepared_image.observed_identity.clone(),
+    let mut derived = DerivedEnsure {
+        container_name: String::new(),
+        image_identity: image.observed_identity.clone(),
         mounts,
-        environment: validated_environment(&request.plan.app.environment)?,
+        environment: validated_environment(&plan.app.environment)?,
         workdir,
         command,
-        labels,
+        labels: BTreeMap::new(),
         volumes,
         tmpfs,
-        host_docker_socket: request.plan.host_docker_socket.clone(),
+        host_docker_socket: plan.host_docker_socket.clone(),
         macos_guest,
-    })
+    };
+    derived
+        .mounts
+        .sort_by(|left, right| left.target.cmp(&right.target));
+    derived
+        .volumes
+        .sort_by(|left, right| left.target.cmp(&right.target));
+    derived
+        .tmpfs
+        .sort_by(|left, right| left.target.cmp(&right.target));
+    let mut arguments = vec![plan.content_sha256.clone()];
+    arguments.extend(derived.create_command().docker_args());
+    if arguments
+        .iter()
+        .try_fold(0usize, |size, value| size.checked_add(value.len() + 8))
+        .is_none_or(|size| size > 2 * 1024 * 1024)
+    {
+        return Err(SetupEnsureError::InvalidRequest(
+            "creation profile exceeds 2 MiB",
+        ));
+    }
+    let digest = crate::creation::creation_digest(&workspace_root, &arguments);
+    derived.container_name = format!("bosn-setup-v2-{digest}");
+    derived.labels = BTreeMap::from([
+        (LABEL_MANAGED.into(), MANAGED_VALUE.into()),
+        (LABEL_CONTENT_SHA256.into(), plan.content_sha256.clone()),
+        (LABEL_CONTAINER_NAME.into(), derived.container_name.clone()),
+        (LABEL_CREATION_PROFILE.into(), format!("v2:{digest}")),
+    ]);
+    Ok(derived)
 }
 
 fn validate_plan_shape(plan: &SetupPlan) -> Result<(), SetupEnsureError> {
@@ -847,6 +1530,11 @@ fn validate_plan_shape(plan: &SetupPlan) -> Result<(), SetupEnsureError> {
         .iter()
         .map(|mount| mount.target.clone())
         .collect();
+    if targets.len() != plan.app.mounts.len() {
+        return Err(SetupEnsureError::InvalidRequest(
+            "duplicate bind mount target",
+        ));
+    }
     for volume in &plan.named_volumes {
         if !valid_volume_name(&volume.name)
             || validate_container_path(&volume.target).is_err()
@@ -1201,38 +1889,39 @@ fn canonical_workspace_member(root: &Path, relative: &str) -> Result<PathBuf, Se
 }
 
 fn parse_inspection(stdout: &[u8]) -> Result<SetupEnsureObservedContainer, CommandError> {
-    let line = std::str::from_utf8(stdout)
-        .map_err(|_| protocol_error("container inspect output is not UTF-8"))?
-        .trim_end_matches(['\r', '\n']);
-    let mut fields = line.split('\t');
-    let container_id = fields.next().unwrap_or_default();
-    let running = match fields.next() {
-        Some("true") => true,
-        Some("false") => false,
-        _ => return Err(protocol_error("container inspect running state is invalid")),
-    };
-    let image_identity = fields.next().unwrap_or_default();
-    let managed = fields.next().unwrap_or_default();
-    let content_sha256 = fields.next().unwrap_or_default();
-    let container_name = fields.next().unwrap_or_default();
-    if fields.next().is_some()
-        || !valid_container_id(container_id)
-        || !valid_identity(image_identity)
-        || managed.contains(['\t', '\n', '\r'])
-        || content_sha256.contains(['\t', '\n', '\r'])
-        || container_name.contains(['\t', '\n', '\r'])
-    {
-        return Err(protocol_error("container inspect output is invalid"));
+    let value = crate::creation::bounded_json(stdout)
+        .map_err(|_| protocol_error("invalid bounded container observation"))?;
+    let text = |field: &str| value.get(field).and_then(serde_json::Value::as_str);
+    let container_id = text("Id").ok_or_else(|| protocol_error("missing container ID"))?;
+    let image_identity = text("Image").ok_or_else(|| protocol_error("missing image ID"))?;
+    let running = value
+        .pointer("/State/Running")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| protocol_error("missing running state"))?;
+    if !valid_container_id(container_id) || !valid_identity(image_identity) {
+        return Err(protocol_error("invalid observed identities"));
+    }
+    let mut labels = BTreeMap::new();
+    for key in [
+        LABEL_MANAGED,
+        LABEL_CONTENT_SHA256,
+        LABEL_CONTAINER_NAME,
+        LABEL_CREATION_PROFILE,
+    ] {
+        let label = value
+            .get("Config")
+            .and_then(|v| v.get("Labels"))
+            .and_then(|v| v.get(key))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| protocol_error("missing creation ownership label"))?;
+        labels.insert(key.into(), label.into());
     }
     Ok(SetupEnsureObservedContainer {
         container_id: container_id.into(),
         running,
         image_identity: image_identity.into(),
-        labels: BTreeMap::from([
-            (LABEL_MANAGED.into(), managed.into()),
-            (LABEL_CONTENT_SHA256.into(), content_sha256.into()),
-            (LABEL_CONTAINER_NAME.into(), container_name.into()),
-        ]),
+        labels,
+        configuration: value,
     })
 }
 
@@ -1390,10 +2079,73 @@ mod tests {
         "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const CONTAINER_ID: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
+    #[cfg(all(unix, feature = "native-test-helper"))]
+    #[test]
+    fn structured_inspection_environment_is_captured_privately_not_forwarded() {
+        let engine = DockerEngine::synthetic_for_test(
+            "/bin/sh",
+            [
+                "-c",
+                "printf '%s' '{\"Config\":{\"Env\":[\"SECRET=private-canary\"]}}'",
+                "sh",
+            ],
+        );
+        let cancellation = CancellationSource::new();
+        let (events, mut receiver) = channel(8);
+        let result = runtime()
+            .run(SetupEnsureEngine::stream(
+                &engine,
+                SetupEnsureCommand::ImageInspect {
+                    image_identity: IDENTITY.into(),
+                },
+                RunOptions::streaming(Duration::from_secs(2), 4096),
+                &cancellation.token(),
+                &events,
+            ))
+            .unwrap();
+        let SetupEnsureResponse::Command(result) = result else {
+            panic!("expected private command receipt");
+        };
+        assert!(
+            String::from_utf8(result.stdout)
+                .unwrap()
+                .contains("private-canary")
+        );
+        drop(events);
+        assert!(runtime().run(receiver.recv()).is_none());
+    }
+
+    #[test]
+    fn creation_identity_binds_workspace_even_when_image_and_content_match() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::create_dir(first.path().join("src")).unwrap();
+        std::fs::create_dir(second.path().join("src")).unwrap();
+        let cancel = CancellationSource::new();
+        let (events, _) = channel(8);
+        let name = |workspace: &Path| {
+            let plan = plan(workspace);
+            let prepared = prepared(&plan);
+            derive_command(&SetupEnsureRequest {
+                plan: &plan,
+                workspace_root: plan.workspace_root.clone(),
+                prepared_image: &prepared,
+                options: RunOptions::streaming(Duration::from_secs(2), 4096),
+                cancellation: &cancel.token(),
+                events: &events,
+            })
+            .unwrap()
+            .container_name
+        };
+        assert_ne!(name(first.path()), name(second.path()));
+        assert_eq!(name(first.path()), name(first.path()));
+    }
+
     #[derive(Default)]
     struct FakeEngine {
         calls: Mutex<Vec<SetupEnsureCommand>>,
         results: Mutex<VecDeque<Result<SetupEnsureResponse, CommandError>>>,
+        created: Mutex<Option<serde_json::Value>>,
     }
 
     impl FakeEngine {
@@ -1403,6 +2155,7 @@ mod tests {
             Self {
                 calls: Mutex::new(Vec::new()),
                 results: Mutex::new(results.into_iter().collect()),
+                created: Mutex::new(None),
             }
         }
     }
@@ -1418,6 +2171,25 @@ mod tests {
             _events: &'a Sender<EngineEvent>,
         ) -> Self::StreamFuture<'a> {
             self.calls.lock().unwrap().push(command);
+            let command = self.calls.lock().unwrap().last().unwrap().clone();
+            if matches!(command, SetupEnsureCommand::ImageInspect { .. }) {
+                return ready(Ok(SetupEnsureResponse::Command(result(
+                    0,
+                    serde_json::to_vec(&fixture_image()).unwrap(),
+                    [],
+                ))));
+            }
+            if matches!(command, SetupEnsureCommand::Inspect { .. })
+                && let Some(value) = self.created.lock().unwrap().as_ref()
+            {
+                return ready(Ok(SetupEnsureResponse::Inspection(
+                    Some(parse_inspection(&serde_json::to_vec(value).unwrap()).unwrap()),
+                    result(0, [], []),
+                )));
+            }
+            if matches!(command, SetupEnsureCommand::Create { .. }) {
+                *self.created.lock().unwrap() = Some(fixture_configuration(&command, false));
+            }
             ready(
                 self.results
                     .lock()
@@ -1455,16 +2227,253 @@ mod tests {
     }
 
     fn observed(plan: &SetupPlan, running: bool) -> SetupEnsureObservedContainer {
-        let name = format!("bosn-setup-{}", plan.content_sha256);
+        let image = prepared(plan);
+        let derived = derive_creation(plan, &plan.workspace_root, &image).unwrap();
         SetupEnsureObservedContainer {
             container_id: CONTAINER_ID.into(),
             running,
             image_identity: IDENTITY.into(),
+            labels: derived.labels.clone(),
+            configuration: fixture_configuration(&derived.create_command(), running),
+        }
+    }
+
+    fn fixture_image() -> serde_json::Value {
+        serde_json::json!({"Id":IDENTITY,"Config":{
+            "Env":["PATH=/usr/bin:/bin"], "Cmd":["sh"],"Entrypoint":null,
+            "User":"","WorkingDir":"","Volumes":null
+        }})
+    }
+
+    fn fixture_configuration(command: &SetupEnsureCommand, running: bool) -> serde_json::Value {
+        let SetupEnsureCommand::Create {
+            image_identity,
+            mounts,
+            volumes,
+            tmpfs,
+            host_docker_socket,
+            environment,
+            workdir,
+            command,
+            labels,
+            macos_guest,
+            ..
+        } = command
+        else {
+            panic!("fixture requires create");
+        };
+        let mut config = fixture_image()["Config"].clone();
+        for key in ["Tty", "OpenStdin", "StdinOnce", "AttachStdin"] {
+            config[key] = false.into();
+        }
+        let mut env = environment.clone();
+        env.entry("PATH".into())
+            .or_insert_with(|| "/usr/bin:/bin".into());
+        if let Some(guest) = macos_guest.as_ref() {
+            env.extend([
+                ("VERSION".into(), guest.version.clone()),
+                ("RAM_SIZE".into(), guest.ram_size.clone()),
+                ("DISK_SIZE".into(), guest.disk_size.clone()),
+                ("CPU_CORES".into(), guest.cpu_cores.to_string()),
+            ]);
+            config["StopTimeout"] = 120.into();
+        } else if let Some(command) = command {
+            config["Cmd"] = serde_json::json!(crate::shell::login_shell_args(command));
+        }
+        config["Env"] = serde_json::json!(
+            env.iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+        );
+        config["WorkingDir"] = serde_json::json!(workdir.as_deref().unwrap_or(""));
+        config["Labels"] = serde_json::json!(labels);
+        let mut actual_mounts: Vec<_> = mounts.iter().map(|m| serde_json::json!({"Type":"bind","Propagation":"rprivate","Source":m.source,"Destination":m.target,"RW":!m.readonly})).collect();
+        actual_mounts.extend(volumes.iter().map(
+            |v| serde_json::json!({"Type":"volume","Driver":"local","Name":v.name,"Source":format!("/var/lib/docker/volumes/{}/_data",v.name),"Destination":v.target,"RW":true}),
+        ));
+        if let Some(socket) = host_docker_socket {
+            actual_mounts.push(serde_json::json!({"Type":"bind","Propagation":"rprivate","Source":socket.source.host_path(),"Destination":socket.target,"RW":!socket.readonly}));
+        }
+        let tmpfs: BTreeMap<_, _> = tmpfs
+            .iter()
+            .map(|m| {
+                (
+                    m.target.clone(),
+                    tmpfs_docker_value(m).split_once(':').unwrap().1.to_owned(),
+                )
+            })
+            .collect();
+        let declared_mounts: Vec<_> = actual_mounts.iter().map(|m| serde_json::json!({"Type":m["Type"],
+            "Source":if m["Type"] == "volume" { &m["Name"] } else { &m["Source"] }, "Target":m["Destination"],"ReadOnly":!m["RW"].as_bool().unwrap()})).collect();
+        let mut host = serde_json::json!({"Mounts":declared_mounts,"VolumeDriver":"","Privileged":false,"NetworkMode":"default","Binds":null,"VolumesFrom":null,"DeviceRequests":null,
+            "SecurityOpt":null,"GroupAdd":null,"DeviceCgroupRules":null,"PublishAllPorts":false,"AutoRemove":false,"CgroupnsMode":"private","RestartPolicy":{"Name":"no","MaximumRetryCount":0},"ReadonlyRootfs":false,"PidMode":"","UTSMode":"","UsernsMode":"","IpcMode":"private",
+            "Devices":[],"CapAdd":null,"CapDrop":null,"PortBindings":{},"Tmpfs":tmpfs});
+        if let Some(guest) = macos_guest.as_ref() {
+            host["Devices"] = serde_json::json!([{"PathOnHost":"/dev/kvm","PathInContainer":"/dev/kvm","CgroupPermissions":"rwm"},
+                {"PathOnHost":"/dev/net/tun","PathInContainer":"/dev/net/tun","CgroupPermissions":"rwm"}]);
+            host["CapAdd"] = serde_json::json!(["NET_ADMIN"]);
+            host["PortBindings"] = serde_json::json!({"22/tcp":[{"HostIp":"127.0.0.1","HostPort":guest.ssh_port.to_string()}],
+                "8006/tcp":[{"HostIp":"127.0.0.1","HostPort":guest.web_port.to_string()}]});
+        }
+        serde_json::json!({"Id":CONTAINER_ID,"Name":format!("/{}",labels[LABEL_CONTAINER_NAME]),"Image":image_identity,"State":{"Running":running},"Config":config,"HostConfig":host,"Mounts":actual_mounts})
+    }
+
+    #[test]
+    fn correctly_labelled_wrong_actual_bind_or_execution_config_refuses() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("src")).unwrap();
+        let plan = plan(workspace.path());
+        let derived = derive_creation(&plan, workspace.path(), &prepared(&plan)).unwrap();
+        let observed = observed(&plan, true);
+        assert!(verify_actual_configuration(&observed, &derived, &fixture_image()).is_ok());
+        for (pointer, replacement) in [
+            ("/Mounts/0/Source", serde_json::json!("/foreign/workspace")),
+            ("/Mounts/0/RW", serde_json::json!(false)),
+            ("/Config/WorkingDir", serde_json::json!("/foreign")),
+            ("/Config/Cmd", serde_json::json!(["wrong"])),
+            ("/Config/Env", serde_json::json!(["PATH=/foreign"])),
+            ("/HostConfig/Privileged", serde_json::json!(true)),
+            ("/HostConfig/Tmpfs", serde_json::json!("malformed grant")),
+            ("/HostConfig/AutoRemove", serde_json::json!(true)),
+            ("/HostConfig/CgroupnsMode", serde_json::json!("host")),
+        ] {
+            let mut bad = observed.clone();
+            *bad.configuration.pointer_mut(pointer).unwrap() = replacement;
+            assert!(
+                matches!(
+                    verify_actual_configuration(&bad, &derived, &fixture_image()),
+                    Err(SetupEnsureError::OwnershipMismatch)
+                ),
+                "{pointer}"
+            );
+            let engine = FakeEngine::with_results([Ok(SetupEnsureResponse::Inspection(
+                Some(bad),
+                result(0, [], []),
+            ))]);
+            let cancellation = CancellationSource::new();
+            assert!(
+                run(
+                    &engine,
+                    &plan,
+                    workspace.path(),
+                    &prepared(&plan),
+                    &cancellation.token(),
+                    RunOptions::streaming(Duration::from_secs(2), 4096)
+                )
+                .is_err()
+            );
+            assert!(engine.calls.lock().unwrap().iter().all(|c| matches!(
+                c,
+                SetupEnsureCommand::Inspect { .. } | SetupEnsureCommand::ImageInspect { .. }
+            )));
+        }
+        let mut legacy = observed.clone();
+        legacy.labels.remove(LABEL_CREATION_PROFILE);
+        assert!(matches!(
+            validate_observed(&legacy, &derived),
+            Err(SetupEnsureError::OwnershipMismatch)
+        ));
+    }
+
+    #[test]
+    fn creation_identity_and_actual_verification_bind_named_volume_set() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("src")).unwrap();
+        let mut plan = plan(workspace.path());
+        plan.named_volumes.push(crate::SetupNamedVolume {
+            name: "bosn-v-stack-a".into(),
+            target: "/target".into(),
             labels: BTreeMap::from([
                 (LABEL_MANAGED.into(), MANAGED_VALUE.into()),
-                (LABEL_CONTENT_SHA256.into(), plan.content_sha256.clone()),
-                (LABEL_CONTAINER_NAME.into(), name),
+                (LABEL_CONTENT_SHA256.into(), HASH.into()),
+                (LABEL_CONTAINER_NAME.into(), "bosn-v-stack-a".into()),
             ]),
+        });
+        let derived = derive_creation(&plan, workspace.path(), &prepared(&plan)).unwrap();
+        let observed = observed(&plan, true);
+        assert!(verify_actual_configuration(&observed, &derived, &fixture_image()).is_ok());
+        let mut bad = observed.clone();
+        bad.configuration["Mounts"][1]["Name"] = "bosn-v-stack-foreign".into();
+        assert!(verify_actual_configuration(&bad, &derived, &fixture_image()).is_err());
+        plan.named_volumes[0].name = "bosn-v-stack-b".into();
+        plan.named_volumes[0]
+            .labels
+            .insert(LABEL_CONTAINER_NAME.into(), "bosn-v-stack-b".into());
+        assert_ne!(
+            derived.container_name,
+            setup_container_name(&plan, workspace.path(), &prepared(&plan)).unwrap()
+        );
+    }
+
+    #[test]
+    fn guest_image_storage_volume_requires_exact_explicit_attachment() {
+        let workspace = tempfile::tempdir().unwrap();
+        let plan = macos_guest_plan(workspace.path());
+        let image = prepared(&plan);
+        let expected = derive_creation(&plan, workspace.path(), &image).unwrap();
+        let mut base = fixture_image();
+        base["Config"]["Volumes"] = serde_json::json!({"/storage":{}});
+        let mut observation = observed(&plan, false);
+        observation.configuration["Config"]["Volumes"] = base["Config"]["Volumes"].clone();
+        assert!(verify_actual_configuration(&observation, &expected, &base).is_ok());
+        base["Config"]["Volumes"]["/anonymous"] = serde_json::json!({});
+        observation.configuration["Config"]["Volumes"] = base["Config"]["Volumes"].clone();
+        assert!(verify_actual_configuration(&observation, &expected, &base).is_err());
+    }
+
+    #[test]
+    fn reuse_and_adoption_refuse_local_volume_bind_options_or_source_mismatch() {
+        let workspace = tempfile::tempdir().unwrap();
+        let plan = macos_guest_plan(workspace.path());
+        let image = prepared(&plan);
+        let volume = &plan.named_volumes[0];
+        for bind_backed in [true, false] {
+            let mut observation = observed(&plan, true);
+            observation.configuration["Mounts"][0]["Source"] =
+                serde_json::json!("/var/lib/docker/volumes/owned/_data");
+            let receipt = serde_json::json!({"Name":volume.name,"Driver":"local","Labels":volume.labels,
+                "Scope":"local","Mountpoint":if bind_backed { "/var/lib/docker/volumes/owned/_data" } else { "/foreign/path" },
+                "Options":if bind_backed { serde_json::json!({"type":"none","o":"bind","device":"/foreign/path"}) } else { serde_json::Value::Null }});
+            for adopt in [false, true] {
+                let engine = FakeEngine::with_results([
+                    Ok(SetupEnsureResponse::Inspection(
+                        Some(observation.clone()),
+                        result(0, [], []),
+                    )),
+                    command(serde_json::to_vec(&receipt).unwrap()),
+                ]);
+                let cancellation = CancellationSource::new();
+                let options = RunOptions::streaming(Duration::from_secs(2), 8192);
+                let result = if adopt {
+                    run_adopt(
+                        &engine,
+                        &plan,
+                        workspace.path(),
+                        &image,
+                        &cancellation.token(),
+                        options,
+                    )
+                } else {
+                    run(
+                        &engine,
+                        &plan,
+                        workspace.path(),
+                        &image,
+                        &cancellation.token(),
+                        options,
+                    )
+                };
+                assert!(
+                    matches!(result, Err(SetupEnsureError::OwnershipMismatch)),
+                    "bind_backed={bind_backed} adopt={adopt}"
+                );
+                assert!(engine.calls.lock().unwrap().iter().all(|c| matches!(
+                    c,
+                    SetupEnsureCommand::Inspect { .. }
+                        | SetupEnsureCommand::ImageInspect { .. }
+                        | SetupEnsureCommand::VolumeInspect { .. }
+                )));
+            }
         }
     }
 
@@ -1620,7 +2629,10 @@ mod tests {
             assert!(!result.created && !result.started);
             assert!(matches!(
                 engine.calls.lock().unwrap().as_slice(),
-                [SetupEnsureCommand::Inspect { .. }]
+                [
+                    SetupEnsureCommand::Inspect { .. },
+                    SetupEnsureCommand::ImageInspect { .. }
+                ]
             ));
         }
         let mut bad = observed(&plan, true);
@@ -1677,51 +2689,34 @@ mod tests {
     }
 
     #[test]
-    fn inspect_format_uses_actual_tabs_that_the_response_parser_accepts() {
-        let container_name = format!("bosn-setup-{HASH}");
-        let command = SetupEnsureCommand::Inspect {
-            container_name: container_name.clone(),
-        };
-        let args = command.docker_args();
-        assert_eq!(args[0], "container");
-        assert_eq!(args[1], "inspect");
-        assert_eq!(args[2], "--format");
-        assert!(args[3].contains('\t'));
-        assert!(!args[3].contains("\\\\t"));
-        assert_eq!(args[4], container_name);
-
-        let observed = parse_inspection(
-            format!(
-                "{CONTAINER_ID}\ttrue\t{IDENTITY}\t{MANAGED_VALUE}\t{HASH}\tbosn-setup-{HASH}\n"
-            )
-            .as_bytes(),
-        )
-        .expect("inspect output using the generated delimiter contract parses");
-        assert_eq!(observed.container_id, CONTAINER_ID);
-        assert!(observed.running);
-        assert_eq!(observed.image_identity, IDENTITY);
+    fn inspection_is_complete_bounded_json_and_legacy_or_duplicate_keys_refuse() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("src")).unwrap();
+        let plan = plan(workspace.path());
+        let observed = observed(&plan, true);
         assert_eq!(
-            observed.labels.get(LABEL_MANAGED).map(String::as_str),
-            Some(MANAGED_VALUE)
+            SetupEnsureCommand::Inspect {
+                container_name: observed.labels[LABEL_CONTAINER_NAME].clone()
+            }
+            .docker_args()[3],
+            "{{json .}}"
         );
         assert_eq!(
+            parse_inspection(&serde_json::to_vec(&observed.configuration).unwrap()).unwrap(),
             observed
-                .labels
-                .get(LABEL_CONTENT_SHA256)
-                .map(String::as_str),
-            Some(HASH)
         );
-        assert_eq!(
-            observed
-                .labels
-                .get(LABEL_CONTAINER_NAME)
-                .map(String::as_str),
-            Some(container_name.as_str())
+        assert!(parse_inspection(b"legacy\tlabels\tonly").is_err());
+        assert!(
+            crate::creation::bounded_json(br#"{"Config":{"Env":[],"Env":["foreign"]}}"#).is_err()
+        );
+        assert!(
+            crate::creation::bounded_json(&vec![b' '; crate::creation::MAX_OBSERVATION_BYTES + 1])
+                .is_err()
         );
     }
 
     #[test]
-    fn volume_inspect_format_uses_actual_tabs_that_match_the_label_receipt() {
+    fn volume_inspect_requests_complete_private_metadata() {
         let volume_name = format!("bosn-v-stack-{HASH}");
         let command = SetupEnsureCommand::VolumeInspect {
             volume_name: volume_name.clone(),
@@ -1730,8 +2725,7 @@ mod tests {
         assert_eq!(args[0], "volume");
         assert_eq!(args[1], "inspect");
         assert_eq!(args[2], "--format");
-        assert!(args[3].contains('\t'));
-        assert!(!args[3].contains("\\\\t"));
+        assert_eq!(args[3], "{{json .}}");
         assert_eq!(args[4], volume_name);
     }
 
@@ -1982,7 +2976,7 @@ mod tests {
         assert_eq!(
             receipt,
             SetupEnsureResult {
-                container_name: format!("bosn-setup-{HASH}"),
+                container_name: setup_container_name(&plan, &workspace, &image).unwrap(),
                 container_id: CONTAINER_ID.into(),
                 image_identity: IDENTITY.into(),
                 created: true,
@@ -1991,14 +2985,14 @@ mod tests {
             }
         );
         let calls = engine.calls.lock().unwrap().clone();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 5);
         assert!(
-            matches!(&calls[0], SetupEnsureCommand::Inspect { container_name } if container_name == &format!("bosn-setup-{HASH}"))
+            matches!(&calls[0], SetupEnsureCommand::Inspect { container_name } if container_name == &setup_container_name(&plan, &workspace, &image).unwrap())
         );
         assert_eq!(
-            calls[2],
+            calls[4],
             SetupEnsureCommand::Start {
-                container_name: format!("bosn-setup-{HASH}")
+                container_name: setup_container_name(&plan, &workspace, &image).unwrap()
             }
         );
         let SetupEnsureCommand::Create {
@@ -2086,6 +3080,7 @@ mod tests {
             stopped.calls.lock().unwrap().as_slice(),
             [
                 SetupEnsureCommand::Inspect { .. },
+                SetupEnsureCommand::ImageInspect { .. },
                 SetupEnsureCommand::Start { .. }
             ]
         ));
@@ -2102,12 +3097,15 @@ mod tests {
         assert!(!receipt.created && !receipt.started);
         assert!(matches!(
             running.calls.lock().unwrap().as_slice(),
-            [SetupEnsureCommand::Inspect { .. }]
+            [
+                SetupEnsureCommand::Inspect { .. },
+                SetupEnsureCommand::ImageInspect { .. }
+            ]
         ));
     }
 
     #[test]
-    fn matching_container_reuse_does_not_reinspect_or_mutate_declared_volumes() {
+    fn matching_container_reuse_reinspects_volume_metadata_without_mutation() {
         let temporary = tempfile::tempdir().unwrap();
         let workspace = temporary.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
@@ -2125,7 +3123,13 @@ mod tests {
         });
         let image = prepared(&plan);
         let cancellation = CancellationSource::new();
-        let engine = FakeEngine::with_results([inspection(&plan, true)]);
+        let volume = &plan.named_volumes[0];
+        let receipt = serde_json::json!({"Name":volume.name,"Driver":"local","Scope":"local","Options":null,"Labels":volume.labels,
+            "Mountpoint":format!("/var/lib/docker/volumes/{}/_data",volume.name)});
+        let engine = FakeEngine::with_results([
+            inspection(&plan, true),
+            command(serde_json::to_vec(&receipt).unwrap()),
+        ]);
 
         let receipt = run(
             &engine,
@@ -2140,7 +3144,11 @@ mod tests {
         assert!(!receipt.created && !receipt.started);
         assert!(matches!(
             engine.calls.lock().unwrap().as_slice(),
-            [SetupEnsureCommand::Inspect { .. }]
+            [
+                SetupEnsureCommand::Inspect { .. },
+                SetupEnsureCommand::ImageInspect { .. },
+                SetupEnsureCommand::VolumeInspect { .. }
+            ]
         ));
     }
 
@@ -2402,6 +3410,7 @@ mod tests {
             start_failed.calls.lock().unwrap().as_slice(),
             [
                 SetupEnsureCommand::Inspect { .. },
+                SetupEnsureCommand::ImageInspect { .. },
                 SetupEnsureCommand::Start { .. }
             ]
         ));
