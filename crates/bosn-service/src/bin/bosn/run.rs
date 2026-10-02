@@ -292,7 +292,10 @@ fn execute(arguments: RunArguments) -> Result<i32, String> {
     ensure_daemon(&runtime, &client, &state_dir)?;
 
     if !arguments.no_ensure {
-        eprintln!("bosn run: ensuring stack {stack}");
+        eprintln!(
+            "bosn run: ensuring stack {stack} for {}",
+            workspace.display()
+        );
         let job = runtime
             .run(client.submit_manifest_ensure(ManifestEnsureJobRequest {
                 workspace: workspace.clone(),

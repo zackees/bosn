@@ -1579,6 +1579,16 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                             .into(),
                     );
                 }
+                // #314: name the verified container and the checkout its
+                // binds were proven against, so a run in one worktree can be
+                // seen not to target another worktree's tree.
+                logs.send(format!(
+                    "[manifest-app-task] verified {} binds workspace {}",
+                    observed.container_name,
+                    plan.workspace_root.display()
+                ))
+                .await
+                .map_err(|_| "manifest app task log consumer closed".to_owned())?;
                 if cancellation.is_cancelled() || deadline.remaining().is_zero() {
                     return Err(
                         "manifest app task ended before exec; remote command was not started"
