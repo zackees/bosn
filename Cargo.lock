@@ -196,6 +196,7 @@ dependencies = [
  "bosn-core",
  "bosn-engine",
  "kernal-api",
+ "serde_json",
  "tempfile",
 ]
 
