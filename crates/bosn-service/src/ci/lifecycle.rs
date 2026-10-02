@@ -4,8 +4,9 @@
 //! call): intent (with its frozen creation profile) -> create -> observe +
 //! register -> start (the owned-engine layer, [`crate::act_engine`]) ->
 //! exclusive execution claim -> prepare -> execute (each verified against the
-//! claim) -> execution outcome -> owner cleanup request -> retire (authorize,
-//! remove, proven absence, terminal record). Cleanup is part of success: a
+//! claim; the engine's storage sampled throughout) -> execution outcome ->
+//! owner cleanup request -> retire (authorize, remove, proven absence,
+//! terminal record). Cleanup is part of success: a
 //! run whose engine could not be proven gone is never reported as passing,
 //! and its record stays `cleanup_required` for the next daemon's startup
 //! recovery ([`crate::act_runtime::recover_startup_act_engines`]), the only
@@ -21,8 +22,9 @@ use bosn_registry::act::{
 };
 use kernal_api::async_engine::{self, CancellationToken};
 
-use super::engine::{
-    ActArtifact, ActEngineBackend, ActInvocation, CacheVolume, EngineLine, ExecEnd,
+use super::{
+    engine::{ActArtifact, ActEngineBackend, ActInvocation, CacheVolume, EngineLine, ExecEnd},
+    storage::{self, StoragePeak, StorageUsage},
 };
 use crate::{
     RegistryActor,
@@ -70,6 +72,8 @@ pub struct EngineReport {
     pub cleanup: CleanupEnd,
     /// The engine's immutable ID once observed.
     pub engine_id: Option<String>,
+    /// The fullest its private storage got while act ran, if sampled.
+    pub storage: Option<StorageUsage>,
 }
 
 /// Receives the declared-job listing and every output line, in order.
@@ -124,6 +128,28 @@ async fn save_toolcache(
         Ok(Ok(())) => observer.note(&format!("tool cache saved in {}", laps.lap())),
         Ok(Err(error)) => observer.note(&format!("tool cache not saved: {error}")),
         Err(_) => observer.note("tool cache not saved: timed out"),
+    }
+}
+
+/// Sample the engine's storage into `peak`, warning in the log the first
+/// time it is low. A failed sample keeps its first error and never changes
+/// the run.
+async fn sample_storage(
+    backend: &dyn ActEngineBackend,
+    engine: &str,
+    peak: &mut StoragePeak,
+    unsampled: &mut Option<String>,
+    observer: &mut dyn EngineObserver,
+) {
+    match backend.storage_usage(engine).await {
+        Ok(usage) => {
+            if peak.record(usage) {
+                observer.note(&storage::low_warning(usage));
+            }
+        }
+        Err(error) => {
+            unsampled.get_or_insert(error);
+        }
     }
 }
 
@@ -270,12 +296,14 @@ pub async fn run_on_engine(
                 execution: ExecutionEnd::EngineFailed(error),
                 cleanup: CleanupEnd::Removed,
                 engine_id: None,
+                storage: None,
             };
         }
     };
     let mut engine_id = None;
     let mut claim = None;
     let mut laps = Laps::new();
+    let mut peak = StoragePeak::default();
     let execution = 'run: {
         if let Err(error) = backend.ensure_cache(&plan.cache).await {
             break 'run ExecutionEnd::EngineFailed(error);
@@ -348,8 +376,15 @@ pub async fn run_on_engine(
             drop(lines);
             end
         };
+        let mut unsampled = None;
         let drain = async {
+            let mut next_sample = Instant::now();
             loop {
+                if Instant::now() >= next_sample {
+                    next_sample = Instant::now() + storage::SAMPLE_INTERVAL;
+                    sample_storage(backend, held.engine(), &mut peak, &mut unsampled, observer)
+                        .await;
+                }
                 match async_engine::timeout(PROGRESS_TICK, receiver.recv()).await {
                     Ok(Some(line)) => observer.line(line),
                     Ok(None) => break,
@@ -359,6 +394,11 @@ pub async fn run_on_engine(
         };
         let (end, ()) = async_engine::join(execute, drain).await;
         observer.note(&format!("act finished in {}", laps.lap()));
+        match (peak.peak(), unsampled) {
+            (Some(usage), _) => observer.note(&storage::peak_note(usage)),
+            (None, Some(error)) => observer.note(&format!("engine storage not sampled: {error}")),
+            (None, None) => {}
+        }
         let end = match end {
             Ok(ExecEnd::Exited(code)) => ExecutionEnd::Exited(code),
             Ok(ExecEnd::TimedOut) => ExecutionEnd::TimedOut,
@@ -412,6 +452,7 @@ pub async fn run_on_engine(
         execution,
         cleanup,
         engine_id,
+        storage: peak.peak(),
     }
 }
 

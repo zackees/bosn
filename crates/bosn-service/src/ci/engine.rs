@@ -211,6 +211,11 @@ pub trait ActEngineBackend: Send + Sync {
         cancellation: &'a CancellationToken,
         lines: &'a async_engine::Sender<EngineLine>,
     ) -> BoxFuture<'a, Result<ExecEnd, String>>;
+    /// How full the engine's private storage is now ([`super::storage`]).
+    fn storage_usage<'a>(
+        &'a self,
+        engine: &'a str,
+    ) -> BoxFuture<'a, Result<super::storage::StorageUsage, String>>;
     /// Save the tool-cache installs this run completed (act's
     /// `/opt/hostedtoolcache`) into the machine-wide cache, each atomically;
     /// best-effort, before the engine is removed.
@@ -223,6 +228,8 @@ pub trait ActEngineBackend: Send + Sync {
 }
 
 const CONTROL_DEADLINE: Duration = Duration::from_secs(60);
+/// A storage sample holds up the run's log drain; it is short or skipped.
+const SAMPLE_DEADLINE: Duration = Duration::from_secs(10);
 const PULL_DEADLINE: Duration = Duration::from_secs(30 * 60);
 const CONTROL_OUTPUT: usize = 1024 * 1024;
 const RUN_OUTPUT: usize = 1024 * 1024 * 1024;
@@ -550,6 +557,23 @@ impl ActEngineBackend for DockerActBackend {
             )
             .await
             .map_err(|e| e.to_string())
+        })
+    }
+
+    fn storage_usage<'a>(
+        &'a self,
+        engine: &'a str,
+    ) -> BoxFuture<'a, Result<super::storage::StorageUsage, String>> {
+        Box::pin(async move {
+            let script = format!("df -Pk {}", super::storage::STORAGE_PATH);
+            let df = self
+                .checked(
+                    "storage usage",
+                    Self::exec(engine, &script),
+                    SAMPLE_DEADLINE,
+                )
+                .await?;
+            super::storage::StorageUsage::parse_df(&df)
         })
     }
 

@@ -243,10 +243,12 @@ job succeeded, or when its engine could not be proven removed.
   registry's ownership labels and a frozen creation profile.
   - Its limits are sized from the host engine's machine (`docker info`, plus
     `/proc/meminfo` when that is the same machine): memory is half the total,
-    at most three quarters of what is available, held between 4 and 28 GiB;
-    the storage tmpfs, which is RAM and counts against that memory, is five
-    sevenths of it, always leaving 2 GiB; CPUs are min(cores, 8); 4096
-    processes. Any of them can be pinned in `<state>/config.toml`:
+    at most three quarters of what is available, held between 4 and 48 GiB;
+    the storage tmpfs, which is RAM and counts against that memory, is three
+    quarters of it, always leaving 2 GiB; CPUs are min(cores, 8); 4096
+    processes. Neither limit reserves RAM until it is written; both only
+    bound a runaway job. Any of them can be pinned in `<state>/config.toml`
+    (pinning only `storage_gib` grows the sized memory to fit it):
 
     ```toml
     [engine]
@@ -259,6 +261,12 @@ job succeeded, or when its engine could not be proven removed.
     The chosen limits are frozen into the creation profile; creation and every
     observation verify the engine against it exactly, so a later host or
     config change never alters an existing run's engine.
+  - While act runs, the engine's storage is sampled (`df` inside the engine)
+    every few seconds. The log notes its peak; when under 5 GiB is left on a
+    mostly used engine it warns at once, and a run that then fails says so
+    in its `reason` (`bosn ci report`), naming `storage_gib`. A step that a
+    free-space guard refused (soldr will not build under 5 GiB) or that hit
+    ENOSPC is explained rather than failing silently (#392).
   - Its one named mount is the machine-wide cache volume (below), frozen into
     the creation profile, verified before creation and on every observation.
     No host path or socket is mounted.

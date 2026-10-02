@@ -37,6 +37,8 @@ pub struct FakeBackend {
     pub cache: Mutex<bool>,
     /// Tool-cache saves that found their engine still present.
     pub saved_while_live: Mutex<u32>,
+    /// What sampling the engine's storage reports; `None` fails the sample.
+    pub storage: Mutex<Option<crate::ci::storage::StorageUsage>>,
     next: Mutex<u64>,
 }
 impl FakeBackend {
@@ -118,6 +120,13 @@ impl ActEngineBackend for FakeBackend {
     ) -> super::super::engine::BoxFuture<'a, Result<Option<u64>, String>> {
         let exists = *self.cache.lock().unwrap();
         Box::pin(async move { Ok(exists.then_some(4096)) })
+    }
+    fn storage_usage<'a>(
+        &'a self,
+        _engine: &'a str,
+    ) -> super::super::engine::BoxFuture<'a, Result<crate::ci::storage::StorageUsage, String>> {
+        let usage = *self.storage.lock().unwrap();
+        Box::pin(async move { usage.ok_or_else(|| "df: not sampled".to_string()) })
     }
     fn save_toolcache<'a>(
         &'a self,
@@ -927,3 +936,5 @@ fn every_engine_step_holds_the_execution_claim() {
         );
     });
 }
+
+mod storage;

@@ -1,11 +1,13 @@
 //! How big one `bosn ci` engine may grow, sized from the engine's host.
 //!
 //! The engine's private storage is a tmpfs, so it is RAM and counts against
-//! the engine's memory limit. Sizing therefore starts from memory: half the
-//! host's total, but no more than three quarters of what is available right
-//! now, held between [`MEMORY_FLOOR`] and [`MEMORY_CEILING`]. Storage takes
-//! five sevenths of that (20 GiB of a 28 GiB engine), always leaving
-//! [`MEMORY_HEADROOM`] for the nested daemon and the jobs themselves.
+//! the engine's memory limit. Neither reserves anything until it is written:
+//! both only bound a runaway job, so a large host gets large bounds. Sizing
+//! starts from memory: half the host's total, but no more than three
+//! quarters of what is available right now, held between [`MEMORY_FLOOR`]
+//! and [`MEMORY_CEILING`]. Storage takes three quarters of that (36 GiB of a
+//! 48 GiB engine; a build's `target/` plus a guard's free-space margin, #392),
+//! always leaving [`MEMORY_HEADROOM`] for the nested daemon and the jobs.
 //!
 //! Every value can be pinned in `<state>/config.toml`:
 //!
@@ -17,10 +19,11 @@
 //! pids = 4096
 //! ```
 //!
-//! The chosen limits are frozen into each run's creation profile before its
-//! intent commits, and creation and every inspection verify the engine
-//! against that profile exactly; changing the host or the config never
-//! changes an existing record.
+//! Pinning only `storage_gib` grows a sized memory limit to fit it (by the
+//! same three quarters). The chosen limits are frozen into each run's
+//! creation profile before its intent commits, and creation and every
+//! inspection verify the engine against that profile exactly; changing the
+//! host or the config never changes an existing record.
 
 use serde::Deserialize;
 
@@ -30,7 +33,7 @@ const GIB: u64 = 1 << 30;
 /// The least memory an engine is sized to, however small the host.
 pub const MEMORY_FLOOR: u64 = 4 * GIB;
 /// The most memory an engine is sized to, however large the host.
-pub const MEMORY_CEILING: u64 = 28 * GIB;
+pub const MEMORY_CEILING: u64 = 48 * GIB;
 /// Memory always left outside the storage tmpfs.
 pub const MEMORY_HEADROOM: u64 = 2 * GIB;
 /// The least private storage an engine is sized to.
@@ -120,18 +123,27 @@ pub fn size_engine(host: HostResources, config: EngineConfig) -> Result<ActEngin
             .checked_mul(GIB)
             .ok_or_else(|| format!("[engine] {what} is out of range"))
     };
-    let memory_bytes = match config.memory_gib {
-        Some(value) => gib(value, "memory_gib")?,
-        None => (host.total_memory / 2)
-            .min(host.available_memory / 4 * 3)
-            .clamp(MEMORY_FLOOR, MEMORY_CEILING),
+    let pinned_storage = config
+        .storage_gib
+        .map(|value| gib(value, "storage_gib"))
+        .transpose()?;
+    let memory_bytes = match (config.memory_gib, pinned_storage) {
+        (Some(value), _) => gib(value, "memory_gib")?,
+        (None, pinned) => {
+            let sized = (host.total_memory / 2)
+                .min(host.available_memory / 4 * 3)
+                .clamp(MEMORY_FLOOR, MEMORY_CEILING);
+            // Pinned storage needs the memory it is a share of.
+            pinned.map_or(sized, |storage| {
+                sized.max(storage.saturating_add(storage / 3))
+            })
+        }
     };
-    let storage_bytes = match config.storage_gib {
-        Some(value) => gib(value, "storage_gib")?,
-        None => (memory_bytes / 7 * 5)
+    let storage_bytes = pinned_storage.unwrap_or_else(|| {
+        (memory_bytes / 4 * 3)
             .min(memory_bytes.saturating_sub(MEMORY_HEADROOM))
-            .max(STORAGE_FLOOR),
-    };
+            .max(STORAGE_FLOOR)
+    });
     let cpus = config.cpus.unwrap_or(host.cpus.clamp(1, CPU_CEILING));
     let limits = ActEngineLimits {
         memory_bytes,
@@ -160,8 +172,8 @@ mod tests {
     #[test]
     fn a_large_idle_host_gets_the_ceiling() {
         let limits = size_engine(host(128, 120, 32), EngineConfig::default()).unwrap();
-        assert_eq!(limits.memory_bytes, 28 * GIB);
-        assert_eq!(limits.storage_bytes, 20 * GIB);
+        assert_eq!(limits.memory_bytes, 48 * GIB);
+        assert_eq!(limits.storage_bytes, 36 * GIB);
         assert_eq!(limits.nano_cpus, 8_000_000_000);
         assert_eq!(limits.pids, DEFAULT_PIDS);
     }
@@ -171,12 +183,41 @@ mod tests {
         // Half of a 32 GiB host.
         let limits = size_engine(host(32, 30, 4), EngineConfig::default()).unwrap();
         assert_eq!(limits.memory_bytes, 16 * GIB);
-        assert_eq!(limits.storage_bytes, 16 * GIB / 7 * 5);
+        assert_eq!(limits.storage_bytes, 12 * GIB);
         assert_eq!(limits.nano_cpus, 4_000_000_000);
         // A busy host: three quarters of the 8 GiB still available.
         let busy = size_engine(host(32, 8, 4), EngineConfig::default()).unwrap();
         assert_eq!(busy.memory_bytes, 6 * GIB);
         assert!(busy.memory_bytes - busy.storage_bytes >= MEMORY_HEADROOM);
+    }
+
+    #[test]
+    fn clud_build_fits_with_soldr_margin_on_a_64_gib_host_and_up() {
+        // clud's build-linux-x64 keeps about 16 GiB on the engine's storage
+        // and soldr refuses to build with under 5 GiB free (#392).
+        let needed = 16 * GIB + 5 * GIB;
+        for total in [64, 96, 128, 256] {
+            let limits = size_engine(host(total, total, 16), EngineConfig::default()).unwrap();
+            assert!(
+                limits.storage_bytes >= needed,
+                "{total} GiB host: {limits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pinning_only_storage_grows_the_sized_memory_to_fit_it() {
+        let pinned = EngineConfig {
+            storage_gib: Some(32),
+            ..EngineConfig::default()
+        };
+        // A 32 GiB host sizes 16 GiB of memory, too little for the pin.
+        let limits = size_engine(host(32, 30, 4), pinned).unwrap();
+        assert_eq!(limits.storage_bytes, 32 * GIB);
+        assert_eq!(limits.memory_bytes, 32 * GIB + 32 * GIB / 3);
+        // Memory already large enough is left as sized.
+        let roomy = size_engine(host(128, 120, 8), pinned).unwrap();
+        assert_eq!(roomy.memory_bytes, 48 * GIB);
     }
 
     #[test]
