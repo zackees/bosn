@@ -679,3 +679,132 @@ fn an_interrupted_app_task_exec_stops_its_processes_in_the_container() {
     ));
     assert_eq!(engine.calls.lock().unwrap().len(), 1);
 }
+
+fn fresh(
+    engine: &FakeAppEngine,
+    plan: &SetupPlan,
+    workspace: &Path,
+    image: &PreparedImage,
+) -> Result<SetupTaskResult, SetupTaskError> {
+    let cancellation = CancellationSource::new();
+    let (events, _receiver) = channel(8);
+    runtime().run(crate::execute_setup_app_task_fresh(
+        engine,
+        SetupAppTaskRequest {
+            plan,
+            workspace_root: workspace.to_path_buf(),
+            task_name: "check".into(),
+            passthrough_env: vec!["GITHUB_TOKEN".into()],
+            prepared_image: image,
+            options: RunOptions::streaming(Duration::from_secs(2), 4096),
+            cancellation: &cancellation.token(),
+            events: &events,
+        },
+    ))
+}
+
+#[test]
+fn a_fresh_app_task_runs_a_new_container_with_the_apps_exact_runtime_shape() {
+    let temporary = tempfile::tempdir().unwrap();
+    let workspace = temporary.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir(workspace.join("src")).unwrap();
+    let plan = plan(&workspace);
+    let image = prepared(&plan);
+    let engine = FakeAppEngine::with_results([command_result(0, b"ok", b"")]);
+    let result = fresh(&engine, &plan, &workspace, &image).unwrap();
+    assert_eq!(result.task_name, "check");
+    assert_eq!(result.image_identity, IDENTITY);
+    let calls = engine.calls.lock().unwrap();
+    let [command @ SetupAppTaskCommand::FreshRun { task_token, .. }] = calls.as_slice() else {
+        panic!("exactly one fresh run: {calls:?}");
+    };
+    let args = command.docker_args();
+    let name = format!("{}{task_token}", crate::FRESH_TASK_CONTAINER_PREFIX);
+    assert_eq!(
+        &args[..8],
+        [
+            "run",
+            "--rm",
+            "--name",
+            name.as_str(),
+            "--env",
+            &format!("BOSN_TASK_TOKEN={task_token}"),
+            "--env",
+            "GITHUB_TOKEN",
+        ]
+    );
+    // Everything between the forwarded names and the image is the setup
+    // app's own creation shape, byte for byte: no flag of its own, and no
+    // name or ownership label that would make it look like the app.
+    let image_at = args.iter().position(|arg| arg == IDENTITY).unwrap();
+    let shape = &args[8..image_at];
+    let create = crate::ensure::derive_creation(&plan, &workspace, &image)
+        .unwrap()
+        .create_command()
+        .docker_args();
+    assert!(!shape.is_empty());
+    assert!(
+        create.windows(shape.len()).any(|window| window == shape),
+        "fresh shape {shape:?} is not the app's creation shape {create:?}"
+    );
+    assert!(shape.iter().all(|arg| arg != "--label" && arg != "--name"));
+    assert_eq!(
+        args[image_at + 1..],
+        crate::shell::task_shell_args("cargo test --locked")[..]
+    );
+}
+
+#[test]
+fn an_interrupted_fresh_task_force_removes_its_container() {
+    let temporary = tempfile::tempdir().unwrap();
+    let workspace = temporary.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir(workspace.join("src")).unwrap();
+    let plan = plan(&workspace);
+    let image = prepared(&plan);
+    let interrupted = || CommandError::Deadline {
+        reaped_pid: None,
+        cleanup: None,
+    };
+
+    let engine =
+        FakeAppEngine::with_results([Err(interrupted()), command_result(0, b"removed", b"")]);
+    let result = fresh(&engine, &plan, &workspace, &image);
+    let calls = engine.calls.lock().unwrap();
+    let SetupAppTaskCommand::FreshRun { container_name, .. } = &calls[0] else {
+        panic!("the task runs first: {calls:?}");
+    };
+    assert_eq!(
+        calls[1],
+        SetupAppTaskCommand::FreshRemove {
+            container_name: container_name.clone()
+        }
+    );
+    assert_eq!(
+        calls[1].docker_args(),
+        ["container", "rm", "--force", container_name.as_str()]
+    );
+    assert!(
+        matches!(result, Err(SetupTaskError::RemoteStopped(_))),
+        "{result:?}"
+    );
+    drop(calls);
+
+    // An unconfirmed removal keeps the uncertain result.
+    let engine = FakeAppEngine::with_results([Err(interrupted()), command_result(1, b"", b"")]);
+    let result = fresh(&engine, &plan, &workspace, &image);
+    assert!(
+        matches!(result, Err(SetupTaskError::Deadline)),
+        "{result:?}"
+    );
+
+    // A completed run, even a failing one, already removed itself.
+    let engine = FakeAppEngine::with_results([command_result(3, b"", b"no")]);
+    let result = fresh(&engine, &plan, &workspace, &image);
+    assert!(matches!(
+        result,
+        Err(SetupTaskError::TaskFailed { exit_code: 3, .. })
+    ));
+    assert_eq!(engine.calls.lock().unwrap().len(), 1);
+}

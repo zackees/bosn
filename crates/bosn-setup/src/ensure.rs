@@ -23,6 +23,7 @@ use crate::{PreparedImage, PreparedImageKind, SetupPlan, SetupPlanAppSource};
 mod checks;
 mod derive;
 use checks::*;
+pub(crate) use derive::derive_creation;
 use derive::*;
 pub use derive::{setup_container_name, verify_setup_observation};
 
@@ -112,7 +113,7 @@ pub enum SetupEnsureCommand {
 }
 
 impl SetupEnsureCommand {
-    fn docker_args(&self) -> Vec<String> {
+    pub(crate) fn docker_args(&self) -> Vec<String> {
         match self {
             Self::VolumeInspect { volume_name } => vec![
                 "volume".into(),
@@ -167,53 +168,14 @@ impl SetupEnsureCommand {
                     args.push("--label".into());
                     args.push(format!("{key}={value}"));
                 }
-                for mount in mounts {
-                    let source = mount
-                        .source
-                        .to_str()
-                        .expect("validated mount source is UTF-8");
-                    let mut value = format!("type=bind,src={source},dst={}", mount.target);
-                    if mount.readonly {
-                        value.push_str(",readonly");
-                    }
-                    args.push("--mount".into());
-                    args.push(value);
-                }
-                for volume in volumes {
-                    args.push("--mount".into());
-                    args.push(format!(
-                        "type=volume,src={},dst={}",
-                        volume.name, volume.target
-                    ));
-                }
-                for mount in tmpfs {
-                    args.push("--tmpfs".into());
-                    args.push(tmpfs_docker_value(mount));
-                }
-                if let Some(socket) = host_docker_socket.as_ref() {
-                    let mut value = format!(
-                        "type=bind,src={},dst={}",
-                        socket.source.host_path(),
-                        socket.target
-                    );
-                    if socket.readonly {
-                        value.push_str(",readonly");
-                    }
-                    args.push("--mount".into());
-                    args.push(value);
-                    if let Some(dir) = &socket.proxy_dir {
-                        args.push("--mount".into());
-                        args.push(format!("type=bind,src={dir},dst={dir}"));
-                    }
-                }
-                for (key, value) in environment {
-                    args.push("--env".into());
-                    args.push(format!("{key}={value}"));
-                }
-                if let Some(workdir) = workdir {
-                    args.push("--workdir".into());
-                    args.push(workdir.clone());
-                }
+                args.extend(runtime_shape_args(
+                    mounts,
+                    volumes,
+                    tmpfs,
+                    host_docker_socket.as_ref().as_ref(),
+                    environment,
+                    workdir.as_deref(),
+                ));
                 if let Some(guest) = macos_guest.as_ref() {
                     args.extend([
                         "--device".into(),
@@ -252,6 +214,69 @@ impl SetupEnsureCommand {
             }
         }
     }
+}
+
+/// The container's runtime shape as `docker container create`/`run` flags:
+/// binds, named volumes, tmpfs, the opted-in host Docker socket, environment
+/// and working directory. The setup app and a `fresh` task container share it,
+/// so a fresh task always sees exactly the app's declared contract.
+pub(crate) fn runtime_shape_args(
+    mounts: &[SetupEnsureMount],
+    volumes: &[SetupEnsureVolume],
+    tmpfs: &[SetupEnsureTmpfs],
+    host_docker_socket: Option<&crate::SetupHostDockerSocket>,
+    environment: &BTreeMap<String, String>,
+    workdir: Option<&str>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    for mount in mounts {
+        let source = mount
+            .source
+            .to_str()
+            .expect("validated mount source is UTF-8");
+        let mut value = format!("type=bind,src={source},dst={}", mount.target);
+        if mount.readonly {
+            value.push_str(",readonly");
+        }
+        args.push("--mount".into());
+        args.push(value);
+    }
+    for volume in volumes {
+        args.push("--mount".into());
+        args.push(format!(
+            "type=volume,src={},dst={}",
+            volume.name, volume.target
+        ));
+    }
+    for mount in tmpfs {
+        args.push("--tmpfs".into());
+        args.push(tmpfs_docker_value(mount));
+    }
+    if let Some(socket) = host_docker_socket {
+        let mut value = format!(
+            "type=bind,src={},dst={}",
+            socket.source.host_path(),
+            socket.target
+        );
+        if socket.readonly {
+            value.push_str(",readonly");
+        }
+        args.push("--mount".into());
+        args.push(value);
+        if let Some(dir) = &socket.proxy_dir {
+            args.push("--mount".into());
+            args.push(format!("type=bind,src={dir},dst={dir}"));
+        }
+    }
+    for (key, value) in environment {
+        args.push("--env".into());
+        args.push(format!("{key}={value}"));
+    }
+    if let Some(workdir) = workdir {
+        args.push("--workdir".into());
+        args.push(workdir.to_owned());
+    }
+    args
 }
 
 /// A successful inspection of a managed candidate container.

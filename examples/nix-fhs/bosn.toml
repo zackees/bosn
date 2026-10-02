@@ -1,0 +1,36 @@
+# Run unmodified foreign binaries on a NixOS-shaped root, once per FHS layer.
+# See docs/fresh-tasks.md. From this directory:
+#
+#   bosn run --task baseline     # no layer: everything foreign fails
+#   bosn run --task desktop      # FHS layer + desktop libraries
+#
+# Every task is `fresh`: it starts from the image, so one layer's /lib64,
+# /usr/lib and tool links can never leak into the next. Downloads and
+# toolchains persist in the machine-scoped `cache` volume.
+
+[stack.fhs]
+dockerfile = "Dockerfile"
+family = "nix"
+default = true
+
+[stack.fhs.mounts]
+exp = { source = ".", destination = "/exp", readonly = true }
+
+[stack.fhs.volumes]
+cache = { scope = "machine", destination = "/cache" }
+
+[task.baseline]
+cmd = "MODE=baseline bash /exp/corpus.sh"
+fresh = true
+
+[task.stock]
+cmd = "MODE=stock bash /exp/corpus.sh"
+fresh = true
+
+[task.base]
+cmd = "MODE=base bash /exp/corpus.sh"
+fresh = true
+
+[task.desktop]
+cmd = "MODE=desktop bash /exp/corpus.sh"
+fresh = true

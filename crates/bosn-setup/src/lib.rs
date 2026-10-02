@@ -62,6 +62,8 @@ pub use task::{
 };
 mod task_stop;
 pub use task_stop::TASK_TOKEN_ENV;
+mod task_fresh;
+pub use task_fresh::{FRESH_TASK_CONTAINER_PREFIX, SetupFreshShape, execute_setup_app_task_fresh};
 
 /// The current durable cache-record wire version.  It is intentionally
 /// independent of the setup-document schema version.

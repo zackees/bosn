@@ -89,6 +89,19 @@ pub enum SetupAppTaskCommand {
         container_name: String,
         task_token: String,
     },
+    /// A `fresh` task: `docker run --rm` of a new container from the app's
+    /// exact image and runtime shape, so nothing the task writes outside the
+    /// declared volumes survives it. See [`crate::execute_setup_app_task_fresh`].
+    FreshRun {
+        container_name: String,
+        task_token: String,
+        passthrough_env: Vec<String>,
+        shape: crate::task_fresh::SetupFreshShape,
+        command: String,
+    },
+    /// Force-remove a fresh task container whose `docker run` client ended
+    /// without the task's exit status; killing the client does not stop it.
+    FreshRemove { container_name: String },
 }
 
 impl SetupAppTaskCommand {
@@ -114,6 +127,35 @@ impl SetupAppTaskCommand {
                 args.extend(crate::shell::task_shell_args(command));
                 args
             }
+            Self::FreshRun {
+                container_name,
+                task_token,
+                passthrough_env,
+                shape,
+                command,
+            } => {
+                let mut args = vec![
+                    "run".into(),
+                    "--rm".into(),
+                    "--name".into(),
+                    container_name.clone(),
+                    "--env".into(),
+                    format!("{}={task_token}", crate::task_stop::TASK_TOKEN_ENV),
+                ];
+                for name in passthrough_env {
+                    args.push("--env".into());
+                    args.push(name.clone());
+                }
+                args.extend(shape.docker_args());
+                args.extend(crate::shell::task_shell_args(command));
+                args
+            }
+            Self::FreshRemove { container_name } => vec![
+                "container".into(),
+                "rm".into(),
+                "--force".into(),
+                container_name.clone(),
+            ],
             Self::Stop {
                 container_name,
                 task_token,
@@ -387,6 +429,58 @@ pub async fn execute_setup_app_task<E: SetupAppTaskEngine>(
     engine: &E,
     request: SetupAppTaskRequest<'_>,
 ) -> Result<SetupTaskResult, SetupTaskError> {
+    let start = start_app_task(&request)?;
+    let result = match engine
+        .stream(
+            SetupAppTaskCommand::Exec {
+                container_name: start.container_name.clone(),
+                task_token: start.task_token.clone(),
+                passthrough_env: request.passthrough_env.clone(),
+                command: start.command.clone(),
+            },
+            RunOptions::streaming(start.remaining, request.options.output_limit),
+            request.cancellation,
+            request.events,
+        )
+        .await
+    {
+        Ok(result) => result,
+        // The client never started, so nothing ran in the container.
+        Err(error @ CommandError::Spawn(_)) => return Err(error.into()),
+        Err(error) => {
+            let cause = SetupTaskError::from(error);
+            let stopped = crate::task_stop::stop_task_processes(
+                engine,
+                &start.container_name,
+                &start.task_token,
+                request.events,
+            )
+            .await;
+            return Err(if stopped {
+                SetupTaskError::RemoteStopped(Box::new(cause))
+            } else {
+                cause
+            });
+        }
+    };
+    finish_app_task(result, request, start.image_identity)
+}
+
+/// Everything an app task needs before its one engine command: the declared
+/// command, the remaining budget, the app's name and a per-execution token.
+pub(crate) struct AppTaskStart {
+    pub(crate) command: String,
+    pub(crate) image_identity: String,
+    pub(crate) remaining: std::time::Duration,
+    pub(crate) container_name: String,
+    pub(crate) task_token: String,
+}
+
+/// Validate one app-task request and derive its [`AppTaskStart`]. Shared by
+/// the in-app exec and the `fresh` container, so both refuse the same inputs.
+pub(crate) fn start_app_task(
+    request: &SetupAppTaskRequest<'_>,
+) -> Result<AppTaskStart, SetupTaskError> {
     let command = derive_command(&SetupTaskRequest {
         plan: request.plan,
         workspace_root: request.workspace_root.clone(),
@@ -420,8 +514,7 @@ pub async fn execute_setup_app_task<E: SetupAppTaskEngine>(
     if request.options.output_limit == 0 {
         return Err(SetupTaskError::InvalidRequest("output budget is zero"));
     }
-    let deadline = Deadline::after(request.options.deadline);
-    let remaining = deadline.remaining();
+    let remaining = Deadline::after(request.options.deadline).remaining();
     if remaining.is_zero() {
         return Err(SetupTaskError::Deadline);
     }
@@ -432,39 +525,21 @@ pub async fn execute_setup_app_task<E: SetupAppTaskEngine>(
     )
     .map_err(|_| SetupTaskError::InvalidRequest("invalid container creation profile"))?;
     let task_token = crate::task_stop::new_task_token(&container_name, &request.task_name);
-    let result = match engine
-        .stream(
-            SetupAppTaskCommand::Exec {
-                container_name: container_name.clone(),
-                task_token: task_token.clone(),
-                passthrough_env: request.passthrough_env,
-                command,
-            },
-            RunOptions::streaming(remaining, request.options.output_limit),
-            request.cancellation,
-            request.events,
-        )
-        .await
-    {
-        Ok(result) => result,
-        // The client never started, so nothing ran in the container.
-        Err(error @ CommandError::Spawn(_)) => return Err(error.into()),
-        Err(error) => {
-            let cause = SetupTaskError::from(error);
-            let stopped = crate::task_stop::stop_task_processes(
-                engine,
-                &container_name,
-                &task_token,
-                request.events,
-            )
-            .await;
-            return Err(if stopped {
-                SetupTaskError::RemoteStopped(Box::new(cause))
-            } else {
-                cause
-            });
-        }
-    };
+    Ok(AppTaskStart {
+        command,
+        image_identity,
+        remaining,
+        container_name,
+        task_token,
+    })
+}
+
+/// Turn a completed app-task command into its receipt or failure.
+pub(crate) fn finish_app_task(
+    result: CommandResult,
+    request: SetupAppTaskRequest<'_>,
+    image_identity: String,
+) -> Result<SetupTaskResult, SetupTaskError> {
     let used = result.stdout.len().saturating_add(result.stderr.len());
     if used > request.options.output_limit {
         return Err(SetupTaskError::Transport(CommandError::OutputLimit {

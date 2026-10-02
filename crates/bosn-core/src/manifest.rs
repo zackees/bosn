@@ -105,6 +105,11 @@ pub struct Task {
     /// for this task and injects only its loopback URL as `GITHUB_API_URL`.
     /// The credential it uses never enters the container.
     pub github_api_proxy: bool,
+    /// `fresh = true`: run in a new container from the stack's image and
+    /// runtime shape (binds, volumes, tmpfs, env, workdir), removed when the
+    /// task ends, so no root-filesystem change survives into the next run.
+    /// Named volumes still persist; they are the stack's declared state.
+    pub fresh: bool,
 }
 
 /// Secret names a manifest task may declare, and the environment variable
@@ -210,7 +215,7 @@ pub fn parse_manifest_toml(source: &str, roots: ManifestRoots) -> Result<Manifes
         let body = table_value(body, "task")?;
         reject_unknown(
             body,
-            &["stack", "cmd", "secrets", "github_api"],
+            &["stack", "cmd", "secrets", "github_api", "fresh"],
             &format!("task.{name}"),
         )?;
         let secrets = parse_task_secrets(body, name)?;
@@ -223,6 +228,7 @@ pub fn parse_manifest_toml(source: &str, roots: ManifestRoots) -> Result<Manifes
                 ));
             }
         };
+        let fresh = optional_bool(body, "fresh", &format!("task.{name}"))?.unwrap_or(false);
         let cmd = required_string(body, "cmd", &format!("task.{name}"))?;
         if cmd.is_empty() {
             return err(format!("[task.{name}] must set `cmd`"));
@@ -252,6 +258,7 @@ pub fn parse_manifest_toml(source: &str, roots: ManifestRoots) -> Result<Manifes
                 cmd,
                 secrets,
                 github_api_proxy,
+                fresh,
             },
         );
     }

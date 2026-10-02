@@ -854,6 +854,39 @@ fn manifest_app_task_plan_retains_only_a_task_from_its_selected_stack() {
     );
 }
 
+#[test]
+fn manifest_task_plan_carries_only_its_own_fresh_opt_in() {
+    let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+    let workspace = temporary.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let image = format!("example.invalid/app@sha256:{}", "a".repeat(64));
+    std::fs::write(workspace.join("bosn.toml"), format!(
+        "[stack.app]\nimage='{image}'\n[task.clean]\ncmd='true'\nfresh=true\n[task.warm]\ncmd='true'\n"
+    )).unwrap();
+    let runtime = RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let request = |task: &str| ManifestAppTaskJobRequest {
+        workspace: workspace.clone(),
+        manifest: "bosn.toml".into(),
+        stack: "app".into(),
+        task_name: task.into(),
+        deadline: Duration::from_secs(1),
+        output_limit: 64,
+    };
+    let clean = runtime
+        .run(manifest_stack_task_setup_plan(&request("clean")))
+        .unwrap();
+    let warm = runtime
+        .run(manifest_stack_task_setup_plan(&request("warm")))
+        .unwrap();
+    assert!(clean.fresh);
+    assert!(!warm.fresh);
+    // `fresh` changes how one task runs, never the app it runs beside.
+    assert_eq!(clean.generation, warm.generation);
+}
+
 /// Two checkouts with the same `bosn.toml` must never share a setup container
 /// that mounts one of them (#359). The container's name is its creation
 /// identity (canonical workspace, creation arguments), so each checkout gets

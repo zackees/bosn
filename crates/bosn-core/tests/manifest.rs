@@ -142,6 +142,21 @@ fn task_github_api_proxy_is_opt_in_and_carries_no_value() {
 }
 
 #[test]
+fn task_fresh_container_is_an_opt_in_boolean() {
+    let manifest = parse_manifest_toml(
+        "[stack.a]\nimage='x'\n[task.clean]\ncmd='true'\nfresh=true\n[task.plain]\ncmd='true'\n",
+        roots(),
+    )
+    .unwrap();
+    assert!(manifest.task("clean").unwrap().fresh);
+    assert!(!manifest.task("plain").unwrap().fresh);
+    for bad in ["fresh='yes'", "fresh=1", "fresh=['true']"] {
+        let source = format!("[stack.a]\nimage='x'\n[task.ci]\ncmd='true'\n{bad}\n");
+        assert!(parse_manifest_toml(&source, roots()).is_err(), "{bad}");
+    }
+}
+
+#[test]
 fn job_caches_are_validated_and_default_to_exclusive_repo_scope() {
     let manifest = parse_manifest_toml(
         r#"

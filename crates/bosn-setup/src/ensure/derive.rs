@@ -18,6 +18,18 @@ pub(crate) struct DerivedEnsure {
 }
 
 impl DerivedEnsure {
+    /// This app's runtime shape as Docker flags (see [`runtime_shape_args`]).
+    pub(crate) fn runtime_shape_args(&self) -> Vec<String> {
+        runtime_shape_args(
+            &self.mounts,
+            &self.volumes,
+            &self.tmpfs,
+            self.host_docker_socket.as_ref(),
+            &self.environment,
+            self.workdir.as_deref(),
+        )
+    }
+
     pub(crate) fn create_command(&self) -> SetupEnsureCommand {
         SetupEnsureCommand::Create {
             container_name: self.container_name.clone(),

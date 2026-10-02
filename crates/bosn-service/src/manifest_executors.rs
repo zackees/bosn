@@ -186,6 +186,7 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
             .map_err(|_| "manifest app task cancelled before ownership inspection".to_owned())?
             .map_err(|_| "manifest app task planning exceeded its deadline".to_owned())??;
             let guest_task = runtime.guest_task;
+            let runtime_fresh = runtime.fresh;
             let job_caches = runtime.job_caches;
             let plan = runtime.plan;
             let task_command = plan
@@ -375,8 +376,9 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                     }
                 }
                 logs.send(format!(
-                    "[manifest-app-task] running declared task {}",
-                    request.task_name
+                    "[manifest-app-task] running declared task {}{}",
+                    request.task_name,
+                    if runtime_fresh { " in a fresh container" } else { "" }
                 ))
                 .await
                 .map_err(|_| "manifest app task log consumer closed".to_owned())?;
@@ -388,20 +390,21 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                     .begin(manifest_app_task_session_container_identity(&observed))
                     .await
                     .map_err(|_| "manifest app task ownership recording unavailable".to_owned())?;
-                let result = execute_setup_app_task(
-                    &engine,
-                    SetupAppTaskRequest {
-                        plan: &plan,
-                        workspace_root: request.workspace.clone(),
-                        task_name: request.task_name.clone(),
-                        passthrough_env: passthrough_env.clone(),
-                        prepared_image: &prepared,
-                        options: RunOptions::streaming(deadline.remaining(), exec_output),
-                        cancellation,
-                        events: &events,
-                    },
-                )
-                .await;
+                let task_request = SetupAppTaskRequest {
+                    plan: &plan,
+                    workspace_root: request.workspace.clone(),
+                    task_name: request.task_name.clone(),
+                    passthrough_env: passthrough_env.clone(),
+                    prepared_image: &prepared,
+                    options: RunOptions::streaming(deadline.remaining(), exec_output),
+                    cancellation,
+                    events: &events,
+                };
+                let result = if runtime_fresh {
+                    bosn_setup::execute_setup_app_task_fresh(&engine, task_request).await
+                } else {
+                    execute_setup_app_task(&engine, task_request).await
+                };
                 // Whatever the outcome (success, failure, cancel, stall or
                 // a lost client), remove what the job created.
                 if let Some(runner) = runner {
@@ -422,6 +425,10 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                 // The last task to leave a retired container stops it.
                 stop_retired_generations(session, &workspace, &request.stack, logs).await?;
                 match result {
+                    Ok(value) if runtime_fresh => Ok(format!(
+                        "completed declared manifest task {} in a fresh container from image {} (stack container {})",
+                        value.task_name, value.image_identity, observed.container_name
+                    )),
                     Ok(value) => Ok(format!(
                         "completed declared manifest task {} in managed container {} with image {}",
                         value.task_name, observed.container_name, value.image_identity

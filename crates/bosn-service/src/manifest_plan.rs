@@ -217,6 +217,7 @@ pub(crate) async fn manifest_stack_plan(
     let mut guest_task = None;
     let mut secrets = Vec::new();
     let mut github_api_proxy = false;
+    let mut fresh = false;
     if let Some(task_name) = task_name {
         let task = manifest
             .task(task_name)
@@ -233,8 +234,12 @@ pub(crate) async fn manifest_stack_plan(
         if task.github_api_proxy && stack.guest.is_some() {
             return Err("github_api = \"proxy\" is not supported for macOS guest tasks".into());
         }
+        if task.fresh && stack.guest.is_some() {
+            return Err("fresh = true is not supported for macOS guest tasks".into());
+        }
         secrets.clone_from(&task.secrets);
         github_api_proxy = task.github_api_proxy;
+        fresh = task.fresh;
         tasks.insert(
             task.name.clone(),
             SetupTask {
@@ -329,6 +334,7 @@ pub(crate) async fn manifest_stack_plan(
         guest_task,
         secrets,
         github_api_proxy,
+        fresh,
         job_caches,
     })
 }
@@ -470,6 +476,9 @@ pub(crate) struct ManifestRuntimePlan {
     pub(crate) secrets: Vec<String>,
     /// The task declared `github_api = "proxy"`.
     pub(crate) github_api_proxy: bool,
+    /// The task declared `fresh = true`: run it in a new container from the
+    /// app's image and runtime shape instead of `docker exec` in the app.
+    pub(crate) fresh: bool,
     /// Cache mappings for the containers this stack's tasks start through
     /// the Docker proxy (#358): the manifest's `job_caches`, plus act's
     /// toolcache as an exclusive machine cache unless the manifest maps it.
