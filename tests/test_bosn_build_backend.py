@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -172,14 +173,19 @@ def test_native_cli_explicit_soldr_preserves_flags(backend, monkeypatch):
     module, calls = backend
     target = module._DARWIN_TARGETS["aarch64-apple-darwin"]
     monkeypatch.setenv("BOSN_WHEEL_TARGET", target.triple)
-    monkeypatch.setattr(module, "run", lambda argv, **kwargs: calls.append(argv))
     monkeypatch.setattr(module, "_assert_target_magic", lambda *args: None)
     monkeypatch.setattr(module, "rmtree", lambda *args, **kwargs: None)
     monkeypatch.setattr(module, "copy2", lambda *args: None)
     monkeypatch.setattr(module, "chmod", lambda *args: None)
-    binary = module._native_cli(target)
+    binary = module._ROOT / "target" / target.triple / "release/bosn-native"
     binary.parent.mkdir(parents=True)
     binary.write_bytes(b"fixture")
+
+    def compiled(argv, **kwargs):
+        calls.append(argv)
+        return module._cargo_native_executable(io.BytesIO(native_artifact_stream(module, binary)))
+
+    monkeypatch.setattr(module, "_run_native_build", compiled)
     monkeypatch.setattr(module, "_WHEEL_NATIVE_DIRECTORY", module._ROOT / "stage")
     module._build_native_cli()
     assert calls[-1] == [
@@ -192,10 +198,85 @@ def test_native_cli_explicit_soldr_preserves_flags(backend, monkeypatch):
         "bosn-python",
         "--bin",
         "bosn-native",
+        "--message-format=json-render-diagnostics",
         "--target",
         target.triple,
     ]
     assert "PYO3_CROSS_PYTHON_VERSION" not in os.environ
+
+
+def native_artifact_stream(module, binary, *, manifest=None, success=True):
+    artifact = {
+        "reason": "compiler-artifact",
+        "manifest_path": str(manifest or module._ROOT / "crates/bosn-python/Cargo.toml"),
+        "target": {"name": "bosn-native", "kind": ["bin"]},
+        "executable": str(binary),
+    }
+    finished = {"reason": "build-finished", "success": success}
+    return (json.dumps(artifact) + "\n" + json.dumps(finished) + "\n").encode()
+
+
+@pytest.mark.parametrize("layout", ["x86_64-pc-windows-msvc", "custom-target-dir"])
+def test_native_cli_stages_the_reported_executable(backend, monkeypatch, layout):
+    module, _ = backend
+    binary = module._ROOT / layout / "release/bosn-native.exe"
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"reported-binary")
+    decoy = module._ROOT / "target/release/bosn-native"
+    decoy.parent.mkdir(parents=True)
+    decoy.write_bytes(b"stale-decoy")
+    monkeypatch.setattr(module, "_WHEEL_DATA", module._ROOT / "wheel-data")
+    monkeypatch.setattr(module, "_WHEEL_NATIVE_DIRECTORY", module._ROOT / "stage")
+    monkeypatch.setattr(module, "_copy_linux_openssl", lambda *args: None)
+    monkeypatch.delenv("BOSN_WHEEL_TARGET", raising=False)
+
+    def compiled(_argv, **kwargs):
+        return module._cargo_native_executable(io.BytesIO(native_artifact_stream(module, binary)))
+
+    monkeypatch.setattr(module, "_run_native_build", compiled)
+    module._build_native_cli()
+    assert (module._WHEEL_NATIVE_DIRECTORY / module._command_name()).read_bytes() == (
+        b"reported-binary"
+    )
+
+
+@pytest.mark.parametrize("invalid", ["duplicate", "missing", "foreign", "unfinished", "failed"])
+def test_unproven_native_executable_refuses(backend, invalid):
+    module, _ = backend
+    binary = module._ROOT / "bosn-native"
+    binary.write_bytes(b"fixture")
+    stream = native_artifact_stream(module, binary, success=invalid != "failed")
+    if invalid == "duplicate":
+        stream = stream.splitlines(keepends=True)[0] + stream
+    elif invalid == "missing":
+        binary.rename(module._ROOT / "gone")
+    elif invalid == "foreign":
+        stream = native_artifact_stream(module, binary, manifest=module._ROOT / "other.toml")
+    elif invalid == "unfinished":
+        stream = stream.splitlines(keepends=True)[0]
+    with pytest.raises(RuntimeError):
+        module._cargo_native_executable(io.BytesIO(stream))
+
+
+def test_artifact_stream_overflow_terminates_and_reaps_live_producer(backend, monkeypatch):
+    module, _ = backend
+    monkeypatch.setattr(module, "_MAX_ARTIFACT_BYTES", 1024)
+    processes = []
+
+    def producer(*args, **kwargs):
+        process = subprocess.Popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(module, "Popen", producer)
+    command = [
+        sys.executable,
+        "-c",
+        "import sys,time; sys.stdout.write('x'*2048+'\\n'); sys.stdout.flush(); time.sleep(30)",
+    ]
+    with pytest.raises(RuntimeError, match="stream exceeds"):
+        module._run_native_build(command)
+    assert len(processes) == 1 and processes[0].poll() is not None
 
 
 def test_actual_fake_frontdoor_executable(backend):

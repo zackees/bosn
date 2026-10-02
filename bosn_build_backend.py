@@ -20,7 +20,7 @@ from pathlib import Path
 from re import compile as compile_regex
 from shutil import copy2, copyfileobj, rmtree, which
 from struct import unpack_from
-from subprocess import run
+from subprocess import PIPE, CalledProcessError, Popen, TimeoutExpired, run
 from sys import platform
 from typing import Any
 from uuid import uuid4
@@ -37,6 +37,8 @@ _WHEEL_DATA = _ROOT / "target" / "bosn-wheel-data"
 _WHEEL_NATIVE_DIRECTORY = _WHEEL_DATA / "scripts"
 _LINUX_OPENSSL = compile_regex(r"^(lib(?:ssl|crypto)\.so\.\d+) => (\S+)")
 _MACHO_64_MAGIC = 0xFEEDFACF
+_MAX_ARTIFACT_BYTES = 32 * 1024 * 1024
+_MAX_ARTIFACT_RECORD_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -76,14 +78,6 @@ def _wheel_target() -> _DarwinTarget | None:
 # command name while staging it into the wheel's scripts tree.
 def _command_name() -> str:
     return "bosn.exe" if os_name == "nt" else "bosn"
-
-
-def _native_cli(target: _DarwinTarget | None) -> Path:
-    name = "bosn-native.exe" if target is None and os_name == "nt" else "bosn-native"
-    directory = _ROOT / "target"
-    if target is not None:
-        directory /= target.triple
-    return directory / "release" / name
 
 
 def _assert_target_magic(binary: Path, target: _DarwinTarget | None) -> None:
@@ -235,12 +229,15 @@ def _build_native_cli() -> None:
         "bosn-python",
         "--bin",
         "bosn-native",
+        "--message-format=json-render-diagnostics",
     ]
     if target is not None:
         command.extend(["--target", target.triple])
     with _cross_pyo3_environment(target), _linux_rpath_environment(target):
-        run(command, cwd=_ROOT, check=True)
-    native_cli = _native_cli(target)
+        # Cargo's machine stream identifies the executable even when Soldr
+        # supplies a host target or CARGO_TARGET_DIR redirects build outputs.
+        # Compiler diagnostics remain rendered on inherited stderr.
+        native_cli = _run_native_build(command)
     _assert_target_magic(native_cli, target)
     rmtree(_WHEEL_DATA, ignore_errors=True)
     destination = _WHEEL_NATIVE_DIRECTORY / _command_name()
@@ -248,6 +245,71 @@ def _build_native_cli() -> None:
     copy2(native_cli, destination)
     chmod(destination, native_cli.stat().st_mode)
     _copy_linux_openssl(destination.parent, native_cli, target)
+
+
+def _run_native_build(command: list[str]) -> Path:
+    process = Popen(command, cwd=_ROOT, stdout=PIPE)
+    assert process.stdout is not None
+    try:
+        executable = _cargo_native_executable(process.stdout)
+        code = process.wait()
+        if code:
+            raise CalledProcessError(code, command)
+        return executable
+    finally:
+        process.stdout.close()
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except TimeoutExpired:
+                process.kill()
+                process.wait()
+
+
+def _cargo_native_executable(artifacts) -> Path:
+    manifest = (_ROOT / "crates/bosn-python/Cargo.toml").resolve()
+    matches = []
+    finished = False
+    total_bytes = 0
+    for line in iter(lambda: artifacts.readline(_MAX_ARTIFACT_RECORD_BYTES + 1), b""):
+        total_bytes += len(line)
+        if total_bytes > _MAX_ARTIFACT_BYTES:
+            raise RuntimeError("Cargo artifact stream exceeds its size bound")
+        if len(line) > _MAX_ARTIFACT_RECORD_BYTES:
+            raise RuntimeError("Cargo artifact record exceeds its size bound")
+        if not line.lstrip().startswith(b"{"):
+            # Proc macros may write ordinary stdout alongside Cargo records.
+            print(line.decode("utf-8", errors="replace"), end="")
+            continue
+        document = json.loads(line)
+        if not isinstance(document, dict):
+            raise RuntimeError("Invalid Cargo artifact record")
+        if document.get("reason") == "build-finished":
+            if finished or document.get("success") is not True:
+                raise RuntimeError("Cargo build did not finish successfully")
+            finished = True
+        if document.get("reason") != "compiler-artifact":
+            continue
+        cargo_target = document.get("target")
+        if (
+            not isinstance(cargo_target, dict)
+            or cargo_target.get("name") != "bosn-native"
+            or cargo_target.get("kind") != ["bin"]
+            or not isinstance(document.get("manifest_path"), str)
+            or Path(document["manifest_path"]).resolve() != manifest
+        ):
+            continue
+        executable = document.get("executable")
+        if not isinstance(executable, str) or not executable:
+            raise RuntimeError("Cargo omitted the native executable path")
+        binary = Path(executable)
+        if not binary.is_absolute() or not binary.is_file():
+            raise RuntimeError("Cargo native executable is missing or not absolute")
+        matches.append(binary)
+    if not finished or len(matches) != 1:
+        raise RuntimeError("Cargo must report one completed native executable")
+    return matches[0]
 
 
 def _copy_linux_openssl(destination: Path, native_cli: Path, target: _DarwinTarget | None) -> None:
