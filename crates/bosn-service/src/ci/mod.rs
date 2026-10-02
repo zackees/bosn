@@ -25,7 +25,7 @@ mod vocabulary {
         $($(#[$vmeta:meta])* $variant:ident => $word:literal),+ $(,)?
     }) => {
         $(#[$meta])*
-        #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+        #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
         pub enum $name {
             $($(#[$vmeta])* #[serde(rename = $word)] $variant),+
         }
@@ -62,10 +62,12 @@ pub mod reply;
 pub mod report;
 pub mod runtime;
 pub mod scheduler;
+pub mod schema;
 pub mod snapshot;
 pub mod store;
 pub mod ui;
 pub mod wire;
+pub mod workflow;
 
 pub use client::{SubmitOptions, detect_actor, plan, stage_submission};
 pub use reply::*;

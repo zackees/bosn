@@ -28,8 +28,11 @@ use super::{
     store::{INDEX_STRIDE, LogFilter, LogQuery, LogWriter, Settings, Store},
     ui::UiHandle,
     wire::*,
+    workflow,
 };
 use crate::{RegistryActor, secrets::SecretMasker};
+mod observer;
+use observer::*;
 
 /// Finished runs kept, and how many of them keep their source for retry.
 const KEEP_RUNS: usize = 200;
@@ -583,7 +586,8 @@ impl CiRuntime {
         let outcome = self.drive(&record, &cancel, &mut observer).await;
         observer.publish();
         let mut tree = std::mem::take(&mut observer.parser.tree);
-        let (conclusion, mut reason) = report::conclude(&outcome, &mut tree);
+        let declared = workflow::declared_steps(&self.store.source(&record.id), &record.workflow);
+        let (conclusion, mut reason) = report::conclude(&outcome, &mut tree, &declared);
         let lost = observer.log.as_ref().map_or(observer.seq, LogWriter::lost);
         if lost > 0 {
             let note = format!("{lost} log records could not be written");
@@ -801,84 +805,6 @@ impl CiState {
         }
         self.order.retain(|id| self.runs.contains_key(id));
         plan
-    }
-}
-
-/// Streams one run's output into its log, parser and published record.
-struct RunObserver {
-    runtime: CiRuntime,
-    id: String,
-    log: Option<LogWriter>,
-    parser: ActParser,
-    /// Masks secret values in act output before it is parsed or stored.
-    masker: SecretMasker,
-    seq: u64,
-    last_publish: Instant,
-}
-
-impl RunObserver {
-    fn append(&mut self, record: LogRecord) {
-        let offset = self.log.as_mut().and_then(|log| log.append(&record));
-        if let Some(offset) = offset
-            && record.seq % INDEX_STRIDE == 1
-        {
-            let mut state = self.runtime.lock();
-            if let Some(slot) = state.runs.get_mut(&self.id) {
-                slot.index.push((record.seq, offset));
-            }
-        }
-        if self.last_publish.elapsed() > PUBLISH_INTERVAL {
-            self.publish();
-        }
-    }
-
-    /// Flush the log, then make its records and the current tree visible.
-    fn publish(&mut self) {
-        if let Some(log) = &mut self.log {
-            log.flush();
-        }
-        self.last_publish = Instant::now();
-        let (seq, tree) = (self.seq, self.parser.tree.clone());
-        self.runtime.update(&self.id, |slot| {
-            slot.record.log_records = seq;
-            slot.record.tree = tree;
-        });
-    }
-
-    fn next_seq(&mut self) -> u64 {
-        self.seq += 1;
-        self.seq
-    }
-}
-
-impl EngineObserver for RunObserver {
-    fn note(&mut self, text: &str) {
-        let seq = self.next_seq();
-        self.append(LogRecord {
-            seq,
-            stream: "bosn".into(),
-            job: None,
-            section: None,
-            text: text.into(),
-        });
-    }
-    fn declared(&mut self, listing: &str) {
-        self.parser = ActParser::new(RunTree::declared(&parse_act_list(listing)));
-        self.publish();
-    }
-    fn line(&mut self, line: EngineLine) {
-        let seq = self.next_seq();
-        let record = match line {
-            EngineLine::Stdout(text) => self.parser.feed(seq, &self.masker.mask_text(&text)),
-            EngineLine::Stderr(text) => LogRecord {
-                seq,
-                stream: "stderr".into(),
-                job: None,
-                section: None,
-                text: self.masker.mask_text(&text),
-            },
-        };
-        self.append(record);
     }
 }
 

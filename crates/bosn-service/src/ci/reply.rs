@@ -25,20 +25,22 @@ impl<T: Serialize> JsonReply for T {
 }
 
 /// A single-use link that signs a browser in to the dashboard.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct UiGrantReply {
     pub url: String,
 }
 
 /// A refused or failed request. `code` is stable (`refused`, `not_found`,
 /// `invalid_request`, `internal`).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ErrorReply {
     pub code: String,
     pub message: String,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 pub struct JobCounts {
     pub total: usize,
     pub completed: usize,
@@ -47,7 +49,7 @@ pub struct JobCounts {
 
 /// A run as clients see it: the record plus fields derived from it. Listings
 /// omit the job tree (`record.tree` is then empty).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RunView {
     #[serde(flatten)]
     pub record: RunRecord,
@@ -81,7 +83,7 @@ impl RunView {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SubmitReply {
     pub run: String,
     /// True when an identical run was already queued or running.
@@ -90,7 +92,7 @@ pub struct SubmitReply {
     pub record: RunView,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RunnerStatus {
     pub limit: usize,
     pub running: usize,
@@ -100,7 +102,7 @@ pub struct RunnerStatus {
     pub act_version: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ListReply {
     pub runs: Vec<RunView>,
     pub runners: RunnerStatus,
@@ -117,7 +119,7 @@ pub struct LogsQuery {
     pub max_bytes: Option<usize>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LogsReply {
     pub run: String,
     pub records: Vec<LogRecord>,
@@ -130,20 +132,20 @@ pub struct LogsReply {
     pub done: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CancelReply {
     pub run: String,
     pub cancelled: bool,
     pub state: RunState,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RunnersReply {
     pub runners: RunnerStatus,
     pub pruned_runs: Option<Vec<String>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FailureReport {
     pub job: String,
     pub job_name: String,
@@ -155,7 +157,7 @@ pub struct FailureReport {
     pub tail: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct JobOutcomes {
     pub succeeded: usize,
     pub failed: usize,
@@ -165,7 +167,7 @@ pub struct JobOutcomes {
 }
 
 /// The `ci report --json` agent contract.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RunReport {
     pub schema_version: u32,
     pub run: String,
@@ -189,7 +191,7 @@ pub struct RunReport {
 }
 
 /// What `bosn ci run` would execute (`bosn ci plan`).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Plan {
     pub schema_version: u32,
     pub workspace: PathBuf,

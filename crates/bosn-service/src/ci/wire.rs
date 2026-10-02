@@ -54,7 +54,7 @@ impl Conclusion {
 
 /// A submission. Built by [`crate::Client::ci_submit`] after it snapshots the
 /// workspace into the daemon's staging area.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitRequest {
     pub staging: String,
@@ -123,7 +123,7 @@ impl SubmitRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunnerAction {
     List,
@@ -140,7 +140,7 @@ pub enum RunnerAction {
 
 /// Every CI operation. Each maps to one typed handler; there is no generic
 /// command surface.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CiRequest {
     Submit {
@@ -183,7 +183,7 @@ pub enum CiRequest {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RunRecord {
     pub schema_version: u32,
     pub id: String,

@@ -66,6 +66,23 @@ The live feed (`/v1/events`, server-sent events) is lossy: a reader that falls
 behind is sent `resync` and refetches. A slow browser never delays the daemon
 or other readers.
 
+## Schema
+
+[`docs/ci.schema.json`](ci.schema.json) is the published JSON Schema of the
+contract:
+
+- every request;
+- each operation's reply (`--json` output and MCP structured content);
+- the live event;
+- the error document.
+
+It is derived from the typed Rust definitions, and a unit test fails when the
+committed copy is stale. After an intentional change, regenerate it with:
+
+```sh
+BOSN_UPDATE_SCHEMA=1 cargo test -p bosn-service published_schema
+```
+
 ## Exit codes
 
 | Code | Meaning |
@@ -190,5 +207,3 @@ These are tracked in #323:
   `actions/cache`.
 - The desktop widget and a native full-view window (blocked on zackees/kernal-api#384).
 - GitLab.
-- Skipped *steps* (`if:` false) are not yet listed; skipped and unsupported
-  *jobs* are.

@@ -6,6 +6,7 @@ use super::{
     model::{ItemConclusion, RunTree},
     reply::{FailureReport, JobOutcomes, RunReport},
     wire::{Conclusion, RunRecord, SCHEMA_VERSION},
+    workflow::DeclaredSteps,
 };
 
 /// Fold the engine report into the tree and return the run conclusion.
@@ -13,6 +14,7 @@ use super::{
 pub fn conclude(
     outcome: &Result<EngineReport, String>,
     tree: &mut RunTree,
+    declared: &DeclaredSteps,
 ) -> (Conclusion, Option<String>) {
     let report = match outcome {
         Ok(report) => report,
@@ -24,6 +26,7 @@ pub fn conclude(
     let (mut conclusion, mut reason) = match &report.execution {
         ExecutionEnd::Exited(code) => {
             tree.settle_finished();
+            tree.add_skipped_steps(declared);
             let failed = tree
                 .jobs()
                 .any(|j| j.conclusion == Some(ItemConclusion::Failure));

@@ -294,7 +294,8 @@ fn conclusion_never_passes_partial_coverage_or_failed_cleanup() {
     assert_eq!(
         report::conclude(
             &report(ExecutionEnd::Exited(0), CleanupEnd::Removed),
-            &mut partial
+            &mut partial,
+            &Default::default(),
         )
         .0,
         Conclusion::Incomplete
@@ -308,7 +309,8 @@ fn conclusion_never_passes_partial_coverage_or_failed_cleanup() {
     assert_eq!(
         report::conclude(
             &report(ExecutionEnd::Exited(0), CleanupEnd::Removed),
-            &mut passed.clone()
+            &mut passed.clone(),
+            &Default::default(),
         )
         .0,
         Conclusion::Success
@@ -316,7 +318,8 @@ fn conclusion_never_passes_partial_coverage_or_failed_cleanup() {
     assert_eq!(
         report::conclude(
             &report(ExecutionEnd::Exited(0), CleanupEnd::Failed("x".into())),
-            &mut passed
+            &mut passed,
+            &Default::default(),
         )
         .0,
         Conclusion::Error
@@ -324,7 +327,8 @@ fn conclusion_never_passes_partial_coverage_or_failed_cleanup() {
     assert_eq!(
         report::conclude(
             &report(ExecutionEnd::TimedOut, CleanupEnd::Removed),
-            &mut tree
+            &mut tree,
+            &Default::default(),
         )
         .0,
         Conclusion::TimedOut
@@ -340,7 +344,7 @@ fn a_run_where_every_declared_job_was_skipped_is_not_success() {
         cleanup: CleanupEnd::Removed,
         engine_id: None,
     });
-    let (conclusion, reason) = report::conclude(&outcome, &mut tree);
+    let (conclusion, reason) = report::conclude(&outcome, &mut tree, &Default::default());
     assert_eq!(conclusion, Conclusion::Incomplete, "{reason:?}");
 }
 
@@ -387,4 +391,67 @@ fn log_pages_always_advance_and_tails_cut_on_char_boundaries() {
     );
     assert_eq!(tail.len(), 2);
     assert!(tail.iter().all(|t| t.len() <= 2048 && t.ends_with('⭐')));
+}
+
+#[test]
+fn steps_act_never_mentioned_are_listed_as_skipped_in_jobs_that_ran() {
+    use super::workflow::{DeclaredStep, DeclaredSteps};
+    let mut parser = ActParser::new(RunTree::declared(&parse_act_list(
+        super::lifecycle::tests::LISTING,
+    )));
+    for line in [
+        r#"{"job":"w/a","jobID":"a","msg":"⭐ Run Main one","stage":"Main","step":"one","stepID":["0"]}"#,
+        r#"{"job":"w/a","jobID":"a","msg":"ok","stage":"Main","stepID":["0"],"stepResult":"success"}"#,
+        r#"{"job":"w/a","jobID":"a","msg":"⭐ Run Main three","stage":"Main","step":"three","stepID":["2"]}"#,
+        r#"{"job":"w/a","jobID":"a","msg":"ok","stage":"Main","stepID":["2"],"stepResult":"success"}"#,
+        r#"{"job":"w/a","jobID":"a","msg":"⭐ Run Complete job","stepid":["--complete-job"]}"#,
+        r#"{"job":"w/a","jobID":"a","msg":"ok","stepid":["--complete-job"],"stepResult":"success"}"#,
+        r#"{"job":"w/a","jobID":"a","msg":"🏁","jobResult":"success"}"#,
+    ]
+    .iter()
+    .enumerate()
+    {
+        parser.feed(line.0 as u64 + 1, line.1);
+    }
+    let step = |id: &str, name: &str| DeclaredStep {
+        id: id.into(),
+        name: name.into(),
+    };
+    let declared: DeclaredSteps = [(
+        "a".to_string(),
+        vec![step("0", "one"), step("1", "never"), step("2", "three")],
+    )]
+    .into();
+    let mut tree = parser.tree;
+    let (conclusion, _) = report::conclude(
+        &Ok(lifecycle::EngineReport {
+            execution: ExecutionEnd::Exited(0),
+            cleanup: CleanupEnd::Removed,
+            engine_id: None,
+        }),
+        &mut tree,
+        &declared,
+    );
+    assert_eq!(
+        conclusion,
+        Conclusion::Success,
+        "a skipped step is not a failure"
+    );
+    let job = tree.jobs().next().unwrap();
+    let order: Vec<_> = job
+        .sections
+        .iter()
+        .map(|s| (s.id.as_str(), s.conclusion))
+        .collect();
+    use super::model::ItemConclusion::{Skipped, Success};
+    assert_eq!(
+        order,
+        [
+            ("0", Some(Success)),
+            ("1", Some(Skipped)),
+            ("2", Some(Success)),
+            ("--complete-job", Some(Success)),
+        ],
+        "the skipped step sits in declaration order"
+    );
 }

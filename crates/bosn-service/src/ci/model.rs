@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Lifecycle of one job or section.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ItemStatus {
     Queued,
@@ -18,7 +18,7 @@ pub enum ItemStatus {
 }
 
 /// Outcome of one job or section once completed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ItemConclusion {
     Success,
@@ -29,7 +29,7 @@ pub enum ItemConclusion {
     Unsupported,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Section {
     /// Provider step identity; nested composite steps are joined with `/`.
     pub id: String,
@@ -45,7 +45,7 @@ pub struct Section {
     pub exit_code: Option<i32>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Job {
     /// Unique per run: GitHub job x matrix leg (act's `job` field).
     pub key: String,
@@ -58,7 +58,7 @@ pub struct Job {
     pub sections: Vec<Section>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Group {
     /// GitHub: the `needs:` stage index; GitLab: the stage name.
     pub name: String,
@@ -66,14 +66,14 @@ pub struct Group {
 }
 
 /// One job declared by the workflow, from the provider's job listing.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DeclaredJob {
     pub stage: u32,
     pub job_id: String,
     pub name: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RunTree {
     pub groups: Vec<Group>,
     /// Lines that were not valid provider records (counted, never fatal).
@@ -81,7 +81,7 @@ pub struct RunTree {
 }
 
 /// One persisted log record. `seq` is the run-wide, gap-free cursor space.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LogRecord {
     pub seq: u64,
     /// `stdout`, `stderr` or `bosn` (daemon lifecycle notes).
@@ -279,6 +279,53 @@ impl RunTree {
         }
     }
 
+    /// List declared steps that never started in a job that ran, as
+    /// `skipped` (act prints nothing for a step whose `if:` is false). Each
+    /// is placed before the next declared step that did run, else before the
+    /// job's post/complete sections.
+    pub fn add_skipped_steps(&mut self, declared: &super::workflow::DeclaredSteps) {
+        for job in self.jobs_mut() {
+            let ran = matches!(
+                job.conclusion,
+                Some(ItemConclusion::Success | ItemConclusion::Failure | ItemConclusion::Cancelled)
+            );
+            let Some(steps) = declared.get(&job.job_id).filter(|_| ran) else {
+                continue;
+            };
+            for (index, step) in steps.iter().enumerate() {
+                if job
+                    .sections
+                    .iter()
+                    .any(|s| s.stage == "Main" && s.id == step.id)
+                {
+                    continue;
+                }
+                let later = |s: &Section| {
+                    s.stage == "Main" && steps[index + 1..].iter().any(|d| d.id == s.id)
+                };
+                let at = job
+                    .sections
+                    .iter()
+                    .position(|s| later(s) || s.stage == "Post" || s.stage == "Complete")
+                    .unwrap_or(job.sections.len());
+                job.sections.insert(
+                    at,
+                    Section {
+                        id: step.id.clone(),
+                        name: step.name.clone(),
+                        stage: "Main".into(),
+                        status: ItemStatus::Completed,
+                        conclusion: Some(ItemConclusion::Skipped),
+                        first_seq: None,
+                        last_seq: None,
+                        duration_ms: None,
+                        exit_code: None,
+                    },
+                );
+            }
+        }
+    }
+
     pub fn unsupported_jobs(&self) -> Vec<String> {
         self.jobs()
             .filter(|j| j.conclusion == Some(ItemConclusion::Unsupported))
@@ -416,7 +463,7 @@ impl ActParser {
 
 /// One `act --json` line, parsed eagerly. Unknown fields are ignored so a
 /// newer act cannot break an older daemon.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ActLine {
     #[serde(default)]
     msg: String,
@@ -443,7 +490,7 @@ struct ActLine {
     raw_output: bool,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum ActResult {
     Success,

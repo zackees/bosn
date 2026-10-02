@@ -15,7 +15,7 @@ use super::{
 /// Events retained per reader before the oldest are dropped.
 pub const FEED_CAPACITY: usize = 1024;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RunEvent {
     /// A run's state, conclusion or progress changed.
