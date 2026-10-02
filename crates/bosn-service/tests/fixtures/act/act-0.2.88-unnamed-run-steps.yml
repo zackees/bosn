@@ -1,0 +1,18 @@
+# The workflow as written. act-0.2.88-unnamed-run-steps.jsonl was recorded
+# (act 0.2.88, `act push --json`) from bosn's copy of it, after
+# `ci::flush::add_traps` prefixed every run: script with the end-of-output
+# trap (#398, #405).
+name: unnamed
+on: [push]
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo one
+      - name: Named
+        run: echo two
+      - if: false
+        run: echo never
+      - run: |
+          printf 'fatal: no newline' >&2
+          exit 3

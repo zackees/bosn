@@ -15,6 +15,11 @@
 //! line, whichever stream it was on. The parser takes the mark off again
 //! ([`unmark`]) and drops a line that held nothing else. A script that sets
 //! its own EXIT trap replaces bosn's and keeps act's behaviour.
+//!
+//! act names an unnamed `run:` step after its script, so the trap would show
+//! wherever such a step is named; [`untrap`] takes it off again (#405).
+
+use std::borrow::Cow;
 
 use serde::Deserialize;
 use serde_yaml::Value;
@@ -41,6 +46,17 @@ pub fn unmark(line: &str) -> Option<&str> {
         Some("") => None,
         Some(rest) => Some(rest),
         None => Some(line),
+    }
+}
+
+/// `text` without bosn's trap: a step's name (act's `step` field, or a
+/// declared step's `run:` text) or an act notice that names the step
+/// (`⭐ Run Main …`, `✅  Success - Main …`), as the workflow wrote it.
+pub fn untrap(text: &str) -> Cow<'_, str> {
+    if text.contains(TRAP) {
+        Cow::Owned(text.replace(TRAP, ""))
+    } else {
+        Cow::Borrowed(text)
     }
 }
 
