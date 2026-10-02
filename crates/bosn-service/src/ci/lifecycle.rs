@@ -7,7 +7,10 @@
 //! could not be proven gone is never reported as passing, and its record
 //! stays `cleanup_required` for the next recovery pass.
 
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use bosn_registry::act::{
     ActEngineIntent, ActEngineRecord, ActEngineRemovalProof, ActEngineState, ActRunOutcome,
@@ -76,6 +79,51 @@ pub trait EngineObserver: Send {
 /// How often a quiet execution gives the observer a chance to publish.
 pub const PROGRESS_TICK: Duration = Duration::from_millis(250);
 
+/// Elapsed time per lifecycle phase, for the run's log (where a run's time
+/// goes outside act's own steps: engine start, prepare, save, removal).
+struct Laps {
+    start: Instant,
+    last: Instant,
+}
+impl Laps {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            start: now,
+            last: now,
+        }
+    }
+    /// Time since the previous lap, e.g. `"14.2s"`.
+    fn lap(&mut self) -> String {
+        let now = Instant::now();
+        let took = now - self.last;
+        self.last = now;
+        format!("{:.1}s", took.as_secs_f64())
+    }
+    fn total(&self) -> String {
+        format!("{:.1}s", self.start.elapsed().as_secs_f64())
+    }
+}
+
+/// Keep the run's tool-cache installs for the next run. Best-effort: a failed
+/// or slow save is noted and never changes the run's outcome.
+async fn save_toolcache(
+    backend: &dyn ActEngineBackend,
+    name: &str,
+    observer: &mut dyn EngineObserver,
+    laps: &mut Laps,
+) {
+    let saved = async_engine::timeout(TOOLCACHE_SAVE_DEADLINE, backend.save_toolcache(name)).await;
+    match saved {
+        Ok(Ok(())) => observer.note(&format!("tool cache saved in {}", laps.lap())),
+        Ok(Err(error)) => observer.note(&format!("tool cache not saved: {error}")),
+        Err(_) => observer.note("tool cache not saved: timed out"),
+    }
+}
+
+/// How long saving the tool cache may delay the engine's removal.
+const TOOLCACHE_SAVE_DEADLINE: Duration = Duration::from_secs(120);
+
 /// Registry transition times must never go backwards.
 struct Clock(f64);
 impl Clock {
@@ -121,6 +169,7 @@ pub async fn run_on_engine(
         };
     }
     let mut engine_id = None;
+    let mut laps = Laps::new();
     let execution = 'run: {
         let labels = match registry_labels(registry, &plan.intent).await {
             Ok(labels) => labels,
@@ -140,6 +189,7 @@ pub async fn run_on_engine(
         {
             break 'run ExecutionEnd::EngineFailed(error);
         }
+        observer.note(&format!("engine created in {}", laps.lap()));
         let observed = match backend.inspect(&name).await {
             Ok(Some(observed)) => observed,
             Ok(None) => {
@@ -178,7 +228,7 @@ pub async fn run_on_engine(
             Err(_) => break 'run ExecutionEnd::TimedOut,
             Ok(Err(_)) => break 'run ExecutionEnd::Cancelled,
             Ok(Ok(Err(error))) => break 'run ExecutionEnd::EngineFailed(error),
-            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Ok(()))) => observer.note(&format!("engine prepared in {}", laps.lap())),
         }
         match async_engine::timeout_at(deadline, backend.list(&name, &plan.invocation.workflow))
             .await
@@ -212,6 +262,7 @@ pub async fn run_on_engine(
             }
         };
         let (end, ()) = async_engine::join(execute, drain).await;
+        observer.note(&format!("act finished in {}", laps.lap()));
         let end = match end {
             Ok(ExecEnd::Exited(code)) => ExecutionEnd::Exited(code),
             Ok(ExecEnd::TimedOut) => ExecutionEnd::TimedOut,
@@ -233,6 +284,9 @@ pub async fn run_on_engine(
         }
         end
     };
+    if engine_id.is_some() {
+        save_toolcache(backend, &name, observer, &mut laps).await;
+    }
     let outcome = registry_outcome(&execution);
     let cleanup = match commit(
         registry,
@@ -257,7 +311,14 @@ pub async fn run_on_engine(
             )
             .await
             {
-                Ok(()) => CleanupEnd::Removed,
+                Ok(()) => {
+                    observer.note(&format!(
+                        "engine removed in {}; total {}",
+                        laps.lap(),
+                        laps.total()
+                    ));
+                    CleanupEnd::Removed
+                }
                 Err(error) => CleanupEnd::Failed(error),
             }
         }

@@ -21,6 +21,8 @@ pub struct Faults {
     pub inspect: bool,
     /// Resolving the engine image never finishes (a stuck pull).
     pub slow_image: bool,
+    /// Saving the tool cache fails.
+    pub save: bool,
 }
 
 /// In-memory engine host: name -> (id, labels).
@@ -31,6 +33,8 @@ pub struct FakeBackend {
     pub executions: Mutex<u32>,
     /// Whether the cache volume exists.
     pub cache: Mutex<bool>,
+    /// Tool-cache saves that found their engine still present.
+    pub saved_while_live: Mutex<u32>,
     next: Mutex<u64>,
 }
 impl FakeBackend {
@@ -83,6 +87,22 @@ impl ActEngineBackend for FakeBackend {
     ) -> super::super::engine::BoxFuture<'a, Result<Option<u64>, String>> {
         let exists = *self.cache.lock().unwrap();
         Box::pin(async move { Ok(exists.then_some(4096)) })
+    }
+    fn save_toolcache<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> super::super::engine::BoxFuture<'a, Result<(), String>> {
+        if self.engines.lock().unwrap().contains_key(name) {
+            *self.saved_while_live.lock().unwrap() += 1;
+        }
+        let fails = self.faults().save;
+        Box::pin(async move {
+            if fails {
+                Err("disk full".into())
+            } else {
+                Ok(())
+            }
+        })
     }
     fn remove_cache<'a>(
         &'a self,
@@ -211,9 +231,12 @@ impl ActEngineBackend for FakeBackend {
 pub struct Collect {
     pub lines: Vec<EngineLine>,
     pub listing: Option<String>,
+    pub notes: Vec<String>,
 }
 impl EngineObserver for Collect {
-    fn note(&mut self, _text: &str) {}
+    fn note(&mut self, text: &str) {
+        self.notes.push(text.into());
+    }
     fn declared(&mut self, listing: &str) {
         self.listing = Some(listing.into());
     }
@@ -332,6 +355,80 @@ fn success_and_failure_end_terminal_with_removal_receipts() {
             assert!(seen.listing.is_some());
             terminal(&record(&registry, &dir, &run_id(n)).await, outcome);
         }
+    });
+}
+
+#[test]
+fn the_tool_cache_is_saved_before_removal_and_a_failed_save_changes_nothing() {
+    with_registry(|registry, dir| async move {
+        for (n, code, save_fails) in [(1, 1, false), (2, 0, true)] {
+            let backend = FakeBackend::with(Faults {
+                exit_code: code,
+                save: save_fails,
+                ..Faults::default()
+            });
+            let mut seen = Collect::default();
+            let report = run_on_engine(
+                &registry,
+                &backend,
+                &plan(&run_id(n), Duration::from_secs(5)),
+                &CancellationSource::new().token(),
+                &mut seen,
+            )
+            .await;
+            assert_eq!(
+                *backend.saved_while_live.lock().unwrap(),
+                1,
+                "saved once, before the engine is removed, whatever the outcome"
+            );
+            assert_eq!(report.execution, ExecutionEnd::Exited(code));
+            assert_eq!(report.cleanup, CleanupEnd::Removed);
+            assert_eq!(backend.live(), 0);
+            if save_fails {
+                assert!(
+                    seen.notes.iter().any(|note| note.contains("tool cache")),
+                    "{:?}",
+                    seen.notes
+                );
+            }
+        }
+        let _ = dir;
+    });
+}
+
+#[test]
+fn every_phase_reports_how_long_it_took() {
+    with_registry(|registry, _dir| async move {
+        let backend = FakeBackend::default();
+        let mut seen = Collect::default();
+        run_on_engine(
+            &registry,
+            &backend,
+            &plan(&run_id(1), Duration::from_secs(5)),
+            &CancellationSource::new().token(),
+            &mut seen,
+        )
+        .await;
+        for phase in [
+            "engine created in ",
+            "engine prepared in ",
+            "act finished in ",
+            "tool cache saved in ",
+            "engine removed in ",
+        ] {
+            assert!(
+                seen.notes
+                    .iter()
+                    .any(|n| n.starts_with(phase) && n.contains('s')),
+                "{phase}: {:?}",
+                seen.notes
+            );
+        }
+        assert!(
+            seen.notes.iter().any(|n| n.contains("total ")),
+            "{:?}",
+            seen.notes
+        );
     });
 }
 
