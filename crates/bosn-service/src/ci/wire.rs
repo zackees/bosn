@@ -9,6 +9,7 @@ use super::{
     model::RunTree,
     provider::{self, Mode, Provider, Trigger},
     scheduler::RunKey,
+    snapshot::BaseRef,
 };
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -74,6 +75,10 @@ pub struct SubmitRequest {
     /// the job checks it out, and the event payload names it.
     #[serde(default)]
     pub commit: Option<String>,
+    /// The base branch a `pr` run's snapshot carries as `origin/<branch>`;
+    /// the event payload names it (#403).
+    #[serde(default)]
+    pub base: Option<BaseRef>,
     pub origin: Option<String>,
     pub pr_number: Option<u64>,
     pub timeout_secs: Option<u64>,
@@ -99,6 +104,13 @@ impl SubmitRequest {
             .is_some_and(|c| !self.dirty || !valid_sha(c))
         {
             return refuse("a synthetic commit is a SHA, and only for a dirty tree");
+        }
+        if self
+            .base
+            .as_ref()
+            .is_some_and(|b| self.trigger != Trigger::Pr || !b.is_valid())
+        {
+            return refuse("a base is a branch and a SHA, and only for a pr run");
         }
         provider::require_supported(self.provider).map_err(CiError::refused)?;
         if self.engine != "act" {

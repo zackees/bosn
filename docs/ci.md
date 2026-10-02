@@ -385,8 +385,13 @@ All runtime state is under the daemon state directory (`ci/`):
   included, in a Git repository holding only the `HEAD` commit (depth 1, plus
   the synthetic commit of a dirty tree), so a workflow's `git rev-parse HEAD`,
   `git diff` and `git status` behave as in a real checkout.
-  `refs/bosn/base` names the commit the snapshot was taken from. It is kept for the newest 10 runs so they
-  can be retried.
+  `refs/bosn/base` names the commit the snapshot was taken from. A `--trigger
+  pr` run also holds its base branch as `origin/<base>` (origin's default
+  branch, else `main`, at `origin/<base>` or the local branch), with the
+  history of both tips down to their merge base, so `git merge-base
+  origin/main HEAD` works as in a `fetch-depth: 0` PR checkout; the payload's
+  `pull_request.base.ref` and `.sha` name the same commit (#403). It is kept
+  for the newest 10 runs so they can be retried.
 
 `runners cache` reports the size of the machine-wide cache volume, and
 `runners clear-cache` removes it. Removal is refused while a run executes,

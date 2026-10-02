@@ -8,7 +8,7 @@ use kernal_api::async_engine;
 use super::{
     provider::{self, Mode, Provider, Trigger},
     reply::Plan,
-    snapshot::{self, Head},
+    snapshot::{self, BaseRef, Head},
     store::Store,
     wire::{CiError, SubmitRequest, new_uuid},
 };
@@ -60,6 +60,8 @@ fn refuse(message: impl Into<String>) -> Error {
 /// Provider, workflow and `HEAD` resolved for one set of options.
 struct Resolved {
     head: Head,
+    /// The branch a `pr` run targets (#403); `None` for other triggers.
+    base: Option<BaseRef>,
     provider: Provider,
     workflow: String,
     trigger: Trigger,
@@ -81,7 +83,12 @@ fn resolve(options: &SubmitOptions) -> Result<Resolved, Error> {
     let trigger = options.trigger.unwrap_or(Trigger::Push);
     let mode = options.mode.unwrap_or(Mode::Minimal);
     provider::validate(trigger, mode, head.dirty).map_err(refuse)?;
+    let base = match trigger {
+        Trigger::Pr => BaseRef::of_workspace(&head.root),
+        Trigger::Push | Trigger::Release => None,
+    };
     Ok(Resolved {
+        base,
         workflow: provider::github_workflow(&head.root, options.workflow.as_deref())
             .map_err(refuse)?,
         head,
@@ -102,6 +109,7 @@ pub fn plan(options: &SubmitOptions) -> Result<Plan, Error> {
         resolved.mode,
         &head.sha,
         head.branch.as_deref(),
+        resolved.base.as_ref(),
         &repository,
         options.pr_number.unwrap_or(1),
     );
@@ -136,9 +144,11 @@ pub async fn stage_submission(
     std::fs::create_dir_all(&staging)?;
     let root = resolved.head.root.clone();
     let source = staging.join("source");
-    let receipt = async_engine::launch_blocking(move || snapshot::snapshot(&root, &source))
-        .await
-        .map_err(|_| Error::ActorClosed)?;
+    let base = resolved.base.clone();
+    let receipt =
+        async_engine::launch_blocking(move || snapshot::snapshot(&root, &source, base.as_ref()))
+            .await
+            .map_err(|_| Error::ActorClosed)?;
     let receipt = receipt.map_err(|error| {
         let _ = std::fs::remove_dir_all(&staging);
         refuse(format!("snapshot failed: {error}"))
@@ -158,6 +168,7 @@ pub async fn stage_submission(
         tree_digest: receipt.tree_digest,
         dirty: receipt.dirty,
         commit: receipt.commit,
+        base: resolved.base,
         origin: receipt.origin,
         pr_number: options.pr_number,
         timeout_secs: options.timeout_secs,

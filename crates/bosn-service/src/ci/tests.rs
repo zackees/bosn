@@ -33,6 +33,7 @@ fn request(staging: &str, sha_byte: char) -> SubmitRequest {
         tree_digest: "d".repeat(64),
         dirty: false,
         commit: None,
+        base: None,
         origin: Some("https://github.com/o/r.git".into()),
         pr_number: None,
         timeout_secs: Some(5),
@@ -281,6 +282,25 @@ fn refusals_are_typed_and_release_needs_a_clean_tree() {
             .unwrap_err();
         assert_eq!(error.code, "refused");
     });
+}
+
+/// #403: only a `pr` run carries a base, and it must be a safe ref and a SHA.
+#[test]
+fn a_base_is_only_for_a_pr_run_and_must_be_a_branch_and_sha() {
+    let based = |trigger, branch: &str, sha: String| {
+        let mut submission = request(&"0".repeat(8), 'a');
+        submission.staging = "00000000-0000-4000-8000-000000000002".into();
+        submission.trigger = trigger;
+        submission.base = Some(crate::ci::snapshot::BaseRef {
+            branch: branch.into(),
+            sha,
+        });
+        submission.validate()
+    };
+    assert!(based(Trigger::Pr, "main", "b".repeat(40)).is_ok());
+    assert!(based(Trigger::Push, "main", "b".repeat(40)).is_err());
+    assert!(based(Trigger::Pr, "../x", "b".repeat(40)).is_err());
+    assert!(based(Trigger::Pr, "main", "HEAD".into()).is_err());
 }
 
 #[test]

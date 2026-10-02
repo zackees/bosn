@@ -14,6 +14,11 @@
 //! work under test as a clean checkout of `HEAD`, and a workflow that cleans
 //! its tree (`git restore`, `git reset --hard`) cannot silently build the
 //! last commit instead. The run record still says `sha + dirty`.
+//!
+//! A pull request run's copy also holds its base branch ([`base`], #403).
+
+mod base;
+pub use base::{BaseRef, DEFAULT_BASE_BRANCH, valid_branch};
 
 use std::{
     io,
@@ -178,9 +183,15 @@ pub fn head(workspace: &Path) -> io::Result<Head> {
 /// Copy the working tree of `workspace` (a Git checkout root) into `dest`,
 /// which must not exist yet, and make it a Git repository holding only the
 /// `HEAD` commit (refs, remote, a depth-1 pack and an index), so the runner
-/// and the workflow's own `git` commands see the right commit. A dirty tree
-/// is then committed on top of `HEAD` ([`commit_working_tree`]).
-pub fn snapshot(workspace: &Path, dest: &Path) -> io::Result<SnapshotReceipt> {
+/// and the workflow's own `git` commands see the right commit. With a
+/// `base` (a pull request run) it also holds that branch, and both tips'
+/// history down to their merge base. A dirty tree is then committed on top
+/// of `HEAD` ([`commit_working_tree`]).
+pub fn snapshot(
+    workspace: &Path,
+    dest: &Path,
+    base: Option<&BaseRef>,
+) -> io::Result<SnapshotReceipt> {
     let Head {
         root,
         sha,
@@ -237,7 +248,12 @@ pub fn snapshot(workspace: &Path, dest: &Path) -> io::Result<SnapshotReceipt> {
     }
     let dirty = dirty || after.dirty;
     write_git_metadata(dest, &sha, branch.as_deref(), origin.as_deref())?;
-    write_head_objects(&root, dest, &sha)?;
+    let depths = base::Depths::of(&root, &sha, base)?;
+    let url = format!("file://{}", root.display()).replace(' ', "%20");
+    write_head_objects(&url, dest, &sha, depths.head)?;
+    if let Some(base) = base {
+        base::fetch_base(dest, &url, base, depths.base)?;
+    }
     let commit = if dirty {
         commit_working_tree(dest, &sha)?
     } else {
@@ -300,14 +316,14 @@ fn write_git_metadata(
     std::fs::write(git.join("config"), config)
 }
 
-/// Fetch exactly the `HEAD` commit's objects (depth 1: no history the run
-/// was not given) and build an index matching it, so a workflow's
+/// Fetch the `HEAD` commit's objects, `depth` commits deep (1 unless a pull
+/// request run needs the merge base: no history the run was not given), and
+/// build an index matching it, so a workflow's
 /// `git rev-parse`, `git diff` and `git status` see a real checkout with the
 /// uncommitted work on top. Always one pack (`fetch.unpackLimit=1`): act
 /// copies files, not empty directories, and one pack copies faster than
 /// thousands of loose objects.
-fn write_head_objects(root: &Path, dest: &Path, sha: &str) -> io::Result<()> {
-    let url = format!("file://{}", root.display()).replace(' ', "%20");
+fn write_head_objects(url: &str, dest: &Path, sha: &str, depth: usize) -> io::Result<()> {
     git(
         dest,
         &[
@@ -316,9 +332,9 @@ fn write_head_objects(root: &Path, dest: &Path, sha: &str) -> io::Result<()> {
             "fetch",
             "--quiet",
             "--depth",
-            "1",
+            &depth.to_string(),
             "--no-tags",
-            &url,
+            url,
             "HEAD",
         ],
     )?;
@@ -473,9 +489,9 @@ pub(crate) mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = TemporaryDirectory::new().unwrap();
         let ws = repo(tmp.path());
-        let clean = snapshot(&ws, &tmp.path().join("s0")).unwrap();
+        let clean = snapshot(&ws, &tmp.path().join("s0"), None).unwrap();
         assert!(!clean.dirty);
-        let again = snapshot(&ws, &tmp.path().join("s1")).unwrap();
+        let again = snapshot(&ws, &tmp.path().join("s1"), None).unwrap();
         assert_eq!(
             clean.tree_digest, again.tree_digest,
             "stable when unchanged"
@@ -486,7 +502,7 @@ pub(crate) mod tests {
             "printf 'b\\n' >> tracked.txt && rm deleted.txt && printf 'new\\n' > untracked.txt && \
              mkdir -p target && printf 'build\\n' > target/out.o",
         );
-        let dirty = snapshot(&ws, &tmp.path().join("s2")).unwrap();
+        let dirty = snapshot(&ws, &tmp.path().join("s2"), None).unwrap();
         let s = tmp.path().join("s2");
         assert!(dirty.dirty);
         assert_ne!(dirty.tree_digest, clean.tree_digest);
@@ -538,7 +554,7 @@ pub(crate) mod tests {
         // One byte changes the digest; editing the workspace after the
         // snapshot does not change the snapshot.
         sh(&ws, "printf 'c' >> untracked.txt");
-        let edited = snapshot(&ws, &tmp.path().join("s3")).unwrap();
+        let edited = snapshot(&ws, &tmp.path().join("s3"), None).unwrap();
         assert_ne!(edited.tree_digest, dirty.tree_digest);
         assert_eq!(
             std::fs::read_to_string(s.join("untracked.txt")).unwrap(),
@@ -564,7 +580,7 @@ pub(crate) mod tests {
                 sub.display()
             ),
         );
-        let receipt = snapshot(&ws, &tmp.path().join("snap")).unwrap();
+        let receipt = snapshot(&ws, &tmp.path().join("snap"), None).unwrap();
         assert!(!receipt.dirty);
         assert_eq!(
             std::fs::read_to_string(tmp.path().join("snap/vendor/sub/s.txt")).unwrap(),
@@ -577,7 +593,7 @@ pub(crate) mod tests {
         let tmp = TemporaryDirectory::new().unwrap();
         let ws = repo(tmp.path());
         std::fs::create_dir(ws.join("nested")).unwrap();
-        assert!(snapshot(&ws.join("nested"), &tmp.path().join("x")).is_err());
+        assert!(snapshot(&ws.join("nested"), &tmp.path().join("x"), None).is_err());
     }
 
     /// `git` in `dir`, which must succeed; stdout with the end trimmed
@@ -605,7 +621,7 @@ pub(crate) mod tests {
     /// What act puts in the job container: files and links, without the
     /// empty directories.
     #[cfg(unix)]
-    fn copy_files_only(from: &Path, to: &Path) {
+    pub(crate) fn copy_files_only(from: &Path, to: &Path) {
         for entry in std::fs::read_dir(from).unwrap().map(Result::unwrap) {
             let (source, target) = (entry.path(), to.join(entry.file_name()));
             let kind = entry.file_type().unwrap();
@@ -628,7 +644,7 @@ pub(crate) mod tests {
         let ws = repo(tmp.path());
         sh(&ws, "printf 'b\\n' > tracked.txt && git commit -qam second");
         let dest = tmp.path().join("s");
-        let receipt = snapshot(&ws, &dest).unwrap();
+        let receipt = snapshot(&ws, &dest, None).unwrap();
         let git = |args: &[&str]| git_in(&dest, args);
         assert!(!receipt.dirty);
         assert_eq!(receipt.commit, None, "a clean tree is the commit itself");
@@ -667,7 +683,7 @@ pub(crate) mod tests {
             "printf 'edit\\n' >> tracked.txt && rm deleted.txt && printf 'new\\n' > untracked.txt",
         );
         let dest = tmp.path().join("s");
-        let receipt = snapshot(&ws, &dest).unwrap();
+        let receipt = snapshot(&ws, &dest, None).unwrap();
         let git = |args: &[&str]| git_in(&dest, args);
         assert!(receipt.dirty, "the receipt still says sha + dirty");
         let commit = receipt.commit.clone().expect("a dirty tree is committed");
@@ -694,7 +710,7 @@ pub(crate) mod tests {
             "cleaning the tree keeps the work under test"
         );
         assert!(dest.join("untracked.txt").exists());
-        let again = snapshot(&ws, &tmp.path().join("s2")).unwrap();
+        let again = snapshot(&ws, &tmp.path().join("s2"), None).unwrap();
         assert_eq!(
             again.commit, receipt.commit,
             "the same tree gives the same commit, so identical runs coalesce"
@@ -715,7 +731,7 @@ pub(crate) mod tests {
         ] {
             sh(&ws, setup);
             let dest = tmp.path().join(name);
-            let receipt = snapshot(&ws, &dest).unwrap();
+            let receipt = snapshot(&ws, &dest, None).unwrap();
             assert_eq!(receipt.branch, None, "{name}");
             let job = tmp.path().join(format!("{name}-job"));
             copy_files_only(&dest, &job);
@@ -743,14 +759,14 @@ pub(crate) mod tests {
         let ws = repo(tmp.path());
         let big = ws.join("big.bin");
         std::fs::File::create(&big).unwrap().set_len(SIZE).unwrap();
-        let first = snapshot(&ws, &tmp.path().join("s0")).unwrap();
+        let first = snapshot(&ws, &tmp.path().join("s0"), None).unwrap();
         assert!(first.dirty, "an untracked file makes the tree dirty");
         assert!(first.bytes >= SIZE, "{} bytes", first.bytes);
         let copied = tmp.path().join("s0").join("big.bin");
         assert_eq!(std::fs::metadata(&copied).unwrap().len(), SIZE);
         std::fs::remove_dir_all(tmp.path().join("s0")).unwrap();
 
-        let again = snapshot(&ws, &tmp.path().join("s1")).unwrap();
+        let again = snapshot(&ws, &tmp.path().join("s1"), None).unwrap();
         assert_eq!(
             first.tree_digest, again.tree_digest,
             "stable when unchanged"
@@ -761,7 +777,7 @@ pub(crate) mod tests {
         file.seek(SeekFrom::Start(SIZE - 1)).unwrap();
         file.write_all(b"x").unwrap();
         drop(file);
-        let edited = snapshot(&ws, &tmp.path().join("s2")).unwrap();
+        let edited = snapshot(&ws, &tmp.path().join("s2"), None).unwrap();
         assert_ne!(
             first.tree_digest, edited.tree_digest,
             "the last byte counts"
