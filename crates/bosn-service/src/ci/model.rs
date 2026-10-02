@@ -189,22 +189,38 @@ impl RunTree {
 
     /// Find the job for an act record, materializing a matrix leg the first
     /// time it appears. A declared placeholder (key == job ID) is replaced by
-    /// its first leg; later legs are added beside it in the same group.
+    /// its first leg; later legs are added beside it in the same group. A job
+    /// that calls a reusable workflow never runs under its own key: act runs
+    /// the called jobs as `<caller name>/<job name>`, and they stand in for
+    /// the caller the same way, in the caller's stage.
     fn job_for(&mut self, key: &str, job_id: &str, matrix: Option<&Value>) -> &mut Job {
         if let Some((g, j)) = self.find(key) {
             return &mut self.groups[g].jobs[j];
         }
+        let called_by = |job: &Job| {
+            key.strip_prefix(job.name.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+        };
         let placeholder = self.groups.iter().enumerate().find_map(|(g, group)| {
             group
                 .jobs
                 .iter()
-                .position(|job| job.job_id == job_id && job.key == job_id && job.matrix.is_none())
+                .position(|job| {
+                    job.key == job.job_id
+                        && job.matrix.is_none()
+                        && (job.job_id == job_id || called_by(job))
+                })
                 .map(|j| (g, j))
         });
-        let sibling_group = self
-            .groups
-            .iter()
-            .position(|group| group.jobs.iter().any(|job| job.job_id == job_id));
+        let caller_prefix = key.split_once('/').map(|(caller, _)| format!("{caller}/"));
+        let sibling_group = self.groups.iter().position(|group| {
+            group.jobs.iter().any(|job| {
+                job.job_id == job_id
+                    || caller_prefix
+                        .as_deref()
+                        .is_some_and(|prefix| job.key.starts_with(prefix))
+            })
+        });
         let job = Job {
             key: key.into(),
             job_id: job_id.into(),
@@ -215,11 +231,16 @@ impl RunTree {
             sections: Vec::new(),
         };
         if let Some((g, j)) = placeholder {
-            let name = self.groups[g].jobs[j].name.clone();
-            self.groups[g].jobs[j] = Job {
-                name: if job.matrix.is_some() { job.name } else { name },
-                ..job
+            let declared = &self.groups[g].jobs[j];
+            // A matrix leg or a called job is named by its own key; the
+            // declared job itself keeps its declared name.
+            let keeps_declared = job.matrix.is_none() && declared.job_id == job.job_id;
+            let name = if keeps_declared {
+                declared.name.clone()
+            } else {
+                job.name.clone()
             };
+            self.groups[g].jobs[j] = Job { name, ..job };
             return &mut self.groups[g].jobs[j];
         }
         let g = match sibling_group {
@@ -704,6 +725,59 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_reusable_workflow_callers_inner_jobs_stand_in_for_it() {
+        // `build` calls a reusable workflow: act runs its inner jobs under
+        // `<caller name>/<inner name>`, never under the caller's key.
+        let list = "Stage  Job ID  Job name   Workflow name  Workflow file  Events\n\
+                    0      static  Static     CI             ci.yml         push\n\
+                    1      build   Build x64  CI             ci.yml         push\n";
+        let lines = [
+            r#"{"job":"CI/Static","jobID":"static","msg":"🏁","jobResult":"success"}"#,
+            r#"{"job":"Build x64/Compile","jobID":"compile","msg":"⭐ Run Main c","stage":"Main","stepID":["0"]}"#,
+            r#"{"job":"Build x64/Compile","jobID":"compile","msg":"done","stage":"Main","stepID":["0"],"stepResult":"success"}"#,
+            r#"{"job":"Build x64/Compile","jobID":"compile","msg":"🏁","jobResult":"success"}"#,
+            r#"{"job":"Build x64/Package","jobID":"package","msg":"🏁","jobResult":"failure"}"#,
+        ];
+        let (mut parser, _) = parse(list, &lines.join("\n"));
+        parser.tree.settle_finished();
+        assert!(
+            parser.tree.skipped_jobs().is_empty(),
+            "the caller ran: {:?}",
+            parser.tree
+        );
+        let stage = |key: &str| {
+            parser
+                .tree
+                .groups
+                .iter()
+                .find(|g| g.jobs.iter().any(|j| j.key == key))
+                .map(|g| g.name.clone())
+        };
+        assert_eq!(
+            stage("Build x64/Compile").as_deref(),
+            Some("1"),
+            "the caller's stage"
+        );
+        assert_eq!(stage("Build x64/Package").as_deref(), Some("1"));
+        assert!(
+            parser.tree.jobs().all(|j| j.key != "build"),
+            "no placeholder left for the caller"
+        );
+        let compile = parser
+            .tree
+            .jobs()
+            .find(|j| j.key == "Build x64/Compile")
+            .unwrap();
+        assert_eq!(compile.name, "Compile", "a called job keeps its own name");
+        let package = parser
+            .tree
+            .jobs()
+            .find(|j| j.key == "Build x64/Package")
+            .unwrap();
+        assert_eq!(package.conclusion, Some(ItemConclusion::Failure));
     }
 
     #[test]
