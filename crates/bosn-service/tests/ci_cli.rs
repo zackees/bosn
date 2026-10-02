@@ -252,3 +252,34 @@ fn run_verbs_keep_their_exit_codes_and_output_against_a_drained_daemon() {
         String::from_utf8_lossy(&shown.stdout)
     );
 }
+
+#[test]
+fn a_command_right_after_daemon_stop_reaches_a_fresh_daemon() {
+    let base = std::env::temp_dir();
+    let base = if base.as_os_str().len() > 40 {
+        std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".cache")
+    } else {
+        base
+    };
+    let root = tempfile::Builder::new()
+        .prefix("bstop")
+        .tempdir_in(base)
+        .unwrap();
+    let repo = repo(root.path());
+    let state = root.path().join("s");
+    let _daemon = Daemon {
+        cwd: &repo,
+        state: &state,
+    };
+    assert!(bosn(&["ci", "runners"], &repo, &state).status.success());
+    for round in 0..5 {
+        let stopped = bosn(&["daemon", "stop"], &repo, &state);
+        assert!(stopped.status.success(), "round {round}: stop failed");
+        let next = bosn(&["ci", "runners"], &repo, &state);
+        assert!(
+            next.status.success(),
+            "round {round}: {}",
+            String::from_utf8_lossy(&next.stderr)
+        );
+    }
+}

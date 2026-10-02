@@ -146,7 +146,9 @@ pub(crate) fn run_daemon(mut arguments: impl Iterator<Item = std::ffi::OsString>
         }
         DaemonInvocation::Stop { state_dir, json } => {
             if Client::for_state(&state_dir)
-                .and_then(|client| runtime.run(client.shutdown()))
+                .and_then(|client| {
+                    runtime.run(client.shutdown_and_wait(std::time::Duration::from_secs(30)))
+                })
                 .is_err()
             {
                 daemon_failure("stop", json);

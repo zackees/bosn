@@ -424,6 +424,20 @@ impl Client {
             _ => Err(Error::Protocol("unexpected shutdown response")),
         }
     }
+    /// Shut the daemon down and wait, up to `limit`, until it no longer
+    /// answers, so the next command starts a fresh daemon instead of reaching
+    /// one that is winding down.
+    pub async fn shutdown_and_wait(&self, limit: Duration) -> Result<(), Error> {
+        self.shutdown().await?;
+        let deadline = async_engine::Deadline::after(limit);
+        while self.ping().await.is_ok() {
+            if deadline.remaining().is_zero() {
+                return Err(Error::Deadline);
+            }
+            async_engine::sleep(Duration::from_millis(20)).await;
+        }
+        Ok(())
+    }
     pub async fn submit_job(
         &self,
         workspace: &str,
