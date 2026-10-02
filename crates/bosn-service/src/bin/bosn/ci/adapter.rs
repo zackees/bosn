@@ -297,7 +297,7 @@ mod tests {
         let digest = format!("sha256:{}", "a".repeat(64));
         bosn_core::act::parse_act_adapter_json(&serde_json::to_vec(&json!({
             "schema_version":1,"repository":{"owner":"FastLED","name":"cli"},"default_branch":"main",
-            "pins":{"interface_schema":1,"act_version":"0.2.88","act_binary_digest":digest,"engine_manifest_digest":digest,"engine_config_digest":digest,"runner_manifest_digest":digest,"runner_config_digest":digest},
+            "pins":{"interface_schema":1,"act_version":bosn_core::act::ACT_VERSION,"act_binary_digest":digest,"engine_manifest_digest":digest,"engine_config_digest":digest,"runner_manifest_digest":digest,"runner_config_digest":digest},
             "workflows":{"pull_request":[".github/workflows/ci.yml"],"push":[".github/workflows/ci.yml"],"release":[".github/workflows/ci.yml"]},
             "cells":[{"id":"lint","workflow":".github/workflows/ci.yml","job":"lint","runner":"ubuntu-latest","proof_scope":"local_linux"},{"id":"unit","workflow":".github/workflows/ci.yml","job":"unit","runner":"ubuntu-22.04","proof_scope":"local_linux"},{"id":"win","workflow":".github/workflows/ci.yml","job":"windows","runner":"windows-2022","proof_scope":"github_only"}],
             "tiers":{"minimal":["lint"],"test":["lint","unit"],"full":["lint","unit","win"]},

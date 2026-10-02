@@ -72,9 +72,12 @@ pub struct ActArtifact {
 pub fn act_artifact(architecture: &str) -> Option<ActArtifact> {
     match architecture {
         "x86_64" | "amd64" => Some(ActArtifact {
-            url: "https://github.com/nektos/act/releases/download/v0.2.88/act_Linux_x86_64.tar.gz",
-            sha256: "1eb9996682dfcc053ac8f3f90f2ec50376f0cdfc229712d82da03d673c63a2b3",
-            binary_sha256: "a76aa7627c633f5e9e9b06407d6eb1069213b1ee984599381b84ad4e7bd894f0",
+            // act2, zackees' fork of nektos/act (zackees/ci.yml ACT-002):
+            // GitHub-parity RUNNER_ENVIRONMENT, an init in hosted-runner job
+            // containers, and --workflow-overlay (#424).
+            url: "https://github.com/zackees/act2/releases/download/v0.2.89-act2.1/act_Linux_x86_64.tar.gz",
+            sha256: "bf25cb70b13e7d2ba6ecc624c9000d0a1ee2d09e0c5a849f344706d35ae4f0f5",
+            binary_sha256: "b2c5353156dad75f220cf4f03356b44b332a9fd9f36dc7f5f89173edee2f3b75",
         }),
         _ => None,
     }
