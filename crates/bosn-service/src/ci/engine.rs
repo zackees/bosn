@@ -10,10 +10,12 @@
 //!
 //! [`DockerActBackend`] adds what `bosn ci` does *inside* a created engine:
 //! act runs there through `docker exec`, so it only ever sees the nested
-//! engine's private socket. The act release is fetched into the cache volume
-//! from its pinned URL and checked against its pinned sha256; the frozen
-//! source and event payload are streamed in; the runner image is loaded from
-//! the cache volume; act's tool cache is seeded from, and saved back to, it.
+//! engine's private socket. Every artifact is pinned in [`super::pins`]: the
+//! act release is fetched into the cache volume from its pinned URL, and it
+//! and the binary inside are checked against their sha256s; the runner image
+//! is loaded from the cache volume (or pulled by digest once) and proven to
+//! be the pinned manifest and config; the frozen source and event payload
+//! are streamed in; act's tool cache is seeded from, and saved back to, it.
 //! Everything act creates lives in the engine's private storage, which goes
 //! with the engine.
 
@@ -27,47 +29,19 @@ use kernal_api::async_engine::{self, CancellationToken};
 
 use crate::{RegistryActor, act_engine};
 
+pub use super::pins::{ACT_VERSION, ActArtifact, RUNNER_IMAGE, act_artifact, runner_tag};
+
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// The pinned engine image, by its publisher manifest digest.
 pub fn engine_image() -> String {
     format!("docker.io/library/docker@{}", act_engine::ENGINE_MANIFEST)
 }
-/// catthehacker/ubuntu:act-24.04, pinned by digest; maps `ubuntu-*` runners.
-pub const RUNNER_IMAGE: &str = "catthehacker/ubuntu:act-24.04@sha256:c58e2b364da03b0c804c7d660f2ecbedf2f221a382b9baa0b344b0144780ff43";
-pub const ACT_VERSION: &str = "0.2.88";
 /// Where the machine-wide cache volume is mounted in the engine.
 pub const ENGINE_CACHE: &str = "/bosn/cache";
 /// The engine's root is read-only: everything a run writes lives under its
 /// private (executable) storage tmpfs, next to the nested daemon's data.
 pub const ENGINE_WORK: &str = "/var/lib/docker/bosn-ci";
-
-/// The runner image's engine-local name. The pinned image is loaded from the
-/// daemon's image cache under this tag (a digest reference cannot be saved
-/// and loaded portably), and act's platform mappings name it.
-pub fn runner_tag() -> String {
-    let digest = RUNNER_IMAGE.rsplit_once("@sha256:").map_or("", |(_, d)| d);
-    format!("bosn/act-runner:{}", &digest[..12.min(digest.len())])
-}
-
-/// One pinned act release artifact for an engine architecture.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ActArtifact {
-    pub url: &'static str,
-    pub sha256: &'static str,
-}
-
-/// The pinned act artifact for the engine's architecture. The engine image
-/// is linux/amd64, so only the x86_64 build can run in it.
-pub fn act_artifact(architecture: &str) -> Option<ActArtifact> {
-    match architecture {
-        "x86_64" | "amd64" => Some(ActArtifact {
-            url: "https://github.com/nektos/act/releases/download/v0.2.88/act_Linux_x86_64.tar.gz",
-            sha256: "1eb9996682dfcc053ac8f3f90f2ec50376f0cdfc229712d82da03d673c63a2b3",
-        }),
-        _ => None,
-    }
-}
 
 /// The machine-wide CI cache: a bosn-labelled named volume holding the act
 /// release, the runner image tar, action checkouts, the tool cache and the
@@ -425,16 +399,28 @@ impl DockerActBackend {
         .await
     }
 
-    /// Make [`runner_tag`] present in the engine: `docker load` from the
-    /// cache volume's image tar, or pull the pinned image once and save it.
+    /// Make [`runner_tag`] present in the engine, proven to be the pinned
+    /// runner ([`super::pins::verify_runner`]): loaded from the cache
+    /// volume's image tar, or pulled by digest once and saved there. A tar
+    /// whose image fails the proof is discarded and the image pulled again.
     async fn load_runner(&self, engine: &str) -> Result<(), String> {
-        self.checked(
-            "runner image",
-            Self::exec(engine, &load_runner_script()),
-            PULL_DEADLINE,
-        )
-        .await
-        .map(|_| ())
+        let mut refused = None;
+        for script in [load_runner_script(), reload_runner_script()] {
+            self.checked("runner image", Self::exec(engine, &script), PULL_DEADLINE)
+                .await?;
+            let inspect = self
+                .checked(
+                    "runner image inspect",
+                    owned(&["exec", engine, "docker", "image", "inspect", &runner_tag()]),
+                    CONTROL_DEADLINE,
+                )
+                .await?;
+            match super::pins::verify_runner(inspect.as_bytes()) {
+                Ok(_) => return Ok(()),
+                Err(error) => refused = Some(error),
+            }
+        }
+        Err(refused.unwrap_or_default())
     }
 
     fn exec(engine: &str, script: &str) -> Vec<String> {
@@ -767,14 +753,15 @@ fn install_act_script(act: ActArtifact) -> String {
            wget -q -O \"$tgz.$$\" '{url}' && \
            echo \"{sum}  $tgz.$$\" | sha256sum -c - >/dev/null && mv \"$tgz.$$\" \"$tgz\"; \
          fi; \
-         tar -xzf \"$tgz\" -C {ENGINE_WORK}/bin act && {ENGINE_WORK}/bin/act --version",
+         tar -xzf \"$tgz\" -C {ENGINE_WORK}/bin act && \
+         echo \"{binary}  {ENGINE_WORK}/bin/act\" | sha256sum -c - >/dev/null && \
+         {ENGINE_WORK}/bin/act --version",
         url = act.url,
         sum = act.sha256,
+        binary = act.binary_sha256,
     )
 }
 
-/// Shell that loads the runner image tar from the cache volume, or pulls
-/// the pinned image, tags it [`runner_tag`] and saves the tar atomically.
 /// act mounts its `act-toolcache` volume at `/opt/hostedtoolcache` in every
 /// job container. The engine is fresh per run, so seed that volume from the
 /// machine-wide copy before act starts.
@@ -808,17 +795,38 @@ fn save_toolcache_script() -> String {
     )
 }
 
+/// The runner image tar in the cache volume.
+fn runner_tar() -> String {
+    format!(
+        "{ENGINE_CACHE}/images/{}.tar",
+        runner_tag().replace([':', '/'], "-")
+    )
+}
+
+/// Shell that loads the runner image tar from the cache volume, or pulls
+/// the pinned image, tags it [`runner_tag`] and saves the tar atomically.
 fn load_runner_script() -> String {
     let tag = runner_tag();
-    let file = tag.replace([':', '/'], "-");
+    let tar = runner_tar();
     format!(
-        "tar={ENGINE_CACHE}/images/{file}.tar; mkdir -p {ENGINE_CACHE}/images; \
+        "tar={tar}; mkdir -p {ENGINE_CACHE}/images; \
          if ! {{ [ -f \"$tar\" ] && docker load -q -i \"$tar\" >/dev/null; }}; then \
            docker pull -q --platform linux/amd64 {RUNNER_IMAGE} >/dev/null && \
            docker tag {RUNNER_IMAGE} {tag} && \
            docker save --platform linux/amd64 -o \"$tar.$$\" {tag} && mv \"$tar.$$\" \"$tar\"; \
          fi; \
          docker image inspect {tag} >/dev/null"
+    )
+}
+
+/// After a cached tar failed the runner proof: drop it and the image it
+/// loaded, then pull and save again.
+fn reload_runner_script() -> String {
+    format!(
+        "rm -f {tar}; docker image rm -f {tag} >/dev/null 2>&1 || :; {load}",
+        tar = runner_tar(),
+        tag = runner_tag(),
+        load = load_runner_script(),
     )
 }
 
@@ -879,7 +887,6 @@ mod tests {
         assert!(args.ends_with(&["-j".to_string(), "lint".to_string()]));
         assert!(RUNNER_IMAGE.contains("@sha256:") && engine_image().contains("@sha256:"));
         assert!(act_artifact("x86_64").is_some() && act_artifact("aarch64").is_none());
-        assert_eq!(runner_tag(), "bosn/act-runner:c58e2b364da0");
         let secrets = SecretEnv(vec![("GITHUB_TOKEN".into(), "ghp_secretvalue".into())]);
         assert!(
             !format!("{secrets:?}").contains("ghp_"),
@@ -896,6 +903,12 @@ mod tests {
         let load = load_runner_script();
         assert!(load.contains("docker load") && load.contains(RUNNER_IMAGE));
         assert!(load.contains("mv \"$tar.$$\" \"$tar\""), "atomic rename");
+        let reload = reload_runner_script();
+        assert!(reload.starts_with(&format!("rm -f {}", runner_tar())) && reload.ends_with(&load));
+        assert!(
+            install.contains(act.binary_sha256),
+            "the extracted binary is checked too"
+        );
         let cache = CacheVolume::machine("11111111-2222-4333-8444-555555555555", 1.0).unwrap();
         assert_eq!(cache.name, CACHE_VOLUME);
         assert!(

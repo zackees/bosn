@@ -12,3 +12,5 @@ docs/docker-support.md text eol=lf
 # Windows checkout conversion must not alter their content-addressed identity.
 crates/bosn-service/src/act_engine_data/engine-manifest.json -text
 crates/bosn-service/src/act_engine_data/engine-config.json -text
+crates/bosn-service/src/ci/pins_data/runner-manifest.json -text
+crates/bosn-service/src/ci/pins_data/runner-config.json -text

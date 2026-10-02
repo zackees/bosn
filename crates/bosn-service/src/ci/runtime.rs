@@ -17,7 +17,7 @@ use super::{
     config::WidgetConfig,
     engine::{
         ACT_VERSION, ActEngineBackend, ActInvocation, CACHE_VOLUME, CacheVolume, EngineLine,
-        RUNNER_IMAGE, SecretEnv, act_artifact,
+        SecretEnv, act_artifact,
     },
     events::Feed,
     lifecycle::{self, CleanupEnd, EngineObserver, EnginePlan, EngineReport, ExecutionEnd},
@@ -731,9 +731,6 @@ impl CiRuntime {
     ) -> Result<EnginePlan, String> {
         let artifact = act_artifact(std::env::consts::ARCH)
             .ok_or("no pinned act build or engine image for this host architecture")?;
-        let (_, runner_digest) = RUNNER_IMAGE
-            .rsplit_once('@')
-            .ok_or("runner image is not pinned")?;
         let registry_id = self
             .registry
             .status()
@@ -759,7 +756,7 @@ impl CiRuntime {
                 act_version: ACT_VERSION.into(),
                 act_image_digest: format!("sha256:{}", artifact.sha256),
                 engine_image_digest: crate::act_engine::ENGINE_MANIFEST.into(),
-                runner_image_digest: runner_digest.into(),
+                runner_image_digest: super::pins::runner_manifest().into(),
                 created_at: lifecycle::now_seconds(),
                 creation_profile: Some(profile),
             },
