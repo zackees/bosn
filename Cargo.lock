@@ -84,6 +84,7 @@ dependencies = [
  "libc",
  "native-tls",
  "prost",
+ "schemars",
  "serde",
  "serde_json",
  "serde_yaml",
