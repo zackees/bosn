@@ -40,5 +40,9 @@ kernal-api = { version = "=0.1.14", default-features = false, features = ["ipc-a
 pyo3 = "=0.29.2"
 serde_json = "=1.0.149"
 
+[build-dependencies]
+# Only for the embedded-python-tests rpath (see build.rs); same pin as pyo3's own.
+pyo3-build-config = { version = "=0.29.2", features = ["resolve-config"] }
+
 [dev-dependencies]
 tempfile = "=3.27.0"
