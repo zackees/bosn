@@ -60,6 +60,7 @@ pub mod lifecycle;
 pub mod limits;
 pub mod mcp;
 pub mod model;
+pub mod pins;
 pub mod provider;
 pub mod reply;
 pub mod report;

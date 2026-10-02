@@ -251,8 +251,15 @@ job succeeded, or when its engine could not be proven removed.
   - Its one named mount is the machine-wide cache volume (below), frozen into
     the creation profile, verified before creation and on every observation.
     No host path or socket is mounted.
-  - act is downloaded into the cache volume from the pinned release URL and
-    checked against its pinned sha256. It runs inside the engine through
+  - Every artifact is pinned in one place (`crates/bosn-service/src/ci/pins.rs`).
+    act is downloaded into the cache volume from the pinned release URL; the
+    tarball and the binary inside are checked against their pinned sha256s.
+    The runner image (`catthehacker/ubuntu:act-24.04`, linux/amd64, pinned by
+    manifest digest) is loaded from the cache volume's image tar, or pulled by
+    digest once and saved there; either way `docker image inspect` must then
+    show exactly the pinned manifest, config, execution config and rootfs,
+    proven against the publisher bytes the daemon ships. A cached tar that
+    fails the proof is discarded and pulled again. act runs inside the engine through
     `docker exec`, so it only sees the engine's private socket. The source
     snapshot and event payload are streamed in on `docker exec`'s stdin.
   - Every job container, network, volume and image act creates lives in the
