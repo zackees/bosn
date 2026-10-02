@@ -205,6 +205,13 @@ deprecation notice on stderr and is removed after one release.
 A run is never reported as `success` when any job was `unsupported`, when no
 job succeeded, or when its engine could not be proven removed.
 
+A matrix leg is keyed by its job name plus the matrix values that name does
+not show (`CI/Native wheel (ubuntu-latest) (3.11)`), never by act's leg
+number, and sits in its job's stage. A job whose `runs-on` is a matrix
+expression is decided per leg by bosn, not act (act 0.2.88 lets the first leg
+overwrite every leg's `runs-on`): a leg whose own runner is not a local Linux
+label is `unsupported`, every time (#404).
+
 ## Jobs only GitHub can run (`remote_only`)
 
 Some jobs cannot run under act at all (zackees/ci.yml GATE-012, #400). A job

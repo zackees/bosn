@@ -147,9 +147,13 @@ pub fn select_jobs(jobs: Vec<DeclaredJob>, job: Option<&str>) -> Vec<DeclaredJob
 }
 
 impl RunTree {
-    /// Seed the tree with every declared job, queued, grouped by stage.
+    /// Seed the tree with every declared job, queued, grouped by stage and
+    /// ordered by job ID within it: `act -l` lists a stage's jobs in Go map
+    /// order, which changes from run to run (#404).
     pub fn declared(jobs: &[DeclaredJob]) -> Self {
         let mut tree = Self::default();
+        let mut jobs: Vec<&DeclaredJob> = jobs.iter().collect();
+        jobs.sort_by(|a, b| (a.stage, &a.job_id).cmp(&(b.stage, &b.job_id)));
         for job in jobs {
             let group = tree.group_mut(&job.stage.to_string());
             group.jobs.push(Job {
@@ -192,76 +196,6 @@ impl RunTree {
 
     fn jobs_mut(&mut self) -> impl Iterator<Item = &mut Job> {
         self.groups.iter_mut().flat_map(|g| g.jobs.iter_mut())
-    }
-
-    /// Find the job for an act record, materializing a matrix leg the first
-    /// time it appears. A declared placeholder (key == job ID) is replaced by
-    /// its first leg; later legs are added beside it in the same group. A job
-    /// that calls a reusable workflow never runs under its own key: act runs
-    /// the called jobs as `<caller name>/<job name>`, and they stand in for
-    /// the caller the same way, in the caller's stage.
-    fn job_for(&mut self, key: &str, job_id: &str, matrix: Option<&Value>) -> &mut Job {
-        if let Some((g, j)) = self.find(key) {
-            return &mut self.groups[g].jobs[j];
-        }
-        let called_by = |job: &Job| {
-            key.strip_prefix(job.name.as_str())
-                .is_some_and(|rest| rest.starts_with('/'))
-        };
-        let placeholder = self.groups.iter().enumerate().find_map(|(g, group)| {
-            group
-                .jobs
-                .iter()
-                .position(|job| {
-                    job.key == job.job_id
-                        && job.matrix.is_none()
-                        && (job.job_id == job_id || called_by(job))
-                })
-                .map(|j| (g, j))
-        });
-        let caller_prefix = key.split_once('/').map(|(caller, _)| format!("{caller}/"));
-        let sibling_group = self.groups.iter().position(|group| {
-            group.jobs.iter().any(|job| {
-                job.job_id == job_id
-                    || caller_prefix
-                        .as_deref()
-                        .is_some_and(|prefix| job.key.starts_with(prefix))
-            })
-        });
-        let job = Job {
-            key: key.into(),
-            job_id: job_id.into(),
-            name: job_name_from_key(key),
-            matrix: matrix.filter(|m| !m.is_null()).cloned(),
-            status: ItemStatus::Queued,
-            conclusion: None,
-            reason: None,
-            sections: Vec::new(),
-        };
-        if let Some((g, j)) = placeholder {
-            let declared = &self.groups[g].jobs[j];
-            // A matrix leg or a called job is named by its own key; the
-            // declared job itself keeps its declared name.
-            let keeps_declared = job.matrix.is_none() && declared.job_id == job.job_id;
-            let name = if keeps_declared {
-                declared.name.clone()
-            } else {
-                job.name.clone()
-            };
-            self.groups[g].jobs[j] = Job { name, ..job };
-            return &mut self.groups[g].jobs[j];
-        }
-        let g = match sibling_group {
-            Some(g) => g,
-            None => {
-                let name = "0".to_string();
-                self.group_mut(&name);
-                self.groups.iter().position(|x| x.name == name).unwrap_or(0)
-            }
-        };
-        self.groups[g].jobs.push(job);
-        let last = self.groups[g].jobs.len() - 1;
-        &mut self.groups[g].jobs[last]
     }
 
     fn find(&self, key: &str) -> Option<(usize, usize)> {
@@ -453,6 +387,7 @@ impl ActParser {
             return Some(record(None, None, text));
         };
         let notice = Notice::of(&act.msg);
+        let key = self.tree.leg_key(&key, act.matrix.as_ref());
         let job = self.tree.job_for(&key, &job_id, act.matrix.as_ref());
         if job.status == ItemStatus::Queued {
             job.status = ItemStatus::InProgress;
@@ -461,7 +396,11 @@ impl ActParser {
             job.status = ItemStatus::Completed;
             job.conclusion = Some(ItemConclusion::Unsupported);
         }
-        if let Some(result) = act.job_result {
+        // An unsupported leg stays unsupported: bosn's gate step for it
+        // ([`super::matrix_runner`]) ends in a successful job.
+        if let Some(result) = act.job_result
+            && job.conclusion != Some(ItemConclusion::Unsupported)
+        {
             job.status = ItemStatus::Completed;
             job.conclusion = Some(result.into());
         }
@@ -590,7 +529,9 @@ impl Notice {
         if msg.starts_with("⭐ Run") {
             return Self::StepStarted;
         }
-        if msg.contains("Skipping unsupported platform") {
+        if msg.contains("Skipping unsupported platform")
+            || msg.starts_with(super::matrix_runner::MARK)
+        {
             return Self::Unsupported;
         }
         msg.strip_prefix("exitcode '")
@@ -617,7 +558,8 @@ impl ActLine {
     /// `None` for a raw line that held only bosn's end-of-output mark.
     fn text(&self) -> Option<String> {
         if self.raw_output {
-            super::flush::unmark(self.msg.trim_end_matches('\n')).map(str::to_string)
+            super::flush::unmark(self.msg.trim_end_matches('\n'))
+                .map(super::matrix_runner::describe)
         } else {
             Some(self.msg.clone())
         }
@@ -642,6 +584,9 @@ impl ActLine {
     }
 }
 
+#[cfg(test)]
+mod leg_tests;
+mod legs;
 #[cfg(test)]
 mod property_tests;
 #[cfg(test)]
@@ -728,7 +673,7 @@ mod tests {
         let legs: Vec<_> = tree.groups[0].jobs.iter().map(|j| j.key.as_str()).collect();
         assert_eq!(
             legs,
-            ["spike/a-1", "spike/a-2"],
+            ["spike/a (one)", "spike/a (two)"],
             "matrix legs share jobID a"
         );
         assert!(
