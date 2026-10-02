@@ -287,8 +287,13 @@ impl Runners {
                 holders.remove(&job_id);
             }
             inner.holders.retain(|_, holders| !holders.is_empty());
-            // Dropping a lock file releases its OS lock.
-            inner.locks.retain(|_, (holder, _)| *holder != job_id);
+            inner.locks.retain(|_, (holder, file)| {
+                if *holder != job_id {
+                    return true;
+                }
+                release_lock(file);
+                false
+            });
             run.record
         };
         self.persist();
@@ -369,7 +374,7 @@ impl Runners {
                     continue;
                 }
                 // Free in this daemon; the OS lock decides across daemons.
-                if let Some(file) = self.try_lock(name) {
+                if let Some(file) = self.try_lock(name)? {
                     inner.locks.insert(name.clone(), (job_id, file));
                     pick = Some(name.clone());
                     break;
@@ -414,12 +419,14 @@ impl Runners {
         Ok(lease)
     }
 
-    /// Take the OS lock for one cache volume without waiting. `None` means
-    /// another holder (this daemon or another) has it. A lock directory that
-    /// cannot be created fails open to this daemon's in-memory bookkeeping.
-    fn try_lock(&self, volume: &str) -> Option<std::fs::File> {
+    /// Take the OS lock for one cache volume without waiting. `Ok(None)`
+    /// means another holder (this daemon or another) has it; any other
+    /// failure is an error, never a silent private copy. A lock directory
+    /// that cannot be created fails open to this daemon's in-memory
+    /// bookkeeping.
+    fn try_lock(&self, volume: &str) -> io::Result<Option<std::fs::File>> {
         if std::fs::create_dir_all(&self.lock_dir).is_err() {
-            return std::fs::File::open("/dev/null").ok();
+            return std::fs::File::open("/dev/null").map(Some);
         }
         #[cfg(unix)]
         {
@@ -431,11 +438,11 @@ impl Runners {
             .create(true)
             .truncate(false)
             .write(true)
-            .open(self.lock_dir.join(format!("{volume}.lock")))
-            .ok()?;
+            .open(self.lock_dir.join(format!("{volume}.lock")))?;
         match file.try_lock() {
-            Ok(()) => Some(file),
-            Err(_) => None,
+            Ok(()) => Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(error),
         }
     }
 
@@ -676,6 +683,16 @@ pub fn ensure_proxy_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Release an exclusive lease's OS lock explicitly. A `flock` belongs to the
+/// open file description, which a child forked by any other thread shares
+/// until it execs; closing this daemon's fd alone would leave the replica
+/// locked for that window (#406). Unlocking releases it for every copy.
+fn release_lock(file: &std::fs::File) {
+    if let Err(error) = file.unlock() {
+        eprintln!("bosn runners: cache lock release failed: {error}");
+    }
+}
+
 fn write_ledger(path: &Path, records: &[RunRecord]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -737,6 +754,39 @@ mod tests {
         first.finish(1);
         second.begin(3, "/w", "s", "t", None);
         assert_eq!(second.lease_cache(3, &rule, "m").unwrap(), a);
+    }
+
+    /// A child forked by any other thread (the daemon spawns act, docker
+    /// and git all the time) inherits a duplicate of every open lock fd
+    /// until it execs. `finish` must release the lock itself, not rely on
+    /// closing its own fd being the last reference (#406).
+    #[test]
+    fn finish_releases_the_lock_even_while_a_forked_child_holds_its_fd() {
+        let dir = tempfile::tempdir().unwrap();
+        let runners = runners(dir.path());
+        let rule = CacheRule {
+            replicas: 1,
+            ..CacheRule::act_toolcache()
+        };
+        let replica = Lease::Kept("bosn-cache-m-act-toolcache-0".into());
+        runners.begin(1, "/w", "s", "t", None);
+        assert_eq!(runners.lease_cache(1, &rule, "m").unwrap(), replica);
+        let inherited = runners.inner.lock().unwrap().locks["bosn-cache-m-act-toolcache-0"]
+            .1
+            .try_clone()
+            .unwrap();
+        runners.finish(1);
+        let other_daemon = Runners::new(&dir.path().join("b"), RunnerCapacity::defaults(Some(4)))
+            .with_api(None)
+            .with_lock_dir(dir.path().join("locks"));
+        other_daemon.begin(2, "/w", "s", "t", None);
+        assert_eq!(other_daemon.lease_cache(2, &rule, "m").unwrap(), replica);
+        runners.begin(3, "/w", "s", "t", None);
+        assert!(matches!(
+            runners.lease_cache(3, &rule, "m").unwrap(),
+            Lease::Private(_)
+        ));
+        drop(inherited);
     }
 
     #[test]
