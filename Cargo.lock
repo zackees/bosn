@@ -159,6 +159,7 @@ dependencies = [
  "bosn-setup",
  "kernal-api",
  "pyo3",
+ "pyo3-build-config",
  "serde_json",
  "tempfile",
 ]
