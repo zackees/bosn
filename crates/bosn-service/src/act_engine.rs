@@ -615,9 +615,12 @@ pub fn observe_engine(
                 "--host=unix:///var/run/docker.sock"
             ])
         || !empty(&host["Binds"])
+        || !empty(&host["VolumesFrom"])
+        || !empty(&host["Mounts"])
         || !empty(&host["PortBindings"])
         || tmpfs != expected_tmpfs
-        || mounts.len() != expected_tmpfs.len()
+        // Docker may omit tmpfs entries from Mounts; declarations remain exact.
+        || (!mounts.is_empty() && (mounts.len() != expected_tmpfs.len()
         || mounts.iter().any(|m| {
             m["Type"] != "tmpfs"
                 || !m["Destination"]
@@ -630,7 +633,7 @@ pub fn observe_engine(
                 .filter(|m| m["Destination"].as_str() == Some(d.as_str()))
                 .count()
                 != 1
-        })
+        })))
         || env
             .iter()
             .filter(|v| {
@@ -822,6 +825,42 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn created_container_without_reported_tmpfs_mounts_retains_storage_boundary() {
+        let mut d = document();
+        d[0]["Mounts"] = json!([]);
+        let observe = |d: &Value| {
+            observe_engine(
+                &serde_json::to_vec(d).unwrap(),
+                &intent(),
+                OWNER,
+                &classic_identity(),
+                limits(),
+            )
+        };
+        assert!(
+            observe(&d).is_ok(),
+            "Docker created container omits tmpfs from Mounts"
+        );
+        for change in 0..7 {
+            let mut wrong = d.clone();
+            match change {
+                0 => wrong[0]["HostConfig"]["Tmpfs"] = json!({}),
+                1 => wrong[0]["HostConfig"]["Tmpfs"]["/var/lib/docker"] = json!("rw,size=1"),
+                2 => wrong[0]["HostConfig"]["Binds"] = json!(["/foreign:/foreign"]),
+                3 => wrong[0]["HostConfig"]["VolumesFrom"] = json!(["foreign"]),
+                4 => {
+                    wrong[0]["HostConfig"]["Mounts"] =
+                        json!([{"Type":"volume","Target":"/foreign"}])
+                }
+                5 => {
+                    wrong[0]["Mounts"] = json!([{"Type":"volume","Destination":"/var/lib/docker"}])
+                }
+                _ => wrong[0]["Mounts"] = json!([{"Type":"tmpfs","Destination":"/var/lib/docker"}]),
+            }
+            assert!(observe(&wrong).is_err(), "{change}");
+        }
     }
     #[test]
     fn refuses_host_socket_anonymous_storage_labels_and_unbounded_resources() {

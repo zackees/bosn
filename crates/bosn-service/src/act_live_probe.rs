@@ -16,7 +16,7 @@ use bosn_registry::act::{
 };
 use serde_json::{Value, json};
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -745,4 +745,77 @@ fn timed_operation_stops_and_joins_owned_observer() {
             assert!(!observer.stop_and_join().await.unwrap());
             assert!(exited.load(std::sync::atomic::Ordering::SeqCst));
         });
+}
+
+/// Explicit recovery of one retained failed probe, never discovery or creation.
+#[test]
+#[ignore = "explicit retained-probe recovery; root review and exact owned identity required"]
+fn recover_retained_pinned_engine_only() {
+    async_engine::RuntimeBuilder::multi_thread().enable_all().build().unwrap().run(async {
+        let env = |name| std::env::var(name).unwrap_or_else(|_| panic!("set {name}"));
+        let input = PathBuf::from(env("BOSN_ACT_PROBE_INPUT_DIR")).canonicalize().unwrap();
+        let root = PathBuf::from(env("BOSN_ACT_RECOVERY_DIR")).canonicalize().unwrap();
+        let run = env("BOSN_ACT_RECOVERY_RUN");
+        let owner = env("BOSN_ACT_RECOVERY_OWNER");
+        assert!(input.starts_with("/tmp") && root.parent() == Some(input.as_path()));
+        assert!(root.file_name().unwrap().to_str().unwrap().starts_with("probe-"));
+        for path in [&input, &root] { let meta = std::fs::metadata(path).unwrap(); assert_eq!(meta.permissions().mode() & 0o077, 0); assert_eq!(meta.uid(), std::fs::metadata("/proc/self").unwrap().uid()); }
+        // Validate canonical identity before constructing any path from the run ID.
+        assert_eq!(run.len(),36); assert!(run.bytes().enumerate().all(|(i,b)| if [8,13,18,23].contains(&i) { b == b'-' } else { b.is_ascii_digit() || (b'a'..=b'f').contains(&b) }));
+        let intent: ActEngineIntent = serde_json::from_slice(&bounded_file(&root.join(format!("{run}-intent.json")),1<<20).unwrap()).unwrap();
+        assert_eq!(intent.run_id,run); assert_eq!(intent.engine_image_digest, ENGINE);
+        let proof = VerifiedEngineManifest::verify(&bounded_file(&input.join("engine-manifest.json"),1<<20).unwrap(), ENGINE, &bounded_file(&input.join("engine-config.json"),1<<20).unwrap(), ENGINE_CONFIG).unwrap();
+        let db = root.join("registry.sqlite3");
+        assert!(std::fs::symlink_metadata(&db).unwrap().is_file()); assert_eq!(db.canonicalize().unwrap().parent(), Some(root.as_path()));
+        let registry = Registry::open_writer(&db).unwrap(); assert_eq!(registry.registry_id().unwrap(),owner);
+        let current = registry.pending_act_engines(None,16).unwrap(); assert!(current.next_run_id.is_none());
+        let current = current.items.iter().find(|r| r.intent.run_id == run).expect("exact pending run required");
+        assert_eq!(current.intent,intent); assert!(current.execution_claim.is_none(), "recovery must not destroy a live execution claim");
+        let (sender,receiver) = async_engine::channel(16); let actor = RegistryActor { sender };
+        let task = async_engine::launch(registry_actor(registry,receiver,None));
+        let result = cleanup(&actor,&DockerEngine::docker(),&intent,&owner,&proof).await;
+        actor.stop().await; task.await.unwrap();
+        retain(&root.join(format!("{run}-recovery-{}.json",random_uuid().await.unwrap())), &serde_json::to_vec_pretty(&json!({"run_id":run,"registry_id":owner,"verified_cleanup":result.is_ok(),"error":result.as_ref().err().map(ToString::to_string)})).unwrap()).unwrap();
+        result.unwrap();
+    });
+}
+
+#[test]
+#[ignore = "explicit retained real inspect fixture; no Docker calls"]
+fn retained_created_engine_inspect_is_verified_offline() {
+    let input = PathBuf::from(std::env::var_os("BOSN_ACT_PROBE_INPUT_DIR").unwrap());
+    let root = PathBuf::from(std::env::var_os("BOSN_ACT_RECOVERY_DIR").unwrap());
+    let run = std::env::var("BOSN_ACT_RECOVERY_RUN").unwrap();
+    let owner = std::env::var("BOSN_ACT_RECOVERY_OWNER").unwrap();
+    let intent: ActEngineIntent = serde_json::from_slice(
+        &bounded_file(&root.join(format!("{run}-intent.json")), 1 << 20).unwrap(),
+    )
+    .unwrap();
+    let proof = VerifiedEngineManifest::verify(
+        &bounded_file(&input.join("engine-manifest.json"), 1 << 20).unwrap(),
+        ENGINE,
+        &bounded_file(&input.join("engine-config.json"), 1 << 20).unwrap(),
+        ENGINE_CONFIG,
+    )
+    .unwrap();
+    let manifest: Value = serde_json::from_slice(
+        &bounded_file(&input.join("engine-manifest.json"), 1 << 20).unwrap(),
+    )
+    .unwrap();
+    let image = json!([{"Id":ENGINE,"RepoDigests":[format!("docker.io/library/docker@{ENGINE}")],"Descriptor":{"digest":ENGINE,"mediaType":manifest["mediaType"],"size":bounded_file(&input.join("engine-manifest.json"),1<<20).unwrap().len()}}]);
+    let image =
+        observe_engine_image_from_manifest(&serde_json::to_vec(&image).unwrap(), &intent, &proof)
+            .unwrap();
+    let observed = observe_engine(
+        &bounded_file(&root.join("failed-created-engine-inspect.json"), 1 << 20).unwrap(),
+        &intent,
+        &owner,
+        &image,
+        limits(),
+    )
+    .unwrap();
+    assert_eq!(
+        observed.engine_id,
+        "da29a0806c0d63ac16233240c5f4fb5e8b90c61057accd511c82cc1e6cbbedaa"
+    );
 }
