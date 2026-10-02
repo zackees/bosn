@@ -46,9 +46,12 @@ pub fn ask_running_widget_to_show(state_dir: &Path) {
     else {
         return;
     };
-    let _ = runtime.run(widget(&client, CiRequest::WidgetCommand {
-        command: WidgetCommand::Show,
-    }));
+    let _ = runtime.run(widget(
+        &client,
+        CiRequest::WidgetCommand {
+            command: WidgetCommand::Show,
+        },
+    ));
 }
 
 async fn widget(client: &Client, request: CiRequest) -> Result<WidgetReply, bosn_service::Error> {
@@ -73,9 +76,12 @@ enum Flow {
 /// The deliberate quit (the bubble closed, or Quit in the panel): record
 /// `dismissed` for this graphical session, then end the event loop.
 async fn quit(client: &Client, views: &ExternalWebviewClient, session: &str) {
-    let _ = widget(client, CiRequest::WidgetDismiss {
-        session: session.into(),
-    })
+    let _ = widget(
+        client,
+        CiRequest::WidgetDismiss {
+            session: session.into(),
+        },
+    )
     .await;
     let _ = views.request_exit();
 }
@@ -118,7 +124,12 @@ impl Windows {
     /// Carry out one daemon command: plan it, run each step, and stop at the
     /// first failure (that window is forgotten and reopens next time). A
     /// quit step is the caller's to carry out: it ends the loop.
-    async fn apply(&mut self, command: WidgetCommand, views: &ExternalWebviewClient, client: &Client) -> Flow {
+    async fn apply(
+        &mut self,
+        command: WidgetCommand,
+        views: &ExternalWebviewClient,
+        client: &Client,
+    ) -> Flow {
         self.forget_closed().await;
         for step in self.layout.plan(command) {
             if step == Step::Quit {
@@ -137,7 +148,12 @@ impl Windows {
     }
 
     /// Run one step; `false` when it did not take effect.
-    async fn execute(&mut self, step: &Step, views: &ExternalWebviewClient, client: &Client) -> bool {
+    async fn execute(
+        &mut self,
+        step: &Step,
+        views: &ExternalWebviewClient,
+        client: &Client,
+    ) -> bool {
         match step {
             Step::Open { window, path } => {
                 let opened = open(views, client, *window, path).await;
@@ -174,7 +190,11 @@ impl Windows {
 /// A daemon page's URL with a fresh single-use sign-in token (views are
 /// incognito, so each window, and each navigation, signs in on its own).
 async fn page_url(client: &Client, path: &str) -> Option<String> {
-    client.ci_ui_grant(Some(path.into())).await.ok().map(|grant| grant.url)
+    client
+        .ci_ui_grant(Some(path.into()))
+        .await
+        .ok()
+        .map(|grant| grant.url)
 }
 
 async fn grant(client: &Client, path: &str) -> Option<WebviewUrlGrant> {
@@ -182,7 +202,12 @@ async fn grant(client: &Client, path: &str) -> Option<WebviewUrlGrant> {
 }
 
 /// Open `window` on a daemon page, presented for this display.
-async fn open(views: &ExternalWebviewClient, client: &Client, window: Window, path: &str) -> Option<WebviewHandle> {
+async fn open(
+    views: &ExternalWebviewClient,
+    client: &Client,
+    window: Window,
+    path: &str,
+) -> Option<WebviewHandle> {
     let url = page_url(client, path).await?;
     let options = window.options(views.window_support()).ok()?;
     views

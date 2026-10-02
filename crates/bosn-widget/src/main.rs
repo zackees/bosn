@@ -32,7 +32,9 @@ fn parse_args() -> Result<Args, String> {
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--state-dir") => {
-                state_dir = Some(PathBuf::from(args.next().ok_or("--state-dir needs a value")?));
+                state_dir = Some(PathBuf::from(
+                    args.next().ok_or("--state-dir needs a value")?,
+                ));
             }
             Some("--autostart") => explicit = false,
             _ => return Err("usage: bosn-widget [--state-dir DIR] [--autostart]".into()),
@@ -58,7 +60,11 @@ fn main() {
         controller::ask_running_widget_to_show(&args.state_dir);
         return;
     };
-    let runtime = match RuntimeBuilder::multi_thread().worker_threads(2).enable_all().build() {
+    let runtime = match RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("bosn-widget: no async runtime: {error}");
@@ -74,9 +80,11 @@ fn main() {
         }
     };
     let client = host.client();
-    let _controller = runtime
-        .handle()
-        .launch(controller::run(client, args.state_dir.clone(), args.explicit));
+    let _controller = runtime.handle().launch(controller::run(
+        client,
+        args.state_dir.clone(),
+        args.explicit,
+    ));
     let code = host.run();
     drop(lock);
     std::process::exit(code);

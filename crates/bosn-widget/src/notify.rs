@@ -57,7 +57,11 @@ fn notify(run: &RunView) {
 
 /// Open an allowlisted URL (the daemon already checked the allowlist).
 pub fn open_external(url: &str) {
-    let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
     let _ = std::process::Command::new(program).arg(url).spawn();
 }
 
@@ -68,14 +72,18 @@ mod tests {
     #[test]
     fn failures_always_notify_successes_only_for_humans() {
         let view = |conclusion, actor: &str| {
-            let mut value: serde_json::Value = serde_json::from_str(include_str!("../tests/run_view.json")).unwrap();
+            let mut value: serde_json::Value =
+                serde_json::from_str(include_str!("../tests/run_view.json")).unwrap();
             value["conclusion"] = serde_json::to_value(conclusion).unwrap();
             value["actor"] = actor.into();
             serde_json::from_value::<RunView>(value).unwrap()
         };
         assert!(worth_notifying(&view(Some(Conclusion::Failure), "agent:x")));
         assert!(worth_notifying(&view(Some(Conclusion::Success), "human")));
-        assert!(!worth_notifying(&view(Some(Conclusion::Success), "agent:x")));
+        assert!(!worth_notifying(&view(
+            Some(Conclusion::Success),
+            "agent:x"
+        )));
         assert!(!worth_notifying(&view(None::<Conclusion>, "human")));
     }
 }
