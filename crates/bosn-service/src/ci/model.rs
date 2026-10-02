@@ -376,12 +376,13 @@ impl ActParser {
             section,
             text,
         };
-        let Ok(act) = serde_json::from_str::<ActLine>(line) else {
+        let Ok(mut act) = serde_json::from_str::<ActLine>(line) else {
             if !line.trim().is_empty() {
                 self.tree.malformed_lines += 1;
             }
             return Some(record(None, None, line.into()));
         };
+        act.untrap();
         let text = act.text()?;
         let (Some(key), Some(job_id)) = (act.job_key(), act.job_id()) else {
             return Some(record(None, None, text));
@@ -548,6 +549,17 @@ struct StepRef {
 }
 
 impl ActLine {
+    /// Name and announce a step as the workflow wrote it: act names an
+    /// unnamed `run:` step after its script, which in the run's copy starts
+    /// with bosn's end-of-output trap. The step's own output is left alone.
+    fn untrap(&mut self) {
+        if let Some(step) = &self.step {
+            self.step = Some(super::flush::untrap(step).into_owned());
+        }
+        if !self.raw_output {
+            self.msg = super::flush::untrap(&self.msg).into_owned();
+        }
+    }
     /// act pads job names for column alignment.
     fn job_key(&self) -> Option<String> {
         self.job.as_deref().map(|j| j.trim().to_string())
@@ -589,6 +601,8 @@ mod leg_tests;
 mod legs;
 #[cfg(test)]
 mod property_tests;
+#[cfg(test)]
+mod trap_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

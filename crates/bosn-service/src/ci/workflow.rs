@@ -64,12 +64,17 @@ pub struct Step {
 }
 
 impl Step {
-    /// act's display name: `name`, else `uses`, else the `run` text.
+    /// act's display name: `name`, else `uses`, else the `run` text as
+    /// written (without the trap bosn added to the run's copy).
     fn display(&self) -> String {
         self.name
             .clone()
             .or_else(|| self.uses.clone())
-            .or_else(|| self.run.as_deref().map(|r| r.trim().to_string()))
+            .or_else(|| {
+                self.run
+                    .as_deref()
+                    .map(|r| super::flush::untrap(r).trim().to_string())
+            })
             .unwrap_or_default()
     }
 }
@@ -109,6 +114,30 @@ fn parse(text: &str) -> Option<Declared> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #405: the run's localized copy has bosn's end-of-output trap on every
+    /// `run:` script; a declared (e.g. skipped) step keeps its written name.
+    #[test]
+    fn a_trapped_copy_declares_the_steps_as_written() {
+        let written = include_str!("../../tests/fixtures/act/act-0.2.88-unnamed-run-steps.yml");
+        let mut localized: serde_yaml::Value = serde_yaml::from_str(written).unwrap();
+        assert_eq!(super::super::flush::add_traps(&mut localized), 4);
+        let localized = parse(&serde_yaml::to_string(&localized).unwrap()).unwrap();
+        assert_eq!(localized, parse(written).unwrap());
+        let names: Vec<&str> = localized.steps["a"]
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "echo one",
+                "Named",
+                "echo never",
+                "printf 'fatal: no newline' >&2\nexit 3"
+            ]
+        );
+    }
 
     #[test]
     fn steps_use_explicit_ids_else_their_index() {
