@@ -24,8 +24,10 @@
 //! looks clean and a workflow's `git restore` does not undo them (#394).
 //!
 //! The same pass gives every POSIX-shell `run:` step the end-of-output trap
-//! of [`super::flush`] (#398) and confines remote-only jobs
-//! ([`super::remote_only`], GATE-012), so the files are read and written once.
+//! of [`super::flush`] (#398), confines remote-only jobs
+//! ([`super::remote_only`], GATE-012) and gates matrix legs on their own
+//! runner ([`super::matrix_runner`], #404), so the files are read and written
+//! once.
 
 use std::{
     fmt, io,
@@ -48,6 +50,9 @@ pub struct Localized {
     /// Remote-only jobs confined to a stub, with the reason
     /// ([`super::remote_only`]).
     pub remote_only: Vec<(String, String)>,
+    /// Matrix jobs whose legs bosn runs or reports unsupported by their own
+    /// runner ([`super::matrix_runner`], #404).
+    pub runner_gated: Vec<String>,
     /// The workflow and action files rewritten.
     pub files: Vec<PathBuf>,
 }
@@ -95,6 +100,7 @@ pub fn localize(workflow: &Path, repository: &str, localized: &mut Localized) ->
     let mut changes = Localized::default();
     localize_document(&mut document, repository, &mut changes);
     changes.remote_only = super::remote_only::confine(&mut document);
+    changes.runner_gated = super::matrix_runner::gate(&mut document);
     changes.trapped = super::flush::add_traps(&mut document);
     let changed = changes != Localized::default();
     if changed {
@@ -105,6 +111,7 @@ pub fn localize(workflow: &Path, repository: &str, localized: &mut Localized) ->
     localized.pinned.extend(changes.pinned);
     localized.trapped += changes.trapped;
     localized.remote_only.extend(changes.remote_only);
+    localized.runner_gated.extend(changes.runner_gated);
     Ok(changed)
 }
 

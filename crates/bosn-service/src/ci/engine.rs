@@ -104,6 +104,11 @@ pub struct ActInvocation {
     pub secrets: SecretEnv,
 }
 
+/// The `runs-on` labels act runs locally, all on the pinned runner image;
+/// any other is unsupported ([`super::matrix_runner`] decides it per matrix
+/// leg).
+pub const LOCAL_RUNNER_LABELS: [&str; 3] = ["ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04"];
+
 impl ActInvocation {
     /// Arguments after `act`. Platform mappings cover the Linux labels; any
     /// other `runs-on` is reported unsupported by act and never passes.
@@ -125,7 +130,7 @@ impl ActInvocation {
             format!("{ENGINE_WORK}/artifacts"),
         ];
         let runner = runner_tag();
-        for label in ["ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04"] {
+        for label in LOCAL_RUNNER_LABELS {
             args.push("-P".into());
             args.push(format!("{label}={runner}"));
         }

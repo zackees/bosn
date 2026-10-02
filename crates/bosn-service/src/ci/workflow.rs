@@ -94,6 +94,8 @@ fn parse(text: &str) -> Option<Declared> {
             .steps
             .iter()
             .enumerate()
+            // bosn's own gate (#404) is no step of the job.
+            .filter(|(_, step)| step.id.as_deref() != Some(super::matrix_runner::STEP_ID))
             .map(|(index, step)| DeclaredStep {
                 id: step.id.clone().unwrap_or_else(|| index.to_string()),
                 name: step.display(),

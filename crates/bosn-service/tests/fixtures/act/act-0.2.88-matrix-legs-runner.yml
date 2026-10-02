@@ -1,0 +1,29 @@
+# The workflow as written. act-0.2.88-matrix-legs-runner.jsonl was recorded
+# (act 0.2.88, `act push --json`) from bosn's copy of it, after
+# `ci::matrix_runner::gate` rewrote `wheel` (#404).
+name: legs
+on: [push]
+jobs:
+  first:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo first
+  wheel:
+    name: Wheel (${{ matrix.os }})
+    needs: first
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11"]
+    steps:
+      - run: echo leg ${{ matrix.os }}
+  lint:
+    needs: first
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        tool: [ruff, pyright]
+    steps:
+      - run: echo lint ${{ matrix.tool }}

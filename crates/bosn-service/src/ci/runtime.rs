@@ -751,6 +751,11 @@ impl CiRuntime {
                         "job {job} runs only on GitHub (GATE-012): {reason}; it is reported remote_only, not run"
                     ));
                 }
+                for job in &localized.runner_gated {
+                    observer.note(&format!(
+                        "job {job}: each matrix leg runs on its own runs-on, or is reported unsupported when that is not a local runner"
+                    ));
+                }
                 for pinned in &localized.pinned {
                     observer.note(&format!(
                         "actions/checkout of {pinned} is fetched anonymously from GitHub (a pinned commit; no token)"
