@@ -235,7 +235,8 @@ fn setup_app_task_is_prompt_typed_and_clears_its_durable_session() {
     let state = temporary.path().join("state");
     let workspace = temporary.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
-    let fake = Arc::new(FakeSetupAppTaskExecutor::new());
+    let (gate, mut control) = execution_gate();
+    let fake = Arc::new(FakeSetupAppTaskExecutor::new(Some(gate)));
     RuntimeBuilder::multi_thread()
         .enable_all()
         .build()
@@ -258,11 +259,15 @@ fn setup_app_task_is_prompt_typed_and_clears_its_durable_session() {
             let submitted = std::time::Instant::now();
             let first = client.submit_setup_app_task(request.clone()).await.unwrap();
             assert!(submitted.elapsed() < Duration::from_millis(250));
+            // Coalescing covers active jobs (#299): hold the executor until
+            // the second IPC request has joined the first one.
+            control.entered().await;
             assert_eq!(
                 first,
                 client.submit_setup_app_task(request).await.unwrap(),
                 "identical semantic app-task requests coalesce"
             );
+            control.release().await;
             wait_for_job_state(&client, first, "Succeeded").await;
             assert_eq!(fake.started.load(Ordering::SeqCst), 1);
             assert_eq!(*fake.observed.lock().unwrap(), vec!["check"]);
@@ -284,9 +289,8 @@ fn manifest_app_task_is_prompt_typed_and_clears_its_durable_session() {
     let state = temporary.path().join("state");
     let workspace = temporary.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
-    let (entered, mut entered_wait) = async_engine::channel(1);
-    let (release, release_wait) = async_engine::channel(1);
-    let fake = Arc::new(FakeManifestAppTaskExecutor::new(entered, release_wait));
+    let (gate, mut control) = execution_gate();
+    let fake = Arc::new(FakeManifestAppTaskExecutor::new(gate));
     RuntimeBuilder::multi_thread()
         .enable_all()
         .build()
@@ -312,15 +316,12 @@ fn manifest_app_task_is_prompt_typed_and_clears_its_durable_session() {
                 .unwrap();
             // Coalescing covers active jobs: keep this executor active
             // until the second IPC request has joined the first one.
-            async_engine::timeout(Duration::from_secs(2), entered_wait.recv())
-                .await
-                .unwrap()
-                .unwrap();
+            control.entered().await;
             assert_eq!(
                 first,
                 client.submit_manifest_app_task(request).await.unwrap()
             );
-            release.send(()).await.unwrap();
+            control.release().await;
             wait_for_job_state(&client, first, "Succeeded").await;
             assert_eq!(fake.observed.lock().unwrap().len(), 1);
             assert_eq!(client.status().await.unwrap().sessions, 0);
