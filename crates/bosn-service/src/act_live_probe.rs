@@ -235,6 +235,191 @@ fn resource_receipt(
     }
     value
 }
+const NESTED_LIMIT: usize = 8;
+const NESTED_RECEIPTS: usize = 24;
+fn nested_rows(raw: &[u8]) -> std::io::Result<Vec<(String, String)>> {
+    let mut rows = Vec::new();
+    for line in raw.split(|b| *b == b'\n').filter(|b| !b.is_empty()) {
+        if rows.len() == NESTED_LIMIT {
+            return Err(fail("nested container count exceeds diagnostic bound"));
+        }
+        let row: Value = serde_json::from_slice(line)?;
+        let id = row["ID"]
+            .as_str()
+            .ok_or_else(|| fail("nested ID missing"))?;
+        if id.len() != 64
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(fail("nested ID is not canonical lower hex"));
+        }
+        let state = row["State"]
+            .as_str()
+            .ok_or_else(|| fail("nested state missing"))?;
+        if !matches!(
+            state,
+            "created" | "running" | "paused" | "restarting" | "removing" | "exited" | "dead"
+        ) || rows.iter().any(|(old, _)| old == id)
+        {
+            return Err(fail("invalid or duplicate nested observation"));
+        }
+        rows.push((id.to_owned(), state.to_owned()));
+    }
+    Ok(rows)
+}
+fn nested_receipt(
+    result: Result<bosn_engine::CommandResult, String>,
+    id: &str,
+    elapsed: Duration,
+) -> Value {
+    let mut receipt = json!({"source":"private engine nested inspect; diagnostic only","unix_seconds":at(),"elapsed_ms":elapsed.as_millis(),"nested_id":id});
+    match result {
+        Ok(output) => {
+            receipt["command_exit"] = json!(output.exit_code);
+            receipt["stderr"] = json!(String::from_utf8_lossy(&output.stderr));
+            receipt["raw_stdout"] = json!(String::from_utf8_lossy(&output.stdout));
+            if output.exit_code == 0 {
+                match serde_json::from_slice::<Value>(&output.stdout) {
+                    Ok(v) if v.as_array().is_some_and(|a| a.len() == 1) && v[0]["Id"] == id => {
+                        receipt["inspection"] = v
+                    }
+                    _ => receipt["observer_error"] = json!("nested inspect identity/JSON mismatch"),
+                }
+            } else {
+                receipt["observer_error"] = json!("nested inspect failed");
+            }
+        }
+        Err(e) => receipt["observer_error"] = json!(e),
+    }
+    receipt
+}
+async fn sample_nested(
+    engine: &DockerEngine,
+    outer: &str,
+    samples: &Path,
+    seen: &mut std::collections::BTreeSet<(String, String)>,
+    elapsed: Duration,
+    budget: Duration,
+) -> std::io::Result<()> {
+    let deadline = Instant::now() + budget.min(Duration::from_secs(5));
+    if budget.is_zero() {
+        return Ok(());
+    }
+    if seen.len() >= NESTED_RECEIPTS {
+        return Ok(());
+    }
+    let list = engine
+        .with_args([
+            "exec",
+            outer,
+            "docker",
+            "ps",
+            "--all",
+            "--no-trunc",
+            "--format",
+            "{{json .}}",
+        ])
+        .capture_async(RunOptions::bounded(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(2)),
+            16384,
+        ))
+        .await;
+    let rows = match list {
+        Ok(r) if r.exit_code == 0 => nested_rows(&r.stdout),
+        Ok(r) => Err(fail(format!(
+            "nested list exit {}: {}",
+            r.exit_code,
+            String::from_utf8_lossy(&r.stderr)
+        ))),
+        Err(e) => Err(fail(e.to_string())),
+    };
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(e) => {
+            let path = samples.join("nested-list-error.json");
+            if !path.exists() {
+                retain(
+                    &path,
+                    &serde_json::to_vec_pretty(
+                        &json!({"source":"private nested listing; diagnostic only","unix_seconds":at(),"observer_error":e.to_string()}),
+                    )?,
+                )?;
+            }
+            return Ok(());
+        }
+    };
+    for (id, state) in rows {
+        if Instant::now() >= deadline {
+            break;
+        }
+        if seen.len() == NESTED_RECEIPTS {
+            break;
+        }
+        if seen.contains(&(id.clone(), state.clone())) {
+            continue;
+        }
+        let result = engine
+            .with_args(["exec", outer, "docker", "inspect", &id])
+            .capture_async(RunOptions::bounded(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_secs(2)),
+                65536,
+            ))
+            .await;
+        let receipt = nested_receipt(result.map_err(|e| e.to_string()), &id, elapsed);
+        retain(
+            &samples.join(format!("nested-{:02}.json", seen.len())),
+            &serde_json::to_vec_pretty(&receipt)?,
+        )?;
+        seen.insert((id, state));
+    }
+    Ok(())
+}
+pub(crate) async fn diagnose_nested_failure(
+    registry: &RegistryActor,
+    engine: &DockerEngine,
+    intent: &ActEngineIntent,
+    observed: &ActEngineObservation,
+    token: &str,
+    evidence: &Path,
+    remaining: Duration,
+) -> std::io::Result<()> {
+    let budget = remaining.min(Duration::from_secs(5));
+    if budget.is_zero() {
+        return Ok(());
+    }
+    let start = Instant::now();
+    async_engine::timeout(
+        budget,
+        registry.act_registry(ActRegistryCommand::VerifyClaimed {
+            run: intent.run_id.clone(),
+            observed: observed.clone(),
+            token: token.to_owned(),
+        }),
+    )
+    .await
+    .map_err(|e| fail(format!("nested diagnostic authorization deadline: {e}")))?
+    .map_err(|e| fail(e.to_string()))?;
+    let budget = budget.saturating_sub(start.elapsed());
+    if budget.is_zero() {
+        return Ok(());
+    }
+    let directory = evidence.join("nested-failure-diagnostics");
+    private_dir(&directory)?;
+    sample_nested(
+        engine,
+        &observed.engine_id,
+        &directory,
+        &mut std::collections::BTreeSet::new(),
+        start.elapsed(),
+        budget,
+    )
+    .await
+}
 async fn docker(engine: &DockerEngine, args: Vec<String>) -> std::io::Result<Vec<u8>> {
     let result = engine
         .with_args(args)
@@ -516,6 +701,7 @@ async fn watch_cancellation(
 ) -> std::io::Result<bool> {
     let (evidence, samples, cancel_case) = artifacts;
     let mut sampled = 0usize;
+    let mut nested_seen = std::collections::BTreeSet::new();
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(120) && !stop.token().is_cancelled() {
         if let Some(current) = record(&registry, &intent.run_id).await?
@@ -546,6 +732,19 @@ async fn watch_cancellation(
                     &serde_json::to_vec_pretty(&sample)?,
                 )?;
                 sampled += 1;
+            }
+            if !stop.token().is_cancelled() {
+                sample_nested(
+                    &engine,
+                    &observed.engine_id,
+                    &samples,
+                    &mut nested_seen,
+                    start.elapsed(),
+                    Duration::from_secs(120)
+                        .saturating_sub(start.elapsed())
+                        .min(Duration::from_secs(2)),
+                )
+                .await?;
             }
             if !cancel_case {
                 async_engine::sleep(Duration::from_millis(500)).await;
@@ -1003,4 +1202,117 @@ fn observer_failure_cannot_be_promoted_to_resource_measurement_or_runtime_succes
             assert!(profile_from_value(&wrong).is_err());
         }
     }
+}
+
+#[test]
+fn nested_diagnostics_refuse_foreign_identity_and_preserve_failure() {
+    let id = "a".repeat(64);
+    let rows = serde_json::to_vec(&json!({"ID":id,"State":"created"})).unwrap();
+    assert_eq!(
+        nested_rows(&rows).unwrap(),
+        vec![(id.clone(), "created".into())]
+    );
+    for bad in ["a".repeat(63), "A".repeat(64), "../foreign".into()] {
+        assert!(
+            nested_rows(&serde_json::to_vec(&json!({"ID":bad,"State":"created"})).unwrap())
+                .is_err()
+        );
+    }
+    let duplicated = [rows.clone(), b"\n".to_vec(), rows].concat();
+    assert!(nested_rows(&duplicated).is_err());
+    let too_many = (0..9)
+        .map(|i| {
+            serde_json::to_string(&json!({"ID":format!("{i:064x}"),"State":"created"})).unwrap()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(nested_rows(too_many.as_bytes()).is_err());
+    let output = bosn_engine::CommandResult {
+        exit_code: 0,
+        stdout: serde_json::to_vec(&json!([{"Id":"b".repeat(64),"Config":{"Env":["PATH=/bin"]}}]))
+            .unwrap(),
+        stderr: vec![],
+    };
+    let receipt = nested_receipt(Ok(output), &id, Duration::ZERO);
+    assert!(receipt.get("observer_error").is_some());
+    assert!(receipt.get("inspection").is_none());
+    assert!(receipt.get("execution_success").is_none());
+    let failure = nested_receipt(Err("capture deadline exceeded".into()), &id, Duration::ZERO);
+    assert_eq!(failure["observer_error"], "capture deadline exceeded");
+}
+
+#[test]
+fn nested_diagnostic_fake_transport_retains_once_per_state_without_docker() {
+    let root = std::env::temp_dir().join(format!(
+        "bosn-nested-diagnostic-fixture-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    private_dir(&root).unwrap();
+    let id = "c".repeat(64);
+    let script = format!(
+        "case \"$4\" in ps) printf '%s\n' '{{\"ID\":\"{id}\",\"State\":\"created\"}}';; inspect) printf '%s\n' '[{{\"Id\":\"{id}\",\"Config\":{{\"Env\":[\"PATH=/usr/bin:/bin\"]}},\"State\":{{\"Status\":\"created\"}},\"Mounts\":[]}}]';; *) exit 93;; esac"
+    );
+    let engine = DockerEngine::synthetic_for_test("/bin/sh", ["-c", &script, "fixture"]);
+    async_engine::RuntimeBuilder::multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .run(async {
+            let mut seen = std::collections::BTreeSet::new();
+            for _ in 0..2 {
+                sample_nested(
+                    &engine,
+                    "owned-outer",
+                    &root,
+                    &mut seen,
+                    Duration::ZERO,
+                    Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
+            }
+            assert_eq!(seen.len(), 1);
+            let exited_script = script.replace("created", "exited");
+            let exited =
+                DockerEngine::synthetic_for_test("/bin/sh", ["-c", &exited_script, "fixture"]);
+            sample_nested(
+                &exited,
+                "owned-outer",
+                &root,
+                &mut seen,
+                Duration::ZERO,
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+            assert_eq!(seen.len(), 2);
+            let forbidden = DockerEngine::synthetic_for_test(
+                "/nonexistent-do-not-spawn",
+                std::iter::empty::<String>(),
+            );
+            sample_nested(
+                &forbidden,
+                "owned-outer",
+                &root,
+                &mut seen,
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+
+            let receipt: Value = serde_json::from_slice(
+                &bounded_file(&root.join("nested-00.json"), 1 << 20).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                receipt["inspection"][0]["Config"]["Env"][0],
+                "PATH=/usr/bin:/bin"
+            );
+            assert!(root.join("nested-01.json").exists());
+            assert!(!root.join("nested-02.json").exists());
+        });
 }
