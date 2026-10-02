@@ -121,6 +121,9 @@ pub(crate) struct ReplyWire {
     /// Codes 360/361: a JSON CI reply, or a JSON `{code, message}` CI error.
     #[prost(string, tag = "57")]
     pub(crate) ci_reply: String,
+    /// Code 220, `bosn jobs` (#358): the accounting view as a JSON document.
+    #[prost(string, tag = "58")]
+    pub(crate) jobs_json: String,
 }
 #[derive(Message)]
 pub(crate) struct LogRecordWire {
@@ -339,6 +342,7 @@ pub(crate) enum Reply {
     UnmanagedApply(UnmanagedApplySummary),
     Ci(String),
     CiError(String),
+    Jobs(String),
 }
 pub(crate) fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
     match v.code {
@@ -462,6 +466,7 @@ pub(crate) fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
             failures: v.unmanaged_failures,
             refused: (!v.unmanaged_refused.is_empty()).then_some(v.unmanaged_refused),
         })),
+        220 => Ok(Reply::Jobs(v.jobs_json)),
         1 => Err(Error::Protocol("unsupported protocol")),
         2 => Err(Error::Protocol("unknown operation")),
         _ => Err(Error::Protocol("daemon error")),

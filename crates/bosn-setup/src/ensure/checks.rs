@@ -165,6 +165,22 @@ pub(crate) fn validate_container_path(value: &str) -> Result<(), SetupEnsureErro
     Ok(())
 }
 
+/// Docker 29 stores `WorkingDir` through `path.Clean` (`/w/.` reads back as
+/// `/w`), while older engines echo the requested spelling. A workdir at a
+/// mount's root is derived as `<target>/.`, so the reuse proof compares the
+/// lexical form: drop `.` segments and repeated or trailing slashes. `..` is
+/// kept verbatim, so it can never make two different directories compare equal.
+pub(crate) fn lexical_container_path(value: &str) -> String {
+    if !value.starts_with('/') {
+        return value.to_owned();
+    }
+    let parts: Vec<&str> = value
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    format!("/{}", parts.join("/"))
+}
+
 pub(crate) fn workspace_prefix(path: &str, prefix: &str) -> bool {
     prefix == "."
         || path == prefix
@@ -462,10 +478,9 @@ pub(crate) fn verify_actual_configuration(
         if !expected.mounts.iter().any(|m| m.target == target)
             && !expected.volumes.iter().any(|v| v.target == target)
             && !expected.tmpfs.iter().any(|m| m.target == target)
-            && expected
-                .host_docker_socket
-                .as_ref()
-                .is_none_or(|s| s.target != target)
+            && expected.host_docker_socket.as_ref().is_none_or(|s| {
+                s.target != target && s.proxy_dir.as_deref() != Some(target.as_str())
+            })
         {
             return Err(fail());
         }
@@ -507,11 +522,13 @@ pub(crate) fn verify_actual_configuration(
         || strings(config.get("Cmd"))? != expected_cmd
         || strings(config.get("Entrypoint"))? != strings(base.get("Entrypoint"))?
         || scalar(config.get("User"))? != scalar(base.get("User"))?
-        || scalar(config.get("WorkingDir"))?
-            != expected
-                .workdir
-                .clone()
-                .unwrap_or(scalar(base.get("WorkingDir"))?)
+        || lexical_container_path(&scalar(config.get("WorkingDir"))?)
+            != lexical_container_path(
+                &expected
+                    .workdir
+                    .clone()
+                    .unwrap_or(scalar(base.get("WorkingDir"))?),
+            )
     {
         return Err(fail());
     }
@@ -590,6 +607,9 @@ pub(crate) fn verify_actual_configuration(
                 !socket.readonly,
             ),
         );
+        if let Some(dir) = &socket.proxy_dir {
+            wanted.insert(dir.clone(), ("bind".into(), dir.clone(), true));
+        }
     }
     let mut seen = BTreeMap::new();
     let mut seen_tmpfs = BTreeSet::new();

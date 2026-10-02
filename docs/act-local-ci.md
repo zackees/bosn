@@ -110,3 +110,16 @@ only privileged container shape is the fixed macOS guest, and the Docker
 command endpoint is not a nested-engine ownership boundary. That capability
 needs a typed Bosn daemon operation and registry recovery before `act run`
 can be enabled.
+
+## Today's act tasks: host-socket stacks under the runner proxy
+
+Until the isolated engine lands, fleet repositories run act as a manifest
+task whose stack mounts the host Docker socket (for example clud's
+`act-ci-*`). Such tasks now run concurrently across checkouts, and act's job
+containers go through a per-job Docker proxy. It labels them, applies the
+runner slot's CPU limit, keeps concurrent runs of one workflow from removing
+each other's containers, maps cache volumes into them, and removes everything
+the run created when it ends. This is accounting, not isolation: the task
+still holds the host engine. Pass `--use-new-action-cache` when the action
+cache is shared between concurrent runs. See [runners.md](runners.md).
+

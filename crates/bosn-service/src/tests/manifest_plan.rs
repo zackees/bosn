@@ -627,8 +627,12 @@ fn manifest_host_docker_socket_is_typed_and_other_host_paths_explain_the_remedy(
                     source: SetupHostDockerSocketSource::VarRun,
                     target: "/var/run/docker.sock".into(),
                     readonly: false,
+                    // No state dir (no serving daemon): no proxy bind.
+                    proxy_dir: None,
                 })
             );
+            // A host-socket stack maps act's toolcache by default.
+            assert_eq!(plan.job_caches, vec![runners::CacheRule::act_toolcache()]);
             assert_eq!(plan.plan.app.mounts.len(), 1);
             assert_eq!(plan.plan.app.mounts[0].target, "/workspace");
             assert_eq!(

@@ -87,7 +87,7 @@ pub(crate) fn run_daemon(mut arguments: impl Iterator<Item = std::ffi::OsString>
     }
     let invocation = match command.to_string_lossy().as_ref() {
         "serve" => parse_daemon_serve_arguments(arguments)
-            .map(|state_dir| DaemonInvocation::Serve { state_dir }),
+            .map(|(state_dir, runners)| DaemonInvocation::Serve { state_dir, runners }),
         "status" => parse_daemon_client_arguments(arguments)
             .map(|(state_dir, json)| DaemonInvocation::Status { state_dir, json }),
         "stop" => parse_daemon_client_arguments(arguments)
@@ -108,12 +108,26 @@ pub(crate) fn run_daemon(mut arguments: impl Iterator<Item = std::ffi::OsString>
         Err(_) => daemon_failure(invocation.action(), invocation.json()),
     };
     match invocation {
-        DaemonInvocation::Serve { state_dir } => {
-            if let Err(error) = runtime.run(
-                bosn_service::Service::new(state_dir)
-                    .with_release_version(env!("CARGO_PKG_VERSION"))
-                    .serve(),
-            ) {
+        DaemonInvocation::Serve { state_dir, runners } => {
+            let mut service = bosn_service::Service::new(&state_dir)
+                .with_release_version(env!("CARGO_PKG_VERSION"));
+            if !runners.is_empty() {
+                let mut capacity = match bosn_service::capacity::RunnerCapacity::load(&state_dir) {
+                    Ok(capacity) => capacity,
+                    Err(error) => {
+                        eprintln!("bosn daemon serve: {error}");
+                        std::process::exit(2);
+                    }
+                };
+                for (key, value) in &runners {
+                    if let Err(error) = capacity.set(key, value) {
+                        eprintln!("bosn daemon serve: {error}");
+                        std::process::exit(2);
+                    }
+                }
+                service = service.with_runner_capacity(capacity);
+            }
+            if let Err(error) = runtime.run(service.serve()) {
                 eprintln!("bosn daemon serve: {error}");
                 std::process::exit(1);
             }
@@ -163,9 +177,18 @@ pub(crate) fn run_daemon(mut arguments: impl Iterator<Item = std::ffi::OsString>
 }
 
 pub(crate) enum DaemonInvocation {
-    Serve { state_dir: PathBuf },
-    Status { state_dir: PathBuf, json: bool },
-    Stop { state_dir: PathBuf, json: bool },
+    Serve {
+        state_dir: PathBuf,
+        runners: RunnerOverrides,
+    },
+    Status {
+        state_dir: PathBuf,
+        json: bool,
+    },
+    Stop {
+        state_dir: PathBuf,
+        json: bool,
+    },
 }
 
 impl DaemonInvocation {
@@ -185,19 +208,42 @@ impl DaemonInvocation {
     }
 }
 
+/// `bosn daemon serve` runner flags (#358) override `runners.toml` and the
+/// `BOSN_RUNNER_*` environment; each names one `runners.toml` key.
+const DAEMON_RUNNER_FLAGS: &[(&str, &str)] = &[
+    ("--runner-slots", "slots"),
+    ("--runner-cpus", "cpus"),
+    ("--runner-memory", "memory"),
+    ("--control-slots", "control_slots"),
+    ("--stall-seconds", "stall_seconds"),
+    ("--docker-proxy", "docker_proxy"),
+];
+
+/// `runners.toml` key and value pairs from `bosn daemon serve` flags.
+pub(crate) type RunnerOverrides = Vec<(&'static str, String)>;
+
 /// Parse every daemon argument before constructing a runtime, asking the
 /// client to resolve an endpoint, or allowing `serve` to create state.
 pub(crate) fn parse_daemon_serve_arguments(
     mut arguments: impl Iterator<Item = std::ffi::OsString>,
-) -> Result<PathBuf, ()> {
+) -> Result<(PathBuf, RunnerOverrides), ()> {
     let mut state_dir = None;
+    let mut overrides = Vec::new();
     while let Some(argument) = arguments.next() {
-        match argument.to_string_lossy().as_ref() {
-            "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
-            _ => Err(()),
-        }?;
+        let argument = argument.to_string_lossy().into_owned();
+        if argument == "--state-dir" {
+            set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir)?;
+        } else if let Some((_, key)) = DAEMON_RUNNER_FLAGS.iter().find(|(f, _)| *f == argument) {
+            let value = arguments.next().ok_or(())?;
+            if overrides.iter().any(|(k, _)| k == key) {
+                return Err(());
+            }
+            overrides.push((*key, value.to_string_lossy().into_owned()));
+        } else {
+            return Err(());
+        }
     }
-    state_dir.ok_or(())
+    Ok((state_dir.ok_or(())?, overrides))
 }
 
 pub(crate) fn parse_daemon_client_arguments(

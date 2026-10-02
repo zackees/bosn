@@ -265,6 +265,12 @@ fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
                     .map(status_json)
                     .map_err(|_| ToolFailure::Daemon)
             }
+            "bosn_jobs" => {
+                if !arguments.is_empty() {
+                    return tool_error("bosn_jobs accepts no arguments");
+                }
+                backend.jobs().map_err(|_| ToolFailure::Daemon)
+            }
             "bosn_doctor" => {
                 if !arguments.is_empty() {
                     return tool_error("bosn_doctor accepts no arguments");

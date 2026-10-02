@@ -25,7 +25,7 @@ impl DerivedEnsure {
             mounts: self.mounts.clone(),
             volumes: self.volumes.clone(),
             tmpfs: self.tmpfs.clone(),
-            host_docker_socket: self.host_docker_socket.clone(),
+            host_docker_socket: Box::new(self.host_docker_socket.clone()),
             environment: self.environment.clone(),
             workdir: self.workdir.clone(),
             command: self.command.clone(),
@@ -253,7 +253,13 @@ pub(crate) fn validate_plan_shape(plan: &SetupPlan) -> Result<(), SetupEnsureErr
             || !targets.insert(socket.target.clone())
             || plan.macos_guest.is_some()
             || crate::SetupHostDockerSocketSource::from_host_path(socket.source.host_path())
-                != Some(socket.source))
+                != Some(socket.source)
+            || socket.proxy_dir.as_ref().is_some_and(|dir| {
+                validate_container_path(dir).is_err()
+                    || dir == "/"
+                    || dir.contains(',')
+                    || !targets.insert(dir.clone())
+            }))
     {
         return Err(SetupEnsureError::InvalidRequest(
             "host Docker socket receipt was modified",

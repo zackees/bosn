@@ -83,14 +83,20 @@ pub(crate) enum JobCommand {
         contract: ManifestRecoveryContract,
         reply: async_engine::OneshotSender<Result<(), String>>,
     },
+    /// Consecutive output lines of one job, batched by its forwarder so a
+    /// chatty job costs one actor command per burst, not one per line.
     Log {
         id: u64,
-        line: String,
+        lines: Vec<String>,
     },
     Completed {
         id: u64,
         kind: SetupJobKind,
         result: Result<String, String>,
+    },
+    /// The accounting view behind `bosn jobs` (#358), as JSON.
+    List {
+        reply: async_engine::OneshotSender<String>,
     },
     Stop(async_engine::OneshotSender<()>),
 }
@@ -182,6 +188,9 @@ pub(crate) struct SetupExecutors {
     pub(crate) ensure: Arc<dyn SetupEnsureExecutor>,
     pub(crate) manifest_ensure: Arc<dyn ManifestEnsureExecutor>,
     pub(crate) manifest_app_task: Arc<dyn ManifestAppTaskExecutor>,
+    /// Runner accounting (#358). `None` in tests that exercise only the
+    /// admission and registry paths.
+    pub(crate) runners: Option<Arc<runners::Runners>>,
 }
 impl JobActor {
     pub(crate) async fn submit(
@@ -323,5 +332,103 @@ impl JobActor {
         if self.sender.send(JobCommand::Stop(reply)).await.is_ok() {
             let _ = wait.await;
         }
+    }
+    pub(crate) async fn list(&self) -> Result<String, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(JobCommand::List { reply })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)
+    }
+}
+
+/// How many finished jobs `bosn jobs` shows.
+const JOBS_VIEW_RECENT: usize = 20;
+
+/// The `bosn jobs` document: capacity, lane load, every unfinished job and
+/// the most recent finished ones, with each running task's accounting.
+pub(crate) fn jobs_view(jobs: &Jobs, runners: Option<&runners::Runners>) -> serde_json::Value {
+    let epoch_ms = |at: Option<SystemTime>| {
+        at.and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+    };
+    let views: BTreeMap<u64, runners::RunView> = runners
+        .map(|r| {
+            r.views()
+                .into_iter()
+                .map(|v| (v.record.job_id, v))
+                .collect()
+        })
+        .unwrap_or_default();
+    let now = Instant::now();
+    let list: Vec<serde_json::Value> = jobs
+        .snapshot(JOBS_VIEW_RECENT)
+        .into_iter()
+        .map(|job| {
+            let mut entry = serde_json::json!({
+                "id": job.id,
+                "state": job_state_name(job.state),
+                "class": job.class.label(),
+                "slot": job.slot,
+                "workspace": job.workspace,
+                "key": job.stack,
+                "submitted_ms": epoch_ms(Some(job.submitted_at)),
+                "started_ms": epoch_ms(job.started_at),
+                "finished_ms": epoch_ms(job.finished_at),
+                // Idle: since the last log line or Docker request, as the
+                // stall sweep sees it.
+                "idle_seconds": job.last_progress
+                    .filter(|_| !job.state.terminal())
+                    .map(|at| {
+                        let docker = views.get(&job.id).map(|v| {
+                            Instant::now()
+                                .checked_sub(Duration::from_millis(
+                                    docker_proxy::now_ms().saturating_sub(v.last_activity_ms),
+                                ))
+                                .unwrap_or(now)
+                        });
+                        now.saturating_duration_since(docker.map_or(at, |d| d.max(at))).as_secs()
+                    }),
+                "error": job.error,
+            });
+            if let Some(view) = views.get(&job.id) {
+                entry["run"] = serde_json::to_value(view).unwrap_or_default();
+            }
+            entry
+        })
+        .collect();
+    let load = jobs.load();
+    let lane = |class| {
+        let (queued, running) = load.get(&class).copied().unwrap_or_default();
+        serde_json::json!({"queued": queued, "running": running})
+    };
+    let policy = jobs.policy();
+    let capacity = runners.map(|r| r.capacity().clone());
+    serde_json::json!({
+        "version": 1,
+        "capacity": {
+            "runner_slots": policy.runner_slots,
+            "control_slots": policy.control_slots,
+            "cpus_per_slot": capacity.as_ref().map(|c| c.cpus_per_slot),
+            "memory_per_slot": capacity.as_ref().and_then(|c| c.memory_per_slot),
+            "stall_seconds": capacity.as_ref().and_then(|c| c.stall_after).map(|d| d.as_secs()),
+            "docker_proxy": capacity.as_ref().is_some_and(|c| c.docker_proxy),
+            "host_cpus": capacity::host_cpus(),
+        },
+        "lanes": {"runner": lane(jobs::JobClass::Runner), "control": lane(jobs::JobClass::Control)},
+        "jobs": list,
+    })
+}
+
+fn job_state_name(state: jobs::JobState) -> &'static str {
+    match state {
+        jobs::JobState::Queued => "queued",
+        jobs::JobState::Running => "running",
+        jobs::JobState::Cancelling => "cancelling",
+        jobs::JobState::Succeeded => "succeeded",
+        jobs::JobState::Failed => "failed",
+        jobs::JobState::Cancelled => "cancelled",
+        jobs::JobState::Superseded => "superseded",
     }
 }

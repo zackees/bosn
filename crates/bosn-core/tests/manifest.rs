@@ -140,3 +140,83 @@ fn task_github_api_proxy_is_opt_in_and_carries_no_value() {
         assert!(parse_manifest_toml(&source, roots()).is_err(), "{bad}");
     }
 }
+
+#[test]
+fn job_caches_are_validated_and_default_to_exclusive_repo_scope() {
+    let manifest = parse_manifest_toml(
+        r#"
+[stack.ci]
+image = "docker@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+[stack.ci.job_caches.toolcache]
+volume = "act-toolcache"
+scope = "machine"
+replicas = 2
+[stack.ci.job_caches.cargo]
+destination = "/root/.cargo/registry/"
+mode = "shared"
+"#,
+        roots(),
+    )
+    .unwrap();
+    let caches = &manifest.stack("ci").unwrap().job_caches;
+    assert_eq!(caches.len(), 2);
+    let cargo = caches.iter().find(|c| c.name == "cargo").unwrap();
+    assert_eq!(cargo.destination.as_deref(), Some("/root/.cargo/registry"));
+    assert_eq!(
+        (cargo.scope.as_str(), cargo.mode.as_str()),
+        ("repo", "shared")
+    );
+    let toolcache = caches.iter().find(|c| c.name == "toolcache").unwrap();
+    assert_eq!(toolcache.volume.as_deref(), Some("act-toolcache"));
+    assert_eq!(toolcache.replicas, 2);
+    assert_eq!(toolcache.mode, "exclusive");
+
+    for (body, needle) in [
+        (
+            "[stack.ci.job_caches.x]\nscope = \"machine\"",
+            "must set `volume`",
+        ),
+        (
+            "[stack.ci.job_caches.x]\nvolume = \"a/b\"",
+            "Docker volume name",
+        ),
+        (
+            "[stack.ci.job_caches.x]\ndestination = \"rel\"",
+            "absolute path",
+        ),
+        (
+            "[stack.ci.job_caches.x]\nvolume = \"v\"\nscope = \"galaxy\"",
+            "`scope`",
+        ),
+        (
+            "[stack.ci.job_caches.x]\nvolume = \"v\"\nmode = \"rw\"",
+            "`mode`",
+        ),
+        (
+            "[stack.ci.job_caches.x]\nvolume = \"v\"\nreplicas = 0",
+            "1..=64",
+        ),
+        (
+            "[stack.ci.job_caches.x]\nvolume = \"v\"\nmode = \"shared\"\nreplicas = 2",
+            "only to exclusive",
+        ),
+        (
+            "[stack.ci.job_caches.x]\nvolume = \"v\"\nbogus = 1",
+            "unknown key",
+        ),
+        (
+            "[stack.ci.job_caches.x]\nvolume = \"v\"\n[stack.ci.job_caches.y]\nvolume = \"v\"",
+            "same volume",
+        ),
+        (
+            "[stack.ci.job_caches.\"bad name\"]\nvolume = \"v\"",
+            "cache name",
+        ),
+    ] {
+        let text = format!(
+            "[stack.ci]\nimage = \"docker@sha256:0000000000000000000000000000000000000000000000000000000000000000\"\n{body}\n"
+        );
+        let error = parse_manifest_toml(&text, roots()).unwrap_err().to_string();
+        assert!(error.contains(needle), "{body}: {error}");
+    }
+}

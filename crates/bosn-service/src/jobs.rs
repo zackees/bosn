@@ -1,9 +1,25 @@
 //! Bounded daemon-owned admission policy. Engine execution is deliberately
 //! outside this module: only validated semantic jobs may reach that layer.
+//!
+//! # Policy (#12, restored and extended by #358)
+//!
+//! * Per `(workspace, stack)` key at most one job runs and one waits; an
+//!   identical digest joins, a different one supersedes the waiting entry
+//!   (#12). This is unchanged.
+//! * Distinct keys run in parallel up to their class's cap. Task jobs use
+//!   **runner slots** (default `max(1, ncpu * 2)`, see `capacity`); short
+//!   control operations (ensure, prepare, converge) use their own **control
+//!   lane**, so a stack ensure never waits behind long tasks.
+//! * Within a class, admission is **round-robin across workspaces**, not
+//!   FIFO: one checkout that queues ten jobs cannot starve another checkout's
+//!   single job. A queued job waits only for a slot of its own class, so a
+//!   long act run never blocks a quick job from another session.
+//! * A running runner job holds a numbered slot (the lowest free index) for
+//!   accounting, until it settles.
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 pub const DEFAULT_MAX_LOG_RECORDS: usize = 5_000;
@@ -12,6 +28,9 @@ pub const DEFAULT_MAX_LOG_RECORDS: usize = 5_000;
 pub const MAX_LOG_LINE_BYTES: usize = 2_048;
 pub const MAX_LOG_PAGE_RECORDS: usize = 256;
 pub const MAX_LOG_PAGE_BYTES: usize = 512 * 1024;
+/// Terminal jobs kept for status/log polls; see [`Jobs::retire_finished`].
+pub const RETAINED_FINISHED_JOBS: usize = 256;
+pub const RETAINED_FINISHED_MIN_AGE: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JobState {
@@ -32,6 +51,30 @@ impl JobState {
     }
 }
 
+/// Which lane admits a job; see the module policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum JobClass {
+    /// Long-running tasks (`bosn run --task`): runner slots.
+    Runner,
+    /// Daemon operations (ensure, prepare, converge): the control lane.
+    Control,
+}
+impl JobClass {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Runner => "runner",
+            Self::Control => "control",
+        }
+    }
+}
+
+/// Lane sizes. [`Jobs::new`] uses one value for both.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SchedulerPolicy {
+    pub runner_slots: usize,
+    pub control_slots: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Job {
     pub id: u64,
@@ -41,11 +84,39 @@ pub struct Job {
     pub state: JobState,
     pub error: Option<String>,
     pub log_start: u64,
+    pub class: JobClass,
+    /// Runner slot index while running (runner jobs only).
+    pub slot: Option<usize>,
+    pub submitted_at: SystemTime,
+    pub started_at: Option<SystemTime>,
+    pub finished_at: Option<SystemTime>,
+    /// Last log line, or admission when none yet; feeds stall detection.
+    pub last_progress: Option<Instant>,
     logs: VecDeque<(u64, String)>,
 }
 impl Job {
     fn key(&self) -> (String, String) {
         (self.workspace.clone(), self.stack.clone())
+    }
+    /// Everything but the retained log, which can hold thousands of records:
+    /// status polls and the accounting view never need it.
+    fn summary(&self) -> Self {
+        Self {
+            id: self.id,
+            workspace: self.workspace.clone(),
+            stack: self.stack.clone(),
+            digest: self.digest.clone(),
+            state: self.state,
+            error: self.error.clone(),
+            log_start: self.log_start,
+            class: self.class,
+            slot: self.slot,
+            submitted_at: self.submitted_at,
+            started_at: self.started_at,
+            finished_at: self.finished_at,
+            last_progress: self.last_progress,
+            logs: VecDeque::new(),
+        }
     }
 }
 
@@ -85,14 +156,23 @@ struct Lease {
     seen: Instant,
 }
 pub struct Jobs {
-    max_running: usize,
+    policy: SchedulerPolicy,
     max_logs: usize,
     next: u64,
-    running: usize,
+    /// Running jobs per class.
+    running: BTreeMap<JobClass, usize>,
     closing: bool,
     jobs: BTreeMap<u64, Job>,
     slots: BTreeMap<(String, String), Slot>,
-    queue: VecDeque<u64>,
+    /// Admissible queued jobs per class, per workspace, FIFO within one
+    /// workspace; see [`Self::pump`].
+    queues: BTreeMap<JobClass, BTreeMap<String, VecDeque<u64>>>,
+    /// The workspace each class served last, for round-robin admission.
+    served: BTreeMap<JobClass, String>,
+    /// Runner slot ownership by index.
+    runner_slots: Vec<Option<u64>>,
+    /// Terminal jobs in finishing order, for bounded retention.
+    finished: VecDeque<u64>,
     /// IDs which have just transitioned from queued to running.  The daemon
     /// actor drains this handoff and attaches the semantic executor; the
     /// scheduler itself never knows about Docker or process ownership.
@@ -102,19 +182,42 @@ pub struct Jobs {
 }
 
 impl Jobs {
+    /// One cap for both lanes; mainly for tests.
     pub fn new(max_running: usize) -> Self {
+        Self::with_policy(SchedulerPolicy {
+            runner_slots: max_running,
+            control_slots: max_running,
+        })
+    }
+    pub fn with_policy(policy: SchedulerPolicy) -> Self {
+        let policy = SchedulerPolicy {
+            runner_slots: policy.runner_slots.max(1),
+            control_slots: policy.control_slots.max(1),
+        };
         Self {
-            max_running: max_running.max(1),
-            max_logs: DEFAULT_MAX_LOG_RECORDS,
-            next: 1,
+            policy,
+            runner_slots: vec![None; policy.runner_slots],
             ..Self::default()
         }
     }
+    pub fn policy(&self) -> SchedulerPolicy {
+        self.policy
+    }
+    /// Submit a control-lane job; see [`Self::submit_class`].
     pub fn submit(
         &mut self,
         workspace: &str,
         stack: &str,
         digest: &str,
+    ) -> Result<Submission, JobError> {
+        self.submit_class(workspace, stack, digest, JobClass::Control)
+    }
+    pub fn submit_class(
+        &mut self,
+        workspace: &str,
+        stack: &str,
+        digest: &str,
+        class: JobClass,
     ) -> Result<Submission, JobError> {
         if self.closing {
             return Err(JobError::Closing);
@@ -149,6 +252,12 @@ impl Jobs {
                 state,
                 error: None,
                 log_start: 0,
+                class,
+                slot: None,
+                submitted_at: SystemTime::now(),
+                started_at: None,
+                finished_at: None,
+                last_progress: None,
                 logs: VecDeque::new(),
             },
         );
@@ -157,7 +266,7 @@ impl Jobs {
             Ok(Submission::Queued(id))
         } else {
             self.slots.get_mut(&key).unwrap().active = Some(id);
-            self.queue.push_back(id);
+            self.enqueue(id);
             self.pump();
             Ok(if self.jobs[&id].state == JobState::Running {
                 Submission::Started(id)
@@ -166,20 +275,129 @@ impl Jobs {
             })
         }
     }
+    fn enqueue(&mut self, id: u64) {
+        let job = &self.jobs[&id];
+        self.queues
+            .entry(job.class)
+            .or_default()
+            .entry(job.workspace.clone())
+            .or_default()
+            .push_back(id);
+    }
+    fn cap(&self, class: JobClass) -> usize {
+        match class {
+            JobClass::Runner => self.policy.runner_slots,
+            JobClass::Control => self.policy.control_slots,
+        }
+    }
+    /// Admit queued jobs while their class has capacity. Workspaces take
+    /// turns: the next admission goes to the first workspace (in key order)
+    /// after the one served last, wrapping around.
     fn pump(&mut self) {
         if self.closing {
             return;
         }
-        while self.running < self.max_running {
-            let Some(id) = self.queue.pop_front() else {
-                return;
-            };
-            if self.jobs[&id].state != JobState::Queued {
-                continue;
+        let mut lapsed = Vec::new();
+        let now = Instant::now();
+        for class in [JobClass::Control, JobClass::Runner] {
+            let mut deferred = Vec::new();
+            while self.running.get(&class).copied().unwrap_or(0) < self.cap(class) {
+                let Some(id) = self.next_queued(class) else {
+                    break;
+                };
+                // A follower that is already gone never gets its job
+                // started: its lease lapsed while the job waited.
+                if self.lease_lapsed(id, now) {
+                    lapsed.push(id);
+                    continue;
+                }
+                // A follower that has not polled for half its lease is
+                // probably gone: hold the job (and leave the slot free)
+                // until it polls again or its lease lapses. A live `bosn
+                // run` polls every 200 ms against a 30 s lease.
+                if self.lease_stale(id, now) {
+                    deferred.push(id);
+                    continue;
+                }
+                let slot = (class == JobClass::Runner).then(|| {
+                    let index = self
+                        .runner_slots
+                        .iter()
+                        .position(Option::is_none)
+                        .expect("a runner below its cap has a free slot");
+                    self.runner_slots[index] = Some(id);
+                    index
+                });
+                let job = self.jobs.get_mut(&id).unwrap();
+                job.state = JobState::Running;
+                job.slot = slot;
+                job.started_at = Some(SystemTime::now());
+                job.last_progress = Some(Instant::now());
+                *self.running.entry(class).or_default() += 1;
+                self.started.push_back(id);
             }
-            self.jobs.get_mut(&id).unwrap().state = JobState::Running;
-            self.running += 1;
-            self.started.push_back(id);
+            for id in deferred.into_iter().rev() {
+                let workspace = self.jobs[&id].workspace.clone();
+                self.queues
+                    .entry(class)
+                    .or_default()
+                    .entry(workspace)
+                    .or_default()
+                    .push_front(id);
+            }
+        }
+        for id in lapsed {
+            let _ = self.log(
+                id,
+                "[bosn] cancelling: the client following this job stopped polling before it started"
+                    .into(),
+            );
+            // Finishing a never-started job admits the next one in turn.
+            self.finish(id, JobState::Cancelled, Some("cancelled".into()));
+        }
+    }
+    fn lease_stale(&self, id: u64, now: Instant) -> bool {
+        self.leases
+            .get(&id)
+            .is_some_and(|lease| now.saturating_duration_since(lease.seen) > lease.period / 2)
+    }
+    fn lease_lapsed(&self, id: u64, now: Instant) -> bool {
+        self.leases
+            .get(&id)
+            .is_some_and(|lease| now.saturating_duration_since(lease.seen) > lease.period)
+    }
+    /// Pop the next admissible job of `class`, round-robin by workspace.
+    /// Entries that stopped being queued (cancelled or superseded) are
+    /// dropped on the way.
+    fn next_queued(&mut self, class: JobClass) -> Option<u64> {
+        let queues = self.queues.get_mut(&class)?;
+        loop {
+            let after = self.served.get(&class);
+            let workspace = after
+                .and_then(|last| {
+                    queues
+                        .range::<String, _>((
+                            std::ops::Bound::Excluded(last),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .next()
+                })
+                .or_else(|| queues.iter().next())
+                .map(|(workspace, _)| workspace.clone())?;
+            let queue = queues.get_mut(&workspace).unwrap();
+            let id = queue.pop_front();
+            if queue.is_empty() {
+                queues.remove(&workspace);
+            }
+            let Some(id) = id else { continue };
+            if self
+                .jobs
+                .get(&id)
+                .is_some_and(|job| job.state == JobState::Queued)
+            {
+                self.served.insert(class, workspace);
+                return Some(id);
+            }
         }
     }
     /// Attach a follow lease to an unfinished job. Leasing a job again keeps
@@ -196,6 +414,14 @@ impl Jobs {
     pub fn touch(&mut self, id: u64, now: Instant) {
         if let Some(lease) = self.leases.get_mut(&id) {
             lease.seen = now;
+            // A job held back for a quiet follower may start now.
+            if self
+                .jobs
+                .get(&id)
+                .is_some_and(|job| job.state == JobState::Queued)
+            {
+                self.pump();
+            }
         }
     }
     /// Queued or running jobs whose follower has not polled within its lease.
@@ -228,8 +454,12 @@ impl Jobs {
         self.finish(id, JobState::Cancelled, Some("cancelled".into()));
         Ok(())
     }
+    /// The job without its log; read the log with [`Self::log_page`].
     pub fn job(&self, id: u64) -> Result<Job, JobError> {
-        self.jobs.get(&id).cloned().ok_or(JobError::Unknown)
+        self.jobs
+            .get(&id)
+            .map(Job::summary)
+            .ok_or(JobError::Unknown)
     }
     pub fn settle(&mut self, id: u64, ok: bool) -> Result<(), JobError> {
         self.settle_with_error(id, ok, None)
@@ -284,26 +514,110 @@ impl Jobs {
         let j = self.jobs.get_mut(&id).unwrap();
         j.state = state;
         j.error = error;
+        j.finished_at = Some(SystemTime::now());
+        let class = j.class;
+        if let Some(slot) = j.slot.take() {
+            self.runner_slots[slot] = None;
+        }
         self.leases.remove(&id);
         if was_running {
-            self.running -= 1
+            *self.running.get_mut(&class).unwrap() -= 1;
         }
         let s = self.slots.get_mut(&key).unwrap();
+        let mut promoted = None;
         if s.active == Some(id) {
             s.active = s.pending.take();
-            if let Some(next) = s.active {
-                self.queue.push_back(next)
-            }
+            promoted = s.active;
         } else if s.pending == Some(id) {
             s.pending = None
         }
+        if s.active.is_none() && s.pending.is_none() {
+            self.slots.remove(&key);
+        }
+        if let Some(next) = promoted {
+            self.enqueue(next)
+        }
+        self.finished.push_back(id);
+        self.retire_finished();
         self.pump();
+    }
+    /// Keep the newest [`RETAINED_FINISHED_JOBS`] terminal jobs (and their
+    /// logs). Older ones are forgotten once they have been finished for
+    /// [`RETAINED_FINISHED_MIN_AGE`], so a follower that polls a little late
+    /// still sees the outcome, while a long-lived daemon's memory stays
+    /// bounded.
+    fn retire_finished(&mut self) {
+        while self.finished.len() > RETAINED_FINISHED_JOBS {
+            let oldest = self.finished[0];
+            let old_enough = self.jobs[&oldest]
+                .finished_at
+                .and_then(|at| at.elapsed().ok())
+                .is_none_or(|age| age >= RETAINED_FINISHED_MIN_AGE);
+            if !old_enough {
+                break;
+            }
+            self.finished.pop_front();
+            self.jobs.remove(&oldest);
+        }
+    }
+    /// Unfinished jobs plus up to `recent` most recently finished ones, for
+    /// the `bosn jobs` accounting view.
+    pub fn snapshot(&self, recent: usize) -> Vec<Job> {
+        let mut out: Vec<Job> = self
+            .jobs
+            .values()
+            .filter(|job| !job.state.terminal())
+            .map(Job::summary)
+            .collect();
+        out.extend(
+            self.finished
+                .iter()
+                .rev()
+                .take(recent)
+                .filter_map(|id| self.jobs.get(id).map(Job::summary)),
+        );
+        out
+    }
+    /// Count of queued and running jobs per class.
+    pub fn load(&self) -> BTreeMap<JobClass, (usize, usize)> {
+        let mut load = BTreeMap::new();
+        for job in self.jobs.values() {
+            let entry: &mut (usize, usize) = load.entry(job.class).or_default();
+            match job.state {
+                JobState::Queued => entry.0 += 1,
+                JobState::Running | JobState::Cancelling => entry.1 += 1,
+                _ => {}
+            }
+        }
+        load
+    }
+    /// Running jobs (not already cancelling) whose last progress is older
+    /// than `after`. `activity` may report a later progress instant from
+    /// outside the log stream, such as Docker traffic.
+    pub fn stalled(
+        &self,
+        now: Instant,
+        after: Duration,
+        activity: impl Fn(u64) -> Option<Instant>,
+    ) -> Vec<u64> {
+        self.jobs
+            .values()
+            .filter(|job| job.state == JobState::Running && job.class == JobClass::Runner)
+            .filter(|job| {
+                let last = job.last_progress.into_iter().chain(activity(job.id)).max();
+                last.is_some_and(|last| now.saturating_duration_since(last) > after)
+            })
+            .map(|job| job.id)
+            .collect()
     }
     pub fn log(&mut self, id: u64, line: String) -> Result<u64, JobError> {
         if line.len() > MAX_LOG_LINE_BYTES {
             return Err(JobError::LogTooLarge);
         }
         let j = self.jobs.get_mut(&id).ok_or(JobError::Unknown)?;
+        if !j.state.terminal() {
+            j.last_progress = Some(Instant::now());
+        }
         let cursor = j.log_start + j.logs.len() as u64;
         j.logs.push_back((cursor, line));
         if j.logs.len() > self.max_logs {
@@ -363,14 +677,20 @@ impl Jobs {
 impl Default for Jobs {
     fn default() -> Self {
         Self {
-            max_running: 1,
+            policy: SchedulerPolicy {
+                runner_slots: 1,
+                control_slots: 1,
+            },
             max_logs: DEFAULT_MAX_LOG_RECORDS,
             next: 1,
-            running: 0,
+            running: BTreeMap::new(),
             closing: false,
             jobs: BTreeMap::new(),
             slots: BTreeMap::new(),
-            queue: VecDeque::new(),
+            queues: BTreeMap::new(),
+            served: BTreeMap::new(),
+            runner_slots: vec![None],
+            finished: VecDeque::new(),
             started: VecDeque::new(),
             leases: BTreeMap::new(),
         }
@@ -378,136 +698,4 @@ impl Default for Jobs {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn joins_supersedes_and_never_rejoins_a_cancelling_active_job() {
-        let mut jobs = Jobs::new(1);
-        assert_eq!(jobs.submit("w", "s", "a").unwrap(), Submission::Started(1));
-        assert_eq!(jobs.submit("w", "s", "a").unwrap(), Submission::Joined(1));
-        assert_eq!(jobs.submit("w", "s", "b").unwrap(), Submission::Queued(2));
-        assert_eq!(jobs.submit("w", "s", "c").unwrap(), Submission::Queued(3));
-        assert_eq!(jobs.jobs[&2].state, JobState::Superseded);
-        jobs.cancel(1).unwrap();
-        assert_eq!(jobs.submit("w", "s", "a").unwrap(), Submission::Queued(4));
-        jobs.settle(1, false).unwrap();
-        assert_eq!(jobs.jobs[&4].state, JobState::Running);
-    }
-
-    #[test]
-    fn cap_cursors_and_shutdown_are_bounded() {
-        let mut jobs = Jobs::new(1);
-        let first = match jobs.submit("a", "s", "x").unwrap() {
-            Submission::Started(id) => id,
-            _ => unreachable!(),
-        };
-        let second = match jobs.submit("b", "s", "x").unwrap() {
-            Submission::Queued(id) => id,
-            _ => unreachable!(),
-        };
-        assert_eq!(jobs.jobs[&second].state, JobState::Queued);
-        jobs.max_logs = 2;
-        jobs.log(first, "one".into()).unwrap();
-        jobs.log(first, "two".into()).unwrap();
-        jobs.log(first, "three".into()).unwrap();
-        let (start, records) = jobs.logs(first, 0).unwrap();
-        assert_eq!(start, 1);
-        assert_eq!(records, vec![(1, "two".into()), (2, "three".into())]);
-        jobs.shutdown();
-        assert_eq!(jobs.jobs[&second].state, JobState::Cancelled);
-        assert!(matches!(jobs.submit("c", "s", "x"), Err(JobError::Closing)));
-    }
-    #[test]
-    fn log_page_reports_eviction_gap_and_bounded_next_cursor() {
-        let mut jobs = Jobs::new(1);
-        let id = match jobs.submit("w", "s", "d").unwrap() {
-            Submission::Started(id) => id,
-            _ => unreachable!(),
-        };
-        jobs.max_logs = 2;
-        for line in ["a", "b", "c"] {
-            jobs.log(id, line.into()).unwrap();
-        }
-        let page = jobs.log_page(id, 0, 1).unwrap();
-        assert!(page.gap);
-        assert_eq!(page.retained_from, 1);
-        assert_eq!(page.records, vec![(1, "b".into())]);
-        assert_eq!(page.next, 2);
-    }
-
-    #[test]
-    fn a_follow_lease_expires_for_queued_and_running_jobs_until_polled() {
-        let mut jobs = Jobs::new(1);
-        let start = Instant::now();
-        let lease = Duration::from_secs(30);
-        let running = match jobs.submit("a", "s", "x").unwrap() {
-            Submission::Started(id) => id,
-            other => panic!("{other:?}"),
-        };
-        let queued = match jobs.submit("b", "s", "x").unwrap() {
-            Submission::Queued(id) => id,
-            other => panic!("{other:?}"),
-        };
-        let unleased = match jobs.submit("c", "s", "x").unwrap() {
-            Submission::Queued(id) => id,
-            other => panic!("{other:?}"),
-        };
-        jobs.lease(running, lease, start);
-        jobs.lease(queued, lease, start);
-        assert!(jobs.expired_leases(start + lease).is_empty(), "not yet");
-
-        // Polling one job renews only that job's lease.
-        jobs.touch(running, start + Duration::from_secs(20));
-        let later = start + Duration::from_secs(31);
-        assert_eq!(jobs.expired_leases(later), vec![queued]);
-        let much_later = start + Duration::from_secs(51);
-        assert_eq!(jobs.expired_leases(much_later), vec![running, queued]);
-        assert!(!jobs.expired_leases(much_later).contains(&unleased));
-
-        // A queued job that expires is cancelled before it ever starts.
-        jobs.cancel(queued).unwrap();
-        assert_eq!(jobs.jobs[&queued].state, JobState::Cancelled);
-        // A running one is left to its executor once it is cancelling.
-        jobs.cancel(running).unwrap();
-        assert!(jobs.expired_leases(much_later).is_empty());
-        jobs.settle(running, false).unwrap();
-        assert!(jobs.leases.is_empty(), "finished jobs forget their lease");
-
-        // The slot passes to the unleased job, which never expires.
-        assert_eq!(jobs.jobs[&unleased].state, JobState::Running);
-        assert!(
-            jobs.expired_leases(start + Duration::from_secs(3600))
-                .is_empty()
-        );
-
-        // A second follower can only shorten a lease; a finished job cannot
-        // be leased again.
-        let next = match jobs.submit("d", "s", "x").unwrap() {
-            Submission::Queued(id) => id,
-            other => panic!("{other:?}"),
-        };
-        jobs.lease(next, lease, start);
-        jobs.lease(next, Duration::from_secs(5), start);
-        assert_eq!(
-            jobs.expired_leases(start + Duration::from_secs(6)),
-            vec![next]
-        );
-        jobs.cancel(next).unwrap();
-        jobs.lease(next, lease, start);
-        assert!(jobs.leases.is_empty());
-    }
-
-    #[test]
-    fn log_records_are_bounded_before_they_can_exceed_the_ipc_frame() {
-        let mut jobs = Jobs::new(1);
-        let id = match jobs.submit("w", "s", "d").unwrap() {
-            Submission::Started(id) => id,
-            _ => unreachable!(),
-        };
-        assert!(matches!(
-            jobs.log(id, "x".repeat(MAX_LOG_LINE_BYTES + 1)),
-            Err(JobError::LogTooLarge)
-        ));
-    }
-}
+mod tests;

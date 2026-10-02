@@ -365,6 +365,7 @@ fn stdio_initialize_lists_tools_and_calls_status() {
         names,
         [
             "bosn_status",
+            "bosn_jobs",
             "bosn_doctor",
             "bosn_registry_resources",
             "bosn_setup_ensure_events",

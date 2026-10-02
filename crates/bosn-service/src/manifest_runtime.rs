@@ -283,6 +283,7 @@ pub(crate) fn parse_manifest_tmpfs_size(value: &str) -> Result<SetupTmpfsSize, S
 /// outside Bosn supervision; that is the manifest author's declared choice.
 pub(crate) fn manifest_host_docker_socket(
     mount: &bosn_core::manifest::Mount,
+    proxy_dir: Option<String>,
 ) -> Result<Option<SetupHostDockerSocket>, String> {
     let Some(source) = SetupHostDockerSocketSource::from_host_path(&mount.source) else {
         return Ok(None);
@@ -295,6 +296,7 @@ pub(crate) fn manifest_host_docker_socket(
         source,
         target: mount.destination.clone(),
         readonly: mount.readonly,
+        proxy_dir,
     }))
 }
 
@@ -540,6 +542,12 @@ pub(crate) fn manifest_runtime_generation(
         manifest_generation_field(&mut hasher, socket.source.host_path().as_bytes());
         manifest_generation_field(&mut hasher, socket.target.as_bytes());
         manifest_generation_field(&mut hasher, if socket.readonly { b"1" } else { b"0" });
+        // Hashed only when present, so a daemon without the proxy keeps the
+        // generation (and container) it had before #358.
+        if let Some(dir) = &socket.proxy_dir {
+            manifest_generation_field(&mut hasher, b"docker-proxy-dir:v1");
+            manifest_generation_field(&mut hasher, dir.as_bytes());
+        }
     }
     match macos_guest {
         None => {
