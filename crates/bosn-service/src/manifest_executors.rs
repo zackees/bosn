@@ -380,6 +380,10 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                 ))
                 .await
                 .map_err(|_| "manifest app task log consumer closed".to_owned())?;
+                // A retired generation's daemons share this stack's volumes
+                // (#383): stop the idle ones before this task uses them.
+                let workspace = plan.workspace_root.to_string_lossy();
+                stop_retired_generations(session, &workspace, &request.stack, logs).await?;
                 session
                     .begin(manifest_app_task_session_container_identity(&observed))
                     .await
@@ -415,6 +419,8 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                     .finish(outcome)
                     .await
                     .map_err(|_| "manifest app task completion recording unavailable".to_owned())?;
+                // The last task to leave a retired container stops it.
+                stop_retired_generations(session, &workspace, &request.stack, logs).await?;
                 match result {
                     Ok(value) => Ok(format!(
                         "completed declared manifest task {} in managed container {} with image {}",
@@ -444,6 +450,20 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                 .map_err(|text| error_masker.mask_text(&text))
         })
     }
+}
+
+async fn stop_retired_generations(
+    session: &dyn ManifestAppTaskSessionRecorder,
+    workspace: &str,
+    stack: &str,
+    logs: &async_engine::Sender<String>,
+) -> Result<(), String> {
+    for line in session.stop_retired_generations(workspace, stack).await {
+        logs.send(line)
+            .await
+            .map_err(|_| "manifest app task log consumer closed".to_owned())?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]

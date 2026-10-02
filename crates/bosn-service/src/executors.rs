@@ -243,6 +243,16 @@ pub trait ManifestAppTaskSessionRecorder: Send + Sync {
     fn run_context(&self) -> Option<&RunContext> {
         None
     }
+    /// Stop the retired generations of `stack` in `workspace` that no task
+    /// runs in (#383), returning one log line per container acted on. Test
+    /// recorders own no containers.
+    fn stop_retired_generations<'a>(
+        &'a self,
+        _workspace: &'a str,
+        _stack: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + 'a>> {
+        Box::pin(async { Vec::new() })
+    }
 }
 
 /// What a running task job holds; see [`runners`].
