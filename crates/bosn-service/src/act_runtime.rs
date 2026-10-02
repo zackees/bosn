@@ -2121,7 +2121,7 @@ if filter.startswith('name=^/bosn-act-'):
  with sqlite3.connect(db) as conn:
   record=json.loads(conn.execute('SELECT detail FROM events WHERE kind=? ORDER BY id DESC LIMIT 1',('act.engine.v1:'+run,)).fetchone()[0])
  assert record['state']=='cleanup_required' and record['outcome']=='interrupted'
- assert record['execution']!='passed' 
+ assert record['execution']!='passed'
 with open(log,'a') as f:f.write(json.dumps(args)+'\n')
 assert args[:4]==['container','ls','--all','--no-trunc']
 if mode=='failed-list':sys.exit(7)
