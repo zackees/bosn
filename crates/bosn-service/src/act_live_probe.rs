@@ -294,6 +294,57 @@ fn nested_receipt(
     }
     receipt
 }
+fn failed_pinned_runner(receipt: &Value) -> bool {
+    let v = &receipt["inspection"][0];
+    v["Image"] == RUNNER
+        && v["ImageManifestDescriptor"]["digest"] == RUNNER
+        && v["State"]["ExitCode"] == 127
+        && v["State"]["Error"]
+            .as_str()
+            .is_some_and(|e| e.contains("exec: \"tail\": executable file not found"))
+}
+async fn capture_tail_archives(
+    engine: &DockerEngine,
+    outer: &str,
+    id: &str,
+    directory: &Path,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    private_dir(directory)?;
+    for (label, path) in [("usr-bin-tail", "/usr/bin/tail"), ("bin-tail", "/bin/tail")] {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let source = format!("{id}:{path}");
+        let result = engine
+            .with_args(["exec", outer, "docker", "cp", &source, "-"])
+            .capture_async(RunOptions::bounded(
+                remaining.min(Duration::from_secs(2)),
+                1 << 20,
+            ))
+            .await;
+        let mut receipt = json!({"source":"private failed-runner docker cp tar stream; diagnostic only","unix_seconds":at(),"nested_id":id,"container_path":path,"byte_ceiling":1<<20});
+        match result {
+            Ok(output) => {
+                receipt["command_exit"] = json!(output.exit_code);
+                receipt["stderr"] = json!(String::from_utf8_lossy(&output.stderr));
+                receipt["bytes"] = json!(output.stdout.len());
+                receipt["sha256"] = json!(digest(&output.stdout));
+                retain(&directory.join(format!("{label}.tar")), &output.stdout)?;
+                if output.exit_code != 0 {
+                    receipt["observer_error"] = json!("private docker cp failed");
+                }
+            }
+            Err(e) => receipt["observer_error"] = json!(e.to_string()),
+        }
+        retain(
+            &directory.join(format!("{label}.json")),
+            &serde_json::to_vec_pretty(&receipt)?,
+        )?;
+    }
+    Ok(())
+}
 async fn sample_nested(
     engine: &DockerEngine,
     outer: &str,
@@ -351,6 +402,7 @@ async fn sample_nested(
             return Ok(());
         }
     };
+    let mut tail_captured = false;
     for (id, state) in rows {
         if Instant::now() >= deadline {
             break;
@@ -375,6 +427,17 @@ async fn sample_nested(
             &samples.join(format!("nested-{:02}.json", seen.len())),
             &serde_json::to_vec_pretty(&receipt)?,
         )?;
+        if !tail_captured && failed_pinned_runner(&receipt) && Instant::now() < deadline {
+            capture_tail_archives(
+                engine,
+                outer,
+                &id,
+                &samples.join(format!("nested-{:02}-tail", seen.len())),
+                deadline,
+            )
+            .await?;
+            tail_captured = true;
+        }
         seen.insert((id, state));
     }
     Ok(())
@@ -1315,4 +1378,99 @@ fn nested_diagnostic_fake_transport_retains_once_per_state_without_docker() {
             assert!(root.join("nested-01.json").exists());
             assert!(!root.join("nested-02.json").exists());
         });
+}
+
+#[test]
+fn tail_archive_fake_transport_checks_exact_paths_and_preserves_binary_tar() {
+    let root = std::env::temp_dir().join(format!(
+        "bosn-tail-diagnostic-fixture-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    private_dir(&root).unwrap();
+    let id = "d".repeat(64);
+    let script = format!(
+        "[ \"$1\" = exec ] && [ \"$2\" = owned-outer ] && [ \"$3\" = docker ] && [ \"$4\" = cp ] && [ \"$6\" = - ] || exit 94; case \"$5\" in {id}:/usr/bin/tail|{id}:/bin/tail) /usr/bin/tar --format=ustar -cf - -T /dev/null;; *) exit 95;; esac"
+    );
+    let engine = DockerEngine::synthetic_for_test("/bin/sh", ["-c", &script, "fixture"]);
+    async_engine::RuntimeBuilder::multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .run(async {
+            capture_tail_archives(
+                &engine,
+                "owned-outer",
+                &id,
+                &root.join("archives"),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        });
+    for label in ["usr-bin-tail", "bin-tail"] {
+        let bytes =
+            bounded_file(&root.join("archives").join(format!("{label}.tar")), 1 << 20).unwrap();
+        assert!(bytes.len() >= 1024 && bytes.iter().all(|b| *b == 0));
+        let receipt: Value = serde_json::from_slice(
+            &bounded_file(&root.join("archives").join(format!("{label}.json")), 4096).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["command_exit"], 0);
+        assert_eq!(receipt["sha256"], digest(&bytes));
+        assert_eq!(receipt["bytes"], bytes.len());
+        assert!(receipt.get("execution_success").is_none());
+    }
+    async_engine::RuntimeBuilder::multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .run(async {
+            let failed = DockerEngine::synthetic_for_test(
+                "/bin/sh",
+                ["-c", "printf missing >&2; exit 17", "fixture"],
+            );
+            capture_tail_archives(
+                &failed,
+                "owned-outer",
+                &id,
+                &root.join("failed"),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            let receipt: Value = serde_json::from_slice(
+                &bounded_file(&root.join("failed/usr-bin-tail.json"), 4096).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(receipt["command_exit"], 17);
+            assert!(receipt.get("observer_error").is_some());
+            assert!(receipt.get("execution_success").is_none());
+            let forbidden = DockerEngine::synthetic_for_test(
+                "/nonexistent-do-not-spawn",
+                std::iter::empty::<String>(),
+            );
+            capture_tail_archives(
+                &forbidden,
+                "owned-outer",
+                &id,
+                &root.join("exhausted"),
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                std::fs::read_dir(root.join("exhausted")).unwrap().count(),
+                0
+            );
+        });
+    let good = json!({"inspection":[{"Image":RUNNER,"ImageManifestDescriptor":{"digest":RUNNER},"State":{"ExitCode":127,"Error":"exec: \"tail\": executable file not found in $PATH"}}]});
+    assert!(failed_pinned_runner(&good));
+    for field in ["Image", "ImageManifestDescriptor", "State"] {
+        let mut foreign = good.clone();
+        foreign["inspection"][0][field] = json!(null);
+        assert!(!failed_pinned_runner(&foreign));
+    }
 }
