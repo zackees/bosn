@@ -4,7 +4,9 @@
 //! never resized, because a resize after the first frame is not applied on
 //! KDE Plasma Wayland (zackees/kernal-api#390).
 
-use kernal_api::webview::{BestEffort, WebviewWindowOptions, WebviewWindowSupport, WindowOptionsError};
+use kernal_api::webview::{
+    BestEffort, WebviewWindowOptions, WebviewWindowSupport, WindowOptionsError,
+};
 
 /// The application id every widget window carries: the Wayland
 /// `xdg_toplevel` app id a KWin window rule matches (`docs/ci.md`).
@@ -61,7 +63,10 @@ impl Window {
 
     /// The validated presentation for this window on a display with
     /// `support`.
-    pub fn options(self, support: WebviewWindowSupport) -> Result<WebviewWindowOptions, WindowOptionsError> {
+    pub fn options(
+        self,
+        support: WebviewWindowSupport,
+    ) -> Result<WebviewWindowOptions, WindowOptionsError> {
         let (width, height) = self.size();
         let options = WebviewWindowOptions::new(self.title(), width, height)?;
         match self {
@@ -125,9 +130,13 @@ mod tests {
 
     #[test]
     fn the_bubble_asks_for_a_position_only_where_the_display_honours_one() {
-        let requested = Window::Bubble.options(support(BestEffort::Requested)).unwrap();
+        let requested = Window::Bubble
+            .options(support(BestEffort::Requested))
+            .unwrap();
         assert_eq!(requested.logical_position(), Some(BUBBLE_FALLBACK_POSITION));
-        let wayland = Window::Bubble.options(support(BestEffort::Unsupported)).unwrap();
+        let wayland = Window::Bubble
+            .options(support(BestEffort::Unsupported))
+            .unwrap();
         assert_eq!(wayland.logical_position(), None);
     }
 

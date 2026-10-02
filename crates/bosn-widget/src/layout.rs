@@ -131,7 +131,9 @@ impl Layout {
 
 /// Open a window on its fixed page.
 fn open_page(window: Window) -> Step {
-    let path = window.page().expect("the bubble and panel have fixed pages");
+    let path = window
+        .page()
+        .expect("the bubble and panel have fixed pages");
     Step::Open {
         window,
         path: path.into(),
@@ -152,25 +154,32 @@ mod tests {
     }
 
     fn opens(steps: &[Step]) -> usize {
-        steps.iter().filter(|step| matches!(step, Step::Open { .. })).count()
+        steps
+            .iter()
+            .filter(|step| matches!(step, Step::Open { .. }))
+            .count()
     }
 
     #[test]
     fn the_first_toggle_opens_the_panel_then_toggles_hide_and_show() {
         let mut layout = Layout::default();
-        assert_eq!(apply(&mut layout, WidgetCommand::Toggle), vec![Step::Open {
-            window: Window::Panel,
-            path: "/widget/panel".into()
-        }]);
+        assert_eq!(
+            apply(&mut layout, WidgetCommand::Toggle),
+            vec![Step::Open {
+                window: Window::Panel,
+                path: "/widget/panel".into()
+            }]
+        );
         assert_eq!(layout.presence(Window::Panel), Presence::Shown);
-        assert_eq!(apply(&mut layout, WidgetCommand::Toggle), vec![Step::Hide(
-            Window::Panel
-        )]);
+        assert_eq!(
+            apply(&mut layout, WidgetCommand::Toggle),
+            vec![Step::Hide(Window::Panel)]
+        );
         assert_eq!(layout.presence(Window::Panel), Presence::Hidden);
-        assert_eq!(apply(&mut layout, WidgetCommand::Toggle), vec![
-            Step::Show(Window::Panel),
-            Step::Focus(Window::Panel)
-        ]);
+        assert_eq!(
+            apply(&mut layout, WidgetCommand::Toggle),
+            vec![Step::Show(Window::Panel), Step::Focus(Window::Panel)]
+        );
         assert_eq!(layout.presence(Window::Panel), Presence::Shown);
     }
 
@@ -198,20 +207,29 @@ mod tests {
     #[test]
     fn repeated_opens_reuse_one_full_view() {
         let mut layout = Layout::default();
-        let first = apply(&mut layout, WidgetCommand::Open {
-            path: "/ci/runs/a".into(),
-        });
-        assert_eq!(first, vec![Step::Open {
-            window: Window::Full,
-            path: "/ci/runs/a".into()
-        }]);
+        let first = apply(
+            &mut layout,
+            WidgetCommand::Open {
+                path: "/ci/runs/a".into(),
+            },
+        );
+        assert_eq!(
+            first,
+            vec![Step::Open {
+                window: Window::Full,
+                path: "/ci/runs/a".into()
+            }]
+        );
         for run in ["b", "c", "d"] {
             let path = format!("/ci/runs/{run}");
-            assert_eq!(apply(&mut layout, WidgetCommand::Open { path: path.clone() }), vec![
-                Step::Navigate { path },
-                Step::Show(Window::Full),
-                Step::Focus(Window::Full),
-            ]);
+            assert_eq!(
+                apply(&mut layout, WidgetCommand::Open { path: path.clone() }),
+                vec![
+                    Step::Navigate { path },
+                    Step::Show(Window::Full),
+                    Step::Focus(Window::Full),
+                ]
+            );
         }
         assert_eq!(layout.presence(Window::Full), Presence::Shown);
     }
@@ -221,10 +239,10 @@ mod tests {
         let mut layout = Layout::default();
         assert_eq!(opens(&apply(&mut layout, WidgetCommand::Show)), 1);
         for _ in 0..3 {
-            assert_eq!(apply(&mut layout, WidgetCommand::Show), vec![
-                Step::Show(Window::Bubble),
-                Step::Focus(Window::Bubble)
-            ]);
+            assert_eq!(
+                apply(&mut layout, WidgetCommand::Show),
+                vec![Step::Show(Window::Bubble), Step::Focus(Window::Bubble)]
+            );
         }
     }
 
@@ -246,7 +264,10 @@ mod tests {
         let mut layout = Layout::default();
         let url = "https://github.com/zackees/bosn".to_string();
         assert_eq!(
-            apply(&mut layout, WidgetCommand::OpenExternal { url: url.clone() }),
+            apply(
+                &mut layout,
+                WidgetCommand::OpenExternal { url: url.clone() }
+            ),
             vec![Step::External { url }]
         );
         assert_eq!(layout, Layout::default());

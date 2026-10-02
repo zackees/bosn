@@ -12,6 +12,9 @@ CHECKS: list[list[str]] = [
     ["ruff", "format", "--check", "."],
     ["ruff", "check", "."],
     ["pyright"],
+    # rustfmt: the workspace, and every crate it excludes (tests/test_rustfmt_coverage.py).
+    ["soldr", "cargo", "fmt", "--all", "--check"],
+    ["soldr", "cargo", "fmt", "--check", "--manifest-path", "crates/bosn-widget/Cargo.toml"],
     # Ctrl-C correctness: ruff's BLE001 flags blind excepts but cannot see the *missing*
     # KeyboardInterrupt sibling handler, which is the actual defect.
     [sys.executable, str(ROOT / "ci" / "lint_kbi.py")],

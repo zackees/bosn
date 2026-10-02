@@ -51,6 +51,7 @@ LANES: dict[str, list[list[str]]] = {
     ],
     "rust": [
         ["soldr", "cargo", "fmt", "--all", "--check"],
+        ["soldr", "cargo", "fmt", "--check", "--manifest-path", "crates/bosn-widget/Cargo.toml"],
         [
             "soldr",
             "cargo",
