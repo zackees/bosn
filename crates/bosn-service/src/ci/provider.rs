@@ -13,6 +13,8 @@ use std::path::{Component, Path};
 
 use serde_json::{Value, json};
 
+use super::snapshot::{BaseRef, DEFAULT_BASE_BRANCH};
+
 vocabulary!(
     /// The CI syntax: GitHub workflows now, `.gitlab-ci.yml` later.
     Provider, "provider" { Github => "github", Gitlab => "gitlab" }
@@ -144,11 +146,14 @@ pub fn validate(trigger: Trigger, mode: Mode, dirty: bool) -> Result<(), String>
 }
 
 /// The provider event name and payload act receives through `--eventpath`.
+/// A pull request names its `base` branch and commit when the snapshot
+/// carries one (#403), else only the default branch name.
 pub fn github_event(
     trigger: Trigger,
     mode: Mode,
     sha: &str,
     branch: Option<&str>,
+    base: Option<&BaseRef>,
     repository: &str,
     pr_number: u64,
 ) -> (&'static str, Value) {
@@ -156,6 +161,10 @@ pub fn github_event(
     let repo = json!({"full_name": repository, "name": repository.rsplit('/').next()});
     match trigger {
         Trigger::Pr => {
+            let base = match base {
+                Some(base) => json!({"ref": base.branch, "sha": base.sha, "repo": repo}),
+                None => json!({"ref": DEFAULT_BASE_BRANCH, "repo": repo}),
+            };
             let labels: Vec<Value> = match mode {
                 Mode::Minimal => vec![],
                 Mode::Test => vec![json!({"name": "ci-test"})],
@@ -170,7 +179,7 @@ pub fn github_event(
                     "pull_request": {
                         "number": pr_number,
                         "head": {"sha": sha, "ref": branch, "repo": repo},
-                        "base": {"ref": "main", "repo": repo},
+                        "base": base,
                         "labels": labels,
                     },
                 }),
@@ -266,23 +275,43 @@ mod tests {
     #[test]
     fn trigger_mapping_golden() {
         let sha = "a".repeat(40);
-        let (event, payload) = github_event(Trigger::Pr, Mode::Test, &sha, Some("feat"), "o/r", 7);
+        let (event, payload) =
+            github_event(Trigger::Pr, Mode::Test, &sha, Some("feat"), None, "o/r", 7);
         assert_eq!(event, "pull_request");
         assert_eq!(payload["pull_request"]["labels"][0]["name"], "ci-test");
         assert_eq!(payload["pull_request"]["head"]["sha"], sha.as_str());
         // A local PR is from this repository to itself.
         assert_eq!(payload["pull_request"]["head"]["repo"]["full_name"], "o/r");
         assert_eq!(payload["pull_request"]["base"]["repo"]["full_name"], "o/r");
-        let (_, full) = github_event(Trigger::Pr, Mode::Full, &sha, None, "o/r", 7);
+        assert_eq!(payload["pull_request"]["base"]["ref"], "main");
+        assert!(payload["pull_request"]["base"].get("sha").is_none());
+        // #403: the base the snapshot carries is the one the payload names.
+        let base = BaseRef {
+            branch: "trunk".into(),
+            sha: "b".repeat(40),
+        };
+        let (_, based) = github_event(Trigger::Pr, Mode::Test, &sha, None, Some(&base), "o/r", 7);
+        assert_eq!(based["pull_request"]["base"]["ref"], "trunk");
+        assert_eq!(based["pull_request"]["base"]["sha"], base.sha.as_str());
+        let (_, full) = github_event(Trigger::Pr, Mode::Full, &sha, None, None, "o/r", 7);
         assert_eq!(full["pull_request"]["labels"][0]["name"], "ci-full");
-        let (_, minimal) = github_event(Trigger::Pr, Mode::Minimal, &sha, None, "o/r", 7);
+        let (_, minimal) = github_event(Trigger::Pr, Mode::Minimal, &sha, None, None, "o/r", 7);
         assert_eq!(minimal["pull_request"]["labels"], json!([]));
-        let (event, push) = github_event(Trigger::Push, Mode::Minimal, &sha, Some("dev"), "o/r", 0);
+        let (event, push) = github_event(
+            Trigger::Push,
+            Mode::Minimal,
+            &sha,
+            Some("dev"),
+            None,
+            "o/r",
+            0,
+        );
         assert_eq!(
             (event, push["ref"].as_str()),
             ("push", Some("refs/heads/dev"))
         );
-        let (event, release) = github_event(Trigger::Release, Mode::Full, &sha, None, "o/r", 0);
+        let (event, release) =
+            github_event(Trigger::Release, Mode::Full, &sha, None, None, "o/r", 0);
         assert_eq!(event, "workflow_dispatch");
         assert_eq!(release["inputs"]["commit_sha"], sha.as_str());
     }

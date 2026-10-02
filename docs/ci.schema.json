@@ -1,5 +1,24 @@
 {
   "$defs": {
+    "BaseRef": {
+      "additionalProperties": false,
+      "description": "The branch a local pull request targets, at its commit in the workspace.",
+      "properties": {
+        "branch": {
+          "description": "`pull_request.base.ref`, e.g. `main`.",
+          "type": "string"
+        },
+        "sha": {
+          "description": "`pull_request.base.sha`: the branch's commit when the run was taken.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "branch",
+        "sha"
+      ],
+      "type": "object"
+    },
     "CacheUsage": {
       "description": "The machine-wide cache volume (act tools, runner image, action\ncheckouts and the per-repository `actions/cache` store).",
       "properties": {
@@ -1531,6 +1550,18 @@
       "properties": {
         "actor": {
           "type": "string"
+        },
+        "base": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BaseRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The base branch a `pr` run's snapshot carries as `origin/<branch>`;\nthe event payload names it (#403)."
         },
         "branch": {
           "type": [

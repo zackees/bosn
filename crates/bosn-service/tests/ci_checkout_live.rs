@@ -5,6 +5,8 @@
 //! of testing the wrong code. A detached `HEAD` gives jobs a real repository
 //! (#393), and a dirty tree is checked out as a synthetic commit, so a
 //! workflow that cleans its tree still builds the uncommitted work (#394).
+//! A `--trigger pr` run carries the base branch as `origin/main`, with
+//! enough history for `git merge-base origin/main HEAD` (#403).
 //! Run with `cargo test -p bosn-service --test ci_checkout_live -- --ignored`.
 
 use std::{path::Path, process::Command};
@@ -54,6 +56,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: someone/elsewhere
+  merge-base:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -eux
+          test "$(git rev-parse origin/main)" = "$BASE_SHA"
+          test "$(git merge-base origin/main HEAD)" = "$(cat expected-merge-base.txt)"
 "#;
 
 fn git(dir: &Path, args: &[&str]) {
@@ -191,4 +205,39 @@ fn checkout_with_a_ref_sees_uncommitted_work_pinned_repos_need_no_token_others_f
     );
     assert_eq!(pinned["conclusion"], "success", "{pinned}");
     assert_eq!(other["conclusion"], "failure", "{other}");
+}
+
+/// #403: a PR run sees `origin/main` at the base commit, and the merge base
+/// of it and `HEAD`, though `main` moved on after the branch was cut.
+#[test]
+#[ignore = "needs Docker"]
+fn a_pr_run_carries_origin_main_and_the_history_to_the_merge_base() {
+    let fixture = Fixture::new();
+    let merge_base = fixture.head();
+    git(&fixture.repo, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(
+        fixture.repo.join("expected-merge-base.txt"),
+        format!("{merge_base}\n"),
+    )
+    .unwrap();
+    git(&fixture.repo, &["add", "-A"]);
+    git(&fixture.repo, &["commit", "-qm", "feature 1"]);
+    git(
+        &fixture.repo,
+        &["commit", "-q", "--allow-empty", "-m", "feature 2"],
+    );
+    git(&fixture.repo, &["checkout", "-q", "main"]);
+    git(
+        &fixture.repo,
+        &["commit", "-q", "--allow-empty", "-m", "main moved"],
+    );
+    git(
+        &fixture.repo,
+        &["update-ref", "refs/remotes/origin/main", "main"],
+    );
+    git(&fixture.repo, &["checkout", "-q", "feature"]);
+    git(&fixture.repo, &["branch", "-q", "-D", "main"]);
+    let pr = fixture.run("merge-base", "pr");
+    fixture.stop();
+    assert_eq!(pr["conclusion"], "success", "{pr}");
 }

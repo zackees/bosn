@@ -105,6 +105,7 @@ fn fake_record() -> crate::ci::RunRecord {
         tree_digest: "d".repeat(64),
         dirty: false,
         commit: None,
+        base: None,
         origin: None,
         pr_number: None,
         timeout_secs: None,

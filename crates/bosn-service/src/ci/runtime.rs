@@ -308,6 +308,7 @@ impl CiRuntime {
                 request.mode,
                 request.commit.as_deref().unwrap_or(&request.sha),
                 request.branch.as_deref(),
+                request.base.as_ref(),
                 &provider::repository(request.origin.as_deref()),
                 request.pr_number.unwrap_or(1),
             );
