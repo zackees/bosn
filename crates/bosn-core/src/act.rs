@@ -5,7 +5,7 @@
 //! proof that dynamic workflow conditions or the actual Act graph matched.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const ACT_ADAPTER_SCHEMA: u32 = 1;
@@ -420,7 +420,7 @@ pub fn resolve_act_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     pub(super) fn adapter_document() -> Value {
         json!({

@@ -7,7 +7,9 @@ use crate::{
     act_registry::{ActRegistryCommand, ActRegistryReply},
 };
 use bosn_engine::{DockerEngine, RunOptions};
-use bosn_registry::act::{ActEngineIntent, ActEngineObservation};
+use bosn_registry::act::{
+    ActEngineCreationProfile, ActEngineIntent, ActEngineObservation, ActEngineTmpfsPolicy,
+};
 use serde_json::Value;
 use std::{collections::BTreeMap, fmt};
 
@@ -289,6 +291,58 @@ impl ActEngineLimits {
     }
 }
 
+pub(crate) fn command_digest(command: &[String]) -> Result<String, ActEngineError> {
+    if command.is_empty()
+        || command.len() > 64
+        || command.iter().any(|part| part.contains('\0'))
+        || command.iter().map(String::len).sum::<usize>() > 65536
+    {
+        return Err(ActEngineError("unbounded engine command identity".into()));
+    }
+    let mut bytes = b"bosn-act-init-command/v1\0".to_vec();
+    bytes.extend(serde_json::to_vec(command).map_err(|error| ActEngineError(error.to_string()))?);
+    Ok(kernal_api::hash::Sha256Hasher::digest(&bytes).to_string())
+}
+
+/// Freeze creation inputs before the registry intent commits. Recovery reads
+/// this profile rather than guessing the limits or command of the current build.
+pub(crate) fn creation_profile(
+    limits: ActEngineLimits,
+) -> Result<ActEngineCreationProfile, ActEngineError> {
+    limits.validate()?;
+    let profile = ActEngineCreationProfile {
+        memory_bytes: limits.memory_bytes,
+        storage_bytes: limits.storage_bytes,
+        nano_cpus: limits.nano_cpus,
+        pids: limits.pids,
+        run_tmpfs_bytes: 16 << 20,
+        tmp_tmpfs_bytes: 64 << 20,
+        tmpfs_policy: ActEngineTmpfsPolicy::StorageExecRunTmpNoexecV1,
+        init_command_sha256: command_digest(&engine_command())?,
+    };
+    profile
+        .validate()
+        .map_err(|error| ActEngineError(error.to_string()))?;
+    Ok(profile)
+}
+
+pub(crate) fn frozen_limits(intent: &ActEngineIntent) -> Result<ActEngineLimits, ActEngineError> {
+    let profile = intent.creation_profile.as_ref().ok_or_else(|| {
+        ActEngineError("legacy engine has no frozen creation profile; execution is refused".into())
+    })?;
+    profile
+        .validate()
+        .map_err(|error| ActEngineError(error.to_string()))?;
+    let limits = ActEngineLimits {
+        memory_bytes: profile.memory_bytes,
+        storage_bytes: profile.storage_bytes,
+        nano_cpus: profile.nano_cpus,
+        pids: profile.pids,
+    };
+    limits.validate()?;
+    Ok(limits)
+}
+
 /// Only the trusted daemon may use these arguments, after its intent commits.
 /// No source directory, host socket, credentials or anonymous volume is bound.
 pub fn create_arguments(
@@ -297,6 +351,11 @@ pub fn create_arguments(
     limits: ActEngineLimits,
 ) -> Result<Vec<String>, ActEngineError> {
     limits.validate()?;
+    if intent.creation_profile.as_ref() != Some(&creation_profile(limits)?) {
+        return Err(ActEngineError(
+            "creation differs from frozen engine profile".into(),
+        ));
+    }
     let labels = intent
         .required_labels(owner)
         .map_err(|e| ActEngineError(e.to_string()))?;
@@ -606,6 +665,15 @@ pub fn observe_engine(
     limits: ActEngineLimits,
 ) -> Result<ActEngineObservation, ActEngineError> {
     limits.validate()?;
+    if frozen_limits(intent)? != limits {
+        return Err(ActEngineError(
+            "observation differs from frozen engine limits".into(),
+        ));
+    }
+    let profile = intent
+        .creation_profile
+        .as_ref()
+        .ok_or_else(|| ActEngineError("engine creation profile is absent".into()))?;
     if image_identity.manifest_digest != intent.engine_image_digest {
         return Err(ActEngineError(
             "verified image belongs to another pinned manifest".into(),
@@ -637,7 +705,29 @@ pub fn observe_engine(
     let env = engine["Config"]["Env"]
         .as_array()
         .ok_or_else(|| ActEngineError("missing environment observation".into()))?;
-    let expected_tmpfs = limits.tmpfs();
+    let expected_tmpfs: BTreeMap<String, String> = [
+        (
+            "/var/lib/docker".into(),
+            format!("rw,exec,nosuid,nodev,size={}", profile.storage_bytes),
+        ),
+        (
+            "/run".into(),
+            format!("rw,nosuid,nodev,size={}", profile.run_tmpfs_bytes),
+        ),
+        (
+            "/tmp".into(),
+            format!("rw,nosuid,nodev,size={}", profile.tmp_tmpfs_bytes),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let command: Vec<String> = serde_json::from_value(engine["Config"]["Cmd"].clone())
+        .map_err(|error| ActEngineError(error.to_string()))?;
+    if command_digest(&command)? != profile.init_command_sha256 {
+        return Err(ActEngineError(
+            "observed command differs from frozen engine init".into(),
+        ));
+    }
     if engine["Name"].as_str() != Some(format!("/{}", intent.engine_name()).as_str())
         || engine["Image"].as_str() != Some(image_identity.docker_image_id.as_str())
         || engine["Config"]["Image"].as_str()
@@ -660,7 +750,6 @@ pub fn observe_engine(
         || engine["Config"]
             .get("Entrypoint")
             .is_none_or(|v| !v.is_null() && !v.as_array().is_some_and(|v| v.is_empty()))
-        || engine["Config"]["Cmd"] != serde_json::json!(engine_command())
         || !empty(&host["Binds"])
         || !empty(&host["VolumesFrom"])
         || !empty(&host["Mounts"])
@@ -735,6 +824,7 @@ mod tests {
             act_image_digest: format!("sha256:{}", "d".repeat(64)),
             engine_image_digest: format!("sha256:{}", "e".repeat(64)),
             runner_image_digest: format!("sha256:{}", "f".repeat(64)),
+            creation_profile: Some(creation_profile(limits()).unwrap()),
             created_at: 1.0,
         }
     }
@@ -1105,6 +1195,79 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn recovery_uses_frozen_command_while_creation_requires_current_producer() {
+        let mut prior = intent();
+        let mut prior_command = engine_command();
+        prior_command.push("--log-level=warn".into());
+        prior.creation_profile.as_mut().unwrap().init_command_sha256 =
+            command_digest(&prior_command).unwrap();
+        let mut observed = document();
+        observed[0]["Config"]["Cmd"] = json!(prior_command);
+        observed[0]["Config"]["Labels"] = json!(prior.required_labels(OWNER).unwrap());
+        assert!(
+            observe_engine(
+                &serde_json::to_vec(&observed).unwrap(),
+                &prior,
+                OWNER,
+                &classic_identity(),
+                frozen_limits(&prior).unwrap()
+            )
+            .is_ok()
+        );
+        assert!(create_arguments(&prior, OWNER, limits()).is_err());
+        observed[0]["Config"]["Cmd"] = json!(engine_command());
+        assert!(
+            observe_engine(
+                &serde_json::to_vec(&observed).unwrap(),
+                &prior,
+                OWNER,
+                &classic_identity(),
+                frozen_limits(&prior).unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_intent_or_changed_creation_limits_never_create_or_observe() {
+        let mut legacy = intent();
+        legacy.creation_profile = None;
+        assert!(create_arguments(&legacy, OWNER, limits()).is_err());
+        assert!(
+            observe_engine(
+                &serde_json::to_vec(&document()).unwrap(),
+                &legacy,
+                OWNER,
+                &classic_identity(),
+                limits()
+            )
+            .is_err()
+        );
+        let changed = ActEngineLimits {
+            memory_bytes: 10 << 30,
+            ..limits()
+        };
+        assert!(create_arguments(&intent(), OWNER, changed).is_err());
+        assert!(
+            observe_engine(
+                &serde_json::to_vec(&document()).unwrap(),
+                &intent(),
+                OWNER,
+                &classic_identity(),
+                changed
+            )
+            .is_err()
+        );
+        let mut profile_drift = intent();
+        profile_drift
+            .creation_profile
+            .as_mut()
+            .unwrap()
+            .run_tmpfs_bytes = 32 << 20;
+        assert!(create_arguments(&profile_drift, OWNER, limits()).is_err());
     }
 
     #[test]

@@ -132,37 +132,6 @@ fn limits() -> ActEngineLimits {
         pids: 1024,
     }
 }
-// Next probe profile is inferred from layer/native-copy demand, not a proven minimum.
-fn legacy_limits() -> ActEngineLimits {
-    ActEngineLimits {
-        memory_bytes: 16 << 30,
-        storage_bytes: 12 << 30,
-        nano_cpus: 2_000_000_000,
-        pids: 1024,
-    }
-}
-fn retained_profile(root: &Path, run: &str) -> std::io::Result<ActEngineLimits> {
-    let path = root.join(format!("{run}-profile.json"));
-    let bytes = match bounded_file(&path, 4096) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(legacy_limits()),
-        Err(e) => return Err(e),
-    };
-    let value: Value = serde_json::from_slice(&bytes)?;
-    profile_from_value(&value)
-}
-fn profile_from_value(value: &Value) -> std::io::Result<ActEngineLimits> {
-    for profile in [limits(), legacy_limits()] {
-        if value["memory_bytes"].as_u64() == Some(profile.memory_bytes)
-            && value["storage_bytes"].as_u64() == Some(profile.storage_bytes)
-            && value["nano_cpus"].as_u64() == Some(profile.nano_cpus)
-            && value["pids"].as_u64() == Some(profile.pids)
-        {
-            return Ok(profile);
-        }
-    }
-    Err(fail("retained probe profile is unsupported"))
-}
 const RESOURCE_COMMAND: &str = "printf 'df_kib\n'; df -Pk /var/lib/docker; printf 'df_inodes\n'; df -Pi /var/lib/docker; printf 'memory_current\n'; cat /sys/fs/cgroup/memory.current; printf 'memory_peak\n'; cat /sys/fs/cgroup/memory.peak; printf 'mountinfo\\n'; cat /proc/self/mountinfo";
 fn resource_values(raw: &[u8]) -> std::io::Result<Value> {
     let text = std::str::from_utf8(raw).map_err(|_| fail("resource sample is not UTF8"))?;
@@ -635,7 +604,6 @@ async fn cleanup(
     intent: &ActEngineIntent,
     owner: &str,
     proof: &VerifiedEngineManifest,
-    profile: ActEngineLimits,
 ) -> std::io::Result<()> {
     let Some(current) = record(registry, &intent.run_id).await? else {
         return Ok(());
@@ -643,6 +611,8 @@ async fn cleanup(
     if current.intent != *intent {
         return Err(fail("probe cleanup immutable intent changed"));
     }
+    let profile = crate::act_engine::frozen_limits(&current.intent)
+        .map_err(|error| fail(error.to_string()))?;
     let image = docker(
         engine,
         vec![
@@ -924,6 +894,10 @@ async fn probe_case(
         act_image_digest: package.manifest_digest.clone(),
         engine_image_digest: ENGINE.into(),
         runner_image_digest: RUNNER.into(),
+        creation_profile: Some(
+            crate::act_engine::creation_profile(limits())
+                .map_err(|error| fail(error.to_string()))?,
+        ),
         created_at: at(),
     };
     retain(
@@ -1045,7 +1019,7 @@ async fn probe_case(
             json!({"cancel_case":cancel_case,"nested_cancellation_observed":nested_cancelled,"report":report}),
         )
     })();
-    let cleanup_result = cleanup(registry, engine, &intent, owner, engine_manifest, limits()).await;
+    let cleanup_result = cleanup(registry, engine, &intent, owner, engine_manifest).await;
     let summary = match (&result, &cleanup_result) {
         (Ok(value), Ok(())) => value.clone(),
         _ => {
@@ -1185,8 +1159,7 @@ fn recover_retained_pinned_engine_only() {
         assert_eq!(current.intent,intent); assert!(current.execution_claim.is_none(), "recovery must not destroy a live execution claim");
         let (sender,receiver) = async_engine::channel(16); let actor = RegistryActor { sender };
         let task = async_engine::launch(registry_actor(registry,receiver,None));
-        let profile=retained_profile(&root,&run).unwrap();
-        let result = cleanup(&actor,&DockerEngine::docker(),&intent,&owner,&proof,profile).await;
+        let result = cleanup(&actor,&DockerEngine::docker(),&intent,&owner,&proof).await;
         actor.stop().await; task.await.unwrap();
         retain(&root.join(format!("{run}-recovery-{}.json",random_uuid().await.unwrap())), &serde_json::to_vec_pretty(&json!({"run_id":run,"registry_id":owner,"verified_cleanup":result.is_ok(),"error":result.as_ref().err().map(ToString::to_string)})).unwrap()).unwrap();
         result.unwrap();
@@ -1195,7 +1168,7 @@ fn recover_retained_pinned_engine_only() {
 
 #[test]
 #[ignore = "explicit retained real inspect fixture; no Docker calls"]
-fn retained_created_engine_inspect_is_verified_offline() {
+fn retained_legacy_engine_inspect_refuses_without_frozen_profile_offline() {
     let input = PathBuf::from(std::env::var_os("BOSN_ACT_PROBE_INPUT_DIR").unwrap());
     let root = PathBuf::from(std::env::var_os("BOSN_ACT_RECOVERY_DIR").unwrap());
     let run = std::env::var("BOSN_ACT_RECOVERY_RUN").unwrap();
@@ -1219,18 +1192,15 @@ fn retained_created_engine_inspect_is_verified_offline() {
     let image =
         observe_engine_image_from_manifest(&serde_json::to_vec(&image).unwrap(), &intent, &proof)
             .unwrap();
+    assert!(intent.creation_profile.is_none());
     let observed = observe_engine(
         &bounded_file(&root.join("failed-created-engine-inspect.json"), 1 << 20).unwrap(),
         &intent,
         &owner,
         &image,
-        legacy_limits(),
-    )
-    .unwrap();
-    assert_eq!(
-        observed.engine_id,
-        "da29a0806c0d63ac16233240c5f4fb5e8b90c61057accd511c82cc1e6cbbedaa"
+        limits(),
     );
+    assert!(observed.is_err());
 }
 
 #[test]
@@ -1255,7 +1225,6 @@ fn resource_sample_preserves_byte_inode_and_memory_axes_and_refuses_bad_data() {
     assert!(resource_values(b"partial observation").is_err());
     assert_eq!(limits().storage_bytes, 20 << 30);
     assert_eq!(limits().memory_bytes, 28 << 30);
-    assert_eq!(legacy_limits().storage_bytes, 12 << 30);
 }
 
 #[test]
@@ -1278,15 +1247,6 @@ fn observer_failure_cannot_be_promoted_to_resource_measurement_or_runtime_succes
     assert!(unavailable["command_exit"].is_null());
     assert!(unavailable["metrics"].is_null());
     assert_eq!(unavailable["observer_error"], "daemon unavailable");
-    for profile in [limits(), legacy_limits()] {
-        let value = json!({"memory_bytes":profile.memory_bytes,"storage_bytes":profile.storage_bytes,"nano_cpus":profile.nano_cpus,"pids":profile.pids});
-        assert_eq!(profile_from_value(&value).unwrap(), profile);
-        for field in ["memory_bytes", "storage_bytes", "nano_cpus", "pids"] {
-            let mut wrong = value.clone();
-            wrong[field] = json!(0);
-            assert!(profile_from_value(&wrong).is_err());
-        }
-    }
 }
 
 #[test]

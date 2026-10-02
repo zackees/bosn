@@ -1197,6 +1197,15 @@ else: raise Exception('unexpected args '+repr(args))
                 act_image_digest: package.manifest_digest.clone(),
                 engine_image_digest: format!("sha256:{}", "e".repeat(64)),
                 runner_image_digest: hash(&base),
+                creation_profile: Some(
+                    crate::act_engine::creation_profile(crate::act_engine::ActEngineLimits {
+                        memory_bytes: 6 << 30,
+                        storage_bytes: 4 << 30,
+                        nano_cpus: 1_000_000_000,
+                        pids: 256,
+                    })
+                    .unwrap(),
+                ),
                 created_at: now().floor(),
             };
             let observed = ActEngineObservation {
