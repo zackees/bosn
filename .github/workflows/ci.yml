@@ -412,10 +412,38 @@ jobs:
       - name: Install and smoke-test Linux-built Darwin wheel
         run: python ci/verify_installed_wheel.py --installer pip "dist/bosn-*.whl"
 
+  # The desktop widget links WebKitGTK, which the core workspace never does
+  # (ci/lint_no_webview_in_core.py); it builds alone, on the full tier only.
+  widget:
+    name: Desktop widget (Linux, WebKitGTK)
+    if: always() && needs.select-tier.outputs.full == 'true'
+    needs: [select-tier]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: clippy
+
+      - name: Install WebKitGTK development packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev pkg-config libssl-dev
+
+      - name: Lint and test bosn-widget
+        run: |
+          cargo clippy --manifest-path crates/bosn-widget/Cargo.toml --locked --all-targets -- -D warnings
+          cargo test --manifest-path crates/bosn-widget/Cargo.toml --locked
+
   full-coverage:
     name: Full CI coverage (exact candidate SHA)
     if: always() && needs.select-tier.outputs.full == 'true'
-    needs: [select-tier, lint-no-macos-runners, rust, linux, native-wheel, darwin-cross-wheel, darwin-hosted-smoke]
+    needs: [select-tier, lint-no-macos-runners, rust, linux, native-wheel, darwin-cross-wheel, darwin-hosted-smoke, widget]
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -441,7 +469,7 @@ jobs:
   ci-queue-timing:
     name: CI queue timing
     if: always()
-    needs: [select-tier, lint-no-macos-runners, rust, linux, native-wheel, darwin-cross-wheel, darwin-hosted-smoke, full-coverage]
+    needs: [select-tier, lint-no-macos-runners, rust, linux, native-wheel, darwin-cross-wheel, darwin-hosted-smoke, widget, full-coverage]
     runs-on: ubuntu-latest
     permissions:
       actions: read

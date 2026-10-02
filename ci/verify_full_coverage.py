@@ -21,6 +21,7 @@ REQUIRED = (
     "Darwin wheel (aarch64-apple-darwin, Linux-hosted Soldr)",
     "Hosted macOS wheel smoke (x86_64-apple-darwin)",
     "Hosted macOS wheel smoke (aarch64-apple-darwin)",
+    "Desktop widget (Linux, WebKitGTK)",
 )
 
 
