@@ -16,9 +16,20 @@ pub mod resolver;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContextEntry {
-    File { path: String, bytes: Vec<u8> },
-    Directory { path: String },
-    Symlink { path: String, target: String },
+    /// `executable`: the file has a Unix execute bit. Docker `COPY` keeps a
+    /// file's mode, so it is part of what the image contains.
+    File {
+        path: String,
+        bytes: Vec<u8>,
+        executable: bool,
+    },
+    Directory {
+        path: String,
+    },
+    Symlink {
+        path: String,
+        target: String,
+    },
 }
 
 /// A context observation is already filtered using Docker's selected context
@@ -208,8 +219,14 @@ pub fn content_digest(
         }
         h.update(b"\0path-record\0");
         match entry {
-            ContextEntry::File { path, bytes } => {
-                field(&mut h, b"file");
+            ContextEntry::File {
+                path,
+                bytes,
+                executable,
+            } => {
+                // A distinct tag, so a plain file's record (and every
+                // existing generation without executables) is unchanged.
+                field(&mut h, if *executable { b"file+x" } else { b"file" });
                 field(&mut h, path.as_bytes());
                 field(&mut h, bytes);
             }
@@ -342,7 +359,7 @@ pub fn stack_generation_from_context(
             .entries
             .iter()
             .find_map(|x| match x {
-                ContextEntry::File { path, bytes } if path == dockerfile => Some(bytes),
+                ContextEntry::File { path, bytes, .. } if path == dockerfile => Some(bytes),
                 _ => None,
             })
             .ok_or_else(|| GenerationError::InvalidContextPath(dockerfile.clone()))?;

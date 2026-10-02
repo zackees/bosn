@@ -677,7 +677,7 @@ fn path(e: &ContextEntry) -> &str {
 }
 fn file<'a>(e: &'a [ContextEntry], p: &str) -> Option<&'a [u8]> {
     e.iter().find_map(|x| match x {
-        ContextEntry::File { path, bytes } if path == p => Some(bytes.as_slice()),
+        ContextEntry::File { path, bytes, .. } if path == p => Some(bytes.as_slice()),
         _ => None,
     })
 }
@@ -723,6 +723,7 @@ mod tests {
         ContextEntry::File {
             path: path.into(),
             bytes: text.into(),
+            executable: false,
         }
     }
     #[test]

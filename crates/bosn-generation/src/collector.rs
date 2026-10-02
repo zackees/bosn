@@ -198,6 +198,7 @@ fn collect_context_inner(
             _ => ContextEntry::File {
                 path: path.clone(),
                 bytes: Vec::new(),
+                executable: false,
             },
         });
     }
@@ -246,6 +247,7 @@ fn collect_context_inner(
                     .ok_or(CollectorError::Limit("total bytes"))?;
                 let read_limit = limits.max_file_bytes.min(remaining);
                 let observed = fs::read_context_regular_file_bounded(&disk, read_limit)?;
+                let executable = observed.metadata.executable;
                 let bytes = if let Some(original) = policy.get(&path) {
                     if observed.bytes != *original {
                         return Err(CollectorError::Mutation);
@@ -260,7 +262,11 @@ fn collect_context_inner(
                 if total > limits.max_total_bytes {
                     return Err(CollectorError::Limit("total bytes"));
                 }
-                entries.push(ContextEntry::File { path, bytes });
+                entries.push(ContextEntry::File {
+                    path,
+                    bytes,
+                    executable,
+                });
             }
             ContextPathKind::Other => return Err(CollectorError::SpecialFile(path)),
         }
@@ -355,6 +361,27 @@ mod tests {
     }
     fn paths(value: &ContextObservation) -> Vec<String> {
         value.entries.iter().map(entry_path).collect()
+    }
+    #[test]
+    fn a_files_execute_bit_is_observed() {
+        let root = tempfile::tempdir().unwrap();
+        write(root.path(), "Dockerfile", b"FROM x\nCOPY . /x\n");
+        write(root.path(), "tool", b"#!/bin/sh\n");
+        write(root.path(), "data", b"x");
+        kernal_api::platform::fs::make_executable(&root.path().join("tool")).unwrap();
+        let got = collect(root.path()).unwrap();
+        let executable = |name: &str| {
+            got.entries.iter().any(|entry| {
+                matches!(entry, ContextEntry::File { path, executable: true, .. } if path == name)
+            })
+        };
+        // Windows has no per-file execute bit.
+        assert_eq!(
+            executable("tool"),
+            !kernal_api::platform::host::target_is_windows()
+        );
+        assert!(!executable("data"));
+        assert!(!executable("Dockerfile"));
     }
     #[test]
     fn real_tree_selection_ignores_large_unselected_and_honors_descendant_negation() {

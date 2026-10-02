@@ -48,9 +48,20 @@ pub struct SetupAssetStore {
 /// host path or a Docker argument.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ManifestBuildEntry {
-    File { path: String, content: Vec<u8> },
-    Directory { path: String },
-    Symlink { path: String, target: String },
+    /// `executable`: materialize it with the owner's execute bit, so a
+    /// Dockerfile `COPY` keeps the script runnable.
+    File {
+        path: String,
+        content: Vec<u8>,
+        executable: bool,
+    },
+    Directory {
+        path: String,
+    },
+    Symlink {
+        path: String,
+        target: String,
+    },
 }
 
 impl SetupAssetStore {
@@ -158,7 +169,11 @@ impl SetupAssetStore {
                 return Err(SetupMaterializeError::InvalidAssetPath);
             }
             match entry {
-                ManifestBuildEntry::File { content, .. } => {
+                ManifestBuildEntry::File {
+                    content,
+                    executable,
+                    ..
+                } => {
                     if content.len() > MAX_COMPANION_FILE_BYTES {
                         return Err(SetupMaterializeError::InvalidAssetPath);
                     }
@@ -168,7 +183,9 @@ impl SetupAssetStore {
                     if total > 64 * 1024 * 1024 {
                         return Err(SetupMaterializeError::InvalidAssetPath);
                     }
-                    expected.push(ExpectedAsset::file(path, content.clone()));
+                    let mut asset = ExpectedAsset::file(path, content.clone());
+                    asset.executable = *executable;
+                    expected.push(asset);
                 }
                 ManifestBuildEntry::Directory { .. } => {
                     expected.push(ExpectedAsset::directory(path));
@@ -381,6 +398,8 @@ fn validated_content_hash(value: &str) -> Result<String, SetupMaterializeError> 
 struct ExpectedAsset {
     relative: String,
     kind: ExpectedAssetKind,
+    /// A file materialized with the owner's execute bit (receipt kind `X`).
+    executable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -398,6 +417,7 @@ impl ExpectedAsset {
         Self {
             relative: path.into(),
             kind: ExpectedAssetKind::File(content),
+            executable: false,
         }
     }
 
@@ -405,6 +425,7 @@ impl ExpectedAsset {
         Self {
             relative: path.into(),
             kind: ExpectedAssetKind::Directory,
+            executable: false,
         }
     }
 }
@@ -419,6 +440,7 @@ fn expected_assets(
     let mut output = vec![ExpectedAsset {
         relative: "Dockerfile".into(),
         kind: ExpectedAssetKind::File(dockerfile.as_bytes().to_vec()),
+        executable: false,
     }];
     let mut names = BTreeSet::from(["Dockerfile".to_owned()]);
     for file in files {
@@ -432,6 +454,7 @@ fn expected_assets(
         output.push(ExpectedAsset {
             relative: file.path.clone(),
             kind: ExpectedAssetKind::File(file.content.as_bytes().to_vec()),
+            executable: false,
         });
     }
     Ok(output)
@@ -517,7 +540,7 @@ fn receipt_bytes(
     for asset in expected {
         match &asset.kind {
             ExpectedAssetKind::File(content) => {
-                receipt.extend_from_slice(b"F\t");
+                receipt.extend_from_slice(if asset.executable { b"X\t" } else { b"F\t" });
                 receipt.extend_from_slice(asset.relative.as_bytes());
                 receipt.push(b'\t');
                 receipt.extend_from_slice(sha256_bytes(content).to_hex().as_bytes());
@@ -556,6 +579,10 @@ fn write_expected_assets(
                     .ok_or(SetupMaterializeError::InvalidAssetPath)?;
                 ensure_asset_parent(asset_root, parent)?;
                 atomic_write_new(&path, content)?;
+                if asset.executable {
+                    // Owner bit only: the asset must stay owner-private.
+                    fs::make_owner_executable(&path).map_err(SetupMaterializeError::Filesystem)?;
+                }
             }
             ExpectedAssetKind::Directory => {
                 ensure_asset_parent(asset_root, &path)?;
@@ -566,6 +593,15 @@ fn write_expected_assets(
         }
     }
     Ok(())
+}
+
+/// Whether a materialized file's execute bit is what its receipt records.
+/// Windows has no per-file execute bit, so there nothing is executable.
+fn execute_bit_matches(path: &Path, executable: bool) -> Result<bool, SetupMaterializeError> {
+    let observed = fs::context_path_metadata_no_follow(path)
+        .map_err(|_| SetupMaterializeError::ExistingAssetsConflict)?
+        .executable;
+    Ok(observed == (executable && !kernal_api::platform::host::target_is_windows()))
 }
 
 fn asset_path(asset_root: &Path, relative: &str) -> Result<PathBuf, SetupMaterializeError> {
@@ -659,7 +695,7 @@ fn verify_complete_assets(
                 let path = asset_path(asset_root, &asset.relative)?;
                 let bytes = fs::read_private_regular_file_bounded(&path, content.len())
                     .map_err(|_| SetupMaterializeError::ExistingAssetsConflict)?;
-                if bytes != *content {
+                if bytes != *content || !execute_bit_matches(&path, asset.executable)? {
                     return Err(SetupMaterializeError::ExistingAssetsConflict);
                 }
             }
@@ -764,6 +800,7 @@ pub(crate) fn verify_materialized_assets(
         let fields = line.split('\t').collect::<Vec<_>>();
         let (kind, relative, value) = match fields.as_slice() {
             ["F", relative, digest] if valid_content_hash(digest) => ('F', *relative, *digest),
+            ["X", relative, digest] if valid_content_hash(digest) => ('X', *relative, *digest),
             ["D", relative] => ('D', *relative, ""),
             ["L", relative, target] if safe_link_target(relative, target) => {
                 ('L', *relative, *target)
@@ -777,7 +814,7 @@ pub(crate) fn verify_materialized_assets(
     }
     if !matches!(
         expected.iter().find(|(_, path, _)| path == dockerfile),
-        Some(('F', _, _))
+        Some(('F' | 'X', _, _))
     ) {
         return Err(SetupMaterializeError::ExistingAssetsConflict);
     }
@@ -798,14 +835,14 @@ pub(crate) fn verify_materialized_assets(
         }
         canonical.push(b'\n');
         match kind {
-            'F' => {
+            'F' | 'X' => {
                 allowed_files.insert(relative.clone());
-                let bytes = fs::read_private_regular_file_bounded(
-                    &asset_path(asset_root, relative)?,
-                    MAX_COMPANION_FILE_BYTES,
-                )
-                .map_err(|_| SetupMaterializeError::ExistingAssetsConflict)?;
-                if sha256_bytes(&bytes).to_hex() != *value {
+                let path = asset_path(asset_root, relative)?;
+                let bytes = fs::read_private_regular_file_bounded(&path, MAX_COMPANION_FILE_BYTES)
+                    .map_err(|_| SetupMaterializeError::ExistingAssetsConflict)?;
+                if sha256_bytes(&bytes).to_hex() != *value
+                    || !execute_bit_matches(&path, *kind == 'X')?
+                {
                     return Err(SetupMaterializeError::ExistingAssetsConflict);
                 }
             }
