@@ -401,7 +401,7 @@ fn act_plan_refuses_mismatched_sha_and_dirty_workflow() {
     let act = fake_act(root.path());
     for (requested_sha, dirty, expected) in [
         ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false, "HEAD"),
-        (sha.as_str(), true, "workflow differs"),
+        (sha.as_str(), true, "source differs"),
     ] {
         if dirty {
             fs::write(root.path().join("ci.yml"), "name: Altered\non: [push]\n").unwrap();
@@ -434,6 +434,50 @@ fn act_plan_refuses_mismatched_sha_and_dirty_workflow() {
         );
         assert!(output.stdout.is_empty());
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn act_plan_bounds_committed_workflow_and_git_observations() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("ci.yml"), vec![b'#'; (1 << 20) + 1]).unwrap();
+    let sha = commit_workflow(root.path(), "ci.yml");
+    let run = |path: Option<&std::path::Path>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bosn"));
+        command
+            .args(["act", "plan", "--workspace"])
+            .arg(root.path())
+            .args([
+                "--workflow",
+                "ci.yml",
+                "--event",
+                "push",
+                "--mode",
+                "minimal",
+                "--sha",
+                &sha,
+                "--act-version",
+                "0.2.88",
+                "--json",
+            ]);
+        if let Some(path) = path {
+            command.env("PATH", path);
+        }
+        command.output().unwrap()
+    };
+    let oversized = run(None);
+    assert_eq!(oversized.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&oversized.stderr).contains("exceeds 1 MiB"));
+    assert!(oversized.stdout.is_empty());
+
+    let commands = tempfile::tempdir().unwrap();
+    let git = commands.path().join("git");
+    fs::write(&git, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o700)).unwrap();
+    let delayed = run(Some(commands.path()));
+    assert_eq!(delayed.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&delayed.stderr).contains("timed out"));
+    assert!(delayed.stdout.is_empty());
 }
 
 #[cfg(unix)]

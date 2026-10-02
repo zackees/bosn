@@ -113,85 +113,10 @@ pub fn run(mut arguments: impl Iterator<Item = OsString>) {
     let root = PathBuf::from(workspace)
         .canonicalize()
         .unwrap_or_else(|_| fail("workspace does not exist"));
-    let top_level = Command::new("git")
-        .current_dir(&root)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .unwrap_or_else(|_| fail("workspace Git root is unavailable"));
-    if !top_level.status.success() {
-        fail("workspace Git root is unavailable")
-    }
-    let git_root = String::from_utf8(top_level.stdout)
-        .unwrap_or_else(|_| fail("workspace Git root is invalid"));
-    let git_root = PathBuf::from(git_root.trim())
-        .canonicalize()
-        .unwrap_or_else(|_| fail("workspace Git root is unavailable"));
-    if git_root != root {
-        fail("--workspace must be the Git checkout root")
-    }
+    adapter_checkout(&root, &sha.to_ascii_lowercase()).unwrap_or_else(|error| fail(error));
+    let current = committed_adapter_file(&root, &workflow).unwrap_or_else(|error| fail(error));
     let relative = Path::new(&workflow);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|c| !matches!(c, std::path::Component::Normal(_)))
-    {
-        fail("workflow must be a relative path without traversal")
-    }
-    let path = root
-        .join(relative)
-        .canonicalize()
-        .unwrap_or_else(|_| fail("workflow does not exist"));
-    if !path.starts_with(&root) || !path.is_file() {
-        fail("workflow escapes workspace or is not a file")
-    }
-    let head = Command::new("git")
-        .current_dir(&root)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .unwrap_or_else(|_| fail("workspace Git HEAD is unavailable"));
-    if !head.status.success() {
-        fail("workspace Git HEAD is unavailable")
-    }
-    let actual_sha =
-        String::from_utf8(head.stdout).unwrap_or_else(|_| fail("workspace Git HEAD is invalid"));
-    if actual_sha.trim() != sha.to_ascii_lowercase() {
-        fail("requested SHA does not match workspace HEAD")
-    }
-    let head_path = format!("HEAD:{workflow}");
-    let committed = Command::new("git")
-        .current_dir(&root)
-        .args(["show", &head_path])
-        .output()
-        .unwrap_or_else(|_| fail("workflow is not in workspace HEAD"));
-    if !committed.status.success() {
-        fail("workflow is not in workspace HEAD")
-    }
-    let current = std::fs::read(&path).unwrap_or_else(|_| fail("workflow could not be read"));
-    if current != committed.stdout {
-        fail("workflow differs from workspace HEAD")
-    }
-    let workspace_status = Command::new("git")
-        .current_dir(&root)
-        .args(["status", "--porcelain", "--untracked-files=all"])
-        .output()
-        .unwrap_or_else(|_| fail("workspace source status is unavailable"));
-    if !workspace_status.status.success() || !workspace_status.stdout.is_empty() {
-        fail("workspace source differs from workspace HEAD")
-    }
-    let index_flags = Command::new("git")
-        .current_dir(&root)
-        .args(["ls-files", "-v", "-z"])
-        .output()
-        .unwrap_or_else(|_| fail("workspace index flags are unavailable"));
-    if !index_flags.status.success()
-        || index_flags
-            .stdout
-            .split(|byte| *byte == 0)
-            .filter(|record| !record.is_empty())
-            .any(|record| record[0].is_ascii_lowercase() || record[0] == b'S')
-    {
-        fail("workspace index hides tracked file changes")
-    }
+    let path = root.join(relative);
     // The generic Bosn surface does not assume each repository's selector or
     // dispatch input names. Its event mapping is an intention until the repo's
     // adapter has furnished and validated the exact event payload.
@@ -233,20 +158,11 @@ pub fn run(mut arguments: impl Iterator<Item = OsString>) {
     ))
     .unwrap_or_else(|_| fail("act list output is not UTF-8"));
     let jobs = parse_list(&output);
-    let final_head = Command::new("git")
-        .current_dir(&root)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .unwrap_or_else(|_| fail("workspace Git HEAD changed during planning"));
-    let final_status = Command::new("git")
-        .current_dir(&root)
-        .args(["status", "--porcelain", "--untracked-files=all"])
-        .output()
-        .unwrap_or_else(|_| fail("workspace source changed during planning"));
-    if !final_head.status.success()
-        || String::from_utf8_lossy(&final_head.stdout).trim() != actual_sha.trim()
-        || !final_status.status.success()
-        || !final_status.stdout.is_empty()
+    adapter_checkout(&root, &sha.to_ascii_lowercase())
+        .unwrap_or_else(|_| fail("workspace changed during planning"));
+    if committed_adapter_file(&root, &workflow)
+        .unwrap_or_else(|_| fail("workspace changed during planning"))
+        != current
     {
         fail("workspace changed during planning")
     }
