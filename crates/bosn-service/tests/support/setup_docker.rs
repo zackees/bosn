@@ -154,6 +154,12 @@ pub(crate) struct ExactContainerCleanup {
 
 impl Drop for ExactContainerCleanup {
     fn drop(&mut self) {
+        if self.container_name.is_empty() {
+            match setup_container_for(&self.engine, &self.content_sha256) {
+                Some(name) => self.container_name = name,
+                None => return,
+            }
+        }
         match inspect_container(&self.engine, &self.container_name) {
             Ok(None) => {}
             Ok(Some(observed))
@@ -183,6 +189,34 @@ impl Drop for ExactContainerCleanup {
             ),
         }
     }
+}
+
+/// The one managed setup container this test's unique document created,
+/// found by its content label. Since #349 the container name is the
+/// creation identity (canonical workspace, creation arguments), which a
+/// test cannot know before its image is prepared.
+pub(crate) fn setup_container_for(engine: &DockerEngine, content_sha256: &str) -> Option<String> {
+    let filter = format!("label=com.zackees.bosn.setup-content-sha256={content_sha256}");
+    let result = docker_capture(
+        engine,
+        [
+            "container",
+            "ls",
+            "--all",
+            "--filter",
+            filter.as_str(),
+            "--format",
+            "{{.Names}}",
+        ],
+    );
+    assert!(result.ok(), "docker container ls failed");
+    let text = String::from_utf8(result.stdout).expect("container names");
+    let names: Vec<&str> = text.split_whitespace().collect();
+    assert!(
+        names.len() <= 1,
+        "more than one container carries {content_sha256}: {names:?}"
+    );
+    names.first().map(|name| (*name).to_owned())
 }
 
 pub(crate) fn wait_for_client(

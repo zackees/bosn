@@ -51,16 +51,13 @@ fn live_docker_setup_ensure_creates_and_reuses_one_managed_app() {
             policy: SetupAcquirePolicy::OnlineRefresh,
         }))
         .expect("plan pinned setup document without Docker");
-    let container_name = format!("bosn-setup-{}", plan.content_sha256);
     assert!(
-        inspect_container(&engine, &container_name)
-            .expect("inspect deterministic test container")
-            .is_none(),
+        setup_container_for(&engine, &plan.content_sha256).is_none(),
         "unique test container name already exists; refusing to touch it"
     );
     let cleanup = ExactContainerCleanup {
         engine: engine.clone(),
-        container_name: container_name.clone(),
+        container_name: String::new(),
         content_sha256: plan.content_sha256.clone(),
     };
     let request = SetupEnsureJobRequest {
@@ -77,6 +74,8 @@ fn live_docker_setup_ensure_creates_and_reuses_one_managed_app() {
         .run(first_client.submit_setup_ensure(request.clone()))
         .expect("submit first production setup ensure job");
     wait_for_success(&runtime, &first_client, first_job);
+    let container_name =
+        setup_container_for(&engine, &plan.content_sha256).expect("the ensured app container");
     let first = inspect_container(&engine, &container_name)
         .expect("inspect first setup app")
         .expect("first setup app exists");
@@ -177,10 +176,9 @@ fn live_docker_setup_reconcile_repair_missing_retires_then_ensure_recreates_app(
             policy: SetupAcquirePolicy::OnlineRefresh,
         }))
         .expect("plan");
-    let container_name = format!("bosn-setup-{}", plan.content_sha256);
     let cleanup = ExactContainerCleanup {
         engine: engine.clone(),
-        container_name: container_name.clone(),
+        container_name: String::new(),
         content_sha256: plan.content_sha256.clone(),
     };
     let mut daemon = DaemonChild::start(&state);
@@ -195,6 +193,8 @@ fn live_docker_setup_reconcile_repair_missing_retires_then_ensure_recreates_app(
         }))
         .expect("submit ensure");
     wait_for_success(&runtime, &client, job);
+    let container_name =
+        setup_container_for(&engine, &plan.content_sha256).expect("the ensured app container");
     let matching = runtime
         .run(client.setup_reconcile_preview(&workspace, 0, 1))
         .expect("matching preview");
@@ -267,7 +267,7 @@ fn live_docker_setup_reconcile_repair_missing_retires_then_ensure_recreates_app(
             .items
             .iter()
             .any(
-                |resource| resource.id == format!("setup-container:{}", plan.content_sha256)
+                |resource| resource.id == format!("setup-container:setup:{container_name}")
                     && resource.state == ResourceState::Active
             )
     );
@@ -319,16 +319,13 @@ fn live_docker_setup_adopt_restores_lost_registry_without_touching_app() {
             policy: SetupAcquirePolicy::OnlineRefresh,
         }))
         .expect("plan setup");
-    let container_name = format!("bosn-setup-{}", plan.content_sha256);
     assert!(
-        inspect_container(&engine, &container_name)
-            .unwrap()
-            .is_none(),
+        setup_container_for(&engine, &plan.content_sha256).is_none(),
         "refuse colliding test name"
     );
     let cleanup = ExactContainerCleanup {
         engine: engine.clone(),
-        container_name: container_name.clone(),
+        container_name: String::new(),
         content_sha256: plan.content_sha256.clone(),
     };
     let ensure = SetupEnsureJobRequest {
@@ -344,6 +341,8 @@ fn live_docker_setup_adopt_restores_lost_registry_without_touching_app() {
         .run(first_client.submit_setup_ensure(ensure))
         .expect("submit ensure");
     wait_for_success(&runtime, &first_client, job);
+    let container_name =
+        setup_container_for(&engine, &plan.content_sha256).expect("the ensured app container");
     let before = inspect_container(&engine, &container_name)
         .unwrap()
         .expect("managed app exists");

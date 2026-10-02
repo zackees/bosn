@@ -60,24 +60,20 @@ fn live_docker_setup_gc_apply_removes_only_retired_generation() {
         plan_a.content_sha256, plan_b.content_sha256,
         "the two one-file documents must form distinct generations"
     );
-    let name_a = format!("bosn-setup-{}", plan_a.content_sha256);
-    let name_b = format!("bosn-setup-{}", plan_b.content_sha256);
-    for name in [&name_a, &name_b] {
+    for content in [&plan_a.content_sha256, &plan_b.content_sha256] {
         assert!(
-            inspect_container(&engine, name)
-                .expect("inspect deterministic test container")
-                .is_none(),
-            "unique test container name already exists; refusing to touch it"
+            setup_container_for(&engine, content).is_none(),
+            "unique test container already exists; refusing to touch it"
         );
     }
     let cleanup_a = ExactContainerCleanup {
         engine: engine.clone(),
-        container_name: name_a.clone(),
+        container_name: String::new(),
         content_sha256: plan_a.content_sha256.clone(),
     };
     let cleanup_b = ExactContainerCleanup {
         engine: engine.clone(),
-        container_name: name_b.clone(),
+        container_name: String::new(),
         content_sha256: plan_b.content_sha256.clone(),
     };
 
@@ -96,6 +92,8 @@ fn live_docker_setup_gc_apply_removes_only_retired_generation() {
         .run(client.submit_setup_ensure(request.clone()))
         .expect("submit first generation");
     wait_for_success(&runtime, &client, first_job);
+    let name_a =
+        setup_container_for(&engine, &plan_a.content_sha256).expect("the ensured app container");
     let first = inspect_container(&engine, &name_a)
         .expect("inspect first generation")
         .expect("first managed app exists");
@@ -107,6 +105,8 @@ fn live_docker_setup_gc_apply_removes_only_retired_generation() {
         .run(client.submit_setup_ensure(request))
         .expect("submit second generation");
     wait_for_success(&runtime, &client, second_job);
+    let name_b =
+        setup_container_for(&engine, &plan_b.content_sha256).expect("the ensured app container");
     let current = inspect_container(&engine, &name_b)
         .expect("inspect current generation")
         .expect("current managed app exists");
@@ -304,16 +304,13 @@ fn live_docker_setup_ensure_builds_and_reuses_inline_app() {
         "inline planning wrote into the selected workspace"
     );
     let image_tag = format!("bosn-setup:{}", plan.content_sha256);
-    let container_name = format!("bosn-setup-{}", plan.content_sha256);
     assert!(
-        inspect_container(&engine, &container_name)
-            .expect("inspect deterministic inline test container")
-            .is_none(),
+        setup_container_for(&engine, &plan.content_sha256).is_none(),
         "unique test container name already exists; refusing to touch it"
     );
     let cleanup = ExactContainerCleanup {
         engine: engine.clone(),
-        container_name: container_name.clone(),
+        container_name: String::new(),
         content_sha256: plan.content_sha256.clone(),
     };
     let request = SetupEnsureJobRequest {
@@ -330,6 +327,8 @@ fn live_docker_setup_ensure_builds_and_reuses_inline_app() {
         .run(first_client.submit_setup_ensure(request.clone()))
         .expect("submit first production inline setup ensure job");
     wait_for_success(&runtime, &first_client, first_job);
+    let container_name =
+        setup_container_for(&engine, &plan.content_sha256).expect("the ensured app container");
     let expected_image = image_identity_for(&engine, &image_tag);
     let first = inspect_container(&engine, &container_name)
         .expect("inspect first inline setup app")
@@ -434,16 +433,13 @@ fn live_docker_setup_ensure_fetches_one_https_document_then_reuses_it_offline() 
         "version = 1\n[app]\nimage = '{PINNED_ALPINE}'\ncommand = 'exec sleep 120 # bosn-remote-changed-{unique}'\n"
     );
     let content_sha256 = sha256_bytes(original.as_bytes()).to_hex();
-    let container_name = format!("bosn-setup-{content_sha256}");
     assert!(
-        inspect_container(&engine, &container_name)
-            .expect("inspect deterministic HTTPS test container")
-            .is_none(),
+        setup_container_for(&engine, &content_sha256).is_none(),
         "unique HTTPS test container name already exists; refusing to touch it"
     );
     let cleanup = ExactContainerCleanup {
         engine: engine.clone(),
-        container_name: container_name.clone(),
+        container_name: String::new(),
         content_sha256: content_sha256.clone(),
     };
     let mut server = TlsSetupServer::start(original.as_bytes());
@@ -468,6 +464,8 @@ fn live_docker_setup_ensure_fetches_one_https_document_then_reuses_it_offline() 
         .run(first_client.submit_setup_ensure(request.clone()))
         .expect("submit remote production setup ensure job");
     wait_for_success(&runtime, &first_client, first_job);
+    let container_name =
+        setup_container_for(&engine, &content_sha256).expect("the ensured app container");
     assert_eq!(server.request_count(), 1, "remote document fetched once");
     let first = inspect_container(&engine, &container_name)
         .expect("inspect first remote setup app")
