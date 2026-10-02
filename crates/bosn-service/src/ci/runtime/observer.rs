@@ -8,6 +8,8 @@ pub(crate) struct RunObserver {
     pub(crate) id: String,
     pub(crate) log: Option<LogWriter>,
     pub(crate) parser: ActParser,
+    /// The `--job` filter, if any: other declared jobs are not part of the run.
+    pub(crate) job: Option<String>,
     /// Masks secret values in act output before it is parsed or stored.
     pub(crate) masker: SecretMasker,
     pub(crate) seq: u64,
@@ -61,7 +63,8 @@ impl EngineObserver for RunObserver {
         });
     }
     fn declared(&mut self, listing: &str) {
-        self.parser = ActParser::new(RunTree::declared(&parse_act_list(listing)));
+        let jobs = select_jobs(parse_act_list(listing), self.job.as_deref());
+        self.parser = ActParser::new(RunTree::declared(&jobs));
         self.publish();
     }
     fn line(&mut self, line: EngineLine) {

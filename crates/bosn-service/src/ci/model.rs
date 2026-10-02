@@ -131,6 +131,15 @@ pub fn parse_act_list(output: &str) -> Vec<DeclaredJob> {
         .collect()
 }
 
+/// The declared jobs a run executes: all of them, or only `job` when the
+/// run was narrowed with `--job` (act runs just that job).
+pub fn select_jobs(jobs: Vec<DeclaredJob>, job: Option<&str>) -> Vec<DeclaredJob> {
+    match job {
+        None => jobs,
+        Some(job) => jobs.into_iter().filter(|j| j.job_id == job).collect(),
+    }
+}
+
 impl RunTree {
     /// Seed the tree with every declared job, queued, grouped by stage.
     pub fn declared(jobs: &[DeclaredJob]) -> Self {
@@ -596,6 +605,17 @@ mod tests {
             .map(|(i, line)| parser.feed(i as u64 + 1, line))
             .collect();
         (parser, records)
+    }
+
+    #[test]
+    fn a_job_filter_declares_only_that_job() {
+        let jobs = parse_act_list(LIST);
+        assert_eq!(select_jobs(jobs.clone(), None).len(), 3);
+        let only = select_jobs(jobs, Some("b"));
+        assert_eq!(
+            only.iter().map(|j| j.job_id.as_str()).collect::<Vec<_>>(),
+            ["b"]
+        );
     }
 
     #[test]
