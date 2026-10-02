@@ -1,6 +1,9 @@
 [workspace]
 members = ["crates/bosn", "crates/bosn-core", "crates/bosn-engine", "crates/bosn-generation", "crates/bosn-registry", "crates/bosn-service", "crates/bosn-python", "crates/bosn-setup"]
 resolver = "3"
+# The desktop widget links a webview toolkit; it builds on its own so the CLI,
+# daemon and CI never link WebKitGTK, WebView2 or AppKit.
+exclude = ["crates/bosn-widget"]
 
 # The release version, and the only place it is written. `./bump` edits it;
 # `bosn` (crates.io) and `bosn-python` (PyPI, via maturin's dynamic version)

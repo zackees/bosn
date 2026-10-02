@@ -120,3 +120,5 @@ details are documented in [docs/migration-rust.md](docs/migration-rust.md),
 [docs/task-secrets.md](docs/task-secrets.md); the read-only GitHub API proxy
 that keeps the token out of containers is in
 [docs/github-api-proxy.md](docs/github-api-proxy.md).
+Local CI on an isolated, daemon-owned engine (`bosn ci run --wait`, with
+reports and stable exit codes for agents) is in [docs/ci.md](docs/ci.md).

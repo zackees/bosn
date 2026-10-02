@@ -264,6 +264,12 @@ struct ExactContainerCleanup {
 
 impl Drop for ExactContainerCleanup {
     fn drop(&mut self) {
+        if self.container_name.is_empty() {
+            match setup_container_for(&self.engine, &self.content_sha256) {
+                Some(name) => self.container_name = name,
+                None => return,
+            }
+        }
         match inspect_container(&self.engine, &self.container_name) {
             Ok(None) => {}
             Ok(Some(observed))
@@ -293,6 +299,34 @@ impl Drop for ExactContainerCleanup {
             ),
         }
     }
+}
+
+/// The one managed setup container this test's unique document created,
+/// found by its content label. Since #349 the container name is the
+/// creation identity (canonical workspace, creation arguments), which a
+/// test cannot know before its image is prepared.
+fn setup_container_for(engine: &DockerEngine, content_sha256: &str) -> Option<String> {
+    let filter = format!("label=com.zackees.bosn.setup-content-sha256={content_sha256}");
+    let result = docker_capture(
+        engine,
+        [
+            "container",
+            "ls",
+            "--all",
+            "--filter",
+            filter.as_str(),
+            "--format",
+            "{{.Names}}",
+        ],
+    );
+    assert!(result.ok(), "docker container ls failed");
+    let text = String::from_utf8(result.stdout).expect("container names");
+    let names: Vec<&str> = text.split_whitespace().collect();
+    assert!(
+        names.len() <= 1,
+        "more than one container carries {content_sha256}: {names:?}"
+    );
+    names.first().map(|name| (*name).to_owned())
 }
 
 fn runtime() -> Runtime {
@@ -451,16 +485,13 @@ fn live_docker_mcp_setup_ensure_creates_and_reuses_one_managed_app() {
         .as_str()
         .expect("MCP plan content hash")
         .to_owned();
-    let container_name = format!("bosn-setup-{content_sha256}");
     assert!(
-        inspect_container(&engine, &container_name)
-            .expect("inspect deterministic test container")
-            .is_none(),
+        setup_container_for(&engine, &content_sha256).is_none(),
         "unique test container name already exists; refusing to touch it"
     );
     let cleanup = ExactContainerCleanup {
         engine: engine.clone(),
-        container_name: container_name.clone(),
+        container_name: String::new(),
         content_sha256: content_sha256.clone(),
     };
 
@@ -489,6 +520,8 @@ fn live_docker_mcp_setup_ensure_creates_and_reuses_one_managed_app() {
     let first_job = first["job_id"].as_u64().expect("first MCP ensure job ID");
     assert_eq!(first["action"], "setup_ensure");
     wait_for_success_and_logs(&mut first_mcp, first_job);
+    let container_name =
+        setup_container_for(&engine, &content_sha256).expect("the ensured app container");
     let first_inspection = inspect_container(&engine, &container_name)
         .expect("inspect first managed MCP app")
         .expect("first managed MCP app exists");

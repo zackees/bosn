@@ -26,9 +26,65 @@ pub struct ActEngineCreationProfile {
     pub tmp_tmpfs_bytes: u64,
     pub tmpfs_policy: ActEngineTmpfsPolicy,
     pub init_command_sha256: String,
+    /// The one named host volume an engine may mount (`bosn ci`'s
+    /// machine-wide cache). Absent for engines without it; omitted from the
+    /// serialized profile then, so earlier profiles and their digests are
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_volume: Option<ActEngineCacheVolume>,
+}
+/// A frozen named-volume mount: Docker's `local` driver, read-write, at
+/// `target`. The volume's ownership is verified before creation and the
+/// attachment after it, like a setup volume.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActEngineCacheVolume {
+    pub name: String,
+    pub target: String,
+}
+impl ActEngineCacheVolume {
+    pub fn validate(&self) -> Result<(), Error> {
+        let name_ok = (1..=64).contains(&self.name.len())
+            && self.name.bytes().enumerate().all(|(i, b)| {
+                b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || (i > 0 && matches!(b, b'-' | b'_' | b'.'))
+            });
+        // An absolute, normalized path outside the engine's private storage
+        // and tmpfs mounts.
+        let target = Path::new(&self.target);
+        let target_ok = self.target.len() <= 256
+            && target.is_absolute()
+            && target
+                .components()
+                .skip(1)
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+            && target.components().count() > 1
+            && !self.target.ends_with('/')
+            && ![
+                "/var/lib/docker",
+                "/run",
+                "/tmp",
+                "/proc",
+                "/sys",
+                "/dev",
+                "/etc",
+            ]
+            .iter()
+            .any(|reserved| {
+                target.starts_with(reserved) || Path::new(reserved).starts_with(target)
+            });
+        if !name_ok || !target_ok {
+            return Err(Error::BadRow("act cache volume"));
+        }
+        Ok(())
+    }
 }
 impl ActEngineCreationProfile {
     pub fn validate(&self) -> Result<(), Error> {
+        if let Some(cache) = &self.cache_volume {
+            cache.validate()?;
+        }
         let reserved = self
             .storage_bytes
             .checked_add(self.run_tmpfs_bytes)

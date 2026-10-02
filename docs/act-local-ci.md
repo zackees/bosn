@@ -57,15 +57,23 @@ the literal `ci-test` PR label, full PR to `ci-full`, and release to exact-SHA
 dispatch. Local simulation cannot prove GitHub's native Windows/macOS/embedded
 execution or the required real PR label-triggered runs.
 
-`bosn act run` and `bosn act report` fail closed. Act launched with the host
-Docker socket creates job containers and images outside Bosn's registry, even
-when the outer Act process runs in a Bosn-managed container. Execution needs
-an isolated engine whose entire lifecycle and storage are owned by Bosn, plus
-bounded serial logs and a complete coverage report, before these commands can
-be enabled. Do not use a host-socket task as evidence that nested resources
-are supervised.
+`bosn act run` and `bosn act report` are now deprecated aliases of
+`bosn ci run` and `bosn ci report` (see [docs/ci.md](ci.md)). Execution happens
+on a daemon-owned isolated engine whose whole lifecycle and storage are tracked
+by the registry. act never sees the host Docker socket. `bosn act plan` and
+`bosn act payload` keep working for one release and print a deprecation notice
+on stderr.
+
+`bosn ci` does not require a clean worktree. It snapshots uncommitted work and
+records the run as `sha + dirty: <tree digest>`. Only `--trigger release`
+requires a clean tree at the exact SHA. `bosn act plan` keeps its clean-tree
+receipt semantics.
 
 ## Execution milestones
+
+Milestones 2 and 3 are implemented by `bosn ci` (#323). Milestone 4's
+coverage rule is enforced: unsupported jobs make a run `incomplete`, never
+`success`.
 
 1. Define a repository adapter with a closed list of supported workflow/job
    IDs and exact event inputs. A PR adapter must build the event payload with

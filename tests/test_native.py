@@ -282,3 +282,38 @@ def test_native_setup_ensure_rejects_bad_input_and_missing_daemon_without_docker
             output_limit=4 * 1024,
         )
     assert "example.invalid" not in str(error.value)
+
+
+def test_native_ci_shares_the_mcp_contract_and_parses_eagerly(tmp_path: Path) -> None:
+    """``Client.ci`` dispatches the same typed tools as the bosn_ci_* MCP tools (#323)."""
+    import subprocess
+
+    repo = tmp_path / "repo"
+    (repo / ".github" / "workflows").mkdir(parents=True)
+    (repo / ".github" / "workflows" / "ci.yml").write_text("on: [push]\njobs: {}\n")
+    env = {
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+        "PATH": __import__("os").environ["PATH"],
+    }
+    for command in (
+        ["git", "init", "-q", "-b", "main"],
+        ["git", "add", "-A"],
+        ["git", "commit", "-qm", "init"],
+    ):
+        subprocess.run(command, cwd=repo, check=True, env=env)
+    client = bosn.Client(tmp_path / "state")
+    plan = client.ci("plan", workspace=str(repo), trigger="pr", mode="test")
+    assert plan["event"] == "pull_request"
+    assert plan["payload"]["pull_request"]["labels"] == [{"name": "ci-test"}]
+    assert plan["workflow"] == ".github/workflows/ci.yml"
+    assert plan["dirty"] is False
+    with pytest.raises(RuntimeError, match="unknown field"):
+        client.ci("plan", workspace=str(repo), bogus=1)
+    with pytest.raises(RuntimeError, match="unknown CI tool"):
+        client.ci("nope")
+    with pytest.raises(RuntimeError, match="daemon"):
+        client.ci("status", run="00000000-0000-4000-8000-000000000000")
+    assert not (tmp_path / "state").exists()

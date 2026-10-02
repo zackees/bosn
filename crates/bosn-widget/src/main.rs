@@ -1,0 +1,80 @@
+//! `bosn-widget`: bosn's floating desktop widget (#323 step 10).
+//!
+//! One user-session process owns every native window: a small bubble, a
+//! panel toggled from it, and one full-view dashboard window. Each is an
+//! isolated kernal-api webview (no IPC bridge) on a page the daemon serves;
+//! clicks go page -> daemon -> this process (`WidgetPoll`). The daemon stays
+//! headless and decides when the widget should exist.
+//!
+//! usage: bosn-widget [--state-dir DIR] [--autostart]
+//!   --autostart  started by the session (systemd/XDG), not typed by the
+//!                user: exits quietly when the user quit the widget earlier
+//!                in this graphical session.
+
+mod controller;
+mod notify;
+
+use std::path::PathBuf;
+
+use kernal_api::{async_engine::RuntimeBuilder, webview::ExternalWebviewHost};
+
+struct Args {
+    state_dir: PathBuf,
+    explicit: bool,
+}
+
+fn parse_args() -> Result<Args, String> {
+    let mut state_dir = None;
+    let mut explicit = true;
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("--state-dir") => {
+                state_dir = Some(PathBuf::from(args.next().ok_or("--state-dir needs a value")?));
+            }
+            Some("--autostart") => explicit = false,
+            _ => return Err("usage: bosn-widget [--state-dir DIR] [--autostart]".into()),
+        }
+    }
+    Ok(Args {
+        state_dir: state_dir.unwrap_or_else(bosn_service::mcp::default_state_dir),
+        explicit,
+    })
+}
+
+fn main() {
+    let args = match parse_args() {
+        Ok(args) => args,
+        Err(message) => {
+            eprintln!("bosn-widget: {message}");
+            std::process::exit(2);
+        }
+    };
+    // One widget per user: a second start asks the running one to show its
+    // bubble, then exits successfully.
+    let Some(lock) = controller::single_instance(&args.state_dir) else {
+        controller::ask_running_widget_to_show(&args.state_dir);
+        return;
+    };
+    let runtime = match RuntimeBuilder::multi_thread().worker_threads(2).enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("bosn-widget: no async runtime: {error}");
+            std::process::exit(1);
+        }
+    };
+    let host = match ExternalWebviewHost::new(runtime.handle()) {
+        Ok(host) => host,
+        Err(error) => {
+            eprintln!("bosn-widget: no webview (is WebKitGTK 4.1 installed?): {error:?}");
+            std::process::exit(1);
+        }
+    };
+    let client = host.client();
+    let _controller = runtime
+        .handle()
+        .launch(controller::run(client, args.state_dir.clone(), args.explicit));
+    let code = host.run();
+    drop(lock);
+    std::process::exit(code);
+}

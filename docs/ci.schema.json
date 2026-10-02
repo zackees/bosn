@@ -1,0 +1,1757 @@
+{
+  "$defs": {
+    "CacheUsage": {
+      "description": "The machine-wide cache volume (act tools, runner image, action\ncheckouts and the per-repository `actions/cache` store).",
+      "properties": {
+        "bytes": {
+          "description": "`None` when the volume does not exist.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "volume": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "volume"
+      ],
+      "type": "object"
+    },
+    "CancelReply": {
+      "properties": {
+        "cancelled": {
+          "type": "boolean"
+        },
+        "run": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/RunState"
+        }
+      },
+      "required": [
+        "run",
+        "cancelled",
+        "state"
+      ],
+      "type": "object"
+    },
+    "CiRequest": {
+      "description": "Every CI operation. Each maps to one typed handler; there is no generic\ncommand surface.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "submit",
+              "type": "string"
+            },
+            "request": {
+              "$ref": "#/$defs/SubmitRequest"
+            }
+          },
+          "required": [
+            "op",
+            "request"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "limit": {
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "op": {
+              "const": "list",
+              "type": "string"
+            },
+            "state": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/RunState"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "workspace": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "show",
+              "type": "string"
+            },
+            "run": {
+              "type": "string"
+            },
+            "tree": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "op",
+            "run"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "job": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "limit": {
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "max_bytes": {
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "op": {
+              "const": "logs",
+              "type": "string"
+            },
+            "run": {
+              "type": "string"
+            },
+            "section": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "since_seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "op",
+            "run"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "cancel",
+              "type": "string"
+            },
+            "run": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "run"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "job": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "op": {
+              "const": "retry",
+              "type": "string"
+            },
+            "run": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "run"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "report",
+              "type": "string"
+            },
+            "run": {
+              "type": "string"
+            },
+            "tail": {
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "op",
+            "run"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/RunnerAction"
+            },
+            "op": {
+              "const": "runners",
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "action"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A widget process starting (`explicit` = typed by the user).",
+          "properties": {
+            "explicit": {
+              "type": "boolean"
+            },
+            "op": {
+              "const": "widget_hello",
+              "type": "string"
+            },
+            "pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "session": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "pid",
+            "session",
+            "explicit"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The widget's heartbeat; the reply carries its pending commands.",
+          "properties": {
+            "op": {
+              "const": "widget_poll",
+              "type": "string"
+            },
+            "pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "op",
+            "pid"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A deliberate quit from the widget's menu.",
+          "properties": {
+            "op": {
+              "const": "widget_dismiss",
+              "type": "string"
+            },
+            "session": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "session"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Queue a command for the widget (from the dashboard or `bosn ui`).",
+          "properties": {
+            "command": {
+              "$ref": "#/$defs/WidgetCommand"
+            },
+            "op": {
+              "const": "widget_command",
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "command"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A single-use dashboard link (only from the owner-only socket).",
+          "properties": {
+            "op": {
+              "const": "ui_grant",
+              "type": "string"
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Conclusion": {
+      "description": "Run conclusion. Exit codes: success 0, failure/error 1,\ncancelled/timed_out 2, refused/incomplete 3.",
+      "oneOf": [
+        {
+          "enum": [
+            "success",
+            "failure",
+            "cancelled",
+            "timed_out",
+            "refused"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "incomplete",
+          "description": "Some jobs could not run here, or none succeeded; never a pass.",
+          "type": "string"
+        },
+        {
+          "const": "error",
+          "description": "The engine or its cleanup failed; never a pass.",
+          "type": "string"
+        }
+      ]
+    },
+    "ErrorReply": {
+      "description": "A refused or failed request. `code` is stable (`refused`, `not_found`,\n`invalid_request`, `internal`).",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "FailureReport": {
+      "properties": {
+        "exit_code": {
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "job": {
+          "type": "string"
+        },
+        "job_name": {
+          "type": "string"
+        },
+        "section": {
+          "description": "`<stage>:<step id>`, usable as `ci logs --step`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "step": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tail": {
+          "description": "The last lines of that one step only.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "job",
+        "job_name",
+        "tail"
+      ],
+      "type": "object"
+    },
+    "Group": {
+      "properties": {
+        "jobs": {
+          "items": {
+            "$ref": "#/$defs/Job"
+          },
+          "type": "array"
+        },
+        "name": {
+          "description": "GitHub: the `needs:` stage index; GitLab: the stage name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "jobs"
+      ],
+      "type": "object"
+    },
+    "ItemConclusion": {
+      "description": "Outcome of one job or section once completed.",
+      "oneOf": [
+        {
+          "enum": [
+            "success",
+            "failure",
+            "cancelled",
+            "skipped"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "unsupported",
+          "description": "The job needs a runner bosn cannot supervise (`runs-on: macos-*`).",
+          "type": "string"
+        }
+      ]
+    },
+    "ItemStatus": {
+      "description": "Lifecycle of one job or section.",
+      "enum": [
+        "queued",
+        "in_progress",
+        "completed"
+      ],
+      "type": "string"
+    },
+    "Job": {
+      "properties": {
+        "conclusion": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ItemConclusion"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "job_id": {
+          "description": "Workflow job ID shared by matrix legs.",
+          "type": "string"
+        },
+        "key": {
+          "description": "Unique per run: GitHub job x matrix leg (act's `job` field).",
+          "type": "string"
+        },
+        "matrix": true,
+        "name": {
+          "type": "string"
+        },
+        "sections": {
+          "items": {
+            "$ref": "#/$defs/Section"
+          },
+          "type": "array"
+        },
+        "status": {
+          "$ref": "#/$defs/ItemStatus"
+        }
+      },
+      "required": [
+        "key",
+        "job_id",
+        "name",
+        "status",
+        "sections"
+      ],
+      "type": "object"
+    },
+    "JobCounts": {
+      "properties": {
+        "completed": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "failed": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "total",
+        "completed",
+        "failed"
+      ],
+      "type": "object"
+    },
+    "JobOutcomes": {
+      "properties": {
+        "cancelled": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "failed": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "skipped": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "succeeded": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unsupported": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "succeeded",
+        "failed",
+        "cancelled",
+        "skipped",
+        "unsupported"
+      ],
+      "type": "object"
+    },
+    "ListReply": {
+      "properties": {
+        "runners": {
+          "$ref": "#/$defs/RunnerStatus"
+        },
+        "runs": {
+          "items": {
+            "$ref": "#/$defs/RunView"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "runs",
+        "runners"
+      ],
+      "type": "object"
+    },
+    "LogRecord": {
+      "description": "One persisted log record. `seq` is the run-wide, gap-free cursor space.",
+      "properties": {
+        "job": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "section": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "seq": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "stream": {
+          "description": "`stdout`, `stderr` or `bosn` (daemon lifecycle notes).",
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "seq",
+        "stream",
+        "text"
+      ],
+      "type": "object"
+    },
+    "LogsReply": {
+      "properties": {
+        "done": {
+          "description": "The run finished: no further records will appear.",
+          "type": "boolean"
+        },
+        "more": {
+          "description": "More records are available now.",
+          "type": "boolean"
+        },
+        "next_seq": {
+          "description": "Cursor for the next call (`since_seq`).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "records": {
+          "items": {
+            "$ref": "#/$defs/LogRecord"
+          },
+          "type": "array"
+        },
+        "run": {
+          "type": "string"
+        },
+        "total_records": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "run",
+        "records",
+        "next_seq",
+        "total_records",
+        "more",
+        "done"
+      ],
+      "type": "object"
+    },
+    "Mode": {
+      "description": "How much of the CI to run (fleet `ci-test`/`ci-full` tiers).",
+      "enum": [
+        "minimal",
+        "test",
+        "full"
+      ],
+      "type": "string"
+    },
+    "Plan": {
+      "description": "What `bosn ci run` would execute (`bosn ci plan`).",
+      "properties": {
+        "actor": {
+          "type": "string"
+        },
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirty": {
+          "type": "boolean"
+        },
+        "engine": {
+          "type": "string"
+        },
+        "event": {
+          "type": "string"
+        },
+        "job": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "$ref": "#/$defs/Mode"
+        },
+        "payload": {
+          "description": "The provider event payload, as act receives it."
+        },
+        "provider": {
+          "$ref": "#/$defs/Provider"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "schema_version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sha": {
+          "type": "string"
+        },
+        "trigger": {
+          "$ref": "#/$defs/Trigger"
+        },
+        "workflow": {
+          "type": "string"
+        },
+        "workspace": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "workspace",
+        "provider",
+        "engine",
+        "workflow",
+        "trigger",
+        "mode",
+        "event",
+        "payload",
+        "repository",
+        "sha",
+        "dirty",
+        "actor"
+      ],
+      "type": "object"
+    },
+    "Provider": {
+      "description": "The CI syntax: GitHub workflows now, `.gitlab-ci.yml` later.",
+      "enum": [
+        "github",
+        "gitlab"
+      ],
+      "type": "string"
+    },
+    "RunEvent": {
+      "oneOf": [
+        {
+          "description": "A run's state, conclusion or progress changed.",
+          "properties": {
+            "actor": {
+              "type": "string"
+            },
+            "conclusion": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Conclusion"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "jobs": {
+              "$ref": "#/$defs/JobCounts"
+            },
+            "log_records": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "run": {
+              "type": "string"
+            },
+            "state": {
+              "$ref": "#/$defs/RunState"
+            },
+            "type": {
+              "const": "run",
+              "type": "string"
+            },
+            "workspace": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "run",
+            "state",
+            "log_records",
+            "jobs",
+            "actor",
+            "workspace"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "This reader missed `skipped` events: refetch everything.",
+          "properties": {
+            "skipped": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "resync",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "skipped"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "RunReport": {
+      "description": "The `ci report --json` agent contract.",
+      "properties": {
+        "actor": {
+          "type": "string"
+        },
+        "cleanup": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "conclusion": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Conclusion"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "coverage_complete": {
+          "description": "False when any job needed a runner bosn cannot supervise.",
+          "type": "boolean"
+        },
+        "dirty": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "exit_code": {
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "first_failure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FailureReport"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "jobs": {
+          "$ref": "#/$defs/JobOutcomes"
+        },
+        "logs_command": {
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/Mode"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run": {
+          "type": "string"
+        },
+        "schema_version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sha": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/RunState"
+        },
+        "trigger": {
+          "$ref": "#/$defs/Trigger"
+        },
+        "ui_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workflow": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "run",
+        "state",
+        "sha",
+        "workflow",
+        "trigger",
+        "mode",
+        "actor",
+        "jobs",
+        "coverage_complete",
+        "logs_command"
+      ],
+      "type": "object"
+    },
+    "RunState": {
+      "description": "Where a run is in its life.",
+      "enum": [
+        "queued",
+        "running",
+        "done"
+      ],
+      "type": "string"
+    },
+    "RunTree": {
+      "properties": {
+        "groups": {
+          "items": {
+            "$ref": "#/$defs/Group"
+          },
+          "type": "array"
+        },
+        "malformed_lines": {
+          "description": "Lines that were not valid provider records (counted, never fatal).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "groups",
+        "malformed_lines"
+      ],
+      "type": "object"
+    },
+    "RunView": {
+      "description": "A run as clients see it: the record plus fields derived from it. Listings\nomit the job tree (`record.tree` is then empty).",
+      "properties": {
+        "act_exit_code": {
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "act_version": {
+          "type": "string"
+        },
+        "actor": {
+          "type": "string"
+        },
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cleanup": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "conclusion": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Conclusion"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "created_at": {
+          "format": "double",
+          "type": "number"
+        },
+        "dirty": {
+          "description": "Tree digest when the run used uncommitted work (`sha + dirty`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "engine": {
+          "type": "string"
+        },
+        "engine_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "event": {
+          "type": "string"
+        },
+        "exit_code": {
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "finished_at": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "job": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "jobs": {
+          "$ref": "#/$defs/JobCounts"
+        },
+        "log_records": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mode": {
+          "$ref": "#/$defs/Mode"
+        },
+        "payload_sha256": {
+          "type": "string"
+        },
+        "provider": {
+          "$ref": "#/$defs/Provider"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repository": {
+          "type": "string"
+        },
+        "retry_of": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runner_image": {
+          "type": "string"
+        },
+        "schema_version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "secrets": {
+          "default": [],
+          "description": "Opt-in secret names; values never leave the daemon's secret store.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "sha": {
+          "type": "string"
+        },
+        "started_at": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/RunState"
+        },
+        "submitters": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "timeout_secs": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tree": {
+          "$ref": "#/$defs/RunTree",
+          "default": {
+            "groups": [],
+            "malformed_lines": 0
+          }
+        },
+        "tree_digest": {
+          "type": "string"
+        },
+        "trigger": {
+          "$ref": "#/$defs/Trigger"
+        },
+        "workflow": {
+          "type": "string"
+        },
+        "workspace": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "id",
+        "provider",
+        "engine",
+        "workspace",
+        "repository",
+        "sha",
+        "tree_digest",
+        "workflow",
+        "trigger",
+        "mode",
+        "actor",
+        "event",
+        "payload_sha256",
+        "state",
+        "created_at",
+        "act_version",
+        "runner_image",
+        "submitters",
+        "timeout_secs",
+        "log_records",
+        "jobs"
+      ],
+      "type": "object"
+    },
+    "RunnerAction": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "const": "list",
+              "type": "string"
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "const": "drain",
+              "type": "string"
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "const": "resume",
+              "type": "string"
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "const": "set_limit",
+              "type": "string"
+            },
+            "limit": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "action",
+            "limit"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "const": "prune_cache",
+              "type": "string"
+            },
+            "max_bytes": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "older_than_secs": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Measure the machine-wide cache volume.",
+          "properties": {
+            "action": {
+              "const": "cache_usage",
+              "type": "string"
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Remove the machine-wide cache volume (refused while a run executes).",
+          "properties": {
+            "action": {
+              "const": "clear_cache",
+              "type": "string"
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "RunnerStatus": {
+      "properties": {
+        "act_version": {
+          "type": "string"
+        },
+        "drained": {
+          "type": "boolean"
+        },
+        "engine": {
+          "type": "string"
+        },
+        "limit": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "queued": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "running": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "widget": {
+          "$ref": "#/$defs/WidgetPresence",
+          "description": "Whether the desktop widget is running."
+        }
+      },
+      "required": [
+        "limit",
+        "running",
+        "queued",
+        "drained",
+        "engine",
+        "act_version",
+        "widget"
+      ],
+      "type": "object"
+    },
+    "RunnersReply": {
+      "properties": {
+        "cache": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CacheUsage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Set by `cache_usage` and `clear_cache`."
+        },
+        "pruned_runs": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "runners": {
+          "$ref": "#/$defs/RunnerStatus"
+        }
+      },
+      "required": [
+        "runners"
+      ],
+      "type": "object"
+    },
+    "Section": {
+      "properties": {
+        "conclusion": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ItemConclusion"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "duration_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "exit_code": {
+          "description": "Exit code reported for a failing step, when the provider names one.",
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "first_seq": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Provider step identity; nested composite steps are joined with `/`.",
+          "type": "string"
+        },
+        "last_seq": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "stage": {
+          "description": "`Setup`, `Pre`, `Main`, `Post` or `Complete` for GitHub.",
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/ItemStatus"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "stage",
+        "status"
+      ],
+      "type": "object"
+    },
+    "SubmitReply": {
+      "properties": {
+        "coalesced": {
+          "description": "True when an identical run was already queued or running.",
+          "type": "boolean"
+        },
+        "queue_position": {
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "record": {
+          "$ref": "#/$defs/RunView"
+        },
+        "run": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "run",
+        "coalesced",
+        "record"
+      ],
+      "type": "object"
+    },
+    "SubmitRequest": {
+      "additionalProperties": false,
+      "description": "A submission. Built by [`crate::Client::ci_submit`] after it snapshots the\nworkspace into the daemon's staging area.",
+      "properties": {
+        "actor": {
+          "type": "string"
+        },
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dirty": {
+          "type": "boolean"
+        },
+        "engine": {
+          "type": "string"
+        },
+        "job": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "$ref": "#/$defs/Mode"
+        },
+        "origin": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pr_number": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "provider": {
+          "$ref": "#/$defs/Provider"
+        },
+        "secrets": {
+          "default": [],
+          "description": "Opt-in daemon-owned secrets by name (only `github_token`).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "sha": {
+          "type": "string"
+        },
+        "staging": {
+          "type": "string"
+        },
+        "timeout_secs": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tree_digest": {
+          "type": "string"
+        },
+        "trigger": {
+          "$ref": "#/$defs/Trigger"
+        },
+        "workflow": {
+          "type": "string"
+        },
+        "workspace": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "staging",
+        "workspace",
+        "provider",
+        "engine",
+        "workflow",
+        "trigger",
+        "mode",
+        "actor",
+        "sha",
+        "tree_digest",
+        "dirty"
+      ],
+      "type": "object"
+    },
+    "Trigger": {
+      "description": "bosn's trigger vocabulary, mapped per provider.",
+      "enum": [
+        "pr",
+        "push",
+        "release"
+      ],
+      "type": "string"
+    },
+    "UiGrantReply": {
+      "description": "A single-use link that signs a browser in to the dashboard.",
+      "properties": {
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    },
+    "WidgetCommand": {
+      "description": "What the widget process should do next.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Show or hide the panel.",
+          "properties": {
+            "command": {
+              "const": "toggle",
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Show the bubble (a second `bosn widget` asked for it).",
+          "properties": {
+            "command": {
+              "const": "show",
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Open or focus the full-view window on a dashboard path.",
+          "properties": {
+            "command": {
+              "const": "open",
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command",
+            "path"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Open an allowlisted external URL with the OS opener.",
+          "properties": {
+            "command": {
+              "const": "open_external",
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command",
+            "url"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "WidgetPresence": {
+      "description": "Whether a widget is running, gone, or deliberately quit.",
+      "enum": [
+        "connected",
+        "absent",
+        "dismissed"
+      ],
+      "type": "string"
+    },
+    "WidgetReply": {
+      "description": "The daemon's answer to a widget request.",
+      "properties": {
+        "allowed": {
+          "description": "False when an auto-launched widget should exit (dismissed session).",
+          "type": "boolean"
+        },
+        "commands": {
+          "items": {
+            "$ref": "#/$defs/WidgetCommand"
+          },
+          "type": "array"
+        },
+        "presence": {
+          "$ref": "#/$defs/WidgetPresence"
+        }
+      },
+      "required": [
+        "presence",
+        "allowed",
+        "commands"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Requests (`bosn ci`, MCP `bosn_ci_*`, the dashboard API), their typed replies, the live event and the error document. `--json` CLI output is the reply of the matching operation.",
+  "properties": {
+    "error": {
+      "$ref": "#/$defs/ErrorReply"
+    },
+    "event": {
+      "$ref": "#/$defs/RunEvent"
+    },
+    "replies": {
+      "properties": {
+        "cancel": {
+          "$ref": "#/$defs/CancelReply"
+        },
+        "list": {
+          "$ref": "#/$defs/ListReply"
+        },
+        "logs": {
+          "$ref": "#/$defs/LogsReply"
+        },
+        "plan": {
+          "$ref": "#/$defs/Plan"
+        },
+        "report": {
+          "$ref": "#/$defs/RunReport"
+        },
+        "retry": {
+          "$ref": "#/$defs/SubmitReply"
+        },
+        "runners": {
+          "$ref": "#/$defs/RunnersReply"
+        },
+        "show": {
+          "$ref": "#/$defs/RunView"
+        },
+        "submit": {
+          "$ref": "#/$defs/SubmitReply"
+        },
+        "ui_grant": {
+          "$ref": "#/$defs/UiGrantReply"
+        },
+        "widget": {
+          "$ref": "#/$defs/WidgetReply"
+        }
+      },
+      "type": "object"
+    },
+    "request": {
+      "$ref": "#/$defs/CiRequest"
+    }
+  },
+  "title": "bosn ci",
+  "type": "object",
+  "x-schema-version": 1
+}

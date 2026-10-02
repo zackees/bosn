@@ -77,6 +77,10 @@ pub enum ActRegistryCommand {
         after_run_id: Option<String>,
         limit: usize,
     },
+    /// Latest state snapshot for one run (read-only).
+    Get {
+        run: String,
+    },
 }
 #[derive(Debug)]
 pub enum ActRegistryReply {
@@ -85,6 +89,7 @@ pub enum ActRegistryReply {
     Verified(Box<ActEngineRecord>),
     Claimed(Box<ActEngineRecord>),
     Recovery(ActEngineRecoveryPage),
+    Record(Option<Box<ActEngineRecord>>),
 }
 
 impl RegistryActor {
@@ -166,6 +171,11 @@ pub(crate) fn apply(
             .pending_act_engines(after_run_id.as_deref(), limit)
             .map(ActRegistryReply::Recovery);
     }
+    if let ActRegistryCommand::Get { run } = command {
+        return registry
+            .act_engine(&run)
+            .map(|record| ActRegistryReply::Record(record.map(Box::new)));
+    }
     let mut transaction = registry.begin_immediate()?;
     let reply = match command {
         ActRegistryCommand::Begin(intent) => {
@@ -236,6 +246,7 @@ pub(crate) fn apply(
             ActRegistryReply::Committed
         }
         ActRegistryCommand::Pending { .. }
+        | ActRegistryCommand::Get { .. }
         | ActRegistryCommand::StartupInterrupt { .. }
         | ActRegistryCommand::SealStartup => {
             unreachable!("startup/read handled before transaction")
@@ -277,6 +288,7 @@ mod tests {
                 tmp_tmpfs_bytes: 64 << 20,
                 tmpfs_policy: bosn_registry::act::ActEngineTmpfsPolicy::StorageExecRunTmpNoexecV1,
                 init_command_sha256: "a".repeat(64),
+                cache_volume: None,
             }),
         };
         let runtime = kernal_api::async_engine::RuntimeBuilder::multi_thread()
@@ -408,6 +420,7 @@ mod tests {
                 tmp_tmpfs_bytes: 64 << 20,
                 tmpfs_policy: bosn_registry::act::ActEngineTmpfsPolicy::StorageExecRunTmpNoexecV1,
                 init_command_sha256: "a".repeat(64),
+                cache_volume: None,
             }),
         }
     }

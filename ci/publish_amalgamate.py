@@ -26,6 +26,8 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+import tomllib
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -100,16 +102,11 @@ def prepare_bosn_crate_for_publish(
             target.write_text(text, encoding="utf-8")
             relocate_includes(target, original=original, crate_dir=crate_dir, facade=facade)
 
-    cli = facade_src / "bin" / CLI_BINARY.name
-    cli.parent.mkdir(parents=True, exist_ok=True)
-    cli.write_text(
-        rewrite_binary_source(
-            (root / "crates" / CLI_CRATE / CLI_BINARY).read_text(encoding="utf-8"),
-            module_map=module_map,
-        ),
-        encoding="utf-8",
-    )
+    copy_cli_binary(root / "crates" / CLI_CRATE / CLI_BINARY, facade_src / "bin", module_map)
 
+    gaps = facade_dependency_gaps(root, modules)
+    if gaps:
+        raise RuntimeError("the facade does not cover its internal crates: " + "; ".join(gaps))
     write_publish_lib_rs(facade_src, modules)
     rewrite_bosn_manifest(facade / "Cargo.toml", module_map)
     assert_publish_crate_is_self_contained(facade, module_map)
@@ -141,6 +138,23 @@ def rewrite_rust_source_for_amalgamation(
         text = re.sub(rf"\b{re.escape(ident)}::", f"crate::{target}::", text)
         text = re.sub(rf"\b{re.escape(ident)}\b", f"crate::{target}", text)
     return text
+
+
+def copy_cli_binary(source: Path, target_bin: Path, module_map: dict[str, str]) -> None:
+    """Carry the CLI and its `#[path = "<stem>/..."]` submodule directory across."""
+
+    submodules = source.parent / source.stem
+    shipped = target_bin / source.stem
+    if shipped.exists():
+        shutil.rmtree(shipped)
+    files = [source, *sorted(submodules.rglob("*.rs"))] if submodules.is_dir() else [source]
+    for path in files:
+        target = target_bin / path.relative_to(source.parent)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            rewrite_binary_source(path.read_text(encoding="utf-8"), module_map=module_map),
+            encoding="utf-8",
+        )
 
 
 def rewrite_binary_source(text: str, *, module_map: dict[str, str]) -> str:
@@ -238,6 +252,43 @@ def rewrite_feature_items(text: str, feature: str, *, remove: set[str]) -> str:
     items = [item for item in re.findall(r'"([^"]+)"', match.group(1)) if item not in remove]
     rendered = ", ".join(f'"{item}"' for item in items)
     return text[: match.start()] + f"{feature} = [{rendered}]" + text[match.end() :]
+
+
+def _dependencies(manifest: Path) -> dict[str, set[str]]:
+    """External dependencies of a manifest, each with the features it enables."""
+    data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+    tables = [data.get("dependencies", {})]
+    tables += [target.get("dependencies", {}) for target in data.get("target", {}).values()]
+    found: dict[str, set[str]] = {}
+    for table in tables:
+        for name, spec in table.items():
+            features = spec.get("features", []) if isinstance(spec, dict) else []
+            found.setdefault(name, set()).update(features)
+    return found
+
+
+def facade_dependency_gaps(root: Path, modules: Sequence[AmalgamatedModule]) -> list[str]:
+    """What the internal crates need that the facade's manifest does not give.
+
+    In the workspace Cargo unifies features across crates, so a missing one
+    only breaks the published crate; this check catches it before then.
+    """
+    internal = {module.crate for module in modules}
+    facade = _dependencies(root / "crates" / "bosn" / "Cargo.toml")
+    gaps = []
+    for module in modules:
+        needed = _dependencies(root / "crates" / module.crate / "Cargo.toml")
+        for name, features in sorted(needed.items()):
+            if name in internal:
+                continue
+            if name not in facade:
+                gaps.append(f"{module.crate} needs {name}")
+                continue
+            gaps.extend(
+                f"{module.crate} needs {name} feature {feature}"
+                for feature in sorted(features - facade[name])
+            )
+    return gaps
 
 
 def assert_publish_crate_is_self_contained(facade: Path, module_map: dict[str, str]) -> None:

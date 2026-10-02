@@ -1,0 +1,18 @@
+name: spike
+on: [push]
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        leg: [one, two]
+    steps:
+      - run: echo hello ${{ matrix.leg }}
+      - if: false
+        run: echo skipped
+  b:
+    needs: a
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo before
+      - run: exit 3

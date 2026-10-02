@@ -36,11 +36,12 @@ bosn-service = { path = "../bosn-service" }
 # The union of the internal crates' external dependencies, so the amalgamated
 # crate builds from crates.io alone. Keep in step with their manifests;
 # `ci/publish_amalgamate.py` refuses a copy whose sources need anything else.
-kernal-api = { version = "=0.1.14", default-features = false, features = ["daemon-frame-v1", "fs", "hash-sha256", "http-client", "http-server", "ipc", "ipc-async", "secure-random", "sqlite"] }
+kernal-api = { version = "=0.1.14", default-features = false, features = ["archive", "daemon-frame-v1", "event-stream", "fs", "hash-sha256", "http-client", "http-server", "ipc", "ipc-async", "secure-random", "sqlite"] }
 libc = { version = "=0.2.189", optional = true }
 prost = "=0.14.4"
+schemars = "=1.2.2"
 serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = "=1.0.149"
+serde_json = { version = "=1.0.149", features = ["float_roundtrip"] }
 serde_yaml = "=0.9.34"
 sha2 = "=0.10.9"
 toml = "=0.8.23"

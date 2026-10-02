@@ -143,6 +143,23 @@ def test_an_include_outside_the_crate_is_refused(tmp_path: Path) -> None:
         )
 
 
+def test_a_dependency_feature_the_facade_lacks_is_refused(tmp_path: Path) -> None:
+    crates = tmp_path / "crates"
+    (crates / "bosn").mkdir(parents=True)
+    (crates / "bosn" / "Cargo.toml").write_text(
+        '[dependencies]\nserde_json = "=1.0.149"\n', encoding="utf-8"
+    )
+    (crates / "bosn-core").mkdir()
+    (crates / "bosn-core" / "Cargo.toml").write_text(
+        '[dependencies]\nserde_json = { version = "=1.0.149", features = ["float_roundtrip"] }\n',
+        encoding="utf-8",
+    )
+    modules = (amalgamate.AmalgamatedModule("bosn-core", "core"),)
+    assert amalgamate.facade_dependency_gaps(tmp_path, modules) == [
+        "bosn-core needs serde_json feature float_roundtrip"
+    ]
+
+
 # --- the real tree --------------------------------------------------------------
 
 
@@ -168,6 +185,23 @@ def test_the_real_tree_amalgamates_into_one_crate(amalgamated: Path) -> None:
     manifest = (amalgamated / "Cargo.toml").read_text(encoding="utf-8")
     for crate in MODULE_MAP:
         assert not re.search(rf"^{re.escape(crate)}\s*=", manifest, re.MULTILINE)
+
+
+def test_the_facade_covers_every_internal_dependency_and_feature() -> None:
+    # In the workspace Cargo unifies features across crates, so a gap only
+    # shows up in the published crate (#323: float_roundtrip on serde_json).
+    assert amalgamate.facade_dependency_gaps(Path("."), amalgamate.INTERNAL_MODULES) == []
+
+
+def test_every_cli_submodule_ships_with_the_cli(amalgamated: Path) -> None:
+    """`bosn.rs` declares `#[path = "bosn/x.rs"] mod x;`; each must resolve (#326)."""
+    cli = amalgamated / "src" / "bin" / "bosn.rs"
+    declared = re.findall(r'#\[path = "([^"]+)"\]', cli.read_text(encoding="utf-8"))
+    assert declared, "the CLI has path-declared submodules"
+    for relative in declared:
+        module = cli.parent / relative
+        assert module.is_file(), module
+        assert "bosn_service" not in module.read_text(encoding="utf-8"), module
 
 
 def test_every_include_in_the_real_tree_still_resolves(amalgamated: Path) -> None:

@@ -28,6 +28,7 @@ def test_every_repo_manifest_uses_the_published_kernel() -> None:
         "bosn-registry",
         "bosn-service",
         "bosn-setup",
+        "bosn-widget",
     }
     for crate in sorted(manifests):
         assert verify(Path("crates") / crate / "Cargo.toml") == [], crate

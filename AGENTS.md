@@ -18,6 +18,20 @@ pretag gate. **Do not use that path for a new release** until the gate is
 implemented. The release section below documents existing behavior, not an
 approved release procedure.
 
+## Code rules (hard gates in `./lint`)
+
+- **Single responsibility and DRY.** Parse inputs eagerly into typed structs
+  and enums at the boundary; never probe untyped JSON for fields.
+- **Every Rust, Python and shell file stays under 1,000 lines**
+  (`ci/lint_file_length.py`). Split by responsibility; never raise the limit.
+- **Write a path once.** Within a file, a directory appears in at most one
+  `include_str!`/`include_bytes!` path. Several files from one directory go
+  through one base macro, e.g.
+  `macro_rules! asset { ($n:literal) => { include_str!(concat!("assets/", $n)) }; }`,
+  and a file used more than once is bound to one `const`
+  (`ci/lint_include_base.py`). A `concat!` base must stay inside the crate's
+  `src/`, because `ci/publish_amalgamate.py` only relocates literal includes.
+
 ## Python packaging
 
 - **The extension is `abi3-py310`. Always. Only.** `crates/bosn-python/Cargo.toml`

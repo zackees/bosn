@@ -17,6 +17,12 @@ CHECKS: list[list[str]] = [
     [sys.executable, str(ROOT / "ci" / "lint_kbi.py")],
     [sys.executable, str(ROOT / "ci" / "lint_no_macos_runners.py")],
     [sys.executable, str(ROOT / "ci" / "lint_no_vcpkg_bootstrap.py")],
+    # The CLI/daemon/wheels never link a webview toolkit (the widget builds alone).
+    [sys.executable, str(ROOT / "ci" / "lint_no_webview_in_core.py")],
+    # Hard gate: every Rust/Python/shell source file stays under 1,000 lines.
+    [sys.executable, str(ROOT / "ci" / "lint_file_length.py")],
+    # DRY: an embedded file's directory is written once per file (one base macro).
+    [sys.executable, str(ROOT / "ci" / "lint_include_base.py")],
 ]
 
 

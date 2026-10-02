@@ -1,0 +1,30 @@
+:root { --fg: #1d1d1f; --muted: #6b6b70; --bg: #ffffff; --line: #e3e3e1;
+  --ok: #1a7f37; --fail: #c62828; --warn: #9a6700; --run: #0b5cad;
+  font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg: #e8e8ea; --muted: #9a9aa0; --bg: #1b1b1e; --line: #2a2a2e;
+          --ok: #4ac26b; --fail: #ff6b6b; --warn: #d4a72c; --run: #6cb6ff; } }
+* { box-sizing: border-box; }
+body { margin: 0; color: var(--fg); background: var(--bg); }
+body.bubble { background: transparent; display: grid; place-items: center; height: 100vh; }
+#ring { width: 52px; height: 52px; border-radius: 50%; border: 4px solid var(--muted);
+        background: var(--bg); color: var(--fg); cursor: pointer; display: grid; place-items: center; padding: 0; }
+#ring.running { border-color: var(--run); } #ring.failed { border-color: var(--fail); }
+#ring.queued { border-color: var(--warn); } #ring.ok { border-color: var(--ok); }
+#ring:focus-visible { outline: 2px solid var(--run); outline-offset: 2px; }
+#count { font-weight: 700; font-size: 15px; line-height: 1; }
+.label { font-size: 8px; color: var(--muted); line-height: 1; }
+body.panel { padding: 10px; }
+header { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.controls { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
+button { font: inherit; padding: 2px 8px; border: 1px solid var(--line); border-radius: 6px;
+         background: var(--bg); color: var(--fg); cursor: pointer; }
+ul { list-style: none; padding: 0; margin: 0; }
+#runs li { border-top: 1px solid var(--line); padding: 6px 0; display: flex; gap: 6px; align-items: start; }
+#runs li > button:first-child { border: 0; flex: 1; text-align: left; padding: 0; display: grid; gap: 1px; }
+#runs li > .row-action { flex: none; font-size: 11px; }
+.controls input { width: 3.5em; }
+button.confirming { border-color: var(--fail); color: var(--fail); }
+.meta { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.success { color: var(--ok); } .failure, .error, .timed_out { color: var(--fail); }
+.running { color: var(--run); } .queued, .cancelled, .incomplete, .refused { color: var(--warn); }

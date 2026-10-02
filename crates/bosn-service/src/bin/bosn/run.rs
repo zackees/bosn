@@ -355,7 +355,11 @@ fn execute(arguments: RunArguments) -> Result<i32, String> {
 }
 
 /// Start `bosn daemon serve` for this state directory when none answers.
-fn ensure_daemon(runtime: &Runtime, client: &Client, state_dir: &Path) -> Result<(), String> {
+pub(crate) fn ensure_daemon(
+    runtime: &Runtime,
+    client: &Client,
+    state_dir: &Path,
+) -> Result<(), String> {
     if let Ok(version) = runtime.run(client.daemon_version()) {
         return matching_daemon(state_dir, &version);
     }
@@ -379,10 +383,7 @@ fn ensure_daemon(runtime: &Runtime, client: &Client, state_dir: &Path) -> Result
         if let Ok(version) = runtime.run(client.daemon_version()) {
             // Another session may have won the start race with its own binary.
             matching_daemon(state_dir, &version)?;
-            eprintln!(
-                "bosn run: started the bosn daemon for {}",
-                state_dir.display()
-            );
+            eprintln!("bosn: started the bosn daemon for {}", state_dir.display());
             return Ok(());
         }
         if let Ok(Some(_)) = child.try_wait() {
