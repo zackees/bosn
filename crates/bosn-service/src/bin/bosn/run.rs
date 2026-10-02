@@ -24,6 +24,11 @@ pub const DEFAULT_ENSURE_DEADLINE: Duration = Duration::from_secs(60 * 60);
 /// Default budget for the declared task (a full CI job under `act`).
 pub const DEFAULT_TASK_DEADLINE: Duration = Duration::from_secs(2 * 60 * 60);
 const DAEMON_START_WAIT: Duration = Duration::from_secs(20);
+/// The task job is cancelled once this client has not polled it for this
+/// long (#357): a `bosn run` killed by SIGTERM, SIGHUP or SIGKILL no longer
+/// leaves its job running to the deadline. Polls happen every
+/// [`POLL_INTERVAL`], so a live client never comes close.
+pub const FOLLOW_LEASE: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Exit status for a Bosn-side failure (as opposed to the task's own status).
 const EXIT_BOSN_FAILURE: i32 = 1;
@@ -297,7 +302,7 @@ fn execute(arguments: RunArguments) -> Result<i32, String> {
                 output_limit: arguments.output_limit,
             }))
             .map_err(|error| format!("manifest ensure was refused: {error}"))?;
-        let status = follow_job(&runtime, &client, job, false)?;
+        let status = follow_job(&runtime, &client, &state_dir, job, false)?;
         match status.state.as_str() {
             "Succeeded" => {}
             "Cancelled" => return Ok(EXIT_INTERRUPTED),
@@ -316,16 +321,20 @@ fn execute(arguments: RunArguments) -> Result<i32, String> {
     };
     eprintln!("bosn run: running task {task} in stack {stack}");
     let job = runtime
-        .run(client.submit_manifest_app_task(ManifestAppTaskJobRequest {
-            workspace,
-            manifest,
-            stack,
-            task_name: task.clone(),
-            deadline: arguments.deadline.unwrap_or(DEFAULT_TASK_DEADLINE),
-            output_limit: arguments.output_limit,
-        }))
+        .run(client.follow_manifest_app_task(
+            ManifestAppTaskJobRequest {
+                workspace,
+                manifest,
+                stack,
+                task_name: task.clone(),
+                deadline: arguments.deadline.unwrap_or(DEFAULT_TASK_DEADLINE),
+                output_limit: arguments.output_limit,
+            },
+            FOLLOW_LEASE,
+        ))
         .map_err(|error| format!("manifest app task was refused: {error}"))?;
-    let status = follow_job(&runtime, &client, job, true)?;
+    eprintln!("{}", job_banner(job, &state_dir));
+    let status = follow_job(&runtime, &client, &state_dir, job, true)?;
     match status.state.as_str() {
         "Succeeded" => Ok(0),
         "Cancelled" => Ok(EXIT_INTERRUPTED),
@@ -427,12 +436,31 @@ fn detach(command: &mut std::process::Command) {
     command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
 }
 
+/// The job id and how to cancel exactly this run, so a caller never has to
+/// match `bosn run` processes by pattern (which also hits other sessions).
+pub fn job_banner(job: u64, state_dir: &Path) -> String {
+    format!(
+        "bosn run: job {job}; cancel it with `bosn job cancel --state-dir {} --job-id {job}`",
+        state_dir.display()
+    )
+}
+
+/// Said once while a job waits for the daemon's job slot, so a queued run
+/// is not mistaken for a hung one.
+pub fn queued_notice(job: u64, state_dir: &Path) -> String {
+    format!(
+        "bosn run: job {job} is queued behind other jobs on the daemon for {}; it starts when they finish",
+        state_dir.display()
+    )
+}
+
 /// Stream one job's logs until it reaches a terminal state. Task stdout and
 /// stderr go to this process's stdout and stderr (ensure output all goes to
 /// stderr); daemon progress lines go to stderr. Ctrl-C cancels the job.
 fn follow_job(
     runtime: &Runtime,
     client: &Client,
+    state_dir: &Path,
     job: u64,
     task_output: bool,
 ) -> Result<JobStatus, String> {
@@ -441,12 +469,17 @@ fn follow_job(
         .map_err(|_| "cannot observe Ctrl-C".to_owned())?;
     let mut after = 0;
     let mut cancel_sent = false;
+    let mut queued_reported = false;
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
     loop {
         let status = runtime
             .run(client.job_status(job))
             .map_err(|error| format!("lost contact with the bosn daemon: {error}"))?;
+        if status.state == "Queued" && !queued_reported {
+            eprintln!("{}", queued_notice(job, state_dir));
+            queued_reported = true;
+        }
         // Drain every retained page before deciding on termination so the
         // tail of the output is never dropped.
         loop {
@@ -655,6 +688,22 @@ mod tests {
         let legacy = daemon_start_failure(temporary.path());
         assert!(legacy.contains("Python bosn 0.1.x"), "{legacy}");
         assert!(legacy.contains("docs/migration-rust.md"), "{legacy}");
+    }
+
+    #[test]
+    fn the_job_banner_names_this_run_and_its_exact_cancel_command() {
+        let state = Path::new("/home/u/.local/state/bosn");
+        assert_eq!(
+            job_banner(87, state),
+            "bosn run: job 87; cancel it with `bosn job cancel --state-dir /home/u/.local/state/bosn --job-id 87`"
+        );
+        assert!(queued_notice(87, state).contains("job 87 is queued"));
+        // The follow lease must be accepted by the daemon and dwarf the poll.
+        assert!(
+            (bosn_service::FOLLOW_LEASE_MIN..=bosn_service::FOLLOW_LEASE_MAX)
+                .contains(&FOLLOW_LEASE)
+        );
+        assert!(FOLLOW_LEASE >= POLL_INTERVAL * 100);
     }
 
     #[test]
