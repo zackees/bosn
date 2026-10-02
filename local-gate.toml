@@ -16,6 +16,8 @@
 [gate]
 run = ["uv", "run", "--no-project", "--python", "3.13", "python", "ci/local_gate.py"]
 verify = "ci.yml:verify"
+# ci-pre only publishes attestation side entries; nothing waits on it.
+verify-exempt = ["ci-pre"]
 mode = "shadow"
 
 # GATE-005: bosn is live infrastructure on the developer's host (its tests
@@ -52,3 +54,21 @@ tools = ["soldr"]
 [gate.lanes.tests]
 run = ["uv", "run", "--no-project", "--python", "3.13", "python", "ci/local_gate.py", "--lane", "tests"]
 tools = ["bosn"]
+
+# GATE-008/010 (zackees/ci.yml#190, #198): an attested PR head skips the
+# remote jobs whose every gate (ci-attestations.yml) it attests. CI's verify
+# job decides with `ci-lint local-gate verify --trust`, from THIS file and
+# ci-attestations.yml as committed on the PR's base. It fails closed: a fork
+# or non-writer author, a `ci-full` label, a head not attested for its exact
+# tree, a missing gate, a change to a surface below (or to either file,
+# ci/local_gate.py or ci.yml) or the audit sample all run the jobs as before.
+# Pushes to main always run them (the post-merge catch); a release always
+# runs everything. `shadow`: report what would be skipped, skip nothing.
+#
+# Only jobs the local lanes fully cover are listed. `linux` also runs the
+# docker-marked tests, which no local lane runs, so it always runs remotely.
+[gate.trust]
+mode = "shadow"
+skip = ["ci.yml:lint-no-macos-runners", "ci.yml:rust"]
+covered-by = { "ci.yml:lint-no-macos-runners" = ["guards"], "ci.yml:rust" = ["rust", "tests"] }
+surfaces = []

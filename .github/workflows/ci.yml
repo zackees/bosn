@@ -39,6 +39,12 @@ jobs:
     outputs:
       attested: ${{ steps.verify.outputs.attested }}
       state: ${{ steps.verify.outputs.state }}
+      trusted: ${{ steps.verify.outputs.trusted }}
+      trust_reason: ${{ steps.verify.outputs.trust_reason }}
+      # GATE-010: true only when the head passes [gate.trust] and attests
+      # every gate ci-attestations.yml maps to the job (never in shadow).
+      skip_rust: ${{ steps.verify.outputs.skip_rust }}
+      skip_lint-no-macos-runners: ${{ steps.verify.outputs.skip_lint-no-macos-runners }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -52,9 +58,16 @@ jobs:
           path: .ci-lint
           persist-credentials: false
           sparse-checkout: ci_lint
-      - name: Verify the local-gate attestation
+      - name: Verify the local-gate attestation and decide attested skips
         id: verify
-        run: PYTHONPATH=.ci-lint python3 -m ci_lint local-gate verify --repo . --github-output
+        run: PYTHONPATH=.ci-lint python3 -m ci_lint local-gate verify --repo . --trust --github-output
+
+  # GATE-010 side entries: publish each valid Ci-Attestation of this commit
+  # as its own tiny lineage-keyed cache entry. Nothing waits on it.
+  ci-pre:
+    uses: ./.github/workflows/ci-pre.yml
+    permissions:
+      contents: read
 
   select-tier:
     name: Select CI tier
@@ -85,6 +98,8 @@ jobs:
     # permits hosted Macs only in ci-full and release; keep this status stable.
     name: CI policy (no hosted macOS runners)
     needs: [verify]
+    # GATE-008/010: skipped only for an attested, trusted PR head.
+    if: needs.verify.outputs.skip_lint-no-macos-runners != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -102,6 +117,8 @@ jobs:
   rust:
     name: Rust workspace (locked tests)
     needs: [verify]
+    # GATE-008/010: skipped only for an attested, trusted PR head.
+    if: needs.verify.outputs.skip_rust != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

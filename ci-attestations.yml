@@ -1,0 +1,26 @@
+# ci-attestations (zackees/ci.yml#198, GATE-010; bosn#361 phase 2).
+#
+# Each gate is one thing CI would otherwise verify remotely, named by the
+# platform schema path <ecosystem>/<platform>/<check>. `lane` is the
+# local-gate.toml lane whose pass proves it: `ci-lint local-gate run` writes
+# one compact-JSON `Ci-Attestation:` trailer per gate of each passed lane into
+# the commit message (never into the tree). A gate with no trailer was not
+# run locally, so CI runs it.
+#
+# `jobs` maps each remote job to the gates it runs. On a PR, CI skips a job
+# only when every one of its gates is attested and stamp-valid AND the head
+# passes [gate.trust] (local-gate.toml). This file is read from the PR's base
+# and is itself a trust surface. Pushes to main always run every job, and a
+# release always ignores attestations.
+version: 1
+gates:
+  python/all/static: {lane: py-static}      # ruff format/check, pyright
+  general/all/ci-policy: {lane: guards}     # CI workflow policy, Ctrl-C, vcpkg, local-gate lint
+  rust/all/fmt: {lane: rust}                # rustfmt --check
+  rust/all/boundary: {lane: rust}           # kernal-api boundary, locked resolution
+  rust/x86_64-unknown-linux-gnu/clippy: {lane: rust}
+  rust/x86_64-unknown-linux-gnu/test: {lane: tests}    # workspace + embedded-Python tests, in bosn
+  python/x86_64-unknown-linux-gnu/test: {lane: tests}  # pytest (not docker-marked), in bosn
+jobs:
+  ci.yml:lint-no-macos-runners: [general/all/ci-policy]
+  ci.yml:rust: [rust/all/boundary, rust/x86_64-unknown-linux-gnu/test]
