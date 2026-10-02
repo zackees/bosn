@@ -27,6 +27,9 @@ pub enum ItemConclusion {
     Skipped,
     /// The job needs a runner bosn cannot supervise (`runs-on: macos-*`).
     Unsupported,
+    /// The job can only run on GitHub (GATE-012): not run locally, never a
+    /// failure and never a coverage gap.
+    RemoteOnly,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -55,6 +58,9 @@ pub struct Job {
     pub matrix: Option<Value>,
     pub status: ItemStatus,
     pub conclusion: Option<ItemConclusion>,
+    /// Why the job did not run locally (a `remote_only` job's reason).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub sections: Vec<Section>,
 }
 
@@ -153,6 +159,7 @@ impl RunTree {
                 matrix: None,
                 status: ItemStatus::Queued,
                 conclusion: None,
+                reason: None,
                 sections: Vec::new(),
             });
         }
@@ -228,6 +235,7 @@ impl RunTree {
             matrix: matrix.filter(|m| !m.is_null()).cloned(),
             status: ItemStatus::Queued,
             conclusion: None,
+            reason: None,
             sections: Vec::new(),
         };
         if let Some((g, j)) = placeholder {
@@ -352,6 +360,20 @@ impl RunTree {
                         exit_code: None,
                     },
                 );
+            }
+        }
+    }
+
+    /// A job that GitHub alone can run (GATE-012) ran locally only as a stub
+    /// that prints its reason: it is `remote_only`, with that reason. A job
+    /// whose own `if:` skipped it stays skipped, as on GitHub.
+    pub fn mark_remote_only(&mut self, remote_only: &std::collections::BTreeMap<String, String>) {
+        for job in self.jobs_mut() {
+            if job.conclusion == Some(ItemConclusion::Success)
+                && let Some(reason) = remote_only.get(&job.job_id)
+            {
+                job.conclusion = Some(ItemConclusion::RemoteOnly);
+                job.reason = Some(reason.clone());
             }
         }
     }

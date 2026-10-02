@@ -205,6 +205,30 @@ deprecation notice on stderr and is removed after one release.
 A run is never reported as `success` when any job was `unsupported`, when no
 job succeeded, or when its engine could not be proven removed.
 
+## Jobs only GitHub can run (`remote_only`)
+
+Some jobs cannot run under act at all (zackees/ci.yml GATE-012, #400). A job
+that asks the GitHub API about its own run gets a 404, because act's
+`github.run_id` is a local ID. A job that needs an OIDC token, or a
+GitHub-side service, cannot run either. `bosn ci` treats a job as remote-only
+when:
+
+- its job-level `env:` declares `CI_REMOTE_ONLY: <reason>`. This is the
+  general declaration; on GitHub it is an unused variable, so the job and any
+  required check built on it are unchanged;
+- it uses an action from GATE-012's act-impossible registry
+  (`crates/bosn-service/src/ci/remote_only.rs`); or
+- it requests `id-token: write`.
+
+In the run's copy of the workflow such a job keeps its `if:`, `needs:`, runner
+and matrix, so it is skipped exactly when GitHub would skip it, and the jobs
+that need it still run. Only its steps are replaced, by one step that prints
+the reason. The run log notes each such job. The job is then reported
+`remote_only` with its reason (`ci report` lists it, `ci show` marks it
+`[remote-only]`). It is never a failure and never a coverage gap: by policy it
+is not local evidence. Declare a job this way rather than guarding it with
+`if: ${{ !env.ACT }}`, which hides the reason and skips its dependents.
+
 ## What runs, and where
 
 - **Provider and engine are separate axes.** The provider is auto-detected:

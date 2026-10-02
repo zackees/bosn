@@ -174,6 +174,38 @@ def test_full_coverage_sentinel_waits_for_every_lane() -> None:
     assert "full-coverage" in timing["needs"]
 
 
+def test_only_run_introspection_jobs_are_remote_only() -> None:
+    # GATE-012 (#400): a job that asks the GitHub API about its own run
+    # (github.run_id) cannot run under act, whose run ID GitHub answers with
+    # 404. It declares CI_REMOTE_ONLY, so a local `bosn ci run` reports it
+    # remote_only with the reason instead of failing. No other job may: that
+    # would silently drop local coverage.
+    def asks_github_about_this_run(job: dict) -> bool:
+        return any("github.run_id" in step.get("run", "") for step in job.get("steps", []))
+
+    remote_only = {
+        name for name, job in CI["jobs"].items() if "CI_REMOTE_ONLY" in job.get("env", {})
+    }
+    assert remote_only == {
+        name for name, job in CI["jobs"].items() if asks_github_about_this_run(job)
+    }
+    assert remote_only == {"full-coverage", "ci-queue-timing"}
+    for name in remote_only:
+        assert CI["jobs"][name]["env"]["CI_REMOTE_ONLY"].strip(), name
+
+
+def test_remote_only_declaration_leaves_the_required_check_unchanged_on_github() -> None:
+    # Branch protection requires this check by name; on GitHub the marker is
+    # an unused variable, so the job still verifies every cell and fails
+    # closed exactly as before.
+    job = CI["jobs"]["full-coverage"]
+    assert job["name"] == "Full CI coverage (exact candidate SHA)"
+    assert set(job["env"]) == {"CI_REMOTE_ONLY"}
+    verify = next(step for step in job["steps"] if "verify_full_coverage.py" in step.get("run", ""))
+    assert verify["env"]["GITHUB_TOKEN"] == "${{ github.token }}"
+    assert "continue-on-error" not in job and "continue-on-error" not in verify
+
+
 def test_no_job_runs_unconditionally_under_a_cancelled_run() -> None:
     # A bare always() job still starts when its run is cancelled and then
     # fails, leaving a FAILURE required check on the head that blocks the

@@ -487,7 +487,7 @@ fn log_pages_always_advance_and_tails_cut_on_char_boundaries() {
 
 #[test]
 fn steps_act_never_mentioned_are_listed_as_skipped_in_jobs_that_ran() {
-    use super::workflow::{DeclaredStep, DeclaredSteps};
+    use super::workflow::{Declared, DeclaredStep};
     let mut parser = ActParser::new(RunTree::declared(&parse_act_list(
         super::lifecycle::tests::LISTING,
     )));
@@ -509,11 +509,14 @@ fn steps_act_never_mentioned_are_listed_as_skipped_in_jobs_that_ran() {
         id: id.into(),
         name: name.into(),
     };
-    let declared: DeclaredSteps = [(
-        "a".to_string(),
-        vec![step("0", "one"), step("1", "never"), step("2", "three")],
-    )]
-    .into();
+    let declared = Declared {
+        steps: [(
+            "a".to_string(),
+            vec![step("0", "one"), step("1", "never"), step("2", "three")],
+        )]
+        .into(),
+        remote_only: Default::default(),
+    };
     let mut tree = parser.tree;
     let (conclusion, _) = report::conclude(
         &Ok(lifecycle::EngineReport {

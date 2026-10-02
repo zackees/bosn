@@ -30,7 +30,7 @@ ul { list-style: none; margin: 0; padding: 0; }
 .hint { color: var(--muted); }
 .status { font-weight: 600; white-space: nowrap; }
 .success { color: var(--ok); } .failure, .error, .timed_out { color: var(--fail); }
-.cancelled, .skipped, .incomplete, .refused, .unsupported, .queued { color: var(--warn); }
+.cancelled, .skipped, .remote_only, .incomplete, .refused, .unsupported, .queued { color: var(--warn); }
 .running, .in_progress { color: var(--run); }
 .tree li { margin: 2px 0; }
 .tree .job > button, .tree .step > button { border: 0; background: transparent; padding: 1px 4px; text-align: left; }

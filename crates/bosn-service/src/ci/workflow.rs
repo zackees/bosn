@@ -4,6 +4,10 @@
 //! silently omit it. Knowing every declared step lets a finished job list the
 //! ones that never ran as `skipped`. Step identity matches act's `stepID`:
 //! the step's `id:` when it has one, otherwise its index.
+//!
+//! The same typed reading names the jobs that only run on GitHub
+//! ([`super::remote_only`], GATE-012), so a finished run reports them as
+//! `remote_only` with their reason.
 
 use std::{collections::BTreeMap, path::Path};
 
@@ -19,24 +23,44 @@ pub struct DeclaredStep {
 /// Declared steps by workflow job ID.
 pub type DeclaredSteps = BTreeMap<String, Vec<DeclaredStep>>;
 
+/// What a run's workflow declares, read once when the run ends.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Declared {
+    pub steps: DeclaredSteps,
+    /// Remote-only jobs (GATE-012) by workflow job ID, with the reason.
+    pub remote_only: BTreeMap<String, String>,
+}
+
 #[derive(Deserialize)]
 struct Workflow {
     #[serde(default)]
     jobs: BTreeMap<String, Job>,
 }
 
-#[derive(Deserialize)]
-struct Job {
+/// One workflow job, read only for the fields bosn acts on.
+#[derive(Debug, Default, Deserialize)]
+pub struct Job {
     #[serde(default)]
-    steps: Vec<Step>,
+    pub steps: Vec<Step>,
+    #[serde(default)]
+    pub env: BTreeMap<String, serde_yaml::Value>,
+    pub permissions: Option<Permissions>,
 }
 
-#[derive(Deserialize)]
-struct Step {
-    id: Option<String>,
-    name: Option<String>,
-    uses: Option<String>,
-    run: Option<String>,
+/// `permissions:` is `read-all`/`write-all` or a map of scopes to levels.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum Permissions {
+    All(String),
+    Scopes(BTreeMap<String, String>),
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct Step {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub uses: Option<String>,
+    pub run: Option<String>,
 }
 
 impl Step {
@@ -50,35 +74,34 @@ impl Step {
     }
 }
 
-/// Parse the workflow file's job steps. A workflow that cannot be read or
-/// parsed yields no declarations (act reports what it can on its own).
-pub fn declared_steps(source: &Path, workflow: &str) -> DeclaredSteps {
+/// Parse the workflow file's jobs. A workflow that cannot be read or parsed
+/// yields no declarations (act reports what it can on its own).
+pub fn declared(source: &Path, workflow: &str) -> Declared {
     std::fs::read_to_string(source.join(workflow))
         .ok()
         .and_then(|text| parse(&text))
         .unwrap_or_default()
 }
 
-fn parse(text: &str) -> Option<DeclaredSteps> {
+fn parse(text: &str) -> Option<Declared> {
     let workflow: Workflow = serde_yaml::from_str(text).ok()?;
-    Some(
-        workflow
-            .jobs
-            .into_iter()
-            .map(|(job, spec)| {
-                let steps = spec
-                    .steps
-                    .iter()
-                    .enumerate()
-                    .map(|(index, step)| DeclaredStep {
-                        id: step.id.clone().unwrap_or_else(|| index.to_string()),
-                        name: step.display(),
-                    })
-                    .collect();
-                (job, steps)
+    let mut declared = Declared::default();
+    for (id, job) in workflow.jobs {
+        if let Some(reason) = super::remote_only::reason(&job) {
+            declared.remote_only.insert(id.clone(), reason);
+        }
+        let steps = job
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(index, step)| DeclaredStep {
+                id: step.id.clone().unwrap_or_else(|| index.to_string()),
+                name: step.display(),
             })
-            .collect(),
-    )
+            .collect();
+        declared.steps.insert(id, steps);
+    }
+    Some(declared)
 }
 
 #[cfg(test)]
@@ -91,6 +114,8 @@ mod tests {
             "on: [push]\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo one\n      - id: cache\n        uses: actions/cache@v4\n      - name: Named\n        if: false\n        run: echo never\n  b:\n    uses: ./.github/workflows/reusable.yml\n",
         )
         .unwrap();
+        assert!(declared.remote_only.is_empty());
+        let declared = declared.steps;
         assert_eq!(
             declared["a"],
             [
@@ -113,5 +138,22 @@ mod tests {
             "reusable workflow jobs declare no steps here"
         );
         assert!(parse(": not yaml [").is_none());
+    }
+
+    #[test]
+    fn remote_only_jobs_are_declared_with_their_reason() {
+        let declared = parse(
+            "on: [push]\njobs:\n  timing:\n    runs-on: ubuntu-latest\n    env:\n      CI_REMOTE_ONLY: reads this run from the GitHub API\n    steps:\n      - run: echo\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo\n",
+        )
+        .unwrap();
+        assert_eq!(
+            declared.remote_only,
+            [(
+                "timing".to_string(),
+                "reads this run from the GitHub API".to_string()
+            )]
+            .into()
+        );
+        assert_eq!(declared.steps.len(), 2);
     }
 }

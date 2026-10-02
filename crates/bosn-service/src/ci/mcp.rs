@@ -418,7 +418,7 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "bosn_ci_report",
-            "description": "The agent failure summary: conclusion, exit code, the first failing job and step with only that step's last lines, and skipped and unsupported jobs listed separately. Never reports success for partial coverage.",
+            "description": "The agent failure summary: conclusion, exit code, the first failing job and step with only that step's last lines, skipped and unsupported jobs listed separately, and remote-only jobs (GATE-012: only GitHub can run them; never a failure) with their reasons. Never reports success for partial coverage.",
             "inputSchema": run_ref_schema(json!({"tail": {"type": "integer", "minimum": 1, "maximum": MAX_REPORT_TAIL}})),
             "annotations": annotations(true, false),
         }),
