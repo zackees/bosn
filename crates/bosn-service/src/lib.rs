@@ -9114,17 +9114,22 @@ impl Service {
                 std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get),
             ),
         );
-        // Engines a previous daemon left behind are reconciled in the
-        // background; new runs use fresh IDs, so they cannot collide.
-        {
-            let ci = ci.clone();
-            async_engine::launch(async move {
-                let report = ci.recover_engines().await;
-                for (run, error) in report.failed {
-                    eprintln!("bosn ci: engine for run {run} needs attention: {error}");
-                }
-            })
-            .detach();
+        // Engines a previous daemon left behind: snapshot them before any
+        // client can submit a run, then reconcile exactly that set in the
+        // background, so a live run is never mistaken for a leftover.
+        match ci.pending_engines().await {
+            Ok(leftovers) if !leftovers.is_empty() => {
+                let ci = ci.clone();
+                async_engine::launch(async move {
+                    let report = ci.reconcile_engines(&leftovers).await;
+                    for (run, error) in report.failed {
+                        eprintln!("bosn ci: engine for run {run} needs attention: {error}");
+                    }
+                })
+                .detach();
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("bosn ci: engine recovery skipped: {error}"),
         }
         let _ = recover_manifest_startup(
             &actor,

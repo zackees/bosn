@@ -4,8 +4,9 @@ use super::lifecycle::tests::{FakeBackend, Faults, with_registry};
 use super::*;
 use super::{
     lifecycle::{CleanupEnd, ExecutionEnd},
-    model::{ActParser, RunTree, parse_act_list},
+    model::{ActParser, LogRecord, RunTree, parse_act_list},
     provider::{Mode, Provider, Trigger},
+    store,
 };
 use kernal_api::async_engine;
 use serde_json::Value;
@@ -329,4 +330,61 @@ fn conclusion_never_passes_partial_coverage_or_failed_cleanup() {
         Conclusion::TimedOut
     );
     assert_eq!(Conclusion::TimedOut.exit_code(), 2);
+}
+
+#[test]
+fn a_run_where_every_declared_job_was_skipped_is_not_success() {
+    let mut tree = RunTree::declared(&parse_act_list(super::lifecycle::tests::LISTING));
+    let outcome = Ok(lifecycle::EngineReport {
+        execution: ExecutionEnd::Exited(0),
+        cleanup: CleanupEnd::Removed,
+        engine_id: None,
+    });
+    let (conclusion, reason) = report::conclude(&outcome, &mut tree);
+    assert_eq!(conclusion, Conclusion::Incomplete, "{reason:?}");
+}
+
+#[test]
+fn log_pages_always_advance_and_tails_cut_on_char_boundaries() {
+    let dir = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+    let store = store::Store::open(dir.path()).unwrap();
+    std::fs::create_dir_all(store.run_dir("r")).unwrap();
+    let mut log = store.log_writer("r").unwrap();
+    // One record far larger than any page, made of 4-byte characters.
+    let huge = "⭐".repeat(30_000);
+    for seq in 1..=2 {
+        log.append(&LogRecord {
+            seq,
+            stream: "stdout".into(),
+            job: Some("j".into()),
+            section: Some("Main:0".into()),
+            text: huge.clone(),
+        });
+    }
+    log.flush();
+    let query = store::LogQuery {
+        since: 0,
+        visible: 2,
+        filter: store::LogFilter::default(),
+        limit: 10,
+        max_bytes: 1024,
+    };
+    let page = store.read_log("r", 0, &query);
+    assert_eq!(
+        page.records.len(),
+        1,
+        "an oversized record still moves the cursor"
+    );
+    assert_eq!(page.next_seq, 1);
+    assert!(page.records[0].text.len() <= 1024);
+    let tail = store.tail(
+        "r",
+        store::LogFilter {
+            job: Some("j"),
+            section: Some("Main:0"),
+        },
+        5,
+    );
+    assert_eq!(tail.len(), 2);
+    assert!(tail.iter().all(|t| t.len() <= 2048 && t.ends_with('⭐')));
 }

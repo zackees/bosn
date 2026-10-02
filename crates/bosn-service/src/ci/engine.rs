@@ -117,11 +117,14 @@ pub trait ActEngineBackend: Send + Sync {
     ) -> BoxFuture<'a, Result<Option<ActEngineObservation>, String>>;
     /// Wait for the nested engine, install act, copy the frozen source and
     /// event payload, and pull the runner image inside the engine.
+    /// The engine's architecture must match `act`, the artifact the intent
+    /// recorded; otherwise this fails rather than install another binary.
     fn prepare<'a>(
         &'a self,
         name: &'a str,
         source: &'a Path,
         event: &'a Path,
+        act: ActArtifact,
     ) -> BoxFuture<'a, Result<(), String>>;
     /// `act -l` for the workflow (declared jobs and their stages).
     fn list<'a>(
@@ -137,7 +140,9 @@ pub trait ActEngineBackend: Send + Sync {
         cancellation: &'a CancellationToken,
         lines: &'a async_engine::Sender<EngineLine>,
     ) -> BoxFuture<'a, Result<ExecEnd, String>>;
-    fn remove<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), String>>;
+    /// Remove the engine with this exact immutable ID (never by name: the
+    /// name could be taken by something else after authorization).
+    fn remove<'a>(&'a self, engine_id: &'a str) -> BoxFuture<'a, Result<(), String>>;
 }
 
 const CONTROL_DEADLINE: Duration = Duration::from_secs(60);
@@ -296,6 +301,7 @@ impl ActEngineBackend for DockerActBackend {
         name: &'a str,
         source: &'a Path,
         event: &'a Path,
+        act: ActArtifact,
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             let deadline = async_engine::Deadline::after(Duration::from_secs(60));
@@ -321,15 +327,18 @@ impl ActEngineBackend for DockerActBackend {
                     CONTROL_DEADLINE,
                 )
                 .await?;
-            let artifact = act_artifact(&arch)
-                .ok_or_else(|| format!("no pinned act build for engine architecture {arch}"))?;
+            if act_artifact(&arch) != Some(act) {
+                return Err(format!(
+                    "engine architecture {arch} does not match the recorded act artifact"
+                ));
+            }
             let install = format!(
                 "mkdir -p /bosn && wget -q -O /bosn/act.tgz '{url}' && \
                  echo '{sum}  /bosn/act.tgz' | sha256sum -c - >/dev/null && \
                  tar -xzf /bosn/act.tgz -C /usr/local/bin act && rm /bosn/act.tgz && \
                  act --version",
-                url = artifact.url,
-                sum = artifact.sha256,
+                url = act.url,
+                sum = act.sha256,
             );
             let version = self
                 .checked(

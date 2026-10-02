@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bosn_registry::act::ActEngineIntent;
+use bosn_registry::act::{ActEngineIntent, ActEngineRecord};
 use kernal_api::async_engine::{self, CancellationSource};
 use serde_json::{Value, json};
 
@@ -99,7 +99,10 @@ impl CiRuntime {
         };
         for mut record in store.load_runs() {
             if record.state != RunState::Done {
-                record.interrupt();
+                record.finish(
+                    Conclusion::Error,
+                    Some("interrupted: the daemon stopped during this run".into()),
+                );
                 store.save_run(&record);
             }
             state.insert(record);
@@ -122,9 +125,18 @@ impl CiRuntime {
         runtime
     }
 
-    /// Reconcile engines left by a previous daemon (registry-driven).
-    pub async fn recover_engines(&self) -> lifecycle::RecoveryReport {
-        lifecycle::recover(&self.registry, self.backend.as_ref()).await
+    /// Engine records a previous daemon left unfinished. Call before the
+    /// daemon accepts requests; reconcile the result with
+    /// [`Self::reconcile_engines`] (it may take a while, so in the background).
+    pub async fn pending_engines(&self) -> Result<Vec<ActEngineRecord>, String> {
+        lifecycle::pending_records(&self.registry).await
+    }
+
+    pub async fn reconcile_engines(
+        &self,
+        records: &[ActEngineRecord],
+    ) -> lifecycle::RecoveryReport {
+        lifecycle::reconcile(&self.registry, self.backend.as_ref(), records).await
     }
 
     pub async fn handle(&self, request: CiRequest) -> Result<Value, CiError> {
@@ -158,20 +170,10 @@ impl CiRuntime {
             CiRequest::Cancel { run } => self.cancel(&run),
             CiRequest::Retry { run, job } => self.retry(&run, job).await,
             CiRequest::Report { run, tail } => {
-                let record = self.record(&run)?;
-                let tail = tail.unwrap_or(DEFAULT_REPORT_TAIL).clamp(1, 500);
-                Ok(report::report(&record, |job, section| {
-                    self.store.tail(
-                        &run,
-                        LogFilter {
-                            job: Some(job),
-                            section: Some(section),
-                        },
-                        tail,
-                    )
-                }))
+                self.report(&run, tail.unwrap_or(DEFAULT_REPORT_TAIL).clamp(1, 500))
+                    .await
             }
-            CiRequest::Runners { action } => self.runners(action),
+            CiRequest::Runners { action } => self.runners(action).await,
         }
     }
 
@@ -332,12 +334,8 @@ impl CiRuntime {
         if state.scheduler.cancel_queued(run) {
             drop(state);
             self.update(run, |slot| {
-                let record = &mut slot.record;
-                record.state = RunState::Done;
-                record.conclusion = Some(Conclusion::Cancelled);
-                record.reason = Some("cancelled while queued".into());
-                record.finished_at = Some(lifecycle::now_seconds());
-                record.tree.cancel_unfinished();
+                slot.record
+                    .finish(Conclusion::Cancelled, Some("cancelled while queued".into()));
             });
             return Ok(json!({"run": run, "cancelled": true, "state": RunState::Done}));
         }
@@ -357,7 +355,7 @@ impl CiRuntime {
         if original.state != RunState::Done {
             return Err(CiError::refused("the run is still in progress"));
         }
-        if job.as_deref().is_some_and(|j| !valid_name(j, 128)) {
+        if job.as_deref().is_some_and(|j| !valid_job(j)) {
             return Err(CiError::refused("invalid job ID"));
         }
         if !self.store.source(run).is_dir() {
@@ -367,19 +365,45 @@ impl CiRuntime {
         }
         let id = new_uuid().await?;
         // A copy, so the retry stays independent of the original's pruning.
-        let staging = self
-            .store
-            .stage_copy(run, &id)
-            .map_err(|e| CiError::new("internal", format!("cannot copy snapshot: {e}")))?;
-        let payload = std::fs::read(self.store.event(run)).unwrap_or_default();
+        let (store, from, staging_id) = (self.store.clone(), run.to_string(), id.clone());
+        let staged = blocking(move || {
+            let staging = store.stage_copy(&from, &staging_id)?;
+            let payload = std::fs::read(store.event(&from))?;
+            Ok::<_, std::io::Error>((staging, payload))
+        })
+        .await?;
+        let (staging, payload) =
+            staged.map_err(|e| CiError::new("internal", format!("cannot copy snapshot: {e}")))?;
         self.admit(original.retry(id, job), &staging, &payload)
     }
 
-    fn runners(&self, action: RunnerAction) -> Result<Value, CiError> {
-        let mut state = self.lock();
+    async fn report(&self, run: &str, tail: usize) -> Result<Value, CiError> {
+        let record = self.record(run)?;
+        let store = self.store.clone();
+        blocking(move || {
+            report::report(&record, |job, section| {
+                let filter = LogFilter {
+                    job: Some(job),
+                    section: Some(section),
+                };
+                store.tail(&record.id, filter, tail)
+            })
+        })
+        .await
+    }
+
+    async fn runners(&self, action: RunnerAction) -> Result<Value, CiError> {
         let mut pruned = None;
+        if let RunnerAction::PruneCache {
+            older_than_secs,
+            max_bytes,
+        } = action
+        {
+            pruned = Some(self.prune(older_than_secs, max_bytes).await?);
+        }
+        let mut state = self.lock();
         match action {
-            RunnerAction::List => {}
+            RunnerAction::List | RunnerAction::PruneCache { .. } => {}
             RunnerAction::Drain => state.scheduler.set_drained(true),
             RunnerAction::Resume => state.scheduler.set_drained(false),
             RunnerAction::SetLimit { limit } => {
@@ -388,10 +412,6 @@ impl CiRuntime {
                 }
                 state.scheduler.set_limit(limit);
             }
-            RunnerAction::PruneCache {
-                older_than_secs,
-                max_bytes,
-            } => pruned = Some(self.prune(&mut state, older_than_secs, max_bytes)),
         }
         self.store.save_settings(&Settings {
             limit: state.scheduler.limit(),
@@ -404,58 +424,74 @@ impl CiRuntime {
     }
 
     /// Remove finished runs by age, total size, or beyond the retention
-    /// counts; drop sources of all but the newest few. Live runs are kept.
-    fn prune(
+    /// counts, and drop sources of all but the newest few. Live runs are
+    /// kept. Sizes are measured and files deleted off the state lock.
+    async fn prune(
         &self,
-        state: &mut CiState,
         older_than: Option<u64>,
         max_bytes: Option<u64>,
-    ) -> Vec<String> {
-        let now = lifecycle::now_seconds();
-        let finished: Vec<String> = state
-            .order
-            .iter()
-            .rev()
-            .filter(|id| state.runs[*id].record.state == RunState::Done)
-            .cloned()
-            .collect();
-        let mut pruned = Vec::new();
-        let mut kept_bytes = 0;
-        for (newest_first, id) in finished.iter().enumerate() {
-            let age = now - state.runs[id].record.created_at;
-            let size = self.store.run_bytes(id);
-            if newest_first >= KEEP_RUNS
-                || older_than.is_some_and(|s| age > s as f64)
-                || max_bytes.is_some_and(|m| kept_bytes + size > m)
-            {
-                self.store.remove_run(id);
-                state.runs.remove(id);
-                pruned.push(id.clone());
-                continue;
+    ) -> Result<Vec<String>, CiError> {
+        let sizes = match max_bytes {
+            None => BTreeMap::new(),
+            Some(_) => {
+                let finished = self.lock().finished_newest_first();
+                let store = self.store.clone();
+                blocking(move || {
+                    finished
+                        .into_iter()
+                        .map(|id| {
+                            let size = store.run_bytes(&id);
+                            (id, size)
+                        })
+                        .collect()
+                })
+                .await?
             }
-            if newest_first >= KEEP_SOURCES {
-                self.store.remove_source(id);
-            }
-            kept_bytes += self.store.run_bytes(id);
-        }
-        state.order.retain(|id| state.runs.contains_key(id));
-        pruned
+        };
+        let plan = self.lock().plan_prune(older_than, max_bytes, &sizes);
+        let store = self.store.clone();
+        let pruned = plan.runs.clone();
+        blocking(move || plan.apply(&store)).await?;
+        Ok(pruned)
     }
 
-    /// Start every run the scheduler admits.
+    /// Start every run the scheduler admits. Each is marked running in the
+    /// same critical section, so a cancel never sees an admitted run that is
+    /// neither queued nor running.
     fn dispatch(&self) {
-        let started = self.lock().scheduler.admit();
-        for id in started {
-            let cancel = CancellationSource::new();
-            let record = self.update(&id, |slot| {
-                slot.cancel = Some(cancel.clone());
-                slot.record.state = RunState::Running;
-                slot.record.started_at = Some(lifecycle::now_seconds());
-            });
-            if let Some(record) = record {
-                let runtime = self.clone();
-                async_engine::launch(async move { runtime.execute(record, cancel).await }).detach();
-            }
+        let started: Vec<(RunRecord, CancellationSource)> = {
+            let mut state = self.lock();
+            let admitted = state.scheduler.admit();
+            admitted
+                .into_iter()
+                .filter_map(|id| {
+                    let slot = state.runs.get_mut(&id)?;
+                    let cancel = CancellationSource::new();
+                    slot.cancel = Some(cancel.clone());
+                    slot.record.state = RunState::Running;
+                    slot.record.started_at = Some(lifecycle::now_seconds());
+                    self.store.save_run(&slot.record);
+                    Some((slot.record.clone(), cancel))
+                })
+                .collect()
+        };
+        for (record, cancel) in started {
+            let id = record.id.clone();
+            let runtime = self.clone();
+            let task = async_engine::launch(async move { runtime.execute(record, cancel).await });
+            // A panicking run must still free its slot and end its record.
+            let watchdog = self.clone();
+            async_engine::launch(async move {
+                if task.await.is_err() {
+                    watchdog.complete(&id, |record| {
+                        record.finish(
+                            Conclusion::Error,
+                            Some("internal error: the run task failed".into()),
+                        )
+                    });
+                }
+            })
+            .detach();
         }
     }
 
@@ -472,22 +508,29 @@ impl CiRuntime {
         observer.publish();
         let mut tree = std::mem::take(&mut observer.parser.tree);
         let (conclusion, reason) = report::conclude(&outcome, &mut tree);
-        // Persisted under the lock before readers can observe `done`, so a
-        // restart never reads a stale in-progress record for a finished run.
+        self.complete(&record.id, |record| {
+            record.tree = tree;
+            record.finish(conclusion, reason);
+            if let Ok(report) = &outcome {
+                record_engine_report(record, report);
+            }
+        });
+        let _ = self.prune(None, None).await;
+    }
+
+    /// End a running run: apply `finish`, persist it before readers can see
+    /// `done` (so a restart never reads a stale in-progress record), and
+    /// free its scheduler slot.
+    fn complete(&self, run: &str, finish: impl FnOnce(&mut RunRecord)) {
         let mut state = self.lock();
-        if let Some(slot) = state.runs.get_mut(&record.id) {
+        if let Some(slot) = state.runs.get_mut(run)
+            && slot.record.state != RunState::Done
+        {
             slot.cancel = None;
-            finish_record(
-                &mut slot.record,
-                tree,
-                conclusion,
-                reason,
-                outcome.as_ref().ok(),
-            );
+            finish(&mut slot.record);
             self.store.save_run(&slot.record);
         }
-        state.scheduler.finish(&record.id);
-        self.prune(&mut state, None, None);
+        state.scheduler.finish(run);
         drop(state);
         self.kick();
     }
@@ -531,6 +574,7 @@ impl CiRuntime {
             .rsplit_once('@')
             .ok_or("runner image is not pinned")?;
         Ok(EnginePlan {
+            act: artifact,
             intent: ActEngineIntent {
                 run_id: record.id.clone(),
                 workspace: record.workspace.clone(),
@@ -566,28 +610,84 @@ fn runner_status(scheduler: &Scheduler) -> Value {
     })
 }
 
-fn finish_record(
-    record: &mut RunRecord,
-    tree: RunTree,
-    conclusion: Conclusion,
-    reason: Option<String>,
-    report: Option<&EngineReport>,
-) {
-    record.tree = tree;
-    record.state = RunState::Done;
-    record.conclusion = Some(conclusion);
-    record.reason = reason;
-    record.finished_at = Some(lifecycle::now_seconds());
-    if let Some(report) = report {
-        record.engine_id = report.engine_id.clone();
-        record.act_exit_code = match report.execution {
-            ExecutionEnd::Exited(code) => Some(code),
-            _ => None,
+fn record_engine_report(record: &mut RunRecord, report: &EngineReport) {
+    record.engine_id = report.engine_id.clone();
+    record.act_exit_code = match report.execution {
+        ExecutionEnd::Exited(code) => Some(code),
+        _ => None,
+    };
+    record.cleanup = Some(match &report.cleanup {
+        CleanupEnd::Removed => "removed".into(),
+        CleanupEnd::Failed(e) => format!("failed: {e}"),
+    });
+}
+
+/// Run blocking file work on the kernel's blocking lane.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, CiError> {
+    async_engine::launch_blocking(work)
+        .await
+        .map_err(|_| CiError::new("internal", "blocking task failed"))
+}
+
+/// What one prune pass deletes: decided under the lock, applied outside it.
+struct PrunePlan {
+    runs: Vec<String>,
+    sources: Vec<String>,
+}
+impl PrunePlan {
+    fn apply(&self, store: &Store) {
+        for id in &self.runs {
+            store.remove_run(id);
+        }
+        for id in &self.sources {
+            store.remove_source(id);
+        }
+    }
+}
+
+impl CiState {
+    fn finished_newest_first(&self) -> Vec<String> {
+        self.order
+            .iter()
+            .rev()
+            .filter(|id| self.runs[*id].record.state == RunState::Done)
+            .cloned()
+            .collect()
+    }
+
+    /// Drop pruned runs from the state now; their files go in `apply`.
+    fn plan_prune(
+        &mut self,
+        older_than: Option<u64>,
+        max_bytes: Option<u64>,
+        sizes: &BTreeMap<String, u64>,
+    ) -> PrunePlan {
+        let now = lifecycle::now_seconds();
+        let mut plan = PrunePlan {
+            runs: Vec::new(),
+            sources: Vec::new(),
         };
-        record.cleanup = Some(match &report.cleanup {
-            CleanupEnd::Removed => "removed".into(),
-            CleanupEnd::Failed(e) => format!("failed: {e}"),
-        });
+        let mut kept_bytes = 0;
+        for (newest_first, id) in self.finished_newest_first().into_iter().enumerate() {
+            let age = now - self.runs[&id].record.created_at;
+            let size = sizes.get(&id).copied().unwrap_or(0);
+            if newest_first >= KEEP_RUNS
+                || older_than.is_some_and(|s| age > s as f64)
+                || max_bytes.is_some_and(|m| kept_bytes + size > m)
+            {
+                self.runs.remove(&id);
+                plan.runs.push(id);
+                continue;
+            }
+            if newest_first >= KEEP_SOURCES {
+                plan.sources.push(id);
+            }
+            kept_bytes += size;
+        }
+        self.order.retain(|id| self.runs.contains_key(id));
+        plan
     }
 }
 

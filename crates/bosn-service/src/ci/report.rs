@@ -35,7 +35,10 @@ pub fn conclude(
                     Conclusion::Incomplete,
                     Some("some jobs need runners bosn cannot supervise".into()),
                 )
-            } else if tree.jobs().next().is_none() {
+            } else if !tree
+                .jobs()
+                .any(|j| j.conclusion == Some(ItemConclusion::Success))
+            {
                 (
                     Conclusion::Incomplete,
                     Some("no job ran for this trigger".into()),

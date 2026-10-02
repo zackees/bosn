@@ -118,22 +118,52 @@ const PLAN_FLAGS: &[&str] = &[
     "--deadline-ms",
 ];
 
-fn refuse(message: impl std::fmt::Display) -> ! {
-    eprintln!("bosn ci: {message}");
-    std::process::exit(EXIT_REFUSED)
+const EXIT_ERROR: i32 = 1;
+
+/// A failed verb and the exit code it maps to: 3 for refusals (including
+/// invalid arguments), 1 for daemon or transport errors.
+struct Failure {
+    exit: i32,
+    message: String,
+}
+impl Failure {
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            exit: EXIT_ERROR,
+            message: message.into(),
+        }
+    }
+}
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self {
+            exit: EXIT_REFUSED,
+            message,
+        }
+    }
+}
+impl From<&str> for Failure {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+fn refuse(failure: Failure) -> ! {
+    eprintln!("bosn ci: {}", failure.message);
+    std::process::exit(failure.exit)
 }
 
 /// Entry point. `alias` names the deprecated spelling that routed here.
 pub fn run(mut arguments: impl Iterator<Item = OsString>, alias: Option<&str>) {
     if let Some(alias) = alias {
         eprintln!(
-            "bosn: `{alias}` is deprecated and will be removed after one release; use `bosn ci --provider github --engine act`"
+            "bosn: `{alias}` is deprecated and will be removed after one release; use `bosn ci run|report` (see `bosn ci` usage)"
         );
     }
     let verb = arguments
         .next()
         .and_then(|v| v.into_string().ok())
-        .unwrap_or_else(|| refuse(USAGE));
+        .unwrap_or_else(|| refuse(USAGE.into()));
     let result = match verb.as_str() {
         "plan" => plan(arguments),
         "run" => submit(arguments),
@@ -141,19 +171,19 @@ pub fn run(mut arguments: impl Iterator<Item = OsString>, alias: Option<&str>) {
         "show" => show(arguments),
         "logs" => logs(arguments),
         "wait" => wait(arguments),
-        "cancel" => simple(arguments, |run| CiRequest::Cancel { run }),
+        "cancel" => cancel(arguments),
         "report" => report(arguments),
         "retry" => retry(arguments),
         "runners" => runners(arguments),
-        _ => Err(USAGE.to_string()),
+        _ => Err(USAGE.into()),
     };
     match result {
         Ok(code) => std::process::exit(code),
-        Err(message) => refuse(message),
+        Err(failure) => refuse(failure),
     }
 }
 
-fn submit_options(flags: &Flags) -> Result<SubmitOptions, String> {
+fn submit_options(flags: &Flags) -> Result<SubmitOptions, Failure> {
     Ok(SubmitOptions {
         workspace: PathBuf::from(flags.get("--workspace").unwrap_or(".")),
         provider: flags.get("--provider").map(Provider::parse).transpose()?,
@@ -170,25 +200,32 @@ fn submit_options(flags: &Flags) -> Result<SubmitOptions, String> {
 }
 
 /// A runtime and a client whose daemon is known to be running.
-fn connect(flags: &Flags) -> Result<(Runtime, Client), String> {
+fn connect(flags: &Flags) -> Result<(Runtime, Client), Failure> {
     let state_dir = flags.state_dir();
     let runtime = RuntimeBuilder::current_thread()
         .enable_all()
         .build()
-        .map_err(|e| e.to_string())?;
-    let client = Client::for_state(&state_dir).map_err(|e| e.to_string())?;
-    super::run::ensure_daemon(&runtime, &client, &state_dir)?;
+        .map_err(|e| Failure::error(e.to_string()))?;
+    let client = Client::for_state(&state_dir).map_err(|e| Failure::error(e.to_string()))?;
+    super::run::ensure_daemon(&runtime, &client, &state_dir).map_err(Failure::error)?;
     Ok((runtime, client))
 }
 
-fn call(runtime: &Runtime, client: &Client, request: CiRequest) -> Result<Value, String> {
+fn call(runtime: &Runtime, client: &Client, request: CiRequest) -> Result<Value, Failure> {
     runtime.run(client.ci(request)).map_err(describe)
 }
 
-fn describe(error: bosn_service::Error) -> String {
+fn describe(error: bosn_service::Error) -> Failure {
     match error {
-        bosn_service::Error::Ci { code, message } => format!("{code}: {message}"),
-        other => format!("daemon request failed: {other}"),
+        bosn_service::Error::Ci { code, message } => Failure {
+            exit: if matches!(code.as_str(), "refused" | "invalid_request") {
+                EXIT_REFUSED
+            } else {
+                EXIT_ERROR
+            },
+            message: format!("{code}: {message}"),
+        },
+        other => Failure::error(format!("daemon request failed: {other}")),
     }
 }
 
@@ -200,7 +237,7 @@ fn print(value: &Value, json: bool, text: impl FnOnce(&Value)) {
     }
 }
 
-fn plan(arguments: impl Iterator<Item = OsString>) -> Result<i32, String> {
+fn plan(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
     let flags = Flags::parse(arguments, PLAN_FLAGS, &["--json"])?;
     let plan = bosn_service::ci::plan(&submit_options(&flags)?).map_err(describe)?;
     print(&plan, flags.json(), |p| {
@@ -220,7 +257,7 @@ fn plan(arguments: impl Iterator<Item = OsString>) -> Result<i32, String> {
     Ok(0)
 }
 
-fn submit(arguments: impl Iterator<Item = OsString>) -> Result<i32, String> {
+fn submit(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
     let flags = Flags::parse(arguments, PLAN_FLAGS, &["--json", "--wait"])?;
     let options = submit_options(&flags)?;
     // Refuse a bad checkout or trigger before starting any daemon.
@@ -247,7 +284,7 @@ fn submit(arguments: impl Iterator<Item = OsString>) -> Result<i32, String> {
 }
 
 /// Wait for a run, then print its full record and return its exit code.
-fn finish(runtime: &Runtime, client: &Client, run: &str, flags: &Flags) -> Result<i32, String> {
+fn finish(runtime: &Runtime, client: &Client, run: &str, flags: &Flags) -> Result<i32, Failure> {
     let deadline = flags
         .number::<u64>("--deadline-ms")?
         .map(|ms| Instant::now() + Duration::from_millis(ms));
@@ -273,13 +310,13 @@ fn finish(runtime: &Runtime, client: &Client, run: &str, flags: &Flags) -> Resul
     }
 }
 
-fn wait(arguments: impl Iterator<Item = OsString>) -> Result<i32, String> {
+fn wait(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
     let flags = Flags::parse(arguments, &["--state-dir", "--deadline-ms"], &["--json"])?;
     let (runtime, client) = connect(&flags)?;
     finish(&runtime, &client, &flags.run()?, &flags)
 }
 
-fn list(arguments: impl Iterator<Item = OsString>) -> Result<i32, String> {
+fn list(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
     let flags = Flags::parse(
         arguments,
         &["--state-dir", "--workspace", "--state", "--limit"],
@@ -290,7 +327,7 @@ fn list(arguments: impl Iterator<Item = OsString>) -> Result<i32, String> {
         Some("queued") => Some(RunState::Queued),
         Some("running") => Some(RunState::Running),
         Some("done") => Some(RunState::Done),
-        Some(other) => return Err(format!("unknown state {other:?}")),
+        Some(other) => return Err(format!("unknown state {other:?}").into()),
     };
     let workspace = flags
         .get("--workspace")
@@ -325,7 +362,7 @@ fn list(arguments: impl Iterator<Item = OsString>) -> Result<i32, String> {
     Ok(0)
 }
 
-fn show(arguments: impl Iterator<Item = OsString>) -> Result<i32, String> {
+fn show(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
     let flags = Flags::parse(arguments, &["--state-dir"], &["--json"])?;
     let (runtime, client) = connect(&flags)?;
     let shown = call(
@@ -340,7 +377,7 @@ fn show(arguments: impl Iterator<Item = OsString>) -> Result<i32, String> {
     Ok(0)
 }
 
-fn logs(arguments: impl Iterator<Item = OsString>) -> Result<i32, String> {
+fn logs(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
     let flags = Flags::parse(
         arguments,
         &["--state-dir", "--job", "--step", "--since-seq", "--limit"],
@@ -384,7 +421,7 @@ fn logs(arguments: impl Iterator<Item = OsString>) -> Result<i32, String> {
     }
 }
 
-fn report(arguments: impl Iterator<Item = OsString>) -> Result<i32, String> {
+fn report(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
     let flags = Flags::parse(arguments, &["--state-dir", "--tail"], &["--json"])?;
     let (runtime, client) = connect(&flags)?;
     let report = call(
@@ -421,7 +458,7 @@ fn report(arguments: impl Iterator<Item = OsString>) -> Result<i32, String> {
     Ok(report["exit_code"].as_i64().map_or(2, |c| c as i32))
 }
 
-fn retry(arguments: impl Iterator<Item = OsString>) -> Result<i32, String> {
+fn retry(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
     let flags = Flags::parse(arguments, &["--state-dir", "--job"], &["--json"])?;
     let (runtime, client) = connect(&flags)?;
     let retried = call(
@@ -438,19 +475,27 @@ fn retry(arguments: impl Iterator<Item = OsString>) -> Result<i32, String> {
     Ok(0)
 }
 
-/// A verb whose only argument is RUN.
-fn simple(
-    arguments: impl Iterator<Item = OsString>,
-    request: impl FnOnce(String) -> CiRequest,
-) -> Result<i32, String> {
+/// Exit 1 when nothing was cancelled (already finished).
+fn cancel(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
     let flags = Flags::parse(arguments, &["--state-dir"], &["--json"])?;
     let (runtime, client) = connect(&flags)?;
-    let reply = call(&runtime, &client, request(flags.run()?))?;
-    print(&reply, flags.json(), |r| println!("{r}"));
-    Ok(0)
+    let reply = call(&runtime, &client, CiRequest::Cancel { run: flags.run()? })?;
+    print(&reply, flags.json(), |r| {
+        let what = if r["cancelled"] == true {
+            "cancelled"
+        } else {
+            "not cancelled"
+        };
+        println!("run {} {what} ({})", text(&r["run"]), text(&r["state"]));
+    });
+    Ok(if reply["cancelled"] == true {
+        0
+    } else {
+        EXIT_ERROR
+    })
 }
 
-fn runners(arguments: impl Iterator<Item = OsString>) -> Result<i32, String> {
+fn runners(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
     let flags = Flags::parse(
         arguments,
         &["--state-dir", "--older-than-secs", "--max-bytes"],

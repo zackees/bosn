@@ -86,22 +86,20 @@ impl SubmitRequest {
         if !valid_uuid(&self.staging) {
             return refuse("invalid staging ID");
         }
-        if !valid_sha(&self.sha) || self.tree_digest.len() != 64 {
+        if !valid_sha(&self.sha) || !valid_hex(&self.tree_digest, 64) {
             return refuse("invalid SHA or tree digest");
         }
-        if self.provider != Provider::Github {
-            return refuse("only the GitHub provider is supported so far (GitLab is planned)");
-        }
+        provider::require_supported(self.provider).map_err(CiError::refused)?;
         if self.engine != "act" {
             return refuse("only the act engine is supported");
         }
         if !Path::new(&self.workspace).is_absolute() || self.workspace.len() > 4096 {
             return refuse("workspace must be an absolute path");
         }
-        if !valid_name(&self.workflow, 512) || self.workflow.contains("..") {
-            return refuse("invalid workflow path");
+        if !valid_workflow(&self.workflow) {
+            return refuse("workflow must be a file under .github/workflows/");
         }
-        if self.job.as_deref().is_some_and(|j| !valid_name(j, 128)) {
+        if self.job.as_deref().is_some_and(|j| !valid_job(j)) {
             return refuse("invalid job ID");
         }
         if self.actor.is_empty() || self.actor.len() > 200 {
@@ -274,10 +272,11 @@ impl RunRecord {
     }
 
     /// Mark a record a previous daemon left unfinished.
-    pub fn interrupt(&mut self) {
+    /// Mark the run done. Unfinished jobs and steps are cancelled.
+    pub fn finish(&mut self, conclusion: Conclusion, reason: Option<String>) {
         self.state = RunState::Done;
-        self.conclusion = Some(Conclusion::Error);
-        self.reason = Some("interrupted: the daemon stopped during this run".into());
+        self.conclusion = Some(conclusion);
+        self.reason = reason;
         self.finished_at = Some(super::lifecycle::now_seconds());
         self.tree.cancel_unfinished();
     }
@@ -292,6 +291,8 @@ impl RunRecord {
             mode: self.mode.as_str().into(),
             provider: self.provider.as_str().into(),
             engine: self.engine.clone(),
+            payload_sha256: self.payload_sha256.clone(),
+            timeout_secs: self.timeout_secs,
         }
     }
     /// The record without its job tree (for listings and polling).
@@ -333,6 +334,15 @@ impl CiError {
         }
     }
 }
+impl From<CiError> for crate::Error {
+    fn from(error: CiError) -> Self {
+        Self::Ci {
+            code: error.code.into(),
+            message: error.message,
+        }
+    }
+}
+
 impl std::fmt::Display for CiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.code, self.message)
@@ -345,14 +355,30 @@ pub(crate) fn valid_uuid(value: &str) -> bool {
         && parts
             .iter()
             .zip([8, 4, 4, 4, 12])
-            .all(|(p, n)| p.len() == n && p.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+            .all(|(part, len)| valid_hex(part, len))
 }
 
 pub(crate) fn valid_sha(value: &str) -> bool {
-    value.len() == 40
+    valid_hex(value, 40)
+}
+
+pub(crate) fn valid_hex(value: &str, len: usize) -> bool {
+    value.len() == len
         && value
             .bytes()
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// A relative workflow file under `.github/workflows/`, no traversal.
+pub(crate) fn valid_workflow(value: &str) -> bool {
+    valid_name(value, 512)
+        && value.starts_with(".github/workflows/")
+        && !value.split('/').any(|part| part.is_empty() || part == "..")
+}
+
+/// A job ID act receives as an argument value: never option-shaped.
+pub(crate) fn valid_job(value: &str) -> bool {
+    valid_name(value, 128) && !value.starts_with('-')
 }
 
 pub(crate) fn valid_name(value: &str, max: usize) -> bool {

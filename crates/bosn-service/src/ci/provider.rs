@@ -56,6 +56,16 @@ vocabulary!(
     Mode, "mode" { Minimal => "minimal", Test => "test", Full => "full" }
 );
 
+/// Providers with an executable adapter today.
+pub fn require_supported(provider: Provider) -> Result<(), String> {
+    match provider {
+        Provider::Github => Ok(()),
+        Provider::Gitlab => {
+            Err("only the GitHub provider is supported so far (GitLab is planned)".into())
+        }
+    }
+}
+
 /// Detect the provider from the files in a checkout. Both present requires
 /// an explicit choice; neither is a clear error.
 pub fn detect(workspace: &Path, requested: Option<Provider>) -> Result<Provider, String> {

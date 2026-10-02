@@ -15,6 +15,9 @@ pub struct RunKey {
     pub mode: String,
     pub provider: String,
     pub engine: String,
+    /// Branch, PR number and repository all shape the event payload.
+    pub payload_sha256: String,
+    pub timeout_secs: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -137,6 +140,8 @@ mod tests {
             mode: "minimal".into(),
             provider: "github".into(),
             engine: "act".into(),
+            payload_sha256: "p".into(),
+            timeout_secs: 60,
         }
     }
 

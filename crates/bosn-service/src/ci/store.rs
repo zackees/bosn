@@ -18,7 +18,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::{model::LogRecord, wire::RunRecord};
+use super::{
+    model::{LogRecord, truncate_text},
+    wire::RunRecord,
+};
 
 /// One `log.jsonl` line is indexed every this many records.
 pub const INDEX_STRIDE: u64 = 128;
@@ -200,6 +203,16 @@ impl Store {
             }
             if query.filter.matches(&record) {
                 if page.records.len() >= query.limit || bytes + size > query.max_bytes {
+                    if !page.records.is_empty() {
+                        page.truncated = true;
+                        break;
+                    }
+                    // A record larger than the whole page is cut down rather
+                    // than skipped, so the cursor always advances.
+                    let mut record = record.clone();
+                    truncate_text(&mut record.text, query.max_bytes / 2);
+                    page.records.push(record);
+                    page.next_seq = page.records[0].seq;
                     page.truncated = true;
                     break;
                 }
@@ -219,7 +232,7 @@ impl Store {
                 ring.pop_front();
             }
             let mut text = record.text;
-            text.truncate(2048);
+            truncate_text(&mut text, 2048);
             ring.push_back(text);
         }
         ring.into()

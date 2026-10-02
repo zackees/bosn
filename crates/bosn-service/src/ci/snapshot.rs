@@ -205,6 +205,13 @@ pub fn snapshot(workspace: &Path, dest: &Path) -> io::Result<SnapshotReceipt> {
         }
         hasher.update([b'\n']);
     }
+    // An edit between the status probe and the copy must not produce a
+    // snapshot labelled clean: probe again after copying.
+    let after = head(&root)?;
+    if after.sha != sha {
+        return Err(io::Error::other("HEAD moved while the snapshot was taken"));
+    }
+    let dirty = dirty || after.dirty;
     write_git_metadata(dest, &sha, branch.as_deref(), origin.as_deref())?;
     Ok(SnapshotReceipt {
         sha,

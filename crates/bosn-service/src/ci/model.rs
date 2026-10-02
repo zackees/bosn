@@ -93,6 +93,11 @@ pub struct LogRecord {
     pub text: String,
 }
 
+/// Cut `text` to at most `max` bytes on a character boundary.
+pub fn truncate_text(text: &mut String, max: usize) {
+    text.truncate(text.floor_char_boundary(max));
+}
+
 /// Parse `act -l` output into declared jobs. Columns are fixed-width and
 /// located from the header, so job names containing spaces still parse.
 pub fn parse_act_list(output: &str) -> Vec<DeclaredJob> {

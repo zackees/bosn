@@ -1990,6 +1990,10 @@ fn redact_diagnostic(value: &str) -> String {
 }
 
 fn service_error(error: bosn_service::Error) -> PyErr {
+    if let bosn_service::Error::Ci { code, message } = &error {
+        // CI codes are a stable contract (`refused`, `not_found`, ...).
+        return PyRuntimeError::new_err(format!("Bosn CI {code}: {message}"));
+    }
     let message = match error {
         bosn_service::Error::Io(_) | bosn_service::Error::Deadline => {
             "Bosn daemon is unavailable or did not respond in time"
@@ -1997,8 +2001,8 @@ fn service_error(error: bosn_service::Error) -> PyErr {
         bosn_service::Error::Unauthorized => "Bosn daemon authentication failed",
         bosn_service::Error::EndpointOccupied(_) => "Bosn daemon endpoint is unavailable",
         bosn_service::Error::Protocol(_) => "Bosn daemon rejected the request",
-        bosn_service::Error::Ci { .. } => "Bosn CI request was refused",
-        bosn_service::Error::Registry(_)
+        bosn_service::Error::Ci { .. }
+        | bosn_service::Error::Registry(_)
         | bosn_service::Error::Random
         | bosn_service::Error::ActorClosed => "Bosn daemon request failed",
     };

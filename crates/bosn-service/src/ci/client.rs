@@ -10,7 +10,7 @@ use super::{
     provider::{self, Mode, Provider, Trigger},
     snapshot::{self, Head},
     store::Store,
-    wire::{SubmitRequest, new_uuid},
+    wire::{CiError, SubmitRequest, new_uuid},
 };
 use crate::Error;
 
@@ -52,10 +52,7 @@ pub fn detect_actor() -> String {
 }
 
 fn refuse(message: impl Into<String>) -> Error {
-    Error::Ci {
-        code: "refused".into(),
-        message: message.into(),
-    }
+    CiError::refused(message).into()
 }
 
 /// Provider, workflow and `HEAD` resolved for one set of options.
@@ -70,11 +67,7 @@ struct Resolved {
 fn resolve(options: &SubmitOptions) -> Result<Resolved, Error> {
     let head = snapshot::head(&options.workspace).map_err(|e| refuse(e.to_string()))?;
     let provider = provider::detect(&head.root, options.provider).map_err(refuse)?;
-    if provider != Provider::Github {
-        return Err(refuse(
-            "only the GitHub provider is supported so far (GitLab is planned)",
-        ));
-    }
+    provider::require_supported(provider).map_err(refuse)?;
     if let Some(sha) = &options.sha
         && !sha.eq_ignore_ascii_case(&head.sha)
     {
@@ -137,7 +130,7 @@ pub async fn stage_submission(
     options: SubmitOptions,
 ) -> Result<SubmitRequest, Error> {
     let resolved = resolve(&options)?;
-    let staging_id = new_uuid().await.map_err(|e| refuse(e.message))?;
+    let staging_id = new_uuid().await?;
     let staging = Store::new(state_dir).staging(&staging_id);
     std::fs::create_dir_all(&staging)?;
     let root = resolved.head.root.clone();

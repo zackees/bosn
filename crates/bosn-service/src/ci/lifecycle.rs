@@ -14,7 +14,9 @@ use bosn_registry::act::{
 };
 use kernal_api::async_engine::{self, CancellationToken};
 
-use super::engine::{ActEngineBackend, ActInvocation, EngineLine, EngineSpec, ExecEnd};
+use super::engine::{
+    ActArtifact, ActEngineBackend, ActInvocation, EngineLine, EngineSpec, ExecEnd,
+};
 use crate::{
     RegistryActor,
     act_registry::{ActRegistryCommand, ActRegistryReply},
@@ -24,6 +26,8 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct EnginePlan {
     pub intent: ActEngineIntent,
+    /// The pinned act build recorded in the intent's `act_image_digest`.
+    pub act: ActArtifact,
     pub source: PathBuf,
     pub event: PathBuf,
     pub invocation: ActInvocation,
@@ -150,7 +154,7 @@ pub async fn run_on_engine(
         observer.note("preparing engine: act, frozen source, runner image");
         let prepared = async_engine::cancellable(
             cancellation,
-            backend.prepare(&name, &plan.source, &plan.event),
+            backend.prepare(&name, &plan.source, &plan.event, plan.act),
         )
         .await;
         match prepared {
@@ -284,6 +288,7 @@ async fn retire(
                 .map_err(|e| format!("engine {name} is not provably ours: {e}"))?;
                 engine_id = Some(observed.engine_id.clone());
             }
+            let observed_id = observed.engine_id.clone();
             let reply = registry
                 .act_registry(ActRegistryCommand::Authorize {
                     run: run.into(),
@@ -294,7 +299,7 @@ async fn retire(
             if !matches!(reply, ActRegistryReply::Authorized(_)) {
                 return Err("cleanup not authorized".into());
             }
-            backend.remove(name).await?;
+            backend.remove(&observed_id).await?;
             if backend.inspect(name).await?.is_some() {
                 return Err(format!("engine {name} still exists after removal"));
             }
@@ -320,11 +325,11 @@ pub struct RecoveryReport {
     pub failed: Vec<(String, String)>,
 }
 
-/// Reconcile every non-terminal engine record (daemon start). Interrupted
-/// runs are marked `interrupted`; their engines are removed after the same
-/// ownership checks as a normal cleanup.
-pub async fn recover(registry: &RegistryActor, backend: &dyn ActEngineBackend) -> RecoveryReport {
-    let mut report = RecoveryReport::default();
+/// Every non-terminal engine record right now. Take this snapshot before the
+/// daemon admits any run, then [`reconcile`] exactly it: a run started later
+/// can never be mistaken for one a previous daemon left behind.
+pub async fn pending_records(registry: &RegistryActor) -> Result<Vec<ActEngineRecord>, String> {
+    let mut records = Vec::new();
     let mut after: Option<String> = None;
     loop {
         let page = match registry
@@ -333,29 +338,46 @@ pub async fn recover(registry: &RegistryActor, backend: &dyn ActEngineBackend) -
                 limit: 64,
             })
             .await
+            .map_err(|e| format!("recovery page: {e}"))?
         {
-            Ok(ActRegistryReply::Recovery(page)) => page,
-            Ok(_) => break,
-            Err(error) => {
-                report
-                    .failed
-                    .push(("*".into(), format!("recovery page: {error}")));
-                break;
-            }
+            ActRegistryReply::Recovery(page) => page,
+            _ => return Err("recovery page: unexpected reply".into()),
         };
-        for record in &page.items {
-            let run = record.intent.run_id.clone();
-            match recover_one(registry, backend, record).await {
-                Ok(()) => report.retired.push(run),
-                Err(error) => report.failed.push((run, error)),
-            }
-        }
+        records.extend(page.items);
         match page.next_run_id {
             Some(next) => after = Some(next),
-            None => break,
+            None => return Ok(records),
+        }
+    }
+}
+
+/// Interrupted runs are marked `interrupted`; their engines are removed
+/// after the same ownership checks as a normal cleanup.
+pub async fn reconcile(
+    registry: &RegistryActor,
+    backend: &dyn ActEngineBackend,
+    records: &[ActEngineRecord],
+) -> RecoveryReport {
+    let mut report = RecoveryReport::default();
+    for record in records {
+        let run = record.intent.run_id.clone();
+        match recover_one(registry, backend, record).await {
+            Ok(()) => report.retired.push(run),
+            Err(error) => report.failed.push((run, error)),
         }
     }
     report
+}
+
+/// Snapshot and reconcile in one step (only safe while no run can start).
+pub async fn recover(registry: &RegistryActor, backend: &dyn ActEngineBackend) -> RecoveryReport {
+    match pending_records(registry).await {
+        Ok(records) => reconcile(registry, backend, &records).await,
+        Err(error) => RecoveryReport {
+            retired: Vec::new(),
+            failed: vec![("*".into(), error)],
+        },
+    }
 }
 
 async fn recover_one(
@@ -489,6 +511,7 @@ pub(crate) mod tests {
             _name: &'a str,
             _source: &'a std::path::Path,
             _event: &'a std::path::Path,
+            _act: ActArtifact,
         ) -> super::super::engine::BoxFuture<'a, Result<(), String>> {
             Box::pin(async move {
                 if self.faults().prepare {
@@ -554,13 +577,16 @@ pub(crate) mod tests {
         }
         fn remove<'a>(
             &'a self,
-            name: &'a str,
+            engine_id: &'a str,
         ) -> super::super::engine::BoxFuture<'a, Result<(), String>> {
             Box::pin(async move {
                 if self.faults().remove {
                     return Err("synthetic removal failure".into());
                 }
-                self.engines.lock().unwrap().remove(name);
+                self.engines
+                    .lock()
+                    .unwrap()
+                    .retain(|_, engine| engine.engine_id != engine_id);
                 Ok(())
             })
         }
@@ -598,6 +624,7 @@ pub(crate) mod tests {
     fn plan(run: &str, deadline: Duration) -> EnginePlan {
         EnginePlan {
             intent: intent(run),
+            act: super::super::engine::act_artifact("x86_64").unwrap(),
             source: "/nonexistent".into(),
             event: "/nonexistent".into(),
             invocation: ActInvocation {
@@ -811,19 +838,31 @@ pub(crate) mod tests {
             }));
             // 50 runs interrupted mid-execution (the future is dropped, as a
             // daemon SIGKILL would), plus one stuck before registration.
-            for n in 0..50 {
-                let interrupted = async_engine::timeout(
-                    Duration::from_millis(150),
-                    run_on_engine(
-                        &registry,
-                        backend.as_ref(),
-                        &plan(&run_id(100 + n), Duration::from_secs(3600)),
-                        &CancellationSource::new().token(),
-                        &mut Collect::default(),
-                    ),
-                )
-                .await;
-                assert!(interrupted.is_err(), "run {n} must still be in flight");
+            let tasks: Vec<_> = (0..50)
+                .map(|n| {
+                    let registry = registry.clone();
+                    let backend = Arc::clone(&backend);
+                    async_engine::launch(async move {
+                        run_on_engine(
+                            &registry,
+                            backend.as_ref(),
+                            &plan(&run_id(100 + n), Duration::from_secs(3600)),
+                            &CancellationSource::new().token(),
+                            &mut Collect::default(),
+                        )
+                        .await
+                    })
+                })
+                .collect();
+            while *backend.executions.lock().unwrap() < 50 {
+                async_engine::sleep(Duration::from_millis(5)).await;
+            }
+            // Every run is mid-execution: drop them all, as a daemon SIGKILL would.
+            for task in &tasks {
+                task.cancel();
+            }
+            for task in tasks {
+                assert!(task.await.is_err(), "run must have been in flight");
             }
             commit(&registry, ActRegistryCommand::Begin(intent(&run_id(200))))
                 .await
@@ -846,6 +885,43 @@ pub(crate) mod tests {
                     .retired
                     .is_empty()
             );
+        });
+    }
+
+    #[test]
+    fn recovery_only_touches_records_from_before_the_daemon_started() {
+        with_registry(|registry, _dir| async move {
+            let backend = Arc::new(FakeBackend::with(Faults {
+                hang: true,
+                ..Faults::default()
+            }));
+            commit(&registry, ActRegistryCommand::Begin(intent(&run_id(300))))
+                .await
+                .unwrap();
+            let stale = pending_records(&registry).await.unwrap();
+            assert_eq!(stale.len(), 1);
+            // A run that starts after the snapshot sorts after it by UUID too.
+            let live = {
+                let registry = registry.clone();
+                let backend = Arc::clone(&backend);
+                async_engine::launch(async move {
+                    run_on_engine(
+                        &registry,
+                        backend.as_ref(),
+                        &plan(&run_id(301), Duration::from_secs(3600)),
+                        &CancellationSource::new().token(),
+                        &mut Collect::default(),
+                    )
+                    .await
+                })
+            };
+            while *backend.executions.lock().unwrap() < 1 {
+                async_engine::sleep(Duration::from_millis(5)).await;
+            }
+            let report = reconcile(&registry, backend.as_ref(), &stale).await;
+            assert_eq!(report.retired, [run_id(300)]);
+            assert_eq!(backend.live(), 1, "the live run's engine is untouched");
+            live.cancel();
         });
     }
 

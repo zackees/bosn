@@ -21,12 +21,12 @@ bosn ci runners [list|drain|resume|set-limit N|prune-cache]
 | Code | Meaning |
 |------|---------|
 | 0 | success |
-| 1 | workflow failure, or an engine or cleanup error |
-| 2 | cancelled or timed out (also `wait` reaching its deadline) |
-| 3 | refused, or coverage incomplete (some jobs need a runner bosn cannot supervise) |
+| 1 | workflow failure, an engine or cleanup error, a daemon/transport error, or `cancel` on a run that was already finished |
+| 2 | cancelled or timed out, or not finished yet (`wait` reached its deadline, or `report` on a running run) |
+| 3 | refused (invalid arguments, release from a dirty tree, ...) or incomplete coverage |
 
 A run is never reported as `success` when any job was `unsupported`, when no
-job ran, or when its engine could not be proven removed.
+job succeeded, or when its engine could not be proven removed.
 
 ## What runs, and where
 
@@ -54,7 +54,11 @@ job ran, or when its engine could not be proven removed.
     against its pinned sha256. It runs there through `docker exec`, so it only
     sees the engine's private socket. The host socket is never mounted.
   - Every job container, network, volume and image act creates lives in the
-    engine's own storage, which `docker rm -f -v` removes with it.
+    engine's own storage, which `docker rm -f -v <engine id>` removes with it.
+  - **This isolates resource ownership and cleanup, not untrusted code.** The
+    engine is privileged, and jobs can reach its Docker socket, so a hostile
+    workflow can escape to the host. Run only workflows you would run on this
+    machine directly.
 - **Lifecycle.** Each step goes through the registry (`docs/rust-registry.md`):
   1. A durable intent is recorded.
   2. The engine is created.
@@ -73,7 +77,8 @@ job ran, or when its engine could not be proven removed.
   limit, which defaults to cores / 4 and is changed with
   `bosn ci runners set-limit N`.
   - Identical submissions share one run ID. "Identical" means the same SHA,
-    dirty digest, workflow, job, trigger, mode, provider and engine.
+    dirty digest, workflow, job, trigger, mode, provider, engine, event payload
+    (branch, PR number, repository) and timeout.
   - `drain` stops new runs from starting, and `resume` restarts them. Neither
     affects running jobs.
 - **Actor.** Every run records who submitted it. `BOSN_CI_ACTOR` sets it
