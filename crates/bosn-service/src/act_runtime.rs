@@ -137,6 +137,39 @@ pub fn verify_loaded_image(
         .filter(|a| a.len() == 1)
         .ok_or_else(|| error("expected exactly one imported image"))?;
     let image = &records[0];
+    for field in ["Env", "Entrypoint", "Cmd"] {
+        let empty = json!([]);
+        let normalize = |value: &Value| {
+            if value.is_null() {
+                empty.clone()
+            } else {
+                value.clone()
+            }
+        };
+        let actual = normalize(&image["Config"][field]);
+        let pinned = normalize(&expected["config"][field]);
+        if !actual.is_array() || actual != pinned {
+            return Err(error(
+                "imported image execution config differs from pinned config",
+            ));
+        }
+    }
+    for field in ["User", "WorkingDir"] {
+        let normalize = |value: &Value| {
+            if value.is_null() {
+                Some(String::new())
+            } else {
+                value.as_str().map(str::to_owned)
+            }
+        };
+        if normalize(&image["Config"][field]).is_none()
+            || normalize(&image["Config"][field]) != normalize(&expected["config"][field])
+        {
+            return Err(error(
+                "imported image execution config differs from pinned config",
+            ));
+        }
+    }
     let id = image["Id"]
         .as_str()
         .ok_or_else(|| error("missing Docker image ID"))?;
@@ -828,6 +861,7 @@ pub async fn run_registered_act(
             request.package.manifest_digest.clone(),
         ])
         .await?;
+        private_file(&evidence.join("act-image-inspect.json"), &loaded)?;
         let image_id = verify_loaded_image(
             &loaded,
             &request.package.manifest_digest,
@@ -844,6 +878,7 @@ pub async fn run_registered_act(
             request.package.runner_manifest_digest.clone(),
         ])
         .await?;
+        private_file(&evidence.join("runner-image-inspect.json"), &runner_loaded)?;
         if request.package.runner_manifest_digest != request.intent.runner_image_digest {
             return Err(error("runner immutable manifest mismatch"));
         }
@@ -1170,7 +1205,7 @@ else: raise Exception('unexpected args '+repr(args))
             transaction.commit().unwrap();
             let image_config: Value = serde_json::from_slice(&package.config).unwrap();
             let runner_config: Value = serde_json::from_slice(&package.runner_config).unwrap();
-            let image = json!({"act":[{"Id":package.manifest_digest,"Descriptor":{"digest":package.manifest_digest,"mediaType":serde_json::from_slice::<Value>(&package.manifest).unwrap()["mediaType"],"size":package.manifest.len()},"RootFS":{"Type":"layers","Layers":image_config["rootfs"]["diff_ids"]},"Config":{"Volumes":null}}],"runner":[{"Id":package.runner_manifest_digest,"Descriptor":{"digest":package.runner_manifest_digest,"mediaType":serde_json::from_slice::<Value>(&package.runner_manifest).unwrap()["mediaType"],"size":package.runner_manifest.len()},"RootFS":{"Type":"layers","Layers":runner_config["rootfs"]["diff_ids"]},"Config":{"Volumes":null}}]});
+            let image = json!({"act":[{"Id":package.manifest_digest,"Descriptor":{"digest":package.manifest_digest,"mediaType":serde_json::from_slice::<Value>(&package.manifest).unwrap()["mediaType"],"size":package.manifest.len()},"RootFS":{"Type":"layers","Layers":image_config["rootfs"]["diff_ids"]},"Config":image_config["config"]}],"runner":[{"Id":package.runner_manifest_digest,"Descriptor":{"digest":package.runner_manifest_digest,"mediaType":serde_json::from_slice::<Value>(&package.runner_manifest).unwrap()["mediaType"],"size":package.runner_manifest.len()},"RootFS":{"Type":"layers","Layers":runner_config["rootfs"]["diff_ids"]},"Config":runner_config["config"]}]});
             let image_path = dir.path().join("image.json");
             std::fs::write(&image_path, serde_json::to_vec(&image).unwrap()).unwrap();
             let script = dir.path().join("docker.py");
@@ -1570,12 +1605,12 @@ else: raise Exception('unexpected args '+repr(args))
     }
     #[test]
     fn imported_manifest_and_config_are_separate_from_docker_image_id() {
-        let config_bytes = serde_json::to_vec(&json!({"architecture":"amd64","os":"linux","config":{"Volumes":{}},"rootfs":{"type":"layers","diff_ids":[format!("sha256:{}","c".repeat(64))]}})).unwrap();
+        let config_bytes = serde_json::to_vec(&json!({"architecture":"amd64","os":"linux","config":{"Volumes":{},"Env":["PATH=/usr/bin:/bin"],"Entrypoint":["/bin/sh"],"Cmd":["-c","true"],"User":"root","WorkingDir":"/tmp"},"rootfs":{"type":"layers","diff_ids":[format!("sha256:{}","c".repeat(64))]}})).unwrap();
         let config = hash(&config_bytes);
         let manifest_bytes = serde_json::to_vec(&json!({"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":config,"size":config_bytes.len(),"mediaType":"application/vnd.oci.image.config.v1+json"}})).unwrap();
         let manifest = hash(&manifest_bytes);
         let expected: Value = serde_json::from_slice(&config_bytes).unwrap();
-        let observation = json!([{"Id":manifest,"Descriptor":{"digest":manifest,"mediaType":"application/vnd.oci.image.manifest.v1+json","size":manifest_bytes.len()},"RootFS":{"Type":"layers","Layers":expected["rootfs"]["diff_ids"]},"Config":{"Volumes":{}}}]);
+        let observation = json!([{"Id":manifest,"Descriptor":{"digest":manifest,"mediaType":"application/vnd.oci.image.manifest.v1+json","size":manifest_bytes.len()},"RootFS":{"Type":"layers","Layers":expected["rootfs"]["diff_ids"]},"Config":expected["config"]}]);
         let verify = |v: &Value, m: &[u8], c: &[u8]| {
             verify_loaded_image(&serde_json::to_vec(v).unwrap(), &manifest, &config, m, c)
         };
@@ -1583,14 +1618,27 @@ else: raise Exception('unexpected args '+repr(args))
             verify(&observation, &manifest_bytes, &config_bytes).unwrap(),
             manifest
         );
-        for field in ["manifest", "size", "mediaType", "layers", "volumes"] {
+        for field in [
+            "manifest",
+            "size",
+            "mediaType",
+            "layers",
+            "volumes",
+            "Env",
+            "Entrypoint",
+            "Cmd",
+            "User",
+            "WorkingDir",
+        ] {
             let mut bad = observation.clone();
             match field {
                 "manifest" => bad[0]["Descriptor"]["digest"] = json!(config),
                 "size" => bad[0]["Descriptor"]["size"] = json!(0),
                 "mediaType" => bad[0]["Descriptor"]["mediaType"] = json!("unknown"),
                 "layers" => bad[0]["RootFS"]["Layers"] = json!([]),
-                _ => bad[0]["Config"]["Volumes"] = json!({"/data":{}}),
+                "volumes" => bad[0]["Config"]["Volumes"] = json!({"/data":{}}),
+                "Env" | "Entrypoint" | "Cmd" => bad[0]["Config"][field] = json!([]),
+                _ => bad[0]["Config"][field] = json!("foreign"),
             };
             assert!(verify(&bad, &manifest_bytes, &config_bytes).is_err());
         }
