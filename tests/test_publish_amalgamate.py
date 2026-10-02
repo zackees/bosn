@@ -214,6 +214,40 @@ def test_every_include_in_the_real_tree_still_resolves(amalgamated: Path) -> Non
     assert includes >= 1
 
 
+# A `pub fn` behind `#[cfg(...)]` (other attributes may sit between them).
+GATED_FN = re.compile(r"#\[cfg\((?P<cfg>[^\]]*)\)\]\s*(?:#\[[^\]]*\]\s*)*pub fn (?P<name>\w+)")
+
+
+def test_seams_the_unit_tests_call_compile_under_cfg_test(amalgamated: Path) -> None:
+    """A test-only seam must reach every unit test that calls it (#380).
+
+    In the workspace a test-helper feature (`native-test-helper`) is enabled by
+    the calling crate's dev-dependency. The amalgamated crate has no such
+    edge: its unit tests compile under `cfg(test)` alone, so a seam gated only
+    on the feature is missing there unless the caller is gated on it too.
+    """
+    sources = {
+        path: path.read_text(encoding="utf-8") for path in (amalgamated / "src").rglob("*.rs")
+    }
+    helpers = set(amalgamate.INTERNAL_FEATURE_REMOVALS)
+    seams = []
+    for path, text in sources.items():
+        for match in GATED_FN.finditer(text):
+            features = set(re.findall(r'feature\s*=\s*"([^"]+)"', match["cfg"]))
+            # The bare `test` predicate, not a feature name that contains it.
+            predicates = re.sub(r'"[^"]*"', '""', match["cfg"])
+            if features & helpers and not re.search(r"\btest\b", predicates):
+                seams.append((path, match["name"], features & helpers))
+    stranded = [
+        (caller.relative_to(amalgamated), name)
+        for _, name, features in seams
+        for caller, text in sources.items()
+        if re.search(rf"\b{name}\s*\(", text)
+        and not any(f'feature = "{feature}"' in text for feature in features)
+    ]
+    assert stranded == [], f"feature-only seams called from ungated code: {stranded}"
+
+
 def test_amalgamating_twice_is_idempotent(tmp_path: Path) -> None:
     shutil.copytree(Path("crates"), tmp_path / "crates", ignore=shutil.ignore_patterns("target"))
     amalgamate.prepare_bosn_crate_for_publish(tmp_path)
