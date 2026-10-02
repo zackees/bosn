@@ -184,6 +184,52 @@ pub fn observe_engine_image(
     })
 }
 
+// Cgroup nesting follows the pinned image's DIND_COMMIT 8d9e3502.../hack/dind.
+// Only the private cgroup namespace root is touched; startup is finite and
+// deliberately omits the publisher entrypoint's TCP listeners and extra mounts.
+const ENGINE_INIT: &str = r#"set -eu
+[ "$$" -eq 1 ] || { echo 'engine init requires PID 1' >&2; exit 1; }
+IFS= read -r group < /proc/self/cgroup
+[ "$group" = '0::/' ] || { echo 'engine init requires private cgroup v2 root' >&2; exit 1; }
+[ -f /sys/fs/cgroup/cgroup.controllers ] || exit 1
+mkdir -p /sys/fs/cgroup/init
+IFS= read -r controllers < /sys/fs/cgroup/cgroup.controllers
+[ -n "$controllers" ] || exit 1
+controls=
+for controller in $controllers; do
+    case "$controller" in *[!a-z0-9_]*|'') exit 1 ;; esac
+    controls="$controls +$controller"
+done
+attempt=0
+while :; do
+    while IFS= read -r pid; do
+        case "$pid" in *[!0-9]*|'') exit 1 ;; esac
+        printf '%s\n' "$pid" > /sys/fs/cgroup/init/cgroup.procs || :
+    done < /sys/fs/cgroup/cgroup.procs
+    if { printf '%s\n' "$controls" > /sys/fs/cgroup/cgroup.subtree_control; } 2>/dev/null; then break; fi
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 32 ] || { echo 'private cgroup controllers unavailable' >&2; exit 1; }
+    sleep 0.01
+done
+exec docker-init -- "$@"
+"#;
+pub(crate) fn engine_command() -> Vec<String> {
+    [
+        "sh",
+        "-ec",
+        ENGINE_INIT,
+        "bosn-act-engine-init",
+        "dockerd",
+        "--feature=containerd-snapshotter=true",
+        "--storage-driver=native",
+        "--data-root=/var/lib/docker",
+        "--exec-root=/run/docker",
+        "--host=unix:///var/run/docker.sock",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
 /// Limits apply to the entire isolated engine and all its descendants.
 /// Storage is private tmpfs; the engine's writable root is disabled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -287,15 +333,11 @@ pub fn create_arguments(
     for (key, value) in labels {
         args.extend(["--label".into(), format!("{key}={value}")]);
     }
-    args.extend([
-        format!("docker.io/library/docker@{}", intent.engine_image_digest),
-        "dockerd".into(),
-        "--feature=containerd-snapshotter=true".into(),
-        "--storage-driver=native".into(),
-        "--data-root=/var/lib/docker".into(),
-        "--exec-root=/run/docker".into(),
-        "--host=unix:///var/run/docker.sock".into(),
-    ]);
+    args.push(format!(
+        "docker.io/library/docker@{}",
+        intent.engine_image_digest
+    ));
+    args.extend(engine_command());
     Ok(args)
 }
 
@@ -605,15 +647,7 @@ pub fn observe_engine(
         || engine["Config"]
             .get("Entrypoint")
             .is_none_or(|v| !v.is_null() && !v.as_array().is_some_and(|v| v.is_empty()))
-        || engine["Config"]["Cmd"]
-            != serde_json::json!([
-                "dockerd",
-                "--feature=containerd-snapshotter=true",
-                "--storage-driver=native",
-                "--data-root=/var/lib/docker",
-                "--exec-root=/run/docker",
-                "--host=unix:///var/run/docker.sock"
-            ])
+        || engine["Config"]["Cmd"] != serde_json::json!(engine_command())
         || !empty(&host["Binds"])
         || !empty(&host["VolumesFrom"])
         || !empty(&host["Mounts"])
@@ -703,10 +737,7 @@ mod tests {
     fn document() -> serde_json::Value {
         let i = intent();
         let l = limits();
-        json!([{"Id":"1".repeat(64),"Name":format!("/{}",i.engine_name()),"Image":format!("sha256:{}","2".repeat(64)),"Config":{"Image":format!("docker.io/library/docker@{}",i.engine_image_digest),"Entrypoint":null,"Labels":i.required_labels(OWNER).unwrap(),"Env":["DOCKER_TLS_CERTDIR=","DOCKER_CONTAINERD_ROOT=/var/lib/docker/containerd/daemon"],"Volumes":{"/var/lib/docker":{}},"Healthcheck":{"Test":["NONE"]},"Cmd":["dockerd","--feature=containerd-snapshotter=true",
-                "--storage-driver=native",
-                "--data-root=/var/lib/docker",
-                "--exec-root=/run/docker","--host=unix:///var/run/docker.sock"]},"HostConfig":{"Privileged":true,"Memory":l.memory_bytes,"MemorySwap":l.memory_bytes,"CpuPeriod":100000,"CpuQuota":l.nano_cpus/10_000,"ReadonlyRootfs":true,"PidMode":"","IpcMode":"private","CgroupnsMode":"private","PidsLimit":l.pids,"Binds":null,"PortBindings":{},"NetworkMode":"bridge","LogConfig":{"Type":"local","Config":{"max-size":"1m","max-file":"2"}},"Tmpfs":l.tmpfs()},"Mounts":[{"Type":"tmpfs","Destination":"/var/lib/docker"},{"Type":"tmpfs","Destination":"/run"},{"Type":"tmpfs","Destination":"/tmp"}]}])
+        json!([{"Id":"1".repeat(64),"Name":format!("/{}",i.engine_name()),"Image":format!("sha256:{}","2".repeat(64)),"Config":{"Image":format!("docker.io/library/docker@{}",i.engine_image_digest),"Entrypoint":null,"Labels":i.required_labels(OWNER).unwrap(),"Env":["DOCKER_TLS_CERTDIR=","DOCKER_CONTAINERD_ROOT=/var/lib/docker/containerd/daemon"],"Volumes":{"/var/lib/docker":{}},"Healthcheck":{"Test":["NONE"]},"Cmd":engine_command()},"HostConfig":{"Privileged":true,"Memory":l.memory_bytes,"MemorySwap":l.memory_bytes,"CpuPeriod":100000,"CpuQuota":l.nano_cpus/10_000,"ReadonlyRootfs":true,"PidMode":"","IpcMode":"private","CgroupnsMode":"private","PidsLimit":l.pids,"Binds":null,"PortBindings":{},"NetworkMode":"bridge","LogConfig":{"Type":"local","Config":{"max-size":"1m","max-file":"2"}},"Tmpfs":l.tmpfs()},"Mounts":[{"Type":"tmpfs","Destination":"/var/lib/docker"},{"Type":"tmpfs","Destination":"/run"},{"Type":"tmpfs","Destination":"/tmp"}]}])
     }
     #[test]
     fn real_descriptor_without_annotations_requires_publisher_config_proof() {
@@ -913,6 +944,97 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn private_cgroup_init_reparents_and_refuses_unavailable_or_foreign_roots() {
+        use std::process::Command;
+        let root =
+            std::env::temp_dir().join(format!("bosn-cgroup-init-3345-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let group = root.join("self-cgroup");
+        let cgroups = root.join("cgroups");
+        std::fs::create_dir(&cgroups).unwrap();
+        std::fs::write(&group, "0::/\n").unwrap();
+        std::fs::write(cgroups.join("cgroup.controllers"), "cpu memory pids\n").unwrap();
+        std::fs::write(cgroups.join("cgroup.procs"), "1\n42\n").unwrap();
+        std::fs::write(cgroups.join("cgroup.subtree_control"), "").unwrap();
+        // Run only against a synthetic file tree, never the host cgroupfs.
+        let script = ENGINE_INIT
+            .replace("[ \"$$\" -eq 1 ]", "[ 1 -eq 1 ]")
+            .replace("/proc/self/cgroup", group.to_str().unwrap())
+            .replace("/sys/fs/cgroup", cgroups.to_str().unwrap())
+            .replace("exec docker-init --", "exec");
+        let run = || {
+            Command::new("sh")
+                .args(["-ec", &script, "fixture", "sh", "-c", "printf initialized"])
+                .output()
+                .unwrap()
+        };
+        let pid_guard = script.replace("[ 1 -eq 1 ]", "[ \"$$\" -eq 1 ]");
+        let refused = Command::new("sh")
+            .args([
+                "-ec",
+                &pid_guard,
+                "fixture",
+                "sh",
+                "-c",
+                "printf initialized",
+            ])
+            .output()
+            .unwrap();
+        assert!(!refused.status.success());
+        assert!(refused.stdout.is_empty());
+        assert_eq!(run().stdout, b"initialized");
+        assert_eq!(
+            std::fs::read_to_string(cgroups.join("init/cgroup.procs")).unwrap(),
+            "42\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cgroups.join("cgroup.subtree_control")).unwrap(),
+            " +cpu +memory +pids\n"
+        );
+        for bad in ["0::/foreign\n", "1:memory:/\n"] {
+            std::fs::write(&group, bad).unwrap();
+            let result = run();
+            assert!(!result.status.success());
+            assert!(result.stdout.is_empty());
+        }
+        std::fs::write(&group, "0::/\n").unwrap();
+        std::fs::write(cgroups.join("cgroup.controllers"), "cpu bad-token\n").unwrap();
+        assert!(!run().status.success());
+        std::fs::write(cgroups.join("cgroup.controllers"), "cpu memory pids\n").unwrap();
+        // A controller write failure must finish after a finite retry budget.
+        let blocked = root.join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        let failing = script.replace(
+            cgroups.join("cgroup.subtree_control").to_str().unwrap(),
+            blocked.to_str().unwrap(),
+        );
+        let result = Command::new("sh")
+            .args(["-ec", &failing, "fixture", "sh", "-c", "printf initialized"])
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(result.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&result.stderr)
+                .contains("private cgroup controllers unavailable")
+        );
+        assert!(!ENGINE_INIT.contains("mount "));
+        assert!(!ENGINE_INIT.contains("tcp://"));
+        let mut wrong = document();
+        wrong[0]["Config"]["Cmd"][2] = json!("exec dockerd --host=tcp://0.0.0.0:2375");
+        assert!(
+            observe_engine(
+                &serde_json::to_vec(&wrong).unwrap(),
+                &intent(),
+                OWNER,
+                &classic_identity(),
+                limits()
+            )
+            .is_err()
+        );
+        eprintln!("retained cgroup fixture {}", root.display());
     }
     #[test]
     fn native_containerd_content_and_runtime_remain_under_bounded_roots() {

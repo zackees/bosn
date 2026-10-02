@@ -903,11 +903,22 @@ pub async fn run_registered_act(
         drop(sender);
         report.output_sha256 = Some(logging.await.map_err(|e| error(e.to_string()))??);
         let output = output.map_err(|e| error(e.to_string()))?;
+        if output.exit_code != 0 {
+            let detail = if output.stderr.is_empty() {
+                &output.stdout
+            } else {
+                &output.stderr
+            };
+            return Err(error(format!(
+                "Act driver exited {}: {}",
+                output.exit_code,
+                String::from_utf8_lossy(&detail[..detail.len().min(2048)])
+            )));
+        }
         let mut bytes = output.stdout;
         bytes.extend_from_slice(&output.stderr);
         report.jobs = parse_job_results(&bytes)?;
-        if output.exit_code != 0
-            || report.jobs.is_empty()
+        if report.jobs.is_empty()
             || report
                 .jobs
                 .iter()
@@ -1044,6 +1055,8 @@ elif args[:5]==['exec',record['engine_id'],'docker','image','inspect']:
  if mode=='foreign-image': value[0]['Descriptor']['digest']='sha256:'+'f'*64
  print(json.dumps(value))
 elif args[:4]==['exec',record['engine_id'],'docker','run']:
+ if mode=='driver-failed':
+  print('named Docker cgroup failure',file=sys.stderr);sys.exit(125)
  assert record['state']=='registered'
  assert '--network=bridge' in args and '--read-only' in args and '-W' in args and args[args.index('-W')+1].endswith('/source/.github/workflows')
  assert not any('GITHUB_TOKEN' in x for x in args)
@@ -1060,6 +1073,7 @@ else: raise Exception('unexpected args '+repr(args))
             "copy-failed",
             "copy-corrupt",
             "load-failed",
+            "driver-failed",
             "foreign-image",
             "missing-runner",
             "unsupported",
@@ -1446,6 +1460,16 @@ else: raise Exception('unexpected args '+repr(args))
                     "{mode}: {:?}",
                     report.failure
                 );
+                if mode == "driver-failed" {
+                    assert!(
+                        report
+                            .failure
+                            .as_deref()
+                            .unwrap()
+                            .contains("Act driver exited 125: named Docker cgroup failure")
+                    );
+                    assert!(report.jobs.is_empty());
+                }
                 assert_eq!(report.engine_removed, mode != "probe-failed", "{mode}");
                 let persisted: Value = serde_json::from_slice(
                     &std::fs::read(evidence.join(&intent.run_id).join("result.json")).unwrap(),
