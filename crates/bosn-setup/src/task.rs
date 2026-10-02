@@ -383,7 +383,14 @@ pub async fn execute_setup_app_task<E: SetupAppTaskEngine>(
     let result = engine
         .stream(
             SetupAppTaskCommand::Exec {
-                container_name: format!("bosn-setup-{}", request.plan.content_sha256),
+                container_name: crate::setup_container_name(
+                    request.plan,
+                    &request.workspace_root,
+                    request.prepared_image,
+                )
+                .map_err(|_| {
+                    SetupTaskError::InvalidRequest("invalid container creation profile")
+                })?,
                 passthrough_env: request.passthrough_env,
                 command,
             },
@@ -1044,6 +1051,7 @@ mod tests {
         std::fs::create_dir(workspace.join("src")).unwrap();
         let plan = plan(&workspace);
         let image = prepared(&plan);
+        let container_name = crate::setup_container_name(&plan, &workspace, &image).unwrap();
         let engine = FakeAppEngine::with_results([command_result(0, b"ok", b"")]);
         let cancellation = CancellationSource::new();
         let (events, _receiver) = channel(8);
@@ -1066,19 +1074,19 @@ mod tests {
         assert_eq!(
             *engine.calls.lock().unwrap(),
             vec![SetupAppTaskCommand::Exec {
-                container_name: format!("bosn-setup-{HASH}"),
+                container_name: container_name.clone(),
                 passthrough_env: Vec::new(),
                 command: "cargo test --locked".into(),
             }]
         );
         assert_eq!(
             SetupAppTaskCommand::Exec {
-                container_name: format!("bosn-setup-{HASH}"),
+                container_name: container_name.clone(),
                 passthrough_env: Vec::new(),
                 command: "cargo test --locked".into(),
             }
             .docker_args(),
-            vec!["container", "exec", &format!("bosn-setup-{HASH}"),]
+            vec!["container", "exec", &container_name.clone(),]
                 .into_iter()
                 .map(String::from)
                 .chain(crate::shell::login_shell_args("cargo test --locked"))

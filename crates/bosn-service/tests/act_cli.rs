@@ -107,7 +107,21 @@ fn commit_workflow(root: &std::path::Path, workflow: &str) -> String {
 #[cfg(unix)]
 fn fake_act(root: &std::path::Path) -> std::path::PathBuf {
     let path = root.join(".git/act-fake");
-    fs::write(&path, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'act version 0.2.88'; exit 0; fi\nif [ \"$1\" = -l ] && [ \"$2\" = -W ]; then if [ \"$BOSN_FAKE_ACT_MODE\" = hang ]; then sleep 4; fi; if [ \"$BOSN_FAKE_ACT_MODE\" = closehang ]; then exec 1>&- 2>&-; sleep 4; fi; if [ \"$BOSN_FAKE_ACT_MODE\" = flood ]; then head -c 2097152 /dev/zero; exit 0; fi; if [ \"$BOSN_FAKE_ACT_MODE\" = dirty ]; then printf changed > src.rs; fi; printf 'Stage  Job ID       Job name       Workflow name  Workflow file  Events\\n0      lint         Lint           CI             ci.yml         push\\n1      build-linux  Linux build    CI             ci.yml         push\\n'; exit 0; fi\nexit 7\n").unwrap();
+    fs::write(&path, r#"#!/bin/sh
+printf '%s\n' "$PWD" > "$(dirname "$0")/act-fake-control"
+if [ "$1" = --version ]; then echo 'act version 0.2.88'; exit 0; fi
+mode=''
+if [ -f "$(dirname "$0")/act-fake-mode" ]; then mode=$(cat "$(dirname "$0")/act-fake-mode"); fi
+if [ "$1" = -l ] && [ "$2" = -C ] && [ "$4" = -W ]; then
+  if [ "$mode" = hang ]; then sleep 4; fi
+  if [ "$mode" = closehang ]; then exec 1>&- 2>&-; sleep 4; fi
+  if [ "$mode" = flood ]; then head -c 2097152 /dev/zero; exit 0; fi
+  if [ "$mode" = dirty ]; then printf changed > "$3/src.rs"; fi
+  if [ "$mode" = fail ]; then exit 7; fi
+  printf 'Stage  Job ID       Job name       Workflow name  Workflow file  Events\n0      lint         Lint           CI             ci.yml         push\n1      build-linux  Linux build    CI             ci.yml         push\n'; exit 0
+fi
+exit 7
+"#).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
     path
 }
@@ -239,7 +253,7 @@ fn act_plan_lists_selected_jobs_from_pinned_act() {
 
 #[cfg(unix)]
 #[test]
-fn act_plan_uses_workspace_for_both_relative_binary_queries() {
+fn act_plan_resolves_workspace_relative_binary_before_sterile_queries() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("ci.yml"), "name: CI\non: [push]\n").unwrap();
     let sha = commit_workflow(root.path(), "ci.yml");
@@ -317,6 +331,7 @@ fn act_plan_rejects_source_changed_during_act_query() {
     fs::write(root.path().join("src.rs"), "original\n").unwrap();
     let sha = commit_workflow(root.path(), "ci.yml");
     let act = fake_act(root.path());
+    fs::write(root.path().join(".git/act-fake-mode"), "dirty").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_bosn"))
         .args(["act", "plan", "--workspace"])
         .arg(root.path())
@@ -334,7 +349,6 @@ fn act_plan_rejects_source_changed_during_act_query() {
             "--act-bin",
         ])
         .arg(&act)
-        .env("BOSN_FAKE_ACT_MODE", "dirty")
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
@@ -387,7 +401,7 @@ fn act_plan_refuses_mismatched_sha_and_dirty_workflow() {
     let act = fake_act(root.path());
     for (requested_sha, dirty, expected) in [
         ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false, "HEAD"),
-        (sha.as_str(), true, "workflow differs"),
+        (sha.as_str(), true, "source differs"),
     ] {
         if dirty {
             fs::write(root.path().join("ci.yml"), "name: Altered\non: [push]\n").unwrap();
@@ -420,6 +434,50 @@ fn act_plan_refuses_mismatched_sha_and_dirty_workflow() {
         );
         assert!(output.stdout.is_empty());
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn act_plan_bounds_committed_workflow_and_git_observations() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("ci.yml"), vec![b'#'; (1 << 20) + 1]).unwrap();
+    let sha = commit_workflow(root.path(), "ci.yml");
+    let run = |path: Option<&std::path::Path>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bosn"));
+        command
+            .args(["act", "plan", "--workspace"])
+            .arg(root.path())
+            .args([
+                "--workflow",
+                "ci.yml",
+                "--event",
+                "push",
+                "--mode",
+                "minimal",
+                "--sha",
+                &sha,
+                "--act-version",
+                "0.2.88",
+                "--json",
+            ]);
+        if let Some(path) = path {
+            command.env("PATH", path);
+        }
+        command.output().unwrap()
+    };
+    let oversized = run(None);
+    assert_eq!(oversized.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&oversized.stderr).contains("exceeds 1 MiB"));
+    assert!(oversized.stdout.is_empty());
+
+    let commands = tempfile::tempdir().unwrap();
+    let git = commands.path().join("git");
+    fs::write(&git, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o700)).unwrap();
+    let delayed = run(Some(commands.path()));
+    assert_eq!(delayed.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&delayed.stderr).contains("timed out"));
+    assert!(delayed.stdout.is_empty());
 }
 
 #[cfg(unix)]
@@ -494,7 +552,8 @@ fn act_plan_times_out_hung_list() {
     fs::write(root.path().join("ci.yml"), "name: CI\non: [push]\n").unwrap();
     let sha = commit_workflow(root.path(), "ci.yml");
     let act = fake_act(root.path());
-    for mode in ["hang", "closehang"] {
+    for mode in ["hang", "closehang", "fail"] {
+        fs::write(root.path().join(".git/act-fake-mode"), mode).unwrap();
         let started = std::time::Instant::now();
         let output = Command::new(env!("CARGO_BIN_EXE_bosn"))
             .args(["act", "plan", "--workspace"])
@@ -514,12 +573,20 @@ fn act_plan_times_out_hung_list() {
             ])
             .arg(&act)
             .args(["--json"])
-            .env("BOSN_FAKE_ACT_MODE", mode)
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(2));
         assert!(started.elapsed() < std::time::Duration::from_secs(4));
-        assert!(String::from_utf8_lossy(&output.stderr).contains("timed out"));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(if mode == "fail" {
+                "query failed"
+            } else {
+                "timed out"
+            })
+        );
+        assert!(output.stdout.is_empty());
+        let control = fs::read_to_string(root.path().join(".git/act-fake-control")).unwrap();
+        assert!(!std::path::Path::new(control.trim()).exists());
     }
 }
 
@@ -530,6 +597,7 @@ fn act_plan_rejects_oversized_list_output() {
     fs::write(root.path().join("ci.yml"), "name: CI\non: [push]\n").unwrap();
     let sha = commit_workflow(root.path(), "ci.yml");
     let act = fake_act(root.path());
+    fs::write(root.path().join(".git/act-fake-mode"), "flood").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_bosn"))
         .args(["act", "plan", "--workspace"])
         .arg(root.path())
@@ -548,10 +616,103 @@ fn act_plan_rejects_oversized_list_output() {
         ])
         .arg(&act)
         .args(["--json"])
-        .env("BOSN_FAKE_ACT_MODE", "flood")
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("output limit"));
     assert!(output.stdout.is_empty());
+}
+
+#[cfg(unix)]
+fn check_sterile_act_queries(with_config: bool) {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("ci.yml"), "name: CI\non: [push]\n").unwrap();
+    if with_config {
+        fs::write(
+            root.path().join(".actrc"),
+            "--secret HOST_TOKEN\n--job attacker\n",
+        )
+        .unwrap();
+    }
+    let sha = commit_workflow(root.path(), "ci.yml");
+    let host = tempfile::tempdir().unwrap();
+    if with_config {
+        fs::write(host.path().join(".actrc"), "--secret HOST_TOKEN\n").unwrap();
+    }
+    fs::create_dir(host.path().join("act")).unwrap();
+    if with_config {
+        fs::write(host.path().join("act/actrc"), "--secret HOST_TOKEN\n").unwrap();
+    }
+    let act = root.path().join(".git/sterile-act");
+    fs::write(&act, r#"#!/bin/sh
+printf '%s\n%s\n%s\n' "$PWD" "$HOME" "$XDG_CONFIG_HOME" >> "$(dirname "$0")/query-audit"
+if [ -f .actrc ] || [ -f "$HOME/.actrc" ] || [ -f "$XDG_CONFIG_HOME/act/actrc" ]; then echo 'inherited actrc' >&2; exit 21; fi
+if [ -n "$HOST_TOKEN$GITHUB_TOKEN$GH_TOKEN$AWS_SECRET_ACCESS_KEY$DOCKER_HOST$LD_PRELOAD$BOSN_FAKE_ACT_MODE" ]; then echo 'inherited credential or configuration' >&2; exit 22; fi
+[ "$ACT_DISABLE_VERSION_CHECK" = 1 ] || { echo 'version lookup not disabled' >&2; exit 26; }
+[ -d "$HOME" ] && [ -d "$XDG_CONFIG_HOME" ] || exit 23
+[ "$PWD" != "$(dirname "$(dirname "$0")")" ] || exit 24
+if [ "$1" = --version ]; then echo 'act version 0.2.88'; exit 0; fi
+[ "$1" = -l ] && [ "$2" = -C ] && [ "$3" = "$(dirname "$(dirname "$0")")" ] && [ "$4" = -W ] && [ "$5" = "$3/ci.yml" ] || { echo 'wrong explicit source/workflow arguments' >&2; exit 25; }
+[ "$#" = 7 ] && [ "$6" = --secret ] && [ "$7" = GITHUB_TOKEN= ] || { echo 'credential helper discovery not suppressed' >&2; exit 27; }
+printf 'Stage  Job ID  Job name\n0  lint  Lint\n'
+"#).unwrap();
+    fs::set_permissions(&act, fs::Permissions::from_mode(0o700)).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_bosn"))
+        .args(["act", "plan", "--workspace"])
+        .arg(root.path())
+        .args([
+            "--workflow",
+            "ci.yml",
+            "--event",
+            "push",
+            "--mode",
+            "minimal",
+            "--sha",
+            &sha,
+            "--act-version",
+            "0.2.88",
+            "--act-bin",
+        ])
+        .arg(&act)
+        .arg("--json")
+        .env("HOME", host.path())
+        .env("XDG_CONFIG_HOME", host.path())
+        .env("HOST_TOKEN", "host secret")
+        .env("GITHUB_TOKEN", "github secret")
+        .env("GH_TOKEN", "gh secret")
+        .env("AWS_SECRET_ACCESS_KEY", "cloud secret")
+        .env("DOCKER_HOST", "tcp://secret.invalid:2375")
+        .env("BOSN_FAKE_ACT_MODE", "ambient")
+        .env("ACT_DISABLE_VERSION_CHECK", "0")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(value["jobs"][0]["id"], "lint");
+    assert_eq!(value["executable"], false);
+    let audit = fs::read_to_string(root.path().join(".git/query-audit")).unwrap();
+    let paths: Vec<_> = audit.lines().collect();
+    assert_eq!(paths.len(), 6);
+    assert_ne!(paths[0], paths[3]);
+    for path in paths {
+        assert!(
+            !std::path::Path::new(path).exists(),
+            "query directory remains: {path}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn act_plan_queries_ignore_source_and_host_actrc() {
+    check_sterile_act_queries(true);
+}
+#[cfg(unix)]
+#[test]
+fn act_plan_queries_clear_arbitrary_host_credentials() {
+    check_sterile_act_queries(false);
 }

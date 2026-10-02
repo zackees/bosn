@@ -51,7 +51,15 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+pub mod act_archive;
+#[cfg(target_os = "linux")]
+pub mod act_artifacts;
+pub mod act_engine;
+pub mod act_image;
+#[cfg(test)]
+mod act_live_probe;
 pub mod act_registry;
+pub mod act_runtime;
 pub mod autostart;
 pub mod github_proxy;
 pub mod jobs;
@@ -808,6 +816,16 @@ struct ManifestRecoveryContract {
 /// inspect and start of a deterministic registry-owned name; no caller can
 /// inject Docker arguments, labels, images, or source paths.
 pub trait ManifestRecoveryExecutor: Send + Sync {
+    /// A label-only observation never authorizes restart. Implementations
+    /// must verify the complete current creation profile before this returns.
+    fn verify_profile<'a>(
+        &'a self,
+        _plan: &'a SetupPlan,
+        _image_identity: &'a str,
+        _name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Err("manifest recovery full profile proof unavailable".into()) })
+    }
     fn inspect<'a>(
         &'a self,
         name: &'a str,
@@ -830,6 +848,65 @@ impl DockerManifestRecoveryExecutor {
     }
 }
 impl ManifestRecoveryExecutor for DockerManifestRecoveryExecutor {
+    fn verify_profile<'a>(
+        &'a self,
+        plan: &'a SetupPlan,
+        image_identity: &'a str,
+        name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let (kind, reference) = match &plan.app_source {
+                SetupPlanAppSource::PinnedImage { image } => (
+                    bosn_setup::PreparedImageKind::PinnedImage {
+                        image: image.clone(),
+                    },
+                    image.clone(),
+                ),
+                SetupPlanAppSource::InlineDockerfile { .. } => {
+                    let tag = format!("bosn-setup:{}", plan.content_sha256);
+                    (
+                        bosn_setup::PreparedImageKind::InlineDockerfile { tag: tag.clone() },
+                        tag,
+                    )
+                }
+            };
+            // This exact immutable image ID comes from the daemon's durable
+            // successful ensure receipt; no pull/build or caller substitution.
+            let image = PreparedImage {
+                setup_content_sha256: plan.content_sha256.clone(),
+                kind,
+                reference,
+                observed_identity: image_identity.into(),
+            };
+            if bosn_setup::setup_container_name(plan, &plan.workspace_root, &image)
+                .map_err(|e| e.to_string())?
+                != name
+            {
+                return Err("manifest recovery creation identity mismatch".into());
+            }
+            let cancellation = CancellationSource::new();
+            let (events, mut receiver) = async_engine::channel(32);
+            let drain =
+                async_engine::launch(async move { while receiver.recv().await.is_some() {} });
+            let result = adopt_setup_app(
+                &self.engine,
+                CoreSetupEnsureRequest {
+                    plan,
+                    workspace_root: plan.workspace_root.clone(),
+                    prepared_image: &image,
+                    options: RunOptions::bounded(MANIFEST_RECOVERY_ENGINE_DEADLINE, 512 * 1024),
+                    cancellation: &cancellation.token(),
+                    events: &events,
+                },
+            )
+            .await;
+            drop(events);
+            drain
+                .await
+                .map_err(|_| "manifest recovery observation drain failed".to_owned())?;
+            result.map(|_| ()).map_err(|e| e.to_string())
+        })
+    }
     fn inspect<'a>(
         &'a self,
         name: &'a str,
@@ -1167,7 +1244,11 @@ impl SetupEnsureExecutor for DockerSetupEnsureExecutor {
                     // container was externally removed. The content-derived
                     // name is the validated logical identity and keeps this
                     // upsert idempotent across that recovery case.
-                    id: format!("setup-container:{}", plan.content_sha256),
+                    id: setup_container_resource_id(
+                        "setup-container",
+                        "setup",
+                        &ensured.container_name,
+                    ),
                     name: ensured.container_name,
                     stack: "setup".into(),
                     generation: format!("sha256:{}", plan.content_sha256),
@@ -1281,15 +1362,14 @@ impl ManifestEnsureExecutor for DockerManifestEnsureExecutor {
                     result.ensured.container_name
                 ),
                 resource: SetupEnsureResource {
-                    id: format!(
-                        "{}:{}:{}",
+                    id: setup_container_resource_id(
                         if is_guest {
                             "manifest-guest"
                         } else {
                             "manifest-container"
                         },
-                        request.stack,
-                        generation
+                        &request.stack,
+                        &result.ensured.container_name,
                     ),
                     name: result.ensured.container_name,
                     stack: request.stack.clone(),
@@ -3165,7 +3245,11 @@ impl SetupAdoptExecutor for DockerSetupAdoptExecutor {
                     adopted.container_name, adopted.container_id
                 ),
                 resource: SetupEnsureResource {
-                    id: format!("setup-container:{}", plan.content_sha256),
+                    id: setup_container_resource_id(
+                        "setup-container",
+                        "setup",
+                        &adopted.container_name,
+                    ),
                     name: adopted.container_name,
                     stack: "setup".into(),
                     generation: format!("sha256:{}", plan.content_sha256),
@@ -3267,6 +3351,10 @@ fn setup_ensure_image_resource(
         generation: prepared.observed_identity.clone(),
         workspace: workspace.into(),
     }
+}
+
+fn setup_container_resource_id(kind: &str, stack: &str, creation_name: &str) -> String {
+    format!("{kind}:{stack}:{creation_name}")
 }
 
 /// Docker-backed implementation for a single setup task.  The daemon plans,
@@ -7000,11 +7088,24 @@ async fn recover_manifest_startup(
         };
         // `runtime` is deliberately retained through this check: successful
         // source proof must precede any registry/engine authority.
-        let _ = runtime;
         if !actor.manifest_recovery_authorized(contract.clone()).await? {
             events.push((
                 "manifest.recovery.refused_registry".into(),
                 "inactive_session_or_volume_intent".into(),
+            ));
+            continue;
+        }
+        if !matches!(
+            async_engine::timeout_at(
+                deadline,
+                executor.verify_profile(&runtime.plan, &contract.image_identity, &contract.name)
+            )
+            .await,
+            Ok(Ok(()))
+        ) {
+            events.push((
+                "manifest.recovery.refused_engine".into(),
+                "creation_profile_unproven".into(),
             ));
             continue;
         }
@@ -7598,16 +7699,21 @@ async fn registry_actor(
     mut receiver: async_engine::Receiver<DbCommand>,
     #[cfg(test)] mut setup_ensure_record_gate: Option<SetupEnsureRecordGate>,
 ) {
+    // The sole writer lease fences prior daemon owners. This authority expires
+    // before any new Act creation/claim and is never restored by reads.
+    let mut act_startup_open = true;
     while let Some(command) = receiver.recv().await {
         match command {
             DbCommand::ActRegistry { command, reply } => {
                 let worker = async_engine::launch_blocking(move || {
-                    let result = act_registry::apply(&mut registry, *command);
-                    (registry, result)
+                    let result =
+                        act_registry::apply(&mut registry, *command, &mut act_startup_open);
+                    (registry, act_startup_open, result)
                 });
                 match worker.await {
-                    Ok((returned, result)) => {
+                    Ok((returned, startup_open, result)) => {
                         registry = returned;
+                        act_startup_open = startup_open;
                         let _ = reply.send(result.map_err(Error::Registry));
                     }
                     Err(_) => {
@@ -9026,6 +9132,9 @@ impl Service {
             }
             Err(error) => return Err(Error::Io(error)),
         };
+        let act_owner = registry.registry_id()?;
+        let act_image_proofs = act_engine::bundled_engine_manifests()
+            .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?;
         let ep = endpoint(&self.state_dir)?;
         if ep.target_exists()? {
             retire_stale_socket(&ep)?;
@@ -9057,6 +9166,42 @@ impl Service {
             #[cfg(test)]
             None,
         ));
+        // The sole registry writer fences stale Act claims before this daemon
+        // accepts any new execution. A failed seal is fatal: the control plane
+        // must never admit work while startup interruption remains available.
+        let act_recovery = act_runtime::recover_startup_act_engines(
+            &actor,
+            &DockerEngine::docker(),
+            &act_owner,
+            &act_image_proofs,
+            act_runtime::ActStartupRecoveryOptions {
+                page_size: 64,
+                max_runs: 10000,
+                deadline: Duration::from_secs(120),
+            },
+            &self.stop.token(),
+        )
+        .await;
+        match act_recovery {
+            Ok(report) => {
+                for run in report.runs {
+                    if let Some(reason) = run.deferred_reason {
+                        eprintln!(
+                            "bosn Act startup cleanup deferred for {}: {reason}",
+                            run.run_id
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                jobs.stop().await;
+                drop(jobs);
+                let _ = job_worker.await;
+                actor.stop().await;
+                let _ = worker.await;
+                return Err(Error::Io(error));
+            }
+        }
         // Recovery runs before accepting user requests so a newly submitted
         // task cannot race a stopped-container restart. Failure to inspect a
         // local Docker daemon is recorded as a bounded recovery outcome when
@@ -12764,7 +12909,9 @@ fi
             };
             let plan = manifest_stack_setup_plan(&request).await.unwrap();
             let content = plan.generation.strip_prefix("sha256:").unwrap();
-            let name = format!("bosn-setup-recovery-{content}");
+            let prepared = recovery_fixture_image(&plan.plan, TEST_IDENTITY);
+            let proof = recovery_fixture_proof(&plan.plan, &prepared);
+            let name = bosn_setup::setup_container_name(&plan.plan, &workspace, &prepared).unwrap();
             let execution = SetupEnsureExecution {
                 receipt: "seed".into(),
                 resource: SetupEnsureResource {
@@ -12775,10 +12922,10 @@ fi
                     workspace: plan.plan.workspace_root.to_string_lossy().into_owned(),
                 },
                 image: SetupEnsureImageResource {
-                    id: "manifest-image:sha256:recovery-test".into(),
-                    name: "manifest-image:sha256:recovery-test".into(),
+                    id: "manifest-image:verified-fixture".into(),
+                    name: "manifest-image:verified-fixture".into(),
                     stack: "app".into(),
-                    generation: "sha256:recovery-test".into(),
+                    generation: TEST_IDENTITY.into(),
                     workspace: plan.plan.workspace_root.to_string_lossy().into_owned(),
                 },
                 volumes: Vec::new(),
@@ -12802,6 +12949,7 @@ fi
                     container: name,
                 })),
                 starts: AtomicUsize::new(0),
+                proof: Some(proof),
             });
             let server = async_engine::launch(
                 Service::new(state.clone())
@@ -12899,6 +13047,7 @@ fi
                         container: name.clone(),
                     })),
                     starts: AtomicUsize::new(0),
+                    proof: None,
                 });
                 let server = async_engine::launch(
                     Service::new(state.clone())
@@ -12943,6 +13092,7 @@ fi
                         container: name.clone(),
                     })),
                     starts: AtomicUsize::new(0),
+                    proof: None,
                 });
                 let server = async_engine::launch(
                     Service::new(state.clone())
@@ -13803,11 +13953,15 @@ fi
 
     struct FakeManifestAppTaskExecutor {
         observed: Mutex<Vec<ManifestAppTaskJobRequest>>,
+        entered: async_engine::Sender<()>,
+        release: Mutex<Option<async_engine::Receiver<()>>>,
     }
     impl FakeManifestAppTaskExecutor {
-        fn new() -> Self {
+        fn new(entered: async_engine::Sender<()>, release: async_engine::Receiver<()>) -> Self {
             Self {
                 observed: Mutex::new(Vec::new()),
+                entered,
+                release: Mutex::new(Some(release)),
             }
         }
     }
@@ -13822,6 +13976,20 @@ fi
             Box::pin(async move {
                 self.observed.lock().unwrap().push(request.clone());
                 session.begin("bosn-setup-manifest-identity".into()).await?;
+                self.entered
+                    .send(())
+                    .await
+                    .map_err(|_| "test entry observer closed".to_owned())?;
+                let mut release = self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| "test task executed twice".to_owned())?;
+                release
+                    .recv()
+                    .await
+                    .ok_or_else(|| "test release closed".to_owned())?;
                 logs.send("[fake] manifest declared task executed".into())
                     .await
                     .map_err(|_| "fake log consumer closed".to_owned())?;
@@ -13970,11 +14138,233 @@ fi
         }
     }
 
+    fn recovery_fixture_image(plan: &SetupPlan, identity: &str) -> PreparedImage {
+        let SetupPlanAppSource::PinnedImage { image } = &plan.app_source else {
+            panic!("fixture pinned image");
+        };
+        PreparedImage {
+            setup_content_sha256: plan.content_sha256.clone(),
+            kind: PreparedImageKind::PinnedImage {
+                image: image.clone(),
+            },
+            reference: image.clone(),
+            observed_identity: identity.into(),
+        }
+    }
+
+    #[test]
+    fn manifest_creation_binds_workspaces_volumes_and_recovery_requires_actual_proof() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let document = format!(
+            "[stack.app]\nimage = 'example.invalid/app@sha256:{}'\n[stack.app.mounts.repo]\nsource = '.'\ndestination = '/repo'\nreadonly = true\n[stack.app.volumes.target]\nscope = 'stack'\ndestination = '/target'\n",
+            "a".repeat(64)
+        );
+        std::fs::write(first.join("bosn.toml"), &document).unwrap();
+        std::fs::write(second.join("bosn.toml"), &document).unwrap();
+        RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let request = |workspace| ManifestEnsureJobRequest {
+                    workspace,
+                    manifest: "bosn.toml".into(),
+                    stack: "app".into(),
+                    deadline: Duration::from_secs(2),
+                    output_limit: 512 * 1024,
+                };
+                let first = manifest_stack_setup_plan(&request(first)).await.unwrap();
+                let second = manifest_stack_setup_plan(&request(second)).await.unwrap();
+                let image = recovery_fixture_image(&first.plan, TEST_IDENTITY);
+                let other_image = recovery_fixture_image(&second.plan, TEST_IDENTITY);
+                let name = bosn_setup::setup_container_name(
+                    &first.plan,
+                    &first.plan.workspace_root,
+                    &image,
+                )
+                .unwrap();
+                let other_name = bosn_setup::setup_container_name(
+                    &second.plan,
+                    &second.plan.workspace_root,
+                    &other_image,
+                )
+                .unwrap();
+                assert_eq!(image.observed_identity, other_image.observed_identity);
+                assert_ne!(name, other_name);
+                assert_ne!(
+                    first.plan.named_volumes[0].name,
+                    second.plan.named_volumes[0].name
+                );
+                assert_ne!(
+                    setup_container_resource_id("manifest-container", "app", &name),
+                    setup_container_resource_id("manifest-container", "app", &other_name)
+                );
+                let proof = recovery_fixture_proof(&first.plan, &image);
+                let fake = |proof| FakeManifestRecoveryExecutor {
+                    observed: Mutex::new(None),
+                    starts: AtomicUsize::new(0),
+                    proof,
+                };
+                assert!(
+                    fake(Some(proof.clone()))
+                        .verify_profile(&first.plan, TEST_IDENTITY, &name)
+                        .await
+                        .is_ok()
+                );
+                assert!(
+                    fake(None)
+                        .verify_profile(&first.plan, TEST_IDENTITY, &name)
+                        .await
+                        .is_err()
+                );
+                for (index, field, replacement) in [
+                    (0, "Source", "/foreign/repo"),
+                    (1, "Name", "foreign-volume"),
+                ] {
+                    let mut bad = proof.clone();
+                    bad.0.configuration["Mounts"][index][field] = replacement.into();
+                    let fake = fake(Some(bad));
+                    assert!(
+                        fake.verify_profile(&first.plan, TEST_IDENTITY, &name)
+                            .await
+                            .is_err()
+                    );
+                    assert_eq!(fake.starts.load(Ordering::SeqCst), 0);
+                }
+                for (field, value) in [
+                    (
+                        "Options",
+                        serde_json::json!({"type":"none","o":"bind","device":"/foreign/path"}),
+                    ),
+                    ("Mountpoint", serde_json::json!("/foreign/path")),
+                ] {
+                    let mut bad = proof.clone();
+                    bad.2.get_mut(&first.plan.named_volumes[0].name).unwrap()[field] = value;
+                    let fake = fake(Some(bad));
+                    assert!(
+                        fake.verify_profile(&first.plan, TEST_IDENTITY, &name)
+                            .await
+                            .is_err()
+                    );
+                    assert_eq!(fake.starts.load(Ordering::SeqCst), 0);
+                }
+            });
+    }
+
+    fn recovery_fixture_proof(
+        plan: &SetupPlan,
+        image: &PreparedImage,
+    ) -> (
+        bosn_setup::SetupEnsureObservedContainer,
+        serde_json::Value,
+        BTreeMap<String, serde_json::Value>,
+    ) {
+        let name = bosn_setup::setup_container_name(plan, &plan.workspace_root, image).unwrap();
+        let digest = name.strip_prefix("bosn-setup-v2-").unwrap();
+        let labels = BTreeMap::from([
+            ("com.zackees.bosn.setup-managed".into(), "v1".into()),
+            (
+                "com.zackees.bosn.setup-content-sha256".into(),
+                plan.content_sha256.clone(),
+            ),
+            ("com.zackees.bosn.setup-container".into(), name.clone()),
+            (
+                "com.zackees.bosn.setup-creation-profile".into(),
+                format!("v2:{digest}"),
+            ),
+        ]);
+        let image_config = serde_json::json!({"Id":image.observed_identity,"Config":{
+            "Env":["PATH=/usr/bin:/bin"],"Cmd":["sh"],"Entrypoint":null,"User":"","WorkingDir":"","Volumes":null}});
+        let mut config = image_config["Config"].clone();
+        for key in ["Tty", "OpenStdin", "StdinOnce", "AttachStdin"] {
+            config[key] = false.into();
+        }
+        let mut env = plan.app.environment.clone();
+        env.entry("PATH".into())
+            .or_insert_with(|| "/usr/bin:/bin".into());
+        config["Env"] = serde_json::json!(
+            env.iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+        );
+        config["Labels"] = serde_json::json!(labels);
+        // Exact five-argument shell carrier used by Docker creation.
+        if let Some(command) = &plan.app.command {
+            config["Cmd"] = serde_json::json!([
+                "sh",
+                "-c",
+                "BOSN_IMAGE_PATH=\"$PATH\"; export BOSN_IMAGE_PATH; exec sh -lc \"$1\"",
+                "sh",
+                format!(
+                    "PATH=\"${{BOSN_IMAGE_PATH:+$BOSN_IMAGE_PATH:}}$PATH\"; export PATH; unset BOSN_IMAGE_PATH\n{command}"
+                )
+            ]);
+        }
+        let mut actual_mounts = Vec::new();
+        let mut declared_mounts = Vec::new();
+        for mount in &plan.app.mounts {
+            let source = std::fs::canonicalize(plan.workspace_root.join(&mount.source)).unwrap();
+            actual_mounts.push(serde_json::json!({"Type":"bind","Propagation":"rprivate","Source":source,"Destination":mount.target,"RW":!mount.readonly}));
+            declared_mounts.push(serde_json::json!({"Type":"bind","Source":source,"Target":mount.target,"ReadOnly":mount.readonly}));
+        }
+        for volume in &plan.named_volumes {
+            actual_mounts.push(serde_json::json!({"Type":"volume","Driver":"local","Name":volume.name,"Source":format!("/var/lib/docker/volumes/{}/_data",volume.name),"Destination":volume.target,"RW":true}));
+            declared_mounts.push(serde_json::json!({"Type":"volume","Source":volume.name,"Target":volume.target,"ReadOnly":false}));
+        }
+        let host = serde_json::json!({"Mounts":declared_mounts,"VolumeDriver":"","Privileged":false,"NetworkMode":"default","Binds":null,
+            "VolumesFrom":null,"DeviceRequests":null,"SecurityOpt":null,"GroupAdd":null,"DeviceCgroupRules":null,"PublishAllPorts":false,"AutoRemove":false,"CgroupnsMode":"private","RestartPolicy":{"Name":"no","MaximumRetryCount":0},"ReadonlyRootfs":false,"PidMode":"","UTSMode":"",
+            "UsernsMode":"","IpcMode":"private","Devices":[],"CapAdd":null,"CapDrop":null,"PortBindings":{},"Tmpfs":{}});
+        let configuration = serde_json::json!({"Id":TEST_CONTAINER_ID,"Name":format!("/{name}"),"Image":image.observed_identity,
+            "State":{"Running":false},"Config":config,"HostConfig":host,"Mounts":actual_mounts});
+        (
+            bosn_setup::SetupEnsureObservedContainer {
+                container_id: TEST_CONTAINER_ID.into(),
+                running: false,
+                image_identity: image.observed_identity.clone(),
+                labels,
+                configuration,
+            },
+            image_config,
+            plan.named_volumes.iter().map(|v| (v.name.clone(),serde_json::json!({"Name":v.name,"Driver":"local","Scope":"local","Options":null,"Labels":v.labels,"Mountpoint":format!("/var/lib/docker/volumes/{}/_data",v.name)}))).collect(),
+        )
+    }
+
     struct FakeManifestRecoveryExecutor {
+        proof: Option<(
+            bosn_setup::SetupEnsureObservedContainer,
+            serde_json::Value,
+            BTreeMap<String, serde_json::Value>,
+        )>,
         observed: Mutex<Option<SetupReconcileObserved>>,
         starts: AtomicUsize,
     }
     impl ManifestRecoveryExecutor for FakeManifestRecoveryExecutor {
+        fn verify_profile<'a>(
+            &'a self,
+            plan: &'a SetupPlan,
+            image_identity: &'a str,
+            name: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async move {
+                let (observed, image_config, volumes) = self
+                    .proof
+                    .as_ref()
+                    .ok_or_else(|| "profile proof missing".to_owned())?;
+                let image = recovery_fixture_image(plan, image_identity);
+                if bosn_setup::setup_container_name(plan, &plan.workspace_root, &image)
+                    .map_err(|e| e.to_string())?
+                    != name
+                {
+                    return Err("profile identity mismatch".into());
+                }
+                bosn_setup::verify_setup_observation(plan, &image, observed, image_config, volumes)
+                    .map_err(|e| e.to_string())
+            })
+        }
         fn inspect<'a>(
             &'a self,
             _name: &'a str,
@@ -14821,7 +15211,9 @@ fi
         let state = temporary.path().join("state");
         let workspace = temporary.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
-        let fake = Arc::new(FakeManifestAppTaskExecutor::new());
+        let (entered, mut entered_wait) = async_engine::channel(1);
+        let (release, release_wait) = async_engine::channel(1);
+        let fake = Arc::new(FakeManifestAppTaskExecutor::new(entered, release_wait));
         RuntimeBuilder::multi_thread()
             .enable_all()
             .build()
@@ -14845,10 +15237,17 @@ fi
                     .submit_manifest_app_task(request.clone())
                     .await
                     .unwrap();
+                // Coalescing covers active jobs: keep this executor active
+                // until the second IPC request has joined the first one.
+                async_engine::timeout(Duration::from_secs(2), entered_wait.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(
                     first,
                     client.submit_manifest_app_task(request).await.unwrap()
                 );
+                release.send(()).await.unwrap();
                 wait_for_job_state(&client, first, "Succeeded").await;
                 assert_eq!(fake.observed.lock().unwrap().len(), 1);
                 assert_eq!(client.status().await.unwrap().sessions, 0);
@@ -16352,6 +16751,7 @@ fi
                         "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
                             .into(),
                     labels: BTreeMap::new(),
+                    configuration: serde_json::Value::Null,
                 }),
                 command_result(0, Vec::new()),
             ))],
@@ -16382,6 +16782,8 @@ fi
         });
         assert_eq!(mismatch.ensure_calls.lock().unwrap().len(), 1);
 
+        let image = recovery_fixture_image(&plan, TEST_IDENTITY);
+        let (observed, image_config, _) = recovery_fixture_proof(&plan, &image);
         let success = PipelineFakeEngine::new(
             [
                 Ok(command_result(0, Vec::new())),
@@ -16395,6 +16797,14 @@ fi
                 Ok(bosn_setup::SetupEnsureResponse::Command(command_result(
                     0,
                     format!("{TEST_CONTAINER_ID}\n"),
+                ))),
+                Ok(bosn_setup::SetupEnsureResponse::Inspection(
+                    Some(observed),
+                    command_result(0, Vec::new()),
+                )),
+                Ok(bosn_setup::SetupEnsureResponse::Command(command_result(
+                    0,
+                    serde_json::to_vec(&image_config).unwrap(),
                 ))),
                 Ok(bosn_setup::SetupEnsureResponse::Command(command_result(
                     0,

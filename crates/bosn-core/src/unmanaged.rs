@@ -1838,7 +1838,7 @@ mod tests {
             parse_docker_timestamp("2026-09-13 18:41:43 -0700 PDT")
         );
         let fraction = parse_rfc3339_timestamp("2026-09-16T08:56:39.263133667-07:00").unwrap();
-        assert!((fraction - 1_789_574_199.263_133_667).abs() < 1e-6);
+        assert!((fraction - 1_789_574_199.263_133_8).abs() < 1e-6);
         assert_eq!(
             parse_rfc3339_timestamp("2026-09-13 18:41:43 +0000 UTC"),
             parse_docker_timestamp("2026-09-13 18:41:43 +0000 UTC")
