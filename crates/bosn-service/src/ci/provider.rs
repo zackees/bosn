@@ -70,14 +70,18 @@ pub fn github_workflow(workspace: &Path, requested: Option<&str>) -> Result<Stri
         {
             return Err("workflow must be a relative path without traversal".into());
         }
-        let candidates = [
-            requested.to_string(),
-            format!(".github/workflows/{requested}"),
-        ];
-        return candidates
-            .into_iter()
-            .find(|c| workspace.join(c).is_file())
-            .ok_or_else(|| format!("workflow {requested:?} does not exist"));
+        // Only workflows under .github/workflows/ run (the daemon refuses
+        // anything else), so a bare name never resolves to a root-level file.
+        let candidate = if requested.starts_with(".github/workflows/") {
+            requested.to_string()
+        } else {
+            format!(".github/workflows/{requested}")
+        };
+        return if workspace.join(&candidate).is_file() {
+            Ok(candidate)
+        } else {
+            Err(format!("workflow {requested:?} does not exist"))
+        };
     }
     for name in ["ci.yml", "ci.yaml"] {
         let candidate = format!(".github/workflows/{name}");
@@ -242,6 +246,18 @@ mod tests {
             ".github/workflows/other.yml"
         );
         assert!(github_workflow(tmp.path(), Some("../x.yml")).is_err());
+        // A root-level file of the same name is never chosen: the daemon
+        // only accepts workflows under .github/workflows/.
+        std::fs::write(tmp.path().join("ci.yml"), "on: push").unwrap();
+        assert_eq!(
+            github_workflow(tmp.path(), Some("ci.yml")).unwrap(),
+            ".github/workflows/ci.yml"
+        );
+        assert_eq!(
+            github_workflow(tmp.path(), Some(".github/workflows/other.yml")).unwrap(),
+            ".github/workflows/other.yml"
+        );
+        assert!(github_workflow(tmp.path(), Some("ci.yml/../ci.yml")).is_err());
     }
 
     #[test]
