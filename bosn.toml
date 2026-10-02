@@ -26,7 +26,7 @@ cmd = "umask 022 && soldr toolchain ensure --json && uv sync --frozen --all-grou
 # the act artifact cache rightly refuses them (bosn#365).
 [task.rust-test]
 stack = "test"
-cmd = "umask 022 && soldr toolchain ensure --json && soldr cargo test --workspace --exclude bosn-python --locked"
+cmd = "umask 022 && soldr toolchain ensure --json && soldr cargo test --workspace --exclude bosn-python --locked && PYO3_PYTHON=$(command -v python3) soldr cargo test -p bosn-python --lib --locked --no-default-features --features embedded-python-tests"
 
 [task.lint]
 stack = "test"

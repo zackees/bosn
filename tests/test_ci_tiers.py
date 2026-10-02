@@ -87,7 +87,9 @@ def test_required_status_names_remain() -> None:
     jobs = CI["jobs"]
     assert jobs["lint-no-macos-runners"]["name"] == "CI policy (no hosted macOS runners)"
     assert jobs["rust"]["name"] == "Rust workspace (locked tests)"
-    assert "if" not in jobs["rust"]
+    # It always runs, except that an attested, trusted PR head may skip it
+    # (GATE-008/010, ci-attestations.yml); a skipped required check passes.
+    assert jobs["rust"]["if"] == "needs.verify.outputs.skip_rust != 'true'"
 
 
 def test_native_backend_and_compiler_fixtures_have_provisioned_tools() -> None:
@@ -141,7 +143,8 @@ def test_manual_and_main_tiers() -> None:
 
 
 def test_every_job_checks_out_exact_candidate() -> None:
-    for job in CI["jobs"].values():
+    # A reusable-workflow call (ci-pre) has no steps of its own.
+    for job in (job for job in CI["jobs"].values() if "uses" not in job):
         checkout = next(
             step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@")
         )
