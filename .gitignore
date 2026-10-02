@@ -10,3 +10,8 @@ build/
 target/
 _vender/
 src/bosn/_native.*
+
+# Only the project cargo config is tracked; a tool that treats .cargo as
+# CARGO_HOME must never get its registry or caches committed.
+/.cargo/*
+!/.cargo/config.toml
