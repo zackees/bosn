@@ -83,6 +83,13 @@ pub struct Fill {
     cancel: CancellationToken,
 }
 
+impl Fill {
+    /// Cancelled when the spare is no longer wanted (shutdown, cache clear).
+    pub fn cancellation(&self) -> &CancellationToken {
+        &self.cancel
+    }
+}
+
 #[derive(Default)]
 struct KeeperState {
     /// Set by the daemon's first `bosn ci` submission: a daemon that never

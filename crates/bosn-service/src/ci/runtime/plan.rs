@@ -6,7 +6,7 @@ use bosn_registry::act::{ActEngineBinding, ActEngineCreationProfile, ActEngineIn
 
 use super::super::{
     engine::{ACT_VERSION, ActArtifact, ActInvocation, CacheVolume, act_artifact},
-    limits::{EngineConfig, HostResources},
+    limits::EngineConfig,
     spare::Spares,
 };
 use super::*;
@@ -16,8 +16,6 @@ pub(super) struct EngineSpec {
     pub(super) act: ActArtifact,
     pub(super) cache: CacheVolume,
     profile: ActEngineCreationProfile,
-    /// The host it was sized for.
-    pub(super) host: HostResources,
 }
 
 impl EngineSpec {
@@ -53,8 +51,8 @@ impl CiRuntime {
             .map_err(|e| format!("registry: {e}"))?
             .registry_id;
         self.backend.ensure_engine_image().await?;
-        let host = self.backend.host_resources().await?;
-        let limits = super::super::limits::size_engine(host, config)?;
+        let limits =
+            super::super::limits::size_engine(self.backend.host_resources().await?, config)?;
         let cache = CacheVolume::machine(&registry_id, lifecycle::now_seconds())?;
         let profile = crate::act_engine::creation_profile_with_cache(limits, Some(cache.mount()))
             .map_err(|e| e.to_string())?;
@@ -62,7 +60,6 @@ impl CiRuntime {
             act,
             cache,
             profile,
-            host,
         })
     }
 

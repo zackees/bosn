@@ -32,7 +32,10 @@ impl CiRuntime {
         };
         let runtime = self.clone();
         async_engine::launch(async move {
-            let plan = runtime.spare_plan().await;
+            // Stopping the daemon must not wait for planning (an image pull).
+            let plan = async_engine::cancellable(fill.cancellation(), runtime.spare_plan())
+                .await
+                .unwrap_or(Ok(None));
             runtime.spares.fill(fill, plan).await;
         })
         .detach();
@@ -40,11 +43,12 @@ impl CiRuntime {
 
     /// The spare to prepare now; `None` when the host has no room for one.
     async fn spare_plan(&self) -> Result<Option<SparePlan>, String> {
-        let config = super::super::config::load(&self.state_dir)?.engine;
-        let spec = self.engine_spec(config).await?;
-        if spec.host.available_memory < ROOM {
+        // Room first: a host without it never pulls the engine image for a spare.
+        if self.backend.host_resources().await?.available_memory < ROOM {
             return Ok(None);
         }
+        let config = super::super::config::load(&self.state_dir)?.engine;
+        let spec = self.engine_spec(config).await?;
         let id = new_uuid().await.map_err(|e| e.message)?;
         let workspace = self.state_dir.to_string_lossy().into_owned();
         Ok(Some(SparePlan {
