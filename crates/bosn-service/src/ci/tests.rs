@@ -489,3 +489,137 @@ fn steps_act_never_mentioned_are_listed_as_skipped_in_jobs_that_ran() {
         "the skipped step sits in declaration order"
     );
 }
+
+#[test]
+fn a_failed_widget_launch_is_reported_once_per_daemon() {
+    with_registry(|registry, dir| async move {
+        let backend = Arc::new(FakeBackend::default());
+        let runtime = CiRuntime::start(&dir, registry, backend, 1);
+        assert!(runtime.note_launch_failure(), "the first failure is logged");
+        assert!(!runtime.note_launch_failure(), "later ones stay quiet");
+        assert!(
+            !runtime.clone().note_launch_failure(),
+            "clones share the daemon's state"
+        );
+    });
+}
+
+#[test]
+fn stdout_and_stderr_stay_separate_and_seq_has_no_gaps() {
+    with_registry(|registry, dir| async move {
+        let backend = Arc::new(FakeBackend::default());
+        let runtime = CiRuntime::start(&dir, registry, backend, 1);
+        let run = submit(&runtime, 'c').await.run;
+        wait_done(&runtime, &run).await;
+        let page: LogsReply = call(
+            &runtime,
+            CiRequest::Logs {
+                run,
+                job: None,
+                section: None,
+                since_seq: Some(0),
+                limit: None,
+                max_bytes: None,
+            },
+        )
+        .await;
+        let seqs: Vec<u64> = page.records.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, (1..=seqs.len() as u64).collect::<Vec<_>>(), "no gaps");
+        let stderr: Vec<_> = page
+            .records
+            .iter()
+            .filter(|r| r.stream == "stderr")
+            .collect();
+        assert_eq!(stderr.len(), 1, "{:?}", page.records);
+        assert_eq!(stderr[0].text, "act: warning on stderr");
+        assert_eq!(stderr[0].job, None, "stderr is never attributed to a job");
+        assert!(
+            page.records
+                .iter()
+                .filter(|r| r.text.contains("Run Main x"))
+                .all(|r| r.stream != "stderr"),
+            "act's JSON on stdout is never relabelled"
+        );
+    });
+}
+
+#[test]
+fn fifty_concurrent_submissions_with_ten_keys_make_ten_executions() {
+    with_registry(|registry, dir| async move {
+        let backend = Arc::new(FakeBackend::default());
+        let runtime = CiRuntime::start(&dir, registry, backend.clone(), 4);
+        // Drained, so no run finishes mid-burst and every duplicate coalesces.
+        let _: RunnersReply = call(
+            &runtime,
+            CiRequest::Runners {
+                action: RunnerAction::Drain,
+            },
+        )
+        .await;
+        let tasks: Vec<_> = (0..50)
+            .map(|i| {
+                let runtime = runtime.clone();
+                let key = char::from_digit(i % 10, 10).unwrap();
+                async_engine::launch(async move { (key, submit(&runtime, key).await.run) })
+            })
+            .collect();
+        let mut by_key =
+            std::collections::BTreeMap::<char, std::collections::BTreeSet<String>>::new();
+        for task in tasks {
+            let (key, run) = task.await.unwrap();
+            by_key.entry(key).or_default().insert(run);
+        }
+        assert_eq!(by_key.len(), 10);
+        assert!(
+            by_key.values().all(|runs| runs.len() == 1),
+            "every submitter of a key gets the same run: {by_key:?}"
+        );
+        let _: RunnersReply = call(
+            &runtime,
+            CiRequest::Runners {
+                action: RunnerAction::Resume,
+            },
+        )
+        .await;
+        for runs in by_key.values() {
+            let run = runs.iter().next().unwrap();
+            let record = wait_done(&runtime, run).await;
+            assert_eq!(record.submitters, 5, "five submitters joined {run}");
+        }
+        assert_eq!(*backend.executions.lock().unwrap(), 10);
+        assert_eq!(backend.live(), 0, "no engine left");
+    });
+}
+
+#[test]
+fn a_run_whose_client_went_away_still_ends_and_is_cleaned() {
+    with_registry(|registry, dir| async move {
+        let backend = Arc::new(FakeBackend::with(Faults {
+            hang: true,
+            ..Faults::default()
+        }));
+        let runtime = CiRuntime::start(&dir, registry, backend.clone(), 1);
+        let staging = new_uuid().await.unwrap();
+        staged(&runtime, &staging);
+        let mut submission = request(&staging, 'd');
+        submission.timeout_secs = Some(1);
+        let run = call::<SubmitReply>(
+            &runtime,
+            CiRequest::Submit {
+                request: submission,
+            },
+        )
+        .await
+        .run;
+        // A client waiting on the run, killed mid-run: nothing else waits.
+        let waiter = {
+            let (runtime, run) = (runtime.clone(), run.clone());
+            async_engine::launch(async move { wait_done(&runtime, &run).await })
+        };
+        async_engine::sleep(Duration::from_millis(100)).await;
+        drop(waiter);
+        let record = wait_done(&runtime, &run).await;
+        assert_eq!(record.conclusion, Some(Conclusion::TimedOut));
+        assert_eq!(backend.live(), 0, "the engine is removed with no client");
+    });
+}

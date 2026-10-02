@@ -109,6 +109,7 @@ pub struct CiRuntime {
     ui: Arc<OnceLock<Arc<UiHandle>>>,
     widget: Arc<Mutex<WidgetState>>,
     widget_config: Arc<Mutex<WidgetConfig>>,
+    launch_failure_logged: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CiRuntime {
@@ -156,6 +157,7 @@ impl CiRuntime {
             ui: Arc::new(OnceLock::new()),
             widget: Arc::new(Mutex::new(WidgetState::default())),
             widget_config: Arc::new(Mutex::new(WidgetConfig::default())),
+            launch_failure_logged: Arc::default(),
         };
         let dispatcher = runtime.clone();
         async_engine::launch(async move {
@@ -519,8 +521,9 @@ impl CiRuntime {
     async fn report(&self, run: &str, tail: usize) -> Result<RunReport, CiError> {
         let record = self.record(run)?;
         let store = self.store.clone();
+        let origin = self.ui.get().map(|ui| ui.origin.clone());
         blocking(move || {
-            report::report(&record, |job, section| {
+            report::report(&record, origin.as_deref(), |job, section| {
                 let filter = LogFilter {
                     job: Some(job),
                     section: Some(section),

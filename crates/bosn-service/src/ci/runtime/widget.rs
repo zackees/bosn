@@ -2,19 +2,22 @@
 //! debounced auto-launch (the decisions themselves live in `ci::widget`).
 
 use std::{
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::Ordering,
     time::{Duration, Instant},
 };
 
 use super::*;
 use crate::ci::widget::{self as policy, WidgetCommand};
 
-/// One "the widget cannot be launched" line per daemon, not one per run.
-static LAUNCH_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
-
 impl CiRuntime {
     fn widget_state(&self) -> MutexGuard<'_, WidgetState> {
         self.widget.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether this is the daemon's first failed widget launch: one "the
+    /// widget cannot be launched" line per daemon, not one per run.
+    pub(crate) fn note_launch_failure(&self) -> bool {
+        !self.launch_failure_logged.swap(true, Ordering::Relaxed)
     }
 
     pub(crate) fn widget_presence(&self) -> WidgetPresence {
@@ -99,6 +102,7 @@ impl CiRuntime {
         let Some((program, args)) = policy::launch_command() else {
             return;
         };
+        let runtime = self.clone();
         async_engine::launch(async move {
             let spec = args.iter().fold(
                 kernal_api::SpawnSpec::new(program)
@@ -110,7 +114,7 @@ impl CiRuntime {
             let started =
                 kernal_api::run_bounded_command_async(spec, Duration::from_secs(10), 4096).await;
             let ok = started.as_ref().is_ok_and(|out| out.exit.raw_code() == 0);
-            if !ok && !LAUNCH_FAILURE_LOGGED.swap(true, Ordering::Relaxed) {
+            if !ok && runtime.note_launch_failure() {
                 eprintln!(
                     "bosn ci: widget: not launched ({program} failed; no graphical session or the \
                      bosn-widget service is not installed)"

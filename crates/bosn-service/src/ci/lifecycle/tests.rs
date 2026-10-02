@@ -137,6 +137,9 @@ impl ActEngineBackend for FakeBackend {
                     r#"{"job":"w/a","jobID":"a","msg":"⭐ Run Main x","stage":"Main","stepID":["0"]}"#.into(),
                 ))
                 .await;
+            let _ = lines
+                .send(EngineLine::Stderr("act: warning on stderr".into()))
+                .await;
             if f.hang {
                 return match async_engine::timeout(
                     deadline,
@@ -303,7 +306,11 @@ fn success_and_failure_end_terminal_with_removal_receipts() {
             assert_eq!(report.execution, ExecutionEnd::Exited(code));
             assert_eq!(report.cleanup, CleanupEnd::Removed);
             assert_eq!(backend.live(), 0, "no engine left");
-            assert_eq!(seen.lines.len(), 3);
+            assert_eq!(
+                seen.lines.len(),
+                4,
+                "three stdout lines and one stderr line"
+            );
             assert!(seen.listing.is_some());
             terminal(&record(&registry, &dir, &run_id(n)).await, outcome);
         }

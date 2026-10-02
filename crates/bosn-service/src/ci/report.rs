@@ -80,7 +80,13 @@ pub fn conclude(
 
 /// The `ci report --json` agent contract. `tail(job, section)` returns the
 /// last lines of that one section.
-pub fn report(record: &RunRecord, tail: impl FnOnce(&str, &str) -> Vec<String>) -> RunReport {
+/// `ui_origin` is the dashboard's origin while it serves; the report then
+/// links straight to this run.
+pub fn report(
+    record: &RunRecord,
+    ui_origin: Option<&str>,
+    tail: impl FnOnce(&str, &str) -> Vec<String>,
+) -> RunReport {
     let tree = &record.tree;
     let first_failure = tree.first_failure().map(|(job, section)| {
         let key = section.map(|s| format!("{}:{}", s.stage, s.id));
@@ -121,7 +127,57 @@ pub fn report(record: &RunRecord, tail: impl FnOnce(&str, &str) -> Vec<String>) 
             unsupported: unsupported.clone(),
         },
         coverage_complete: unsupported.is_empty(),
-        ui_url: None,
+        ui_url: ui_origin.map(|origin| format!("{origin}/ci/runs/{}", record.id)),
         logs_command: format!("bosn ci logs {}", record.id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ci::model::{ActParser, RunTree, parse_act_list};
+
+    #[test]
+    fn the_report_lists_skipped_and_unsupported_jobs_and_links_the_dashboard() {
+        let list = "Stage  Job ID  Job name  Workflow name  Workflow file  Events\n\
+                    0      lin     lin       w              ci.yml         push\n\
+                    0      mac     mac       w              ci.yml         push\n\
+                    1      late    late      w              ci.yml         push\n";
+        let mut parser = ActParser::new(RunTree::declared(&parse_act_list(list)));
+        for (seq, line) in [
+            r#"{"job":"w/mac","jobID":"mac","level":"info","msg":"🚧  Skipping unsupported platform -- Try running with `-P macos-latest=...`"}"#,
+            r#"{"job":"w/lin","jobID":"lin","msg":"⭐ Run Main a","stage":"Main","step":"a","stepID":["0"]}"#,
+            r#"{"job":"w/lin","jobID":"lin","msg":"  ✅  Success - Main a","stage":"Main","stepID":["0"],"stepResult":"success"}"#,
+            r#"{"job":"w/lin","jobID":"lin","msg":"🏁  Job succeeded","jobResult":"success"}"#,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            parser.feed(seq as u64 + 1, line);
+        }
+        parser.tree.settle_finished();
+        let mut record = crate::ci::tests::sample_record("run-1");
+        record.tree = parser.tree;
+        record.finish(Conclusion::Failure, None);
+
+        let report = report(&record, Some("http://127.0.0.1:7341"), |_, _| Vec::new());
+        assert_eq!(report.jobs.succeeded, 1);
+        assert_eq!(report.jobs.unsupported, ["w/mac"]);
+        // A job that never ran keeps its declared key, the job ID.
+        assert_eq!(report.jobs.skipped, ["late"]);
+        assert!(
+            !report.coverage_complete,
+            "an unsupported job is partial coverage"
+        );
+        assert_eq!(
+            report.ui_url.as_deref(),
+            Some("http://127.0.0.1:7341/ci/runs/run-1")
+        );
+        assert_eq!(report.logs_command, "bosn ci logs run-1");
+        let without_ui = super::report(&record, None, |_, _| Vec::new());
+        assert_eq!(
+            without_ui.ui_url, None,
+            "no link while the dashboard is off"
+        );
     }
 }

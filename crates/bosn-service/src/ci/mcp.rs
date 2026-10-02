@@ -38,6 +38,7 @@ pub trait CiBackend {
     fn ci_show(&mut self, run: String, tree: bool) -> Result<RunView, Error>;
     fn ci_logs(&mut self, query: LogsQuery) -> Result<super::LogsReply, Error>;
     fn ci_cancel(&mut self, run: String) -> Result<super::CancelReply, Error>;
+    fn ci_retry(&mut self, run: String, job: Option<String>) -> Result<super::SubmitReply, Error>;
     fn ci_report(&mut self, run: String, tail: Option<usize>) -> Result<super::RunReport, Error>;
     fn ci_runners(&mut self, action: RunnerAction) -> Result<super::RunnersReply, Error>;
 }
@@ -74,6 +75,9 @@ impl CiBackend for ClientCi<'_> {
     fn ci_cancel(&mut self, run: String) -> Result<super::CancelReply, Error> {
         self.runtime.run(self.client.ci_cancel(run))
     }
+    fn ci_retry(&mut self, run: String, job: Option<String>) -> Result<super::SubmitReply, Error> {
+        self.runtime.run(self.client.ci_retry(run, job))
+    }
     fn ci_report(&mut self, run: String, tail: Option<usize>) -> Result<super::RunReport, Error> {
         self.runtime.run(self.client.ci_report(run, tail))
     }
@@ -103,6 +107,9 @@ impl CiBackend for Offline {
         Err(Error::ActorClosed)
     }
     fn ci_cancel(&mut self, _: String) -> Result<super::CancelReply, Error> {
+        Err(Error::ActorClosed)
+    }
+    fn ci_retry(&mut self, _: String, _: Option<String>) -> Result<super::SubmitReply, Error> {
         Err(Error::ActorClosed)
     }
     fn ci_report(&mut self, _: String, _: Option<usize>) -> Result<super::RunReport, Error> {
@@ -194,6 +201,13 @@ struct WaitArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RetryArgs {
+    run: String,
+    job: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReportArgs {
     run: String,
     tail: Option<usize>,
@@ -270,6 +284,9 @@ pub fn call(
         }),
         "bosn_ci_cancel" => parse::<RunArg>(arguments)
             .and_then(|a| backend.ci_cancel(a.run).map_err(daemon))
+            .and_then(|reply| bounded(&reply)),
+        "bosn_ci_retry" => parse::<RetryArgs>(arguments)
+            .and_then(|a| backend.ci_retry(a.run, a.job).map_err(daemon))
             .and_then(|reply| bounded(&reply)),
         "bosn_ci_report" => parse::<ReportArgs>(arguments)
             .and_then(|a| {
@@ -394,6 +411,12 @@ pub fn tools() -> Vec<Value> {
             "annotations": annotations(false, true),
         }),
         json!({
+            "name": "bosn_ci_retry",
+            "description": "Run a finished run again from its frozen source snapshot (the same commit and uncommitted work), optionally only one `job`. Returns the new run, which records `retry_of`.",
+            "inputSchema": run_ref_schema(json!({"job": {"type": "string", "description": "Job ID to rerun alone (from bosn_ci_report)."}})),
+            "annotations": annotations(false, false),
+        }),
+        json!({
             "name": "bosn_ci_report",
             "description": "The agent failure summary: conclusion, exit code, the first failing job and step with only that step's last lines, and skipped and unsupported jobs listed separately. Never reports success for partial coverage.",
             "inputSchema": run_ref_schema(json!({"tail": {"type": "integer", "minimum": 1, "maximum": MAX_REPORT_TAIL}})),
@@ -496,6 +519,15 @@ mod tests {
                 state: RunState::Done,
             })
         }
+        fn ci_retry(&mut self, run: String, job: Option<String>) -> Result<SubmitReply, Error> {
+            self.calls.push(format!("retry {run} {job:?}"));
+            Ok(SubmitReply {
+                run: "r2".into(),
+                coalesced: false,
+                queue_position: Some(0),
+                record: RunView::of(crate::ci::tests::sample_record("r2"), false),
+            })
+        }
         fn ci_report(&mut self, _run: String, tail: Option<usize>) -> Result<RunReport, Error> {
             self.calls.push(format!("report {tail:?}"));
             Err(Error::Ci {
@@ -529,6 +561,7 @@ mod tests {
             "bosn_ci_logs",
             "bosn_ci_wait",
             "bosn_ci_cancel",
+            "bosn_ci_retry",
             "bosn_ci_report",
             "bosn_ci_runners",
         ] {
@@ -607,5 +640,20 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cancelled["cancelled"], true);
+    }
+
+    #[test]
+    fn retry_reruns_a_finished_run_optionally_one_job() {
+        let mut backend = Fake::default();
+        let reply = call(
+            "bosn_ci_retry",
+            &args(json!({"run": "r", "job": "build"})),
+            &mut backend,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(reply["run"], "r2");
+        let _ = call("bosn_ci_retry", &args(json!({"run": "r"})), &mut backend);
+        assert_eq!(backend.calls, ["retry r Some(\"build\")", "retry r None"]);
     }
 }

@@ -24,7 +24,11 @@ fn bosn_payload_maps_literal_ci_labels_and_release_dispatch() {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
+        // stdout stays pure JSON; the deprecation notice goes to stderr.
         let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("`bosn act payload` is deprecated")
+        );
         assert_eq!(value["github_event"], expected_event);
         assert_eq!(value["payload"]["repository"]["full_name"], "zackees/bosn");
         assert_eq!(value["executable"], false);
@@ -147,7 +151,9 @@ fn act_plan_is_read_only_and_emits_selected_inputs() {
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
+    // stdout stays pure JSON; the deprecation notice goes to stderr.
     let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert!(String::from_utf8_lossy(&result.stderr).contains("`bosn act plan` is deprecated"));
     assert_eq!(value["action"], "act_plan");
     assert_eq!(value["event"], "push");
     assert_eq!(value["act_version"], "0.2.88");

@@ -32,6 +32,8 @@ pub struct UiHandle {
 /// A running listener; dropping it stops serving.
 pub struct UiServer {
     pub handle: Arc<UiHandle>,
+    /// Where the listener is bound (always loopback).
+    pub local_addr: SocketAddr,
     _task: async_engine::Task<io::Result<()>>,
 }
 
@@ -62,7 +64,8 @@ pub async fn start(config: UiConfig, ci: CiRuntime) -> io::Result<Option<UiServe
         "content-security-policy",
         "default-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'",
     )?;
-    let port = server.local_addr()?.port();
+    let local_addr = server.local_addr()?;
+    let port = local_addr.port();
     let auth = Arc::new(Auth::new(port));
     let handle = Arc::new(UiHandle {
         origin: auth.origin(),
@@ -74,6 +77,7 @@ pub async fn start(config: UiConfig, ci: CiRuntime) -> io::Result<Option<UiServe
     }));
     Ok(Some(UiServer {
         handle,
+        local_addr,
         _task: task,
     }))
 }

@@ -24,7 +24,7 @@ run that exceeds it ends `timed_out`, and its engine is still removed.
 
 `bosn mcp` serves `bosn_ci_plan`, `bosn_ci_run`, `bosn_ci_status`,
 `bosn_ci_list`, `bosn_ci_logs`, `bosn_ci_wait`, `bosn_ci_cancel`,
-`bosn_ci_report` and `bosn_ci_runners`. Python gets the same contract through
+`bosn_ci_retry`, `bosn_ci_report` and `bosn_ci_runners`. Python gets the same contract through
 `bosn.Client(state_dir).ci("<tool>", **arguments)` (for example
 `client.ci("run", workspace="/repo", trigger="pr", mode="test")`), which
 dispatches through the same code.

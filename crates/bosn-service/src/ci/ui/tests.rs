@@ -77,12 +77,14 @@ async fn listener(
     .unwrap()
     .expect("enabled");
     ci.attach_ui(server.handle.clone());
-    let port = server
-        .handle
-        .origin
-        .strip_prefix("http://127.0.0.1:")
-        .and_then(|p| p.parse().ok())
-        .expect("bound on 127.0.0.1");
+    // The socket itself, not only the advertised origin, is loopback.
+    assert!(
+        server.local_addr.ip().is_loopback(),
+        "{}",
+        server.local_addr
+    );
+    let port = server.local_addr.port();
+    assert_eq!(server.handle.origin, format!("http://127.0.0.1:{port}"));
     (ci, server, port)
 }
 
@@ -274,6 +276,31 @@ fn a_paused_feed_reader_never_delays_publishing_or_other_clients() {
         paused
             .write_all(get(port, "/v1/events", &host, Some(&cookie)).as_bytes())
             .unwrap();
+        // A second reader that keeps up: it reports when it sees a marker.
+        let mut active = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        active
+            .write_all(get(port, "/v1/events", &host, Some(&cookie)).as_bytes())
+            .unwrap();
+        let marker = "aaaaaaaa-bbbb-4ccc-8ddd-0000000000ff";
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let mut buf = [0u8; 65536];
+            while let Ok(n) = active.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                text.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if text.contains(marker) {
+                    let _ = seen_tx.send(Instant::now());
+                    break;
+                }
+                // Keep only a tail, so a split marker is still found.
+                if text.len() > 4096 {
+                    text.drain(..text.len() - 256);
+                }
+            }
+        });
         async_engine::sleep(Duration::from_millis(100)).await;
         let fake = fake_record();
         let started = Instant::now();
@@ -290,6 +317,21 @@ fn a_paused_feed_reader_never_delays_publishing_or_other_clients() {
         assert!(
             other.elapsed() < Duration::from_millis(500),
             "other clients unaffected"
+        );
+        // With the paused reader still stalled, a fresh event reaches the
+        // reader that keeps up within 100 ms.
+        async_engine::sleep(Duration::from_millis(300)).await;
+        let mut marked = fake.clone();
+        marked.id = marker.into();
+        let published = Instant::now();
+        ci.feed().publish(&marked);
+        let seen = seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the active reader receives the event");
+        assert!(
+            seen.duration_since(published) < Duration::from_millis(100),
+            "event latency {:?} with a stalled reader",
+            seen.duration_since(published)
         );
         // The paused reader resumes with a resync rather than a backlog.
         paused

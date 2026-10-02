@@ -398,6 +398,7 @@ fn stdio_initialize_lists_tools_and_calls_status() {
             "bosn_ci_logs",
             "bosn_ci_wait",
             "bosn_ci_cancel",
+            "bosn_ci_retry",
             "bosn_ci_report",
             "bosn_ci_runners",
         ]

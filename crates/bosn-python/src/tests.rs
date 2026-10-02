@@ -610,7 +610,9 @@ fn python_registry_diagnostics_match_the_authenticated_daemon_surface() {
 #[cfg(feature = "embedded-python-tests")]
 async fn wait_for_client(state: &Path) -> ServiceClient {
     let client = ServiceClient::for_state(state).unwrap();
-    for _ in 0..50 {
+    // Up to 5 s: a loaded machine (a parallel build) can take well over
+    // 500 ms to bring the fake daemon up; the common case still polls fast.
+    for _ in 0..500 {
         if client.ping().await.is_ok() {
             return client;
         }

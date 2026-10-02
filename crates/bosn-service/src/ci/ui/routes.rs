@@ -361,13 +361,94 @@ mod tests {
                     action: RunnerAction::SetLimit { limit: 2 },
                 }),
             ),
+            ("GET", "/widget/bubble".into(), vec![], "", Route::Page),
+            ("GET", "/widget/panel".into(), vec![], "", Route::Page),
+            (
+                "POST",
+                "/v1/widget/toggle".into(),
+                vec![],
+                "",
+                Route::api(CiRequest::WidgetCommand {
+                    command: WidgetCommand::Toggle,
+                }),
+            ),
+            (
+                "POST",
+                "/v1/widget/open".into(),
+                vec![],
+                r#"{"path":"/ci"}"#,
+                Route::api(CiRequest::WidgetCommand {
+                    command: WidgetCommand::Open { path: "/ci".into() },
+                }),
+            ),
+            (
+                "POST",
+                "/v1/widget/open-external".into(),
+                vec![],
+                r#"{"url":"https://github.com/o/r"}"#,
+                Route::api(CiRequest::WidgetCommand {
+                    command: WidgetCommand::OpenExternal {
+                        url: "https://github.com/o/r".into(),
+                    },
+                }),
+            ),
         ];
+        let mut served = std::collections::BTreeSet::new();
         for (method, path, query, body, expected) in table {
-            assert_eq!(
-                parse(method, &path, &query, body).unwrap(),
-                expected,
-                "{method} {path}"
+            let route = parse(method, &path, &query, body).unwrap();
+            assert_eq!(route, expected, "{method} {path}");
+            if let Route::Api(request) = route {
+                served.insert(operation(&request));
+            }
+        }
+        // Every operation is either served by a route above or only on the
+        // owner-only daemon socket. `operation` has no wildcard, so a new
+        // CiRequest cannot compile until it is placed in one of the two.
+        let socket_only = [
+            "submit",
+            "ui_grant",
+            "widget_hello",
+            "widget_poll",
+            "widget_dismiss",
+        ];
+        let all = [
+            "submit",
+            "list",
+            "show",
+            "logs",
+            "cancel",
+            "retry",
+            "report",
+            "runners",
+            "widget_hello",
+            "widget_poll",
+            "widget_dismiss",
+            "widget_command",
+            "ui_grant",
+        ];
+        for name in all {
+            assert!(
+                served.contains(name) != socket_only.contains(&name),
+                "{name}: either served over HTTP or socket-only, not both or neither"
             );
+        }
+    }
+
+    fn operation(request: &CiRequest) -> &'static str {
+        match request {
+            CiRequest::Submit { .. } => "submit",
+            CiRequest::List { .. } => "list",
+            CiRequest::Show { .. } => "show",
+            CiRequest::Logs { .. } => "logs",
+            CiRequest::Cancel { .. } => "cancel",
+            CiRequest::Retry { .. } => "retry",
+            CiRequest::Report { .. } => "report",
+            CiRequest::Runners { .. } => "runners",
+            CiRequest::WidgetHello { .. } => "widget_hello",
+            CiRequest::WidgetPoll { .. } => "widget_poll",
+            CiRequest::WidgetDismiss { .. } => "widget_dismiss",
+            CiRequest::WidgetCommand { .. } => "widget_command",
+            CiRequest::UiGrant { .. } => "ui_grant",
         }
     }
 

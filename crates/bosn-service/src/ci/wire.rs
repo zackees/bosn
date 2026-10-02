@@ -325,7 +325,6 @@ impl RunRecord {
         }
     }
 
-    /// Mark a record a previous daemon left unfinished.
     /// The act cache-server namespace: one store per repository identity
     /// (the origin repository, else the checkout path).
     pub fn cache_namespace(&self) -> String {
@@ -493,5 +492,31 @@ mod tests {
             REPLY_DEADLINE > Duration::from_secs(3),
             "longer than a plain daemon call"
         );
+    }
+
+    #[test]
+    fn actions_cache_is_namespaced_per_repository_identity() {
+        let namespace = |workspace: &str, origin: Option<&str>| {
+            let mut record = crate::ci::tests::sample_record("r");
+            record.workspace = workspace.into();
+            record.repository = super::super::provider::repository(origin);
+            record.cache_namespace()
+        };
+        let https = namespace("/a", Some("https://github.com/o/r.git"));
+        assert_eq!(
+            https,
+            namespace("/b", Some("git@github.com:o/r.git")),
+            "one repository shares its cache across clones and transports"
+        );
+        assert_ne!(
+            https,
+            namespace("/a", Some("https://github.com/o/other.git"))
+        );
+        assert_ne!(
+            namespace("/a", None),
+            namespace("/b", None),
+            "without an origin each checkout path is its own repository"
+        );
+        assert_eq!(namespace("/a", None), namespace("/a", None));
     }
 }
