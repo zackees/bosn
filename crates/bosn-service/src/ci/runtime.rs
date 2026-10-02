@@ -5,7 +5,7 @@
 use std::{
     collections::BTreeMap,
     path::Path,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -18,6 +18,7 @@ use super::{
         ACT_VERSION, ActEngineBackend, ActInvocation, CacheVolume, EngineLine, RUNNER_IMAGE,
         SecretEnv, act_artifact,
     },
+    events::Feed,
     lifecycle::{self, CleanupEnd, EngineObserver, EnginePlan, EngineReport, ExecutionEnd},
     model::{ActParser, LogRecord, RunTree, parse_act_list},
     provider,
@@ -25,6 +26,7 @@ use super::{
     report,
     scheduler::{Admission, Scheduler},
     store::{INDEX_STRIDE, LogFilter, LogQuery, LogWriter, Settings, Store},
+    ui::UiHandle,
     wire::*,
 };
 use crate::{RegistryActor, secrets::SecretMasker};
@@ -78,6 +80,9 @@ pub struct CiRuntime {
     kick: async_engine::Sender<()>,
     registry: RegistryActor,
     backend: Arc<dyn ActEngineBackend>,
+    feed: Feed,
+    /// Set once when the opt-in UI listener is serving.
+    ui: Arc<OnceLock<Arc<UiHandle>>>,
 }
 
 impl CiRuntime {
@@ -120,6 +125,8 @@ impl CiRuntime {
             kick,
             registry,
             backend,
+            feed: Feed::new(),
+            ui: Arc::new(OnceLock::new()),
         };
         let dispatcher = runtime.clone();
         async_engine::launch(async move {
@@ -191,6 +198,7 @@ impl CiRuntime {
                     .await,
             ),
             CiRequest::Runners { action } => wire(self.runners(action).await),
+            CiRequest::UiGrant { path } => wire(self.ui_grant(path).await),
         }
     }
 
@@ -200,6 +208,42 @@ impl CiRuntime {
 
     fn kick(&self) {
         let _ = self.kick.try_send(());
+    }
+
+    /// Save a record and announce it on the live feed.
+    fn persist(&self, record: &RunRecord) {
+        self.store.save_run(record);
+        self.feed.publish(record);
+    }
+
+    /// Attach the UI listener so `UiGrant` can issue links for it.
+    pub fn attach_ui(&self, handle: Arc<UiHandle>) {
+        let _ = self.ui.set(handle);
+    }
+
+    async fn ui_grant(&self, path: Option<String>) -> Result<UiGrantReply, CiError> {
+        let ui = self.ui.get().ok_or_else(|| {
+            CiError::refused(
+                "the dashboard is disabled; set `[ui] enabled = true` in <state>/config.toml and restart the daemon",
+            )
+        })?;
+        let next = path.unwrap_or_else(|| "/".into());
+        if !next.starts_with('/') || next.starts_with("//") || next.len() > 256 {
+            return Err(CiError::refused("path must be a local dashboard path"));
+        }
+        let token = ui
+            .auth
+            .grant()
+            .await
+            .map_err(|e| CiError::new("internal", e))?;
+        Ok(UiGrantReply {
+            url: format!("{}/auth?token={token}&next={next}", ui.origin),
+        })
+    }
+
+    /// The live run feed (lossy; see [`super::events`]).
+    pub fn feed(&self) -> &Feed {
+        &self.feed
     }
 
     pub(crate) fn record(&self, run: &str) -> Result<RunRecord, CiError> {
@@ -212,7 +256,7 @@ impl CiRuntime {
         let slot = state.runs.get_mut(run)?;
         change(slot);
         let record = slot.record.clone();
-        self.store.save_run(&record);
+        self.persist(&record);
         Some(record)
     }
 
@@ -273,7 +317,7 @@ impl CiRuntime {
                 format!("cannot place snapshot: {error}"),
             ));
         }
-        self.store.save_run(&record);
+        self.persist(&record);
         let view = RunView::of(record.clone(), false);
         state.insert(record);
         let queue_position = state.scheduler.queue_position(&id);
@@ -501,7 +545,7 @@ impl CiRuntime {
                     slot.cancel = Some(cancel.clone());
                     slot.record.state = RunState::Running;
                     slot.record.started_at = Some(lifecycle::now_seconds());
-                    self.store.save_run(&slot.record);
+                    self.persist(&slot.record);
                     Some((slot.record.clone(), cancel))
                 })
                 .collect()
@@ -565,7 +609,7 @@ impl CiRuntime {
         {
             slot.cancel = None;
             finish(&mut slot.record);
-            self.store.save_run(&slot.record);
+            self.persist(&slot.record);
         }
         state.scheduler.finish(run);
         drop(state);
@@ -845,7 +889,7 @@ impl CiRuntime {
         self.store.staging(id)
     }
     pub(crate) fn save(&self, record: &RunRecord) {
-        self.store.save_run(record);
+        self.persist(record);
     }
     pub(crate) fn listing(&self) -> ListReply {
         self.list(None, None, 100)

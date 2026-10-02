@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bosn ci</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header>
+  <h1>bosn ci</h1>
+  <div id="runners" role="status" aria-live="polite"></div>
+  <div class="controls">
+    <button id="drain" type="button">Drain</button>
+    <button id="resume" type="button">Resume</button>
+    <label>Limit <input id="limit" type="number" min="1" max="256" size="3"></label>
+    <button id="set-limit" type="button">Set</button>
+  </div>
+</header>
+<main>
+  <nav aria-label="Runs">
+    <h2>Runs</h2>
+    <ul id="runs"></ul>
+  </nav>
+  <section id="detail" aria-live="polite">
+    <p class="hint">Select a run.</p>
+  </section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

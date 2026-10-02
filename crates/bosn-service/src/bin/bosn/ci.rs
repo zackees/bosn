@@ -31,6 +31,7 @@ pub const USAGE: &str = "usage: bosn ci plan [--workspace P] [--provider github]
    or: bosn ci report RUN [--tail N] [--json]
    or: bosn ci retry RUN [--job K] [--json]
    or: bosn ci runners [list|drain|resume|set-limit N|prune-cache [--older-than-secs N] [--max-bytes N]] [--json]
+   or: bosn ui [--path /ci/runs/RUN] [--print]  (needs `[ui] enabled = true` in <state>/config.toml)
    (every verb accepts --state-dir STATE_DIR)";
 
 const EXIT_REFUSED: i32 = 3;
@@ -458,6 +459,54 @@ fn retry(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
     )?;
     print(&retried, flags.json(), |r| println!("run {} queued", r.run));
     Ok(0)
+}
+
+/// `bosn ui [--path P] [--print] [--browser]`: a single-use dashboard link,
+/// opened in the system browser (the native widget window comes later).
+pub fn run_ui(arguments: impl Iterator<Item = OsString>) {
+    let result = (|| -> Result<i32, Failure> {
+        let flags = Flags::parse(
+            arguments,
+            &["--state-dir", "--path"],
+            &["--print", "--browser"],
+        )?;
+        let (runtime, client) = connect(&flags)?;
+        let grant = call(
+            &runtime,
+            client.ci_ui_grant(flags.get("--path").map(str::to_string)),
+        )?;
+        if flags.has("--print") {
+            println!("{}", grant.url);
+            return Ok(0);
+        }
+        open_url(&grant.url).map_err(|e| Failure::error(format!("cannot open a browser: {e}")))?;
+        eprintln!("bosn ui: opened the dashboard in your browser (single-use link)");
+        Ok(0)
+    })();
+    match result {
+        Ok(code) => std::process::exit(code),
+        Err(failure) => refuse(failure),
+    }
+}
+
+/// The platform's URL opener, detached from this terminal.
+fn open_url(url: &str) -> std::io::Result<()> {
+    let mut command = if cfg!(target_os = "macos") {
+        std::process::Command::new("open")
+    } else if cfg!(windows) {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "start", ""]);
+        command
+    } else {
+        std::process::Command::new("xdg-open")
+    };
+    command
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
 }
 
 /// Exit 1 when nothing was cancelled (already finished).

@@ -53,6 +53,7 @@ mod vocabulary {
 
 pub mod client;
 pub mod engine;
+pub mod events;
 pub mod lifecycle;
 pub mod mcp;
 pub mod model;
@@ -63,6 +64,7 @@ pub mod runtime;
 pub mod scheduler;
 pub mod snapshot;
 pub mod store;
+pub mod ui;
 pub mod wire;
 
 pub use client::{SubmitOptions, detect_actor, plan, stage_submission};

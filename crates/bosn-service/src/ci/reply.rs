@@ -24,6 +24,12 @@ impl<T: Serialize> JsonReply for T {
     }
 }
 
+/// A single-use link that signs a browser in to the dashboard.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiGrantReply {
+    pub url: String,
+}
+
 /// A refused or failed request. `code` is stable (`refused`, `not_found`,
 /// `invalid_request`, `internal`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

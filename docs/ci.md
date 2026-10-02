@@ -35,6 +35,37 @@ dispatches through the same code.
 - `bosn_ci_report` gives the first failing job and step with only that step's
   tail (at most 20 lines).
 
+## Dashboard (`bosn ui`)
+
+The dashboard is opt-in. Enable it in the daemon state directory's
+`config.toml`, then restart the daemon:
+
+```toml
+[ui]
+enabled = true   # default false: no port is bound
+port = 0         # 0 = an ephemeral port
+```
+
+`bosn ui [--path /ci/runs/RUN]` asks the daemon (over its owner-only socket)
+for a single-use link and opens it in the browser. `--print` only prints it.
+
+- The listener binds `127.0.0.1` only.
+- The link is redeemed once for an `HttpOnly; SameSite=Strict` session cookie.
+  A replayed link is refused.
+- Every request's `Host` must name the listener, which defends against DNS
+  rebinding.
+- Every write must carry the listener's `Origin`, which defends against CSRF.
+  A write with no `Origin` is refused.
+- Every `/v1` route is one of the typed CI operations above; the listener can
+  do nothing the daemon socket cannot.
+- The page, script and stylesheet are compiled into the binary. They load no
+  CDN, fonts or analytics, so the dashboard works with no network beyond
+  loopback.
+
+The live feed (`/v1/events`, server-sent events) is lossy: a reader that falls
+behind is sent `resync` and refetches. A slow browser never delays the daemon
+or other readers.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -157,7 +188,7 @@ These are tracked in #323:
 
 - Cross-repository sharing of compiler caches (zccache/soldr) outside
   `actions/cache`.
-- The daemon UI and the desktop widget.
+- The desktop widget and a native full-view window (blocked on zackees/kernal-api#384).
 - GitLab.
 - Skipped *steps* (`if:` false) are not yet listed; skipped and unsupported
   *jobs* are.

@@ -169,6 +169,25 @@ impl Service {
                 std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get),
             ),
         );
+        // The opt-in dashboard listener lives as long as the daemon.
+        let _ui = match ci::ui::config::load(&self.state_dir) {
+            Ok(config) => match ci::ui::start(config, ci.clone()).await {
+                Ok(Some(server)) => {
+                    ci.attach_ui(Arc::clone(&server.handle));
+                    eprintln!("bosn ci: dashboard listening on {}", server.handle.origin);
+                    Some(server)
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    eprintln!("bosn ci: dashboard listener failed to start: {error}");
+                    None
+                }
+            },
+            Err(error) => {
+                eprintln!("bosn ci: dashboard disabled, config unreadable: {error}");
+                None
+            }
+        };
         // Engines a previous daemon left behind: snapshot them before any
         // client can submit a run, then reconcile exactly that set in the
         // background, so a live run is never mistaken for a leftover.

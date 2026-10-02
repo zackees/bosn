@@ -177,6 +177,10 @@ pub enum CiRequest {
     Runners {
         action: RunnerAction,
     },
+    /// A single-use dashboard link (only from the owner-only socket).
+    UiGrant {
+        path: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

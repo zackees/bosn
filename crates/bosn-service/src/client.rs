@@ -824,6 +824,9 @@ impl Client {
     ) -> Result<ci::RunReport, Error> {
         self.ci_call(ci::CiRequest::Report { run, tail }).await
     }
+    pub async fn ci_ui_grant(&self, path: Option<String>) -> Result<ci::UiGrantReply, Error> {
+        self.ci_call(ci::CiRequest::UiGrant { path }).await
+    }
     pub async fn ci_runners(&self, action: ci::RunnerAction) -> Result<ci::RunnersReply, Error> {
         self.ci_call(ci::CiRequest::Runners { action }).await
     }

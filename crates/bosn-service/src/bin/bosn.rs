@@ -96,6 +96,7 @@ fn main() {
         "compose" => run_compose(arguments),
         "act" => act::run(arguments),
         "ci" => ci::run(arguments, None),
+        "ui" => ci::run_ui(arguments),
         "manifest" => run_manifest(arguments),
         "run" => run::run(arguments),
         "setup" => run_setup(arguments),
