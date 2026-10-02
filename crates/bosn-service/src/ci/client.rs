@@ -157,6 +157,7 @@ pub async fn stage_submission(
         branch: receipt.branch,
         tree_digest: receipt.tree_digest,
         dirty: receipt.dirty,
+        commit: receipt.commit,
         origin: receipt.origin,
         pr_number: options.pr_number,
         timeout_secs: options.timeout_secs,

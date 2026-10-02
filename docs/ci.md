@@ -223,6 +223,17 @@ job succeeded, or when its engine could not be proven removed.
   submodule checkouts are included. The snapshot goes into the daemon's staging
   area.
   - The run records `sha` plus `dirty: <tree digest>`, never only the bare SHA.
+  - The job sees uncommitted work as a **synthetic commit** on top of `sha`
+    (by `bosn`, dated like `sha`, so the same tree always gives the same
+    commit and identical runs still coalesce). Its checkout is clean, and
+    `HEAD`, `github.sha` and `pull_request.head.sha` all name that commit, so
+    a workflow that cleans its tree (`git restore`, `git reset --hard`) still
+    builds the work under test (#394). The record keeps the real `sha` and
+    names the synthetic one in `commit`. A clean tree is checked out at
+    exactly `sha`.
+  - bosn's own rewrites of `actions/checkout` steps are marked skip-worktree,
+    so they neither show in `git status` nor are reverted by a restore.
+  - A detached `HEAD` is checked out detached at the same commit (#393).
   - Editing the checkout during a run does not change what the run sees.
 - **Isolation.** Each run gets one owned Act engine on the host engine
   (`crates/bosn-service/src/act_engine`, #349): a privileged container of the
@@ -339,9 +350,10 @@ All runtime state is under the daemon state directory (`ci/`):
   `section`.
 - `event.json` is the event payload.
 - `source/` is the frozen snapshot: the working tree, uncommitted work
-  included, in a Git repository holding only the `HEAD` commit (depth 1), so
-  a workflow's `git rev-parse HEAD`, `git diff` and `git status` behave as in
-  a real checkout. It is kept for the newest 10 runs so they
+  included, in a Git repository holding only the `HEAD` commit (depth 1, plus
+  the synthetic commit of a dirty tree), so a workflow's `git rev-parse HEAD`,
+  `git diff` and `git status` behave as in a real checkout.
+  `refs/bosn/base` names the commit the snapshot was taken from. It is kept for the newest 10 runs so they
   can be retried.
 
 `runners cache` reports the size of the machine-wide cache volume, and

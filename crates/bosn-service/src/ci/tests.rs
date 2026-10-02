@@ -32,6 +32,7 @@ fn request(staging: &str, sha_byte: char) -> SubmitRequest {
         branch: Some("main".into()),
         tree_digest: "d".repeat(64),
         dirty: false,
+        commit: None,
         origin: Some("https://github.com/o/r.git".into()),
         pr_number: None,
         timeout_secs: Some(5),
@@ -57,7 +58,7 @@ async fn submit(runtime: &CiRuntime, sha_byte: char) -> SubmitReply {
     call(
         runtime,
         CiRequest::Submit {
-            request: request(&staging, sha_byte),
+            request: Box::new(request(&staging, sha_byte)),
         },
     )
     .await
@@ -203,7 +204,7 @@ fn the_run_timeout_covers_planning_not_only_execution() {
         let reply: SubmitReply = call(
             &runtime,
             CiRequest::Submit {
-                request: submission,
+                request: Box::new(submission),
             },
         )
         .await;
@@ -262,7 +263,7 @@ fn refusals_are_typed_and_release_needs_a_clean_tree() {
         dirty_release.dirty = true;
         let error = runtime
             .handle(CiRequest::Submit {
-                request: dirty_release,
+                request: Box::new(dirty_release),
             })
             .await
             .unwrap_err();
@@ -274,7 +275,7 @@ fn refusals_are_typed_and_release_needs_a_clean_tree() {
         );
         let error = runtime
             .handle(CiRequest::Submit {
-                request: request("../../etc", 'f'),
+                request: Box::new(request("../../etc", 'f')),
             })
             .await
             .unwrap_err();
@@ -606,7 +607,7 @@ fn a_run_whose_client_went_away_still_ends_and_is_cleaned() {
         let run = call::<SubmitReply>(
             &runtime,
             CiRequest::Submit {
-                request: submission,
+                request: Box::new(submission),
             },
         )
         .await
@@ -640,7 +641,7 @@ fn a_silent_step_still_shows_its_progress_while_it_runs() {
         let run = call::<SubmitReply>(
             &runtime,
             CiRequest::Submit {
-                request: submission,
+                request: Box::new(submission),
             },
         )
         .await

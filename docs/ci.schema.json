@@ -1020,6 +1020,14 @@
             "null"
           ]
         },
+        "commit": {
+          "default": null,
+          "description": "The synthetic commit the job checked out when `dirty`: `sha` plus the\nuncommitted work, so a workflow cleaning its tree still builds it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "conclusion": {
           "anyOf": [
             {
@@ -1489,6 +1497,14 @@
           "type": "string"
         },
         "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "commit": {
+          "default": null,
+          "description": "The synthetic commit holding the uncommitted work (dirty runs only):\nthe job checks it out, and the event payload names it.",
           "type": [
             "string",
             "null"
