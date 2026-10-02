@@ -16,6 +16,25 @@ bosn ci cancel RUN | retry RUN [--job K] | wait RUN --deadline-ms N
 bosn ci runners [list|drain|resume|set-limit N|prune-cache]
 ```
 
+## Agents: MCP tools and `bosn.Client`
+
+`bosn mcp` serves `bosn_ci_plan`, `bosn_ci_run`, `bosn_ci_status`,
+`bosn_ci_list`, `bosn_ci_logs`, `bosn_ci_wait`, `bosn_ci_cancel`,
+`bosn_ci_report` and `bosn_ci_runners`. Python gets the same contract through
+`bosn.Client(state_dir).ci("<tool>", **arguments)` (for example
+`client.ci("run", workspace="/repo", trigger="pr", mode="test")`), which
+dispatches through the same code.
+
+- Arguments are parsed eagerly into typed structs; an unknown field is
+  refused.
+- Every reply is a typed document of at most 64 KiB.
+- `bosn_ci_run` returns a durable run ID at once. Waiting goes through
+  `bosn_ci_wait`, which accepts a deadline of at most 10 minutes per call.
+- Logs are cursor pages (`since_seq` to `next_seq`); each record comes back
+  exactly once.
+- `bosn_ci_report` gives the first failing job and step with only that step's
+  tail (at most 20 lines).
+
 ## Exit codes
 
 | Code | Meaning |
@@ -138,7 +157,6 @@ These are tracked in #323:
 
 - Cross-repository sharing of compiler caches (zccache/soldr) outside
   `actions/cache`.
-- MCP tools and `bosn.Client` methods.
 - The daemon UI and the desktop widget.
 - GitLab.
 - Skipped *steps* (`if:` false) are not yet listed; skipped and unsupported

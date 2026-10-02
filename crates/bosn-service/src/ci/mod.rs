@@ -54,6 +54,7 @@ mod vocabulary {
 pub mod client;
 pub mod engine;
 pub mod lifecycle;
+pub mod mcp;
 pub mod model;
 pub mod provider;
 pub mod reply;

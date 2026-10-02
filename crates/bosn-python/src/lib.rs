@@ -58,6 +58,30 @@ impl Client {
         self.state_dir.to_string_lossy().into_owned()
     }
 
+    /// Call one local-CI tool (the same contract as the `bosn_ci_*` MCP
+    /// tools: `plan`, `run`, `status`, `list`, `logs`, `wait`, `cancel`,
+    /// `report`, `runners`) with keyword arguments; returns the typed reply
+    /// as a dict. Replies stay under 64 KiB; long work returns a run ID.
+    #[pyo3(signature = (tool, **arguments))]
+    fn ci(
+        &self,
+        tool: &str,
+        arguments: Option<&Bound<'_, pyo3::types::PyDict>>,
+        py: Python<'_>,
+    ) -> PyResult<Py<PyAny>> {
+        let json = py.import("json")?;
+        let encoded: String = match arguments {
+            Some(arguments) => json.call_method1("dumps", (arguments,))?.extract()?,
+            None => "{}".into(),
+        };
+        let name = format!("bosn_ci_{tool}");
+        let state_dir = self.state_dir.clone();
+        let reply = py
+            .detach(move || ci_call(&state_dir, &name, &encoded))
+            .map_err(PyRuntimeError::new_err)?;
+        Ok(json.call_method1("loads", (reply,))?.unbind())
+    }
+
     /// Return the daemon's typed, read-only registry status.
     ///
     /// The synchronous Python method releases the GIL while a kernal-api
@@ -1987,6 +2011,21 @@ fn redact_diagnostic(value: &str) -> String {
         }
     }
     redacted
+}
+
+fn ci_call(state_dir: &Path, name: &str, arguments: &str) -> Result<String, String> {
+    let arguments: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(arguments).map_err(|e| format!("invalid arguments: {e}"))?;
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let client = bosn_service::Client::for_state(state_dir).map_err(|e| e.to_string())?;
+    let mut backend = bosn_service::ci::mcp::ClientCi::new(&runtime, &client);
+    bosn_service::ci::mcp::call(name, &arguments, &mut backend)
+        .ok_or_else(|| format!("unknown CI tool {name}"))?
+        .map(|value| value.to_string())
 }
 
 fn service_error(error: bosn_service::Error) -> PyErr {

@@ -103,6 +103,8 @@ pub fn serve_stdio(state_dir: impl Into<PathBuf>) -> Result<(), Error> {
 }
 
 trait Backend {
+    /// The CI tools' daemon view (see [`crate::ci::mcp`]).
+    fn ci(&mut self) -> Box<dyn crate::ci::mcp::CiBackend + '_>;
     fn status(&mut self) -> Result<Status, Error>;
     fn doctor(&mut self) -> Result<DoctorReport, Error>;
     fn registry_resources(&mut self, after: u64, limit: u32)
@@ -204,6 +206,9 @@ struct DaemonBackend<'a> {
     state_dir: PathBuf,
 }
 impl Backend for DaemonBackend<'_> {
+    fn ci(&mut self) -> Box<dyn crate::ci::mcp::CiBackend + '_> {
+        Box::new(crate::ci::mcp::ClientCi::new(self.runtime, &self.client))
+    }
     fn status(&mut self) -> Result<Status, Error> {
         self.runtime.run(self.client.status())
     }
@@ -491,7 +496,7 @@ fn valid_id(id: &Value) -> bool {
 }
 
 fn tools_list() -> Value {
-    json!({
+    let mut list = json!({
         "tools": [
             {
                 "name": "bosn_status",
@@ -630,7 +635,11 @@ fn tools_list() -> Value {
                 "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}
             }
         ]
-    })
+    });
+    if let Some(tools) = list["tools"].as_array_mut() {
+        tools.extend(crate::ci::mcp::tools());
+    }
+    list
 }
 
 fn compose_plan_schema() -> Value {
@@ -790,6 +799,12 @@ fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
         Some(Value::Object(arguments)) => arguments,
         Some(_) => return tool_error("tool arguments must be an object"),
     };
+    if let Some(result) = crate::ci::mcp::call(name, arguments, backend.ci().as_mut()) {
+        return match result {
+            Ok(value) => tool_success(value),
+            Err(message) => tool_error(&message),
+        };
+    }
     let result =
         match name {
             "bosn_compose_plan" => compose_plan_request(arguments).and_then(|document| {
@@ -1730,6 +1745,9 @@ mod tests {
         setup_task_error: bool,
     }
     impl Backend for FakeBackend {
+        fn ci(&mut self) -> Box<dyn crate::ci::mcp::CiBackend + '_> {
+            Box::new(crate::ci::mcp::Offline)
+        }
         fn status(&mut self) -> Result<Status, Error> {
             self.daemon_reads += 1;
             Ok(Status {
@@ -2102,7 +2120,16 @@ mod tests {
                 "bosn_manifest_converge",
                 "bosn_manifest_app_task",
                 "bosn_setup_task",
-                "bosn_setup_app_task"
+                "bosn_setup_app_task",
+                "bosn_ci_plan",
+                "bosn_ci_run",
+                "bosn_ci_status",
+                "bosn_ci_list",
+                "bosn_ci_logs",
+                "bosn_ci_wait",
+                "bosn_ci_cancel",
+                "bosn_ci_report",
+                "bosn_ci_runners",
             ]
         );
         let resources = replies[1]["result"]["tools"]
