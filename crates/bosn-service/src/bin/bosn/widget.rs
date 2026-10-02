@@ -60,6 +60,46 @@ pub fn spawn_detached(binary: &Path, state_dir: &Path, autostart: bool) -> std::
     command.spawn().map(|_| ())
 }
 
+/// Where `bosn ui` shows the dashboard.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UiTarget {
+    /// Queue the page for the running widget's full-view window.
+    Widget,
+    /// Start the widget, then queue the page once it registers.
+    LaunchWidget,
+    Browser,
+    /// Print the single-use link (asked for, or no desktop to open it on).
+    Print,
+}
+
+/// What `bosn ui` decides from.
+#[derive(Clone, Copy)]
+pub struct UiContext {
+    pub print: bool,
+    pub browser: bool,
+    pub display: bool,
+    pub policy: bosn_service::ci::widget::AutoLaunch,
+    pub presence: bosn_service::ci::widget::WidgetPresence,
+    pub installed: bool,
+}
+
+/// The widget when it is running or may be started (an explicit `bosn ui`
+/// overrides an earlier quit); otherwise the browser.
+pub fn ui_target(context: &UiContext) -> UiTarget {
+    use bosn_service::ci::widget::{AutoLaunch, WidgetPresence};
+    if context.print || !context.display {
+        return UiTarget::Print;
+    }
+    if context.browser {
+        return UiTarget::Browser;
+    }
+    match context.presence {
+        WidgetPresence::Connected => UiTarget::Widget,
+        _ if context.policy == AutoLaunch::Never || !context.installed => UiTarget::Browser,
+        WidgetPresence::Absent | WidgetPresence::Dismissed => UiTarget::LaunchWidget,
+    }
+}
+
 /// The systemd user unit: started with the graphical session (so it gets
 /// WAYLAND_DISPLAY/DISPLAY/DBUS_SESSION_BUS_ADDRESS from systemd's user
 /// environment), restarted after a crash with backoff, never after a quit.
@@ -152,5 +192,65 @@ mod tests {
             "a quit (exit 0) is not restarted"
         );
         assert!(unit.contains("StartLimitBurst=5"));
+    }
+
+    #[test]
+    fn bosn_ui_prefers_the_widget_and_falls_back_to_the_browser() {
+        use bosn_service::ci::widget::{AutoLaunch, WidgetPresence::*};
+        let desktop = UiContext {
+            print: false,
+            browser: false,
+            display: true,
+            policy: AutoLaunch::OnActivity,
+            presence: Absent,
+            installed: true,
+        };
+        assert_eq!(
+            ui_target(&UiContext {
+                presence: Connected,
+                ..desktop
+            }),
+            UiTarget::Widget,
+            "a running widget shows the page"
+        );
+        assert_eq!(ui_target(&desktop), UiTarget::LaunchWidget);
+        assert_eq!(
+            ui_target(&UiContext {
+                print: true,
+                presence: Connected,
+                ..desktop
+            }),
+            UiTarget::Print
+        );
+        assert_eq!(
+            ui_target(&UiContext {
+                browser: true,
+                presence: Connected,
+                ..desktop
+            }),
+            UiTarget::Browser
+        );
+        assert_eq!(
+            ui_target(&UiContext {
+                display: false,
+                ..desktop
+            }),
+            UiTarget::Print,
+            "no desktop: print the link instead of failing to open anything"
+        );
+        assert_eq!(
+            ui_target(&UiContext {
+                policy: AutoLaunch::Never,
+                ..desktop
+            }),
+            UiTarget::Browser
+        );
+        assert_eq!(
+            ui_target(&UiContext {
+                installed: false,
+                ..desktop
+            }),
+            UiTarget::Browser
+        );
     }
 }

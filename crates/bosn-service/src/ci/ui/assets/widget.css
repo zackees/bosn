@@ -16,12 +16,15 @@ body.bubble { background: transparent; display: grid; place-items: center; heigh
 .label { font-size: 8px; color: var(--muted); line-height: 1; }
 body.panel { padding: 10px; }
 header { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
-.controls { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.controls { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
 button { font: inherit; padding: 2px 8px; border: 1px solid var(--line); border-radius: 6px;
          background: var(--bg); color: var(--fg); cursor: pointer; }
 ul { list-style: none; padding: 0; margin: 0; }
-#runs li { border-top: 1px solid var(--line); padding: 6px 0; }
-#runs li button { border: 0; width: 100%; text-align: left; padding: 0; display: grid; gap: 1px; }
+#runs li { border-top: 1px solid var(--line); padding: 6px 0; display: flex; gap: 6px; align-items: start; }
+#runs li > button:first-child { border: 0; flex: 1; text-align: left; padding: 0; display: grid; gap: 1px; }
+#runs li > .row-action { flex: none; font-size: 11px; }
+.controls input { width: 3.5em; }
+button.confirming { border-color: var(--fail); color: var(--fail); }
 .meta { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
 .success { color: var(--ok); } .failure, .error, .timed_out { color: var(--fail); }
 .running { color: var(--run); } .queued, .cancelled, .incomplete, .refused { color: var(--warn); }

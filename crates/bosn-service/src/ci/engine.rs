@@ -223,6 +223,11 @@ pub trait ActEngineBackend: Send + Sync {
     /// Remove the engine with this exact immutable ID (never by name: the
     /// name could be taken by something else after authorization).
     fn remove<'a>(&'a self, engine_id: &'a str) -> BoxFuture<'a, Result<(), String>>;
+    /// The cache volume's size in bytes; `None` when it does not exist.
+    fn cache_bytes<'a>(&'a self, volume: &'a str) -> BoxFuture<'a, Result<Option<u64>, String>>;
+    /// Remove the cache volume. The host engine refuses while any container
+    /// (another daemon's run included) still uses it.
+    fn remove_cache<'a>(&'a self, volume: &'a str) -> BoxFuture<'a, Result<(), String>>;
 }
 
 const CONTROL_DEADLINE: Duration = Duration::from_secs(60);
@@ -271,6 +276,13 @@ impl DockerActBackend {
             ));
         }
         Ok(String::from_utf8_lossy(&result.stdout).trim().to_string())
+    }
+
+    async fn volume_exists(&self, volume: &str) -> Result<bool, String> {
+        Ok(self
+            .run(owned(&["volume", "inspect", volume]), CONTROL_DEADLINE)
+            .await?
+            .ok())
     }
 
     async fn wait_ready(&self, name: &str) -> Result<(), String> {
@@ -383,6 +395,48 @@ impl ActEngineBackend for DockerActBackend {
             .await?;
             self.checked("engine image inspect", inspect, CONTROL_DEADLINE)
                 .await
+        })
+    }
+
+    fn cache_bytes<'a>(&'a self, volume: &'a str) -> BoxFuture<'a, Result<Option<u64>, String>> {
+        Box::pin(async move {
+            if !self.volume_exists(volume).await? {
+                return Ok(None);
+            }
+            // Measured read-only with the pinned engine image (present once
+            // any run created the volume): no extra image is pulled.
+            let mount = format!("type=volume,source={volume},target=/cache,readonly");
+            let du = owned(&[
+                "run",
+                "--rm",
+                "--mount",
+                &mount,
+                ENGINE_IMAGE,
+                "du",
+                "-sb",
+                "/cache",
+            ]);
+            let out = self.checked("cache size", du, PULL_DEADLINE).await?;
+            out.split_whitespace()
+                .next()
+                .and_then(|bytes| bytes.parse().ok())
+                .map(Some)
+                .ok_or_else(|| format!("cache size: unexpected output {out:?}"))
+        })
+    }
+
+    fn remove_cache<'a>(&'a self, volume: &'a str) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            if !self.volume_exists(volume).await? {
+                return Ok(());
+            }
+            self.checked(
+                "cache volume remove",
+                owned(&["volume", "rm", volume]),
+                CONTROL_DEADLINE,
+            )
+            .await
+            .map(|_| ())
         })
     }
 

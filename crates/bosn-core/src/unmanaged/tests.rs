@@ -1,5 +1,8 @@
 use super::*;
 
+/// `docker system df -v --format json` from a small engine, written once.
+const SYSTEM_DF_MINIMAL: &str = include_str!("../../tests/fixtures/system_df_minimal.json");
+
 fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
         .iter()
@@ -610,7 +613,7 @@ fn label_lists_parse_and_a_bare_key_counts_as_present() {
 
 #[test]
 fn observe_maps_the_df_sections_onto_artifacts() {
-    let json = include_str!("../../tests/fixtures/system_df_minimal.json");
+    let json = SYSTEM_DF_MINIMAL;
     let report: SystemDfReport = serde_json::from_str(json).expect("fixture parses");
     let observed = observe(EngineObservation {
         report: &report,
@@ -650,7 +653,7 @@ fn observe_maps_the_df_sections_onto_artifacts() {
 fn only_docker_reported_dangling_images_are_dangling() {
     // An untagged image that is still the parent of a tagged one is not dangling. If the
     // caller's dangling set omits it, the heuristic must not override that.
-    let json = include_str!("../../tests/fixtures/system_df_minimal.json");
+    let json = SYSTEM_DF_MINIMAL;
     let report: SystemDfReport = serde_json::from_str(json).expect("fixture parses");
     let observed = observe(EngineObservation {
         report: &report,
@@ -676,7 +679,7 @@ fn only_docker_reported_dangling_images_are_dangling() {
 
 #[test]
 fn inspected_volumes_supply_the_age_the_accounting_document_lacks() {
-    let json = include_str!("../../tests/fixtures/system_df_minimal.json");
+    let json = SYSTEM_DF_MINIMAL;
     let report: SystemDfReport = serde_json::from_str(json).expect("fixture parses");
     let now = 1_789_595_611.0;
     let observed = observe(EngineObservation {

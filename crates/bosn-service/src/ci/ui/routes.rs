@@ -40,7 +40,9 @@ impl Route {
             CiRequest::Cancel { .. }
             | CiRequest::Retry { .. }
             | CiRequest::WidgetCommand { .. } => true,
-            CiRequest::Runners { action } => *action != RunnerAction::List,
+            CiRequest::Runners { action } => {
+                !matches!(action, RunnerAction::List | RunnerAction::CacheUsage)
+            }
             _ => false,
         }
     }
@@ -60,7 +62,7 @@ impl Route {
         let get = method == "GET";
         let post = method == "POST";
         let route = match (segments.as_slice(), get, post) {
-            ([""] | ["app.js"] | ["app.css"], true, _) => Route::Page,
+            ([""] | ["app.js"] | ["app.css"] | ["shared.js"], true, _) => Route::Page,
             (["ci", ..], true, _) => Route::Page,
             (["widget", "bubble" | "panel" | "widget.js" | "widget.css"], true, _) => Route::Page,
             (["v1", "widget", "toggle"], _, true) => Route::api(CiRequest::WidgetCommand {
@@ -144,6 +146,7 @@ impl Route {
                 [""]
                 | ["app.js"]
                 | ["app.css"]
+                | ["shared.js"]
                 | ["ci", ..]
                 | ["widget", ..]
                 | ["v1", "widget", "toggle" | "open" | "open-external"]
@@ -361,6 +364,7 @@ mod tests {
                     action: RunnerAction::SetLimit { limit: 2 },
                 }),
             ),
+            ("GET", "/shared.js".into(), vec![], "", Route::Page),
             ("GET", "/widget/bubble".into(), vec![], "", Route::Page),
             ("GET", "/widget/panel".into(), vec![], "", Route::Page),
             (

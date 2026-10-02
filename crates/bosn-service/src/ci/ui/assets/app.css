@@ -14,7 +14,7 @@ header { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center;
 h1 { font-size: 16px; margin: 0; }
 h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 8px; }
 h3 { font-size: 14px; margin: 16px 0 6px; }
-.controls { display: flex; gap: 8px; align-items: center; margin-left: auto; }
+.controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-left: auto; }
 button { font: inherit; padding: 3px 10px; border: 1px solid var(--line); border-radius: 6px;
          background: var(--panel); color: var(--fg); cursor: pointer; }
 button:focus-visible, li > button:focus-visible { outline: 2px solid var(--run); outline-offset: 1px; }
@@ -38,3 +38,4 @@ ul { list-style: none; margin: 0; padding: 0; }
 pre#log { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px;
           max-height: 55vh; overflow: auto; white-space: pre-wrap; font: 12px/1.4 ui-monospace, monospace; }
 .failure-box { border-left: 3px solid var(--fail); padding: 4px 10px; margin: 8px 0; }
+button.confirming { border-color: var(--fail); color: var(--fail); }

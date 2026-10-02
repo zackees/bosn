@@ -668,3 +668,63 @@ fn a_silent_step_still_shows_its_progress_while_it_runs() {
         wait_done(&runtime, &run).await;
     });
 }
+
+#[test]
+fn the_cache_volume_is_measured_and_cleared_only_while_nothing_runs() {
+    with_registry(|registry, dir| async move {
+        let backend = Arc::new(FakeBackend::default());
+        let runtime = CiRuntime::start(&dir, registry, backend.clone(), 1);
+        let usage = |runtime: CiRuntime| async move {
+            call::<RunnersReply>(
+                &runtime,
+                CiRequest::Runners {
+                    action: RunnerAction::CacheUsage,
+                },
+            )
+            .await
+            .cache
+            .expect("cache usage is reported")
+        };
+        assert_eq!(
+            usage(runtime.clone()).await.bytes,
+            None,
+            "no run yet: no volume"
+        );
+        let run = submit(&runtime, '1').await.run;
+        wait_done(&runtime, &run).await;
+        let used = usage(runtime.clone()).await;
+        assert_eq!(used.volume, "bosn-ci-cache-v1");
+        assert!(used.bytes.is_some(), "a run creates the cache volume");
+
+        *backend.faults.lock().unwrap() = Faults {
+            hang: true,
+            ..Faults::default()
+        };
+        let busy = submit(&runtime, '2').await.run;
+        for _ in 0..200 {
+            if *backend.executions.lock().unwrap() == 2 {
+                break;
+            }
+            async_engine::sleep(Duration::from_millis(10)).await;
+        }
+        let refused = runtime
+            .handle(CiRequest::Runners {
+                action: RunnerAction::ClearCache,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "refused", "never under a running job");
+        assert!(usage(runtime.clone()).await.bytes.is_some());
+
+        let _: CancelReply = call(&runtime, CiRequest::Cancel { run: busy.clone() }).await;
+        wait_done(&runtime, &busy).await;
+        let cleared: RunnersReply = call(
+            &runtime,
+            CiRequest::Runners {
+                action: RunnerAction::ClearCache,
+            },
+        )
+        .await;
+        assert_eq!(cleared.cache.unwrap().bytes, None, "the volume is gone");
+    });
+}

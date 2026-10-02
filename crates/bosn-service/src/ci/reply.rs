@@ -154,6 +154,18 @@ pub struct CancelReply {
 pub struct RunnersReply {
     pub runners: RunnerStatus,
     pub pruned_runs: Option<Vec<String>>,
+    /// Set by `cache_usage` and `clear_cache`.
+    #[serde(default)]
+    pub cache: Option<CacheUsage>,
+}
+
+/// The machine-wide cache volume (act tools, runner image, action
+/// checkouts and the per-repository `actions/cache` store).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CacheUsage {
+    pub volume: String,
+    /// `None` when the volume does not exist.
+    pub bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

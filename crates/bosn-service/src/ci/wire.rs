@@ -136,6 +136,10 @@ pub enum RunnerAction {
         older_than_secs: Option<u64>,
         max_bytes: Option<u64>,
     },
+    /// Measure the machine-wide cache volume.
+    CacheUsage,
+    /// Remove the machine-wide cache volume (refused while a run executes).
+    ClearCache,
 }
 
 /// Every CI operation. Each maps to one typed handler; there is no generic
@@ -213,7 +217,10 @@ impl CiRequest {
             Self::Retry { .. }
             | Self::Report { .. }
             | Self::Runners {
-                action: RunnerAction::PruneCache { .. },
+                action:
+                    RunnerAction::PruneCache { .. }
+                    | RunnerAction::CacheUsage
+                    | RunnerAction::ClearCache,
             } => SLOW_REPLY_DEADLINE,
             _ => REPLY_DEADLINE,
         }

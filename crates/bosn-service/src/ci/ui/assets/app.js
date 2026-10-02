@@ -1,30 +1,14 @@
 // bosn ci dashboard: runs, the stage/job/step tree, step logs and runner
-// management, live over /v1/events. Untrusted text only ever goes through
-// textContent; writes are same-origin POSTs (the daemon checks Origin).
+// management, live over /v1/events. Helpers (icons, `el`, `request`,
+// `confirmButton`) come from /shared.js; writes are same-origin POSTs (the
+// daemon checks Origin).
 "use strict";
 
-const ICON = {
-  success: "✓", failure: "✗", error: "✗", timed_out: "⏱", cancelled: "⊘",
-  skipped: "↷", unsupported: "⚠", incomplete: "⚠", refused: "⚠",
-  in_progress: "●", running: "●", queued: "○", completed: "✓", done: "✓",
-};
-const $ = (id) => document.getElementById(id);
 let selected = runFromPath();
 
 function runFromPath() {
   const m = location.pathname.match(/^\/ci\/runs\/([0-9a-f-]{36})$/);
   return m ? m[1] : null;
-}
-
-function el(tag, attrs = {}, ...children) {
-  const node = document.createElement(tag);
-  for (const [k, v] of Object.entries(attrs)) {
-    if (k === "class") node.className = v;
-    else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
-    else node.setAttribute(k, v);
-  }
-  for (const child of children) node.append(child);
-  return node;
 }
 
 // Status is shown by icon and word, never by colour alone.
@@ -33,27 +17,23 @@ function badge(word) {
   return el("span", { class: `status ${w}` }, `${ICON[w] || "•"} ${w.replace("_", " ")}`);
 }
 
-async function api(path, options = {}) {
-  const response = await fetch(path, { credentials: "same-origin", ...options });
-  if (response.status === 401) {
-    $("detail").replaceChildren(el("p", { class: "hint" }, "Session expired: run `bosn ui` for a new link."));
-    throw new Error("unauthorized");
+async function api(path, body) {
+  try {
+    return await request(path, body);
+  } catch (error) {
+    if (error instanceof Unauthorized) {
+      $("detail").replaceChildren(el("p", { class: "hint" }, "Session expired: run `bosn ui` for a new link."));
+    }
+    throw error;
   }
-  const body = await response.json();
-  if (!response.ok) throw new Error(body.message || response.statusText);
-  return body;
 }
 
-const post = (path, body) =>
-  api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body || {}) });
+const post = (path, body) => api(path, body || {});
 
 async function refreshList() {
   const list = await api("/v1/runs?limit=100");
   const r = list.runners;
-  $("runners").replaceChildren(
-    `${r.running} running · ${r.queued} queued · limit ${r.limit}`,
-    r.drained ? el("strong", {}, " · drained") : "",
-  );
+  $("runners").textContent = runnersText(r);
   $("limit").placeholder = r.limit;
   $("runs").replaceChildren(...list.runs.map((run) => el("li", {},
     el("button", {
@@ -82,8 +62,9 @@ async function showRun() {
     el("p", {}, badge(run.conclusion || run.state), " ", `exit ${run.exit_code ?? "–"} · ${run.workflow} · ${run.sha}${run.dirty ? " +dirty" : ""}`),
     el("p", { class: "meta" }, `${run.trigger}/${run.mode} · ${run.actor} · cleanup: ${run.cleanup || "–"}`),
     el("div", { class: "controls" },
-      el("button", { type: "button", onclick: () => post(`/v1/runs/${run.id}/cancel`).then(showRun) }, "Cancel"),
-      el("button", { type: "button", onclick: () => post(`/v1/runs/${run.id}/retry`).then((r) => select(r.run)) }, "Retry"),
+      run.state === "done"
+        ? el("button", { type: "button", onclick: () => post(`/v1/runs/${run.id}/retry`).then((r) => select(r.run)) }, "Retry")
+        : confirmButton("Cancel", () => post(`/v1/runs/${run.id}/cancel`), showRun),
     ),
   ];
   if (run.reason) parts.push(el("p", { class: "meta" }, run.reason));
@@ -154,6 +135,13 @@ $("set-limit").addEventListener("click", () => {
   const limit = Number($("limit").value);
   if (limit >= 1) post("/v1/runners", { action: "set_limit", limit }).then(refreshList);
 });
+
+const showCache = (reply) => { $("cache").textContent = cacheText(reply.cache); };
+$("measure-cache").addEventListener("click", () => post("/v1/runners", { action: "cache_usage" }).then(showCache));
+$("prune-slot").replaceChildren(confirmButton("Prune runs older than 7 days",
+  () => post("/v1/runners", { action: "prune_cache", older_than_secs: WEEK_SECS }), refreshList));
+$("clear-cache-slot").replaceChildren(confirmButton("Clear cache",
+  () => post("/v1/runners", { action: "clear_cache" }), showCache));
 
 refreshList().then(() => selected && showRun()).catch(() => {});
 connect();

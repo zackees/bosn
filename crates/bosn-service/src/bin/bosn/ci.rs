@@ -30,8 +30,8 @@ pub const USAGE: &str = "usage: bosn ci plan [--workspace P] [--provider github]
    or: bosn ci cancel RUN [--json]
    or: bosn ci report RUN [--tail N] [--json]
    or: bosn ci retry RUN [--job K] [--json]
-   or: bosn ci runners [list|drain|resume|set-limit N|prune-cache [--older-than-secs N] [--max-bytes N]] [--json]
-   or: bosn ui [--path /ci/runs/RUN] [--print]  (needs `[ui] enabled = true` in <state>/config.toml)
+   or: bosn ci runners [list|drain|resume|set-limit N|prune-cache [--older-than-secs N] [--max-bytes N]|cache|clear-cache] [--json]
+   or: bosn ui [--path /ci/runs/RUN] [--print|--browser]  (the widget when installed, else the browser; needs `[ui] enabled = true` in <state>/config.toml)
    (every verb accepts --state-dir STATE_DIR)";
 
 const EXIT_REFUSED: i32 = 3;
@@ -490,13 +490,40 @@ pub fn run_ui(arguments: impl Iterator<Item = OsString>) {
             &["--print", "--browser"],
         )?;
         let (runtime, client) = connect(&flags)?;
-        let grant = call(
-            &runtime,
-            client.ci_ui_grant(flags.get("--path").map(str::to_string)),
-        )?;
-        maybe_start_widget(&runtime, &client, &flags);
-        if flags.has("--print") {
-            println!("{}", grant.url);
+        let path = flags.get("--path").unwrap_or("/").to_string();
+        // Also proves the dashboard is enabled before anything else happens.
+        let grant = call(&runtime, client.ci_ui_grant(Some(path.clone())))?;
+        let state_dir = flags.state_dir();
+        let binary = super::widget::widget_binary();
+        let context = super::widget::UiContext {
+            print: flags.has("--print"),
+            browser: flags.has("--browser"),
+            display: super::widget::graphical_session(),
+            policy: bosn_service::ci::config::load(&state_dir)
+                .map(|c| c.widget.auto_launch)
+                .unwrap_or_default(),
+            presence: widget_presence(&runtime, &client)?,
+            installed: binary.is_some(),
+        };
+        use super::widget::UiTarget;
+        let shown = match super::widget::ui_target(&context) {
+            UiTarget::Print => {
+                println!("{}", grant.url);
+                return Ok(0);
+            }
+            UiTarget::Widget => open_in_widget(&runtime, &client, &path)?,
+            UiTarget::LaunchWidget => {
+                let started = binary
+                    .as_deref()
+                    .is_some_and(|b| super::widget::spawn_detached(b, &state_dir, false).is_ok());
+                started
+                    && wait_for_widget(&runtime, &client)
+                    && open_in_widget(&runtime, &client, &path)?
+            }
+            UiTarget::Browser => false,
+        };
+        if shown {
+            eprintln!("bosn ui: opened in the bosn widget");
             return Ok(0);
         }
         open_url(&grant.url).map_err(|e| Failure::error(format!("cannot open a browser: {e}")))?;
@@ -507,6 +534,38 @@ pub fn run_ui(arguments: impl Iterator<Item = OsString>) {
         Ok(code) => std::process::exit(code),
         Err(failure) => refuse(failure),
     }
+}
+
+fn widget_presence(
+    runtime: &Runtime,
+    client: &Client,
+) -> Result<bosn_service::ci::widget::WidgetPresence, Failure> {
+    Ok(call(runtime, client.ci_runners(RunnerAction::List))?
+        .runners
+        .widget)
+}
+
+/// Queue `path` for the widget's full-view window.
+fn open_in_widget(runtime: &Runtime, client: &Client, path: &str) -> Result<bool, Failure> {
+    let command = bosn_service::ci::widget::WidgetCommand::Open { path: path.into() };
+    call(
+        runtime,
+        client.ci_widget(bosn_service::ci::CiRequest::WidgetCommand { command }),
+    )?;
+    Ok(true)
+}
+
+/// Whether a just-started widget registers within a few seconds.
+fn wait_for_widget(runtime: &Runtime, client: &Client) -> bool {
+    use bosn_service::ci::widget::WidgetPresence;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if widget_presence(runtime, client).is_ok_and(|p| p == WidgetPresence::Connected) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
 }
 
 /// The platform's URL opener, detached from this terminal.
@@ -563,6 +622,8 @@ fn runners(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
             older_than_secs: flags.number("--older-than-secs")?,
             max_bytes: flags.number("--max-bytes")?,
         },
+        ["cache"] => RunnerAction::CacheUsage,
+        ["clear-cache"] => RunnerAction::ClearCache,
         _ => return Err(USAGE.into()),
     };
     let (runtime, client) = connect(&flags)?;
@@ -572,8 +633,29 @@ fn runners(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
         if let Some(pruned) = &r.pruned_runs {
             println!("pruned runs: {}", pruned.len());
         }
+        if let Some(cache) = &r.cache {
+            match cache.bytes {
+                Some(bytes) => println!("cache: {} {}", cache.volume, human_bytes(bytes)),
+                None => println!("cache: {} (none)", cache.volume),
+            }
+        }
     });
     Ok(0)
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn print_runners(runners: &RunnerStatus) {

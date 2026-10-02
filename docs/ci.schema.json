@@ -1,5 +1,26 @@
 {
   "$defs": {
+    "CacheUsage": {
+      "description": "The machine-wide cache volume (act tools, runner image, action\ncheckouts and the per-repository `actions/cache` store).",
+      "properties": {
+        "bytes": {
+          "description": "`None` when the volume does not exist.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "volume": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "volume"
+      ],
+      "type": "object"
+    },
     "CancelReply": {
       "properties": {
         "cancelled": {
@@ -1260,6 +1281,34 @@
             "action"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Measure the machine-wide cache volume.",
+          "properties": {
+            "action": {
+              "const": "cache_usage",
+              "type": "string"
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Remove the machine-wide cache volume (refused while a run executes).",
+          "properties": {
+            "action": {
+              "const": "clear_cache",
+              "type": "string"
+            }
+          },
+          "required": [
+            "action"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -1307,6 +1356,18 @@
     },
     "RunnersReply": {
       "properties": {
+        "cache": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CacheUsage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Set by `cache_usage` and `clear_cache`."
+        },
         "pruned_runs": {
           "items": {
             "type": "string"

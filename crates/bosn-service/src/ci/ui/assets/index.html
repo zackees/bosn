@@ -15,6 +15,10 @@
     <button id="resume" type="button">Resume</button>
     <label>Limit <input id="limit" type="number" min="1" max="256" size="3"></label>
     <button id="set-limit" type="button">Set</button>
+    <span id="prune-slot"></span>
+    <span id="cache" role="status" aria-live="polite">cache: –</span>
+    <button id="measure-cache" type="button">Measure cache</button>
+    <span id="clear-cache-slot"></span>
   </div>
 </header>
 <main>
@@ -26,6 +30,7 @@
     <p class="hint">Select a run.</p>
   </section>
 </main>
+<script src="/shared.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

@@ -16,8 +16,8 @@ use serde_json::Value;
 use super::{
     config::WidgetConfig,
     engine::{
-        ACT_VERSION, ActEngineBackend, ActInvocation, CacheVolume, EngineLine, RUNNER_IMAGE,
-        SecretEnv, act_artifact,
+        ACT_VERSION, ActEngineBackend, ActInvocation, CACHE_VOLUME, CacheVolume, EngineLine,
+        RUNNER_IMAGE, SecretEnv, act_artifact,
     },
     events::Feed,
     lifecycle::{self, CleanupEnd, EngineObserver, EnginePlan, EngineReport, ExecutionEnd},
@@ -35,6 +35,7 @@ use super::{
 use crate::{RegistryActor, secrets::SecretMasker};
 mod observer;
 mod persist;
+mod runners;
 mod widget;
 use observer::*;
 use persist::{RecordWriter, Save};
@@ -70,6 +71,8 @@ struct CiState {
     runs: BTreeMap<String, RunSlot>,
     /// Run IDs, oldest first.
     order: Vec<String>,
+    /// The cache volume is being removed: dispatch holds new runs.
+    clearing_cache: bool,
 }
 
 impl CiState {
@@ -133,6 +136,7 @@ impl CiRuntime {
             scheduler,
             runs: BTreeMap::new(),
             order: Vec::new(),
+            clearing_cache: false,
         };
         for mut record in store.load_runs() {
             if record.state != RunState::Done {
@@ -534,79 +538,17 @@ impl CiRuntime {
         .await
     }
 
-    async fn runners(&self, action: RunnerAction) -> Result<RunnersReply, CiError> {
-        let mut pruned = None;
-        if let RunnerAction::PruneCache {
-            older_than_secs,
-            max_bytes,
-        } = action
-        {
-            pruned = Some(self.prune(older_than_secs, max_bytes).await?);
-        }
-        let mut state = self.lock();
-        match action {
-            RunnerAction::List | RunnerAction::PruneCache { .. } => {}
-            RunnerAction::Drain => state.scheduler.set_drained(true),
-            RunnerAction::Resume => state.scheduler.set_drained(false),
-            RunnerAction::SetLimit { limit } => {
-                if !(1..=256).contains(&limit) {
-                    return Err(CiError::refused("limit must be between 1 and 256"));
-                }
-                state.scheduler.set_limit(limit);
-            }
-        }
-        self.store.save_settings(&Settings {
-            limit: state.scheduler.limit(),
-            drained: state.scheduler.drained(),
-        });
-        let status = runner_status(&state.scheduler, self.widget_presence());
-        drop(state);
-        self.kick();
-        Ok(RunnersReply {
-            runners: status,
-            pruned_runs: pruned,
-        })
-    }
-
-    /// Remove finished runs by age, total size, or beyond the retention
-    /// counts, and drop sources of all but the newest few. Live runs are
-    /// kept. Sizes are measured and files deleted off the state lock.
-    async fn prune(
-        &self,
-        older_than: Option<u64>,
-        max_bytes: Option<u64>,
-    ) -> Result<Vec<String>, CiError> {
-        let sizes = match max_bytes {
-            None => BTreeMap::new(),
-            Some(_) => {
-                let finished = self.lock().finished_newest_first();
-                let store = self.store.clone();
-                blocking(move || {
-                    finished
-                        .into_iter()
-                        .map(|id| {
-                            let size = store.run_bytes(&id);
-                            (id, size)
-                        })
-                        .collect()
-                })
-                .await?
-            }
-        };
-        let plan = self.lock().plan_prune(older_than, max_bytes, &sizes);
-        let (store, writer) = (self.store.clone(), self.writer.clone());
-        let pruned = plan.runs.clone();
-        blocking(move || plan.apply(&store, &writer)).await?;
-        Ok(pruned)
-    }
-
     /// Start every run the scheduler admits. Each is marked running in the
     /// same critical section, so a cancel never sees an admitted run that is
     /// neither queued nor running.
     fn dispatch(&self) {
         let started: Vec<(Save, CancellationSource)> = {
             let mut state = self.lock();
-            let admitted = state.scheduler.admit();
+            let admitted = if state.clearing_cache {
+                Vec::new()
+            } else {
+                state.scheduler.admit()
+            };
             admitted
                 .into_iter()
                 .filter_map(|id| {
@@ -693,12 +635,20 @@ impl CiRuntime {
                     save
                 })
         };
-        let mut rewrite = None;
-        if let Some(save) = finished {
-            let written = save.record.clone();
-            let _ = self.writer.save(save).await;
+        let written = match finished {
+            Some(save) => {
+                let written = save.record.clone();
+                let _ = self.writer.save(save).await;
+                Some(written)
+            }
+            None => None,
+        };
+        // `done` and the freed slot become visible together.
+        let rewrite = {
             let mut state = self.lock();
-            if let Some(slot) = state.runs.get_mut(run)
+            let mut rewrite = None;
+            if let Some(written) = written
+                && let Some(slot) = state.runs.get_mut(run)
                 && slot.record.state != RunState::Done
             {
                 slot.cancel = None;
@@ -708,8 +658,9 @@ impl CiRuntime {
                     rewrite = Some(slot.snapshot());
                 }
             }
-        }
-        self.lock().scheduler.finish(run);
+            state.scheduler.finish(run);
+            rewrite
+        };
         if let Some(save) = rewrite {
             self.writer.save_detached(save);
         }
@@ -877,66 +828,6 @@ enum Admitted {
     Queued(SubmitReply),
     /// Coalesced into a live run: that run's new version, to write.
     Joined(Option<Save>),
-}
-
-/// What one prune pass deletes: decided under the lock, applied outside it.
-struct PrunePlan {
-    runs: Vec<String>,
-    sources: Vec<String>,
-}
-impl PrunePlan {
-    fn apply(&self, store: &Store, writer: &RecordWriter) {
-        for id in &self.runs {
-            writer.remove_run(id);
-        }
-        for id in &self.sources {
-            store.remove_source(id);
-        }
-    }
-}
-
-impl CiState {
-    fn finished_newest_first(&self) -> Vec<String> {
-        self.order
-            .iter()
-            .rev()
-            .filter(|id| self.runs[*id].record.state == RunState::Done)
-            .cloned()
-            .collect()
-    }
-
-    /// Drop pruned runs from the state now; their files go in `apply`.
-    fn plan_prune(
-        &mut self,
-        older_than: Option<u64>,
-        max_bytes: Option<u64>,
-        sizes: &BTreeMap<String, u64>,
-    ) -> PrunePlan {
-        let now = lifecycle::now_seconds();
-        let mut plan = PrunePlan {
-            runs: Vec::new(),
-            sources: Vec::new(),
-        };
-        let mut kept_bytes = 0;
-        for (newest_first, id) in self.finished_newest_first().into_iter().enumerate() {
-            let age = now - self.runs[&id].record.created_at;
-            let size = sizes.get(&id).copied().unwrap_or(0);
-            if newest_first >= KEEP_RUNS
-                || older_than.is_some_and(|s| age > s as f64)
-                || max_bytes.is_some_and(|m| kept_bytes + size > m)
-            {
-                self.runs.remove(&id);
-                plan.runs.push(id);
-                continue;
-            }
-            if newest_first >= KEEP_SOURCES {
-                plan.sources.push(id);
-            }
-            kept_bytes += size;
-        }
-        self.order.retain(|id| self.runs.contains_key(id));
-        plan
-    }
 }
 
 /// The run directory root, for tests.

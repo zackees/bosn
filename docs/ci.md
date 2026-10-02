@@ -13,7 +13,7 @@ bosn ci show RUN                        # Run -> stage -> job -> step tree
 bosn ci logs RUN --follow               # or --since-seq N --limit N
 bosn ci report RUN --json               # agent contract: first failure + tail
 bosn ci cancel RUN | retry RUN [--job K] | wait RUN --deadline-ms N
-bosn ci runners [list|drain|resume|set-limit N|prune-cache]
+bosn ci runners [list|drain|resume|set-limit N|prune-cache|cache|clear-cache]
 ```
 
 `--timeout-secs N` (default 2 hours) bounds the whole run from the moment it
@@ -51,7 +51,20 @@ port = 0         # 0 = an ephemeral port
 ```
 
 `bosn ui [--path /ci/runs/RUN]` asks the daemon (over its owner-only socket)
-for a single-use link and opens it in the browser. `--print` only prints it.
+for a single-use link, then picks where to show the page:
+
+- The bosn widget's full-view window, when the widget is running. If it is
+  installed but not running, it is started first; an explicit `bosn ui`
+  overrides an earlier quit.
+- The browser, with `--browser`, with `auto_launch = "never"`, when
+  `bosn-widget` is not installed, or when the widget does not register within
+  5 seconds.
+- Printed only, with `--print` or when there is no desktop.
+
+The dashboard and the widget panel both offer the run actions: cancel or
+retry a run, drain/resume, set the limit, prune runs older than 7 days, and
+measure or clear the cache volume. A destructive action takes a second click
+within 4 seconds to confirm.
 
 - The listener binds `127.0.0.1` only.
 - The link is redeemed once for an `HttpOnly; SameSite=Strict` session cookie.
@@ -266,6 +279,10 @@ All runtime state is under the daemon state directory (`ci/`):
 - `event.json` is the event payload.
 - `source/` is the frozen snapshot. It is kept for the newest 10 runs so they
   can be retried.
+
+`runners cache` reports the size of the machine-wide cache volume, and
+`runners clear-cache` removes it. Removal is refused while a run executes,
+and the next run recreates the volume cold.
 
 The newest 200 finished runs are kept; `runners prune-cache --older-than-secs N
 --max-bytes N` prunes further.

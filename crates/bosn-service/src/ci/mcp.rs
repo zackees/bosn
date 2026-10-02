@@ -424,9 +424,9 @@ pub fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "bosn_ci_runners",
-            "description": "Runner management: list; drain/resume (stop or restart taking new runs); set_limit (live concurrency limit); prune_cache (finished runs by age/size).",
+            "description": "Runner management: list; drain/resume (stop or restart taking new runs); set_limit (live concurrency limit); prune_cache (finished runs by age/size); cache_usage (size of the machine-wide cache volume); clear_cache (remove that volume; refused while a run executes).",
             "inputSchema": {"type": "object", "additionalProperties": false, "required": ["action"], "properties": {
-                "action": {"enum": ["list", "drain", "resume", "set_limit", "prune_cache"]},
+                "action": {"enum": ["list", "drain", "resume", "set_limit", "prune_cache", "cache_usage", "clear_cache"]},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 256},
                 "older_than_secs": {"type": "integer", "minimum": 0},
                 "max_bytes": {"type": "integer", "minimum": 0}

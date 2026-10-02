@@ -14,8 +14,14 @@
   <button id="open-full" type="button">Open full view</button>
   <button id="drain" type="button">Drain</button>
   <button id="resume" type="button">Resume</button>
+  <label>Limit <input id="limit" type="number" min="1" max="256" size="3"></label>
+  <button id="set-limit" type="button">Set</button>
+  <span id="prune-slot"></span>
+  <span id="clear-cache-slot"></span>
+  <span id="cache" role="status" aria-live="polite"></span>
 </div>
 <ul id="runs" aria-label="Runs across workspaces"></ul>
+<script src="/shared.js"></script>
 <script src="/widget/widget.js"></script>
 </body>
 </html>

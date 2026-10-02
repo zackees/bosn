@@ -1,19 +1,9 @@
 // The widget's bubble and panel. Clicks never call native code: they POST to
 // the daemon, which forwards a command to the widget process (no page IPC).
+// Helpers (icons, `el`, `request`, `confirmButton`) come from /shared.js.
 "use strict";
 
-const $ = (id) => document.getElementById(id);
-const ICON = { success: "✓", failure: "✗", error: "✗", timed_out: "⏱", cancelled: "⊘",
-               incomplete: "⚠", refused: "⚠", running: "●", queued: "○" };
-
-async function api(path, body) {
-  const options = body === undefined ? {} : {
-    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
-  };
-  const response = await fetch(path, { credentials: "same-origin", ...options });
-  if (!response.ok) throw new Error(response.statusText);
-  return response.json();
-}
+const api = request;
 
 function word(run) { return run.conclusion || run.state; }
 
@@ -36,7 +26,7 @@ async function renderBubble() {
 async function renderPanel() {
   const list = await api("/v1/runs?limit=30");
   const r = list.runners;
-  $("runners").textContent = `${r.running} running · ${r.queued} queued · limit ${r.limit}${r.drained ? " · drained" : ""}`;
+  $("runners").textContent = runnersText(r);
   $("runs").replaceChildren(...list.runs.map((run) => {
     const item = document.createElement("li");
     const button = document.createElement("button");
@@ -50,7 +40,12 @@ async function renderPanel() {
     meta.textContent = `${repo} · ${run.branch || "-"} · ${run.sha.slice(0, 8)}${run.dirty ? " +dirty" : ""} · ${run.actor} · ${run.jobs.completed}/${run.jobs.total} jobs`;
     button.append(head, meta);
     button.addEventListener("click", () => api("/v1/widget/open", { path: `/ci/runs/${run.id}` }));
-    item.append(button);
+    // The run's own action: retry a finished run, cancel a live one.
+    const action = run.state === "done"
+      ? el("button", { type: "button", onclick: () => api(`/v1/runs/${run.id}/retry`, {}).then(render) }, "Retry")
+      : confirmButton("Cancel", () => api(`/v1/runs/${run.id}/cancel`, {}), render);
+    action.classList.add("row-action");
+    item.append(button, action);
     return item;
   }));
 }
@@ -60,6 +55,14 @@ if ($("ring")) $("ring").addEventListener("click", () => api("/v1/widget/toggle"
 if ($("open-full")) $("open-full").addEventListener("click", () => api("/v1/widget/open", { path: "/" }));
 if ($("drain")) $("drain").addEventListener("click", () => api("/v1/runners", { action: "drain" }).then(render));
 if ($("resume")) $("resume").addEventListener("click", () => api("/v1/runners", { action: "resume" }).then(render));
+if ($("set-limit")) $("set-limit").addEventListener("click", () => {
+  const limit = Number($("limit").value);
+  if (limit >= 1) api("/v1/runners", { action: "set_limit", limit }).then(render);
+});
+if ($("prune-slot")) $("prune-slot").replaceChildren(confirmButton("Prune old runs",
+  () => api("/v1/runners", { action: "prune_cache", older_than_secs: WEEK_SECS }), render));
+if ($("clear-cache-slot")) $("clear-cache-slot").replaceChildren(confirmButton("Clear cache",
+  () => api("/v1/runners", { action: "clear_cache" }), (reply) => { $("cache").textContent = cacheText(reply.cache); }));
 
 let pending = null;
 function schedule() {

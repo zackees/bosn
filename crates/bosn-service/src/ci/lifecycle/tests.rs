@@ -29,6 +29,8 @@ pub struct FakeBackend {
     pub engines: Mutex<BTreeMap<String, ActEngineObservation>>,
     pub faults: Mutex<Faults>,
     pub executions: Mutex<u32>,
+    /// Whether the cache volume exists.
+    pub cache: Mutex<bool>,
     next: Mutex<u64>,
 }
 impl FakeBackend {
@@ -72,6 +74,21 @@ impl ActEngineBackend for FakeBackend {
         &'a self,
         _cache: &'a CacheVolume,
     ) -> super::super::engine::BoxFuture<'a, Result<(), String>> {
+        *self.cache.lock().unwrap() = true;
+        Box::pin(async { Ok(()) })
+    }
+    fn cache_bytes<'a>(
+        &'a self,
+        _volume: &'a str,
+    ) -> super::super::engine::BoxFuture<'a, Result<Option<u64>, String>> {
+        let exists = *self.cache.lock().unwrap();
+        Box::pin(async move { Ok(exists.then_some(4096)) })
+    }
+    fn remove_cache<'a>(
+        &'a self,
+        _volume: &'a str,
+    ) -> super::super::engine::BoxFuture<'a, Result<(), String>> {
+        *self.cache.lock().unwrap() = false;
         Box::pin(async { Ok(()) })
     }
     fn create<'a>(
