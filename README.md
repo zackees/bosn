@@ -106,6 +106,12 @@ operations return durable job IDs.
 ./test
 ```
 
+`./install` prepares Soldr and the Rust toolchain pinned by
+`rust-toolchain.toml` before installing the native package. Source builds use
+Soldr for both the CLI and Maturin's compiler calls. The declared Docker test
+and lint tasks build a wheel against a read-only checkout, with writable
+target, toolchain and environment volumes.
+
 The Rust migration status, native manifest lifecycle boundary, and registry
 details are documented in [docs/migration-rust.md](docs/migration-rust.md),
 [docs/rust-manifest-runtime.md](docs/rust-manifest-runtime.md), and

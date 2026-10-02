@@ -7,14 +7,16 @@ native CLI first, then let maturin include that artifact in the wheel.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from os import chmod, environ
+from functools import wraps
+from os import X_OK, access, chmod, environ, pathsep
 from os import name as os_name
 from pathlib import Path
 from re import compile as compile_regex
-from shutil import copy2, rmtree
+from shutil import copy2, rmtree, which
 from struct import unpack_from
 from subprocess import run
 from sys import platform
@@ -151,9 +153,77 @@ def _linux_rpath_environment(target: _DarwinTarget | None) -> Iterator[None]:
             environ[key] = previous
 
 
+def _soldr_executable() -> str:
+    soldr = which("soldr")
+    if soldr is None:
+        raise RuntimeError("Bosn source builds require preprovisioned Soldr and Rust toolchain")
+    return str(Path(soldr).absolute())
+
+
+@contextmanager
+def _soldr_toolchain_environment() -> Iterator[None]:
+    """Use canonical Soldr shims; trusted builder provisions toolchain first."""
+    soldr = _soldr_executable()
+    shim_dir = _ROOT / "target" / "bosn-wheel-toolchain"
+    result = run(
+        [soldr, "toolchain", "link", "--shim-dir", str(shim_dir), "--json"],
+        cwd=_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    document = json.loads(result.stdout)
+    tools = document.get("tools") if isinstance(document, dict) else None
+    expected = {"cargo", "rustfmt", "clippy-driver", "rustc", "rustdoc"}
+    if (
+        not isinstance(document, dict)
+        or type(document.get("schema_version")) is not int
+        or document["schema_version"] != 1
+        or document.get("shim_dir") != str(shim_dir)
+        or not isinstance(tools, list)
+        or len(tools) != len(expected)
+    ):
+        raise RuntimeError("Soldr toolchain link returned invalid schema")
+    seen = set()
+    for tool in tools:
+        if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
+            raise RuntimeError("Soldr toolchain link returned invalid tool")
+        name = tool["name"]
+        shim = shim_dir / (name + (".exe" if os_name == "nt" else ""))
+        if (
+            name not in expected
+            or name in seen
+            or tool.get("shim_path") != str(shim)
+            or type(tool.get("created")) is not bool
+            or (tool["created"] is False and tool.get("skip_reason") != "existing-matches")
+            or not shim.is_file()
+            or not access(shim, X_OK)
+        ):
+            raise RuntimeError(
+                "Soldr toolchain shim missing or differs; refusing untrusted Cargo route"
+            )
+        seen.add(name)
+    updates = {
+        "PATH": str(shim_dir) + pathsep + environ.get("PATH", ""),
+        "CARGO": str(shim_dir / ("cargo.exe" if os_name == "nt" else "cargo")),
+        "MATURIN_NO_INSTALL_RUST": "1",
+    }
+    previous = {key: environ.get(key) for key in updates}
+    environ.update(updates)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                environ.pop(key, None)
+            else:
+                environ[key] = value
+
+
 def _build_native_cli() -> None:
     target = _wheel_target()
     command = [
+        _soldr_executable(),
         "cargo",
         "build",
         "--release",
@@ -226,7 +296,7 @@ def build_wheel(
     metadata_directory: str | None = None,
 ) -> str:
     target = _wheel_target()
-    with _cross_pyo3_environment(target):
+    with _soldr_toolchain_environment(), _cross_pyo3_environment(target):
         _build_native_cli()
         return maturin.build_wheel(
             wheel_directory, _wheel_config(config_settings), metadata_directory
@@ -241,15 +311,25 @@ def build_editable(
     target = _wheel_target()
     if target is not None:
         raise RuntimeError("cross-target editable wheels are unsupported; build a wheel instead")
-    _build_native_cli()
-    return maturin.build_editable(
-        wheel_directory, _wheel_config(config_settings), metadata_directory
-    )
+    with _soldr_toolchain_environment():
+        _build_native_cli()
+        return maturin.build_editable(
+            wheel_directory, _wheel_config(config_settings), metadata_directory
+        )
 
 
-get_requires_for_build_wheel = maturin.get_requires_for_build_wheel
-get_requires_for_build_editable = maturin.get_requires_for_build_editable
-get_requires_for_build_sdist = maturin.get_requires_for_build_sdist
-prepare_metadata_for_build_wheel = maturin.prepare_metadata_for_build_wheel
-prepare_metadata_for_build_editable = maturin.prepare_metadata_for_build_editable
-build_sdist = maturin.build_sdist
+def _routed_hook(hook):
+    @wraps(hook)
+    def routed(*args, **kwargs):
+        with _soldr_toolchain_environment():
+            return hook(*args, **kwargs)
+
+    return routed
+
+
+get_requires_for_build_wheel = _routed_hook(maturin.get_requires_for_build_wheel)
+get_requires_for_build_editable = _routed_hook(maturin.get_requires_for_build_editable)
+get_requires_for_build_sdist = _routed_hook(maturin.get_requires_for_build_sdist)
+prepare_metadata_for_build_wheel = _routed_hook(maturin.prepare_metadata_for_build_wheel)
+prepare_metadata_for_build_editable = _routed_hook(maturin.prepare_metadata_for_build_editable)
+build_sdist = _routed_hook(maturin.build_sdist)

@@ -11,11 +11,15 @@ venv = { scope = "stack", destination = "/venv" }
 uv-cache = { scope = "machine", destination = "/root/.cache/uv" }
 ruff-cache = { scope = "machine", destination = "/root/.cache/ruff" }
 pyright-cache = { scope = "machine", destination = "/root/.cache/pyright-python" }
+cargo-home = { scope = "machine", destination = "/root/.cargo" }
+rustup-home = { scope = "machine", destination = "/root/.rustup" }
+rust-target = { scope = "stack", destination = "/repo/target" }
+soldr-state = { scope = "stack", destination = "/root/.soldr" }
 
 [task.test]
 stack = "test"
-cmd = "uv sync --frozen --all-groups && uv run --no-sync pytest -q -m 'not docker' -p no:cacheprovider"
+cmd = "soldr toolchain ensure --json && uv sync --frozen --all-groups --no-editable && uv run --no-sync pytest -q -m 'not docker' -p no:cacheprovider"
 
 [task.lint]
 stack = "test"
-cmd = "uv sync --frozen --all-groups && uv run --no-sync python ci/lint.py"
+cmd = "soldr toolchain ensure --json && uv sync --frozen --all-groups --no-editable && uv run --no-sync python ci/lint.py"

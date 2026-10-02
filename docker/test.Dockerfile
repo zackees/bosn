@@ -4,14 +4,22 @@ FROM python:3.13-slim-bookworm@sha256:00faa2debb87529f9f0764e9491d8ba400a3678976
 COPY --from=uv /uv /uvx /bin/
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends git libatomic1 \
+    && apt-get install --yes --no-install-recommends git libatomic1 build-essential pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Bootstrap only reviewed binary wheels; source builds use the repository's
+# rust-toolchain.toml through this pinned Soldr front door.
+RUN printf '%s\n' 'soldr==0.9.27 --hash=sha256:c9195b0ed390b4d4df16975c12a7e5c2fc5bd68c87ed6c86c5ba04284a27f538 --hash=sha256:9e6993f988e0ab073c031d473c9427c6a98c9221f1f6e16d63ce3b09b5a96640' > /tmp/soldr-bootstrap.txt \
+    && uv pip install --system --require-hashes --only-binary=:all: -r /tmp/soldr-bootstrap.txt
 
 ENV UV_PROJECT_ENVIRONMENT=/venv \
     UV_CACHE_DIR=/root/.cache/uv \
     UV_LINK_MODE=copy \
     RUFF_CACHE_DIR=/root/.cache/ruff \
     PYRIGHT_PYTHON_CACHE_DIR=/root/.cache/pyright-python \
+    CARGO_HOME=/root/.cargo \
+    RUSTUP_HOME=/root/.rustup \
+    CARGO_TARGET_DIR=/repo/target \
     PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /repo
