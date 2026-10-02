@@ -1,6 +1,7 @@
 //! The widget's control loop: register with the daemon, open the bubble,
 //! then poll for commands (toggle the panel, open the full view, open an
-//! allowlisted external link) and watch for finished runs to notify about.
+//! allowlisted external link, quit) and watch for finished runs to notify
+//! about.
 
 use std::{path::Path, time::Duration};
 
@@ -62,6 +63,23 @@ fn session_id() -> String {
         .unwrap_or_else(|_| "default".into())
 }
 
+/// Whether the control loop keeps going after a command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Flow {
+    Continue,
+    Quit,
+}
+
+/// The deliberate quit (the bubble closed, or Quit in the panel): record
+/// `dismissed` for this graphical session, then end the event loop.
+async fn quit(client: &Client, views: &ExternalWebviewClient, session: &str) {
+    let _ = widget(client, CiRequest::WidgetDismiss {
+        session: session.into(),
+    })
+    .await;
+    let _ = views.request_exit();
+}
+
 /// The three windows this process owns, and what each is doing.
 #[derive(Default)]
 struct Windows {
@@ -98,19 +116,24 @@ impl Windows {
     }
 
     /// Carry out one daemon command: plan it, run each step, and stop at the
-    /// first failure (that window is forgotten and reopens next time).
-    async fn apply(&mut self, command: WidgetCommand, views: &ExternalWebviewClient, client: &Client) {
+    /// first failure (that window is forgotten and reopens next time). A
+    /// quit step is the caller's to carry out: it ends the loop.
+    async fn apply(&mut self, command: WidgetCommand, views: &ExternalWebviewClient, client: &Client) -> Flow {
         self.forget_closed().await;
         for step in self.layout.plan(command) {
+            if step == Step::Quit {
+                return Flow::Quit;
+            }
             if self.execute(&step, views, client).await {
                 self.layout.record(&step);
             } else {
                 if let Some(window) = step.window() {
                     self.forget(window);
                 }
-                return;
+                return Flow::Continue;
             }
         }
+        Flow::Continue
     }
 
     /// Run one step; `false` when it did not take effect.
@@ -142,6 +165,8 @@ impl Windows {
                 crate::notify::open_external(url);
                 true
             }
+            // `apply` returns before executing a quit.
+            Step::Quit => false,
         }
     }
 }
@@ -210,17 +235,16 @@ pub async fn run(views: ExternalWebviewClient, state_dir: std::path::PathBuf, ex
             && closed(bubble).await
         {
             // Closing the bubble is the deliberate "quit".
-            let _ = widget(&client, CiRequest::WidgetDismiss {
-                session: session.clone(),
-            })
-            .await;
-            let _ = views.request_exit();
+            quit(&client, &views, &session).await;
             return;
         }
         match widget(&client, CiRequest::WidgetPoll { pid }).await {
             Ok(reply) => {
                 for command in reply.commands {
-                    windows.apply(command, &views, &client).await;
+                    if windows.apply(command, &views, &client).await == Flow::Quit {
+                        quit(&client, &views, &session).await;
+                        return;
+                    }
                 }
             }
             // A daemon restart: re-register once it answers again.

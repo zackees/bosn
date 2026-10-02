@@ -54,7 +54,8 @@ impl CiRuntime {
         self.reply(false, Vec::new())
     }
 
-    /// Queue a command; paths must be local and external links allowlisted.
+    /// Queue a command; paths must be local, external links allowlisted, and
+    /// a quit needs a running widget (a queued one would outlive it).
     pub(super) fn widget_command(&self, command: WidgetCommand) -> Result<WidgetReply, CiError> {
         match &command {
             WidgetCommand::Open { path }
@@ -75,6 +76,9 @@ impl CiRuntime {
                         "only https links to github.com, gitlab.com or a configured host open",
                     ));
                 }
+            }
+            WidgetCommand::Quit if self.widget_presence() != WidgetPresence::Connected => {
+                return Err(CiError::refused("no widget is running"));
             }
             _ => {}
         }

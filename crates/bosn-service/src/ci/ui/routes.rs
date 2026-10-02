@@ -68,6 +68,12 @@ impl Route {
             (["v1", "widget", "toggle"], _, true) => Route::api(CiRequest::WidgetCommand {
                 command: WidgetCommand::Toggle,
             }),
+            (["v1", "widget", "quit"], _, true) => {
+                let EmptyBody {} = typed_body(body)?;
+                Route::api(CiRequest::WidgetCommand {
+                    command: WidgetCommand::Quit,
+                })
+            }
             (["v1", "widget", "open"], _, true) => {
                 let body: OpenBody = typed_body(body)?;
                 Route::api(CiRequest::WidgetCommand {
@@ -149,7 +155,7 @@ impl Route {
                 | ["shared.js"]
                 | ["ci", ..]
                 | ["widget", ..]
-                | ["v1", "widget", "toggle" | "open" | "open-external"]
+                | ["v1", "widget", "toggle" | "open" | "open-external" | "quit"]
                 | ["auth"]
                 | ["v1", "events"]
                 | ["v1", "runs"]
@@ -236,6 +242,11 @@ struct LogsQuery {
 struct ReportQuery {
     tail: Option<usize>,
 }
+
+/// A command that takes no arguments: an empty or `{}` body only.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyBody {}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -378,6 +389,15 @@ mod tests {
             ),
             (
                 "POST",
+                "/v1/widget/quit".into(),
+                vec![],
+                "",
+                Route::api(CiRequest::WidgetCommand {
+                    command: WidgetCommand::Quit,
+                }),
+            ),
+            (
+                "POST",
                 "/v1/widget/open".into(),
                 vec![],
                 r#"{"path":"/ci"}"#,
@@ -464,10 +484,19 @@ mod tests {
             parse("GET", "/widget/bubble", &[], "").unwrap(),
             Route::Page
         );
-        assert_eq!(
-            parse("GET", "/v1/widget/toggle", &[], ""),
-            Err(RouteError::MethodNotAllowed)
-        );
+        for command in ["toggle", "quit"] {
+            assert_eq!(
+                parse("GET", &format!("/v1/widget/{command}"), &[], ""),
+                Err(RouteError::MethodNotAllowed),
+                "{command}"
+            );
+        }
+        let quit = parse("POST", "/v1/widget/quit", &[], "").unwrap();
+        assert!(quit.is_write() && quit.needs_session(), "quit is a write");
+        assert!(matches!(
+            parse("POST", "/v1/widget/quit", &[], r#"{"extra":1}"#),
+            Err(RouteError::BadRequest(_))
+        ));
         assert!(matches!(
             parse("POST", "/v1/widget/open", &[], r#"{"path":"/","extra":1}"#),
             Err(RouteError::BadRequest(_))
