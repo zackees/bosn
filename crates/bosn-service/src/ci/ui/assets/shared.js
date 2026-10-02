@@ -6,7 +6,7 @@
 
 const ICON = {
   success: "✓", failure: "✗", error: "✗", timed_out: "⏱", cancelled: "⊘",
-  skipped: "↷", unsupported: "⚠", incomplete: "⚠", refused: "⚠",
+  skipped: "↷", unsupported: "⚠", remote_only: "☁", incomplete: "⚠", refused: "⚠",
   in_progress: "●", running: "●", queued: "○", completed: "✓", done: "✓",
 };
 const CONFIRM_MS = 4000;

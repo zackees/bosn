@@ -587,7 +587,7 @@ impl CiRuntime {
         let outcome = self.drive(&record, &cancel, &mut observer).await;
         observer.publish();
         let mut tree = std::mem::take(&mut observer.parser.tree);
-        let declared = workflow::declared_steps(&self.store.source(&record.id), &record.workflow);
+        let declared = workflow::declared(&self.store.source(&record.id), &record.workflow);
         let (conclusion, mut reason) = report::conclude(&outcome, &mut tree, &declared);
         let lost = observer.log.as_ref().map_or(observer.seq, LogWriter::lost);
         if lost > 0 {
@@ -722,7 +722,8 @@ impl CiRuntime {
     /// Serve checkouts without a token (#335) and say how, naming every
     /// repository fetched from GitHub. The rewrites are hidden from the
     /// snapshot's Git index, so the job still sees a clean checkout (#394).
-    /// The same pass ends each POSIX `run:` step's output with a newline (#398).
+    /// The same pass ends each POSIX `run:` step's output with a newline (#398)
+    /// and confines jobs only GitHub can run (GATE-012, #400).
     fn localize_checkouts(&self, record: &RunRecord, observer: &mut RunObserver) {
         let source = self.store.source(&record.id);
         match super::checkout::localize_tree(&source, &record.repository) {
@@ -742,6 +743,11 @@ impl CiRuntime {
                     observer.note(&format!(
                         "{} run: step(s) end their output with a newline, so a last line without one still reaches the log",
                         localized.trapped
+                    ));
+                }
+                for (job, reason) in &localized.remote_only {
+                    observer.note(&format!(
+                        "job {job} runs only on GitHub (GATE-012): {reason}; it is reported remote_only, not run"
                     ));
                 }
                 for pinned in &localized.pinned {

@@ -480,6 +480,11 @@
           "const": "unsupported",
           "description": "The job needs a runner bosn cannot supervise (`runs-on: macos-*`).",
           "type": "string"
+        },
+        {
+          "const": "remote_only",
+          "description": "The job can only run on GitHub (GATE-012): not run locally, never a\nfailure and never a coverage gap.",
+          "type": "string"
         }
       ]
     },
@@ -515,6 +520,13 @@
         "matrix": true,
         "name": {
           "type": "string"
+        },
+        "reason": {
+          "description": "Why the job did not run locally (a `remote_only` job's reason).",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "sections": {
           "items": {
@@ -571,6 +583,14 @@
           "format": "uint",
           "minimum": 0,
           "type": "integer"
+        },
+        "remote_only": {
+          "default": [],
+          "description": "Jobs only GitHub can run (GATE-012): not run locally, never a failure\nand never a coverage gap.",
+          "items": {
+            "$ref": "#/$defs/RemoteOnlyJob"
+          },
+          "type": "array"
         },
         "skipped": {
           "items": {
@@ -783,6 +803,22 @@
         "gitlab"
       ],
       "type": "string"
+    },
+    "RemoteOnlyJob": {
+      "description": "A job reported `remote_only`, and why act cannot run it.",
+      "properties": {
+        "job": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "job",
+        "reason"
+      ],
+      "type": "object"
     },
     "RunEvent": {
       "oneOf": [

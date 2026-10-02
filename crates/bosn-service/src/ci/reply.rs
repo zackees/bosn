@@ -187,6 +187,17 @@ pub struct JobOutcomes {
     pub cancelled: usize,
     pub skipped: Vec<String>,
     pub unsupported: Vec<String>,
+    /// Jobs only GitHub can run (GATE-012): not run locally, never a failure
+    /// and never a coverage gap.
+    #[serde(default)]
+    pub remote_only: Vec<RemoteOnlyJob>,
+}
+
+/// A job reported `remote_only`, and why act cannot run it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RemoteOnlyJob {
+    pub job: String,
+    pub reason: String,
 }
 
 /// The `ci report --json` agent contract.

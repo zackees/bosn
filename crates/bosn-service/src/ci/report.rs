@@ -4,10 +4,10 @@
 use super::{
     lifecycle::{CleanupEnd, EngineReport, ExecutionEnd},
     model::{ItemConclusion, RunTree},
-    reply::{FailureReport, JobOutcomes, RunReport},
+    reply::{FailureReport, JobOutcomes, RemoteOnlyJob, RunReport},
     storage,
     wire::{Conclusion, RunRecord, SCHEMA_VERSION},
-    workflow::DeclaredSteps,
+    workflow::Declared,
 };
 
 /// Fold the engine report into the tree and return the run conclusion.
@@ -15,7 +15,7 @@ use super::{
 pub fn conclude(
     outcome: &Result<EngineReport, String>,
     tree: &mut RunTree,
-    declared: &DeclaredSteps,
+    declared: &Declared,
 ) -> (Conclusion, Option<String>) {
     let report = match outcome {
         Ok(report) => report,
@@ -27,7 +27,8 @@ pub fn conclude(
     let (mut conclusion, mut reason) = match &report.execution {
         ExecutionEnd::Exited(code) => {
             tree.settle_finished();
-            tree.add_skipped_steps(declared);
+            tree.add_skipped_steps(&declared.steps);
+            tree.mark_remote_only(&declared.remote_only);
             let failed = tree
                 .jobs()
                 .any(|j| j.conclusion == Some(ItemConclusion::Failure));
@@ -137,6 +138,14 @@ pub fn report(
             cancelled: count(ItemConclusion::Cancelled),
             skipped: tree.skipped_jobs(),
             unsupported: unsupported.clone(),
+            remote_only: tree
+                .jobs()
+                .filter(|j| j.conclusion == Some(ItemConclusion::RemoteOnly))
+                .map(|j| RemoteOnlyJob {
+                    job: j.key.clone(),
+                    reason: j.reason.clone().unwrap_or_default(),
+                })
+                .collect(),
         },
         coverage_complete: unsupported.is_empty(),
         ui_url: ui_origin.map(|origin| format!("{origin}/ci/runs/{}", record.id)),
@@ -191,5 +200,59 @@ mod tests {
             without_ui.ui_url, None,
             "no link while the dashboard is off"
         );
+    }
+
+    #[test]
+    fn a_remote_only_job_is_reported_with_its_reason_and_never_fails_the_run() {
+        use crate::ci::lifecycle::{CleanupEnd, EngineReport, ExecutionEnd};
+        use crate::ci::workflow::Declared;
+        let list = "Stage  Job ID  Job name         Workflow name  Workflow file  Events\n\
+                    0      lin     lin              w              ci.yml         push\n\
+                    1      timing  CI queue timing  w              ci.yml         push\n";
+        let mut parser = ActParser::new(RunTree::declared(&parse_act_list(list)));
+        for (seq, line) in [
+            r#"{"job":"w/lin","jobID":"lin","msg":"🏁  Job succeeded","jobResult":"success"}"#,
+            r#"{"job":"w/CI queue timing","jobID":"timing","msg":"⭐ Run Main Remote-only","stage":"Main","step":"Remote-only","stepID":["0"]}"#,
+            r#"{"job":"w/CI queue timing","jobID":"timing","msg":"  ✅  Success - Main Remote-only","stage":"Main","stepID":["0"],"stepResult":"success"}"#,
+            r#"{"job":"w/CI queue timing","jobID":"timing","msg":"🏁  Job succeeded","jobResult":"success"}"#,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            parser.feed(seq as u64 + 1, line);
+        }
+        let mut tree = parser.tree;
+        let declared = Declared {
+            steps: Default::default(),
+            remote_only: [(
+                "timing".to_string(),
+                "reads this run from the GitHub API".to_string(),
+            )]
+            .into(),
+        };
+        let (conclusion, reason) = conclude(
+            &Ok(EngineReport {
+                execution: ExecutionEnd::Exited(0),
+                cleanup: CleanupEnd::Removed,
+                engine_id: None,
+                storage: None,
+            }),
+            &mut tree,
+            &declared,
+        );
+        assert_eq!((conclusion, reason), (Conclusion::Success, None));
+        let mut record = crate::ci::tests::sample_record("run-1");
+        record.tree = tree;
+        record.finish(conclusion, None);
+        let report = report(&record, None, |_, _| Vec::new());
+        assert_eq!(report.jobs.succeeded, 1, "the stub is no local evidence");
+        assert_eq!(
+            report.jobs.remote_only,
+            [RemoteOnlyJob {
+                job: "w/CI queue timing".into(),
+                reason: "reads this run from the GitHub API".into(),
+            }]
+        );
+        assert!(report.jobs.unsupported.is_empty() && report.coverage_complete);
     }
 }

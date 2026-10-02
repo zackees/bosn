@@ -478,6 +478,9 @@ fn report(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
                 println!("{kind}: {}", jobs.join(", "));
             }
         }
+        for job in &r.jobs.remote_only {
+            println!("remote-only: {} ({})", job.job, job.reason);
+        }
     });
     Ok(report.exit_code.unwrap_or(EXIT_NOT_FINISHED))
 }
@@ -719,6 +722,7 @@ fn mark(conclusion: Option<ItemConclusion>, status: ItemStatus) -> &'static str 
         (Some(ItemConclusion::Cancelled), _) => "[cancelled]",
         (Some(ItemConclusion::Skipped), _) => "[skip]",
         (Some(ItemConclusion::Unsupported), _) => "[unsupported]",
+        (Some(ItemConclusion::RemoteOnly), _) => "[remote-only]",
         (None, ItemStatus::InProgress) => "[..]",
         (None, _) => "[queued]",
     }

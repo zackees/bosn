@@ -64,6 +64,7 @@ pub mod mcp;
 pub mod model;
 pub mod pins;
 pub mod provider;
+pub mod remote_only;
 pub mod reply;
 pub mod report;
 pub mod runtime;

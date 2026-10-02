@@ -483,6 +483,10 @@ jobs:
     permissions:
       actions: read
       contents: read
+    # GATE-012: only GitHub can run this job. A local `bosn ci run` reports it
+    # remote_only with this reason; there, the run's own verdict covers it.
+    env:
+      CI_REMOTE_ONLY: verifies this run's jobs through the GitHub Actions API, which has no record of a local run
     steps:
       - uses: actions/checkout@v4
         with:
@@ -509,6 +513,9 @@ jobs:
     permissions:
       actions: read
       contents: read
+    # GATE-012: only GitHub can run this job (see full-coverage).
+    env:
+      CI_REMOTE_ONLY: reads this run's queue timing from the GitHub Actions API, which has no record of a local run
     steps:
       - uses: actions/checkout@v4
         with:
