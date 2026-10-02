@@ -167,12 +167,15 @@ pub(crate) async fn manifest_stack_plan(
     // so roll it whenever that effective lifecycle shape changes.
     let generation = manifest_runtime_generation(
         &base_generation,
-        &mounts,
-        guest_workdir.as_deref().or(workdir.as_deref()),
-        &stack.volumes,
-        &tmpfs,
-        host_docker_socket.as_ref(),
-        macos_guest.as_ref(),
+        &ManifestRuntimeShape {
+            workspace: &workspace,
+            mounts: &mounts,
+            workdir: guest_workdir.as_deref().or(workdir.as_deref()),
+            volumes: &stack.volumes,
+            tmpfs: &tmpfs,
+            host_docker_socket: host_docker_socket.as_ref(),
+            macos_guest: macos_guest.as_ref(),
+        },
     );
     let content_sha256 = generation
         .strip_prefix("sha256:")
