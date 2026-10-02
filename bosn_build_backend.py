@@ -8,19 +8,22 @@ native CLI first, then let maturin include that artifact in the wheel.
 from __future__ import annotations
 
 import json
+import os
+import stat
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
-from os import X_OK, access, chmod, environ, pathsep
+from os import X_OK, access, chmod, environ, pathsep, replace
 from os import name as os_name
 from pathlib import Path
 from re import compile as compile_regex
-from shutil import copy2, rmtree, which
+from shutil import copy2, copyfileobj, rmtree, which
 from struct import unpack_from
 from subprocess import run
 from sys import platform
 from typing import Any
+from uuid import uuid4
 
 import maturin
 
@@ -290,17 +293,104 @@ def _wheel_config(config_settings: Mapping[str, Any] | None) -> dict[str, Any]:
     return settings
 
 
+@contextmanager
+def _wheel_cache_copy_environment() -> Iterator[None]:
+    """Wheel repair rewrites ELF bytes: never let it mutate a cache hardlink."""
+    previous = environ.get("SOLDR_ZCCACHE_MODE")
+    environ["SOLDR_ZCCACHE_MODE"] = "copy"
+    try:
+        yield
+    finally:
+        if previous is None:
+            environ.pop("SOLDR_ZCCACHE_MODE", None)
+        else:
+            environ["SOLDR_ZCCACHE_MODE"] = previous
+
+
+def _detach_repaired_cargo_aliases(target: _DarwinTarget | None) -> None:
+    """Maturin restores a pristine primary, but Cargo deps may alias its stage.
+
+    Replace only proven same-inode deps aliases with independent pristine bytes.
+    Never reverse guessed SONAMEs or rewrite the repaired wheel artifact/cache.
+    """
+    if target is not None or not platform.startswith("linux"):
+        return
+    base = _ROOT / "target"
+    staged = base / "maturin" / "libbosn_native.so"
+    if not staged.exists():
+        return
+    if staged.is_symlink() or not staged.is_file():
+        raise RuntimeError("unsafe maturin extension artifact")
+    aliases = [
+        path
+        for path in (base / "release" / "deps").glob("libbosn_native*.so")
+        if path.is_file() and path.samefile(staged)
+    ]
+    if not aliases:
+        return
+    pristine = base / "release" / staged.name
+    if pristine.is_symlink() or not pristine.is_file() or pristine.samefile(staged):
+        raise RuntimeError("pristine Cargo extension unavailable; use a fresh owned target tree")
+    for alias in aliases:
+        if alias.is_symlink() or not alias.samefile(staged):
+            raise RuntimeError("Cargo extension alias changed during detachment")
+        temporary = alias.with_name(f".bosn-wheel-detached-{uuid4()}")
+        created = False
+        try:
+            source_fd = os.open(pristine, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(source_fd, "rb") as source:
+                before = os.fstat(source.fileno())
+                if not stat.S_ISREG(before.st_mode):
+                    raise RuntimeError("pristine Cargo extension is not regular")
+                destination_fd = os.open(
+                    temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+                )
+                created = True
+                with os.fdopen(destination_fd, "wb") as destination:
+                    copyfileobj(source, destination, length=65536)
+                    destination.flush()
+                    after = os.fstat(source.fileno())
+                    if any(
+                        getattr(before, key) != getattr(after, key)
+                        for key in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+                    ):
+                        raise RuntimeError("pristine Cargo extension changed during copy")
+                    os.fchmod(destination.fileno(), stat.S_IMODE(before.st_mode))
+                    os.utime(destination.fileno(), ns=(before.st_atime_ns, before.st_mtime_ns))
+                    os.fsync(destination.fileno())
+            if not alias.samefile(staged):
+                raise RuntimeError("Cargo extension alias changed during detachment")
+            replace(temporary, alias)
+        except BaseException as original:
+            if created:
+                raise original from RuntimeError(f"retained owned temporary: {temporary}")
+            raise
+
+
 def build_wheel(
     wheel_directory: str,
     config_settings: Mapping[str, Any] | None = None,
     metadata_directory: str | None = None,
 ) -> str:
     target = _wheel_target()
-    with _soldr_toolchain_environment(), _cross_pyo3_environment(target):
+    with (
+        _soldr_toolchain_environment(),
+        _cross_pyo3_environment(target),
+        _wheel_cache_copy_environment(),
+    ):
         _build_native_cli()
-        return maturin.build_wheel(
-            wheel_directory, _wheel_config(config_settings), metadata_directory
-        )
+        try:
+            result = maturin.build_wheel(
+                wheel_directory, _wheel_config(config_settings), metadata_directory
+            )
+        except BaseException as original:
+            try:
+                _detach_repaired_cargo_aliases(target)
+            except Exception as cleanup:
+                raise original from cleanup
+            raise
+        _detach_repaired_cargo_aliases(target)
+        return result
 
 
 def build_editable(

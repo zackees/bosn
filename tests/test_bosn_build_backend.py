@@ -204,3 +204,145 @@ def test_actual_fake_frontdoor_executable(backend):
             [os.environ["CARGO"], "metadata"], check=True, capture_output=True, text=True
         )
         assert result.stdout == "soldr-routed:metadata"
+
+
+def test_repeated_wheel_does_not_reuse_repaired_cargo_alias(backend, monkeypatch):
+    import shutil
+
+    module, _ = backend
+    monkeypatch.setattr(module, "_build_native_cli", lambda: None)
+    root = module._ROOT / "target"
+    deps = root / "release/deps/libbosn_native.so"
+    primary = root / "release/libbosn_native.so"
+    staged = root / "maturin/libbosn_native.so"
+    deps.parent.mkdir(parents=True)
+    staged.parent.mkdir(parents=True)
+    original = b"ELF needs libssl.so.3 libcrypto.so.3"
+    deps.write_bytes(original)
+
+    def repaired(*args):
+        assert deps.read_bytes() == original, "second build reused patched dependencies"
+        if not primary.exists():
+            os.link(deps, primary)
+        os.replace(primary, staged)
+        shutil.copy2(staged, primary)
+        staged.write_bytes(b"ELF needs libssl-HASH.so.3 libcrypto-HASH.so.3")
+        return "bosn.whl"
+
+    monkeypatch.setattr(module.maturin, "build_wheel", repaired)
+    assert module.build_wheel("wheel") == "bosn.whl"
+    assert module.build_wheel("wheel") == "bosn.whl"
+
+
+def test_maturin_failure_preserved_without_pristine_primary(backend, monkeypatch):
+    module, _ = backend
+    monkeypatch.setattr(module, "_build_native_cli", lambda: None)
+    root = module._ROOT / "target"
+    staged = root / "maturin/libbosn_native.so"
+    alias = root / "release/deps/libbosn_native.so"
+    staged.parent.mkdir(parents=True)
+    alias.parent.mkdir(parents=True)
+    staged.write_bytes(b"patched")
+    os.link(staged, alias)
+    monkeypatch.setenv("SOLDR_ZCCACHE_MODE", "reflink")
+
+    def fail(*args):
+        assert os.environ["SOLDR_ZCCACHE_MODE"] == "copy"
+        raise ValueError("original repair error")
+
+    monkeypatch.setattr(module.maturin, "build_wheel", fail)
+    with pytest.raises(ValueError, match="original repair error") as failure:
+        module.build_wheel("wheel")
+    assert "pristine Cargo extension unavailable" in str(failure.value.__cause__)
+    assert os.environ["SOLDR_ZCCACHE_MODE"] == "reflink"
+    assert staged.samefile(alias) and alias.read_bytes() == b"patched"
+
+
+def test_detachment_rejects_missing_pristine_and_preserves_independent_files(backend):
+    module, _ = backend
+    root = module._ROOT / "target"
+    staged = root / "maturin/libbosn_native.so"
+    alias = root / "release/deps/libbosn_native.so"
+    staged.parent.mkdir(parents=True)
+    alias.parent.mkdir(parents=True)
+    staged.write_bytes(b"repaired")
+    alias.write_bytes(b"independent")
+    module._detach_repaired_cargo_aliases(None)
+    assert alias.read_bytes() == b"independent"
+    second = alias.parent / "libbosn_native-actualalias.so"
+    os.link(staged, second)
+    with pytest.raises(RuntimeError, match="pristine Cargo extension unavailable"):
+        module._detach_repaired_cargo_aliases(None)
+    assert second.samefile(staged)
+
+
+def test_failure_after_copyback_detaches_alias_and_restores_env(backend, monkeypatch):
+    import shutil
+
+    module, _ = backend
+    monkeypatch.setattr(module, "_build_native_cli", lambda: None)
+    root = module._ROOT / "target"
+    alias = root / "release/deps/libbosn_native.so"
+    primary = root / "release/libbosn_native.so"
+    staged = root / "maturin/libbosn_native.so"
+    alias.parent.mkdir(parents=True)
+    staged.parent.mkdir(parents=True)
+    alias.write_bytes(b"clean")
+    os.link(alias, primary)
+
+    def fail(*args):
+        os.replace(primary, staged)
+        shutil.copy2(staged, primary)
+        staged.write_bytes(b"repaired")
+        raise ValueError("repair failed after copyback")
+
+    monkeypatch.setattr(module.maturin, "build_wheel", fail)
+    monkeypatch.delenv("SOLDR_ZCCACHE_MODE", raising=False)
+    with pytest.raises(ValueError, match="repair failed after copyback"):
+        module.build_wheel("wheel")
+    assert alias.read_bytes() == b"clean"
+    assert not alias.samefile(staged)
+    assert "SOLDR_ZCCACHE_MODE" not in os.environ
+
+
+def test_detachment_existing_temporary_is_never_overwritten(backend, monkeypatch):
+    module, _ = backend
+    root = module._ROOT / "target"
+    staged = root / "maturin/libbosn_native.so"
+    alias = root / "release/deps/libbosn_native.so"
+    primary = root / "release/libbosn_native.so"
+    staged.parent.mkdir(parents=True)
+    alias.parent.mkdir(parents=True)
+    staged.write_bytes(b"repaired")
+    os.link(staged, alias)
+    primary.write_bytes(b"pristine")
+    monkeypatch.setattr(module, "uuid4", lambda: "fixed-test-name")
+    occupied = alias.with_name(".bosn-wheel-detached-fixed-test-name")
+    occupied.write_bytes(b"foreign existing bytes")
+    with pytest.raises(FileExistsError):
+        module._detach_repaired_cargo_aliases(None)
+    assert occupied.read_bytes() == b"foreign existing bytes"
+    assert alias.samefile(staged)
+
+
+def test_copy_failure_preserves_original_and_reports_owned_temporary(backend, monkeypatch):
+    module, _ = backend
+    root = module._ROOT / "target"
+    staged = root / "maturin/libbosn_native.so"
+    alias = root / "release/deps/libbosn_native.so"
+    primary = root / "release/libbosn_native.so"
+    staged.parent.mkdir(parents=True)
+    alias.parent.mkdir(parents=True)
+    staged.write_bytes(b"repaired")
+    os.link(staged, alias)
+    primary.write_bytes(b"pristine")
+
+    def fail(*args, **kwargs):
+        raise OSError("original copy failure")
+
+    monkeypatch.setattr(module, "copyfileobj", fail)
+    with pytest.raises(OSError, match="original copy failure") as failure:
+        module._detach_repaired_cargo_aliases(None)
+    assert "retained owned temporary" in str(failure.value.__cause__)
+    assert alias.samefile(staged)
+    assert len(list(alias.parent.glob(".bosn-wheel-detached-*"))) == 1
