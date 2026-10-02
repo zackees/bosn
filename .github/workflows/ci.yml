@@ -171,7 +171,7 @@ jobs:
 
   linux:
     name: Linux (lint + unit + docker)
-    if: always()
+    if: ${{ !cancelled() }}
     needs: [select-tier]
     runs-on: ubuntu-latest
     steps:
@@ -229,7 +229,7 @@ jobs:
 
   native-wheel:
     name: Native wheel (${{ matrix.os }})
-    if: always()
+    if: ${{ !cancelled() }}
     needs: [select-tier]
     runs-on: ${{ matrix.os }}
     strategy:
@@ -315,7 +315,7 @@ jobs:
 
   darwin-cross-wheel:
     name: Darwin wheel (${{ matrix.target }}, Linux-hosted Soldr)
-    if: always()
+    if: ${{ !cancelled() }}
     needs: [select-tier]
     runs-on: ubuntu-latest
     strategy:
@@ -444,7 +444,7 @@ jobs:
 
   full-coverage:
     name: Full CI coverage (exact candidate SHA)
-    if: always() && needs.select-tier.outputs.full == 'true'
+    if: ${{ !cancelled() && needs.select-tier.outputs.full == 'true' }}
     needs: [select-tier, lint-no-macos-runners, rust, linux, native-wheel, darwin-cross-wheel, darwin-hosted-smoke]
     runs-on: ubuntu-latest
     permissions:
@@ -470,7 +470,7 @@ jobs:
   # capacity is an account-level condition, not a Bosn defect.
   ci-queue-timing:
     name: CI queue timing
-    if: always()
+    if: ${{ !cancelled() }}
     needs: [select-tier, lint-no-macos-runners, rust, linux, native-wheel, darwin-cross-wheel, darwin-hosted-smoke, full-coverage]
     runs-on: ubuntu-latest
     permissions:

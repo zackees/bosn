@@ -25,7 +25,9 @@ def test_expensive_jobs_require_selector() -> None:
 def test_required_tiered_jobs_fail_closed_when_selector_fails() -> None:
     for name in ("linux", "native-wheel", "darwin-cross-wheel"):
         job = CI["jobs"][name]
-        assert job["if"] == "always()", "required checks must run after selector failure"
+        # Fail closed when the selector fails, but a superseded (cancelled)
+        # run must never leave FAILURE required checks behind (#373).
+        assert job["if"] == "${{ !cancelled() }}", "required checks must run after selector failure"
         assert "select-tier" in job["needs"]
         verify = job["steps"][0]
         assert verify["name"] == "Verify selected CI tier"
@@ -73,7 +75,7 @@ def test_required_wheel_matrix_cells_exist_on_every_tier() -> None:
     }.items():
         job = jobs[name]
         assert "select-tier" in job["needs"]
-        assert job["if"] == "always()", "matrix must expand even if selector fails"
+        assert job["if"] == "${{ !cancelled() }}", "matrix must expand even if selector fails"
         matrix = job["strategy"]["matrix"]
         cells = set(matrix.get("os", [])) or {cell["target"] for cell in matrix["include"]}
         assert cells == expected_cells
@@ -155,7 +157,7 @@ def test_every_job_checks_out_exact_candidate() -> None:
 
 def test_full_coverage_sentinel_waits_for_every_lane() -> None:
     job = CI["jobs"]["full-coverage"]
-    assert "always()" in job["if"]
+    assert "!cancelled()" in job["if"]
     assert "needs.select-tier.outputs.full == 'true'" in job["if"]
     assert set(job["needs"]) >= {
         "select-tier",
@@ -168,5 +170,13 @@ def test_full_coverage_sentinel_waits_for_every_lane() -> None:
     }
     assert any("ci/verify_full_coverage.py" in step.get("run", "") for step in job["steps"])
     timing = CI["jobs"]["ci-queue-timing"]
-    assert timing["if"] == "always()"
+    assert timing["if"] == "${{ !cancelled() }}"
     assert "full-coverage" in timing["needs"]
+
+
+def test_no_job_runs_unconditionally_under_a_cancelled_run() -> None:
+    # A bare always() job still starts when its run is cancelled and then
+    # fails, leaving a FAILURE required check on the head that blocks the
+    # merge even though the live run is green (#373).
+    for name, job in CI["jobs"].items():
+        assert "always()" not in str(job.get("if", "")), name
