@@ -11,37 +11,7 @@
 
 use std::path::{Component, Path};
 
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-
-/// A closed vocabulary enum whose wire spelling is its snake_case name,
-/// with `as_str` and a CLI `parse` that lists the accepted words.
-macro_rules! vocabulary {
-    ($(#[$meta:meta])* $name:ident, $what:literal { $($variant:ident => $word:literal),+ $(,)? }) => {
-        $(#[$meta])*
-        #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-        #[serde(rename_all = "snake_case")]
-        pub enum $name {
-            $($variant),+
-        }
-        impl $name {
-            pub fn as_str(self) -> &'static str {
-                match self {
-                    $(Self::$variant => $word),+
-                }
-            }
-            pub fn parse(value: &str) -> Result<Self, String> {
-                match value {
-                    $($word => Ok(Self::$variant),)+
-                    _ => Err(format!(
-                        concat!("unknown ", $what, " {:?} (expected ", $($word, " "),+, ")"),
-                        value
-                    )),
-                }
-            }
-        }
-    };
-}
 
 vocabulary!(
     /// The CI syntax: GitHub workflows now, `.gitlab-ci.yml` later.

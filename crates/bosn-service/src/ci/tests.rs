@@ -9,7 +9,6 @@ use super::{
     store,
 };
 use kernal_api::async_engine;
-use serde_json::Value;
 use std::{sync::Arc, time::Duration};
 
 fn staged(runtime: &CiRuntime, id: &str) {
@@ -39,15 +38,23 @@ fn request(staging: &str, sha_byte: char) -> SubmitRequest {
     }
 }
 
-async fn submit(runtime: &CiRuntime, sha_byte: char) -> Value {
+/// Dispatch like the daemon does and parse the reply as a client would, so
+/// every test also proves the wire reply decodes into its typed reply.
+async fn call<T: serde::de::DeserializeOwned>(runtime: &CiRuntime, request: CiRequest) -> T {
+    let value = runtime.handle(request).await.unwrap();
+    serde_json::from_value(value).expect("reply decodes into its typed reply")
+}
+
+async fn submit(runtime: &CiRuntime, sha_byte: char) -> SubmitReply {
     let staging = new_uuid().await.unwrap();
     staged(runtime, &staging);
-    runtime
-        .handle(CiRequest::Submit {
+    call(
+        runtime,
+        CiRequest::Submit {
             request: request(&staging, sha_byte),
-        })
-        .await
-        .unwrap()
+        },
+    )
+    .await
 }
 
 async fn wait_done(runtime: &CiRuntime, run: &str) -> RunRecord {
@@ -71,13 +78,12 @@ fn identical_submissions_coalesce_and_distinct_ones_queue_behind_the_limit() {
         let runtime = CiRuntime::start(&dir, registry, backend.clone(), 1);
         let first = submit(&runtime, 'a').await;
         let again = submit(&runtime, 'a').await;
-        assert_eq!(first["run"], again["run"], "same key, same run ID");
-        assert_eq!(again["coalesced"], true);
+        assert_eq!(first.run, again.run, "same key, same run ID");
+        assert!(again.coalesced);
         let other = submit(&runtime, 'b').await;
-        assert_eq!(other["coalesced"], false);
+        assert!(!other.coalesced);
         async_engine::sleep(Duration::from_millis(100)).await;
-        let b = other["run"].as_str().unwrap().to_string();
-        let a = first["run"].as_str().unwrap().to_string();
+        let (a, b) = (first.run, other.run);
         assert_eq!(
             runtime.record(&b).unwrap().state,
             RunState::Queued,
@@ -87,12 +93,13 @@ fn identical_submissions_coalesce_and_distinct_ones_queue_behind_the_limit() {
                 .map(|r| (r.state, r.conclusion, r.reason))
         );
         // Raising the limit starts the waiting run immediately.
-        runtime
-            .handle(CiRequest::Runners {
+        let _: RunnersReply = call(
+            &runtime,
+            CiRequest::Runners {
                 action: RunnerAction::SetLimit { limit: 2 },
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await;
         async_engine::sleep(Duration::from_millis(100)).await;
         assert_eq!(
             runtime.record(&b).unwrap().state,
@@ -103,11 +110,13 @@ fn identical_submissions_coalesce_and_distinct_ones_queue_behind_the_limit() {
                 .map(|r| (r.conclusion, r.reason, r.cleanup))
         );
         assert_eq!(runtime.record(&a).unwrap().submitters, 2);
+        while *backend.executions.lock().unwrap() < 2 {
+            async_engine::sleep(Duration::from_millis(5)).await;
+        }
         for run in [&a, &b] {
-            runtime
-                .handle(CiRequest::Cancel { run: run.clone() })
-                .await
-                .unwrap();
+            let cancelled: CancelReply =
+                call(&runtime, CiRequest::Cancel { run: run.clone() }).await;
+            assert!(cancelled.cancelled);
             let done = wait_done(&runtime, run).await;
             assert_eq!(done.conclusion, Some(Conclusion::Cancelled));
             assert_eq!(done.cleanup.as_deref(), Some("removed"));
@@ -129,45 +138,42 @@ fn failing_run_reports_the_failing_step_and_only_its_tail() {
             ..Faults::default()
         }));
         let runtime = CiRuntime::start(&dir, registry, backend, 2);
-        let run = submit(&runtime, 'c').await["run"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let run = submit(&runtime, 'c').await.run;
         let record = wait_done(&runtime, &run).await;
         assert_eq!(record.conclusion, Some(Conclusion::Failure));
         assert_eq!(Conclusion::Failure.exit_code(), 1);
-        let report = runtime
-            .handle(CiRequest::Report {
+        let report: RunReport = call(
+            &runtime,
+            CiRequest::Report {
                 run: run.clone(),
                 tail: Some(10),
-            })
-            .await
-            .unwrap();
-        assert_eq!(report["first_failure"]["job"], "w/a");
-        assert_eq!(report["first_failure"]["section"], "Main:0");
-        let tail = report["first_failure"]["tail"].as_array().unwrap();
-        assert_eq!(tail.len(), 2, "only the failing step's lines: {tail:?}");
-        assert_eq!(report["exit_code"], 1);
+            },
+        )
+        .await;
+        let failure = report.first_failure.expect("a failing step");
+        assert_eq!(failure.job, "w/a");
+        assert_eq!(failure.section.as_deref(), Some("Main:0"));
+        assert_eq!(failure.tail.len(), 2, "only the failing step's lines");
+        assert_eq!(report.exit_code, Some(1));
         // Paged logs return every record exactly once.
         let mut seen = Vec::new();
         let mut since = 0;
         loop {
-            let page = runtime
-                .handle(CiRequest::Logs {
+            let page: LogsReply = call(
+                &runtime,
+                CiRequest::Logs {
                     run: run.clone(),
                     job: None,
                     section: None,
                     since_seq: Some(since),
                     limit: Some(2),
                     max_bytes: None,
-                })
-                .await
-                .unwrap();
-            for r in page["records"].as_array().unwrap() {
-                seen.push(r["seq"].as_u64().unwrap());
-            }
-            since = page["next_seq"].as_u64().unwrap();
-            if page["more"] == false {
+                },
+            )
+            .await;
+            seen.extend(page.records.iter().map(|r| r.seq));
+            since = page.next_seq;
+            if !page.more {
                 break;
             }
         }
@@ -181,35 +187,31 @@ fn queued_runs_cancel_without_an_engine_and_drain_holds_the_queue() {
     with_registry(|registry, dir| async move {
         let backend = Arc::new(FakeBackend::default());
         let runtime = CiRuntime::start(&dir, registry, backend.clone(), 1);
-        runtime
-            .handle(CiRequest::Runners {
+        let _: RunnersReply = call(
+            &runtime,
+            CiRequest::Runners {
                 action: RunnerAction::Drain,
-            })
-            .await
-            .unwrap();
-        let run = submit(&runtime, 'e').await["run"]
-            .as_str()
-            .unwrap()
-            .to_string();
+            },
+        )
+        .await;
+        let run = submit(&runtime, 'e').await.run;
         async_engine::sleep(Duration::from_millis(50)).await;
         assert_eq!(runtime.record(&run).unwrap().state, RunState::Queued);
-        let cancelled = runtime
-            .handle(CiRequest::Cancel { run: run.clone() })
-            .await
-            .unwrap();
-        assert_eq!(cancelled["cancelled"], true);
+        let cancelled: CancelReply = call(&runtime, CiRequest::Cancel { run: run.clone() }).await;
+        assert!(cancelled.cancelled);
         assert_eq!(
             runtime.record(&run).unwrap().conclusion,
             Some(Conclusion::Cancelled)
         );
         assert_eq!(*backend.executions.lock().unwrap(), 0);
-        let resumed = runtime
-            .handle(CiRequest::Runners {
+        let resumed: RunnersReply = call(
+            &runtime,
+            CiRequest::Runners {
                 action: RunnerAction::Resume,
-            })
-            .await
-            .unwrap();
-        assert_eq!(resumed["runners"]["drained"], false);
+            },
+        )
+        .await;
+        assert!(!resumed.runners.drained);
     });
 }
 
@@ -250,10 +252,7 @@ fn restart_marks_unfinished_runs_interrupted_and_keeps_finished_ones() {
     with_registry(|registry, dir| async move {
         let backend = Arc::new(FakeBackend::default());
         let runtime = CiRuntime::start(&dir, registry.clone(), backend.clone(), 1);
-        let done = submit(&runtime, '1').await["run"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let done = submit(&runtime, '1').await.run;
         wait_done(&runtime, &done).await;
         // Fake a run a dead daemon left running.
         let mut stuck = runtime.record(&done).unwrap();
@@ -271,7 +270,7 @@ fn restart_marks_unfinished_runs_interrupted_and_keeps_finished_ones() {
             Some(Conclusion::Success)
         );
         let listed = restarted.listing();
-        assert_eq!(listed["runs"].as_array().unwrap().len(), 2);
+        assert_eq!(listed.runs.len(), 2);
     });
 }
 

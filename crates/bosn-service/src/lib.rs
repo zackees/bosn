@@ -5283,8 +5283,12 @@ impl Client {
             _ => Err(Error::Protocol("unexpected manifest app task response")),
         }
     }
-    /// One typed CI operation; the reply is the operation's JSON document.
-    pub async fn ci(&self, request: ci::CiRequest) -> Result<serde_json::Value, Error> {
+    /// One CI request; the reply is parsed eagerly into `T`, the request's
+    /// typed reply (see [`ci::reply`]).
+    async fn ci_call<T: serde::de::DeserializeOwned>(
+        &self,
+        request: ci::CiRequest,
+    ) -> Result<T, Error> {
         let encoded =
             serde_json::to_string(&request).map_err(|_| Error::Protocol("ci request encode"))?;
         match self
@@ -5298,10 +5302,11 @@ impl Client {
                 serde_json::from_str(&json).map_err(|_| Error::Protocol("ci reply decode"))
             }
             Reply::CiError(json) => {
-                let value: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+                let error: ci::ErrorReply =
+                    serde_json::from_str(&json).map_err(|_| Error::Protocol("ci error decode"))?;
                 Err(Error::Ci {
-                    code: value["code"].as_str().unwrap_or("error").into(),
-                    message: value["message"].as_str().unwrap_or(&json).into(),
+                    code: error.code,
+                    message: error.message,
                 })
             }
             _ => Err(Error::Protocol("unexpected ci response")),
@@ -5310,14 +5315,65 @@ impl Client {
     /// Snapshot `workspace` into the daemon's staging area, then submit it.
     /// The snapshot is taken here (same user) because copying a tree can
     /// take longer than one daemon request may.
-    pub async fn ci_submit(&self, options: ci::SubmitOptions) -> Result<serde_json::Value, Error> {
+    pub async fn ci_submit(&self, options: ci::SubmitOptions) -> Result<ci::SubmitReply, Error> {
         let request = ci::stage_submission(&self.state_dir, options).await?;
         let staging = ci::staging_root(&self.state_dir).join(&request.staging);
-        let result = self.ci(ci::CiRequest::Submit { request }).await;
+        let result = self.ci_call(ci::CiRequest::Submit { request }).await;
         if result.is_err() {
             let _ = std::fs::remove_dir_all(staging);
         }
         result
+    }
+    pub async fn ci_list(
+        &self,
+        workspace: Option<String>,
+        state: Option<ci::RunState>,
+        limit: Option<usize>,
+    ) -> Result<ci::ListReply, Error> {
+        self.ci_call(ci::CiRequest::List {
+            workspace,
+            state,
+            limit,
+        })
+        .await
+    }
+    pub async fn ci_show(&self, run: String, tree: bool) -> Result<ci::RunView, Error> {
+        self.ci_call(ci::CiRequest::Show {
+            run,
+            tree: Some(tree),
+        })
+        .await
+    }
+    pub async fn ci_logs(&self, query: ci::LogsQuery) -> Result<ci::LogsReply, Error> {
+        self.ci_call(ci::CiRequest::Logs {
+            run: query.run,
+            job: query.job,
+            section: query.section,
+            since_seq: Some(query.since_seq),
+            limit: query.limit,
+            max_bytes: query.max_bytes,
+        })
+        .await
+    }
+    pub async fn ci_cancel(&self, run: String) -> Result<ci::CancelReply, Error> {
+        self.ci_call(ci::CiRequest::Cancel { run }).await
+    }
+    pub async fn ci_retry(
+        &self,
+        run: String,
+        job: Option<String>,
+    ) -> Result<ci::SubmitReply, Error> {
+        self.ci_call(ci::CiRequest::Retry { run, job }).await
+    }
+    pub async fn ci_report(
+        &self,
+        run: String,
+        tail: Option<usize>,
+    ) -> Result<ci::RunReport, Error> {
+        self.ci_call(ci::CiRequest::Report { run, tail }).await
+    }
+    pub async fn ci_runners(&self, action: ci::RunnerAction) -> Result<ci::RunnersReply, Error> {
+        self.ci_call(ci::CiRequest::Runners { action }).await
     }
     async fn call(&self, request: Request) -> Result<Reply, Error> {
         // Resolve on every call: a Client may have been constructed while a
@@ -9880,6 +9936,18 @@ struct ConnectionContext {
     ci: ci::CiRuntime,
 }
 
+fn ci_error_wire(code: &str, message: String) -> ReplyWire {
+    let reply = ci::ErrorReply {
+        code: code.into(),
+        message,
+    };
+    ReplyWire {
+        code: 361,
+        ci_reply: serde_json::to_string(&reply).unwrap_or_default(),
+        ..Default::default()
+    }
+}
+
 async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Result<(), Error> {
     let ConnectionContext {
         actor,
@@ -10668,25 +10736,14 @@ async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Result<(), Er
                 },
             },
             36 => match serde_json::from_str::<ci::CiRequest>(&r.ci_request) {
-                Err(error) => ReplyWire {
-                    code: 361,
-                    ci_reply:
-                        serde_json::json!({"code": "invalid_request", "message": error.to_string()})
-                            .to_string(),
-                    ..Default::default()
-                },
+                Err(error) => ci_error_wire("invalid_request", error.to_string()),
                 Ok(request) => match ci.handle(request).await {
                     Ok(value) => ReplyWire {
                         code: 360,
                         ci_reply: value.to_string(),
                         ..Default::default()
                     },
-                    Err(error) => ReplyWire {
-                        code: 361,
-                        ci_reply: serde_json::json!({"code": error.code, "message": error.message})
-                            .to_string(),
-                        ..Default::default()
-                    },
+                    Err(error) => ci_error_wire(error.code, error.message),
                 },
             },
             _ => ReplyWire {

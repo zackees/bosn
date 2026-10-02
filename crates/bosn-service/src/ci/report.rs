@@ -1,11 +1,10 @@
 //! Verdicts: folding an engine outcome and a parsed tree into a run
 //! conclusion, and the agent-facing failure report. Pure functions.
 
-use serde_json::{Value, json};
-
 use super::{
     lifecycle::{CleanupEnd, EngineReport, ExecutionEnd},
     model::{ItemConclusion, RunTree},
+    reply::{FailureReport, JobOutcomes, RunReport},
     wire::{Conclusion, RunRecord, SCHEMA_VERSION},
 };
 
@@ -78,44 +77,48 @@ pub fn conclude(
 
 /// The `ci report --json` agent contract. `tail(job, section)` returns the
 /// last lines of that one section.
-pub fn report(record: &RunRecord, tail: impl FnOnce(&str, &str) -> Vec<String>) -> Value {
+pub fn report(record: &RunRecord, tail: impl FnOnce(&str, &str) -> Vec<String>) -> RunReport {
     let tree = &record.tree;
-    let failure = tree.first_failure().map(|(job, section)| {
+    let first_failure = tree.first_failure().map(|(job, section)| {
         let key = section.map(|s| format!("{}:{}", s.stage, s.id));
-        json!({
-            "job": job.key,
-            "job_name": job.name,
-            "section": key,
-            "step": section.map(|s| s.name.clone()),
-            "exit_code": section.and_then(|s| s.exit_code),
-            "tail": key.as_deref().map(|k| tail(&job.key, k)).unwrap_or_default(),
-        })
+        FailureReport {
+            job: job.key.clone(),
+            job_name: job.name.clone(),
+            tail: key
+                .as_deref()
+                .map(|k| tail(&job.key, k))
+                .unwrap_or_default(),
+            section: key,
+            step: section.map(|s| s.name.clone()),
+            exit_code: section.and_then(|s| s.exit_code),
+        }
     });
     let count = |c: ItemConclusion| tree.jobs().filter(|j| j.conclusion == Some(c)).count();
-    json!({
-        "schema_version": SCHEMA_VERSION,
-        "run": record.id,
-        "state": record.state,
-        "conclusion": record.conclusion,
-        "exit_code": record.conclusion.map(Conclusion::exit_code),
-        "reason": record.reason,
-        "sha": record.sha,
-        "dirty": record.dirty,
-        "workflow": record.workflow,
-        "trigger": record.trigger,
-        "mode": record.mode,
-        "actor": record.actor,
-        "cleanup": record.cleanup,
-        "first_failure": failure,
-        "jobs": {
-            "succeeded": count(ItemConclusion::Success),
-            "failed": count(ItemConclusion::Failure),
-            "cancelled": count(ItemConclusion::Cancelled),
-            "skipped": tree.skipped_jobs(),
-            "unsupported": tree.unsupported_jobs(),
+    let unsupported = tree.unsupported_jobs();
+    RunReport {
+        schema_version: SCHEMA_VERSION,
+        run: record.id.clone(),
+        state: record.state,
+        conclusion: record.conclusion,
+        exit_code: record.conclusion.map(Conclusion::exit_code),
+        reason: record.reason.clone(),
+        sha: record.sha.clone(),
+        dirty: record.dirty.clone(),
+        workflow: record.workflow.clone(),
+        trigger: record.trigger,
+        mode: record.mode,
+        actor: record.actor.clone(),
+        cleanup: record.cleanup.clone(),
+        first_failure,
+        jobs: JobOutcomes {
+            succeeded: count(ItemConclusion::Success),
+            failed: count(ItemConclusion::Failure),
+            cancelled: count(ItemConclusion::Cancelled),
+            skipped: tree.skipped_jobs(),
+            unsupported: unsupported.clone(),
         },
-        "coverage_complete": tree.unsupported_jobs().is_empty(),
-        "ui_url": Value::Null,
-        "logs_command": format!("bosn ci logs {}", record.id),
-    })
+        coverage_complete: unsupported.is_empty(),
+        ui_url: None,
+        logs_command: format!("bosn ci logs {}", record.id),
+    }
 }

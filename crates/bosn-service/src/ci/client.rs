@@ -4,10 +4,10 @@
 use std::path::PathBuf;
 
 use kernal_api::async_engine;
-use serde_json::{Value, json};
 
 use super::{
     provider::{self, Mode, Provider, Trigger},
+    reply::Plan,
     snapshot::{self, Head},
     store::Store,
     wire::{CiError, SubmitRequest, new_uuid},
@@ -91,9 +91,9 @@ fn resolve(options: &SubmitOptions) -> Result<Resolved, Error> {
 
 /// What `bosn ci run` would execute, without copying or contacting the
 /// daemon.
-pub fn plan(options: &SubmitOptions) -> Result<Value, Error> {
+pub fn plan(options: &SubmitOptions) -> Result<Plan, Error> {
     let resolved = resolve(options)?;
-    let head = &resolved.head;
+    let head = resolved.head;
     let repository = provider::repository(head.origin.as_deref());
     let (event, payload) = provider::github_event(
         resolved.trigger,
@@ -103,24 +103,23 @@ pub fn plan(options: &SubmitOptions) -> Result<Value, Error> {
         &repository,
         options.pr_number.unwrap_or(1),
     );
-    Ok(json!({
-        "schema_version": super::SCHEMA_VERSION,
-        "workspace": head.root,
-        "provider": resolved.provider,
-        "engine": options.engine.as_deref().unwrap_or("act"),
-        "workflow": resolved.workflow,
-        "job": options.job,
-        "trigger": resolved.trigger,
-        "mode": resolved.mode,
-        "event": event,
-        "payload": payload,
-        "repository": repository,
-        "sha": head.sha,
-        "branch": head.branch,
-        "dirty": head.dirty,
-        "actor": options.actor.clone().unwrap_or_else(detect_actor),
-        "executable": true,
-    }))
+    Ok(Plan {
+        schema_version: super::SCHEMA_VERSION,
+        workspace: head.root,
+        provider: resolved.provider,
+        engine: options.engine.clone().unwrap_or_else(|| "act".into()),
+        workflow: resolved.workflow,
+        job: options.job.clone(),
+        trigger: resolved.trigger,
+        mode: resolved.mode,
+        event: event.into(),
+        payload,
+        repository,
+        sha: head.sha,
+        branch: head.branch,
+        dirty: head.dirty,
+        actor: options.actor.clone().unwrap_or_else(detect_actor),
+    })
 }
 
 /// Resolve the options, snapshot the workspace into the daemon's staging

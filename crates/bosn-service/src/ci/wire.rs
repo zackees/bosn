@@ -4,10 +4,9 @@
 use std::{path::Path, time::Duration};
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 
 use super::{
-    model::{ItemConclusion, ItemStatus, RunTree},
+    model::RunTree,
     provider::{self, Mode, Provider, Trigger},
     scheduler::RunKey,
 };
@@ -21,29 +20,27 @@ pub const DEFAULT_REPORT_TAIL: usize = 40;
 pub const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const MAX_RUN_TIMEOUT: Duration = Duration::from_secs(12 * 60 * 60);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunState {
-    Queued,
-    Running,
-    Done,
-}
+vocabulary!(
+    /// Where a run is in its life.
+    RunState, "state" { Queued => "queued", Running => "running", Done => "done" }
+);
 
-/// Run conclusion. Exit codes: success 0, failure/error 1,
-/// cancelled/timed_out 2, refused/incomplete 3.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Conclusion {
-    Success,
-    Failure,
-    Cancelled,
-    TimedOut,
-    /// Some jobs could not run here (unsupported runner); never a pass.
-    Incomplete,
-    Refused,
-    /// The engine or its cleanup failed; never a pass.
-    Error,
-}
+vocabulary!(
+    /// Run conclusion. Exit codes: success 0, failure/error 1,
+    /// cancelled/timed_out 2, refused/incomplete 3.
+    Conclusion, "conclusion" {
+        Success => "success",
+        Failure => "failure",
+        Cancelled => "cancelled",
+        TimedOut => "timed_out",
+        /// Some jobs could not run here, or none succeeded; never a pass.
+        Incomplete => "incomplete",
+        Refused => "refused",
+        /// The engine or its cleanup failed; never a pass.
+        Error => "error",
+    }
+);
+
 impl Conclusion {
     pub fn exit_code(self) -> i32 {
         match self {
@@ -206,6 +203,7 @@ pub struct RunRecord {
     pub retry_of: Option<String>,
     pub timeout_secs: u64,
     pub log_records: u64,
+    #[serde(default)]
     pub tree: RunTree,
 }
 
@@ -294,27 +292,6 @@ impl RunRecord {
             payload_sha256: self.payload_sha256.clone(),
             timeout_secs: self.timeout_secs,
         }
-    }
-    /// The record without its job tree (for listings and polling).
-    pub fn summary(&self) -> Value {
-        let mut value = serde_json::to_value(self).unwrap_or(Value::Null);
-        if let Some(map) = value.as_object_mut() {
-            map.remove("tree");
-            let jobs: Vec<_> = self.tree.jobs().collect();
-            map.insert(
-                "jobs".into(),
-                json!({
-                    "total": jobs.len(),
-                    "completed": jobs.iter().filter(|j| j.status == ItemStatus::Completed).count(),
-                    "failed": jobs.iter().filter(|j| j.conclusion == Some(ItemConclusion::Failure)).count(),
-                }),
-            );
-            map.insert(
-                "exit_code".into(),
-                json!(self.conclusion.map(Conclusion::exit_code)),
-            );
-        }
-        value
     }
 }
 

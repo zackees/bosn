@@ -334,64 +334,48 @@ impl ActParser {
     /// Fold one stdout line. Returns the log record to persist.
     pub fn feed(&mut self, seq: u64, line: &str) -> LogRecord {
         let line = line.trim_end_matches(['\r', '\n']);
-        let Ok(Value::Object(record)) = serde_json::from_str::<Value>(line) else {
+        let record = |job: Option<String>, section: Option<String>, text: String| LogRecord {
+            seq,
+            stream: "stdout".into(),
+            job,
+            section,
+            text,
+        };
+        let Ok(act) = serde_json::from_str::<ActLine>(line) else {
             if !line.trim().is_empty() {
                 self.tree.malformed_lines += 1;
             }
-            return LogRecord {
-                seq,
-                stream: "stdout".into(),
-                job: None,
-                section: None,
-                text: line.into(),
-            };
+            return record(None, None, line.into());
         };
-        let text = |key: &str| record.get(key).and_then(Value::as_str);
-        let msg = text("msg").unwrap_or("").to_string();
-        let raw = record.get("raw_output").and_then(Value::as_bool) == Some(true);
-        let message = if raw {
-            msg.trim_end_matches('\n').to_string()
-        } else {
-            msg.clone()
+        let text = act.text();
+        let (Some(key), Some(job_id)) = (act.job_key(), act.job_id()) else {
+            return record(None, None, text);
         };
-        let (Some(key), Some(job_id)) = (text("job"), text("jobID")) else {
-            return LogRecord {
-                seq,
-                stream: "stdout".into(),
-                job: None,
-                section: None,
-                text: message,
-            };
-        };
-        // act pads job names for column alignment.
-        let key = key.trim().to_string();
-        let job_id = job_id.trim().to_string();
-        let matrix = record.get("matrix").cloned();
-        let job = self.tree.job_for(&key, &job_id, matrix.as_ref());
+        let notice = Notice::of(&act.msg);
+        let job = self.tree.job_for(&key, &job_id, act.matrix.as_ref());
         if job.status == ItemStatus::Queued {
             job.status = ItemStatus::InProgress;
         }
-        if msg.contains("Skipping unsupported platform") {
+        if notice == Notice::Unsupported {
             job.status = ItemStatus::Completed;
             job.conclusion = Some(ItemConclusion::Unsupported);
         }
-        if let Some(result) = text("jobResult") {
+        if let Some(result) = act.job_result {
             job.status = ItemStatus::Completed;
-            job.conclusion = Some(conclusion(result));
+            job.conclusion = Some(result.into());
         }
-        let section_id = step_id(&record);
-        let section = section_id.map(|(id, stage)| {
+        let section = act.step().and_then(|step| {
             let index = match job
                 .sections
                 .iter()
-                .position(|s| s.id == id && s.stage == stage)
+                .position(|s| s.id == step.id && s.stage == step.stage)
             {
                 Some(i) => i,
                 None => {
                     job.sections.push(Section {
-                        id: id.clone(),
-                        name: text("step").unwrap_or(&id).into(),
-                        stage: stage.clone(),
+                        name: act.step.clone().unwrap_or_else(|| step.id.clone()),
+                        id: step.id,
+                        stage: step.stage,
                         status: ItemStatus::Queued,
                         conclusion: None,
                         first_seq: None,
@@ -403,10 +387,12 @@ impl ActParser {
                 }
             };
             let section = &mut job.sections[index];
-            let started = msg.starts_with("⭐ Run") || section.first_seq.is_some();
-            // Ambient noise (git probes before the step starts) is attached
-            // to the job, not to a step that may never run.
-            let owned = started || text("stepResult").is_some() || raw;
+            // Ambient noise (git probes before the step starts) stays with
+            // the job, not with a step that may never run.
+            let owned = notice == Notice::StepStarted
+                || section.first_seq.is_some()
+                || act.step_result.is_some()
+                || act.raw_output;
             if owned {
                 section.first_seq.get_or_insert(seq);
                 section.last_seq = Some(seq);
@@ -414,73 +400,134 @@ impl ActParser {
                     section.status = ItemStatus::InProgress;
                 }
             }
-            if let Some(result) = text("stepResult") {
+            if let Some(result) = act.step_result {
                 section.status = ItemStatus::Completed;
-                section.conclusion = Some(conclusion(result));
-                section.duration_ms = record
-                    .get("executionTime")
-                    .and_then(Value::as_u64)
-                    .map(|ns| ns / 1_000_000);
+                section.conclusion = Some(result.into());
+                section.duration_ms = act.execution_time.map(|ns| ns / 1_000_000);
             }
-            if let Some(code) = msg
-                .strip_prefix("exitcode '")
-                .and_then(|r| r.split_once('\''))
-                .and_then(|(c, _)| c.parse().ok())
-            {
+            if let Notice::ExitCode(code) = notice {
                 section.exit_code = Some(code);
             }
             owned.then(|| format!("{}:{}", section.stage, section.id))
         });
-        LogRecord {
-            seq,
-            stream: "stdout".into(),
-            job: Some(key),
-            section: section.flatten(),
-            text: message,
+        record(Some(key), section, text)
+    }
+}
+
+/// One `act --json` line, parsed eagerly. Unknown fields are ignored so a
+/// newer act cannot break an older daemon.
+#[derive(Debug, Deserialize)]
+struct ActLine {
+    #[serde(default)]
+    msg: String,
+    job: Option<String>,
+    #[serde(rename = "jobID")]
+    job_id: Option<String>,
+    matrix: Option<Value>,
+    stage: Option<String>,
+    step: Option<String>,
+    /// Workflow steps; composite steps nest (`["2", "0"]`).
+    #[serde(rename = "stepID")]
+    step_ids: Option<Vec<String>>,
+    /// act's synthetic `--setup-job` / `--complete-job` steps.
+    #[serde(rename = "stepid")]
+    synthetic_step_ids: Option<Vec<String>>,
+    #[serde(rename = "stepResult")]
+    step_result: Option<ActResult>,
+    #[serde(rename = "jobResult")]
+    job_result: Option<ActResult>,
+    /// Nanoseconds.
+    #[serde(rename = "executionTime")]
+    execution_time: Option<u64>,
+    #[serde(default)]
+    raw_output: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ActResult {
+    Success,
+    Skipped,
+    Cancelled,
+    /// `failure` and anything a newer act invents: never a pass.
+    #[serde(other)]
+    Failure,
+}
+
+impl From<ActResult> for ItemConclusion {
+    fn from(result: ActResult) -> Self {
+        match result {
+            ActResult::Success => Self::Success,
+            ActResult::Skipped => Self::Skipped,
+            ActResult::Cancelled => Self::Cancelled,
+            ActResult::Failure => Self::Failure,
         }
     }
 }
 
-fn conclusion(result: &str) -> ItemConclusion {
-    match result {
-        "success" => ItemConclusion::Success,
-        "skipped" => ItemConclusion::Skipped,
-        "cancelled" => ItemConclusion::Cancelled,
-        _ => ItemConclusion::Failure,
+/// What an act message announces, classified once.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Notice {
+    StepStarted,
+    Unsupported,
+    ExitCode(i32),
+    Plain,
+}
+
+impl Notice {
+    fn of(msg: &str) -> Self {
+        if msg.starts_with("⭐ Run") {
+            return Self::StepStarted;
+        }
+        if msg.contains("Skipping unsupported platform") {
+            return Self::Unsupported;
+        }
+        msg.strip_prefix("exitcode '")
+            .and_then(|rest| rest.split_once('\''))
+            .and_then(|(code, _)| code.parse().ok())
+            .map_or(Self::Plain, Self::ExitCode)
     }
 }
 
-/// (section ID, stage) for a record. act uses `stepid` for its synthetic
-/// setup/complete steps and `stepID` plus `stage` for workflow steps.
-fn step_id(record: &serde_json::Map<String, Value>) -> Option<(String, String)> {
-    let join = |v: &Value| {
-        v.as_array().map(|parts| {
-            parts
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join("/")
-        })
-    };
-    if let Some(id) = record
-        .get("stepID")
-        .and_then(join)
-        .filter(|s| !s.is_empty())
-    {
-        let stage = record
-            .get("stage")
-            .and_then(Value::as_str)
-            .unwrap_or("Main")
-            .to_string();
-        return Some((id, stage));
+/// A section's identity within its job.
+struct StepRef {
+    id: String,
+    stage: String,
+}
+
+impl ActLine {
+    /// act pads job names for column alignment.
+    fn job_key(&self) -> Option<String> {
+        self.job.as_deref().map(|j| j.trim().to_string())
     }
-    let id = record.get("stepid").and_then(join)?;
-    let stage = match id.as_str() {
-        "--setup-job" => "Setup",
-        "--complete-job" => "Complete",
-        _ => "Main",
-    };
-    Some((id, stage.into()))
+    fn job_id(&self) -> Option<String> {
+        self.job_id.as_deref().map(|j| j.trim().to_string())
+    }
+    fn text(&self) -> String {
+        if self.raw_output {
+            self.msg.trim_end_matches('\n').to_string()
+        } else {
+            self.msg.clone()
+        }
+    }
+    fn step(&self) -> Option<StepRef> {
+        if let Some(ids) = self.step_ids.as_ref().filter(|ids| !ids.is_empty()) {
+            return Some(StepRef {
+                id: ids.join("/"),
+                stage: self.stage.clone().unwrap_or_else(|| "Main".into()),
+            });
+        }
+        let id = self.synthetic_step_ids.as_ref()?.join("/");
+        let stage = match id.as_str() {
+            "--setup-job" => "Setup",
+            "--complete-job" => "Complete",
+            _ => "Main",
+        };
+        Some(StepRef {
+            id,
+            stage: stage.into(),
+        })
+    }
 }
 
 #[cfg(test)]

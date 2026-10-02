@@ -13,12 +13,13 @@ use std::{
 use bosn_service::{
     Client,
     ci::{
-        CiRequest, RunState, RunnerAction, SubmitOptions,
+        Conclusion, JsonReply, LogsQuery, RunState, RunView, RunnerAction, RunnerStatus,
+        SubmitOptions,
+        model::{ItemConclusion, ItemStatus},
         provider::{Mode, Provider, Trigger},
     },
 };
 use kernal_api::async_engine::{Runtime, RuntimeBuilder};
-use serde_json::Value;
 
 pub const USAGE: &str = "usage: bosn ci plan [--workspace P] [--provider github] [--workflow F] [--job J] [--trigger pr|push|release] [--mode minimal|test|full] [--sha S] [--json]
    or: bosn ci run <plan options> [--engine act] [--pr-number N] [--timeout-secs N] [--wait [--deadline-ms N]] [--json]
@@ -33,6 +34,8 @@ pub const USAGE: &str = "usage: bosn ci plan [--workspace P] [--provider github]
    (every verb accepts --state-dir STATE_DIR)";
 
 const EXIT_REFUSED: i32 = 3;
+/// `wait` reached its deadline, or `report` on a run still in progress.
+const EXIT_NOT_FINISHED: i32 = 2;
 const POLL: Duration = Duration::from_millis(500);
 
 /// Parsed `--flag value` / `--switch` arguments plus positionals.
@@ -211,8 +214,12 @@ fn connect(flags: &Flags) -> Result<(Runtime, Client), Failure> {
     Ok((runtime, client))
 }
 
-fn call(runtime: &Runtime, client: &Client, request: CiRequest) -> Result<Value, Failure> {
-    runtime.run(client.ci(request)).map_err(describe)
+/// Run one typed client call to completion.
+fn call<T>(
+    runtime: &Runtime,
+    request: impl std::future::Future<Output = Result<T, bosn_service::Error>>,
+) -> Result<T, Failure> {
+    runtime.run(request).map_err(describe)
 }
 
 fn describe(error: bosn_service::Error) -> Failure {
@@ -229,11 +236,12 @@ fn describe(error: bosn_service::Error) -> Failure {
     }
 }
 
-fn print(value: &Value, json: bool, text: impl FnOnce(&Value)) {
+/// `--json` prints the typed reply as JSON; otherwise `text` renders it.
+fn print<T: JsonReply>(reply: &T, json: bool, text: impl FnOnce(&T)) {
     if json {
-        println!("{value}");
+        println!("{}", reply.to_json());
     } else {
-        text(value);
+        text(reply);
     }
 }
 
@@ -241,18 +249,12 @@ fn plan(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
     let flags = Flags::parse(arguments, PLAN_FLAGS, &["--json"])?;
     let plan = bosn_service::ci::plan(&submit_options(&flags)?).map_err(describe)?;
     print(&plan, flags.json(), |p| {
-        for key in [
-            "provider",
-            "workflow",
-            "trigger",
-            "mode",
-            "event",
-            "sha",
-            "dirty",
-            "executable",
-        ] {
-            println!("{key}: {}", text(&p[key]));
-        }
+        println!("provider: {}", p.provider.as_str());
+        println!("workflow: {}", p.workflow);
+        println!("trigger: {} ({})", p.trigger.as_str(), p.event);
+        println!("mode: {}", p.mode.as_str());
+        println!("sha: {}{}", p.sha, if p.dirty { " +dirty" } else { "" });
+        println!("actor: {}", p.actor);
     });
     Ok(0)
 }
@@ -263,48 +265,44 @@ fn submit(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
     // Refuse a bad checkout or trigger before starting any daemon.
     bosn_service::ci::plan(&options).map_err(describe)?;
     let (runtime, client) = connect(&flags)?;
-    let submitted = runtime.run(client.ci_submit(options)).map_err(describe)?;
-    let run = submitted["run"].as_str().unwrap_or_default().to_string();
+    let submitted = call(&runtime, client.ci_submit(options))?;
     if !flags.has("--wait") {
         print(&submitted, flags.json(), |s| {
-            let how = if s["coalesced"] == true {
+            let how = if s.coalesced {
                 " (joined an identical run)"
             } else {
                 ""
             };
-            println!("run {run} queued{how}");
-            println!("follow: bosn ci logs {run} --follow");
+            println!("run {} queued{how}", s.run);
+            println!("follow: bosn ci logs {} --follow", s.run);
         });
         return Ok(0);
     }
     if !flags.json() {
-        eprintln!("run {run} submitted; waiting");
+        eprintln!("run {} submitted; waiting", submitted.run);
     }
-    finish(&runtime, &client, &run, &flags)
+    finish(&runtime, &client, &submitted.run, &flags)
 }
 
-/// Wait for a run, then print its full record and return its exit code.
+/// Wait for a run, then print its full record and return its exit code
+/// (2 when the deadline passes first).
 fn finish(runtime: &Runtime, client: &Client, run: &str, flags: &Flags) -> Result<i32, Failure> {
     let deadline = flags
         .number::<u64>("--deadline-ms")?
         .map(|ms| Instant::now() + Duration::from_millis(ms));
     loop {
-        let shown = call(
-            runtime,
-            client,
-            CiRequest::Show {
-                run: run.into(),
-                tree: Some(true),
-            },
-        )?;
-        let done = shown["state"] == "done";
-        if done || deadline.is_some_and(|d| Instant::now() >= d) {
+        let shown = call(runtime, client.ci_show(run.into(), true))?;
+        let expired = deadline.is_some_and(|d| Instant::now() >= d);
+        if let Some(code) = shown
+            .exit_code
+            .filter(|_| shown.record.state == RunState::Done)
+        {
             print(&shown, flags.json(), print_tree);
-            return Ok(if done {
-                shown["exit_code"].as_i64().unwrap_or(1) as i32
-            } else {
-                2
-            });
+            return Ok(code);
+        }
+        if expired {
+            print(&shown, flags.json(), print_tree);
+            return Ok(EXIT_NOT_FINISHED);
         }
         std::thread::sleep(POLL);
     }
@@ -322,13 +320,7 @@ fn list(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
         &["--state-dir", "--workspace", "--state", "--limit"],
         &["--json"],
     )?;
-    let state = match flags.get("--state") {
-        None => None,
-        Some("queued") => Some(RunState::Queued),
-        Some("running") => Some(RunState::Running),
-        Some("done") => Some(RunState::Done),
-        Some(other) => return Err(format!("unknown state {other:?}").into()),
-    };
+    let state = flags.get("--state").map(RunState::parse).transpose()?;
     let workspace = flags
         .get("--workspace")
         .map(|w| std::fs::canonicalize(w).map_err(|_| "workspace does not exist".to_string()))
@@ -337,27 +329,23 @@ fn list(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
     let (runtime, client) = connect(&flags)?;
     let listed = call(
         &runtime,
-        &client,
-        CiRequest::List {
-            workspace,
-            state,
-            limit: flags.number("--limit")?,
-        },
+        client.ci_list(workspace, state, flags.number("--limit")?),
     )?;
     print(&listed, flags.json(), |l| {
-        for run in l["runs"].as_array().into_iter().flatten() {
+        for view in &l.runs {
+            let run = &view.record;
             println!(
                 "{}  {:<8} {:<10} {}{}  {}  {}",
-                text(&run["id"]),
-                text(&run["state"]),
-                text(&run["conclusion"]),
-                &text(&run["sha"]).chars().take(12).collect::<String>(),
-                if run["dirty"].is_null() { "" } else { "+dirty" },
-                text(&run["workflow"]),
-                text(&run["actor"]),
+                run.id,
+                run.state.as_str(),
+                run.conclusion.map_or("-", Conclusion::as_str),
+                &run.sha[..12.min(run.sha.len())],
+                if run.dirty.is_some() { "+dirty" } else { "" },
+                run.workflow,
+                run.actor,
             );
         }
-        print_runners(&l["runners"]);
+        print_runners(&l.runners);
     });
     Ok(0)
 }
@@ -365,14 +353,7 @@ fn list(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
 fn show(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
     let flags = Flags::parse(arguments, &["--state-dir"], &["--json"])?;
     let (runtime, client) = connect(&flags)?;
-    let shown = call(
-        &runtime,
-        &client,
-        CiRequest::Show {
-            run: flags.run()?,
-            tree: Some(true),
-        },
-    )?;
+    let shown = call(&runtime, client.ci_show(flags.run()?, true))?;
     print(&shown, flags.json(), print_tree);
     Ok(0)
 }
@@ -383,39 +364,41 @@ fn logs(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
         &["--state-dir", "--job", "--step", "--since-seq", "--limit"],
         &["--json", "--follow"],
     )?;
-    let run = flags.run()?;
+    let follow = flags.has("--follow");
+    // `--limit` without `--follow` is one bounded page (agents page by cursor).
+    let one_page = flags.get("--limit").is_some() && !follow;
+    let mut query = LogsQuery {
+        run: flags.run()?,
+        job: flags.get("--job").map(str::to_string),
+        section: flags.get("--step").map(str::to_string),
+        since_seq: flags.number("--since-seq")?.unwrap_or(0),
+        limit: flags.number("--limit")?,
+        max_bytes: None,
+    };
     let (runtime, client) = connect(&flags)?;
-    let mut since = flags.number::<u64>("--since-seq")?.unwrap_or(0);
     loop {
-        let page = call(
-            &runtime,
-            &client,
-            CiRequest::Logs {
-                run: run.clone(),
-                job: flags.get("--job").map(str::to_string),
-                section: flags.get("--step").map(str::to_string),
-                since_seq: Some(since),
-                limit: flags.number("--limit")?,
-                max_bytes: None,
-            },
-        )?;
-        for record in page["records"].as_array().into_iter().flatten() {
+        let page = call(&runtime, client.ci_logs(query.clone()))?;
+        for record in &page.records {
             if flags.json() {
-                println!("{record}");
+                println!("{}", record.to_json());
             } else {
-                println!("{}", text(&record["text"]));
+                println!("{}", record.text);
             }
         }
-        since = page["next_seq"].as_u64().unwrap_or(since);
-        let more = page["more"] == true;
-        let one_page = flags.get("--limit").is_some() && !flags.has("--follow");
-        if one_page || (!more && (!flags.has("--follow") || page["done"] == true)) {
-            if one_page && more {
-                eprintln!("more: bosn ci logs {run} --since-seq {since}");
+        query.since_seq = page.next_seq;
+        if one_page {
+            if page.more {
+                eprintln!(
+                    "more: bosn ci logs {} --since-seq {}",
+                    query.run, page.next_seq
+                );
             }
             return Ok(0);
         }
-        if !more {
+        if !page.more && (!follow || page.done) {
+            return Ok(0);
+        }
+        if !page.more {
             std::thread::sleep(POLL);
         }
     }
@@ -426,36 +409,35 @@ fn report(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
     let (runtime, client) = connect(&flags)?;
     let report = call(
         &runtime,
-        &client,
-        CiRequest::Report {
-            run: flags.run()?,
-            tail: flags.number("--tail")?,
-        },
+        client.ci_report(flags.run()?, flags.number("--tail")?),
     )?;
     print(&report, flags.json(), |r| {
-        println!("run {}: {}", text(&r["run"]), text(&r["conclusion"]));
-        if !r["reason"].is_null() {
-            println!("reason: {}", text(&r["reason"]));
+        let conclusion = r.conclusion.map_or("not finished", Conclusion::as_str);
+        println!("run {}: {conclusion}", r.run);
+        if let Some(reason) = &r.reason {
+            println!("reason: {reason}");
         }
-        if let Some(failure) = r["first_failure"].as_object() {
+        if let Some(failure) = &r.first_failure {
             println!(
                 "first failure: job {} step {} (exit {})",
-                text(&failure["job"]),
-                text(&failure["step"]),
-                text(&failure["exit_code"])
+                failure.job,
+                failure.step.as_deref().unwrap_or("-"),
+                failure.exit_code.map_or("-".into(), |c| c.to_string()),
             );
-            for line in failure["tail"].as_array().into_iter().flatten() {
-                println!("  | {}", text(line));
+            for line in &failure.tail {
+                println!("  | {line}");
             }
         }
-        for kind in ["skipped", "unsupported"] {
-            let jobs = &r["jobs"][kind];
-            if jobs.as_array().is_some_and(|a| !a.is_empty()) {
-                println!("{kind}: {jobs}");
+        for (kind, jobs) in [
+            ("skipped", &r.jobs.skipped),
+            ("unsupported", &r.jobs.unsupported),
+        ] {
+            if !jobs.is_empty() {
+                println!("{kind}: {}", jobs.join(", "));
             }
         }
     });
-    Ok(report["exit_code"].as_i64().map_or(2, |c| c as i32))
+    Ok(report.exit_code.unwrap_or(EXIT_NOT_FINISHED))
 }
 
 fn retry(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
@@ -463,15 +445,9 @@ fn retry(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
     let (runtime, client) = connect(&flags)?;
     let retried = call(
         &runtime,
-        &client,
-        CiRequest::Retry {
-            run: flags.run()?,
-            job: flags.get("--job").map(str::to_string),
-        },
+        client.ci_retry(flags.run()?, flags.get("--job").map(str::to_string)),
     )?;
-    print(&retried, flags.json(), |r| {
-        println!("run {} queued", text(&r["run"]))
-    });
+    print(&retried, flags.json(), |r| println!("run {} queued", r.run));
     Ok(0)
 }
 
@@ -479,20 +455,16 @@ fn retry(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
 fn cancel(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
     let flags = Flags::parse(arguments, &["--state-dir"], &["--json"])?;
     let (runtime, client) = connect(&flags)?;
-    let reply = call(&runtime, &client, CiRequest::Cancel { run: flags.run()? })?;
+    let reply = call(&runtime, client.ci_cancel(flags.run()?))?;
     print(&reply, flags.json(), |r| {
-        let what = if r["cancelled"] == true {
+        let what = if r.cancelled {
             "cancelled"
         } else {
             "not cancelled"
         };
-        println!("run {} {what} ({})", text(&r["run"]), text(&r["state"]));
+        println!("run {} {what} ({})", r.run, r.state.as_str());
     });
-    Ok(if reply["cancelled"] == true {
-        0
-    } else {
-        EXIT_ERROR
-    })
+    Ok(if reply.cancelled { 0 } else { EXIT_ERROR })
 }
 
 fn runners(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
@@ -501,12 +473,8 @@ fn runners(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
         &["--state-dir", "--older-than-secs", "--max-bytes"],
         &["--json"],
     )?;
-    let action = match flags
-        .positional
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()[..]
-    {
+    let positional: Vec<&str> = flags.positional.iter().map(String::as_str).collect();
+    let action = match positional[..] {
         [] | ["list"] => RunnerAction::List,
         ["drain"] => RunnerAction::Drain,
         ["resume"] => RunnerAction::Resume,
@@ -520,69 +488,50 @@ fn runners(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
         _ => return Err(USAGE.into()),
     };
     let (runtime, client) = connect(&flags)?;
-    let reply = call(&runtime, &client, CiRequest::Runners { action })?;
+    let reply = call(&runtime, client.ci_runners(action))?;
     print(&reply, flags.json(), |r| {
-        print_runners(&r["runners"]);
-        if let Some(pruned) = r["pruned_runs"].as_array() {
+        print_runners(&r.runners);
+        if let Some(pruned) = &r.pruned_runs {
             println!("pruned runs: {}", pruned.len());
         }
     });
     Ok(0)
 }
 
-fn text(value: &Value) -> String {
-    match value {
-        Value::String(s) => s.clone(),
-        Value::Null => "-".into(),
-        other => other.to_string(),
-    }
-}
-
-fn print_runners(runners: &Value) {
+fn print_runners(runners: &RunnerStatus) {
     println!(
         "runners: {} running, {} queued, limit {}{}",
-        text(&runners["running"]),
-        text(&runners["queued"]),
-        text(&runners["limit"]),
-        if runners["drained"] == true {
-            " (drained)"
-        } else {
-            ""
-        }
+        runners.running,
+        runners.queued,
+        runners.limit,
+        if runners.drained { " (drained)" } else { "" }
     );
 }
 
-fn print_tree(run: &Value) {
+fn print_tree(view: &RunView) {
+    let run = &view.record;
     println!(
         "run {} {} {}  sha {}{}  {}",
-        text(&run["id"]),
-        text(&run["state"]),
-        text(&run["conclusion"]),
-        text(&run["sha"]),
-        if run["dirty"].is_null() {
-            ""
-        } else {
-            " +dirty"
-        },
-        text(&run["workflow"]),
+        run.id,
+        run.state.as_str(),
+        run.conclusion.map_or("-", Conclusion::as_str),
+        run.sha,
+        if run.dirty.is_some() { " +dirty" } else { "" },
+        run.workflow,
     );
-    if !run["reason"].is_null() {
-        println!("  reason: {}", text(&run["reason"]));
+    if let Some(reason) = &run.reason {
+        println!("  reason: {reason}");
     }
-    for group in run["tree"]["groups"].as_array().into_iter().flatten() {
-        println!("  stage {}", text(&group["name"]));
-        for job in group["jobs"].as_array().into_iter().flatten() {
-            println!(
-                "    {} {}",
-                mark(&job["conclusion"], &job["status"]),
-                text(&job["key"])
-            );
-            for section in job["sections"].as_array().into_iter().flatten() {
+    for group in &run.tree.groups {
+        println!("  stage {}", group.name);
+        for job in &group.jobs {
+            println!("    {} {}", mark(job.conclusion, job.status), job.key);
+            for section in &job.sections {
                 println!(
                     "      {} {} {}",
-                    mark(&section["conclusion"], &section["status"]),
-                    text(&section["stage"]),
-                    text(&section["name"])
+                    mark(section.conclusion, section.status),
+                    section.stage,
+                    section.name
                 );
             }
         }
@@ -590,14 +539,14 @@ fn print_tree(run: &Value) {
 }
 
 /// Status by symbol as well as word, never colour alone.
-fn mark(conclusion: &Value, status: &Value) -> &'static str {
-    match (conclusion.as_str(), status.as_str()) {
-        (Some("success"), _) => "[ok]",
-        (Some("failure"), _) => "[FAIL]",
-        (Some("cancelled"), _) => "[cancelled]",
-        (Some("skipped"), _) => "[skip]",
-        (Some("unsupported"), _) => "[unsupported]",
-        (_, Some("in_progress")) => "[..]",
-        _ => "[queued]",
+fn mark(conclusion: Option<ItemConclusion>, status: ItemStatus) -> &'static str {
+    match (conclusion, status) {
+        (Some(ItemConclusion::Success), _) => "[ok]",
+        (Some(ItemConclusion::Failure), _) => "[FAIL]",
+        (Some(ItemConclusion::Cancelled), _) => "[cancelled]",
+        (Some(ItemConclusion::Skipped), _) => "[skip]",
+        (Some(ItemConclusion::Unsupported), _) => "[unsupported]",
+        (None, ItemStatus::InProgress) => "[..]",
+        (None, _) => "[queued]",
     }
 }

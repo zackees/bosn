@@ -11,7 +11,7 @@ use std::{
 
 use bosn_registry::act::{ActEngineIntent, ActEngineRecord};
 use kernal_api::async_engine::{self, CancellationSource};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::{
     engine::{
@@ -19,7 +19,9 @@ use super::{
     },
     lifecycle::{self, CleanupEnd, EngineObserver, EnginePlan, EngineReport, ExecutionEnd},
     model::{ActParser, LogRecord, RunTree, parse_act_list},
-    provider, report,
+    provider,
+    reply::*,
+    report,
     scheduler::{Admission, Scheduler},
     store::{INDEX_STRIDE, LogFilter, LogQuery, LogWriter, Settings, Store},
     wire::*,
@@ -139,15 +141,24 @@ impl CiRuntime {
         lifecycle::reconcile(&self.registry, self.backend.as_ref(), records).await
     }
 
+    /// Dispatch one typed request; the reply is that operation's typed reply
+    /// (see [`super::reply`]) serialized for the wire.
     pub async fn handle(&self, request: CiRequest) -> Result<Value, CiError> {
         match request {
-            CiRequest::Submit { request } => self.submit(request).await,
+            CiRequest::Submit { request } => wire(self.submit(request).await),
             CiRequest::List {
                 workspace,
                 state,
                 limit,
-            } => Ok(self.list(workspace.as_deref(), state, limit.unwrap_or(50).min(500))),
-            CiRequest::Show { run, tree } => self.show(&run, tree.unwrap_or(true)),
+            } => wire(Ok(self.list(
+                workspace.as_deref(),
+                state,
+                limit.unwrap_or(50).min(500),
+            ))),
+            CiRequest::Show { run, tree } => wire(
+                self.record(&run)
+                    .map(|r| RunView::of(r, tree.unwrap_or(true))),
+            ),
             CiRequest::Logs {
                 run,
                 job,
@@ -155,25 +166,27 @@ impl CiRuntime {
                 since_seq,
                 limit,
                 max_bytes,
-            } => self.logs(
-                &run,
-                LogFilter {
-                    job: job.as_deref(),
-                    section: section.as_deref(),
-                },
-                since_seq.unwrap_or(0),
-                limit.unwrap_or(DEFAULT_LOG_PAGE_RECORDS).clamp(1, 5_000),
-                max_bytes
-                    .unwrap_or(DEFAULT_LOG_PAGE_BYTES)
-                    .clamp(1024, MAX_LOG_PAGE_BYTES),
+            } => wire(
+                self.logs(
+                    &run,
+                    LogFilter {
+                        job: job.as_deref(),
+                        section: section.as_deref(),
+                    },
+                    since_seq.unwrap_or(0),
+                    limit.unwrap_or(DEFAULT_LOG_PAGE_RECORDS).clamp(1, 5_000),
+                    max_bytes
+                        .unwrap_or(DEFAULT_LOG_PAGE_BYTES)
+                        .clamp(1024, MAX_LOG_PAGE_BYTES),
+                ),
             ),
-            CiRequest::Cancel { run } => self.cancel(&run),
-            CiRequest::Retry { run, job } => self.retry(&run, job).await,
-            CiRequest::Report { run, tail } => {
+            CiRequest::Cancel { run } => wire(self.cancel(&run)),
+            CiRequest::Retry { run, job } => wire(self.retry(&run, job).await),
+            CiRequest::Report { run, tail } => wire(
                 self.report(&run, tail.unwrap_or(DEFAULT_REPORT_TAIL).clamp(1, 500))
-                    .await
-            }
-            CiRequest::Runners { action } => self.runners(action).await,
+                    .await,
+            ),
+            CiRequest::Runners { action } => wire(self.runners(action).await),
         }
     }
 
@@ -199,7 +212,7 @@ impl CiRuntime {
         Some(record)
     }
 
-    async fn submit(&self, request: SubmitRequest) -> Result<Value, CiError> {
+    async fn submit(&self, request: SubmitRequest) -> Result<SubmitReply, CiError> {
         let staging = self.store.staging(&request.staging);
         let admitted = async {
             request.validate()?;
@@ -226,7 +239,12 @@ impl CiRuntime {
     }
 
     /// Queue (or coalesce) a record whose source is staged at `staging`.
-    fn admit(&self, record: RunRecord, staging: &Path, payload: &[u8]) -> Result<Value, CiError> {
+    fn admit(
+        &self,
+        record: RunRecord,
+        staging: &Path,
+        payload: &[u8],
+    ) -> Result<SubmitReply, CiError> {
         let mut state = self.lock();
         let id = match state.scheduler.submit(record.key(), record.id.clone()) {
             Admission::Coalesced(existing) => {
@@ -235,7 +253,12 @@ impl CiRuntime {
                 let joined = self
                     .update(&existing, |slot| slot.record.submitters += 1)
                     .ok_or_else(|| CiError::new("internal", "coalesced run is missing"))?;
-                return Ok(json!({"run": existing, "coalesced": true, "record": joined.summary()}));
+                return Ok(SubmitReply {
+                    run: existing,
+                    coalesced: true,
+                    queue_position: None,
+                    record: RunView::of(joined, false),
+                });
             }
             Admission::Queued(id) => id,
         };
@@ -247,17 +270,22 @@ impl CiRuntime {
             ));
         }
         self.store.save_run(&record);
-        let summary = record.summary();
+        let view = RunView::of(record.clone(), false);
         state.insert(record);
-        let position = state.scheduler.queue_position(&id);
+        let queue_position = state.scheduler.queue_position(&id);
         drop(state);
         self.kick();
-        Ok(json!({"run": id, "coalesced": false, "queue_position": position, "record": summary}))
+        Ok(SubmitReply {
+            run: id,
+            coalesced: false,
+            queue_position,
+            record: view,
+        })
     }
 
-    fn list(&self, workspace: Option<&str>, filter: Option<RunState>, limit: usize) -> Value {
+    fn list(&self, workspace: Option<&str>, filter: Option<RunState>, limit: usize) -> ListReply {
         let state = self.lock();
-        let runs: Vec<Value> = state
+        let runs = state
             .order
             .iter()
             .rev()
@@ -265,24 +293,12 @@ impl CiRuntime {
             .filter(|slot| workspace.is_none_or(|w| slot.record.workspace == w))
             .filter(|slot| filter.is_none_or(|f| slot.record.state == f))
             .take(limit)
-            .map(|slot| slot.record.summary())
+            .map(|slot| RunView::of(slot.record.clone(), false))
             .collect();
-        json!({"runs": runs, "runners": runner_status(&state.scheduler)})
-    }
-
-    fn show(&self, run: &str, tree: bool) -> Result<Value, CiError> {
-        let record = self.record(run)?;
-        if !tree {
-            return Ok(record.summary());
+        ListReply {
+            runs,
+            runners: runner_status(&state.scheduler),
         }
-        let mut value = serde_json::to_value(&record).unwrap_or(Value::Null);
-        if let Some(map) = value.as_object_mut() {
-            map.insert(
-                "exit_code".into(),
-                json!(record.conclusion.map(Conclusion::exit_code)),
-            );
-        }
-        Ok(value)
     }
 
     fn logs(
@@ -292,7 +308,7 @@ impl CiRuntime {
         since: u64,
         limit: usize,
         max_bytes: usize,
-    ) -> Result<Value, CiError> {
+    ) -> Result<LogsReply, CiError> {
         let (visible, offset, done) = {
             let state = self.lock();
             let slot = state.slot(run)?;
@@ -319,17 +335,17 @@ impl CiRuntime {
                 max_bytes,
             },
         );
-        Ok(json!({
-            "run": run,
-            "records": page.records,
-            "next_seq": page.next_seq,
-            "total_records": visible,
-            "more": page.truncated || page.next_seq < visible,
-            "done": done,
-        }))
+        Ok(LogsReply {
+            run: run.into(),
+            more: page.truncated || page.next_seq < visible,
+            records: page.records,
+            next_seq: page.next_seq,
+            total_records: visible,
+            done,
+        })
     }
 
-    fn cancel(&self, run: &str) -> Result<Value, CiError> {
+    fn cancel(&self, run: &str) -> Result<CancelReply, CiError> {
         let mut state = self.lock();
         if state.scheduler.cancel_queued(run) {
             drop(state);
@@ -337,7 +353,11 @@ impl CiRuntime {
                 slot.record
                     .finish(Conclusion::Cancelled, Some("cancelled while queued".into()));
             });
-            return Ok(json!({"run": run, "cancelled": true, "state": RunState::Done}));
+            return Ok(CancelReply {
+                run: run.into(),
+                cancelled: true,
+                state: RunState::Done,
+            });
         }
         let slot = state.slot(run)?;
         let cancelled = match (&slot.cancel, slot.record.state) {
@@ -347,10 +367,14 @@ impl CiRuntime {
             }
             _ => false,
         };
-        Ok(json!({"run": run, "cancelled": cancelled, "state": slot.record.state}))
+        Ok(CancelReply {
+            run: run.into(),
+            cancelled,
+            state: slot.record.state,
+        })
     }
 
-    async fn retry(&self, run: &str, job: Option<String>) -> Result<Value, CiError> {
+    async fn retry(&self, run: &str, job: Option<String>) -> Result<SubmitReply, CiError> {
         let original = self.record(run)?;
         if original.state != RunState::Done {
             return Err(CiError::refused("the run is still in progress"));
@@ -377,7 +401,7 @@ impl CiRuntime {
         self.admit(original.retry(id, job), &staging, &payload)
     }
 
-    async fn report(&self, run: &str, tail: usize) -> Result<Value, CiError> {
+    async fn report(&self, run: &str, tail: usize) -> Result<RunReport, CiError> {
         let record = self.record(run)?;
         let store = self.store.clone();
         blocking(move || {
@@ -392,7 +416,7 @@ impl CiRuntime {
         .await
     }
 
-    async fn runners(&self, action: RunnerAction) -> Result<Value, CiError> {
+    async fn runners(&self, action: RunnerAction) -> Result<RunnersReply, CiError> {
         let mut pruned = None;
         if let RunnerAction::PruneCache {
             older_than_secs,
@@ -420,7 +444,10 @@ impl CiRuntime {
         let status = runner_status(&state.scheduler);
         drop(state);
         self.kick();
-        Ok(json!({"runners": status, "pruned_runs": pruned}))
+        Ok(RunnersReply {
+            runners: status,
+            pruned_runs: pruned,
+        })
     }
 
     /// Remove finished runs by age, total size, or beyond the retention
@@ -599,14 +626,21 @@ impl CiRuntime {
     }
 }
 
-fn runner_status(scheduler: &Scheduler) -> Value {
-    json!({
-        "limit": scheduler.limit(),
-        "running": scheduler.running(),
-        "queued": scheduler.queued(),
-        "drained": scheduler.drained(),
-        "engine": "act",
-        "act_version": ACT_VERSION,
+fn runner_status(scheduler: &Scheduler) -> RunnerStatus {
+    RunnerStatus {
+        limit: scheduler.limit(),
+        running: scheduler.running(),
+        queued: scheduler.queued(),
+        drained: scheduler.drained(),
+        engine: "act".into(),
+        act_version: ACT_VERSION.into(),
+    }
+}
+
+/// Serialize a typed reply for the daemon frame.
+fn wire<T: serde::Serialize>(reply: Result<T, CiError>) -> Result<Value, CiError> {
+    reply.and_then(|reply| {
+        serde_json::to_value(reply).map_err(|e| CiError::new("internal", e.to_string()))
     })
 }
 
@@ -776,7 +810,7 @@ impl CiRuntime {
     pub(crate) fn save(&self, record: &RunRecord) {
         self.store.save_run(record);
     }
-    pub(crate) fn listing(&self) -> Value {
+    pub(crate) fn listing(&self) -> ListReply {
         self.list(None, None, 100)
     }
 }

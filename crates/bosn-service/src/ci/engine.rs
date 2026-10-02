@@ -268,30 +268,13 @@ impl ActEngineBackend for DockerActBackend {
                 }
                 return Err(format!("engine inspect failed: {}", stderr.trim()));
             }
-            let value: serde_json::Value = serde_json::from_slice(&result.stdout)
-                .map_err(|_| "engine inspect returned invalid JSON".to_string())?;
-            let text = |pointer: &str| {
-                value
-                    .pointer(pointer)
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            };
-            let labels = value
-                .pointer("/Config/Labels")
-                .and_then(serde_json::Value::as_object)
-                .map(|m| {
-                    m.iter()
-                        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let inspected: ContainerInspect = serde_json::from_slice(&result.stdout)
+                .map_err(|_| "engine inspect returned an unexpected document".to_string())?;
             Ok(Some(ActEngineObservation {
-                name: text("/Name")
-                    .map(|n| n.trim_start_matches('/').to_string())
-                    .ok_or("engine inspect has no name")?,
-                engine_id: text("/Id").ok_or("engine inspect has no ID")?,
-                image_digest: text("/Image").ok_or("engine inspect has no image")?,
-                labels,
+                name: inspected.name.trim_start_matches('/').to_string(),
+                engine_id: inspected.id,
+                image_digest: inspected.image,
+                labels: inspected.config.labels.unwrap_or_default(),
             }))
         })
     }
@@ -471,6 +454,25 @@ impl ActEngineBackend for DockerActBackend {
             .map(|_| ())
         })
     }
+}
+
+/// The fields of `docker container inspect` the ownership checks need.
+#[derive(serde::Deserialize)]
+struct ContainerInspect {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Image")]
+    image: String,
+    #[serde(rename = "Config")]
+    config: ContainerConfig,
+}
+
+#[derive(serde::Deserialize)]
+struct ContainerConfig {
+    #[serde(rename = "Labels")]
+    labels: Option<BTreeMap<String, String>>,
 }
 
 /// Splits a byte stream into bounded UTF-8 lines.
