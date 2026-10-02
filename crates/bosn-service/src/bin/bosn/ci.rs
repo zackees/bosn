@@ -276,6 +276,7 @@ fn submit(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
     bosn_service::ci::plan(&options).map_err(describe)?;
     let (runtime, client) = connect(&flags)?;
     let submitted = call(&runtime, client.ci_submit(options))?;
+    maybe_start_widget(&runtime, &client, &flags);
     if !flags.has("--wait") {
         print(&submitted, flags.json(), |s| {
             let how = if s.coalesced {
@@ -292,6 +293,24 @@ fn submit(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
         eprintln!("run {} submitted; waiting", submitted.run);
     }
     finish(&runtime, &client, &submitted.run, &flags)
+}
+
+/// The CLI's fallback auto-launch: when the daemon reports no widget and
+/// this terminal has a desktop, start `bosn-widget` detached (it respects a
+/// dismissal itself). Never fails the command.
+fn maybe_start_widget(runtime: &Runtime, client: &Client, flags: &Flags) {
+    use bosn_service::ci::widget::{AutoLaunch, WidgetPresence};
+    let state_dir = flags.state_dir();
+    let policy = bosn_service::ci::config::load(&state_dir).map(|c| c.widget.auto_launch);
+    if policy == Ok(AutoLaunch::Never) || !super::widget::graphical_session() {
+        return;
+    }
+    let absent = runtime
+        .run(client.ci_runners(RunnerAction::List))
+        .is_ok_and(|r| r.runners.widget == WidgetPresence::Absent);
+    if let (true, Some(binary)) = (absent, super::widget::widget_binary()) {
+        let _ = super::widget::spawn_detached(&binary, &state_dir, true);
+    }
 }
 
 /// Wait for a run, then print its full record and return its exit code
@@ -475,6 +494,7 @@ pub fn run_ui(arguments: impl Iterator<Item = OsString>) {
             &runtime,
             client.ci_ui_grant(flags.get("--path").map(str::to_string)),
         )?;
+        maybe_start_widget(&runtime, &client, &flags);
         if flags.has("--print") {
             println!("{}", grant.url);
             return Ok(0);

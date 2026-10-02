@@ -824,6 +824,11 @@ impl Client {
     ) -> Result<ci::RunReport, Error> {
         self.ci_call(ci::CiRequest::Report { run, tail }).await
     }
+    /// A widget request (`WidgetHello`, `WidgetPoll`, `WidgetDismiss`,
+    /// `WidgetCommand`); every one answers with the widget's state.
+    pub async fn ci_widget(&self, request: ci::CiRequest) -> Result<ci::WidgetReply, Error> {
+        self.ci_call(request).await
+    }
     pub async fn ci_ui_grant(&self, path: Option<String>) -> Result<ci::UiGrantReply, Error> {
         self.ci_call(ci::CiRequest::UiGrant { path }).await
     }

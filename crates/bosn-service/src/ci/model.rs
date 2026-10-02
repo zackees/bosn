@@ -731,7 +731,11 @@ mod tests {
         assert_eq!(by_id("0").duration_ms, Some(2));
         assert_eq!(by_id("1").conclusion, Some(ItemConclusion::Skipped));
         assert_eq!(by_id("2/0").conclusion, Some(ItemConclusion::Failure));
-        assert_eq!(by_id("2/0").name, "2/0 › 0", "nested steps show their sub-path");
+        assert_eq!(
+            by_id("2/0").name,
+            "2/0 › 0",
+            "nested steps show their sub-path"
+        );
         assert_eq!(records[2].section, None, "pre-start noise is not a section");
         assert_eq!(records[6].text, r#"{"truncated":"#);
     }

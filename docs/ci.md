@@ -83,6 +83,73 @@ committed copy is stale. After an intentional change, regenerate it with:
 BOSN_UPDATE_SCHEMA=1 cargo test -p bosn-service published_schema
 ```
 
+## Desktop widget (`bosn widget`)
+
+`bosn-widget` is a separate binary. It links the webview toolkit, so the
+`bosn` CLI, the daemon and headless installs never do. It runs in the user
+session and opens three kinds of window onto daemon pages, each signed in
+with its own single-use grant:
+
+- a small **bubble** (`/widget/bubble`): running, queued and failed counts,
+  coloured by the worst state;
+- a **panel** (`/widget/panel`), toggled from the bubble: runs across
+  workspaces with actor, branch, SHA (`+dirty`) and progress, plus runner
+  controls;
+- one **full view** (the dashboard).
+
+The pages never call native code. A click POSTs to the daemon
+(`/v1/widget/toggle`, `/open` and `/open-external`), and the widget picks the
+command up on its next one-second poll. External links open in the OS
+browser only for `https` URLs on `github.com`, `gitlab.com` or a host listed
+in `[widget] external_hosts`.
+
+```sh
+bosn widget              # run it (a second start shows the running bubble)
+bosn widget --detach
+bosn widget install      # systemd user unit, started with the graphical session
+```
+
+**When it appears.** `[widget] auto_launch` is `always` (the default),
+`on-activity` or `never`.
+
+- The daemon tries `systemctl --user start bosn-widget.service`:
+  - with `always`, when the daemon starts;
+  - with `always` or `on-activity`, when a run is submitted.
+  It tries at most once every 10 seconds, and only while no widget is
+  connected and the dashboard listener is enabled.
+- `bosn ci run` and `bosn ui` start it detached themselves when the daemon
+  reports none and the terminal has a desktop.
+
+**Quitting.** Closing the bubble is a deliberate quit. It suppresses
+auto-launch until the next login (a new graphical session) or an explicit
+`bosn widget`. A crash is not a quit: systemd restarts it, backing off after
+five failures in a minute.
+
+**Notifications.** The widget sends a desktop notification for every failed
+run, and for the completion of runs a human started. Agent successes stay
+silent.
+
+**KDE Plasma on Wayland.** The window app id is `bosn-widget`. Until
+kernal-api#384 adds keep-above and undecorated windows, a KWin rule does the
+placement. Declare it in the desktop configuration (zackees/nixos):
+
+```ini
+[bosn widget bubble]
+Description=bosn widget bubble
+wmclass=bosn-widget
+wmclassmatch=1
+title=bosn
+titlematch=1
+above=true
+aboverule=2
+noborder=true
+noborderrule=2
+skiptaskbar=true
+skiptaskbarrule=2
+skippager=true
+skippagerrule=2
+```
+
 ## Exit codes
 
 | Code | Meaning |
@@ -205,5 +272,5 @@ These are tracked in #323:
 
 - Cross-repository sharing of compiler caches (zccache/soldr) outside
   `actions/cache`.
-- The desktop widget and a native full-view window (blocked on zackees/kernal-api#384).
+- Transparent, compositor-anchored widget windows (zackees/kernal-api#384; KWin rules cover keep-above today).
 - GitLab.

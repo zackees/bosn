@@ -58,6 +58,8 @@ mod secret;
 mod setup;
 #[path = "bosn/setup_args.rs"]
 mod setup_args;
+#[path = "bosn/widget.rs"]
+mod widget;
 use args::*;
 use daemon::*;
 use gc::*;
@@ -97,6 +99,7 @@ fn main() {
         "act" => act::run(arguments),
         "ci" => ci::run(arguments, None),
         "ui" => ci::run_ui(arguments),
+        "widget" => widget::run(arguments),
         "manifest" => run_manifest(arguments),
         "run" => run::run(arguments),
         "setup" => run_setup(arguments),
@@ -189,6 +192,7 @@ fn usage() -> ! {
     );
     eprintln!("   or: bosn act run|report (deprecated alias of bosn ci run|report)");
     eprintln!("   or: {}", ci::USAGE.trim_start_matches("usage: "));
+    eprintln!("   or: {}", widget::USAGE.trim_start_matches("usage: "));
     eprintln!("usage: bosn mcp [--state-dir STATE_DIR]");
     eprintln!("   or: {}", run::USAGE.trim_start_matches("usage: "));
     eprintln!(
