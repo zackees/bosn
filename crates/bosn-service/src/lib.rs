@@ -7604,16 +7604,21 @@ async fn registry_actor(
     mut receiver: async_engine::Receiver<DbCommand>,
     #[cfg(test)] mut setup_ensure_record_gate: Option<SetupEnsureRecordGate>,
 ) {
+    // The sole writer lease fences prior daemon owners. This authority expires
+    // before any new Act creation/claim and is never restored by reads.
+    let mut act_startup_open = true;
     while let Some(command) = receiver.recv().await {
         match command {
             DbCommand::ActRegistry { command, reply } => {
                 let worker = async_engine::launch_blocking(move || {
-                    let result = act_registry::apply(&mut registry, *command);
-                    (registry, result)
+                    let result =
+                        act_registry::apply(&mut registry, *command, &mut act_startup_open);
+                    (registry, act_startup_open, result)
                 });
                 match worker.await {
-                    Ok((returned, result)) => {
+                    Ok((returned, startup_open, result)) => {
                         registry = returned;
+                        act_startup_open = startup_open;
                         let _ = reply.send(result.map_err(Error::Registry));
                     }
                     Err(_) => {

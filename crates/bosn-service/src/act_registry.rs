@@ -14,6 +14,13 @@ use kernal_api::async_engine;
 /// There is deliberately no corresponding protobuf/client operation.
 #[derive(Debug)]
 pub enum ActRegistryCommand {
+    /// Only before this writer actor admits any new creation/execution.
+    StartupInterrupt {
+        run: String,
+        at: f64,
+    },
+    /// Irreversibly withdraw startup recovery authority for this actor.
+    SealStartup,
     Begin(ActEngineIntent),
     Register {
         run: String,
@@ -103,7 +110,53 @@ impl RegistryActor {
 pub(crate) fn apply(
     registry: &mut Registry,
     command: ActRegistryCommand,
+    startup_open: &mut bool,
 ) -> Result<ActRegistryReply, bosn_registry::Error> {
+    // Admission closes the window even if its transaction is later refused or
+    // its caller loses the reply. Actor queue order is the authority boundary.
+    if matches!(
+        &command,
+        ActRegistryCommand::Begin(_)
+            | ActRegistryCommand::Claim { .. }
+            | ActRegistryCommand::SealStartup
+    ) {
+        *startup_open = false;
+    }
+    if matches!(&command, ActRegistryCommand::SealStartup) {
+        return Ok(ActRegistryReply::Committed);
+    }
+    if let ActRegistryCommand::StartupInterrupt { run, at } = &command {
+        if !*startup_open {
+            return Err(bosn_registry::Error::BadRow(
+                "act startup recovery window sealed",
+            ));
+        }
+        let record = registry
+            .act_engine(run)?
+            .ok_or(bosn_registry::Error::BadRow("act startup intent missing"))?;
+        if !at.is_finite() || *at < record.updated_at {
+            return Err(bosn_registry::Error::BadRow("act startup time"));
+        }
+        if record.state == bosn_registry::act::ActEngineState::Terminal {
+            return Err(bosn_registry::Error::BadRow("act startup terminal intent"));
+        }
+        if record.state == bosn_registry::act::ActEngineState::CleanupRequired {
+            return Ok(ActRegistryReply::Committed);
+        }
+        let mut transaction = registry.begin_immediate()?;
+        if let Some(token) = record.execution_claim {
+            transaction.request_act_execution_cleanup(
+                run,
+                &token,
+                ActRunOutcome::Interrupted,
+                *at,
+            )?;
+        } else {
+            transaction.request_act_cleanup(run, ActRunOutcome::Interrupted, *at)?;
+        }
+        transaction.commit()?;
+        return Ok(ActRegistryReply::Committed);
+    }
     if let ActRegistryCommand::Pending {
         after_run_id,
         limit,
@@ -182,7 +235,11 @@ pub(crate) fn apply(
             transaction.finalize_act_cleanup(&run, &proof, at)?;
             ActRegistryReply::Committed
         }
-        ActRegistryCommand::Pending { .. } => unreachable!("read handled before transaction"),
+        ActRegistryCommand::Pending { .. }
+        | ActRegistryCommand::StartupInterrupt { .. }
+        | ActRegistryCommand::SealStartup => {
+            unreachable!("startup/read handled before transaction")
+        }
     };
     transaction.commit()?;
     Ok(reply)
@@ -329,5 +386,301 @@ mod tests {
             registry.act_engine(&intent.run_id).unwrap().unwrap().intent,
             intent
         );
+    }
+    fn startup_fixture() -> ActEngineIntent {
+        ActEngineIntent {
+            run_id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".into(),
+            workspace: "/private/source".into(),
+            candidate_sha: "a".repeat(40),
+            payload_sha256: "b".repeat(64),
+            snapshot_sha256: "c".repeat(64),
+            act_version: "0.2.88".into(),
+            act_image_digest: format!("sha256:{}", "d".repeat(64)),
+            engine_image_digest: format!("sha256:{}", "e".repeat(64)),
+            runner_image_digest: format!("sha256:{}", "f".repeat(64)),
+            created_at: 1.0,
+            creation_profile: Some(bosn_registry::act::ActEngineCreationProfile {
+                memory_bytes: 28 << 30,
+                storage_bytes: 20 << 30,
+                nano_cpus: 2_000_000_000,
+                pids: 1024,
+                run_tmpfs_bytes: 16 << 20,
+                tmp_tmpfs_bytes: 64 << 20,
+                tmpfs_policy: bosn_registry::act::ActEngineTmpfsPolicy::StorageExecRunTmpNoexecV1,
+                init_command_sha256: "a".repeat(64),
+            }),
+        }
+    }
+    const STARTUP_OWNER: &str = "11111111-2222-4333-8444-555555555555";
+    const STALE_CLAIM: &str = "12345678-1234-4234-8234-123456789abc";
+    fn seed_claim(registry: &mut Registry, intent: &ActEngineIntent) -> ActEngineObservation {
+        let observed = ActEngineObservation {
+            name: intent.engine_name(),
+            engine_id: "1".repeat(64),
+            image_digest: intent.engine_image_digest.clone(),
+            labels: intent.required_labels(STARTUP_OWNER).unwrap(),
+        };
+        let mut tx = registry.begin_immediate().unwrap();
+        tx.begin_act_engine(intent).unwrap();
+        tx.register_act_engine(&intent.run_id, &observed, 2.0)
+            .unwrap();
+        tx.claim_act_execution(intent, &observed, STALE_CLAIM, 3.0)
+            .unwrap();
+        tx.commit().unwrap();
+        observed
+    }
+    async fn pending(actor: &RegistryActor) -> Vec<ActEngineRecord> {
+        let ActRegistryReply::Recovery(page) = actor
+            .act_registry(ActRegistryCommand::Pending {
+                after_run_id: None,
+                limit: 16,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("recovery page")
+        };
+        page.items
+    }
+    #[test]
+    fn startup_writer_fence_recovers_stale_v2_claim_after_reopen() {
+        let dir = TemporaryDirectory::new().unwrap();
+        let path = dir.path().join("startup.sqlite3");
+        let intent = startup_fixture();
+        let mut writer = Registry::create_writer(&path, STARTUP_OWNER).unwrap();
+        seed_claim(&mut writer, &intent);
+        let mut old =
+            serde_json::to_value(writer.act_engine(&intent.run_id).unwrap().unwrap()).unwrap();
+        old["schema_version"] = serde_json::json!(2);
+        old["intent"]
+            .as_object_mut()
+            .unwrap()
+            .remove("creation_profile");
+        let mut tx = writer.begin_immediate().unwrap();
+        tx.append_event(
+            3.0,
+            &format!("act.engine.v1:{}", intent.run_id),
+            &serde_json::to_string(&old).unwrap(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        drop(writer);
+        let registry = Registry::open_writer(&path).unwrap();
+        assert!(
+            Registry::open_writer(&path).is_err(),
+            "only one recovery writer"
+        );
+        async_engine::RuntimeBuilder::multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let (sender, receiver) = async_engine::channel(16);
+                let actor = RegistryActor { sender };
+                let task = async_engine::launch(crate::registry_actor(registry, receiver, None));
+                for _ in 0..2 {
+                    assert_eq!(
+                        pending(&actor).await[0].execution_claim.as_deref(),
+                        Some(STALE_CLAIM)
+                    );
+                }
+                actor
+                    .act_registry(ActRegistryCommand::StartupInterrupt {
+                        run: intent.run_id.clone(),
+                        at: 4.0,
+                    })
+                    .await
+                    .unwrap();
+                let current = pending(&actor).await.remove(0);
+                assert_eq!(
+                    current.state,
+                    bosn_registry::act::ActEngineState::CleanupRequired
+                );
+                assert_eq!(current.outcome, Some(ActRunOutcome::Interrupted));
+                assert_eq!(current.execution, None);
+                assert_eq!(current.execution_claim.as_deref(), Some(STALE_CLAIM));
+                actor
+                    .act_registry(ActRegistryCommand::SealStartup)
+                    .await
+                    .unwrap();
+                assert!(
+                    actor
+                        .act_registry(ActRegistryCommand::StartupInterrupt {
+                            run: intent.run_id.clone(),
+                            at: 5.0
+                        })
+                        .await
+                        .is_err()
+                );
+                assert_eq!(pending(&actor).await.remove(0), current);
+                actor.stop().await;
+                task.await.unwrap();
+            });
+        let reopened = Registry::open_writer(&path).unwrap();
+        assert_eq!(
+            reopened
+                .act_engine(&intent.run_id)
+                .unwrap()
+                .unwrap()
+                .outcome,
+            Some(ActRunOutcome::Interrupted)
+        );
+    }
+    #[test]
+    fn admission_or_seal_irreversibly_closes_startup_and_preserves_live_claim() {
+        for close in ["seal", "begin", "claim"] {
+            let dir = TemporaryDirectory::new().unwrap();
+            let path = dir.path().join("fenced.sqlite3");
+            let intent = startup_fixture();
+            let mut registry = Registry::create_writer(&path, STARTUP_OWNER).unwrap();
+            let observed = seed_claim(&mut registry, &intent);
+            async_engine::RuntimeBuilder::multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .run(async {
+                    let (sender, receiver) = async_engine::channel(16);
+                    let actor = RegistryActor { sender };
+                    let task =
+                        async_engine::launch(crate::registry_actor(registry, receiver, None));
+                    let before = pending(&actor).await.remove(0);
+                    match close {
+                        "seal" => {
+                            actor
+                                .act_registry(ActRegistryCommand::SealStartup)
+                                .await
+                                .unwrap();
+                        }
+                        "begin" => {
+                            let mut next = intent.clone();
+                            next.run_id = "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee".into();
+                            actor
+                                .act_registry(ActRegistryCommand::Begin(next))
+                                .await
+                                .unwrap();
+                        }
+                        _ => {
+                            assert!(
+                                actor
+                                    .act_registry(ActRegistryCommand::Claim {
+                                        intent: intent.clone(),
+                                        observed: observed.clone(),
+                                        token: STALE_CLAIM.into(),
+                                        at: 4.0
+                                    })
+                                    .await
+                                    .is_err()
+                            );
+                        }
+                    }
+                    for _ in 0..2 {
+                        assert!(
+                            actor
+                                .act_registry(ActRegistryCommand::StartupInterrupt {
+                                    run: intent.run_id.clone(),
+                                    at: 5.0
+                                })
+                                .await
+                                .is_err()
+                        );
+                        let current = pending(&actor)
+                            .await
+                            .into_iter()
+                            .find(|r| r.intent.run_id == intent.run_id)
+                            .unwrap();
+                        assert_eq!(current, before);
+                    }
+                    actor.stop().await;
+                    task.await.unwrap();
+                });
+        }
+    }
+    #[test]
+    fn startup_handles_pending_registered_cleanup_and_terminal_without_success() {
+        for initial in ["pending", "registered", "cleanup", "terminal"] {
+            let dir = TemporaryDirectory::new().unwrap();
+            let path = dir.path().join("states.sqlite3");
+            let intent = startup_fixture();
+            let mut writer = Registry::create_writer(&path, STARTUP_OWNER).unwrap();
+            let observed = ActEngineObservation {
+                name: intent.engine_name(),
+                engine_id: "1".repeat(64),
+                image_digest: intent.engine_image_digest.clone(),
+                labels: intent.required_labels(STARTUP_OWNER).unwrap(),
+            };
+            let mut tx = writer.begin_immediate().unwrap();
+            tx.begin_act_engine(&intent).unwrap();
+            if initial != "pending" {
+                tx.register_act_engine(&intent.run_id, &observed, 2.0)
+                    .unwrap();
+            }
+            if matches!(initial, "cleanup" | "terminal") {
+                tx.request_act_cleanup(&intent.run_id, ActRunOutcome::Failed, 3.0)
+                    .unwrap();
+            }
+            if initial == "terminal" {
+                tx.finalize_act_cleanup(
+                    &intent.run_id,
+                    &ActEngineRemovalProof {
+                        name: intent.engine_name(),
+                        engine_id: Some(observed.engine_id),
+                    },
+                    4.0,
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+            let before = writer.act_engine(&intent.run_id).unwrap().unwrap();
+            async_engine::RuntimeBuilder::multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .run(async {
+                    let (sender, receiver) = async_engine::channel(16);
+                    let actor = RegistryActor { sender };
+                    let task = async_engine::launch(crate::registry_actor(writer, receiver, None));
+                    assert!(
+                        actor
+                            .act_registry(ActRegistryCommand::StartupInterrupt {
+                                run: intent.run_id.clone(),
+                                at: f64::NAN
+                            })
+                            .await
+                            .is_err()
+                    );
+                    let result = actor
+                        .act_registry(ActRegistryCommand::StartupInterrupt {
+                            run: intent.run_id.clone(),
+                            at: 5.0,
+                        })
+                        .await;
+                    assert_eq!(result.is_err(), initial == "terminal");
+                    if initial != "terminal" {
+                        let current = pending(&actor).await.remove(0);
+                        assert_eq!(
+                            current.state,
+                            bosn_registry::act::ActEngineState::CleanupRequired
+                        );
+                        assert_eq!(current.execution, None);
+                        if initial == "cleanup" {
+                            assert_eq!(current, before);
+                        } else {
+                            assert_eq!(current.outcome, Some(ActRunOutcome::Interrupted));
+                        }
+                    }
+                    actor.stop().await;
+                    task.await.unwrap();
+                });
+            if initial == "terminal" {
+                assert_eq!(
+                    Registry::open_writer(&path)
+                        .unwrap()
+                        .act_engine(&intent.run_id)
+                        .unwrap()
+                        .unwrap(),
+                    before
+                );
+            }
+        }
     }
 }
