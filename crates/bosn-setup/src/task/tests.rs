@@ -250,7 +250,7 @@ fn declared_task_becomes_only_a_semantic_bounded_run_command() {
         ]
         .into_iter()
         .map(String::from)
-        .chain(crate::shell::login_shell_args("cargo test --locked"))
+        .chain(crate::shell::task_shell_args("cargo test --locked"))
         .collect::<Vec<_>>()
     );
 }
@@ -307,7 +307,7 @@ fn declared_app_task_has_only_the_content_addressed_exec_shape() {
         ]
         .into_iter()
         .map(String::from)
-        .chain(crate::shell::login_shell_args("cargo test --locked"))
+        .chain(crate::shell::task_shell_args("cargo test --locked"))
         .collect::<Vec<_>>()
     );
 }
@@ -334,7 +334,7 @@ fn app_task_secret_env_is_forwarded_by_name_only() {
         ]
         .into_iter()
         .map(String::from)
-        .chain(crate::shell::login_shell_args("true"))
+        .chain(crate::shell::task_shell_args("true"))
         .collect::<Vec<_>>()
     );
     assert!(args.iter().all(|arg| !arg.contains("GITHUB_TOKEN=")));
