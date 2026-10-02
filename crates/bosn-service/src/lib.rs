@@ -52,6 +52,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 pub mod act_archive;
+#[cfg(target_os = "linux")]
+pub mod act_artifacts;
 pub mod act_engine;
 pub mod act_image;
 #[cfg(test)]
