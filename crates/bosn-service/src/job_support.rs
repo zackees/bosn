@@ -43,6 +43,27 @@ impl ManifestAppTaskSessionRecorder for ActorManifestAppTaskSessionRecorder {
     fn run_context(&self) -> Option<&RunContext> {
         self.run.as_ref()
     }
+    fn stop_retired_generations<'a>(
+        &'a self,
+        workspace: &'a str,
+        stack: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + 'a>> {
+        Box::pin(async move {
+            match stop_retired_stack_containers(&self.actor, workspace, stack).await {
+                Ok(stops) => stops
+                    .stopped
+                    .iter()
+                    .map(|name| format!("[manifest-app-task] stopped retired generation {name}"))
+                    .chain(stops.failed.iter().map(|(name, error)| {
+                        format!("[manifest-app-task] warning: retired generation {name} was not stopped: {error}")
+                    }))
+                    .collect(),
+                Err(error) => vec![format!(
+                    "[manifest-app-task] warning: retired generations of stack {stack} were not listed: {error}"
+                )],
+            }
+        })
+    }
     fn begin<'a>(
         &'a self,
         managed_container_identity: String,

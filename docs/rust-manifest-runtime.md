@@ -177,7 +177,7 @@ changed.
 | image tags or unpinned image references | Refused |
 | generic `run`, shell, arbitrary Docker arguments | Not exposed |
 | all-stack orchestration | Supported by `manifest converge`: every declared stack in lexical order, one at a time, with per-stack durable records and partial-success semantics. The TOML model has no dependencies/root selector; dependency spellings fail closed rather than being guessed. |
-| replacement/rollover | Supported for this accepted subset; a new immutable generation is ensured first, then only the same-workspace/stack prior manifest container is registry-retired |
+| replacement/rollover | Supported for this accepted subset; a new immutable generation is ensured first, then only the same-workspace/stack prior manifest container is registry-retired. Because `stack`/`machine` volumes outlive a generation, a declared task first stops every retired container of its stack that no task runs in (the explicit retired-stop's checks: no execution session, lease or foreign use), and the last task to finish in a retired container stops it, so no retired daemon keeps serving the shared volumes (#383). Stopped containers stay for GC |
 
 Guest task authentication is daemon-owned but not auto-provisioned: before the
 first guest task, install one private key at `STATE_DIR/guest-ssh/id_ed25519`

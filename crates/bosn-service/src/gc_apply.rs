@@ -472,6 +472,79 @@ pub(crate) async fn stop_setup_retired_candidate(
     token: String,
 ) -> Result<SetupRetiredStopResult, Error> {
     let (id, name, generation) = parse_setup_gc_token(&token)?;
+    stop_retired_container(actor, workspace, id, name, generation)
+        .await?
+        .ok_or(Error::Protocol("setup retired stop candidate is absent"))
+}
+
+/// What [`stop_retired_stack_containers`] did, by container name.
+#[derive(Debug, Default)]
+pub(crate) struct RetiredStackStops {
+    pub(crate) stopped: Vec<String>,
+    /// A candidate that could not be stopped, with the reason.
+    pub(crate) failed: Vec<(String, Error)>,
+}
+
+/// Stop every retired container of one manifest stack that no task runs in
+/// (#383). Stack- and machine-scoped volumes outlive a generation, so a
+/// retired container's daemons (soldr-broker in `/root/.soldr`) would
+/// otherwise keep serving the shared volumes to the new generation from a
+/// different mount namespace. The selection is the explicit retired-stop's:
+/// an execution session or lease still protects a container, and its last
+/// task stops it on finishing.
+pub(crate) async fn stop_retired_stack_containers(
+    actor: &RegistryActor,
+    workspace: &str,
+    stack: &str,
+) -> Result<RetiredStackStops, Error> {
+    let prefix = setup_container_resource_id("manifest-container", stack, "");
+    let mut retired = Vec::new();
+    let mut after = 0;
+    loop {
+        let page = actor
+            .setup_gc_preview(workspace.to_owned(), after, MAX_REGISTRY_DIAGNOSTIC_PAGE)
+            .await?;
+        retired.extend(
+            page.candidates
+                .into_iter()
+                .filter(|candidate| candidate.id.starts_with(&prefix)),
+        );
+        match page.next {
+            Some(next) => after = next,
+            None => break,
+        }
+    }
+    let mut stops = RetiredStackStops::default();
+    for candidate in retired {
+        let name = candidate.name.clone();
+        match stop_retired_container(
+            actor,
+            workspace.to_owned(),
+            candidate.id,
+            candidate.name,
+            candidate.generation,
+        )
+        .await
+        {
+            Ok(Some(result)) if result.stopped => stops.stopped.push(name),
+            // Already stopped, or removed outside Bosn: nothing runs in it.
+            Ok(_) => {}
+            Err(error) => stops.failed.push((name, error)),
+        }
+    }
+    Ok(stops)
+}
+
+/// Recheck one retired candidate against the registry and Docker, then stop
+/// it; `None` when Docker no longer has it. The registry record is retained
+/// for GC.
+async fn stop_retired_container(
+    actor: &RegistryActor,
+    workspace: String,
+    id: String,
+    name: String,
+    generation: String,
+) -> Result<Option<SetupRetiredStopResult>, Error> {
     let candidate = actor
         .setup_gc_candidate(workspace.clone(), id, name, generation)
         .await?
@@ -480,14 +553,14 @@ pub(crate) async fn stop_setup_retired_candidate(
         ))?;
     let engine = DockerEngine::docker();
     match inspect_setup_gc_container(&engine, &candidate).await? {
-        None => return Err(Error::Protocol("setup retired stop candidate is absent")),
+        None => return Ok(None),
         Some(false) => {
             // Already stopped is idempotent. Do not add duplicate events and
             // keep the exact retired candidate eligible for explicit GC.
-            return Ok(SetupRetiredStopResult {
+            return Ok(Some(SetupRetiredStopResult {
                 stopped: false,
                 already_stopped: true,
-            });
+            }));
         }
         Some(true) => {}
     }
@@ -529,8 +602,8 @@ pub(crate) async fn stop_setup_retired_candidate(
     if !recorded {
         return Err(Error::Protocol("setup retired stop registry became stale"));
     }
-    Ok(SetupRetiredStopResult {
+    Ok(Some(SetupRetiredStopResult {
         stopped: true,
         already_stopped: false,
-    })
+    }))
 }
