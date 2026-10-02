@@ -16,6 +16,10 @@ bosn ci cancel RUN | retry RUN [--job K] | wait RUN --deadline-ms N
 bosn ci runners [list|drain|resume|set-limit N|prune-cache]
 ```
 
+`--timeout-secs N` (default 2 hours) bounds the whole run from the moment it
+starts: resolving and pulling images, preparing the engine and running act. A
+run that exceeds it ends `timed_out`, and its engine is still removed.
+
 ## Agents: MCP tools and `bosn.Client`
 
 `bosn mcp` serves `bosn_ci_plan`, `bosn_ci_run`, `bosn_ci_status`,

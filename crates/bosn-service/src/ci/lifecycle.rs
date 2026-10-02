@@ -32,8 +32,9 @@ pub struct EnginePlan {
     pub event: PathBuf,
     pub invocation: ActInvocation,
     pub cache: CacheVolume,
-    /// Covers everything after the engine exists: prepare and execution.
-    pub deadline: Duration,
+    /// The run's deadline, fixed when the run started: planning, prepare,
+    /// the job listing and execution all count against it.
+    pub deadline: async_engine::Deadline,
 }
 
 /// How the workflow execution itself ended.
@@ -157,7 +158,7 @@ pub async fn run_on_engine(
         if cancellation.is_cancelled() {
             break 'run ExecutionEnd::Cancelled;
         }
-        let deadline = async_engine::Deadline::after(plan.deadline);
+        let deadline = plan.deadline;
         observer.note("preparing engine: act, frozen source, runner image");
         let prepared = async_engine::timeout_at(
             deadline,
@@ -173,9 +174,12 @@ pub async fn run_on_engine(
             Ok(Ok(Err(error))) => break 'run ExecutionEnd::EngineFailed(error),
             Ok(Ok(Ok(()))) => {}
         }
-        match backend.list(&name, &plan.invocation.workflow).await {
-            Ok(listing) => observer.declared(&listing),
-            Err(error) => break 'run ExecutionEnd::EngineFailed(error),
+        match async_engine::timeout_at(deadline, backend.list(&name, &plan.invocation.workflow))
+            .await
+        {
+            Err(_) => break 'run ExecutionEnd::TimedOut,
+            Ok(Ok(listing)) => observer.declared(&listing),
+            Ok(Err(error)) => break 'run ExecutionEnd::EngineFailed(error),
         }
         observer.note("running act on the isolated engine");
         let (lines, mut receiver) = async_engine::channel(512);

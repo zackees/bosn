@@ -56,8 +56,15 @@ pub(crate) fn peer_is_authorized(peer_user_id: &str, expected_user_id: &str) -> 
     !peer_user_id.is_empty() && peer_user_id == expected_user_id
 }
 pub(crate) async fn read_frame(s: &mut AsyncStream) -> Result<DaemonFrame, Error> {
+    read_frame_within(s, IO_DEADLINE).await
+}
+/// Read one frame, which must arrive in full within `limit`.
+pub(crate) async fn read_frame_within(
+    s: &mut AsyncStream,
+    limit: Duration,
+) -> Result<DaemonFrame, Error> {
     let mut b = Vec::new();
-    let deadline = async_engine::Deadline::after(IO_DEADLINE);
+    let deadline = async_engine::Deadline::after(limit);
     loop {
         if b.len() > MAX_FRAME {
             return Err(Error::Protocol("frame too large"));

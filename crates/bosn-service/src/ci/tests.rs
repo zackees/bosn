@@ -39,6 +39,11 @@ fn request(staging: &str, sha_byte: char) -> SubmitRequest {
     }
 }
 
+/// A queued record for `id`, for tests that only need its shape.
+pub(crate) fn sample_record(id: &str) -> RunRecord {
+    RunRecord::queued(id.into(), &request("s", 'a'), "push", b"{}")
+}
+
 /// Dispatch like the daemon does and parse the reply as a client would, so
 /// every test also proves the wire reply decodes into its typed reply.
 async fn call<T: serde::de::DeserializeOwned>(runtime: &CiRuntime, request: CiRequest) -> T {
@@ -180,6 +185,35 @@ fn failing_run_reports_the_failing_step_and_only_its_tail() {
         }
         let expected: Vec<u64> = (1..=record.log_records).collect();
         assert_eq!(seen, expected);
+    });
+}
+
+#[test]
+fn the_run_timeout_covers_planning_not_only_execution() {
+    with_registry(|registry, dir| async move {
+        let backend = Arc::new(FakeBackend::with(Faults {
+            slow_image: true,
+            ..Faults::default()
+        }));
+        let runtime = CiRuntime::start(&dir, registry, backend.clone(), 1);
+        let staging = new_uuid().await.unwrap();
+        staged(&runtime, &staging);
+        let mut submission = request(&staging, 'f');
+        submission.timeout_secs = Some(1);
+        let reply: SubmitReply = call(
+            &runtime,
+            CiRequest::Submit {
+                request: submission,
+            },
+        )
+        .await;
+        let record = wait_done(&runtime, &reply.run).await;
+        assert_eq!(record.conclusion, Some(Conclusion::TimedOut));
+        assert_eq!(*backend.executions.lock().unwrap(), 0);
+        assert!(
+            backend.engines.lock().unwrap().is_empty(),
+            "no engine was created"
+        );
     });
 }
 

@@ -4,7 +4,7 @@
 
 use std::{
     collections::BTreeMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard, OnceLock},
     time::{Duration, Instant},
 };
@@ -34,8 +34,10 @@ use super::{
 };
 use crate::{RegistryActor, secrets::SecretMasker};
 mod observer;
+mod persist;
 mod widget;
 use observer::*;
+use persist::{RecordWriter, Save};
 
 /// Finished runs kept, and how many of them keep their source for retry.
 const KEEP_RUNS: usize = 200;
@@ -48,6 +50,19 @@ struct RunSlot {
     cancel: Option<CancellationSource>,
     /// Sparse (seq, byte offset) index into the run's log.
     index: Vec<(u64, u64)>,
+    /// Bumped on every change; orders this run's record writes.
+    version: u64,
+}
+
+impl RunSlot {
+    /// The record's next version, to write once the lock is released.
+    fn snapshot(&mut self) -> Save {
+        self.version += 1;
+        Save {
+            record: self.record.clone(),
+            version: self.version,
+        }
+    }
 }
 
 struct CiState {
@@ -63,7 +78,8 @@ impl CiState {
             .get(run)
             .ok_or_else(|| CiError::new("not_found", format!("no run {run}")))
     }
-    fn insert(&mut self, record: RunRecord) {
+    /// Track a run whose record is on disk at `version`.
+    fn insert(&mut self, record: RunRecord, version: u64) {
         self.order.push(record.id.clone());
         self.runs.insert(
             record.id.clone(),
@@ -71,6 +87,7 @@ impl CiState {
                 record,
                 cancel: None,
                 index: Vec::new(),
+                version,
             },
         );
     }
@@ -82,6 +99,7 @@ pub struct CiRuntime {
     /// The daemon state directory (secrets are read from it per run).
     state_dir: std::path::PathBuf,
     store: Store,
+    writer: RecordWriter,
     state: Arc<Mutex<CiState>>,
     kick: async_engine::Sender<()>,
     registry: RegistryActor,
@@ -123,11 +141,12 @@ impl CiRuntime {
                 );
                 store.save_run(&record);
             }
-            state.insert(record);
+            state.insert(record, 0);
         }
         let (kick, mut kicked) = async_engine::channel(64);
         let runtime = Self {
             state_dir: state_dir.to_path_buf(),
+            writer: RecordWriter::new(store.clone()),
             store,
             state: Arc::new(Mutex::new(state)),
             kick,
@@ -228,10 +247,11 @@ impl CiRuntime {
         let _ = self.kick.try_send(());
     }
 
-    /// Save a record and announce it on the live feed.
-    fn persist(&self, record: &RunRecord) {
-        self.store.save_run(record);
-        self.feed.publish(record);
+    /// Announce a change on the live feed (under the state lock, so events
+    /// keep the order of changes) and return its write.
+    fn announce(&self, slot: &mut RunSlot) -> Save {
+        self.feed.publish(&slot.record);
+        slot.snapshot()
     }
 
     /// Attach the UI listener so `UiGrant` can issue links for it.
@@ -268,13 +288,17 @@ impl CiRuntime {
         self.lock().slot(run).map(|s| s.record.clone())
     }
 
-    /// Apply `change` to a run's record and persist the result.
+    /// Apply `change` to a run's record and write the result in the
+    /// background.
     fn update(&self, run: &str, change: impl FnOnce(&mut RunSlot)) -> Option<RunRecord> {
-        let mut state = self.lock();
-        let slot = state.runs.get_mut(run)?;
-        change(slot);
-        let record = slot.record.clone();
-        self.persist(&record);
+        let save = {
+            let mut state = self.lock();
+            let slot = state.runs.get_mut(run)?;
+            change(slot);
+            self.announce(slot)
+        };
+        let record = save.record.clone();
+        self.writer.save_detached(save);
         Some(record)
     }
 
@@ -295,7 +319,7 @@ impl CiRuntime {
             );
             let payload = serde_json::to_vec_pretty(&payload).unwrap_or_default();
             let record = RunRecord::queued(new_uuid().await?, &request, event, &payload);
-            self.admit(record, &staging, &payload)
+            self.admit(record, staging.clone(), payload).await
         }
         .await;
         if admitted.is_err() && valid_uuid(&request.staging) {
@@ -305,49 +329,73 @@ impl CiRuntime {
     }
 
     /// Queue (or coalesce) a record whose source is staged at `staging`.
-    fn admit(
+    /// The source is placed and the record written before the scheduler
+    /// can see the run, with no lock held.
+    async fn admit(
         &self,
         record: RunRecord,
-        staging: &Path,
-        payload: &[u8],
+        staging: PathBuf,
+        payload: Vec<u8>,
     ) -> Result<SubmitReply, CiError> {
-        let mut state = self.lock();
-        let id = match state.scheduler.submit(record.key(), record.id.clone()) {
-            Admission::Coalesced(existing) => {
-                drop(state);
-                let _ = std::fs::remove_dir_all(staging);
-                let joined = self
-                    .update(&existing, |slot| slot.record.submitters += 1)
-                    .ok_or_else(|| CiError::new("internal", "coalesced run is missing"))?;
-                return Ok(SubmitReply {
-                    run: existing,
+        let (store, writer, id) = (self.store.clone(), self.writer.clone(), record.id.clone());
+        let first = Save {
+            record: record.clone(),
+            version: 1,
+        };
+        blocking(move || {
+            let placed = store.place(&id, &staging, &payload);
+            match placed {
+                Ok(()) => writer.write(&first),
+                Err(_) => writer.remove_run(&id),
+            }
+            placed
+        })
+        .await?
+        .map_err(|e| CiError::new("internal", format!("cannot place snapshot: {e}")))?;
+        let admitted = {
+            let mut state = self.lock();
+            match state.scheduler.submit(record.key(), record.id.clone()) {
+                Admission::Coalesced(existing) => {
+                    Admitted::Joined(state.runs.get_mut(&existing).map(|slot| {
+                        slot.record.submitters += 1;
+                        self.announce(slot)
+                    }))
+                }
+                Admission::Queued(id) => {
+                    self.feed.publish(&record);
+                    let view = RunView::of(record.clone(), false);
+                    state.insert(record.clone(), 1);
+                    Admitted::Queued(SubmitReply {
+                        queue_position: state.scheduler.queue_position(&id),
+                        run: id,
+                        coalesced: false,
+                        record: view,
+                    })
+                }
+            }
+        };
+        match admitted {
+            Admitted::Queued(reply) => {
+                self.kick();
+                self.maybe_launch_widget(LaunchTrigger::Activity);
+                Ok(reply)
+            }
+            Admitted::Joined(joined) => {
+                // The run joined a live one: drop the copy placed for it.
+                let (writer, placed) = (self.writer.clone(), record.id.clone());
+                blocking(move || writer.remove_run(&placed)).await?;
+                let joined =
+                    joined.ok_or_else(|| CiError::new("internal", "coalesced run is missing"))?;
+                let reply = SubmitReply {
+                    run: joined.record.id.clone(),
                     coalesced: true,
                     queue_position: None,
-                    record: RunView::of(joined, false),
-                });
+                    record: RunView::of(joined.record.clone(), false),
+                };
+                self.writer.save_detached(joined);
+                Ok(reply)
             }
-            Admission::Queued(id) => id,
-        };
-        if let Err(error) = self.store.place(&id, staging, payload) {
-            state.scheduler.finish(&id);
-            return Err(CiError::new(
-                "internal",
-                format!("cannot place snapshot: {error}"),
-            ));
         }
-        self.persist(&record);
-        let view = RunView::of(record.clone(), false);
-        state.insert(record);
-        let queue_position = state.scheduler.queue_position(&id);
-        drop(state);
-        self.kick();
-        self.maybe_launch_widget(LaunchTrigger::Activity);
-        Ok(SubmitReply {
-            run: id,
-            coalesced: false,
-            queue_position,
-            record: view,
-        })
     }
 
     fn list(&self, workspace: Option<&str>, filter: Option<RunState>, limit: usize) -> ListReply {
@@ -465,7 +513,7 @@ impl CiRuntime {
         .await?;
         let (staging, payload) =
             staged.map_err(|e| CiError::new("internal", format!("cannot copy snapshot: {e}")))?;
-        self.admit(original.retry(id, job), &staging, &payload)
+        self.admit(original.retry(id, job), staging, payload).await
     }
 
     async fn report(&self, run: &str, tail: usize) -> Result<RunReport, CiError> {
@@ -543,9 +591,9 @@ impl CiRuntime {
             }
         };
         let plan = self.lock().plan_prune(older_than, max_bytes, &sizes);
-        let store = self.store.clone();
+        let (store, writer) = (self.store.clone(), self.writer.clone());
         let pruned = plan.runs.clone();
-        blocking(move || plan.apply(&store)).await?;
+        blocking(move || plan.apply(&store, &writer)).await?;
         Ok(pruned)
     }
 
@@ -553,7 +601,7 @@ impl CiRuntime {
     /// same critical section, so a cancel never sees an admitted run that is
     /// neither queued nor running.
     fn dispatch(&self) {
-        let started: Vec<(RunRecord, CancellationSource)> = {
+        let started: Vec<(Save, CancellationSource)> = {
             let mut state = self.lock();
             let admitted = state.scheduler.admit();
             admitted
@@ -564,12 +612,13 @@ impl CiRuntime {
                     slot.cancel = Some(cancel.clone());
                     slot.record.state = RunState::Running;
                     slot.record.started_at = Some(lifecycle::now_seconds());
-                    self.persist(&slot.record);
-                    Some((slot.record.clone(), cancel))
+                    Some((self.announce(slot), cancel))
                 })
                 .collect()
         };
-        for (record, cancel) in started {
+        for (save, cancel) in started {
+            let record = save.record.clone();
+            self.writer.save_detached(save);
             let id = record.id.clone();
             let runtime = self.clone();
             let task = async_engine::launch(async move { runtime.execute(record, cancel).await });
@@ -577,12 +626,14 @@ impl CiRuntime {
             let watchdog = self.clone();
             async_engine::launch(async move {
                 if task.await.is_err() {
-                    watchdog.complete(&id, |record| {
-                        record.finish(
-                            Conclusion::Error,
-                            Some("internal error: the run task failed".into()),
-                        )
-                    });
+                    watchdog
+                        .complete(&id, |record| {
+                            record.finish(
+                                Conclusion::Error,
+                                Some("internal error: the run task failed".into()),
+                            )
+                        })
+                        .await;
                 }
             })
             .detach();
@@ -611,29 +662,54 @@ impl CiRuntime {
             reason = Some(reason.map_or(note.clone(), |r| format!("{r}; {note}")));
         }
         self.complete(&record.id, |record| {
-            record.tree = tree;
-            record.finish(conclusion, reason);
+            record.tree = tree.clone();
+            record.finish(conclusion, reason.clone());
             if let Ok(report) = &outcome {
                 record_engine_report(record, report);
             }
-        });
+        })
+        .await;
         let _ = self.prune(None, None).await;
     }
 
-    /// End a running run: apply `finish`, persist it before readers can see
-    /// `done` (so a restart never reads a stale in-progress record), and
-    /// free its scheduler slot.
-    fn complete(&self, run: &str, finish: impl FnOnce(&mut RunRecord)) {
-        let mut state = self.lock();
-        if let Some(slot) = state.runs.get_mut(run)
-            && slot.record.state != RunState::Done
-        {
-            slot.cancel = None;
-            finish(&mut slot.record);
-            self.persist(&slot.record);
+    /// End a running run: write the finished record before readers can see
+    /// `done` (so a restart never reads a stale in-progress record), then
+    /// apply `finish` and free its scheduler slot. Nothing is written under
+    /// the state lock; a change that lands during the write (a coalesced
+    /// submitter) is kept and written again.
+    async fn complete(&self, run: &str, finish: impl Fn(&mut RunRecord)) {
+        let finished = {
+            let mut state = self.lock();
+            state
+                .runs
+                .get_mut(run)
+                .filter(|slot| slot.record.state != RunState::Done)
+                .map(|slot| {
+                    let mut save = slot.snapshot();
+                    finish(&mut save.record);
+                    save
+                })
+        };
+        let mut rewrite = None;
+        if let Some(save) = finished {
+            let written = save.record.clone();
+            let _ = self.writer.save(save).await;
+            let mut state = self.lock();
+            if let Some(slot) = state.runs.get_mut(run)
+                && slot.record.state != RunState::Done
+            {
+                slot.cancel = None;
+                finish(&mut slot.record);
+                self.feed.publish(&slot.record);
+                if slot.record != written {
+                    rewrite = Some(slot.snapshot());
+                }
+            }
         }
-        state.scheduler.finish(run);
-        drop(state);
+        self.lock().scheduler.finish(run);
+        if let Some(save) = rewrite {
+            self.writer.save_detached(save);
+        }
         self.kick();
     }
 
@@ -644,7 +720,17 @@ impl CiRuntime {
         observer: &mut RunObserver,
     ) -> Result<EngineReport, String> {
         self.localize_checkouts(record, observer);
-        let plan = self.plan(record).await?;
+        let deadline = async_engine::Deadline::after(Duration::from_secs(record.timeout_secs));
+        let Ok(plan) = async_engine::timeout_at(deadline, self.plan(record, deadline)).await else {
+            // Nothing exists on the host yet: an engine is only created
+            // once the plan is complete.
+            return Ok(EngineReport {
+                execution: ExecutionEnd::TimedOut,
+                cleanup: CleanupEnd::Removed,
+                engine_id: None,
+            });
+        };
+        let plan = plan?;
         observer.masker = SecretMasker::new(plan.invocation.secrets.0.iter().map(|(_, v)| v));
         observer.note(&format!(
             "run {} sha {}{} workflow {} trigger {} mode {} actor {}",
@@ -698,7 +784,11 @@ impl CiRuntime {
     }
 
     /// The immutable engine intent and act invocation for a record.
-    async fn plan(&self, record: &RunRecord) -> Result<EnginePlan, String> {
+    async fn plan(
+        &self,
+        record: &RunRecord,
+        deadline: async_engine::Deadline,
+    ) -> Result<EnginePlan, String> {
         let artifact = act_artifact(std::env::consts::ARCH)
             .ok_or("no pinned act build for this host architecture")?;
         let (_, runner_digest) = RUNNER_IMAGE
@@ -734,7 +824,7 @@ impl CiRuntime {
                 secrets: self.secrets(record)?,
             },
             cache: CacheVolume::machine(&registry_id, lifecycle::now_seconds())?,
-            deadline: Duration::from_secs(record.timeout_secs),
+            deadline,
         })
     }
 }
@@ -779,15 +869,22 @@ async fn blocking<T: Send + 'static>(
         .map_err(|_| CiError::new("internal", "blocking task failed"))
 }
 
+/// The scheduler's answer to a submission, decided under the state lock.
+enum Admitted {
+    Queued(SubmitReply),
+    /// Coalesced into a live run: that run's new version, to write.
+    Joined(Option<Save>),
+}
+
 /// What one prune pass deletes: decided under the lock, applied outside it.
 struct PrunePlan {
     runs: Vec<String>,
     sources: Vec<String>,
 }
 impl PrunePlan {
-    fn apply(&self, store: &Store) {
+    fn apply(&self, store: &Store, writer: &RecordWriter) {
         for id in &self.runs {
-            store.remove_run(id);
+            writer.remove_run(id);
         }
         for id in &self.sources {
             store.remove_source(id);
@@ -846,7 +943,7 @@ impl CiRuntime {
         self.store.staging(id)
     }
     pub(crate) fn save(&self, record: &RunRecord) {
-        self.persist(record);
+        self.store.save_run(record);
     }
     pub(crate) fn listing(&self) -> ListReply {
         self.list(None, None, 100)

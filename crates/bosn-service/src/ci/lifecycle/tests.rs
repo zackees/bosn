@@ -18,6 +18,8 @@ pub struct Faults {
     pub hang: bool,
     pub remove: bool,
     pub inspect: bool,
+    /// Resolving the engine image never finishes (a stuck pull).
+    pub slow_image: bool,
 }
 
 /// In-memory engine host: name -> (id, labels).
@@ -58,7 +60,12 @@ pub const LISTING: &str = "Stage  Job ID  Job name  Workflow name  Workflow file
                            0      a       a         w              ci.yml         push\n";
 impl ActEngineBackend for FakeBackend {
     fn resolve_engine_image(&self) -> super::super::engine::BoxFuture<'_, Result<String, String>> {
-        Box::pin(async { Ok(format!("sha256:{}", "e".repeat(64))) })
+        Box::pin(async move {
+            if self.faults().slow_image {
+                std::future::pending::<()>().await;
+            }
+            Ok(format!("sha256:{}", "e".repeat(64)))
+        })
     }
     fn ensure_cache<'a>(
         &'a self,
@@ -222,7 +229,7 @@ fn plan(run: &str, deadline: Duration) -> EnginePlan {
             secrets: Default::default(),
         },
         cache: test_cache(),
-        deadline,
+        deadline: async_engine::Deadline::after(deadline),
     }
 }
 fn test_cache() -> CacheVolume {

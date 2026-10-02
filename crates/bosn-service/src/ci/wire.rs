@@ -201,6 +201,25 @@ pub enum CiRequest {
     },
 }
 
+/// How long a client waits for a CI reply. Most requests answer from
+/// memory; the slow ones copy a source tree (retry), scan a whole log
+/// (report) or measure every run (a size-bounded prune).
+pub const REPLY_DEADLINE: Duration = Duration::from_secs(30);
+pub const SLOW_REPLY_DEADLINE: Duration = Duration::from_secs(10 * 60);
+
+impl CiRequest {
+    pub fn reply_deadline(&self) -> Duration {
+        match self {
+            Self::Retry { .. }
+            | Self::Report { .. }
+            | Self::Runners {
+                action: RunnerAction::PruneCache { .. },
+            } => SLOW_REPLY_DEADLINE,
+            _ => REPLY_DEADLINE,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RunRecord {
     pub schema_version: u32,
@@ -429,4 +448,50 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = kernal_api::hash::Sha256Hasher::new();
     hasher.update(bytes);
     hasher.finalize().to_hex()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slow_requests_get_the_long_reply_deadline() {
+        let run = || "r".to_string();
+        let slow = [
+            CiRequest::Retry {
+                run: run(),
+                job: None,
+            },
+            CiRequest::Report {
+                run: run(),
+                tail: None,
+            },
+            CiRequest::Runners {
+                action: RunnerAction::PruneCache {
+                    older_than_secs: None,
+                    max_bytes: Some(1),
+                },
+            },
+        ];
+        for request in slow {
+            assert_eq!(request.reply_deadline(), SLOW_REPLY_DEADLINE, "{request:?}");
+        }
+        let quick = [
+            CiRequest::Show {
+                run: run(),
+                tree: None,
+            },
+            CiRequest::Cancel { run: run() },
+            CiRequest::Runners {
+                action: RunnerAction::Drain,
+            },
+        ];
+        for request in quick {
+            assert_eq!(request.reply_deadline(), REPLY_DEADLINE, "{request:?}");
+        }
+        assert!(
+            REPLY_DEADLINE > Duration::from_secs(3),
+            "longer than a plain daemon call"
+        );
+    }
 }

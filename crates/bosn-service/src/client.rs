@@ -743,11 +743,15 @@ impl Client {
     ) -> Result<T, Error> {
         let encoded =
             serde_json::to_string(&request).map_err(|_| Error::Protocol("ci request encode"))?;
+        let deadline = request.reply_deadline();
         match self
-            .call(Request {
-                ci_request: encoded,
-                ..Request::operation(36)
-            })
+            .call_within(
+                Request {
+                    ci_request: encoded,
+                    ..Request::operation(36)
+                },
+                deadline,
+            )
             .await?
         {
             Reply::Ci(json) => {
@@ -771,7 +775,10 @@ impl Client {
         let request = ci::stage_submission(&self.state_dir, options).await?;
         let staging = ci::staging_root(&self.state_dir).join(&request.staging);
         let result = self.ci_call(ci::CiRequest::Submit { request }).await;
-        if result.is_err() {
+        // Only a refusal proves the daemon will not use the snapshot; after a
+        // lost reply it may have queued the run, and its startup sweep drops
+        // abandoned staging anyway.
+        if daemon_refused(&result) {
             let _ = std::fs::remove_dir_all(staging);
         }
         result
@@ -836,6 +843,14 @@ impl Client {
         self.ci_call(ci::CiRequest::Runners { action }).await
     }
     pub(crate) async fn call(&self, request: Request) -> Result<Reply, Error> {
+        self.call_within(request, IO_DEADLINE).await
+    }
+    /// One request whose reply may take up to `reply_deadline` to arrive.
+    async fn call_within(
+        &self,
+        request: Request,
+        reply_deadline: Duration,
+    ) -> Result<Reply, Error> {
         // Resolve on every call: a Client may have been constructed while a
         // fresh daemon was still creating its registry, before an inode-based
         // alias-stable endpoint name existed.
@@ -855,7 +870,32 @@ impl Client {
             DaemonFrame::request(PAYLOAD_PROTOCOL, payload).with_request_id(1),
         )
         .await?;
-        let frame = read_frame(&mut stream).await?;
+        let frame = read_frame_within(&mut stream, reply_deadline).await?;
         decode_response_frame(frame, 1)
+    }
+}
+
+/// Whether the daemon definitely refused a CI request.
+fn daemon_refused<T>(result: &Result<T, Error>) -> bool {
+    matches!(result, Err(Error::Ci { .. }))
+}
+
+#[cfg(test)]
+mod ci_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_definite_refusal_discards_the_staged_snapshot() {
+        let refused: Result<(), Error> = Err(Error::Ci {
+            code: "refused".into(),
+            message: "no".into(),
+        });
+        assert!(daemon_refused(&refused));
+        // The daemon may have accepted the run before the reply was lost.
+        assert!(!daemon_refused::<()>(&Err(Error::Deadline)));
+        assert!(!daemon_refused::<()>(&Err(Error::Protocol(
+            "ci reply decode"
+        ))));
+        assert!(!daemon_refused(&Ok(())));
     }
 }
