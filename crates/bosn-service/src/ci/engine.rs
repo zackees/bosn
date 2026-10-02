@@ -1,33 +1,46 @@
 //! The isolated engine act runs against.
 //!
-//! [`DockerActBackend`] creates one privileged `docker:dind` container per run
-//! on the host engine, pinned by digest and labelled with the registry's
-//! ownership labels. act itself runs *inside* that container through
-//! `docker exec`, so it only ever sees the nested engine's private socket
-//! (`unix:///var/run/docker.sock` inside the engine); the host socket is never
-//! mounted. Every container, network, volume and image act creates lives in
-//! the nested engine's storage, an anonymous volume removed with the engine
-//! (`docker rm -f -v`), which makes the engine the cleanup boundary.
+//! The engine itself is #349's owned Act engine ([`crate::act_engine`]): the
+//! pinned `docker:29.7.2` image, created only after its intent (with a frozen
+//! creation profile) is durable, with a read-only root, private tmpfs storage,
+//! a private cgroup namespace and no host path or socket. Its one named mount
+//! is the machine-wide cache volume, frozen into that profile and verified
+//! before creation and on every observation. Creation, observation and
+//! retirement all go through that layer.
 //!
-//! The act binary is fetched inside the engine from the pinned release URL
-//! and checked against its pinned sha256 before use.
+//! [`DockerActBackend`] adds what `bosn ci` does *inside* a created engine:
+//! act runs there through `docker exec`, so it only ever sees the nested
+//! engine's private socket. The act release is fetched into the cache volume
+//! from its pinned URL and checked against its pinned sha256; the frozen
+//! source and event payload are streamed in; the runner image is loaded from
+//! the cache volume; act's tool cache is seeded from, and saved back to, it.
+//! Everything act creates lives in the engine's private storage, which goes
+//! with the engine.
 
 use std::{collections::BTreeMap, future::Future, path::Path, pin::Pin, time::Duration};
 
 use bosn_engine::{CommandError, DockerEngine, EngineEvent, RunOptions};
-use bosn_registry::act::ActEngineObservation;
+use bosn_registry::act::{
+    ActEngineCacheVolume, ActEngineIntent, ActEngineObservation, ActEngineRecord,
+};
 use kernal_api::async_engine::{self, CancellationToken};
+
+use crate::{RegistryActor, act_engine};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// docker:28-dind (multi-arch index), pinned by digest.
-pub const ENGINE_IMAGE: &str =
-    "docker@sha256:2a232a42256f70d78e3cc5d2b5d6b3276710a0de0596c145f627ecfae90282ac";
+/// The pinned engine image, by its publisher manifest digest.
+pub fn engine_image() -> String {
+    format!("docker.io/library/docker@{}", act_engine::ENGINE_MANIFEST)
+}
 /// catthehacker/ubuntu:act-24.04, pinned by digest; maps `ubuntu-*` runners.
 pub const RUNNER_IMAGE: &str = "catthehacker/ubuntu:act-24.04@sha256:c58e2b364da03b0c804c7d660f2ecbedf2f221a382b9baa0b344b0144780ff43";
 pub const ACT_VERSION: &str = "0.2.88";
-/// Where the daemon's persistent CI cache directory appears in the engine.
+/// Where the machine-wide cache volume is mounted in the engine.
 pub const ENGINE_CACHE: &str = "/bosn/cache";
+/// The engine's root is read-only: everything a run writes lives under its
+/// private (executable) storage tmpfs, next to the nested daemon's data.
+pub const ENGINE_WORK: &str = "/var/lib/docker/bosn-ci";
 
 /// The runner image's engine-local name. The pinned image is loaded from the
 /// daemon's image cache under this tag (a digest reference cannot be saved
@@ -44,37 +57,40 @@ pub struct ActArtifact {
     pub sha256: &'static str,
 }
 
-/// The pinned act artifact for the engine's architecture (`docker info`).
+/// The pinned act artifact for the engine's architecture. The engine image
+/// is linux/amd64, so only the x86_64 build can run in it.
 pub fn act_artifact(architecture: &str) -> Option<ActArtifact> {
     match architecture {
         "x86_64" | "amd64" => Some(ActArtifact {
             url: "https://github.com/nektos/act/releases/download/v0.2.88/act_Linux_x86_64.tar.gz",
             sha256: "1eb9996682dfcc053ac8f3f90f2ec50376f0cdfc229712d82da03d673c63a2b3",
         }),
-        "aarch64" | "arm64" => Some(ActArtifact {
-            url: "https://github.com/nektos/act/releases/download/v0.2.88/act_Linux_arm64.tar.gz",
-            sha256: "94d87738f7ea6650782c8505366c758c99db54cc67bd8c711583478c93305d78",
-        }),
         _ => None,
     }
 }
 
-/// Everything the backend needs to create one engine.
-#[derive(Clone, Debug)]
-pub struct EngineSpec {
-    pub name: String,
-    pub labels: BTreeMap<String, String>,
-    /// The machine-wide cache volume, mounted at [`ENGINE_CACHE`].
-    pub cache: CacheVolume,
+/// The bounds of one run's engine: memory (which its private storage tmpfs
+/// counts against), that storage, CPUs and processes. Frozen into the
+/// intent's creation profile.
+pub fn engine_limits(cpus: usize) -> act_engine::ActEngineLimits {
+    let cpus = cpus.clamp(1, 8) as u64;
+    act_engine::ActEngineLimits {
+        memory_bytes: 28 << 30,
+        storage_bytes: 20 << 30,
+        nano_cpus: cpus * 1_000_000_000,
+        pids: 4096,
+    }
 }
 
 /// The machine-wide CI cache: a bosn-labelled named volume holding the act
-/// release, the runner image tar, action checkouts and the per-repository
-/// act cache-server stores. A volume (not a host directory) because the
-/// privileged engine writes as root, and Docker Desktop shares no paths.
+/// release, the runner image tar, action checkouts, the tool cache and the
+/// per-repository act cache-server stores. A volume (not a host directory)
+/// because the privileged engine writes as root, and Docker Desktop shares
+/// no paths.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheVolume {
     pub name: String,
+    /// The labels it is created with (its owner's; verified before use).
     pub labels: BTreeMap<String, String>,
 }
 
@@ -83,25 +99,19 @@ pub const CACHE_VOLUME: &str = "bosn-ci-cache-v1";
 impl CacheVolume {
     /// The machine-wide cache volume, labelled as owned by `registry`.
     pub fn machine(registry: &str, created: f64) -> Result<Self, String> {
-        let labels = bosn_core::ResourceLabels::new(
-            registry,
-            bosn_core::ResourceKind::Volume,
-            "ci-cache",
-            "v1",
-            bosn_core::Scope::Machine,
-            "machine",
-            &created.to_string(),
-            Some(bosn_core::Retention::Pinned),
-        )
-        .map_err(|_| "cache volume labels".to_string())?
-        .to_map()
-        .into_iter()
-        .map(|(k, v)| (k.into(), v))
-        .collect();
         Ok(Self {
             name: CACHE_VOLUME.into(),
-            labels,
+            labels: act_engine::cache_volume_labels(registry, created)
+                .map_err(|error| error.to_string())?,
         })
+    }
+
+    /// The mount frozen into an engine's creation profile.
+    pub fn mount(&self) -> ActEngineCacheVolume {
+        ActEngineCacheVolume {
+            name: self.name.clone(),
+            target: ENGINE_CACHE.into(),
+        }
     }
 }
 
@@ -139,7 +149,7 @@ impl ActInvocation {
             "-W".into(),
             self.workflow.clone(),
             "--eventpath".into(),
-            "/bosn/event.json".into(),
+            format!("{ENGINE_WORK}/event.json"),
             "--json".into(),
             "--pull=false".into(),
             "--action-cache-path".into(),
@@ -148,7 +158,7 @@ impl ActInvocation {
             format!("{ENGINE_CACHE}/actcache/{}", self.cache_namespace),
             // Per engine, so concurrent runs never share artifacts or ports.
             "--artifact-server-path".into(),
-            "/bosn/artifacts".into(),
+            format!("{ENGINE_WORK}/artifacts"),
         ];
         let runner = runner_tag();
         for label in ["ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04"] {
@@ -181,27 +191,41 @@ pub enum EngineLine {
     Stderr(String),
 }
 
-/// The trusted engine runtime. Inspect results are the only source of
-/// [`ActEngineObservation`]s; `Ok(None)` from [`Self::inspect`] is a proven
-/// absence, while `Err` means the engine state is unknown.
+/// The trusted engine runtime behind `bosn ci`. Engine identity, ownership
+/// and removal are the owned-engine layer's ([`crate::act_engine`],
+/// [`crate::act_runtime::retire_engine`]); the in-engine steps address an
+/// engine by its immutable ID, which the caller only holds while its
+/// execution claim is verified.
 pub trait ActEngineBackend: Send + Sync {
-    /// Resolve the immutable local image ID of [`ENGINE_IMAGE`], pulling it
-    /// when missing. Recorded in the intent before creation.
-    fn resolve_engine_image(&self) -> BoxFuture<'_, Result<String, String>>;
+    /// Make the pinned engine image present on the host engine (pulled by
+    /// its manifest digest when missing).
+    fn ensure_engine_image(&self) -> BoxFuture<'_, Result<(), String>>;
     /// Create the machine-wide cache volume unless it exists.
     fn ensure_cache<'a>(&'a self, cache: &'a CacheVolume) -> BoxFuture<'a, Result<(), String>>;
-    fn create<'a>(&'a self, spec: &'a EngineSpec) -> BoxFuture<'a, Result<(), String>>;
-    fn inspect<'a>(
+    /// Commit `intent`, then create, verify, register and start its engine.
+    /// A failure after the intent commits leaves the record for cleanup.
+    fn create<'a>(
         &'a self,
-        name: &'a str,
-    ) -> BoxFuture<'a, Result<Option<ActEngineObservation>, String>>;
-    /// Wait for the nested engine, install act, copy the frozen source and
-    /// event payload, and pull the runner image inside the engine.
-    /// The engine's architecture must match `act`, the artifact the intent
-    /// recorded; otherwise this fails rather than install another binary.
+        registry: &'a RegistryActor,
+        intent: &'a ActEngineIntent,
+        owner: &'a str,
+        at: f64,
+    ) -> BoxFuture<'a, Result<ActEngineObservation, String>>;
+    /// Retire a `cleanup_required` engine: prove it absent or remove exactly
+    /// the committed engine, then record the terminal receipt.
+    fn retire<'a>(
+        &'a self,
+        registry: &'a RegistryActor,
+        owner: &'a str,
+        record: &'a ActEngineRecord,
+        budget: Duration,
+    ) -> BoxFuture<'a, Result<(), String>>;
+    /// Wait for the nested engine, install act, seed the tool cache, stream
+    /// in the frozen source and event payload, and load the runner image.
+    /// The artifact must be the one the intent recorded.
     fn prepare<'a>(
         &'a self,
-        name: &'a str,
+        engine: &'a str,
         source: &'a Path,
         event: &'a Path,
         act: ActArtifact,
@@ -209,24 +233,21 @@ pub trait ActEngineBackend: Send + Sync {
     /// `act -l` for the workflow (declared jobs and their stages).
     fn list<'a>(
         &'a self,
-        name: &'a str,
+        engine: &'a str,
         workflow: &'a str,
     ) -> BoxFuture<'a, Result<String, String>>;
     fn execute<'a>(
         &'a self,
-        name: &'a str,
+        engine: &'a str,
         invocation: &'a ActInvocation,
         deadline: Duration,
         cancellation: &'a CancellationToken,
         lines: &'a async_engine::Sender<EngineLine>,
     ) -> BoxFuture<'a, Result<ExecEnd, String>>;
-    /// Remove the engine with this exact immutable ID (never by name: the
-    /// name could be taken by something else after authorization).
-    fn remove<'a>(&'a self, engine_id: &'a str) -> BoxFuture<'a, Result<(), String>>;
     /// Save the tool-cache installs this run completed (act's
     /// `/opt/hostedtoolcache`) into the machine-wide cache, each atomically;
     /// best-effort, before the engine is removed.
-    fn save_toolcache<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), String>>;
+    fn save_toolcache<'a>(&'a self, engine: &'a str) -> BoxFuture<'a, Result<(), String>>;
     /// The cache volume's size in bytes; `None` when it does not exist.
     fn cache_bytes<'a>(&'a self, volume: &'a str) -> BoxFuture<'a, Result<Option<u64>, String>>;
     /// Remove the cache volume. The host engine refuses while any container
@@ -289,10 +310,10 @@ impl DockerActBackend {
             .ok())
     }
 
-    async fn wait_ready(&self, name: &str) -> Result<(), String> {
+    async fn wait_ready(&self, engine: &str) -> Result<(), String> {
         let deadline = async_engine::Deadline::after(Duration::from_secs(60));
         loop {
-            let probe = Self::exec(name, "docker info >/dev/null 2>&1");
+            let probe = Self::exec(engine, "docker info >/dev/null 2>&1");
             if self.run(probe, CONTROL_DEADLINE).await?.ok() {
                 return Ok(());
             }
@@ -305,11 +326,11 @@ impl DockerActBackend {
 
     /// Install the pinned act release, verified by sha256, from the cache
     /// volume (downloading it there once).
-    async fn install_act(&self, name: &str, act: ActArtifact) -> Result<(), String> {
+    async fn install_act(&self, engine: &str, act: ActArtifact) -> Result<(), String> {
         let arch = self
             .checked(
                 "engine architecture",
-                Self::exec(name, "uname -m"),
+                Self::exec(engine, "uname -m"),
                 CONTROL_DEADLINE,
             )
             .await?;
@@ -321,7 +342,7 @@ impl DockerActBackend {
         let version = self
             .checked(
                 "act install",
-                Self::exec(name, &install_act_script(act)),
+                Self::exec(engine, &install_act_script(act)),
                 PULL_DEADLINE,
             )
             .await?;
@@ -333,47 +354,136 @@ impl DockerActBackend {
         Ok(())
     }
 
-    /// Copy the frozen source to `/src` and the event payload beside it.
-    async fn copy_inputs(&self, name: &str, source: &Path, event: &Path) -> Result<(), String> {
-        self.checked(
-            "source copy",
-            owned(&["exec", name, "mkdir", "-p", "/src"]),
-            CONTROL_DEADLINE,
-        )
-        .await?;
-        let copy = vec![
-            "cp".into(),
-            format!("{}/.", source.display()),
-            format!("{name}:/src"),
-        ];
-        self.checked("source copy", copy, PULL_DEADLINE).await?;
-        let copy = vec![
-            "cp".into(),
-            event.display().to_string(),
-            format!("{name}:/bosn/event.json"),
-        ];
-        self.checked("event copy", copy, CONTROL_DEADLINE)
+    /// Stream `file` into the engine on `docker exec`'s stdin. The engine's
+    /// root is read-only and its storage is a private tmpfs, which `docker
+    /// cp` cannot reach, so inputs travel the way the owned runtime's do.
+    async fn stream_in(
+        &self,
+        what: &str,
+        engine: &str,
+        file: &Path,
+        script: &str,
+    ) -> Result<(), String> {
+        let input = std::fs::File::open(file).map_err(|e| format!("{what}: {e}"))?;
+        let size = input.metadata().map_err(|e| format!("{what}: {e}"))?.len();
+        let result = self
+            .docker
+            .with_args(Self::exec_stdin(engine, script))
+            .capture_with_stdin_file_async(
+                input,
+                size,
+                RunOptions::bounded(PULL_DEADLINE, CONTROL_OUTPUT),
+                None,
+            )
             .await
-            .map(|_| ())
+            .map_err(|e| format!("{what}: {e}"))?;
+        if !result.ok() {
+            return Err(format!(
+                "{what} failed: {}",
+                String::from_utf8_lossy(&result.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Stream the frozen source (as a tar) and the event payload into the
+    /// engine's work directory.
+    async fn copy_inputs(&self, engine: &str, source: &Path, event: &Path) -> Result<(), String> {
+        let archive = source.with_extension("engine.tar");
+        let (from, to) = (source.to_path_buf(), archive.clone());
+        let tar = async_engine::launch_blocking(move || {
+            kernal_api::run_bounded_command(
+                kernal_api::SpawnSpec::new("tar")
+                    .arg("-C")
+                    .arg(&from)
+                    .arg("-cf")
+                    .arg(&to)
+                    .arg(".")
+                    .stdin(kernal_api::StreamMode::Null)
+                    .stdout(kernal_api::StreamMode::Piped)
+                    .stderr(kernal_api::StreamMode::Piped),
+                PULL_DEADLINE,
+                CONTROL_OUTPUT,
+            )
+        })
+        .await
+        .map_err(|e| format!("source archive: {e}"))?
+        .map_err(|e| format!("source archive: {e}"))?;
+        if tar.exit.raw_code() != 0 {
+            let _ = std::fs::remove_file(&archive);
+            return Err(format!(
+                "source archive failed: {}",
+                String::from_utf8_lossy(&tar.stderr).trim()
+            ));
+        }
+        let copied = self
+            .stream_in(
+                "source copy",
+                engine,
+                &archive,
+                &format!("tar -xf - -C {ENGINE_WORK}/src"),
+            )
+            .await;
+        let _ = std::fs::remove_file(&archive);
+        copied?;
+        self.stream_in(
+            "event copy",
+            engine,
+            event,
+            &format!("cat > {ENGINE_WORK}/event.json"),
+        )
+        .await
     }
 
     /// Make [`runner_tag`] present in the engine: `docker load` from the
     /// cache volume's image tar, or pull the pinned image once and save it.
-    async fn load_runner(&self, name: &str) -> Result<(), String> {
+    async fn load_runner(&self, engine: &str) -> Result<(), String> {
         self.checked(
             "runner image",
-            Self::exec(name, &load_runner_script()),
+            Self::exec(engine, &load_runner_script()),
             PULL_DEADLINE,
         )
         .await
         .map(|_| ())
     }
 
-    fn exec(name: &str, script: &str) -> Vec<String> {
-        ["exec", name, "sh", "-ec", script]
+    fn exec(engine: &str, script: &str) -> Vec<String> {
+        ["exec", engine, "sh", "-ec", script]
             .into_iter()
             .map(String::from)
             .collect()
+    }
+
+    fn exec_stdin(engine: &str, script: &str) -> Vec<String> {
+        ["exec", "-i", engine, "sh", "-ec", script]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
+    /// `docker exec` arguments that run act in the work tree, with a
+    /// writable home on the engine's storage (its root is read-only).
+    fn act_exec(engine: &str, secrets: &SecretEnv) -> Vec<String> {
+        let mut args = owned(&["exec", "-w"]);
+        args.push(format!("{ENGINE_WORK}/src"));
+        for (key, value) in [
+            ("HOME", "home"),
+            ("XDG_CACHE_HOME", "home/.cache"),
+            ("XDG_CONFIG_HOME", "home/.config"),
+            ("TMPDIR", "tmp"),
+        ] {
+            args.push("--env".into());
+            args.push(format!("{key}={ENGINE_WORK}/{value}"));
+        }
+        // Secret values reach act only through the docker client's own
+        // environment (`--env NAME` copies it); never through argv.
+        for (key, _) in &secrets.0 {
+            args.push("--env".into());
+            args.push(key.clone());
+        }
+        args.push(engine.into());
+        args.push(format!("{ENGINE_WORK}/bin/act"));
+        args
     }
 }
 
@@ -382,31 +492,79 @@ fn owned(args: &[&str]) -> Vec<String> {
 }
 
 impl ActEngineBackend for DockerActBackend {
-    fn resolve_engine_image(&self) -> BoxFuture<'_, Result<String, String>> {
+    fn ensure_engine_image(&self) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async move {
-            let inspect = owned(&["image", "inspect", "--format", "{{.Id}}", ENGINE_IMAGE]);
-            if let Ok(id) = self
-                .checked("engine image inspect", inspect.clone(), CONTROL_DEADLINE)
-                .await
-            {
-                return Ok(id);
+            let image = engine_image();
+            let inspect = owned(&["image", "inspect", "--format", "{{.Id}}", &image]);
+            if self.run(inspect, CONTROL_DEADLINE).await?.ok() {
+                return Ok(());
             }
             self.checked(
                 "engine image pull",
-                owned(&["pull", "-q", ENGINE_IMAGE]),
+                owned(&["pull", "-q", &image]),
                 PULL_DEADLINE,
             )
-            .await?;
-            self.checked("engine image inspect", inspect, CONTROL_DEADLINE)
-                .await
+            .await
+            .map(|_| ())
         })
     }
 
-    fn save_toolcache<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), String>> {
+    fn create<'a>(
+        &'a self,
+        registry: &'a RegistryActor,
+        intent: &'a ActEngineIntent,
+        owner: &'a str,
+        at: f64,
+    ) -> BoxFuture<'a, Result<ActEngineObservation, String>> {
+        Box::pin(async move {
+            let limits = act_engine::frozen_limits(intent).map_err(|e| e.to_string())?;
+            let proofs = act_engine::bundled_engine_manifests().map_err(|e| e.to_string())?;
+            let proof = proofs
+                .get(&intent.engine_image_digest)
+                .ok_or("no publisher proof for the engine image")?;
+            act_engine::create_owned_engine_from_manifest(
+                registry,
+                &self.docker,
+                intent.clone(),
+                owner,
+                proof,
+                limits,
+                at,
+            )
+            .await
+            .map_err(|e| format!("engine create: {e}"))
+        })
+    }
+
+    fn retire<'a>(
+        &'a self,
+        registry: &'a RegistryActor,
+        owner: &'a str,
+        record: &'a ActEngineRecord,
+        budget: Duration,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let proofs = act_engine::bundled_engine_manifests().map_err(|e| e.to_string())?;
+            let never = async_engine::CancellationSource::new();
+            crate::act_runtime::retire_engine(
+                registry,
+                &self.docker,
+                owner,
+                &proofs,
+                record,
+                budget,
+                &never.token(),
+            )
+            .await
+            .map_err(|e| e.to_string())
+        })
+    }
+
+    fn save_toolcache<'a>(&'a self, engine: &'a str) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             self.checked(
                 "tool cache save",
-                Self::exec(name, &save_toolcache_script()),
+                Self::exec(engine, &save_toolcache_script()),
                 PULL_DEADLINE,
             )
             .await
@@ -422,13 +580,19 @@ impl ActEngineBackend for DockerActBackend {
             // Measured read-only with the pinned engine image (present once
             // any run created the volume): no extra image is pulled.
             let mount = format!("type=volume,source={volume},target=/cache,readonly");
+            let image = engine_image();
             let du = owned(&[
                 "run",
                 "--rm",
+                "--pull",
+                "never",
+                "--network",
+                "none",
                 "--mount",
                 &mount,
-                ENGINE_IMAGE,
+                "--entrypoint",
                 "du",
+                &image,
                 "-sb",
                 "/cache",
             ]);
@@ -458,10 +622,7 @@ impl ActEngineBackend for DockerActBackend {
 
     fn ensure_cache<'a>(&'a self, cache: &'a CacheVolume) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
-            let exists = self
-                .run(owned(&["volume", "inspect", &cache.name]), CONTROL_DEADLINE)
-                .await?;
-            if exists.ok() {
+            if self.volume_exists(&cache.name).await? {
                 return Ok(());
             }
             let mut args = owned(&["volume", "create"]);
@@ -476,119 +637,55 @@ impl ActEngineBackend for DockerActBackend {
         })
     }
 
-    fn create<'a>(&'a self, spec: &'a EngineSpec) -> BoxFuture<'a, Result<(), String>> {
-        Box::pin(async move {
-            let mut args = owned(&["run", "-d", "--privileged", "--name"]);
-            args.push(spec.name.clone());
-            for (key, value) in &spec.labels {
-                args.push("--label".into());
-                args.push(format!("{key}={value}"));
-            }
-            // No host socket and no host path. The nested engine's storage is
-            // the image's anonymous /var/lib/docker volume, removed with
-            // `rm -v`; the named cache volume persists by design.
-            args.push("--mount".into());
-            args.push(format!(
-                "type=volume,source={},target={ENGINE_CACHE}",
-                spec.cache.name
-            ));
-            args.extend(owned(&[
-                "--env",
-                "DOCKER_TLS_CERTDIR=",
-                ENGINE_IMAGE,
-                "dockerd",
-                "--host=unix:///var/run/docker.sock",
-            ]));
-            self.checked("engine create", args, PULL_DEADLINE)
-                .await
-                .map(|_| ())
-        })
-    }
-
-    fn inspect<'a>(
-        &'a self,
-        name: &'a str,
-    ) -> BoxFuture<'a, Result<Option<ActEngineObservation>, String>> {
-        Box::pin(async move {
-            let result = self
-                .run(
-                    owned(&["container", "inspect", "--format", "{{json .}}", name]),
-                    CONTROL_DEADLINE,
-                )
-                .await?;
-            if !result.ok() {
-                let stderr = String::from_utf8_lossy(&result.stderr).to_ascii_lowercase();
-                // Only Docker's own "no such container" proves absence.
-                if stderr.contains("no such container") || stderr.contains("no such object") {
-                    return Ok(None);
-                }
-                return Err(format!("engine inspect failed: {}", stderr.trim()));
-            }
-            let inspected: ContainerInspect = serde_json::from_slice(&result.stdout)
-                .map_err(|_| "engine inspect returned an unexpected document".to_string())?;
-            Ok(Some(ActEngineObservation {
-                name: inspected.name.trim_start_matches('/').to_string(),
-                engine_id: inspected.id,
-                image_digest: inspected.image,
-                labels: inspected.config.labels.unwrap_or_default(),
-            }))
-        })
-    }
-
     fn prepare<'a>(
         &'a self,
-        name: &'a str,
+        engine: &'a str,
         source: &'a Path,
         event: &'a Path,
         act: ActArtifact,
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
-            self.wait_ready(name).await?;
-            self.install_act(name, act).await?;
+            self.wait_ready(engine).await?;
+            self.checked(
+                "work directory",
+                Self::exec(engine, &work_dirs_script()),
+                CONTROL_DEADLINE,
+            )
+            .await?;
+            self.install_act(engine, act).await?;
             self.checked(
                 "tool cache seed",
-                Self::exec(name, &seed_toolcache_script()),
+                Self::exec(engine, &seed_toolcache_script()),
                 PULL_DEADLINE,
             )
             .await?;
-            self.copy_inputs(name, source, event).await?;
-            self.load_runner(name).await
+            self.copy_inputs(engine, source, event).await?;
+            self.load_runner(engine).await
         })
     }
 
     fn list<'a>(
         &'a self,
-        name: &'a str,
+        engine: &'a str,
         workflow: &'a str,
     ) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(async move {
-            self.checked(
-                "act -l",
-                owned(&["exec", "-w", "/src", name, "act", "-l", "-W", workflow]),
-                CONTROL_DEADLINE,
-            )
-            .await
+            let mut args = Self::act_exec(engine, &SecretEnv::default());
+            args.extend(owned(&["-l", "-W", workflow]));
+            self.checked("act -l", args, CONTROL_DEADLINE).await
         })
     }
 
     fn execute<'a>(
         &'a self,
-        name: &'a str,
+        engine: &'a str,
         invocation: &'a ActInvocation,
         deadline: Duration,
         cancellation: &'a CancellationToken,
         lines: &'a async_engine::Sender<EngineLine>,
     ) -> BoxFuture<'a, Result<ExecEnd, String>> {
         Box::pin(async move {
-            // Secret values reach act only through the docker client's own
-            // environment (`--env NAME` copies it); never through argv.
-            let mut args = owned(&["exec", "-w", "/src"]);
-            for (key, _) in &invocation.secrets.0 {
-                args.push("--env".into());
-                args.push(key.clone());
-            }
-            args.push(name.into());
-            args.push("act".into());
+            let mut args = Self::act_exec(engine, &invocation.secrets);
             args.extend(invocation.args());
             let (events, mut receiver) = async_engine::channel(256);
             let docker = invocation
@@ -647,18 +744,14 @@ impl ActEngineBackend for DockerActBackend {
             }
         })
     }
+}
 
-    fn remove<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), String>> {
-        Box::pin(async move {
-            self.checked(
-                "engine removal",
-                owned(&["rm", "-f", "-v", name]),
-                CONTROL_DEADLINE,
-            )
-            .await
-            .map(|_| ())
-        })
-    }
+/// The run's work tree on the engine's private storage.
+fn work_dirs_script() -> String {
+    format!(
+        "mkdir -p {ENGINE_WORK}/bin {ENGINE_WORK}/src {ENGINE_WORK}/artifacts \
+         {ENGINE_WORK}/home/.cache {ENGINE_WORK}/home/.config {ENGINE_WORK}/tmp"
+    )
 }
 
 /// Shell (busybox) that installs act from the cache volume, refreshing a
@@ -670,7 +763,7 @@ fn install_act_script(act: ActArtifact) -> String {
            wget -q -O \"$tgz.$$\" '{url}' && \
            echo \"{sum}  $tgz.$$\" | sha256sum -c - >/dev/null && mv \"$tgz.$$\" \"$tgz\"; \
          fi; \
-         tar -xzf \"$tgz\" -C /usr/local/bin act && act --version",
+         tar -xzf \"$tgz\" -C {ENGINE_WORK}/bin act && {ENGINE_WORK}/bin/act --version",
         url = act.url,
         sum = act.sha256,
     )
@@ -717,30 +810,12 @@ fn load_runner_script() -> String {
     format!(
         "tar={ENGINE_CACHE}/images/{file}.tar; mkdir -p {ENGINE_CACHE}/images; \
          if ! {{ [ -f \"$tar\" ] && docker load -q -i \"$tar\" >/dev/null; }}; then \
-           docker pull -q {RUNNER_IMAGE} >/dev/null && docker tag {RUNNER_IMAGE} {tag} && \
-           docker save -o \"$tar.$$\" {tag} && mv \"$tar.$$\" \"$tar\"; \
+           docker pull -q --platform linux/amd64 {RUNNER_IMAGE} >/dev/null && \
+           docker tag {RUNNER_IMAGE} {tag} && \
+           docker save --platform linux/amd64 -o \"$tar.$$\" {tag} && mv \"$tar.$$\" \"$tar\"; \
          fi; \
          docker image inspect {tag} >/dev/null"
     )
-}
-
-/// The fields of `docker container inspect` the ownership checks need.
-#[derive(serde::Deserialize)]
-struct ContainerInspect {
-    #[serde(rename = "Id")]
-    id: String,
-    #[serde(rename = "Name")]
-    name: String,
-    #[serde(rename = "Image")]
-    image: String,
-    #[serde(rename = "Config")]
-    config: ContainerConfig,
-}
-
-#[derive(serde::Deserialize)]
-struct ContainerConfig {
-    #[serde(rename = "Labels")]
-    labels: Option<BTreeMap<String, String>>,
 }
 
 /// Splits a byte stream into bounded UTF-8 lines.
@@ -798,8 +873,8 @@ mod tests {
             "no value in argv"
         );
         assert!(args.ends_with(&["-j".to_string(), "lint".to_string()]));
-        assert!(RUNNER_IMAGE.contains("@sha256:") && ENGINE_IMAGE.contains("@sha256:"));
-        assert!(act_artifact("x86_64").is_some() && act_artifact("riscv64").is_none());
+        assert!(RUNNER_IMAGE.contains("@sha256:") && engine_image().contains("@sha256:"));
+        assert!(act_artifact("x86_64").is_some() && act_artifact("aarch64").is_none());
         assert_eq!(runner_tag(), "bosn/act-runner:c58e2b364da0");
         let secrets = SecretEnv(vec![("GITHUB_TOKEN".into(), "ghp_secretvalue".into())]);
         assert!(

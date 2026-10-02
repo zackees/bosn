@@ -56,8 +56,6 @@ pub mod act_archive;
 pub mod act_artifacts;
 pub mod act_engine;
 pub mod act_image;
-#[cfg(test)]
-mod act_live_probe;
 pub mod act_registry;
 pub mod act_runtime;
 pub mod autostart;

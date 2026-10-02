@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bosn_registry::act::{ActEngineIntent, ActEngineRecord};
+use bosn_registry::act::ActEngineIntent;
 use kernal_api::async_engine::{self, CancellationSource};
 use serde_json::Value;
 
@@ -17,7 +17,7 @@ use super::{
     config::WidgetConfig,
     engine::{
         ACT_VERSION, ActEngineBackend, ActInvocation, CACHE_VOLUME, CacheVolume, EngineLine,
-        RUNNER_IMAGE, SecretEnv, act_artifact,
+        RUNNER_IMAGE, SecretEnv, act_artifact, engine_limits,
     },
     events::Feed,
     lifecycle::{self, CleanupEnd, EngineObserver, EnginePlan, EngineReport, ExecutionEnd},
@@ -171,20 +171,6 @@ impl CiRuntime {
         })
         .detach();
         runtime
-    }
-
-    /// Engine records a previous daemon left unfinished. Call before the
-    /// daemon accepts requests; reconcile the result with
-    /// [`Self::reconcile_engines`] (it may take a while, so in the background).
-    pub async fn pending_engines(&self) -> Result<Vec<ActEngineRecord>, String> {
-        lifecycle::pending_records(&self.registry).await
-    }
-
-    pub async fn reconcile_engines(
-        &self,
-        records: &[ActEngineRecord],
-    ) -> lifecycle::RecoveryReport {
-        lifecycle::reconcile(&self.registry, self.backend.as_ref(), records).await
     }
 
     /// Dispatch one typed request; the reply is that operation's typed reply
@@ -744,7 +730,7 @@ impl CiRuntime {
         deadline: async_engine::Deadline,
     ) -> Result<EnginePlan, String> {
         let artifact = act_artifact(std::env::consts::ARCH)
-            .ok_or("no pinned act build for this host architecture")?;
+            .ok_or("no pinned act build or engine image for this host architecture")?;
         let (_, runner_digest) = RUNNER_IMAGE
             .rsplit_once('@')
             .ok_or("runner image is not pinned")?;
@@ -754,6 +740,15 @@ impl CiRuntime {
             .await
             .map_err(|e| format!("registry: {e}"))?
             .registry_id;
+        self.backend.ensure_engine_image().await?;
+        let cache = CacheVolume::machine(&registry_id, lifecycle::now_seconds())?;
+        let profile = crate::act_engine::creation_profile_with_cache(
+            engine_limits(
+                std::thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get),
+            ),
+            Some(cache.mount()),
+        )
+        .map_err(|e| e.to_string())?;
         Ok(EnginePlan {
             act: artifact,
             intent: ActEngineIntent {
@@ -764,10 +759,10 @@ impl CiRuntime {
                 snapshot_sha256: record.tree_digest.clone(),
                 act_version: ACT_VERSION.into(),
                 act_image_digest: format!("sha256:{}", artifact.sha256),
-                engine_image_digest: self.backend.resolve_engine_image().await?,
+                engine_image_digest: crate::act_engine::ENGINE_MANIFEST.into(),
                 runner_image_digest: runner_digest.into(),
                 created_at: lifecycle::now_seconds(),
-                creation_profile: None,
+                creation_profile: Some(profile),
             },
             source: self.store.source(&record.id),
             event: self.store.event(&record.id),
@@ -778,7 +773,7 @@ impl CiRuntime {
                 cache_namespace: record.cache_namespace(),
                 secrets: self.secrets(record)?,
             },
-            cache: CacheVolume::machine(&registry_id, lifecycle::now_seconds())?,
+            cache,
             deadline,
         })
     }

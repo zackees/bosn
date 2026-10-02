@@ -1,11 +1,15 @@
 //! One act run on one isolated engine, end to end, through the registry.
 //!
 //! Order of effects (each registry step is durable before the next engine
-//! call): intent -> create -> observe + register -> prepare -> execute ->
-//! execution outcome -> cleanup request -> authorize -> remove -> proven
-//! absence -> terminal record. Cleanup is part of success: a run whose engine
-//! could not be proven gone is never reported as passing, and its record
-//! stays `cleanup_required` for the next recovery pass.
+//! call): intent (with its frozen creation profile) -> create -> observe +
+//! register -> start (the owned-engine layer, [`crate::act_engine`]) ->
+//! exclusive execution claim -> prepare -> execute (each verified against the
+//! claim) -> execution outcome -> owner cleanup request -> retire (authorize,
+//! remove, proven absence, terminal record). Cleanup is part of success: a
+//! run whose engine could not be proven gone is never reported as passing,
+//! and its record stays `cleanup_required` for the next daemon's startup
+//! recovery ([`crate::act_runtime::recover_startup_act_engines`]), the only
+//! recovery there is.
 
 use std::{
     path::PathBuf,
@@ -13,12 +17,12 @@ use std::{
 };
 
 use bosn_registry::act::{
-    ActEngineIntent, ActEngineRecord, ActEngineRemovalProof, ActEngineState, ActRunOutcome,
+    ActEngineIntent, ActEngineObservation, ActEngineRecord, ActEngineState, ActRunOutcome,
 };
 use kernal_api::async_engine::{self, CancellationToken};
 
 use super::engine::{
-    ActArtifact, ActEngineBackend, ActInvocation, CacheVolume, EngineLine, EngineSpec, ExecEnd,
+    ActArtifact, ActEngineBackend, ActInvocation, CacheVolume, EngineLine, ExecEnd,
 };
 use crate::{
     RegistryActor,
@@ -28,6 +32,8 @@ use crate::{
 /// Everything fixed before the engine exists.
 #[derive(Clone, Debug)]
 pub struct EnginePlan {
+    /// The immutable intent, with the frozen creation profile (limits and
+    /// the cache volume mount) the engine is created from and verified by.
     pub intent: ActEngineIntent,
     /// The pinned act build recorded in the intent's `act_image_digest`.
     pub act: ActArtifact,
@@ -148,6 +154,104 @@ async fn commit(registry: &RegistryActor, command: ActRegistryCommand) -> Result
         .map_err(|e| format!("registry: {e}"))
 }
 
+/// The run's latest durable record, if its intent ever committed.
+async fn record(registry: &RegistryActor, run: &str) -> Result<Option<ActEngineRecord>, String> {
+    match registry
+        .act_registry(ActRegistryCommand::Get { run: run.into() })
+        .await
+        .map_err(|e| format!("registry: {e}"))?
+    {
+        ActRegistryReply::Record(record) => Ok(record.map(|record| *record)),
+        _ => Err("registry: unexpected record reply".into()),
+    }
+}
+
+/// The registry this daemon owns engines for.
+async fn registry_owner(registry: &RegistryActor) -> Result<String, String> {
+    registry
+        .status()
+        .await
+        .map(|status| status.registry_id)
+        .map_err(|e| format!("registry: {e}"))
+}
+
+/// A fresh, unguessable execution-claim token.
+async fn claim_token() -> Result<String, String> {
+    let random = kernal_api::random::SecureRandom::new(1, Duration::from_secs(5))
+        .map_err(|e| format!("claim token: {e}"))?;
+    let bytes = random
+        .bytes(16)
+        .await
+        .map_err(|e| format!("claim token: {e}"))?;
+    Ok(crate::uuid(&bytes))
+}
+
+/// The run's exclusive execution claim on its registered engine. Every
+/// in-engine step re-verifies it, so an engine whose claim was withdrawn
+/// (or whose observation no longer matches) is never driven further.
+struct Claim<'a> {
+    registry: &'a RegistryActor,
+    run: String,
+    observed: ActEngineObservation,
+    token: String,
+}
+impl<'a> Claim<'a> {
+    async fn commit(
+        registry: &'a RegistryActor,
+        intent: &ActEngineIntent,
+        observed: ActEngineObservation,
+        at: f64,
+    ) -> Result<Self, String> {
+        let token = claim_token().await?;
+        match registry
+            .act_registry(ActRegistryCommand::Claim {
+                intent: intent.clone(),
+                observed: observed.clone(),
+                token: token.clone(),
+                at,
+            })
+            .await
+            .map_err(|e| format!("registry: {e}"))?
+        {
+            ActRegistryReply::Claimed(_) => Ok(Self {
+                registry,
+                run: intent.run_id.clone(),
+                observed,
+                token,
+            }),
+            _ => Err("registry did not commit the execution claim".into()),
+        }
+    }
+
+    /// The claim still holds for this exact engine and nothing has executed.
+    async fn verify(&self) -> Result<(), String> {
+        match self
+            .registry
+            .act_registry(ActRegistryCommand::VerifyClaimed {
+                run: self.run.clone(),
+                observed: self.observed.clone(),
+                token: self.token.clone(),
+            })
+            .await
+            .map_err(|e| format!("execution claim: {e}"))?
+        {
+            ActRegistryReply::Verified(record)
+                if record.state == ActEngineState::Registered && record.execution.is_none() =>
+            {
+                Ok(())
+            }
+            _ => Err("execution claim no longer holds".into()),
+        }
+    }
+
+    fn engine(&self) -> &str {
+        &self.observed.engine_id
+    }
+}
+
+/// How long the in-run cleanup may take to prove an engine gone.
+const CLEANUP_BUDGET: Duration = Duration::from_secs(180);
+
 /// Run one workflow on a fresh isolated engine. Never panics on engine
 /// faults; every path ends in a cleanup attempt whose result is reported.
 pub async fn run_on_engine(
@@ -158,69 +262,52 @@ pub async fn run_on_engine(
     observer: &mut dyn EngineObserver,
 ) -> EngineReport {
     let run = plan.intent.run_id.clone();
-    let name = plan.intent.engine_name();
     let mut clock = Clock(plan.intent.created_at);
-    // The intent is durable before anything exists on the host engine.
-    if let Err(error) = commit(registry, ActRegistryCommand::Begin(plan.intent.clone())).await {
-        return EngineReport {
-            execution: ExecutionEnd::EngineFailed(error),
-            cleanup: CleanupEnd::Removed,
-            engine_id: None,
-        };
-    }
+    let owner = match registry_owner(registry).await {
+        Ok(owner) => owner,
+        Err(error) => {
+            return EngineReport {
+                execution: ExecutionEnd::EngineFailed(error),
+                cleanup: CleanupEnd::Removed,
+                engine_id: None,
+            };
+        }
+    };
     let mut engine_id = None;
+    let mut claim = None;
     let mut laps = Laps::new();
     let execution = 'run: {
-        let labels = match registry_labels(registry, &plan.intent).await {
-            Ok(labels) => labels,
-            Err(error) => break 'run ExecutionEnd::EngineFailed(error),
-        };
         if let Err(error) = backend.ensure_cache(&plan.cache).await {
             break 'run ExecutionEnd::EngineFailed(error);
         }
         observer.note("creating isolated engine");
-        if let Err(error) = backend
-            .create(&EngineSpec {
-                name: name.clone(),
-                labels,
-                cache: plan.cache.clone(),
-            })
+        // The intent is durable before anything exists on the host engine.
+        let observed = match backend
+            .create(registry, &plan.intent, &owner, clock.now())
             .await
         {
-            break 'run ExecutionEnd::EngineFailed(error);
-        }
-        observer.note(&format!("engine created in {}", laps.lap()));
-        let observed = match backend.inspect(&name).await {
-            Ok(Some(observed)) => observed,
-            Ok(None) => {
-                break 'run ExecutionEnd::EngineFailed("engine vanished after creation".into());
-            }
+            Ok(observed) => observed,
             Err(error) => break 'run ExecutionEnd::EngineFailed(error),
         };
-        let id = observed.engine_id.clone();
-        if let Err(error) = commit(
-            registry,
-            ActRegistryCommand::Register {
-                run: run.clone(),
-                observed,
-                at: clock.now(),
-            },
-        )
-        .await
-        {
-            break 'run ExecutionEnd::EngineFailed(error);
-        }
-        engine_id = Some(id);
+        engine_id = Some(observed.engine_id.clone());
+        observer.note(&format!("engine created in {}", laps.lap()));
+        let held = match Claim::commit(registry, &plan.intent, observed, clock.now()).await {
+            Ok(held) => claim.insert(held),
+            Err(error) => break 'run ExecutionEnd::EngineFailed(error),
+        };
         if cancellation.is_cancelled() {
             break 'run ExecutionEnd::Cancelled;
         }
         let deadline = plan.deadline;
         observer.note("preparing engine: act, frozen source, runner image");
+        if let Err(error) = held.verify().await {
+            break 'run ExecutionEnd::EngineFailed(error);
+        }
         let prepared = async_engine::timeout_at(
             deadline,
             async_engine::cancellable(
                 cancellation,
-                backend.prepare(&name, &plan.source, &plan.event, plan.act),
+                backend.prepare(held.engine(), &plan.source, &plan.event, plan.act),
             ),
         )
         .await;
@@ -230,19 +317,28 @@ pub async fn run_on_engine(
             Ok(Ok(Err(error))) => break 'run ExecutionEnd::EngineFailed(error),
             Ok(Ok(Ok(()))) => observer.note(&format!("engine prepared in {}", laps.lap())),
         }
-        match async_engine::timeout_at(deadline, backend.list(&name, &plan.invocation.workflow))
-            .await
+        if let Err(error) = held.verify().await {
+            break 'run ExecutionEnd::EngineFailed(error);
+        }
+        match async_engine::timeout_at(
+            deadline,
+            backend.list(held.engine(), &plan.invocation.workflow),
+        )
+        .await
         {
             Err(_) => break 'run ExecutionEnd::TimedOut,
             Ok(Ok(listing)) => observer.declared(&listing),
             Ok(Err(error)) => break 'run ExecutionEnd::EngineFailed(error),
+        }
+        if let Err(error) = held.verify().await {
+            break 'run ExecutionEnd::EngineFailed(error);
         }
         observer.note("running act on the isolated engine");
         let (lines, mut receiver) = async_engine::channel(512);
         let execute = async {
             let end = backend
                 .execute(
-                    &name,
+                    held.engine(),
                     &plan.invocation,
                     deadline.remaining(),
                     cancellation,
@@ -269,13 +365,16 @@ pub async fn run_on_engine(
             Ok(ExecEnd::Cancelled) => ExecutionEnd::Cancelled,
             Err(error) => ExecutionEnd::EngineFailed(error),
         };
-        let outcome = registry_outcome(&end);
+        // Keep the run's tool-cache installs while the claim still holds.
+        if held.verify().await.is_ok() {
+            save_toolcache(backend, held.engine(), observer, &mut laps).await;
+        }
         if let Err(error) = commit(
             registry,
             ActRegistryCommand::Execution {
                 run: run.clone(),
-                token: String::new(),
-                outcome,
+                token: held.token.clone(),
+                outcome: registry_outcome(&end),
                 at: clock.now(),
             },
         )
@@ -285,44 +384,29 @@ pub async fn run_on_engine(
         }
         end
     };
-    if engine_id.is_some() {
-        save_toolcache(backend, &name, observer, &mut laps).await;
-    }
     let outcome = registry_outcome(&execution);
-    let cleanup = match commit(
+    let token = claim.as_ref().map(|held| held.token.clone());
+    observer.note("removing isolated engine");
+    let cleanup = match cleanup(
         registry,
-        ActRegistryCommand::Cleanup {
-            run: run.clone(),
-            outcome,
-            at: clock.now(),
-        },
+        backend,
+        &owner,
+        &run,
+        token.as_deref(),
+        outcome,
+        &mut clock,
     )
     .await
     {
-        Err(error) => CleanupEnd::Failed(error),
         Ok(()) => {
-            observer.note("removing isolated engine");
-            match retire(
-                registry,
-                backend,
-                &run,
-                &name,
-                engine_id.clone(),
-                &mut clock,
-            )
-            .await
-            {
-                Ok(()) => {
-                    observer.note(&format!(
-                        "engine removed in {}; total {}",
-                        laps.lap(),
-                        laps.total()
-                    ));
-                    CleanupEnd::Removed
-                }
-                Err(error) => CleanupEnd::Failed(error),
-            }
+            observer.note(&format!(
+                "engine removed in {}; total {}",
+                laps.lap(),
+                laps.total()
+            ));
+            CleanupEnd::Removed
         }
+        Err(error) => CleanupEnd::Failed(error),
     };
     EngineReport {
         execution,
@@ -339,170 +423,48 @@ fn registry_outcome(end: &ExecutionEnd) -> ActRunOutcome {
     }
 }
 
-async fn registry_labels(
-    registry: &RegistryActor,
-    intent: &ActEngineIntent,
-) -> Result<std::collections::BTreeMap<String, String>, String> {
-    let status = registry
-        .status()
-        .await
-        .map_err(|e| format!("registry: {e}"))?;
-    intent
-        .required_labels(&status.registry_id)
-        .map_err(|e| format!("registry: {e}"))
-}
-
-/// Remove an engine whose record is `cleanup_required`, proving absence
-/// before the terminal record. A container holding the name without the
-/// exact ownership labels is never removed.
-async fn retire(
+/// Request cleanup (as the claim's owner when the run held one) unless the
+/// creation path already did, then retire the engine. A run whose intent
+/// never committed has nothing to clean up.
+async fn cleanup(
     registry: &RegistryActor,
     backend: &dyn ActEngineBackend,
+    owner: &str,
     run: &str,
-    name: &str,
-    mut engine_id: Option<String>,
+    token: Option<&str>,
+    outcome: ActRunOutcome,
     clock: &mut Clock,
 ) -> Result<(), String> {
-    match backend.inspect(name).await? {
-        None => {}
-        Some(observed) => {
-            if engine_id.is_none() {
-                // Created but never registered (crash or failed register):
-                // capture its identity for cleanup only.
-                commit(
-                    registry,
-                    ActRegistryCommand::Recover {
-                        run: run.into(),
-                        observed: observed.clone(),
-                        at: clock.now(),
-                    },
-                )
-                .await
-                .map_err(|e| format!("engine {name} is not provably ours: {e}"))?;
-                engine_id = Some(observed.engine_id.clone());
-            }
-            let observed_id = observed.engine_id.clone();
-            let reply = registry
-                .act_registry(ActRegistryCommand::Authorize {
+    let Some(current) = record(registry, run).await? else {
+        return Ok(());
+    };
+    match current.state {
+        ActEngineState::Terminal => return Ok(()),
+        ActEngineState::CleanupRequired => {}
+        ActEngineState::Pending | ActEngineState::Registered => {
+            let at = clock.now().max(current.updated_at);
+            let command = match (token, current.execution_claim.as_deref()) {
+                (Some(token), Some(held)) if token == held => ActRegistryCommand::CleanupClaimed {
                     run: run.into(),
-                    observed,
-                })
-                .await
-                .map_err(|e| format!("cleanup not authorized: {e}"))?;
-            if !matches!(reply, ActRegistryReply::Authorized(_)) {
-                return Err("cleanup not authorized".into());
-            }
-            backend.remove(&observed_id).await?;
-            if backend.inspect(name).await?.is_some() {
-                return Err(format!("engine {name} still exists after removal"));
-            }
+                    token: token.into(),
+                    outcome,
+                    at,
+                },
+                _ => ActRegistryCommand::Cleanup {
+                    run: run.into(),
+                    outcome,
+                    at,
+                },
+            };
+            commit(registry, command).await?;
         }
     }
-    commit(
-        registry,
-        ActRegistryCommand::Finalize {
-            run: run.into(),
-            proof: ActEngineRemovalProof {
-                name: name.into(),
-                engine_id,
-            },
-            at: clock.now(),
-        },
-    )
-    .await
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RecoveryReport {
-    pub retired: Vec<String>,
-    pub failed: Vec<(String, String)>,
-}
-
-/// Every non-terminal engine record right now. Take this snapshot before the
-/// daemon admits any run, then [`reconcile`] exactly it: a run started later
-/// can never be mistaken for one a previous daemon left behind.
-pub async fn pending_records(registry: &RegistryActor) -> Result<Vec<ActEngineRecord>, String> {
-    let mut records = Vec::new();
-    let mut after: Option<String> = None;
-    loop {
-        let page = match registry
-            .act_registry(ActRegistryCommand::Pending {
-                after_run_id: after.clone(),
-                limit: 64,
-            })
-            .await
-            .map_err(|e| format!("recovery page: {e}"))?
-        {
-            ActRegistryReply::Recovery(page) => page,
-            _ => return Err("recovery page: unexpected reply".into()),
-        };
-        records.extend(page.items);
-        match page.next_run_id {
-            Some(next) => after = Some(next),
-            None => return Ok(records),
-        }
-    }
-}
-
-/// Interrupted runs are marked `interrupted`; their engines are removed
-/// after the same ownership checks as a normal cleanup.
-pub async fn reconcile(
-    registry: &RegistryActor,
-    backend: &dyn ActEngineBackend,
-    records: &[ActEngineRecord],
-) -> RecoveryReport {
-    let mut report = RecoveryReport::default();
-    for record in records {
-        let run = record.intent.run_id.clone();
-        match recover_one(registry, backend, record).await {
-            Ok(()) => report.retired.push(run),
-            Err(error) => report.failed.push((run, error)),
-        }
-    }
-    report
-}
-
-/// Snapshot and reconcile in one step (only safe while no run can start).
-pub async fn recover(registry: &RegistryActor, backend: &dyn ActEngineBackend) -> RecoveryReport {
-    match pending_records(registry).await {
-        Ok(records) => reconcile(registry, backend, &records).await,
-        Err(error) => RecoveryReport {
-            retired: Vec::new(),
-            failed: vec![("*".into(), error)],
-        },
-    }
-}
-
-async fn recover_one(
-    registry: &RegistryActor,
-    backend: &dyn ActEngineBackend,
-    record: &ActEngineRecord,
-) -> Result<(), String> {
-    let run = &record.intent.run_id;
-    let mut clock = Clock(record.updated_at);
-    if matches!(
-        record.state,
-        ActEngineState::Pending | ActEngineState::Registered
-    ) {
-        commit(
-            registry,
-            ActRegistryCommand::Cleanup {
-                run: run.clone(),
-                outcome: ActRunOutcome::Interrupted,
-                at: clock.now(),
-            },
-        )
-        .await?;
-    }
-    retire(
-        registry,
-        backend,
-        run,
-        &record.intent.engine_name(),
-        record.engine_id.clone(),
-        &mut clock,
-    )
-    .await
+    let current = record(registry, run)
+        .await?
+        .ok_or("registry: the run's record vanished")?;
+    backend
+        .retire(registry, owner, &current, CLEANUP_BUDGET)
+        .await
 }
 
 #[cfg(test)]

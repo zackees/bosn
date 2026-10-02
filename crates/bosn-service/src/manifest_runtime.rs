@@ -471,44 +471,19 @@ pub(crate) fn is_windows_absolute_path(value: &str) -> bool {
         && (bytes[2] == b'/' || bytes[2] == b'\\')
 }
 
-/// The persistent container's lifecycle shape: everything beyond the image
-/// generation that decides whether an existing container still fits.
-pub(crate) struct ManifestRuntimeShape<'a> {
-    /// The canonical checkout the stack serves.
-    pub workspace: &'a std::path::Path,
-    pub mounts: &'a [bosn_core::WorkspaceMount],
-    pub workdir: Option<&'a str>,
-    pub volumes: &'a [bosn_core::manifest::Volume],
-    pub tmpfs: &'a [SetupTmpfs],
-    pub host_docker_socket: Option<&'a SetupHostDockerSocket>,
-    pub macos_guest: Option<&'a SetupMacosGuest>,
-}
-
 pub(crate) fn manifest_runtime_generation(
     base_generation: &str,
-    shape: &ManifestRuntimeShape<'_>,
+    mounts: &[bosn_core::WorkspaceMount],
+    workdir: Option<&str>,
+    volumes: &[bosn_core::manifest::Volume],
+    tmpfs: &[SetupTmpfs],
+    host_docker_socket: Option<&SetupHostDockerSocket>,
+    macos_guest: Option<&SetupMacosGuest>,
 ) -> String {
-    let ManifestRuntimeShape {
-        workspace,
-        mounts,
-        workdir,
-        volumes,
-        tmpfs,
-        host_docker_socket,
-        macos_guest,
-    } = *shape;
     let mut hasher = Sha256Hasher::new();
     manifest_generation_field(&mut hasher, b"bosn-manifest-runtime-v1");
     manifest_generation_field(&mut hasher, base_generation.as_bytes());
     manifest_generation_field(&mut hasher, &(mounts.len() as u64).to_be_bytes());
-    // Mount sources are workspace-relative, so two checkouts with the same
-    // manifest would otherwise share one container that binds whichever
-    // checkout created it (#359). Only stacks that mount the workspace
-    // depend on which checkout they serve.
-    if !mounts.is_empty() {
-        manifest_generation_field(&mut hasher, b"workspace");
-        manifest_generation_field(&mut hasher, workspace.as_os_str().as_encoded_bytes());
-    }
     for mount in mounts {
         manifest_generation_field(&mut hasher, mount.source.as_bytes());
         manifest_generation_field(&mut hasher, mount.target.as_bytes());

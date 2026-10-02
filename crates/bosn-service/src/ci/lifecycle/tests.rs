@@ -1,6 +1,6 @@
 use super::*;
 use crate::{Registry, registry_actor};
-use bosn_registry::act::ActEngineObservation;
+use bosn_registry::act::{ActEngineObservation, ActEngineRemovalProof};
 use kernal_api::async_engine::{CancellationSource, RuntimeBuilder};
 use std::{
     collections::BTreeMap,
@@ -25,7 +25,9 @@ pub struct Faults {
     pub save: bool,
 }
 
-/// In-memory engine host: name -> (id, labels).
+/// In-memory engine host: name -> observation. Creation and retirement
+/// drive the real registry actor through the same commands, in the same
+/// order, as the owned-engine layer does on Docker.
 #[derive(Default)]
 pub struct FakeBackend {
     pub engines: Mutex<BTreeMap<String, ActEngineObservation>>,
@@ -49,29 +51,46 @@ impl FakeBackend {
     pub fn live(&self) -> usize {
         self.engines.lock().unwrap().len()
     }
-    fn insert(&self, spec: &EngineSpec) {
+    fn insert(
+        &self,
+        name: &str,
+        image: &str,
+        labels: BTreeMap<String, String>,
+    ) -> ActEngineObservation {
         let mut next = self.next.lock().unwrap();
         *next += 1;
-        self.engines.lock().unwrap().insert(
-            spec.name.clone(),
-            ActEngineObservation {
-                name: spec.name.clone(),
-                engine_id: format!("{:064x}", *next),
-                image_digest: format!("sha256:{}", "e".repeat(64)),
-                labels: spec.labels.clone(),
-            },
-        );
+        let observed = ActEngineObservation {
+            name: name.into(),
+            engine_id: format!("{:064x}", *next),
+            image_digest: image.into(),
+            labels,
+        };
+        self.engines
+            .lock()
+            .unwrap()
+            .insert(name.into(), observed.clone());
+        observed
+    }
+    fn live_id(&self, engine_id: &str) -> bool {
+        self.engines
+            .lock()
+            .unwrap()
+            .values()
+            .any(|engine| engine.engine_id == engine_id)
     }
 }
 pub const LISTING: &str = "Stage  Job ID  Job name  Workflow name  Workflow file  Events\n\
                            0      a       a         w              ci.yml         push\n";
+fn later(record: &ActEngineRecord) -> f64 {
+    now_seconds().max(record.updated_at)
+}
 impl ActEngineBackend for FakeBackend {
-    fn resolve_engine_image(&self) -> super::super::engine::BoxFuture<'_, Result<String, String>> {
+    fn ensure_engine_image(&self) -> super::super::engine::BoxFuture<'_, Result<(), String>> {
         Box::pin(async move {
             if self.faults().slow_image {
                 std::future::pending::<()>().await;
             }
-            Ok(format!("sha256:{}", "e".repeat(64)))
+            Ok(())
         })
     }
     fn ensure_cache<'a>(
@@ -90,9 +109,9 @@ impl ActEngineBackend for FakeBackend {
     }
     fn save_toolcache<'a>(
         &'a self,
-        name: &'a str,
+        engine: &'a str,
     ) -> super::super::engine::BoxFuture<'a, Result<(), String>> {
-        if self.engines.lock().unwrap().contains_key(name) {
+        if self.live_id(engine) {
             *self.saved_while_live.lock().unwrap() += 1;
         }
         let fails = self.faults().save;
@@ -113,39 +132,107 @@ impl ActEngineBackend for FakeBackend {
     }
     fn create<'a>(
         &'a self,
-        spec: &'a EngineSpec,
-    ) -> super::super::engine::BoxFuture<'a, Result<(), String>> {
+        registry: &'a RegistryActor,
+        intent: &'a ActEngineIntent,
+        owner: &'a str,
+        at: f64,
+    ) -> super::super::engine::BoxFuture<'a, Result<ActEngineObservation, String>> {
         Box::pin(async move {
             let f = self.faults();
+            commit(registry, ActRegistryCommand::Begin(intent.clone())).await?;
             if f.create {
                 return Err("synthetic create failure".into());
             }
-            self.insert(spec);
+            let labels = intent.required_labels(owner).map_err(|e| e.to_string())?;
+            let observed = self.insert(&intent.engine_name(), &intent.engine_image_digest, labels);
             if f.create_after_side_effect {
                 return Err("synthetic create failure after side effect".into());
             }
-            Ok(())
+            commit(
+                registry,
+                ActRegistryCommand::Register {
+                    run: intent.run_id.clone(),
+                    observed: observed.clone(),
+                    at,
+                },
+            )
+            .await?;
+            Ok(observed)
         })
     }
-    fn inspect<'a>(
+    fn retire<'a>(
         &'a self,
-        name: &'a str,
-    ) -> super::super::engine::BoxFuture<'a, Result<Option<ActEngineObservation>, String>> {
+        registry: &'a RegistryActor,
+        owner: &'a str,
+        record: &'a ActEngineRecord,
+        _budget: Duration,
+    ) -> super::super::engine::BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
-            if self.faults().inspect {
+            let f = self.faults();
+            if f.inspect {
                 return Err("synthetic inspect failure".into());
             }
-            Ok(self.engines.lock().unwrap().get(name).cloned())
+            let run = record.intent.run_id.clone();
+            let name = record.intent.engine_name();
+            let found = self.engines.lock().unwrap().get(&name).cloned();
+            let engine_id = match found {
+                None => record.engine_id.clone(),
+                Some(observed) => {
+                    let required = record
+                        .intent
+                        .required_labels(owner)
+                        .map_err(|e| e.to_string())?;
+                    if observed.labels != required {
+                        return Err(format!("engine {name} is not provably ours"));
+                    }
+                    if record.engine_id.is_none() {
+                        commit(
+                            registry,
+                            ActRegistryCommand::Recover {
+                                run: run.clone(),
+                                observed: observed.clone(),
+                                at: later(record),
+                            },
+                        )
+                        .await?;
+                    }
+                    let reply = registry
+                        .act_registry(ActRegistryCommand::Authorize {
+                            run: run.clone(),
+                            observed: observed.clone(),
+                        })
+                        .await
+                        .map_err(|e| format!("cleanup not authorized: {e}"))?;
+                    if !matches!(reply, ActRegistryReply::Authorized(_)) {
+                        return Err("cleanup not authorized".into());
+                    }
+                    if f.remove {
+                        return Err("synthetic removal failure".into());
+                    }
+                    self.engines.lock().unwrap().remove(&name);
+                    Some(observed.engine_id)
+                }
+            };
+            commit(
+                registry,
+                ActRegistryCommand::Finalize {
+                    run,
+                    proof: ActEngineRemovalProof { name, engine_id },
+                    at: later(record),
+                },
+            )
+            .await
         })
     }
     fn prepare<'a>(
         &'a self,
-        _name: &'a str,
+        engine: &'a str,
         _source: &'a std::path::Path,
         _event: &'a std::path::Path,
         _act: ActArtifact,
     ) -> super::super::engine::BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
+            assert!(self.live_id(engine), "prepare addresses the engine by ID");
             if self.faults().prepare {
                 return Err("synthetic prepare failure".into());
             }
@@ -154,14 +241,14 @@ impl ActEngineBackend for FakeBackend {
     }
     fn list<'a>(
         &'a self,
-        _name: &'a str,
+        _engine: &'a str,
         _workflow: &'a str,
     ) -> super::super::engine::BoxFuture<'a, Result<String, String>> {
         Box::pin(async { Ok(LISTING.to_string()) })
     }
     fn execute<'a>(
         &'a self,
-        _name: &'a str,
+        _engine: &'a str,
         _invocation: &'a ActInvocation,
         deadline: Duration,
         cancellation: &'a CancellationToken,
@@ -210,21 +297,6 @@ impl ActEngineBackend for FakeBackend {
             Ok(ExecEnd::Exited(f.exit_code))
         })
     }
-    fn remove<'a>(
-        &'a self,
-        engine_id: &'a str,
-    ) -> super::super::engine::BoxFuture<'a, Result<(), String>> {
-        Box::pin(async move {
-            if self.faults().remove {
-                return Err("synthetic removal failure".into());
-            }
-            self.engines
-                .lock()
-                .unwrap()
-                .retain(|_, engine| engine.engine_id != engine_id);
-            Ok(())
-        })
-    }
 }
 
 #[derive(Default)]
@@ -254,10 +326,16 @@ pub fn intent(run: &str) -> ActEngineIntent {
         snapshot_sha256: "c".repeat(64),
         act_version: "0.2.88".into(),
         act_image_digest: format!("sha256:{}", "d".repeat(64)),
-        engine_image_digest: format!("sha256:{}", "e".repeat(64)),
+        engine_image_digest: crate::act_engine::ENGINE_MANIFEST.into(),
         runner_image_digest: format!("sha256:{}", "f".repeat(64)),
         created_at: 1.0,
-        creation_profile: None,
+        creation_profile: Some(
+            crate::act_engine::creation_profile_with_cache(
+                super::super::engine::engine_limits(2),
+                Some(test_cache().mount()),
+            )
+            .unwrap(),
+        ),
     }
 }
 fn plan(run: &str, deadline: Duration) -> EnginePlan {
@@ -287,6 +365,33 @@ pub fn run_id(n: u32) -> String {
     format!("aaaaaaaa-bbbb-4ccc-8ddd-{n:012x}")
 }
 
+const OWNER: &str = "11111111-2222-4333-8444-555555555555";
+
+/// One daemon's sole registry writer over a registry file.
+pub struct Daemon {
+    pub registry: RegistryActor,
+    task: async_engine::Task<()>,
+}
+impl Daemon {
+    pub fn open(path: &std::path::Path) -> Self {
+        let registry = if path.exists() {
+            Registry::open_writer(path).unwrap()
+        } else {
+            Registry::create_writer(path, OWNER).unwrap()
+        };
+        let (sender, receiver) = async_engine::channel(16);
+        let task = async_engine::launch(registry_actor(registry, receiver, None));
+        Self {
+            registry: RegistryActor { sender },
+            task,
+        }
+    }
+    pub async fn stop(self) {
+        self.registry.stop().await;
+        let _ = self.task.await;
+    }
+}
+
 /// Run `body` with a live registry actor over a temporary registry.
 pub fn with_registry<F, Fut>(body: F)
 where
@@ -300,18 +405,65 @@ where
         .build()
         .unwrap()
         .run(async {
-            let registry =
-                Registry::create_writer(&path, "11111111-2222-4333-8444-555555555555").unwrap();
-            let (sender, receiver) = async_engine::channel(16);
-            let actor = RegistryActor { sender };
-            let task = async_engine::launch(registry_actor(registry, receiver, None));
-            body(actor.clone(), dir.path().to_path_buf()).await;
-            actor.stop().await;
-            let _ = task.await;
+            let daemon = Daemon::open(&path);
+            body(daemon.registry.clone(), dir.path().to_path_buf()).await;
+            daemon.stop().await;
         });
 }
 
-async fn record(registry: &RegistryActor, _dir: &std::path::Path, run: &str) -> ActEngineRecord {
+/// What the next daemon's startup does before it admits any run
+/// ([`crate::act_runtime::recover_startup_act_engines`]), over the fake
+/// engine host: interrupt every non-terminal record, retire its engine,
+/// then seal the startup window.
+async fn startup_recovery(
+    registry: &RegistryActor,
+    backend: &FakeBackend,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let (mut retired, mut failed) = (Vec::new(), Vec::new());
+    let mut after = None;
+    loop {
+        let ActRegistryReply::Recovery(page) = registry
+            .act_registry(ActRegistryCommand::Pending {
+                after_run_id: after.clone(),
+                limit: 16,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("recovery page");
+        };
+        for stale in page.items {
+            let run = stale.intent.run_id.clone();
+            commit(
+                registry,
+                ActRegistryCommand::StartupInterrupt {
+                    run: run.clone(),
+                    at: later(&stale),
+                },
+            )
+            .await
+            .unwrap();
+            let current = record_of(registry, &run).await;
+            match backend
+                .retire(registry, OWNER, &current, Duration::from_secs(5))
+                .await
+            {
+                Ok(()) => retired.push(run),
+                Err(error) => failed.push((run, error)),
+            }
+        }
+        match page.next_run_id {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    commit(registry, ActRegistryCommand::SealStartup)
+        .await
+        .unwrap();
+    (retired, failed)
+}
+
+async fn record_of(registry: &RegistryActor, run: &str) -> ActEngineRecord {
     match registry
         .act_registry(ActRegistryCommand::Get { run: run.into() })
         .await
@@ -320,6 +472,10 @@ async fn record(registry: &RegistryActor, _dir: &std::path::Path, run: &str) -> 
         ActRegistryReply::Record(Some(record)) => *record,
         other => panic!("no record for {run}: {other:?}"),
     }
+}
+
+async fn record(registry: &RegistryActor, _dir: &std::path::Path, run: &str) -> ActEngineRecord {
+    record_of(registry, run).await
 }
 
 fn terminal(record: &ActEngineRecord, outcome: ActRunOutcome) {
@@ -519,16 +675,40 @@ fn cancellation_mid_run_is_cancelled_and_cleaned() {
     });
 }
 
+/// Restart the daemon over the same registry and run its startup recovery.
+async fn restarted(
+    path: &std::path::Path,
+    backend: &FakeBackend,
+) -> (Daemon, Vec<String>, Vec<(String, String)>) {
+    let daemon = Daemon::open(path);
+    let (retired, failed) = startup_recovery(&daemon.registry, backend).await;
+    (daemon, retired, failed)
+}
+
+fn with_daemon<F, Fut>(body: F)
+where
+    F: FnOnce(Daemon, std::path::PathBuf) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let dir = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+    let path = dir.path().join("registry.sqlite3");
+    RuntimeBuilder::multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .run(async { body(Daemon::open(&path), path.clone()).await });
+}
+
 #[test]
-fn failed_cleanup_is_never_success_and_recovery_finishes_it() {
-    with_registry(|registry, dir| async move {
+fn failed_cleanup_is_never_success_and_startup_recovery_finishes_it() {
+    with_daemon(|daemon, path| async move {
         let backend = FakeBackend::with(Faults {
             remove: true,
             ..Faults::default()
         });
         let run = run_id(30);
         let report = run_on_engine(
-            &registry,
+            &daemon.registry,
             &backend,
             &plan(&run, Duration::from_secs(5)),
             &CancellationSource::new().token(),
@@ -537,31 +717,37 @@ fn failed_cleanup_is_never_success_and_recovery_finishes_it() {
         .await;
         assert_eq!(report.execution, ExecutionEnd::Exited(0));
         assert!(matches!(report.cleanup, CleanupEnd::Failed(_)));
-        let pending = record(&registry, &dir, &run).await;
+        let pending = record_of(&daemon.registry, &run).await;
         assert_eq!(pending.state, ActEngineState::CleanupRequired);
         assert_eq!(backend.live(), 1);
+        daemon.stop().await;
         backend.faults.lock().unwrap().remove = false;
-        let recovered = recover(&registry, &backend).await;
-        assert_eq!(recovered.retired, std::slice::from_ref(&run));
+        let (daemon, retired, failed) = restarted(&path, &backend).await;
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(retired, std::slice::from_ref(&run));
         assert_eq!(backend.live(), 0);
         // The run passed but cleanup needed recovery: the record keeps
         // the passed outcome with a removal receipt.
-        terminal(&record(&registry, &dir, &run).await, ActRunOutcome::Passed);
+        terminal(
+            &record_of(&daemon.registry, &run).await,
+            ActRunOutcome::Passed,
+        );
+        daemon.stop().await;
     });
 }
 
 #[test]
-fn daemon_restart_mid_run_is_reconciled_as_interrupted() {
-    with_registry(|registry, dir| async move {
+fn daemon_restart_mid_run_is_recovered_as_interrupted() {
+    with_daemon(|daemon, path| async move {
         let backend = Arc::new(FakeBackend::with(Faults {
             hang: true,
             ..Faults::default()
         }));
         // 50 runs interrupted mid-execution (the future is dropped, as a
-        // daemon SIGKILL would), plus one stuck before registration.
+        // daemon SIGKILL would), plus one stuck before its engine exists.
         let tasks: Vec<_> = (0..50)
             .map(|n| {
-                let registry = registry.clone();
+                let registry = daemon.registry.clone();
                 let backend = Arc::clone(&backend);
                 async_engine::launch(async move {
                     run_on_engine(
@@ -578,50 +764,45 @@ fn daemon_restart_mid_run_is_reconciled_as_interrupted() {
         while *backend.executions.lock().unwrap() < 50 {
             async_engine::sleep(Duration::from_millis(5)).await;
         }
-        // Every run is mid-execution: drop them all, as a daemon SIGKILL would.
         for task in &tasks {
             task.cancel();
         }
         for task in tasks {
             assert!(task.await.is_err(), "run must have been in flight");
         }
-        commit(&registry, ActRegistryCommand::Begin(intent(&run_id(200))))
-            .await
-            .unwrap();
+        commit(
+            &daemon.registry,
+            ActRegistryCommand::Begin(intent(&run_id(200))),
+        )
+        .await
+        .unwrap();
         assert_eq!(backend.live(), 50);
+        daemon.stop().await;
         backend.faults.lock().unwrap().hang = false;
-        let report = recover(&registry, backend.as_ref()).await;
-        assert!(report.failed.is_empty(), "{:?}", report.failed);
-        assert_eq!(report.retired.len(), 51);
+        let (daemon, retired, failed) = restarted(&path, &backend).await;
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(retired.len(), 51);
         assert_eq!(backend.live(), 0, "no orphaned engine");
         for n in (0..50).map(|n| run_id(100 + n)).chain([run_id(200)]) {
             terminal(
-                &record(&registry, &dir, &n).await,
+                &record_of(&daemon.registry, &n).await,
                 ActRunOutcome::Interrupted,
             );
         }
-        assert!(
-            recover(&registry, backend.as_ref())
-                .await
-                .retired
-                .is_empty()
-        );
+        daemon.stop().await;
+        let (daemon, retired, _) = restarted(&path, &backend).await;
+        assert!(retired.is_empty(), "nothing is left to recover");
+        daemon.stop().await;
     });
 }
 
 #[test]
-fn recovery_only_touches_records_from_before_the_daemon_started() {
+fn a_live_run_is_never_interrupted_once_runs_are_admitted() {
     with_registry(|registry, _dir| async move {
         let backend = Arc::new(FakeBackend::with(Faults {
             hang: true,
             ..Faults::default()
         }));
-        commit(&registry, ActRegistryCommand::Begin(intent(&run_id(300))))
-            .await
-            .unwrap();
-        let stale = pending_records(&registry).await.unwrap();
-        assert_eq!(stale.len(), 1);
-        // A run that starts after the snapshot sorts after it by UUID too.
         let live = {
             let registry = registry.clone();
             let backend = Arc::clone(&backend);
@@ -639,8 +820,17 @@ fn recovery_only_touches_records_from_before_the_daemon_started() {
         while *backend.executions.lock().unwrap() < 1 {
             async_engine::sleep(Duration::from_millis(5)).await;
         }
-        let report = reconcile(&registry, backend.as_ref(), &stale).await;
-        assert_eq!(report.retired, [run_id(300)]);
+        // Admitting the run sealed the startup window: recovery authority
+        // over its record is gone for this daemon's lifetime.
+        assert!(
+            registry
+                .act_registry(ActRegistryCommand::StartupInterrupt {
+                    run: run_id(301),
+                    at: now_seconds(),
+                })
+                .await
+                .is_err()
+        );
         assert_eq!(backend.live(), 1, "the live run's engine is untouched");
         live.cancel();
     });
@@ -648,43 +838,80 @@ fn recovery_only_touches_records_from_before_the_daemon_started() {
 
 #[test]
 fn foreign_container_with_the_engine_name_is_never_removed() {
-    with_registry(|registry, dir| async move {
+    with_daemon(|daemon, path| async move {
         let run = run_id(40);
         let backend = FakeBackend::default();
-        commit(&registry, ActRegistryCommand::Begin(intent(&run)))
+        commit(&daemon.registry, ActRegistryCommand::Begin(intent(&run)))
             .await
             .unwrap();
         // Something else took the deterministic name, without our labels.
-        backend.insert(&EngineSpec {
-            name: intent(&run).engine_name(),
-            labels: BTreeMap::new(),
-            cache: test_cache(),
-        });
-        let report = recover(&registry, &backend).await;
-        assert_eq!(report.failed.len(), 1);
+        backend.insert(
+            &intent(&run).engine_name(),
+            crate::act_engine::ENGINE_MANIFEST,
+            BTreeMap::new(),
+        );
+        daemon.stop().await;
+        let (daemon, _, failed) = restarted(&path, &backend).await;
+        assert_eq!(failed.len(), 1);
         assert_eq!(backend.live(), 1, "foreign container left alone");
-        let r = record(&registry, &dir, &run).await;
+        let r = record_of(&daemon.registry, &run).await;
         assert_eq!(r.state, ActEngineState::CleanupRequired);
+        daemon.stop().await;
     });
 }
 
 #[test]
 fn inspect_outage_during_cleanup_is_reported_not_assumed_absent() {
-    with_registry(|registry, dir| async move {
+    with_daemon(|daemon, path| async move {
         let backend = FakeBackend::with(Faults {
             inspect: true,
             ..Faults::default()
         });
         let run = run_id(51);
-        commit(&registry, ActRegistryCommand::Begin(intent(&run)))
+        commit(&daemon.registry, ActRegistryCommand::Begin(intent(&run)))
             .await
             .unwrap();
-        let recovered = recover(&registry, &backend).await;
-        assert_eq!(recovered.failed.len(), 1);
+        daemon.stop().await;
+        let (daemon, _, failed) = restarted(&path, &backend).await;
+        assert_eq!(failed.len(), 1);
         assert_eq!(
-            record(&registry, &dir, &run).await.state,
+            record_of(&daemon.registry, &run).await.state,
             ActEngineState::CleanupRequired,
             "an unreadable engine is never assumed absent"
+        );
+        daemon.stop().await;
+    });
+}
+
+#[test]
+fn every_engine_step_holds_the_execution_claim() {
+    with_registry(|registry, _dir| async move {
+        let backend = FakeBackend::default();
+        let run = run_id(60);
+        let report = run_on_engine(
+            &registry,
+            &backend,
+            &plan(&run, Duration::from_secs(5)),
+            &CancellationSource::new().token(),
+            &mut Collect::default(),
+        )
+        .await;
+        assert_eq!(report.execution, ExecutionEnd::Exited(0));
+        let done = record_of(&registry, &run).await;
+        assert_eq!(done.schema_version, 3);
+        assert!(
+            done.execution_claim.is_some(),
+            "the run executed under a claim"
+        );
+        assert_eq!(done.execution, Some(ActRunOutcome::Passed));
+        assert_eq!(
+            done.intent
+                .creation_profile
+                .as_ref()
+                .and_then(|profile| profile.cache_volume.as_ref())
+                .map(|cache| cache.target.as_str()),
+            Some(super::super::engine::ENGINE_CACHE),
+            "the cache volume mount is frozen into the creation profile"
         );
     });
 }

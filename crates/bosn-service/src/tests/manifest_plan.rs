@@ -851,48 +851,50 @@ fn manifest_app_task_plan_retains_only_a_task_from_its_selected_stack() {
 }
 
 /// Two checkouts with the same `bosn.toml` must never share a setup container
-/// that mounts one of them (#359); a stack that mounts no workspace path may.
+/// that mounts one of them (#359). The container's name is its creation
+/// identity (canonical workspace, creation arguments), so each checkout gets
+/// its own while the image generation stays shared.
 #[test]
-fn the_generation_names_the_workspace_it_mounts() {
+fn each_checkout_gets_its_own_setup_container_and_one_checkout_is_stable() {
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let image = format!("example.invalid/app@sha256:{}", "a".repeat(64));
     let runtime = RuntimeBuilder::current_thread()
         .enable_all()
         .build()
         .unwrap();
-    let generation = |clone: &str, manifest: &str| {
+    let mounting = format!(
+        "[stack.app]\nimage = '{image}'\n[stack.app.mounts.source]\nsource = '.'\ndestination = '/workspace'\n"
+    );
+    let identity = |clone: &str| {
         let workspace = temporary.path().join(clone);
         std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::write(workspace.join("bosn.toml"), manifest).unwrap();
-        runtime
+        std::fs::write(workspace.join("bosn.toml"), &mounting).unwrap();
+        let plan = runtime
             .run(manifest_stack_setup_plan(&ManifestEnsureJobRequest {
-                workspace,
+                workspace: workspace.clone(),
                 manifest: "bosn.toml".into(),
                 stack: "app".into(),
                 deadline: Duration::from_secs(1),
                 output_limit: 64,
             }))
-            .unwrap()
-            .generation
+            .unwrap();
+        let prepared = recovery_fixture_image(&plan.plan, TEST_IDENTITY);
+        let name = bosn_setup::setup_container_name(&plan.plan, &workspace, &prepared).unwrap();
+        (plan.generation, name)
     };
-    let mounting = format!(
-        "[stack.app]\nimage = '{image}'\n[stack.app.mounts.source]\nsource = '.'\ndestination = '/workspace'\n"
-    );
-    let first = generation("clone-a", &mounting);
+    let (generation_a, container_a) = identity("clone-a");
+    let (generation_b, container_b) = identity("clone-b");
     assert_ne!(
-        first,
-        generation("clone-b", &mounting),
+        container_a, container_b,
         "each checkout gets its own container"
     );
     assert_eq!(
-        first,
-        generation("clone-a", &mounting),
-        "stable for one checkout"
+        generation_a, generation_b,
+        "the image generation is not forked per checkout"
     );
-    let detached = format!("[stack.app]\nimage = '{image}'\n");
     assert_eq!(
-        generation("clone-c", &detached),
-        generation("clone-d", &detached),
-        "a stack that mounts no workspace path does not depend on the checkout"
+        identity("clone-a"),
+        (generation_a, container_a),
+        "stable for one checkout"
     );
 }

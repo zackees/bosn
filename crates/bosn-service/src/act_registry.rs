@@ -288,6 +288,7 @@ mod tests {
                 tmp_tmpfs_bytes: 64 << 20,
                 tmpfs_policy: bosn_registry::act::ActEngineTmpfsPolicy::StorageExecRunTmpNoexecV1,
                 init_command_sha256: "a".repeat(64),
+                cache_volume: None,
             }),
         };
         let runtime = kernal_api::async_engine::RuntimeBuilder::multi_thread()
@@ -419,6 +420,7 @@ mod tests {
                 tmp_tmpfs_bytes: 64 << 20,
                 tmpfs_policy: bosn_registry::act::ActEngineTmpfsPolicy::StorageExecRunTmpNoexecV1,
                 init_command_sha256: "a".repeat(64),
+                cache_volume: None,
             }),
         }
     }
