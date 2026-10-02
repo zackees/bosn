@@ -145,10 +145,11 @@ jobs:
           toolchain: "1.95.0"
           prebuild-deps: none
 
-      - name: Restore Cargo build cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: rust-workspace-v1
+      # No hand-keyed target cache (#361 phase 3): the former
+      # Swatinem/rust-cache `rust-workspace-v1` key was invalidated by hand.
+      # Compiled artifacts come from setup-soldr's content-keyed zccache
+      # build cache above (nearest-ancestor restore per zackees/ci.yml
+      # CACHE-024), and an attested PR head skips this job altogether.
 
       - name: Install native build dependencies
         run: |
