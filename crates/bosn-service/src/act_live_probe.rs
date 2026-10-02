@@ -126,11 +126,114 @@ async fn random_uuid() -> std::io::Result<String> {
 }
 fn limits() -> ActEngineLimits {
     ActEngineLimits {
+        memory_bytes: 28 << 30,
+        storage_bytes: 20 << 30,
+        nano_cpus: 2_000_000_000,
+        pids: 1024,
+    }
+}
+// Next probe profile is inferred from layer/native-copy demand, not a proven minimum.
+fn legacy_limits() -> ActEngineLimits {
+    ActEngineLimits {
         memory_bytes: 16 << 30,
         storage_bytes: 12 << 30,
         nano_cpus: 2_000_000_000,
         pids: 1024,
     }
+}
+fn retained_profile(root: &Path, run: &str) -> std::io::Result<ActEngineLimits> {
+    let path = root.join(format!("{run}-profile.json"));
+    let bytes = match bounded_file(&path, 4096) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(legacy_limits()),
+        Err(e) => return Err(e),
+    };
+    let value: Value = serde_json::from_slice(&bytes)?;
+    profile_from_value(&value)
+}
+fn profile_from_value(value: &Value) -> std::io::Result<ActEngineLimits> {
+    for profile in [limits(), legacy_limits()] {
+        if value["memory_bytes"].as_u64() == Some(profile.memory_bytes)
+            && value["storage_bytes"].as_u64() == Some(profile.storage_bytes)
+            && value["nano_cpus"].as_u64() == Some(profile.nano_cpus)
+            && value["pids"].as_u64() == Some(profile.pids)
+        {
+            return Ok(profile);
+        }
+    }
+    Err(fail("retained probe profile is unsupported"))
+}
+const RESOURCE_COMMAND: &str = "printf 'df_kib\n'; df -Pk /var/lib/docker; printf 'df_inodes\n'; df -Pi /var/lib/docker; printf 'memory_current\n'; cat /sys/fs/cgroup/memory.current; printf 'memory_peak\n'; cat /sys/fs/cgroup/memory.peak";
+fn resource_values(raw: &[u8]) -> std::io::Result<Value> {
+    let text = std::str::from_utf8(raw).map_err(|_| fail("resource sample is not UTF8"))?;
+    let lines = text.lines().collect::<Vec<_>>();
+    let row = |name: &str| -> std::io::Result<Vec<u64>> {
+        let position = lines
+            .iter()
+            .position(|line| *line == name)
+            .ok_or_else(|| fail("resource marker missing"))?;
+        let fields = lines
+            .get(position + 2)
+            .ok_or_else(|| fail("df row missing"))?
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        if fields.len() != 6 || fields[5] != "/var/lib/docker" {
+            return Err(fail("df mount row mismatch"));
+        }
+        fields[1..4]
+            .iter()
+            .map(|v| v.parse().map_err(|_| fail("invalid df counter")))
+            .collect()
+    };
+    let bytes = row("df_kib")?
+        .into_iter()
+        .map(|v| v.checked_mul(1024).ok_or_else(|| fail("df byte overflow")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let inodes = row("df_inodes")?;
+    let memory = |name: &str| -> std::io::Result<u64> {
+        let position = lines
+            .iter()
+            .position(|line| *line == name)
+            .ok_or_else(|| fail("memory marker missing"))?;
+        lines
+            .get(position + 1)
+            .ok_or_else(|| fail("memory value missing"))?
+            .parse()
+            .map_err(|_| fail("invalid memory counter"))
+    };
+    Ok(
+        json!({"tmpfs_total_bytes":bytes[0],"tmpfs_used_bytes":bytes[1],"tmpfs_available_bytes":bytes[2],"inodes_total":inodes[0],"inodes_used":inodes[1],"inodes_available":inodes[2],"memory_current":memory("memory_current")?,"memory_peak":memory("memory_peak")?}),
+    )
+}
+async fn sample_resources(engine: &DockerEngine, id: &str, elapsed: Duration) -> Value {
+    let result = engine
+        .with_args(["exec", id, "sh", "-c", RESOURCE_COMMAND])
+        .capture_async(RunOptions::bounded(Duration::from_secs(2), 16384))
+        .await;
+    resource_receipt(result.map_err(|e| e.to_string()), id, elapsed)
+}
+fn resource_receipt(
+    result: Result<bosn_engine::CommandResult, String>,
+    id: &str,
+    elapsed: Duration,
+) -> Value {
+    let mut value = json!({"schema_version":1,"source":"owned-engine df and private cgroupfs; observer telemetry only","unix_seconds":at(),"elapsed_ms":elapsed.as_millis(),"command":RESOURCE_COMMAND,"engine_id":id});
+    match result {
+        Ok(result) => {
+            value["command_exit"] = json!(result.exit_code);
+            value["stderr"] = json!(String::from_utf8_lossy(&result.stderr));
+            if result.exit_code == 0 {
+                match resource_values(&result.stdout) {
+                    Ok(metrics) => value["metrics"] = metrics,
+                    Err(e) => value["observer_error"] = json!(e.to_string()),
+                }
+            } else {
+                value["observer_error"] = json!("resource command failed");
+            }
+        }
+        Err(e) => value["observer_error"] = json!(e.to_string()),
+    }
+    value
 }
 async fn docker(engine: &DockerEngine, args: Vec<String>) -> std::io::Result<Vec<u8>> {
     let result = engine
@@ -262,6 +365,7 @@ async fn cleanup(
     intent: &ActEngineIntent,
     owner: &str,
     proof: &VerifiedEngineManifest,
+    profile: ActEngineLimits,
 ) -> std::io::Result<()> {
     let Some(current) = record(registry, &intent.run_id).await? else {
         return Ok(());
@@ -286,7 +390,7 @@ async fn cleanup(
             vec!["container".into(), "inspect".into(), id.clone()],
         )
         .await?;
-        observe_engine(&raw, intent, owner, &identity, limits()).map_err(|e| fail(e.to_string()))?
+        observe_engine(&raw, intent, owner, &identity, profile).map_err(|e| fail(e.to_string()))?
     } else {
         let ids = docker(
             engine,
@@ -338,7 +442,7 @@ async fn cleanup(
             vec!["container".into(), "inspect".into(), ids[0].into()],
         )
         .await?;
-        let observed = observe_engine(&raw, intent, owner, &identity, limits())
+        let observed = observe_engine(&raw, intent, owner, &identity, profile)
             .map_err(|e| fail(e.to_string()))?;
         if current.state == ActEngineState::Pending {
             registry
@@ -406,11 +510,12 @@ async fn watch_cancellation(
     engine: DockerEngine,
     intent: ActEngineIntent,
     observed: ActEngineObservation,
-    artifacts: (PathBuf, PathBuf),
+    artifacts: (PathBuf, PathBuf, bool),
     cancel: CancellationSource,
     stop: CancellationSource,
 ) -> std::io::Result<bool> {
-    let (evidence, samples) = artifacts;
+    let (evidence, samples, cancel_case) = artifacts;
+    let mut sampled = 0usize;
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(120) && !stop.token().is_cancelled() {
         if let Some(current) = record(&registry, &intent.run_id).await?
@@ -418,14 +523,34 @@ async fn watch_cancellation(
             && current.execution.is_none()
             && let Some(token) = current.execution_claim
         {
-            registry
+            if let Err(error) = registry
                 .act_registry(ActRegistryCommand::VerifyClaimed {
                     run: intent.run_id.clone(),
                     observed: observed.clone(),
                     token,
                 })
                 .await
-                .map_err(|e| fail(e.to_string()))?;
+            {
+                retain(
+                    &samples.join("observer-authorization-error.json"),
+                    &serde_json::to_vec_pretty(
+                        &json!({"source":"probe observer authorization; not runtime evidence","unix_seconds":at(),"observer_error":error.to_string()}),
+                    )?,
+                )?;
+                return Ok(false);
+            }
+            if sampled < 240 && !stop.token().is_cancelled() {
+                let sample = sample_resources(&engine, &observed.engine_id, start.elapsed()).await;
+                retain(
+                    &samples.join(format!("resources-{sampled:03}.json")),
+                    &serde_json::to_vec_pretty(&sample)?,
+                )?;
+                sampled += 1;
+            }
+            if !cancel_case {
+                async_engine::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
             if let Ok(raw) = docker(
                 &engine,
                 vec![
@@ -521,6 +646,13 @@ async fn probe_case(
         &root.join(format!("{run}-intent.json")),
         &serde_json::to_vec_pretty(&intent)?,
     )?;
+    let profile = limits();
+    retain(
+        &root.join(format!("{run}-profile.json")),
+        &serde_json::to_vec_pretty(
+            &json!({"memory_bytes":profile.memory_bytes,"storage_bytes":profile.storage_bytes,"nano_cpus":profile.nano_cpus,"pids":profile.pids,"basis":"inferred expanded layer/native-copy demand; not validated minimum"}),
+        )?,
+    )?;
     let cancellation = CancellationSource::new();
     let mut observer = ProbeObserver::new();
     let result = match async_engine::timeout(Duration::from_secs(120), async {
@@ -564,19 +696,15 @@ async fn probe_case(
         let evidence = root.join("evidence");
         let samples = root.join(format!("{run}-samples"));
         private_dir(&samples)?;
-        observer.task = if cancel_case {
-            Some(async_engine::launch(watch_cancellation(
-                registry.clone(),
-                engine.clone(),
-                intent.clone(),
-                observed.clone(),
-                (evidence.clone(), samples),
-                cancellation.clone(),
-                observer.stop.clone(),
-            )))
-        } else {
-            None
-        };
+        observer.task = Some(async_engine::launch(watch_cancellation(
+            registry.clone(),
+            engine.clone(),
+            intent.clone(),
+            observed.clone(),
+            (evidence.clone(), samples, cancel_case),
+            cancellation.clone(),
+            observer.stop.clone(),
+        )));
         run_registered_act(
             registry,
             engine,
@@ -633,7 +761,7 @@ async fn probe_case(
             json!({"cancel_case":cancel_case,"nested_cancellation_observed":nested_cancelled,"report":report}),
         )
     })();
-    let cleanup_result = cleanup(registry, engine, &intent, owner, engine_manifest).await;
+    let cleanup_result = cleanup(registry, engine, &intent, owner, engine_manifest, limits()).await;
     let summary = match (&result, &cleanup_result) {
         (Ok(value), Ok(())) => value.clone(),
         _ => {
@@ -773,7 +901,8 @@ fn recover_retained_pinned_engine_only() {
         assert_eq!(current.intent,intent); assert!(current.execution_claim.is_none(), "recovery must not destroy a live execution claim");
         let (sender,receiver) = async_engine::channel(16); let actor = RegistryActor { sender };
         let task = async_engine::launch(registry_actor(registry,receiver,None));
-        let result = cleanup(&actor,&DockerEngine::docker(),&intent,&owner,&proof).await;
+        let profile=retained_profile(&root,&run).unwrap();
+        let result = cleanup(&actor,&DockerEngine::docker(),&intent,&owner,&proof,profile).await;
         actor.stop().await; task.await.unwrap();
         retain(&root.join(format!("{run}-recovery-{}.json",random_uuid().await.unwrap())), &serde_json::to_vec_pretty(&json!({"run_id":run,"registry_id":owner,"verified_cleanup":result.is_ok(),"error":result.as_ref().err().map(ToString::to_string)})).unwrap()).unwrap();
         result.unwrap();
@@ -811,11 +940,67 @@ fn retained_created_engine_inspect_is_verified_offline() {
         &intent,
         &owner,
         &image,
-        limits(),
+        legacy_limits(),
     )
     .unwrap();
     assert_eq!(
         observed.engine_id,
         "da29a0806c0d63ac16233240c5f4fb5e8b90c61057accd511c82cc1e6cbbedaa"
     );
+}
+
+#[test]
+fn resource_sample_preserves_byte_inode_and_memory_axes_and_refuses_bad_data() {
+    let raw = b"df_kib\nFilesystem 1024-blocks Used Available Capacity Mounted on\ntmpfs 20971520 1024 20970496 1% /var/lib/docker\ndf_inodes\nFilesystem Inodes IUsed IFree IUse% Mounted on\ntmpfs 1000 800 200 80% /var/lib/docker\nmemory_current\n4096\nmemory_peak\n8192\n";
+    let metrics = resource_values(raw).unwrap();
+    assert_eq!(metrics["tmpfs_total_bytes"], 20u64 << 30);
+    assert_eq!(metrics["tmpfs_used_bytes"], 1 << 20);
+    assert_eq!(metrics["inodes_used"], 800);
+    assert_eq!(metrics["memory_peak"], 8192);
+    for replacement in ["/foreign", "18446744073709551615"] {
+        let text = std::str::from_utf8(raw).unwrap().replace(
+            if replacement == "/foreign" {
+                "/var/lib/docker"
+            } else {
+                "20971520"
+            },
+            replacement,
+        );
+        assert!(resource_values(text.as_bytes()).is_err());
+    }
+    assert!(resource_values(b"partial observation").is_err());
+    assert_eq!(limits().storage_bytes, 20 << 30);
+    assert_eq!(limits().memory_bytes, 28 << 30);
+    assert_eq!(legacy_limits().storage_bytes, 12 << 30);
+}
+
+#[test]
+fn observer_failure_cannot_be_promoted_to_resource_measurement_or_runtime_success() {
+    let failed = resource_receipt(
+        Ok(bosn_engine::CommandResult {
+            exit_code: 7,
+            stdout: b"invented counters".to_vec(),
+            stderr: b"df failed".to_vec(),
+        }),
+        "owned-id",
+        Duration::from_secs(1),
+    );
+    assert_eq!(failed["command_exit"], 7);
+    assert!(failed["metrics"].is_null());
+    assert!(failed["observer_error"].is_string());
+    assert!(failed["execution_success"].is_null());
+    let unavailable =
+        resource_receipt(Err("daemon unavailable".into()), "owned-id", Duration::ZERO);
+    assert!(unavailable["command_exit"].is_null());
+    assert!(unavailable["metrics"].is_null());
+    assert_eq!(unavailable["observer_error"], "daemon unavailable");
+    for profile in [limits(), legacy_limits()] {
+        let value = json!({"memory_bytes":profile.memory_bytes,"storage_bytes":profile.storage_bytes,"nano_cpus":profile.nano_cpus,"pids":profile.pids});
+        assert_eq!(profile_from_value(&value).unwrap(), profile);
+        for field in ["memory_bytes", "storage_bytes", "nano_cpus", "pids"] {
+            let mut wrong = value.clone();
+            wrong[field] = json!(0);
+            assert!(profile_from_value(&wrong).is_err());
+        }
+    }
 }
