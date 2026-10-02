@@ -923,8 +923,14 @@ mod tests {
         };
         let overlay = format!("{ENGINE_WORK}/overlay");
         let args = invocation.args();
-        assert!(args.windows(2).any(|w| w == ["-W", ".github/workflows/ci.yml"]));
-        assert!(args.windows(2).any(|w| w[0] == "--workflow-overlay" && w[1] == overlay));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-W", ".github/workflows/ci.yml"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--workflow-overlay" && w[1] == overlay)
+        );
         invocation.workflow_overlaid = true;
         let args = invocation.args();
         let planned = format!("{overlay}/.github/workflows/ci.yml");

@@ -488,7 +488,10 @@ mod tests {
             let text = std::fs::read_to_string(overlay.join(relative)).unwrap();
             assert!(!text.contains("ref:"), "{relative}: {text}");
             let original = std::fs::read_to_string(root.join(relative)).unwrap();
-            assert!(original.contains("ref:"), "{relative}: the snapshot is only read");
+            assert!(
+                original.contains("ref:"),
+                "{relative}: the snapshot is only read"
+            );
         }
         assert!(
             !overlay.join(".github/workflows/other.yml").exists(),
@@ -522,9 +525,16 @@ mod tests {
         assert_eq!(localized.trapped, 1, "the run: step ends its output");
         assert_eq!(localized.files, vec![PathBuf::from(relative)]);
         assert_eq!(std::fs::read_to_string(&workflow).unwrap(), original);
-        assert_eq!(git_in(root, &["status", "--porcelain"]), "", "clean, unaided");
+        assert_eq!(
+            git_in(root, &["status", "--porcelain"]),
+            "",
+            "clean, unaided"
+        );
         let rewritten = std::fs::read_to_string(overlay.join(relative)).unwrap();
-        assert!(!rewritten.contains("ref:"), "act reads the rewrite: {rewritten}");
+        assert!(
+            !rewritten.contains("ref:"),
+            "act reads the rewrite: {rewritten}"
+        );
         let _ = std::fs::remove_dir_all(&overlay);
     }
 

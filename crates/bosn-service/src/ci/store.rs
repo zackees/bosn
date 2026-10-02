@@ -346,4 +346,3 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
 pub fn overlay_beside(source: &Path) -> PathBuf {
     source.with_file_name("overlay")
 }
-
