@@ -18,6 +18,7 @@ pub struct RunKey {
     /// Branch, PR number and repository all shape the event payload.
     pub payload_sha256: String,
     pub timeout_secs: u64,
+    pub secrets: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -142,6 +143,7 @@ mod tests {
             engine: "act".into(),
             payload_sha256: "p".into(),
             timeout_secs: 60,
+            secrets: Vec::new(),
         }
     }
 

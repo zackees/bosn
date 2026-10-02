@@ -15,7 +15,7 @@ use bosn_registry::act::{
 use kernal_api::async_engine::{self, CancellationToken};
 
 use super::engine::{
-    ActArtifact, ActEngineBackend, ActInvocation, EngineLine, EngineSpec, ExecEnd,
+    ActArtifact, ActEngineBackend, ActInvocation, CacheVolume, EngineLine, EngineSpec, ExecEnd,
 };
 use crate::{
     RegistryActor,
@@ -31,6 +31,8 @@ pub struct EnginePlan {
     pub source: PathBuf,
     pub event: PathBuf,
     pub invocation: ActInvocation,
+    pub cache: CacheVolume,
+    /// Covers everything after the engine exists: prepare and execution.
     pub deadline: Duration,
 }
 
@@ -117,11 +119,15 @@ pub async fn run_on_engine(
             Ok(labels) => labels,
             Err(error) => break 'run ExecutionEnd::EngineFailed(error),
         };
+        if let Err(error) = backend.ensure_cache(&plan.cache).await {
+            break 'run ExecutionEnd::EngineFailed(error);
+        }
         observer.note("creating isolated engine");
         if let Err(error) = backend
             .create(&EngineSpec {
                 name: name.clone(),
                 labels,
+                cache: plan.cache.clone(),
             })
             .await
         {
@@ -151,16 +157,21 @@ pub async fn run_on_engine(
         if cancellation.is_cancelled() {
             break 'run ExecutionEnd::Cancelled;
         }
+        let deadline = async_engine::Deadline::after(plan.deadline);
         observer.note("preparing engine: act, frozen source, runner image");
-        let prepared = async_engine::cancellable(
-            cancellation,
-            backend.prepare(&name, &plan.source, &plan.event, plan.act),
+        let prepared = async_engine::timeout_at(
+            deadline,
+            async_engine::cancellable(
+                cancellation,
+                backend.prepare(&name, &plan.source, &plan.event, plan.act),
+            ),
         )
         .await;
         match prepared {
-            Err(_) => break 'run ExecutionEnd::Cancelled,
-            Ok(Err(error)) => break 'run ExecutionEnd::EngineFailed(error),
-            Ok(Ok(())) => {}
+            Err(_) => break 'run ExecutionEnd::TimedOut,
+            Ok(Err(_)) => break 'run ExecutionEnd::Cancelled,
+            Ok(Ok(Err(error))) => break 'run ExecutionEnd::EngineFailed(error),
+            Ok(Ok(Ok(()))) => {}
         }
         match backend.list(&name, &plan.invocation.workflow).await {
             Ok(listing) => observer.declared(&listing),
@@ -170,7 +181,13 @@ pub async fn run_on_engine(
         let (lines, mut receiver) = async_engine::channel(512);
         let execute = async {
             let end = backend
-                .execute(&name, &plan.invocation, plan.deadline, cancellation, &lines)
+                .execute(
+                    &name,
+                    &plan.invocation,
+                    deadline.remaining(),
+                    cancellation,
+                    &lines,
+                )
                 .await;
             drop(lines);
             end
@@ -478,6 +495,12 @@ pub(crate) mod tests {
         ) -> super::super::engine::BoxFuture<'_, Result<String, String>> {
             Box::pin(async { Ok(format!("sha256:{}", "e".repeat(64))) })
         }
+        fn ensure_cache<'a>(
+            &'a self,
+            _cache: &'a CacheVolume,
+        ) -> super::super::engine::BoxFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
         fn create<'a>(
             &'a self,
             spec: &'a EngineSpec,
@@ -631,8 +654,17 @@ pub(crate) mod tests {
                 event: "push".into(),
                 workflow: ".github/workflows/ci.yml".into(),
                 job: None,
+                cache_namespace: "0".repeat(16),
+                secrets: Default::default(),
             },
+            cache: test_cache(),
             deadline,
+        }
+    }
+    fn test_cache() -> CacheVolume {
+        CacheVolume {
+            name: "bosn-ci-cache-test".into(),
+            labels: BTreeMap::new(),
         }
     }
     pub fn run_id(n: u32) -> String {
@@ -937,6 +969,7 @@ pub(crate) mod tests {
             backend.insert(&EngineSpec {
                 name: intent(&run).engine_name(),
                 labels: BTreeMap::new(),
+                cache: test_cache(),
             });
             let report = recover(&registry, &backend).await;
             assert_eq!(report.failed.len(), 1);

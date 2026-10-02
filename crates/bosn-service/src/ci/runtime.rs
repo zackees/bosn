@@ -15,7 +15,8 @@ use serde_json::Value;
 
 use super::{
     engine::{
-        ACT_VERSION, ActEngineBackend, ActInvocation, EngineLine, RUNNER_IMAGE, act_artifact,
+        ACT_VERSION, ActEngineBackend, ActInvocation, CacheVolume, EngineLine, RUNNER_IMAGE,
+        SecretEnv, act_artifact,
     },
     lifecycle::{self, CleanupEnd, EngineObserver, EnginePlan, EngineReport, ExecutionEnd},
     model::{ActParser, LogRecord, RunTree, parse_act_list},
@@ -26,7 +27,7 @@ use super::{
     store::{INDEX_STRIDE, LogFilter, LogQuery, LogWriter, Settings, Store},
     wire::*,
 };
-use crate::RegistryActor;
+use crate::{RegistryActor, secrets::SecretMasker};
 
 /// Finished runs kept, and how many of them keep their source for retry.
 const KEEP_RUNS: usize = 200;
@@ -70,6 +71,8 @@ impl CiState {
 /// The daemon-side CI runtime. Cheap to clone.
 #[derive(Clone)]
 pub struct CiRuntime {
+    /// The daemon state directory (secrets are read from it per run).
+    state_dir: std::path::PathBuf,
     store: Store,
     state: Arc<Mutex<CiState>>,
     kick: async_engine::Sender<()>,
@@ -111,6 +114,7 @@ impl CiRuntime {
         }
         let (kick, mut kicked) = async_engine::channel(64);
         let runtime = Self {
+            state_dir: state_dir.to_path_buf(),
             store,
             state: Arc::new(Mutex::new(state)),
             kick,
@@ -528,13 +532,19 @@ impl CiRuntime {
             id: record.id.clone(),
             log: self.store.log_writer(&record.id),
             parser: ActParser::default(),
+            masker: SecretMasker::new(Vec::<String>::new()),
             seq: 0,
             last_publish: Instant::now(),
         };
         let outcome = self.drive(&record, &cancel, &mut observer).await;
         observer.publish();
         let mut tree = std::mem::take(&mut observer.parser.tree);
-        let (conclusion, reason) = report::conclude(&outcome, &mut tree);
+        let (conclusion, mut reason) = report::conclude(&outcome, &mut tree);
+        let lost = observer.log.as_ref().map_or(observer.seq, LogWriter::lost);
+        if lost > 0 {
+            let note = format!("{lost} log records could not be written");
+            reason = Some(reason.map_or(note.clone(), |r| format!("{r}; {note}")));
+        }
         self.complete(&record.id, |record| {
             record.tree = tree;
             record.finish(conclusion, reason);
@@ -569,6 +579,7 @@ impl CiRuntime {
         observer: &mut RunObserver,
     ) -> Result<EngineReport, String> {
         let plan = self.plan(record).await?;
+        observer.masker = SecretMasker::new(plan.invocation.secrets.0.iter().map(|(_, v)| v));
         observer.note(&format!(
             "run {} sha {}{} workflow {} trigger {} mode {} actor {}",
             record.id,
@@ -593,6 +604,21 @@ impl CiRuntime {
         .await)
     }
 
+    /// The opted-in secrets, read from the daemon's secret store. A refused
+    /// secret fails the run; a missing one runs without it (act then calls
+    /// GitHub anonymously, limited to 60 requests per hour).
+    fn secrets(&self, record: &RunRecord) -> Result<SecretEnv, String> {
+        let mut env = Vec::new();
+        for name in &record.secrets {
+            let key = crate::secrets::secret_env_name(name)
+                .ok_or_else(|| format!("unknown secret {name}"))?;
+            if let Some(value) = crate::secrets::read_secret(&self.state_dir, name)? {
+                env.push((key.to_string(), value));
+            }
+        }
+        Ok(SecretEnv(env))
+    }
+
     /// The immutable engine intent and act invocation for a record.
     async fn plan(&self, record: &RunRecord) -> Result<EnginePlan, String> {
         let artifact = act_artifact(std::env::consts::ARCH)
@@ -600,6 +626,12 @@ impl CiRuntime {
         let (_, runner_digest) = RUNNER_IMAGE
             .rsplit_once('@')
             .ok_or("runner image is not pinned")?;
+        let registry_id = self
+            .registry
+            .status()
+            .await
+            .map_err(|e| format!("registry: {e}"))?
+            .registry_id;
         Ok(EnginePlan {
             act: artifact,
             intent: ActEngineIntent {
@@ -620,7 +652,10 @@ impl CiRuntime {
                 event: record.event.clone(),
                 workflow: record.workflow.clone(),
                 job: record.job.clone(),
+                cache_namespace: record.cache_namespace(),
+                secrets: self.secrets(record)?,
             },
+            cache: CacheVolume::machine(&registry_id, lifecycle::now_seconds())?,
             deadline: Duration::from_secs(record.timeout_secs),
         })
     }
@@ -731,19 +766,21 @@ struct RunObserver {
     id: String,
     log: Option<LogWriter>,
     parser: ActParser,
+    /// Masks secret values in act output before it is parsed or stored.
+    masker: SecretMasker,
     seq: u64,
     last_publish: Instant,
 }
 
 impl RunObserver {
     fn append(&mut self, record: LogRecord) {
-        if let Some(log) = &mut self.log {
-            let offset = log.append(&record);
-            if record.seq % INDEX_STRIDE == 1 {
-                let mut state = self.runtime.lock();
-                if let Some(slot) = state.runs.get_mut(&self.id) {
-                    slot.index.push((record.seq, offset));
-                }
+        let offset = self.log.as_mut().and_then(|log| log.append(&record));
+        if let Some(offset) = offset
+            && record.seq % INDEX_STRIDE == 1
+        {
+            let mut state = self.runtime.lock();
+            if let Some(slot) = state.runs.get_mut(&self.id) {
+                slot.index.push((record.seq, offset));
             }
         }
         if self.last_publish.elapsed() > PUBLISH_INTERVAL {
@@ -788,13 +825,13 @@ impl EngineObserver for RunObserver {
     fn line(&mut self, line: EngineLine) {
         let seq = self.next_seq();
         let record = match line {
-            EngineLine::Stdout(text) => self.parser.feed(seq, &text),
+            EngineLine::Stdout(text) => self.parser.feed(seq, &self.masker.mask_text(&text)),
             EngineLine::Stderr(text) => LogRecord {
                 seq,
                 stream: "stderr".into(),
                 job: None,
                 section: None,
-                text,
+                text: self.masker.mask_text(&text),
             },
         };
         self.append(record);

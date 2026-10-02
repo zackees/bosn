@@ -29,6 +29,8 @@ pub struct SubmitOptions {
     pub sha: Option<String>,
     pub pr_number: Option<u64>,
     pub timeout_secs: Option<u64>,
+    /// Opt-in daemon-owned secrets by name (`github_token`).
+    pub secrets: Vec<String>,
 }
 
 /// Who is submitting: `BOSN_CI_ACTOR`, else an agent session when running
@@ -158,5 +160,6 @@ pub async fn stage_submission(
         origin: receipt.origin,
         pr_number: options.pr_number,
         timeout_secs: options.timeout_secs,
+        secrets: options.secrets,
     })
 }

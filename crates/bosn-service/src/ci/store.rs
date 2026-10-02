@@ -118,9 +118,12 @@ impl Store {
             .and_then(|b| serde_json::from_slice(&b).ok())
     }
     pub fn save_settings(&self, settings: &Settings) {
-        let _ = write_atomic(
-            &self.root.join("settings.json"),
-            &serde_json::to_vec(settings).unwrap_or_default(),
+        logged(
+            "runner settings",
+            write_atomic(
+                &self.root.join("settings.json"),
+                &serde_json::to_vec(settings).unwrap_or_default(),
+            ),
         );
     }
 
@@ -139,11 +142,13 @@ impl Store {
 
     pub fn save_run(&self, record: &RunRecord) {
         let dir = self.run_dir(&record.id);
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = write_atomic(
-            &dir.join("run.json"),
-            &serde_json::to_vec_pretty(record).unwrap_or_default(),
-        );
+        let saved = std::fs::create_dir_all(&dir).and_then(|()| {
+            write_atomic(
+                &dir.join("run.json"),
+                &serde_json::to_vec_pretty(record).unwrap_or_default(),
+            )
+        });
+        logged("run record", saved);
     }
 
     /// Move a staged snapshot into a new run directory with its payload.
@@ -183,6 +188,7 @@ impl Store {
             .map(|file| LogWriter {
                 out: io::BufWriter::new(file),
                 offset: 0,
+                lost: 0,
             })
     }
 
@@ -260,27 +266,45 @@ impl Store {
 pub struct LogWriter {
     out: io::BufWriter<std::fs::File>,
     offset: u64,
+    /// Records that could not be written (their seqs are missing).
+    lost: u64,
 }
 impl LogWriter {
-    /// Append one record; returns its byte offset.
-    pub fn append(&mut self, record: &LogRecord) -> u64 {
+    /// Append one record; returns its byte offset, or `None` if it was lost.
+    pub fn append(&mut self, record: &LogRecord) -> Option<u64> {
         let at = self.offset;
-        if let Ok(mut line) = serde_json::to_string(record) {
-            line.push('\n');
-            if self.out.write_all(line.as_bytes()).is_ok() {
-                self.offset += line.len() as u64;
-            }
+        let mut line = serde_json::to_string(record).ok()?;
+        line.push('\n');
+        if self.out.write_all(line.as_bytes()).is_err() {
+            self.lost += 1;
+            return None;
         }
-        at
+        self.offset += line.len() as u64;
+        Some(at)
     }
     pub fn flush(&mut self) {
-        let _ = self.out.flush();
+        if self.out.flush().is_err() {
+            self.lost += 1;
+        }
+    }
+    pub fn lost(&self) -> u64 {
+        self.lost
     }
 }
 
+/// State writes are best effort for the run itself, but never silent.
+fn logged(what: &str, result: io::Result<()>) {
+    if let Err(error) = result {
+        eprintln!("bosn ci: could not write the {what}: {error}");
+    }
+}
+
+/// Write, fsync, then rename, so a crash leaves the old or the new file.
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
     std::fs::rename(tmp, path)
 }
 

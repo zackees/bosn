@@ -73,6 +73,9 @@ pub struct SubmitRequest {
     pub origin: Option<String>,
     pub pr_number: Option<u64>,
     pub timeout_secs: Option<u64>,
+    /// Opt-in daemon-owned secrets by name (only `github_token`).
+    #[serde(default)]
+    pub secrets: Vec<String>,
 }
 
 impl SubmitRequest {
@@ -101,6 +104,14 @@ impl SubmitRequest {
         }
         if self.actor.is_empty() || self.actor.len() > 200 {
             return refuse("invalid actor");
+        }
+        if self.secrets.len() > 4
+            || self
+                .secrets
+                .iter()
+                .any(|s| crate::secrets::secret_env_name(s).is_none())
+        {
+            return refuse("unknown secret (only github_token is supported)");
         }
         provider::validate(self.trigger, self.mode, self.dirty).map_err(CiError::refused)
     }
@@ -202,6 +213,9 @@ pub struct RunRecord {
     pub submitters: u32,
     pub retry_of: Option<String>,
     pub timeout_secs: u64,
+    /// Opt-in secret names; values never leave the daemon's secret store.
+    #[serde(default)]
+    pub secrets: Vec<String>,
     pub log_records: u64,
     #[serde(default)]
     pub tree: RunTree,
@@ -242,6 +256,7 @@ impl RunRecord {
             submitters: 1,
             retry_of: None,
             timeout_secs: request.timeout().as_secs(),
+            secrets: request.secrets.clone(),
             log_records: 0,
             tree: RunTree::default(),
         }
@@ -270,6 +285,17 @@ impl RunRecord {
     }
 
     /// Mark a record a previous daemon left unfinished.
+    /// The act cache-server namespace: one store per repository identity
+    /// (the origin repository, else the checkout path).
+    pub fn cache_namespace(&self) -> String {
+        let identity = if self.repository == super::provider::LOCAL_REPOSITORY {
+            &self.workspace
+        } else {
+            &self.repository
+        };
+        sha256_hex(identity.as_bytes())[..16].to_string()
+    }
+
     /// Mark the run done. Unfinished jobs and steps are cancelled.
     pub fn finish(&mut self, conclusion: Conclusion, reason: Option<String>) {
         self.state = RunState::Done;
@@ -291,6 +317,7 @@ impl RunRecord {
             engine: self.engine.clone(),
             payload_sha256: self.payload_sha256.clone(),
             timeout_secs: self.timeout_secs,
+            secrets: self.secrets.clone(),
         }
     }
 }

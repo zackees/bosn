@@ -106,9 +106,12 @@ pub fn github_workflow(workspace: &Path, requested: Option<&str>) -> Result<Stri
     }
 }
 
+/// The repository name used when the checkout has no `origin`.
+pub const LOCAL_REPOSITORY: &str = "local/repository";
+
 /// `owner/repo` from an origin URL, when it names one.
 pub fn repository(origin: Option<&str>) -> String {
-    let fallback = "local/repository".to_string();
+    let fallback = LOCAL_REPOSITORY.to_string();
     let Some(origin) = origin else {
         return fallback;
     };

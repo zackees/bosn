@@ -22,7 +22,7 @@ use bosn_service::{
 use kernal_api::async_engine::{Runtime, RuntimeBuilder};
 
 pub const USAGE: &str = "usage: bosn ci plan [--workspace P] [--provider github] [--workflow F] [--job J] [--trigger pr|push|release] [--mode minimal|test|full] [--sha S] [--json]
-   or: bosn ci run <plan options> [--engine act] [--pr-number N] [--timeout-secs N] [--wait [--deadline-ms N]] [--json]
+   or: bosn ci run <plan options> [--engine act] [--pr-number N] [--timeout-secs N] [--github-token] [--wait [--deadline-ms N]] [--json]
    or: bosn ci list [--workspace P] [--state queued|running|done] [--limit N] [--json]
    or: bosn ci show RUN [--json]
    or: bosn ci logs RUN [--job K] [--step S] [--since-seq N] [--follow] [--json]
@@ -199,6 +199,11 @@ fn submit_options(flags: &Flags) -> Result<SubmitOptions, Failure> {
         sha: flags.get("--sha").map(str::to_string),
         pr_number: flags.number("--pr-number")?,
         timeout_secs: flags.number("--timeout-secs")?,
+        secrets: if flags.has("--github-token") {
+            vec!["github_token".into()]
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -246,7 +251,7 @@ fn print<T: JsonReply>(reply: &T, json: bool, text: impl FnOnce(&T)) {
 }
 
 fn plan(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
-    let flags = Flags::parse(arguments, PLAN_FLAGS, &["--json"])?;
+    let flags = Flags::parse(arguments, PLAN_FLAGS, &["--json", "--github-token"])?;
     let plan = bosn_service::ci::plan(&submit_options(&flags)?).map_err(describe)?;
     print(&plan, flags.json(), |p| {
         println!("provider: {}", p.provider.as_str());
@@ -260,7 +265,11 @@ fn plan(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
 }
 
 fn submit(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
-    let flags = Flags::parse(arguments, PLAN_FLAGS, &["--json", "--wait"])?;
+    let flags = Flags::parse(
+        arguments,
+        PLAN_FLAGS,
+        &["--json", "--wait", "--github-token"],
+    )?;
     let options = submit_options(&flags)?;
     // Refuse a bad checkout or trigger before starting any daemon.
     bosn_service::ci::plan(&options).map_err(describe)?;

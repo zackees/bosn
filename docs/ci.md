@@ -85,6 +85,39 @@ job succeeded, or when its engine could not be proven removed.
   explicitly. Under an agent session it is `agent:<session>`, and otherwise
   `human`.
 
+## Caches (machine-wide)
+
+Every engine mounts one bosn-labelled named volume, `bosn-ci-cache-v1`, at
+`/bosn/cache`. It is a volume rather than a host directory because the
+privileged engine writes as root, and Docker Desktop shares no host paths
+with its VM. It holds:
+
+- `tools/`: the pinned act release, verified by sha256 on every use.
+- `images/`: the pinned runner image, saved once as a tar and loaded into each
+  engine with `docker load` (a warm run skips the ~30 s pull).
+- `actions/`: act's action checkouts (`--action-cache-path`). These are keyed
+  by repository and ref, so they are safe to share.
+- `actcache/<namespace>/`: act's cache server store (`--cache-server-path`),
+  one per repository identity. The namespace is a hash of the `origin`
+  repository, or of the checkout path when there is no origin. So two
+  repositories using the same `actions/cache` key never restore each other's
+  entries, while a repository's second run restores its own.
+
+Artifacts use a per-engine store, so concurrent runs never share an artifact
+server or its port.
+
+## GitHub token (opt-in)
+
+`bosn ci run --github-token` passes the daemon-owned secret
+(`bosn secret set github_token`; see [task-secrets.md](task-secrets.md)) to
+act as `-s GITHUB_TOKEN`.
+
+- The value travels only in the Docker client's environment
+  (`docker exec --env GITHUB_TOKEN`). It never appears in argv, records or logs.
+- Run output is masked before it is parsed or stored.
+- A missing secret runs anonymously, which GitHub limits to 60 API requests
+  per hour. A refused secret (wrong permissions, or a symlink) fails the run.
+
 ## State
 
 All runtime state is under the daemon state directory (`ci/`):
@@ -103,10 +136,8 @@ The newest 200 finished runs are kept; `runners prune-cache --older-than-secs N
 
 These are tracked in #323:
 
-- The persistent action and cache volumes and the runner-image cache (#302, #303).
-  Each run currently pulls the runner image inside its engine, which takes
-  about 40 s.
-- Secrets and `GITHUB_TOKEN` (#308).
+- Cross-repository sharing of compiler caches (zccache/soldr) outside
+  `actions/cache`.
 - MCP tools and `bosn.Client` methods.
 - The daemon UI and the desktop widget.
 - GitLab.

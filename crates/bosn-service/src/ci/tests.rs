@@ -35,6 +35,7 @@ fn request(staging: &str, sha_byte: char) -> SubmitRequest {
         origin: Some("https://github.com/o/r.git".into()),
         pr_number: None,
         timeout_secs: Some(5),
+        secrets: Vec::new(),
     }
 }
 
