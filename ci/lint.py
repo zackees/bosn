@@ -17,6 +17,8 @@ CHECKS: list[list[str]] = [
     [sys.executable, str(ROOT / "ci" / "lint_kbi.py")],
     [sys.executable, str(ROOT / "ci" / "lint_no_macos_runners.py")],
     [sys.executable, str(ROOT / "ci" / "lint_no_vcpkg_bootstrap.py")],
+    # Hard gate: every Rust/Python/shell source file stays under 1,000 lines.
+    [sys.executable, str(ROOT / "ci" / "lint_file_length.py")],
 ]
 
 
