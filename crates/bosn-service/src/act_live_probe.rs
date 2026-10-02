@@ -163,7 +163,7 @@ fn profile_from_value(value: &Value) -> std::io::Result<ActEngineLimits> {
     }
     Err(fail("retained probe profile is unsupported"))
 }
-const RESOURCE_COMMAND: &str = "printf 'df_kib\n'; df -Pk /var/lib/docker; printf 'df_inodes\n'; df -Pi /var/lib/docker; printf 'memory_current\n'; cat /sys/fs/cgroup/memory.current; printf 'memory_peak\n'; cat /sys/fs/cgroup/memory.peak";
+const RESOURCE_COMMAND: &str = "printf 'df_kib\n'; df -Pk /var/lib/docker; printf 'df_inodes\n'; df -Pi /var/lib/docker; printf 'memory_current\n'; cat /sys/fs/cgroup/memory.current; printf 'memory_peak\n'; cat /sys/fs/cgroup/memory.peak; printf 'mountinfo\\n'; cat /proc/self/mountinfo";
 fn resource_values(raw: &[u8]) -> std::io::Result<Value> {
     let text = std::str::from_utf8(raw).map_err(|_| fail("resource sample is not UTF8"))?;
     let lines = text.lines().collect::<Vec<_>>();
@@ -222,6 +222,7 @@ fn resource_receipt(
         Ok(result) => {
             value["command_exit"] = json!(result.exit_code);
             value["stderr"] = json!(String::from_utf8_lossy(&result.stderr));
+            value["stdout"] = json!(String::from_utf8_lossy(&result.stdout));
             if result.exit_code == 0 {
                 match resource_values(&result.stdout) {
                     Ok(metrics) => value["metrics"] = metrics,
