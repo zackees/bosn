@@ -939,6 +939,26 @@ pub async fn run_registered_act(
         report.output_sha256 = Some(logging.await.map_err(|e| error(e.to_string()))??);
         let output = output.map_err(|e| error(e.to_string()))?;
         if output.exit_code != 0 {
+            #[cfg(all(test, target_os = "linux"))]
+            if std::env::var_os("BOSN_ACT_PROBE_INPUT_DIR").is_some() {
+                let remaining = request.execution_deadline.saturating_sub(started.elapsed());
+                if let Err(diagnostic) = crate::act_live_probe::diagnose_nested_failure(
+                    registry,
+                    engine,
+                    request.intent,
+                    request.observed,
+                    &token,
+                    &evidence,
+                    remaining,
+                )
+                .await
+                {
+                    let _ = private_file(
+                        &evidence.join("probe-diagnostic-error.txt"),
+                        diagnostic.to_string().as_bytes(),
+                    );
+                }
+            }
             // Retain complete structured stdout when Act reports failed jobs.
             // This evidence never overrides the driver's failing exit status.
             report.jobs = parse_job_results(&output.stdout).unwrap_or_default();
