@@ -1,7 +1,8 @@
 //! Opt-in, live-Docker proof for #335: `actions/checkout` with a `ref:` is
-//! served from the run's frozen snapshot (uncommitted work included), and a
-//! checkout of another repository fails loudly instead of testing the wrong
-//! code. Run with `cargo test -p bosn-service --test ci_checkout_live -- --ignored`.
+//! served from the run's frozen snapshot (uncommitted work included), a
+//! checkout of another public repository pinned to a commit needs no token,
+//! and a checkout of another repository at a moving ref fails loudly instead
+//! of testing the wrong code. Run with `cargo test -p bosn-service --test ci_checkout_live -- --ignored`.
 
 use std::{path::Path, process::Command};
 
@@ -20,6 +21,15 @@ jobs:
         with:
           path: nested
       - run: grep -q uncommitted-edit nested/marker.txt
+  pinned:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: actions/checkout
+          ref: 11bd71901bbe5b1630ceea73d27597364c9af683
+          path: dep
+      - run: test -f dep/action.yml
   other:
     runs-on: ubuntu-latest
     steps:
@@ -56,7 +66,7 @@ fn short_temp() -> tempfile::TempDir {
 
 #[test]
 #[ignore = "needs Docker"]
-fn checkout_with_a_ref_sees_uncommitted_work_and_other_repos_fail_loudly() {
+fn checkout_with_a_ref_sees_uncommitted_work_pinned_repos_need_no_token_others_fail_loudly() {
     let root = short_temp();
     let repo = root.path().join("repo");
     let state = root.path().join("s");
@@ -87,6 +97,7 @@ fn checkout_with_a_ref_sees_uncommitted_work_and_other_repos_fail_loudly() {
             .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&out.stderr)))
     };
     let own = run("own");
+    let pinned = run("pinned");
     let other = run("other");
     let _ = Command::new(env!("CARGO_BIN_EXE_bosn"))
         .args(["daemon", "stop", "--state-dir"])
@@ -97,5 +108,6 @@ fn checkout_with_a_ref_sees_uncommitted_work_and_other_repos_fail_loudly() {
         own["dirty"].is_string(),
         "the run used the uncommitted tree"
     );
+    assert_eq!(pinned["conclusion"], "success", "{pinned}");
     assert_eq!(other["conclusion"], "failure", "{other}");
 }

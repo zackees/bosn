@@ -711,14 +711,24 @@ impl CiRuntime {
         Ok(SecretEnv(env))
     }
 
-    /// Serve own-repository checkouts from the snapshot (#335) and say so.
+    /// Serve checkouts without a token (#335) and say how, naming every
+    /// repository fetched from GitHub.
     fn localize_checkouts(&self, record: &RunRecord, observer: &mut RunObserver) {
         let source = self.store.source(&record.id);
         match super::checkout::localize_tree(&source, &record.repository) {
-            Ok(0) => {}
-            Ok(changed) => observer.note(&format!(
-                "{changed} actions/checkout step(s) of this repository are served from the frozen snapshot"
-            )),
+            Ok(localized) => {
+                if localized.own > 0 {
+                    observer.note(&format!(
+                        "{} actions/checkout step(s) of this repository are served from the frozen snapshot",
+                        localized.own
+                    ));
+                }
+                for pinned in &localized.pinned {
+                    observer.note(&format!(
+                        "actions/checkout of {pinned} is fetched anonymously from GitHub (a pinned commit; no token)"
+                    ));
+                }
+            }
             Err(error) => observer.note(&format!("workflow left as written: {error}")),
         }
     }
