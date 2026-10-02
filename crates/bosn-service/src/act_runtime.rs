@@ -383,6 +383,57 @@ async fn control(
     }
     Ok(output.stdout)
 }
+async fn transfer_input(
+    registry: &RegistryActor,
+    engine: &DockerEngine,
+    ownership: (&ActRuntimeRequest<'_>, &str),
+    source: &Path,
+    destination: &str,
+    started: Instant,
+    cancellation: &async_engine::CancellationToken,
+) -> std::io::Result<()> {
+    let (request, token) = ownership;
+    if !matches!(destination, "act.oci.tar" | "source.tar" | "event.json") {
+        return Err(error("unknown private input destination"));
+    }
+    let remaining = request
+        .execution_deadline
+        .checked_sub(started.elapsed())
+        .filter(|d| !d.is_zero())
+        .ok_or_else(|| error("Act lifecycle deadline exceeded"))?;
+    if cancellation.is_cancelled() {
+        return Err(error("Act runtime cancelled"));
+    }
+    verify_registry(registry, request, token).await?;
+    let source = std::fs::File::open(source)?;
+    let output = engine
+        .with_args([
+            "exec".to_owned(),
+            "-i".to_owned(),
+            request.observed.engine_id.clone(),
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "umask 077; cat > \"$1\"".to_owned(),
+            "bosn-input".to_owned(),
+            format!("{INPUTS}/{destination}"),
+        ])
+        .capture_with_stdin_file_async(
+            source,
+            request.archive_ceiling,
+            RunOptions::bounded(remaining.min(Duration::from_secs(30)), 2 << 20),
+            Some(cancellation),
+        )
+        .await
+        .map_err(|e| error(e.to_string()))?;
+    if output.exit_code != 0 {
+        return Err(error(format!(
+            "owned engine input transfer failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    verify_registry(registry, request, token).await?;
+    Ok(())
+}
 fn verify_ready_engine(bytes: &[u8]) -> std::io::Result<()> {
     let info: Value = serde_json::from_slice(bytes)?;
     let containerd = info["DriverStatus"].as_array().is_some_and(|rows| {
@@ -719,11 +770,15 @@ pub async fn run_registered_act(
         ])
         .await?;
         for file in ["act.oci.tar", "source.tar", "event.json"] {
-            control(vec![
-                "cp".into(),
-                evidence.join(file).to_string_lossy().into_owned(),
-                format!("{id}:{INPUTS}/{file}"),
-            ])
+            transfer_input(
+                registry,
+                engine,
+                (&request, &token),
+                &evidence.join(file),
+                file,
+                started,
+                cancellation,
+            )
             .await?;
         }
         let copied = control(vec![
@@ -952,9 +1007,19 @@ if args[:2]==['container','rm']:
  print(record['engine_id'])
 elif args[:2]==['container','ls']:
  if mode=='probe-failed': sys.exit(8)
-elif args[0]=='cp':
- assert record['state']=='registered' and args[-1].startswith(record['engine_id']+':/var/lib/docker/bosn-inputs/')
+elif args[:4]==['exec','-i',record['engine_id'],'sh']:
+ assert record['state']=='registered' and args[-1].startswith('/var/lib/docker/bosn-inputs/')
+ assert args[-2]=='bosn-input' and args[4]=='-c' and args[5]=='umask 077; cat > \"$1\"'
  if mode=='copy-failed': sys.exit(7)
+ import hashlib
+ from pathlib import Path
+ received=Path(db).parent/'received';received.mkdir(exist_ok=True)
+ digest=hashlib.sha256()
+ while True:
+  chunk=sys.stdin.buffer.read(8192)
+  if not chunk: break
+  digest.update(chunk)
+ (received/Path(args[-1]).name).write_text(digest.hexdigest())
 elif args[:4]==['exec',record['engine_id'],'docker','info']:
  if mode=='readiness-timeout': sys.exit(8)
  value={'DockerRootDir':'/var/lib/docker','Driver':'native','ServerVersion':'29.7.2','OSType':'linux','Architecture':'x86_64','DriverStatus':[['driver-type','io.containerd.snapshotter.v1']]}
@@ -963,9 +1028,9 @@ elif args[:4]==['exec',record['engine_id'],'docker','info']:
 elif args[:3]==['exec',record['engine_id'],'sha256sum']:
  import hashlib
  from pathlib import Path
- evidence=Path(db).parent/'evidence'/record['intent']['run_id']
+ received=Path(db).parent/'received'
  for path in args[3:]:
-  digest=hashlib.sha256((evidence/Path(path).name).read_bytes()).hexdigest()
+  digest=(received/Path(path).name).read_text()
   if mode=='copy-corrupt': digest='f'*64
   print(digest+'  '+path)
 elif args[:4]==['exec',record['engine_id'],'docker','load']:
