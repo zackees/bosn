@@ -369,7 +369,7 @@ fn cancellation_queued_at_registry_handoff_is_rejected_after_persisted_success()
                 SetupExecutors {
                     prepare: Arc::new(SlowFakeSetupExecutor::new()),
                     task: Arc::new(FakeSetupTaskExecutor::new()),
-                    app_task: Arc::new(FakeSetupAppTaskExecutor::new()),
+                    app_task: Arc::new(FakeSetupAppTaskExecutor::new(None)),
                     ensure: fake,
                     manifest_ensure: Arc::new(DockerManifestEnsureExecutor::new(state.clone())),
                     manifest_app_task: Arc::new(DockerManifestAppTaskExecutor::new(state.clone())),

@@ -16,6 +16,18 @@ fn joins_supersedes_and_never_rejoins_a_cancelling_active_job() {
 }
 
 #[test]
+fn coalescing_ends_when_the_job_does() {
+    // #299: only a queued or running job absorbs an identical submission; a
+    // finished one leaves its key free, so the same request runs again.
+    let mut jobs = Jobs::new(1);
+    assert_eq!(jobs.submit("w", "s", "a").unwrap(), Submission::Started(1));
+    assert_eq!(jobs.submit("w", "s", "a").unwrap(), Submission::Joined(1));
+    jobs.settle(1, true).unwrap();
+    assert_eq!(jobs.jobs[&1].state, JobState::Succeeded);
+    assert_eq!(jobs.submit("w", "s", "a").unwrap(), Submission::Started(2));
+}
+
+#[test]
 fn cap_cursors_and_shutdown_are_bounded() {
     let mut jobs = Jobs::new(1);
     let first = match jobs.submit("a", "s", "x").unwrap() {

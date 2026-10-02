@@ -450,15 +450,75 @@ impl SetupTaskExecutor for FakeSetupTaskExecutor {
     }
 }
 
+/// Holds a fake executor inside its run until the test releases it, so the
+/// test can act while the job is provably in flight (#299). Coalescing joins
+/// only active jobs, so a coalescing assertion must not race the executor.
+struct ExecutionGate {
+    entered: async_engine::Sender<()>,
+    release: Mutex<Option<async_engine::Receiver<()>>>,
+}
+/// The test's side of an [`ExecutionGate`].
+struct GateControl {
+    entered: async_engine::Receiver<()>,
+    release: async_engine::Sender<()>,
+}
+fn execution_gate() -> (ExecutionGate, GateControl) {
+    let (entered, entered_wait) = async_engine::channel(1);
+    let (release, release_wait) = async_engine::channel(1);
+    (
+        ExecutionGate {
+            entered,
+            release: Mutex::new(Some(release_wait)),
+        },
+        GateControl {
+            entered: entered_wait,
+            release,
+        },
+    )
+}
+impl ExecutionGate {
+    /// Report entry, then wait for the release. A second run fails: a gated
+    /// fake executes once.
+    async fn hold(&self) -> Result<(), String> {
+        self.entered
+            .send(())
+            .await
+            .map_err(|_| "test entry observer closed".to_owned())?;
+        let mut release = self
+            .release
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| "test task executed twice".to_owned())?;
+        release
+            .recv()
+            .await
+            .ok_or_else(|| "test release closed".to_owned())
+    }
+}
+impl GateControl {
+    async fn entered(&mut self) {
+        async_engine::timeout(Duration::from_secs(10), self.entered.recv())
+            .await
+            .expect("gated executor did not start")
+            .expect("gated executor dropped its gate");
+    }
+    async fn release(&self) {
+        self.release.send(()).await.unwrap();
+    }
+}
+
 struct FakeSetupAppTaskExecutor {
     started: AtomicUsize,
     observed: Mutex<Vec<String>>,
+    gate: Option<ExecutionGate>,
 }
 impl FakeSetupAppTaskExecutor {
-    fn new() -> Self {
+    fn new(gate: Option<ExecutionGate>) -> Self {
         Self {
             started: AtomicUsize::new(0),
             observed: Mutex::new(Vec::new()),
+            gate,
         }
     }
 }
@@ -477,6 +537,9 @@ impl SetupAppTaskExecutor for FakeSetupAppTaskExecutor {
                 .unwrap()
                 .push(request.task_name.clone());
             session.begin("owned-container-id".into()).await?;
+            if let Some(gate) = &self.gate {
+                gate.hold().await?;
+            }
             logs.send("[fake] declared app task executed".into())
                 .await
                 .map_err(|_| "fake log consumer closed".to_owned())?;
@@ -488,15 +551,13 @@ impl SetupAppTaskExecutor for FakeSetupAppTaskExecutor {
 
 struct FakeManifestAppTaskExecutor {
     observed: Mutex<Vec<ManifestAppTaskJobRequest>>,
-    entered: async_engine::Sender<()>,
-    release: Mutex<Option<async_engine::Receiver<()>>>,
+    gate: ExecutionGate,
 }
 impl FakeManifestAppTaskExecutor {
-    fn new(entered: async_engine::Sender<()>, release: async_engine::Receiver<()>) -> Self {
+    fn new(gate: ExecutionGate) -> Self {
         Self {
             observed: Mutex::new(Vec::new()),
-            entered,
-            release: Mutex::new(Some(release)),
+            gate,
         }
     }
 }
@@ -511,20 +572,7 @@ impl ManifestAppTaskExecutor for FakeManifestAppTaskExecutor {
         Box::pin(async move {
             self.observed.lock().unwrap().push(request.clone());
             session.begin("bosn-setup-manifest-identity".into()).await?;
-            self.entered
-                .send(())
-                .await
-                .map_err(|_| "test entry observer closed".to_owned())?;
-            let mut release = self
-                .release
-                .lock()
-                .unwrap()
-                .take()
-                .ok_or_else(|| "test task executed twice".to_owned())?;
-            release
-                .recv()
-                .await
-                .ok_or_else(|| "test release closed".to_owned())?;
+            self.gate.hold().await?;
             logs.send("[fake] manifest declared task executed".into())
                 .await
                 .map_err(|_| "fake log consumer closed".to_owned())?;
@@ -858,15 +906,15 @@ async fn wait_for_client(state: &Path) -> Client {
     // unrelated service tests fail before their assertions ran.
     let started = std::time::Instant::now();
     loop {
-        if client.ping().await.is_ok() {
-            return client;
-        }
+        let error = match client.ping().await {
+            Ok(_) => return client,
+            Err(error) => error,
+        };
         if started.elapsed() >= Duration::from_secs(5) {
-            break;
+            panic!("daemon did not become ready within 5s; last ping error: {error}");
         }
         async_engine::sleep(Duration::from_millis(20)).await;
     }
-    panic!("daemon did not become ready")
 }
 
 async fn wait_for(predicate: impl Fn() -> bool) {
