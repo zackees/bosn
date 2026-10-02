@@ -123,6 +123,16 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install uv for isolated compiler fixtures
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Soldr
+        uses: zackees/setup-soldr@fe965fc7e2c5203570072e1d0fd19d0935d98e39
+        with:
+          version: "0.9.27"
+          toolchain: "1.95.0"
+          prebuild-deps: none
+
       - name: Restore Cargo build cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -136,7 +146,7 @@ jobs:
       - name: Verify kernal-api boundary and locked resolution
         run: |
           python3 ci/verify_kernel_boundary.py
-          cargo metadata --locked --format-version 1 --no-deps > /dev/null
+          soldr cargo metadata --locked --format-version 1 --no-deps > /dev/null
 
       # Deliberately does not include --ignored: Docker and Hermes acceptance
       # cases retain their explicit opt-in prerequisites and dedicated proofs.
@@ -144,8 +154,8 @@ jobs:
       # unit tests instead link the selected CPython explicitly.
       - name: Test Rust workspace
         run: |
-          cargo test --workspace --exclude bosn-python --locked
-          PYO3_PYTHON="$(command -v python)" cargo test -p bosn-python --lib --locked --no-default-features --features embedded-python-tests
+          soldr cargo test --workspace --exclude bosn-python --locked
+          PYO3_PYTHON="$(command -v python)" soldr cargo test -p bosn-python --lib --locked --no-default-features --features embedded-python-tests
 
   linux:
     name: Linux (lint + unit + docker)
@@ -261,6 +271,14 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+
+      - name: Set up Soldr for the wheel backend
+        if: needs.select-tier.outputs.full == 'true'
+        uses: zackees/setup-soldr@fe965fc7e2c5203570072e1d0fd19d0935d98e39
+        with:
+          version: "0.9.27"
+          toolchain: "1.95.0"
+          prebuild-deps: none
 
       # No OpenSSL bootstrap on Windows: kernal-api's http-client uses reqwest
       # default-tls, which is native-tls/SChannel on MSVC, so openssl-sys is not

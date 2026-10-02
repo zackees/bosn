@@ -90,6 +90,39 @@ def test_required_status_names_remain() -> None:
     assert "if" not in jobs["rust"]
 
 
+def test_native_backend_and_compiler_fixtures_have_provisioned_tools() -> None:
+    release = yaml.safe_load((ROOT / ".github/workflows/auto-release.yml").read_text())
+    wheel_jobs = [CI["jobs"]["native-wheel"]]
+    wheel_jobs.extend(
+        job
+        for job in release["jobs"].values()
+        if any(step.get("run") == "uv build --wheel --out-dir dist" for step in job["steps"])
+        and "os" in job.get("strategy", {}).get("matrix", {})
+    )
+    assert len(wheel_jobs) == 2
+    for job in [CI["jobs"]["rust"], *wheel_jobs]:
+        steps = job["steps"]
+        soldr = next(
+            index
+            for index, step in enumerate(steps)
+            if step.get("uses", "").startswith("zackees/setup-soldr@")
+        )
+        uv = next(
+            index
+            for index, step in enumerate(steps)
+            if step.get("uses", "").startswith("astral-sh/setup-uv@")
+        )
+        consumers = [
+            index
+            for index, step in enumerate(steps)
+            if "soldr cargo" in step.get("run", "")
+            or "uv build --wheel" in step.get("run", "")
+        ]
+        assert consumers and max(soldr, uv) < min(consumers)
+        assert steps[soldr]["with"]["version"] == "0.9.27"
+        assert steps[soldr]["with"]["toolchain"] == "1.95.0"
+
+
 def test_label_changes_reselect_same_sha() -> None:
     payload = {"pull_request": {"head": {"sha": "fixed"}, "labels": []}}
     assert select_ci_tier.select("pull_request", payload) == "minimal"
