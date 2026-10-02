@@ -15,7 +15,8 @@ from pathlib import Path
 import tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
-SKIPPED_DIRS = {"target", ".git", "node_modules", ".venv", "vendor", "vendored", "extern", ".clud"}
+# Dot-directories hold tool state (.cargo/registry, .venv, .git, .clud), never our crates.
+SKIPPED_DIRS = {"target", "node_modules", "vendor", "vendored", "extern"}
 
 
 def _load(name: str, path: Path):
@@ -35,7 +36,7 @@ def manifests() -> list[Path]:
     found: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(ROOT):
         dirnames[:] = [
-            d for d in dirnames if d not in SKIPPED_DIRS and not d.startswith("bosn-extern")
+            d for d in dirnames if d not in SKIPPED_DIRS and not d.startswith((".", "bosn-extern"))
         ]
         if "Cargo.toml" in filenames:
             found.append(Path(dirpath) / "Cargo.toml")
