@@ -12,7 +12,9 @@
 //!                in this graphical session.
 
 mod controller;
+mod layout;
 mod notify;
+mod windows;
 
 use std::path::PathBuf;
 
@@ -63,7 +65,8 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let host = match ExternalWebviewHost::new(runtime.handle()) {
+    // The app id lets a compositor rule match the windows (KWin on Wayland).
+    let host = match ExternalWebviewHost::with_app_id(runtime.handle(), windows::APP_ID) {
         Ok(host) => host,
         Err(error) => {
             eprintln!("bosn-widget: no webview (is WebKitGTK 4.1 installed?): {error:?}");
