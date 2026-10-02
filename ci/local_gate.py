@@ -28,7 +28,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 # The zackees/ci.yml commit whose ci-lint this repository's gate is checked by.
-CI_LINT = "git+https://github.com/zackees/ci.yml@c87f1a2b88c07037d5c10a8e8ff27dd25895eab9"
+CI_LINT = "git+https://github.com/zackees/ci.yml@acde655080acb24bcdb70b153b3790474b958379"
 
 # The locked environment without bosn itself (installing bosn is a full Rust
 # extension build the linters do not need), then the tools from it.
