@@ -5,7 +5,7 @@ use std::{
     io::{Read, Write},
     net::TcpStream,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use super::*;
@@ -434,11 +434,27 @@ fn malformed_oversized_and_slow_clients_stay_within_limits() {
                 s
             })
             .collect();
-        let started = Instant::now();
         let healthy = raw(port, get(port, "/v1/runners", &host, Some(&cookie))).await;
         assert_eq!(healthy.status, 200);
-        assert!(started.elapsed() < Duration::from_millis(500));
-        drop(drips);
+        // Every drip was still held open when the healthy client was served
+        // (each now completes its own request), so it never waited for one
+        // to give up (#417).
+        let rest = format!("st: {host}\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n");
+        let statuses = async_engine::launch_blocking(move || {
+            drips
+                .into_iter()
+                .map(|mut drip| {
+                    drip.set_read_timeout(Some(HUNG)).unwrap();
+                    drip.write_all(rest.as_bytes()).unwrap();
+                    let mut reply = String::new();
+                    let _ = drip.read_to_string(&mut reply);
+                    reply.split(' ').nth(1).unwrap_or_default().to_string()
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap();
+        assert_eq!(statuses, vec!["200"; 8], "every drip was still connected");
     });
 }
 
