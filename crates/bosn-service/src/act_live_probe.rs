@@ -303,6 +303,17 @@ fn failed_pinned_runner(receipt: &Value) -> bool {
             .as_str()
             .is_some_and(|e| e.contains("exec: \"tail\": executable file not found"))
 }
+const FAILED_RUNNER_PATHS: [(&str, &str); 6] = [
+    (
+        "loader-target",
+        "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+    ),
+    ("loader-interpreter", "/lib64/ld-linux-x86-64.so.2"),
+    ("lib64-link", "/lib64"),
+    ("lib-link", "/lib"),
+    ("usr-bin-tail", "/usr/bin/tail"),
+    ("bin-tail", "/bin/tail"),
+];
 async fn capture_tail_archives(
     engine: &DockerEngine,
     outer: &str,
@@ -311,10 +322,16 @@ async fn capture_tail_archives(
     deadline: Instant,
 ) -> std::io::Result<()> {
     private_dir(directory)?;
-    for (label, path) in [("usr-bin-tail", "/usr/bin/tail"), ("bin-tail", "/bin/tail")] {
+    for (label, path) in FAILED_RUNNER_PATHS {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            break;
+            retain(
+                &directory.join(format!("{label}.json")),
+                &serde_json::to_vec_pretty(
+                    &json!({"source":"private failed-runner docker cp tar stream; diagnostic only","unix_seconds":at(),"nested_id":id,"container_path":path,"captured":false,"observer_error":"shared diagnostic deadline exhausted"}),
+                )?,
+            )?;
+            continue;
         }
         let source = format!("{id}:{path}");
         let result = engine
@@ -324,9 +341,10 @@ async fn capture_tail_archives(
                 1 << 20,
             ))
             .await;
-        let mut receipt = json!({"source":"private failed-runner docker cp tar stream; diagnostic only","unix_seconds":at(),"nested_id":id,"container_path":path,"byte_ceiling":1<<20});
+        let mut receipt = json!({"source":"private failed-runner docker cp tar stream; diagnostic only","unix_seconds":at(),"nested_id":id,"container_path":path,"byte_ceiling":1<<20,"follow_symlinks":false});
         match result {
             Ok(output) => {
+                receipt["captured"] = json!(true);
                 receipt["command_exit"] = json!(output.exit_code);
                 receipt["stderr"] = json!(String::from_utf8_lossy(&output.stderr));
                 receipt["bytes"] = json!(output.stdout.len());
@@ -336,7 +354,10 @@ async fn capture_tail_archives(
                     receipt["observer_error"] = json!("private docker cp failed");
                 }
             }
-            Err(e) => receipt["observer_error"] = json!(e.to_string()),
+            Err(e) => {
+                receipt["captured"] = json!(false);
+                receipt["observer_error"] = json!(e.to_string());
+            }
         }
         retain(
             &directory.join(format!("{label}.json")),
@@ -1391,10 +1412,17 @@ fn tail_archive_fake_transport_checks_exact_paths_and_preserves_binary_tar() {
     ));
     private_dir(&root).unwrap();
     let id = "d".repeat(64);
+    std::os::unix::fs::symlink("/not-followed-loader-target", root.join("fixture-link")).unwrap();
+    let allowed = FAILED_RUNNER_PATHS
+        .iter()
+        .map(|(_, p)| format!("{id}:{p}"))
+        .collect::<Vec<_>>()
+        .join("|");
     let script = format!(
-        "[ \"$1\" = exec ] && [ \"$2\" = owned-outer ] && [ \"$3\" = docker ] && [ \"$4\" = cp ] && [ \"$6\" = - ] || exit 94; case \"$5\" in {id}:/usr/bin/tail|{id}:/bin/tail) /usr/bin/tar --format=ustar -cf - -T /dev/null;; *) exit 95;; esac"
+        "[ \"$1\" = exec ] && [ \"$2\" = owned-outer ] && [ \"$3\" = docker ] && [ \"$4\" = cp ] && [ \"$6\" = - ] && [ -z \"$7\" ] || exit 94; case \"$5\" in {allowed}) printf '%s\\n' \"$5\" >> \"$FIXTURE_DIR/order\"; /usr/bin/tar --format=ustar -cf - -C \"$FIXTURE_DIR\" fixture-link;; *) exit 95;; esac"
     );
-    let engine = DockerEngine::synthetic_for_test("/bin/sh", ["-c", &script, "fixture"]);
+    let engine = DockerEngine::synthetic_for_test("/bin/sh", ["-c", &script, "fixture"])
+        .env("FIXTURE_DIR", root.as_os_str());
     async_engine::RuntimeBuilder::multi_thread()
         .enable_all()
         .build()
@@ -1410,10 +1438,12 @@ fn tail_archive_fake_transport_checks_exact_paths_and_preserves_binary_tar() {
             .await
             .unwrap();
         });
-    for label in ["usr-bin-tail", "bin-tail"] {
+    for (label, _) in FAILED_RUNNER_PATHS {
         let bytes =
             bounded_file(&root.join("archives").join(format!("{label}.tar")), 1 << 20).unwrap();
-        assert!(bytes.len() >= 1024 && bytes.iter().all(|b| *b == 0));
+        assert!(bytes.len() >= 1024);
+        assert_eq!(bytes[156], b'2');
+        assert!(bytes[157..257].starts_with(b"/not-followed-loader-target"));
         let receipt: Value = serde_json::from_slice(
             &bounded_file(&root.join("archives").join(format!("{label}.json")), 4096).unwrap(),
         )
@@ -1448,6 +1478,26 @@ fn tail_archive_fake_transport_checks_exact_paths_and_preserves_binary_tar() {
             assert_eq!(receipt["command_exit"], 17);
             assert!(receipt.get("observer_error").is_some());
             assert!(receipt.get("execution_success").is_none());
+            let oversized = DockerEngine::synthetic_for_test(
+                "/bin/sh",
+                ["-c", "head -c 1048577 /dev/zero", "fixture"],
+            );
+            capture_tail_archives(
+                &oversized,
+                "owned-outer",
+                &id,
+                &root.join("oversized"),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            let overflow: Value = serde_json::from_slice(
+                &bounded_file(&root.join("oversized/loader-target.json"), 4096).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(overflow["captured"], false);
+            assert!(overflow.get("observer_error").is_some());
+            assert!(!root.join("oversized/loader-target.tar").exists());
             let forbidden = DockerEngine::synthetic_for_test(
                 "/nonexistent-do-not-spawn",
                 std::iter::empty::<String>(),
@@ -1463,9 +1513,25 @@ fn tail_archive_fake_transport_checks_exact_paths_and_preserves_binary_tar() {
             .unwrap();
             assert_eq!(
                 std::fs::read_dir(root.join("exhausted")).unwrap().count(),
-                0
+                6
             );
+            let skipped: Value = serde_json::from_slice(
+                &bounded_file(&root.join("exhausted/loader-target.json"), 4096).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(skipped["captured"], false);
+            assert!(!root.join("exhausted/loader-target.tar").exists());
         });
+    assert_eq!(
+        std::fs::read_to_string(root.join("order"))
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        FAILED_RUNNER_PATHS
+            .iter()
+            .map(|(_, p)| format!("{id}:{p}"))
+            .collect::<Vec<_>>()
+    );
     let good = json!({"inspection":[{"Image":RUNNER,"ImageManifestDescriptor":{"digest":RUNNER},"State":{"ExitCode":127,"Error":"exec: \"tail\": executable file not found in $PATH"}}]});
     assert!(failed_pinned_runner(&good));
     for field in ["Image", "ImageManifestDescriptor", "State"] {
