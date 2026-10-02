@@ -9,6 +9,57 @@ use bosn_core::ResourceLabels;
 use serde::{Deserialize, Serialize};
 
 const PREFIX: &str = "act.engine.v1:";
+/// Frozen producer policy, not client-selected Docker options.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActEngineTmpfsPolicy {
+    StorageExecRunTmpNoexecV1,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActEngineCreationProfile {
+    pub memory_bytes: u64,
+    pub storage_bytes: u64,
+    pub nano_cpus: u64,
+    pub pids: u64,
+    pub run_tmpfs_bytes: u64,
+    pub tmp_tmpfs_bytes: u64,
+    pub tmpfs_policy: ActEngineTmpfsPolicy,
+    pub init_command_sha256: String,
+}
+impl ActEngineCreationProfile {
+    pub fn validate(&self) -> Result<(), Error> {
+        let reserved = self
+            .storage_bytes
+            .checked_add(self.run_tmpfs_bytes)
+            .and_then(|v| v.checked_add(self.tmp_tmpfs_bytes))
+            .and_then(|v| v.checked_add(512 << 20));
+        if self.storage_bytes < 1 << 20
+            || self.memory_bytes > i64::MAX as u64
+            || reserved.is_none_or(|v| v > self.memory_bytes)
+            || self.run_tmpfs_bytes < 1 << 20
+            || self.run_tmpfs_bytes > 256 << 20
+            || self.tmp_tmpfs_bytes < 1 << 20
+            || self.tmp_tmpfs_bytes > 1 << 30
+            || self.nano_cpus < 1_000_000
+            || self.nano_cpus > 256_000_000_000
+            || !self.nano_cpus.is_multiple_of(10_000)
+            || self.pids == 0
+            || self.pids > 65536
+            || !hex(&self.init_command_sha256, 64)
+        {
+            return Err(Error::BadRow("act creation profile"));
+        }
+        Ok(())
+    }
+    /// Stable field-order JSON with a versioned, NUL-separated domain.
+    pub fn digest(&self) -> Result<String, Error> {
+        self.validate()?;
+        let mut bytes = b"bosn.act.engine-creation-profile.v1\0".to_vec();
+        bytes.extend(serde_json::to_vec(self).map_err(|_| Error::BadRow("act profile JSON"))?);
+        Ok(kernal_api::hash::sha256_bytes(&bytes).to_hex())
+    }
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActEngineIntent {
@@ -22,6 +73,8 @@ pub struct ActEngineIntent {
     pub engine_image_digest: String,
     pub runner_image_digest: String,
     pub created_at: f64,
+    #[serde(default)]
+    pub creation_profile: Option<ActEngineCreationProfile>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -94,6 +147,9 @@ impl ActEngineIntent {
     }
     fn validate(&self) -> Result<(), Error> {
         canonical_run(&self.run_id)?;
+        if let Some(profile) = &self.creation_profile {
+            profile.validate()?;
+        }
         if self.workspace.is_empty()
             || self.workspace.len() > 4096
             || self.workspace.contains('\0')
@@ -154,6 +210,16 @@ impl ActEngineIntent {
         ] {
             labels.insert(format!("com.zackees.bosn.act.{key}"), value.into());
         }
+        if let Some(profile) = &self.creation_profile {
+            labels.insert(
+                "com.zackees.bosn.act.creation-profile-sha256".into(),
+                profile.digest()?,
+            );
+            labels.insert(
+                "com.zackees.bosn.act.init-command-sha256".into(),
+                profile.init_command_sha256.clone(),
+            );
+        }
         Ok(labels)
     }
 }
@@ -167,14 +233,15 @@ impl ActEngineRecord {
         {
             return Err(Error::BadRow("act removal snapshot"));
         }
-        if !matches!(self.schema_version, 1 | 2)
+        if !matches!(self.schema_version, 1..=3)
+            || ((self.schema_version == 3) != self.intent.creation_profile.is_some())
             || (self.schema_version == 1 && self.execution_claim.is_some())
             || self.execution_claim.as_ref().is_some_and(|token| {
                 canonical_run(token).is_err()
                     || self.engine_id.is_none()
                     || self.state == ActEngineState::Pending
             })
-            || (self.schema_version == 2
+            || (matches!(self.schema_version, 2 | 3)
                 && self.execution.is_some()
                 && self.execution_claim.is_none())
             || !is_uuid(&self.registry_id)
@@ -255,6 +322,9 @@ impl Immediate<'_> {
     }
     pub fn begin_act_engine(&mut self, intent: &ActEngineIntent) -> Result<(), Error> {
         intent.validate()?;
+        if intent.creation_profile.is_none() {
+            return Err(Error::BadRow("act new creation requires frozen profile"));
+        }
         if self.act_record(&intent.run_id)?.is_some() {
             return Err(Error::ResourceIdentityConflict);
         }
@@ -268,7 +338,7 @@ impl Immediate<'_> {
         )?;
         let registry_id = text(rows.first().ok_or(Error::BadRow("registry_id"))?, 0)?;
         self.store_act_record(&ActEngineRecord {
-            schema_version: 2,
+            schema_version: 3,
             registry_id,
             intent: intent.clone(),
             state: ActEngineState::Pending,
@@ -398,7 +468,7 @@ impl Immediate<'_> {
         canonical_run(token)?;
         let mut record = self.verify_act_engine(&intent.run_id, observed)?;
         record.check_time(at)?;
-        if record.schema_version != 2
+        if record.schema_version != 3
             || record.intent != *intent
             || record.state != ActEngineState::Registered
             || record.execution.is_some()
@@ -418,7 +488,10 @@ impl Immediate<'_> {
         token: &str,
     ) -> Result<ActEngineRecord, Error> {
         let record = self.verify_act_execution_owner(run, observed, token)?;
-        if record.state != ActEngineState::Registered || record.execution.is_some() {
+        if record.schema_version != 3
+            || record.state != ActEngineState::Registered
+            || record.execution.is_some()
+        {
             return Err(Error::BadRow("act active execution claim"));
         }
         Ok(record)
@@ -443,7 +516,9 @@ impl Immediate<'_> {
     }
     fn check_execution_owner(record: &ActEngineRecord, token: &str) -> Result<(), Error> {
         canonical_run(token)?;
-        if record.schema_version != 2 || record.execution_claim.as_deref() != Some(token) {
+        if !matches!(record.schema_version, 2 | 3)
+            || record.execution_claim.as_deref() != Some(token)
+        {
             return Err(Error::BadRow("act execution owner"));
         }
         Ok(())
@@ -460,7 +535,10 @@ impl Immediate<'_> {
             .ok_or(Error::BadRow("act intent missing"))?;
         record.check_time(at)?;
         Self::check_execution_owner(&record, token)?;
-        if record.state != ActEngineState::Registered || record.execution.is_some() {
+        if record.schema_version != 3
+            || record.state != ActEngineState::Registered
+            || record.execution.is_some()
+        {
             return Err(Error::BadRow("act execution transition"));
         }
         record.execution = Some(outcome);

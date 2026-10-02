@@ -26,6 +26,6 @@ serde = { version = "=1.0.229", features = ["derive"] }
 # Immutable Act ownership labels include the exact persisted f64 timestamp.
 # Approximate JSON parsing can otherwise change that value by one ULP.
 serde_json = { version = "=1.0.149", features = ["float_roundtrip"] }
-kernal-api = { version = "=0.1.14", default-features = false, features = ["sqlite", "fs", "ipc", "secure-random"] }
+kernal-api = { version = "=0.1.14", default-features = false, features = ["sqlite", "fs", "ipc", "secure-random", "hash-sha256"] }
 
 [dev-dependencies]

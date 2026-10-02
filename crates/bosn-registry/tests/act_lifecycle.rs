@@ -4,6 +4,18 @@ use std::collections::BTreeMap;
 const OWNER: &str = "11111111-2222-4333-8444-555555555555";
 const CLAIM: &str = "12345678-1234-4234-8234-123456789abc";
 const RUN: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+fn profile() -> ActEngineCreationProfile {
+    ActEngineCreationProfile {
+        memory_bytes: 28 << 30,
+        storage_bytes: 20 << 30,
+        nano_cpus: 2_000_000_000,
+        pids: 1024,
+        run_tmpfs_bytes: 16 << 20,
+        tmp_tmpfs_bytes: 64 << 20,
+        tmpfs_policy: ActEngineTmpfsPolicy::StorageExecRunTmpNoexecV1,
+        init_command_sha256: "a".repeat(64),
+    }
+}
 fn intent() -> ActEngineIntent {
     ActEngineIntent {
         run_id: RUN.into(),
@@ -16,6 +28,7 @@ fn intent() -> ActEngineIntent {
         engine_image_digest: format!("sha256:{}", "e".repeat(64)),
         runner_image_digest: format!("sha256:{}", "f".repeat(64)),
         created_at: 1.0,
+        creation_profile: Some(profile()),
     }
 }
 fn observed(i: &ActEngineIntent) -> ActEngineObservation {
@@ -682,6 +695,10 @@ fn legacy_registered_snapshot_is_recoverable_but_cannot_execute() {
     }
     let mut old = serde_json::to_value(registry.act_engine(RUN).unwrap().unwrap()).unwrap();
     old["schema_version"] = serde_json::json!(1);
+    old["intent"]
+        .as_object_mut()
+        .unwrap()
+        .remove("creation_profile");
     old.as_object_mut().unwrap().remove("execution_claim");
     {
         let mut tx = registry.begin_immediate().unwrap();
@@ -714,4 +731,224 @@ fn legacy_registered_snapshot_is_recoverable_but_cannot_execute() {
         registry.act_engine(RUN).unwrap().unwrap().state,
         ActEngineState::CleanupRequired
     );
+}
+
+#[test]
+fn frozen_profile_is_validated_bound_to_labels_and_reopened_exactly() {
+    let dir = TemporaryDirectory::new().unwrap();
+    let path = dir.path().join("profile.sqlite3");
+    let mut registry = Registry::create_writer(&path, OWNER).unwrap();
+    let mut absent = intent();
+    absent.creation_profile = None;
+    assert!(
+        registry
+            .begin_immediate()
+            .unwrap()
+            .begin_act_engine(&absent)
+            .is_err()
+    );
+    let mut tx = registry.begin_immediate().unwrap();
+    tx.begin_act_engine(&intent()).unwrap();
+    tx.commit().unwrap();
+    drop(registry);
+    let mut registry = Registry::open_writer(&path).unwrap();
+    let record = registry.act_engine(RUN).unwrap().unwrap();
+    assert_eq!(record.schema_version, 3);
+    assert_eq!(record.intent.creation_profile, Some(profile()));
+    assert_eq!(
+        profile().digest().unwrap(),
+        "72d8760f51a8a89bacf590bc6a7c90b43f4eeb543f396f376025feeddc1f6938"
+    );
+    let labels = intent().required_labels(OWNER).unwrap();
+    assert_eq!(
+        labels["com.zackees.bosn.act.creation-profile-sha256"],
+        profile().digest().unwrap()
+    );
+    assert_eq!(
+        labels["com.zackees.bosn.act.init-command-sha256"],
+        "a".repeat(64)
+    );
+    for field in [
+        "memory_bytes",
+        "storage_bytes",
+        "nano_cpus",
+        "pids",
+        "run_tmpfs_bytes",
+        "tmp_tmpfs_bytes",
+        "init_command_sha256",
+    ] {
+        let mut v = serde_json::to_value(profile()).unwrap();
+        v[field] = if field == "init_command_sha256" {
+            serde_json::json!("A".repeat(64))
+        } else {
+            serde_json::json!(0)
+        };
+        let invalid: ActEngineCreationProfile = serde_json::from_value(v).unwrap();
+        assert!(invalid.validate().is_err(), "{field}");
+    }
+    for field in [
+        "memory_bytes",
+        "storage_bytes",
+        "nano_cpus",
+        "pids",
+        "run_tmpfs_bytes",
+        "tmp_tmpfs_bytes",
+        "init_command_sha256",
+    ] {
+        let mut value = serde_json::to_value(profile()).unwrap();
+        value[field] = if field == "init_command_sha256" {
+            serde_json::json!("b".repeat(64))
+        } else {
+            serde_json::json!(
+                value[field].as_u64().unwrap() + if field == "nano_cpus" { 10000 } else { 1 }
+            )
+        };
+        let changed_profile: ActEngineCreationProfile = serde_json::from_value(value).unwrap();
+        changed_profile.validate().unwrap();
+        assert_ne!(
+            changed_profile.digest().unwrap(),
+            profile().digest().unwrap(),
+            "{field}"
+        );
+        let mut changed = intent();
+        changed.creation_profile = Some(changed_profile);
+        assert!(
+            registry
+                .begin_immediate()
+                .unwrap()
+                .register_act_engine(RUN, &observed(&changed), 2.0)
+                .is_err(),
+            "{field}"
+        );
+    }
+    assert_eq!(
+        registry.act_engine(RUN).unwrap().unwrap().state,
+        ActEngineState::Pending
+    );
+    for (key, bad) in [
+        ("tmpfs_policy", serde_json::json!("storage_all_exec")),
+        ("untrusted_argv", serde_json::json!("dockerd")),
+    ] {
+        let mut malformed = serde_json::to_value(profile()).unwrap();
+        malformed[key] = bad;
+        assert!(serde_json::from_value::<ActEngineCreationProfile>(malformed).is_err());
+    }
+}
+#[test]
+fn legacy_v2_claim_cannot_resume_or_complete_but_owner_can_request_cleanup() {
+    let dir = TemporaryDirectory::new().unwrap();
+    let path = dir.path().join("legacy-v2.sqlite3");
+    let mut registry = Registry::create_writer(&path, OWNER).unwrap();
+    let mut tx = registry.begin_immediate().unwrap();
+    tx.begin_act_engine(&intent()).unwrap();
+    tx.register_act_engine(RUN, &observed(&intent()), 2.0)
+        .unwrap();
+    tx.claim_act_execution(&intent(), &observed(&intent()), CLAIM, 3.0)
+        .unwrap();
+    tx.commit().unwrap();
+    let mut old = serde_json::to_value(registry.act_engine(RUN).unwrap().unwrap()).unwrap();
+    old["schema_version"] = serde_json::json!(2);
+    old["intent"]
+        .as_object_mut()
+        .unwrap()
+        .remove("creation_profile");
+    let mut tx = registry.begin_immediate().unwrap();
+    tx.append_event(
+        3.0,
+        &format!("act.engine.v1:{RUN}"),
+        &serde_json::to_string(&old).unwrap(),
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    drop(registry);
+    let mut registry = Registry::open_writer(&path).unwrap();
+    let old = registry.act_engine(RUN).unwrap().unwrap();
+    assert_eq!(old.intent.creation_profile, None);
+    let old_observed = observed(&old.intent);
+    let mut unclaimed = serde_json::to_value(&old).unwrap();
+    unclaimed["execution_claim"] = serde_json::json!(null);
+    let mut tx = registry.begin_immediate().unwrap();
+    tx.append_event(
+        3.0,
+        &format!("act.engine.v1:{RUN}"),
+        &serde_json::to_string(&unclaimed).unwrap(),
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    assert!(
+        registry
+            .begin_immediate()
+            .unwrap()
+            .claim_act_execution(&old.intent, &old_observed, CLAIM, 4.0)
+            .is_err()
+    );
+    let mut tx = registry.begin_immediate().unwrap();
+    tx.append_event(
+        3.0,
+        &format!("act.engine.v1:{RUN}"),
+        &serde_json::to_string(&old).unwrap(),
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    assert!(
+        registry
+            .begin_immediate()
+            .unwrap()
+            .verify_act_execution(RUN, &old_observed, CLAIM)
+            .is_err()
+    );
+    assert!(
+        registry
+            .begin_immediate()
+            .unwrap()
+            .record_act_execution(RUN, CLAIM, ActRunOutcome::Passed, 4.0)
+            .is_err()
+    );
+    assert!(
+        registry
+            .begin_immediate()
+            .unwrap()
+            .request_act_cleanup(RUN, ActRunOutcome::Interrupted, 4.0)
+            .is_err()
+    );
+    let mut tx = registry.begin_immediate().unwrap();
+    tx.request_act_execution_cleanup(RUN, CLAIM, ActRunOutcome::Interrupted, 4.0)
+        .unwrap();
+    tx.commit().unwrap();
+    assert_eq!(
+        registry.act_engine(RUN).unwrap().unwrap().state,
+        ActEngineState::CleanupRequired
+    );
+}
+
+#[test]
+fn record_versions_refuse_profile_presence_mismatches() {
+    for (version, has_profile) in [(1, true), (2, true), (3, false), (4, true)] {
+        let dir = TemporaryDirectory::new().unwrap();
+        let mut registry = Registry::create_writer(dir.path().join("bad-version"), OWNER).unwrap();
+        let mut tx = registry.begin_immediate().unwrap();
+        tx.begin_act_engine(&intent()).unwrap();
+        tx.commit().unwrap();
+        let mut value = serde_json::to_value(registry.act_engine(RUN).unwrap().unwrap()).unwrap();
+        value["schema_version"] = serde_json::json!(version);
+        if !has_profile {
+            value["intent"]
+                .as_object_mut()
+                .unwrap()
+                .remove("creation_profile");
+        }
+        let mut tx = registry.begin_immediate().unwrap();
+        tx.append_event(
+            1.0,
+            &format!("act.engine.v1:{RUN}"),
+            &serde_json::to_string(&value).unwrap(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert!(
+            registry.act_engine(RUN).is_err(),
+            "version{version},profile{has_profile}"
+        );
+    }
 }

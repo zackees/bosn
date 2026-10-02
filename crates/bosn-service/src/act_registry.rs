@@ -211,6 +211,16 @@ mod tests {
             engine_image_digest: format!("sha256:{}", "e".repeat(64)),
             runner_image_digest: format!("sha256:{}", "f".repeat(64)),
             created_at: 1.0,
+            creation_profile: Some(bosn_registry::act::ActEngineCreationProfile {
+                memory_bytes: 28 << 30,
+                storage_bytes: 20 << 30,
+                nano_cpus: 2_000_000_000,
+                pids: 1024,
+                run_tmpfs_bytes: 16 << 20,
+                tmp_tmpfs_bytes: 64 << 20,
+                tmpfs_policy: bosn_registry::act::ActEngineTmpfsPolicy::StorageExecRunTmpNoexecV1,
+                init_command_sha256: "a".repeat(64),
+            }),
         };
         let runtime = kernal_api::async_engine::RuntimeBuilder::multi_thread()
             .enable_all()
