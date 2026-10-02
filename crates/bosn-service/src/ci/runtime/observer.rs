@@ -73,9 +73,15 @@ impl EngineObserver for RunObserver {
         }
     }
     fn line(&mut self, line: EngineLine) {
-        let seq = self.next_seq();
+        // A line the parser drops (bosn's end-of-output mark) takes no seq.
+        let seq = self.seq + 1;
         let record = match line {
-            EngineLine::Stdout(text) => self.parser.feed(seq, &self.masker.mask_text(&text)),
+            EngineLine::Stdout(text) => {
+                let Some(record) = self.parser.feed(seq, &self.masker.mask_text(&text)) else {
+                    return;
+                };
+                record
+            }
             EngineLine::Stderr(text) => LogRecord {
                 seq,
                 stream: "stderr".into(),
@@ -84,6 +90,7 @@ impl EngineObserver for RunObserver {
                 text: self.masker.mask_text(&text),
             },
         };
+        self.seq = seq;
         self.append(record);
     }
 }

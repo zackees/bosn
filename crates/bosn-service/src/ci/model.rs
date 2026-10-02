@@ -408,8 +408,10 @@ impl ActParser {
         Self { tree }
     }
 
-    /// Fold one stdout line. Returns the log record to persist.
-    pub fn feed(&mut self, seq: u64, line: &str) -> LogRecord {
+    /// Fold one stdout line. Returns the log record to persist, or `None`
+    /// for a line that held only bosn's end-of-output mark
+    /// ([`super::flush`]): it is neither folded nor given a seq.
+    pub fn feed(&mut self, seq: u64, line: &str) -> Option<LogRecord> {
         let line = line.trim_end_matches(['\r', '\n']);
         let record = |job: Option<String>, section: Option<String>, text: String| LogRecord {
             seq,
@@ -422,11 +424,11 @@ impl ActParser {
             if !line.trim().is_empty() {
                 self.tree.malformed_lines += 1;
             }
-            return record(None, None, line.into());
+            return Some(record(None, None, line.into()));
         };
-        let text = act.text();
+        let text = act.text()?;
         let (Some(key), Some(job_id)) = (act.job_key(), act.job_id()) else {
-            return record(None, None, text);
+            return Some(record(None, None, text));
         };
         let notice = Notice::of(&act.msg);
         let job = self.tree.job_for(&key, &job_id, act.matrix.as_ref());
@@ -487,7 +489,7 @@ impl ActParser {
             }
             owned.then(|| format!("{}:{}", section.stage, section.id))
         });
-        record(Some(key), section, text)
+        Some(record(Some(key), section, text))
     }
 }
 
@@ -590,11 +592,12 @@ impl ActLine {
     fn job_id(&self) -> Option<String> {
         self.job_id.as_deref().map(|j| j.trim().to_string())
     }
-    fn text(&self) -> String {
+    /// `None` for a raw line that held only bosn's end-of-output mark.
+    fn text(&self) -> Option<String> {
         if self.raw_output {
-            self.msg.trim_end_matches('\n').to_string()
+            super::flush::unmark(self.msg.trim_end_matches('\n')).map(str::to_string)
         } else {
-            self.msg.clone()
+            Some(self.msg.clone())
         }
     }
     fn step(&self) -> Option<StepRef> {
@@ -635,7 +638,7 @@ mod tests {
         let records = lines
             .lines()
             .enumerate()
-            .map(|(i, line)| parser.feed(i as u64 + 1, line))
+            .filter_map(|(i, line)| parser.feed(i as u64 + 1, line))
             .collect();
         (parser, records)
     }
@@ -648,6 +651,33 @@ mod tests {
         assert_eq!(
             only.iter().map(|j| j.job_id.as_str()).collect::<Vec<_>>(),
             ["b"]
+        );
+    }
+
+    /// #398: the end-of-output trap completes a partial last line; the
+    /// record keeps the line without the mark, and a bare mark is no record.
+    #[test]
+    fn a_partial_last_line_is_kept_and_the_bare_mark_dropped() {
+        let raw = |msg: &str| {
+            serde_json::json!({"job": "w/a", "jobID": "a", "msg": msg, "raw_output": true,
+                "stage": "Main", "step": "one", "stepID": ["0"]})
+            .to_string()
+        };
+        let mark = crate::ci::flush::MARK;
+        let lines = [
+            r#"{"job":"w/a","jobID":"a","msg":"⭐ Run Main one","stage":"Main","step":"one","stepID":["0"]}"#.to_string(),
+            raw("ok\n"),
+            raw(&format!("fatal: no newline{mark}\n")),
+            raw(&format!("{mark}\n")),
+        ]
+        .join("\n");
+        let (_, records) = parse(LIST, &lines);
+        let texts: Vec<_> = records.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, ["⭐ Run Main one", "ok", "fatal: no newline"]);
+        assert!(
+            records
+                .iter()
+                .all(|r| r.section.as_deref() == Some("Main:0"))
         );
     }
 
