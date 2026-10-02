@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const ACT_ADAPTER_SCHEMA: u32 = 1;
-pub const ACT_VERSION: &str = "0.2.88";
+pub const ACT_VERSION: &str = "0.2.89-act2.1";
 const MAX_DOCUMENT_BYTES: usize = 1 << 20;
 const MAX_CELLS: usize = 4096;
 
@@ -442,7 +442,7 @@ mod tests {
             "repository": {"owner":"FastLED","name":"fbuild"},
             "default_branch": "main",
             "pins": {
-                "interface_schema":1,"act_version":"0.2.88",
+                "interface_schema":1,"act_version":ACT_VERSION,
                 "act_binary_digest":format!("sha256:{}", "a".repeat(64)),
                 "engine_manifest_digest":format!("sha256:{}", "b".repeat(64)),
                 "engine_config_digest":format!("sha256:{}", "c".repeat(64)),

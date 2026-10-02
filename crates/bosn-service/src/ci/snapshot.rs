@@ -383,30 +383,6 @@ fn commit_working_tree(dest: &Path, base: &str) -> io::Result<Option<String>> {
     Ok(Some(commit))
 }
 
-/// Mark `paths` (relative to the snapshot `root`) skip-worktree, so bosn's
-/// own rewrites of them neither show as edits nor are reverted by a
-/// workflow's `git restore`/`git reset --hard`; the job then sees a clean
-/// checkout of the commit under test.
-pub fn hide_from_git(root: &Path, paths: &[PathBuf]) -> io::Result<()> {
-    if paths.is_empty() {
-        return Ok(());
-    }
-    let relative: Vec<String> = paths
-        .iter()
-        .map(|p| {
-            p.strip_prefix(root)
-                .unwrap_or(p)
-                .to_string_lossy()
-                .into_owned()
-        })
-        .collect();
-    let args: Vec<&str> = ["update-index", "--skip-worktree", "--"]
-        .into_iter()
-        .chain(relative.iter().map(String::as_str))
-        .collect();
-    git(root, &args).map(|_| ())
-}
-
 #[cfg(unix)]
 fn symlink(target: &Path, link: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(target, link)

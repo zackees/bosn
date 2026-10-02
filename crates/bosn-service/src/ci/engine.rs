@@ -99,6 +99,8 @@ impl std::fmt::Debug for SecretEnv {
 pub struct ActInvocation {
     pub event: String,
     pub workflow: String,
+    /// bosn rewrote the workflow, so act runs the overlay's copy (#424).
+    pub workflow_overlaid: bool,
     pub job: Option<String>,
     /// Repository identity (hex) that namespaces the act cache server store,
     /// so two repositories' `actions/cache` keys never meet.
@@ -114,13 +116,26 @@ pub struct ActInvocation {
 pub const LOCAL_RUNNER_LABELS: [&str; 3] = ["ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04"];
 
 impl ActInvocation {
+    /// The workflow act plans: bosn's rewrite when there is one. The
+    /// workspace jobs check out always holds the original (#424).
+    pub fn workflow_arg(&self) -> String {
+        if self.workflow_overlaid {
+            format!("{ENGINE_WORK}/overlay/{}", self.workflow)
+        } else {
+            self.workflow.clone()
+        }
+    }
+
     /// Arguments after `act`. Platform mappings cover the Linux labels; any
     /// other `runs-on` is reported unsupported by act and never passes.
     pub fn args(&self) -> Vec<String> {
         let mut args = vec![
             self.event.clone(),
             "-W".into(),
-            self.workflow.clone(),
+            self.workflow_arg(),
+            // Local reusable workflows and composite actions bosn rewrote.
+            "--workflow-overlay".into(),
+            format!("{ENGINE_WORK}/overlay"),
             "--eventpath".into(),
             format!("{ENGINE_WORK}/event.json"),
             "--json".into(),
@@ -378,11 +393,27 @@ impl DockerActBackend {
         Ok(())
     }
 
-    /// Stream the frozen source (as a tar) and the event payload into the
-    /// engine's work directory.
+    /// Stream the frozen source and bosn's overlay (each as a tar) and the
+    /// event payload into the engine's work directory.
     async fn copy_inputs(&self, engine: &str, source: &Path, event: &Path) -> Result<(), String> {
-        let archive = source.with_extension("engine.tar");
-        let (from, to) = (source.to_path_buf(), archive.clone());
+        self.copy_tree(engine, source, "src").await?;
+        let overlay = super::store::overlay_beside(source);
+        if overlay.is_dir() {
+            self.copy_tree(engine, &overlay, "overlay").await?;
+        }
+        self.stream_in(
+            "event copy",
+            engine,
+            event,
+            &format!("cat > {ENGINE_WORK}/event.json"),
+        )
+        .await
+    }
+
+    /// Stream the host directory `tree` into `{ENGINE_WORK}/<into>`.
+    async fn copy_tree(&self, engine: &str, tree: &Path, into: &str) -> Result<(), String> {
+        let archive = tree.with_extension("engine.tar");
+        let (from, to) = (tree.to_path_buf(), archive.clone());
         let tar = async_engine::launch_blocking(move || {
             kernal_api::run_bounded_command(
                 kernal_api::SpawnSpec::new("tar")
@@ -399,32 +430,25 @@ impl DockerActBackend {
             )
         })
         .await
-        .map_err(|e| format!("source archive: {e}"))?
-        .map_err(|e| format!("source archive: {e}"))?;
+        .map_err(|e| format!("{into} archive: {e}"))?
+        .map_err(|e| format!("{into} archive: {e}"))?;
         if tar.exit.raw_code() != 0 {
             let _ = std::fs::remove_file(&archive);
             return Err(format!(
-                "source archive failed: {}",
+                "{into} archive failed: {}",
                 String::from_utf8_lossy(&tar.stderr).trim()
             ));
         }
         let copied = self
             .stream_in(
-                "source copy",
+                &format!("{into} copy"),
                 engine,
                 &archive,
-                &format!("tar -xf - -C {ENGINE_WORK}/src"),
+                &format!("tar -xf - -C {ENGINE_WORK}/{into}"),
             )
             .await;
         let _ = std::fs::remove_file(&archive);
-        copied?;
-        self.stream_in(
-            "event copy",
-            engine,
-            event,
-            &format!("cat > {ENGINE_WORK}/event.json"),
-        )
-        .await
+        copied
     }
 
     /// Make [`runner_tag`] present in the engine, proven to be the pinned
@@ -714,7 +738,8 @@ impl ActEngineBackend for DockerActBackend {
     ) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(async move {
             let mut args = Self::act_exec(engine, &SecretEnv::default());
-            args.extend(owned(&["-l", "-W", workflow]));
+            args.extend(owned(&["-l", "-W", workflow, "--workflow-overlay"]));
+            args.push(format!("{ENGINE_WORK}/overlay"));
             self.checked("act -l", args, CONTROL_DEADLINE).await
         })
     }
@@ -792,7 +817,7 @@ impl ActEngineBackend for DockerActBackend {
 /// The run's work tree on the engine's private storage.
 fn work_dirs_script() -> String {
     format!(
-        "mkdir -p {ENGINE_WORK}/bin {ENGINE_WORK}/src {ENGINE_WORK}/artifacts \
+        "mkdir -p {ENGINE_WORK}/bin {ENGINE_WORK}/src {ENGINE_WORK}/overlay {ENGINE_WORK}/artifacts \
          {ENGINE_WORK}/home/.cache {ENGINE_WORK}/home/.config {ENGINE_WORK}/tmp"
     )
 }
@@ -859,6 +884,7 @@ mod tests {
         let args = ActInvocation {
             event: "push".into(),
             workflow: ".github/workflows/ci.yml".into(),
+            workflow_overlaid: false,
             job: Some("lint".into()),
             cache_namespace: "0123456789abcdef".into(),
             secrets: SecretEnv(vec![("GITHUB_TOKEN".into(), "ghp_secretvalue".into())]),
@@ -881,6 +907,35 @@ mod tests {
             !format!("{secrets:?}").contains("ghp_"),
             "Debug shows names only"
         );
+    }
+
+    /// #424: act plans bosn's rewrite of the workflow and reads rewritten
+    /// reusable workflows and actions from the overlay; jobs never see it.
+    #[test]
+    fn act_reads_rewrites_from_the_overlay() {
+        let mut invocation = ActInvocation {
+            event: "push".into(),
+            workflow: ".github/workflows/ci.yml".into(),
+            workflow_overlaid: false,
+            job: None,
+            cache_namespace: "0123456789abcdef".into(),
+            secrets: SecretEnv::default(),
+        };
+        let overlay = format!("{ENGINE_WORK}/overlay");
+        let args = invocation.args();
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-W", ".github/workflows/ci.yml"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--workflow-overlay" && w[1] == overlay)
+        );
+        invocation.workflow_overlaid = true;
+        let args = invocation.args();
+        let planned = format!("{overlay}/.github/workflows/ci.yml");
+        assert!(args.windows(2).any(|w| w[0] == "-W" && w[1] == planned));
+        assert!(work_dirs_script().contains(&overlay));
     }
 
     #[test]

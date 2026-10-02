@@ -60,6 +60,7 @@ pub fn plan(run: &str, deadline: Duration) -> EnginePlan {
         invocation: ActInvocation {
             event: "push".into(),
             workflow: ".github/workflows/ci.yml".into(),
+            workflow_overlaid: false,
             job: None,
             cache_namespace: "0".repeat(16),
             secrets: Default::default(),

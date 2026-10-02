@@ -19,9 +19,11 @@
 //! without a token rather than silently testing something else.
 //!
 //! Every file act may run is rewritten: the workflows (reusable ones
-//! included) and the repository's own composite actions. The run then hides
-//! the rewritten [`Localized::files`] from Git, so the job's checkout still
-//! looks clean and a workflow's `git restore` does not undo them (#394).
+//! included) and the repository's own composite actions. The rewrites go to
+//! an overlay beside the snapshot, never into it (#424): act2 reads them
+//! through `--workflow-overlay`, and every job checks out the snapshot, so a
+//! repository that inspects its own `.github/` sees exactly what it
+//! committed.
 //!
 //! The same pass gives every POSIX-shell `run:` step the end-of-output trap
 //! of [`super::flush`] (#398), confines remote-only jobs
@@ -53,13 +55,15 @@ pub struct Localized {
     /// Matrix jobs whose legs bosn runs or reports unsupported by their own
     /// runner ([`super::matrix_runner`], #404).
     pub runner_gated: Vec<String>,
-    /// The workflow and action files rewritten.
+    /// The workflow and action files rewritten, relative to the snapshot.
     pub files: Vec<PathBuf>,
 }
 
 /// Rewrite checkout and `run:` steps in every workflow under `.github/workflows/` and
-/// every composite action under `.github/actions/` of the snapshot at `root`.
-pub fn localize_tree(root: &Path, repository: &str) -> io::Result<Localized> {
+/// every composite action under `.github/actions/` of the snapshot at `root`,
+/// writing each changed file to the same relative path under `overlay`.
+/// `root` itself is only read.
+pub fn localize_tree(root: &Path, overlay: &Path, repository: &str) -> io::Result<Localized> {
     let yaml = |path: &Path| path.extension().is_some_and(|e| e == "yml" || e == "yaml");
     let mut files: Vec<_> = match std::fs::read_dir(root.join(".github/workflows")) {
         Ok(entries) => entries
@@ -84,17 +88,23 @@ pub fn localize_tree(root: &Path, repository: &str) -> io::Result<Localized> {
     files.sort();
     let mut localized = Localized::default();
     for file in files {
-        if localize(&file, repository, &mut localized)? {
-            localized.files.push(file);
+        let relative = file.strip_prefix(root).unwrap_or(&file).to_path_buf();
+        if localize(&file, &overlay.join(&relative), repository, &mut localized)? {
+            localized.files.push(relative);
         }
     }
     Ok(localized)
 }
 
 /// Rewrite the checkout and `run:` steps of one workflow or action file, adding what
-/// changed to `localized`; the file is rewritten (and `true` returned) only
-/// when something did.
-pub fn localize(workflow: &Path, repository: &str, localized: &mut Localized) -> io::Result<bool> {
+/// changed to `localized`; the rewrite is written to `out` (and `true`
+/// returned) only when something did.
+pub fn localize(
+    workflow: &Path,
+    out: &Path,
+    repository: &str,
+    localized: &mut Localized,
+) -> io::Result<bool> {
     let text = std::fs::read_to_string(workflow)?;
     let mut document: Value = serde_yaml::from_str(&text).map_err(io::Error::other)?;
     let mut changes = Localized::default();
@@ -105,7 +115,10 @@ pub fn localize(workflow: &Path, repository: &str, localized: &mut Localized) ->
     let changed = changes != Localized::default();
     if changed {
         let rewritten = serde_yaml::to_string(&document).map_err(io::Error::other)?;
-        std::fs::write(workflow, rewritten)?;
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(out, rewritten)?;
     }
     localized.own += changes.own;
     localized.pinned.extend(changes.pinned);
@@ -463,7 +476,8 @@ mod tests {
         );
         let other = "on: [push]\njobs:\n  c:\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          repository: someone/else\n          ref: v1\n";
         write(".github/workflows/other.yml", other);
-        let localized = localize_tree(root, "example/demo").unwrap();
+        let overlay = dir.path().with_extension("overlay");
+        let localized = localize_tree(root, &overlay, "example/demo").unwrap();
         assert_eq!(localized.own, 3);
         assert!(localized.pinned.is_empty());
         for relative in [
@@ -471,47 +485,57 @@ mod tests {
             ".github/workflows/_build.yaml",
             ".github/actions/setup/action.yml",
         ] {
-            let text = std::fs::read_to_string(root.join(relative)).unwrap();
+            let text = std::fs::read_to_string(overlay.join(relative)).unwrap();
             assert!(!text.contains("ref:"), "{relative}: {text}");
+            let original = std::fs::read_to_string(root.join(relative)).unwrap();
+            assert!(
+                original.contains("ref:"),
+                "{relative}: the snapshot is only read"
+            );
         }
-        assert_eq!(
-            std::fs::read_to_string(root.join(".github/workflows/other.yml")).unwrap(),
-            other,
-            "another repository's checkout is untouched"
+        assert!(
+            !overlay.join(".github/workflows/other.yml").exists(),
+            "another repository's checkout is untouched, so not overlaid"
         );
+        let _ = std::fs::remove_dir_all(&overlay);
     }
 
-    /// #394: bosn's rewrites must not look like edits to the job, so a
-    /// workflow that cleans its tree neither sees nor reverts them.
+    /// #424 (supersedes #394): bosn's rewrites never touch the snapshot, so
+    /// a job's checkout is byte-for-byte the tree under test, clean to Git
+    /// with no index tricks, and a repository's own workflow tests read what
+    /// it committed.
     #[cfg(unix)]
     #[test]
-    fn rewrites_are_hidden_from_git_and_survive_a_restore() {
+    fn the_snapshot_stays_the_tree_under_test() {
         use crate::ci::snapshot::tests::{git_in, sh};
         let dir = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
         let root = dir.path();
-        let workflow = root.join(".github/workflows/ci.yml");
+        let relative = ".github/workflows/ci.yml";
+        let workflow = root.join(relative);
         std::fs::create_dir_all(workflow.parent().unwrap()).unwrap();
-        std::fs::write(
-            &workflow,
-            "on: [push]\njobs:\n  a:\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          ref: ${{ github.sha }}\n      - run: make test\n",
-        )
-        .unwrap();
+        let original = "# the repository's own comment\non: [push]\njobs:\n  a:\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          ref: ${{ github.sha }}\n      - run: make test\n";
+        std::fs::write(&workflow, original).unwrap();
         sh(
             root,
             "printf 'x\\n' > README && git init -q -b main . && git add -A && git commit -qm init",
         );
-        let localized = localize_tree(root, "example/demo").unwrap();
+        let overlay = root.with_extension("overlay");
+        let localized = localize_tree(root, &overlay, "example/demo").unwrap();
         assert_eq!(localized.own, 1);
         assert_eq!(localized.trapped, 1, "the run: step ends its output");
-        assert_eq!(localized.files, vec![workflow.clone()]);
-        crate::ci::snapshot::hide_from_git(root, &localized.files).unwrap();
-        assert_eq!(git_in(root, &["status", "--porcelain"]), "", "looks clean");
-        git_in(root, &["restore", "--staged", "--worktree", "--", "."]);
-        git_in(root, &["reset", "--hard", "--quiet"]);
-        assert!(
-            !std::fs::read_to_string(&workflow).unwrap().contains("ref:"),
-            "the rewrite stays"
+        assert_eq!(localized.files, vec![PathBuf::from(relative)]);
+        assert_eq!(std::fs::read_to_string(&workflow).unwrap(), original);
+        assert_eq!(
+            git_in(root, &["status", "--porcelain"]),
+            "",
+            "clean, unaided"
         );
+        let rewritten = std::fs::read_to_string(overlay.join(relative)).unwrap();
+        assert!(
+            !rewritten.contains("ref:"),
+            "act reads the rewrite: {rewritten}"
+        );
+        let _ = std::fs::remove_dir_all(&overlay);
     }
 
     #[test]
@@ -520,9 +544,11 @@ mod tests {
         let path = dir.path().join("ci.yml");
         let original = "# comments survive when nothing changes\non: [push]\njobs: {}\n";
         std::fs::write(&path, original).unwrap();
+        let out = dir.path().join("overlay/ci.yml");
         let mut localized = Localized::default();
-        localize(&path, "example/demo", &mut localized).unwrap();
+        localize(&path, &out, "example/demo", &mut localized).unwrap();
         assert_eq!(localized, Localized::default());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(!out.exists(), "nothing to overlay");
     }
 }
