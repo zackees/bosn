@@ -242,7 +242,7 @@ jobs:
         run: soldr prepare --target "${{ matrix.target }}" --github-env "$GITHUB_ENV"
 
       - name: Install Rust standard library for Darwin target
-        run: rustup target add "${{ matrix.target }}" --toolchain 1.95.0
+        run: soldr rustup target add "${{ matrix.target }}" --toolchain 1.95.0
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5

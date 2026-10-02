@@ -1,0 +1,54 @@
+# bosn's local gate (zackees/ci.yml#166..#198: GATE-001..007; bosn#361).
+#
+# Before every push, from a clean, committed tree:
+#
+#   uvx --from git+https://github.com/zackees/ci.yml@c87f1a2b88c07037d5c10a8e8ff27dd25895eab9 ci-lint local-gate run
+#
+# runs `run` below and, on success, stamps HEAD with a tree-bound
+# `Local-Gate:` trailer (and, with ci-attestations.yml, one `Ci-Attestation:`
+# per attested gate). CI's `verify` job checks it; every other job needs
+# `verify`. Install the matching pre-push hook once per clone with
+# `... ci-lint local-gate install-hook`.
+#
+# Rollout: `shadow` reports a missing or stale attestation without failing
+# the run. Promote to `enforce` once `ci-lint local-gate first-pass` shows
+# attested heads are the norm.
+[gate]
+run = ["uv", "run", "--no-project", "--python", "3.13", "python", "ci/local_gate.py"]
+verify = "ci.yml:verify"
+mode = "shadow"
+
+# GATE-005: bosn is live infrastructure on the developer's host (its tests
+# start bosn daemons and touch bosn state roots), so its suites run only in
+# the isolated bosn container. The guards refuse a bare host run: Python's in
+# tests/conftest.py, Rust's in ci/test_guard.sh (cargo's test runner, see
+# .cargo/config.toml). docker/test.Dockerfile sets the marker.
+[gate.isolation]
+marker = "BOSN_TEST_ISOLATED"
+runner = ["bosn", "run", "--task", "test"]
+guard = "tests/conftest.py"
+
+# GATE-007: lanes, split along input boundaries. A lane is skipped when its
+# inputs (the commit tree minus `exclude`, plus the mandatory inputs) match a
+# recorded pass. Exclusions are deliberately few until
+# `ci-lint local-gate lanes --simulate` shows more are safe: the Rust crates
+# `include_str!` JSON schemas, fixtures and docs, so only Python-only lanes
+# exclude anything.
+[gate.lanes.py-static]
+run = ["uv", "run", "--no-project", "--python", "3.13", "python", "ci/local_gate.py", "--lane", "py-static"]
+tools = ["uv"]
+weight = "light"
+exclude = ["crates/**", "Cargo.toml", "Cargo.lock", "docs/**", "*.md", "docker/**", ".github/workflows/**", "**/*.rs", "**/*.json"]
+
+[gate.lanes.guards]
+run = ["uv", "run", "--no-project", "--python", "3.13", "python", "ci/local_gate.py", "--lane", "guards"]
+tools = ["uv"]
+weight = "light"
+
+[gate.lanes.rust]
+run = ["uv", "run", "--no-project", "--python", "3.13", "python", "ci/local_gate.py", "--lane", "rust"]
+tools = ["soldr"]
+
+[gate.lanes.tests]
+run = ["uv", "run", "--no-project", "--python", "3.13", "python", "ci/local_gate.py", "--lane", "tests"]
+tools = ["bosn"]

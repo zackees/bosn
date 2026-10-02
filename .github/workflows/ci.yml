@@ -25,15 +25,41 @@ permissions:
   contents: read
 
 jobs:
+  # GATE-002/003 (zackees/ci.yml#166, bosn#361): the head commit carries a
+  # tree-bound `Local-Gate:` attestation from `ci-lint local-gate run`
+  # (local-gate.toml), and every other job needs this one. It supersedes the
+  # former GEN-021 shadow reuse report: attestations are the authoritative
+  # record of what passed locally. mode = shadow (local-gate.toml): a missing
+  # or stale attestation is reported, not enforced, until `first-pass` shows
+  # attested heads are the norm.
+  verify:
+    name: Verify local gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      attested: ${{ steps.verify.outputs.attested }}
+      state: ${{ steps.verify.outputs.state }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: zackees/ci.yml
+          ref: c87f1a2b88c07037d5c10a8e8ff27dd25895eab9
+          path: .ci-lint
+          persist-credentials: false
+          sparse-checkout: ci_lint
+      - name: Verify the local-gate attestation
+        id: verify
+        run: PYTHONPATH=.ci-lint python3 -m ci_lint local-gate verify --repo . --github-output
+
   select-tier:
     name: Select CI tier
+    needs: [verify]
     runs-on: ubuntu-latest
-    # Read-only grants for the shadow reuse decision below (PR association,
-    # commit trees, run/job lists). Nothing here writes.
-    permissions:
-      contents: read
-      actions: read
-      pull-requests: read
     outputs:
       tier: ${{ steps.select.outputs.tier }}
       test: ${{ steps.select.outputs.test }}
@@ -54,43 +80,11 @@ jobs:
           --manual-sha "$MANUAL_SHA"
           --output "$GITHUB_OUTPUT"
 
-      # GEN-021 verified reuse, SHADOW mode only (zackees/ci.yml#162): on a
-      # main push, report in the step summary whether this commit's tree is
-      # identical to a PR head whose CI passed every job below. It never skips
-      # anything (shadow always yields reuse=false), sets no job output, and
-      # both steps are continue-on-error so a failure cannot turn CI red.
-      - name: Check out ci-lint (shadow reuse decision)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        continue-on-error: true
-        timeout-minutes: 3
-        uses: actions/checkout@v4
-        with:
-          repository: zackees/ci.yml
-          ref: b93b8c4a20ce3cd476c75a278ad01a31bde2438b
-          path: .ci-lint
-          persist-credentials: false
-
-      - name: Verified reuse decision (GEN-021, shadow)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        continue-on-error: true
-        timeout-minutes: 3
-        working-directory: .ci-lint
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: >-
-          python3 -m ci_lint reuse-check --workflow ci.yml --mode shadow
-          --required-job "CI policy (no hosted macOS runners)"
-          --required-job "Rust workspace (locked tests)"
-          --required-job "Linux (lint + unit + docker)"
-          --required-job "Native wheel (ubuntu-latest)"
-          --required-job "Native wheel (windows-latest)"
-          --required-job "Darwin wheel (x86_64-apple-darwin, Linux-hosted Soldr)"
-          --required-job "Darwin wheel (aarch64-apple-darwin, Linux-hosted Soldr)"
-
   lint-no-macos-runners:
     # Legacy required-check name in branch protection. The implementation now
     # permits hosted Macs only in ci-full and release; keep this status stable.
     name: CI policy (no hosted macOS runners)
+    needs: [verify]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -107,6 +101,7 @@ jobs:
 
   rust:
     name: Rust workspace (locked tests)
+    needs: [verify]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -373,7 +368,7 @@ jobs:
       # Soldr prepared, rather than relying on a host default target set.
       - name: Install Rust standard library for Darwin target
         if: needs.select-tier.outputs.full == 'true'
-        run: rustup target add "${{ matrix.target }}" --toolchain 1.95.0
+        run: soldr rustup target add "${{ matrix.target }}" --toolchain 1.95.0
 
       - name: Install uv
         if: needs.select-tier.outputs.full == 'true'

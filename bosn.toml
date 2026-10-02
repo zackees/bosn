@@ -18,7 +18,15 @@ soldr-state = { scope = "stack", destination = "/root/.soldr" }
 
 [task.test]
 stack = "test"
-cmd = "soldr toolchain ensure --json && uv sync --frozen --all-groups --no-editable && uv run --no-sync pytest -q -m 'not docker' -p no:cacheprovider"
+cmd = "umask 022 && soldr toolchain ensure --json && uv sync --frozen --all-groups --no-editable && uv run --no-sync pytest -q -m 'not docker' -p no:cacheprovider"
+
+# The Rust suite, isolated like the Python one (zackees/ci.yml GATE-005).
+# Both test tasks set the umask CI runners use (022): the setup container's
+# default is 0000, under which tempfile directories are world-writable and
+# the act artifact cache rightly refuses them (bosn#365).
+[task.rust-test]
+stack = "test"
+cmd = "umask 022 && soldr toolchain ensure --json && soldr cargo test --workspace --exclude bosn-python --locked"
 
 [task.lint]
 stack = "test"
