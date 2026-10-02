@@ -63,6 +63,9 @@ if ($("prune-slot")) $("prune-slot").replaceChildren(confirmButton("Prune old ru
   () => api("/v1/runners", { action: "prune_cache", older_than_secs: WEEK_SECS }), render));
 if ($("clear-cache-slot")) $("clear-cache-slot").replaceChildren(confirmButton("Clear cache",
   () => api("/v1/runners", { action: "clear_cache" }), (reply) => { $("cache").textContent = cacheText(reply.cache); }));
+// Quit is deliberate (auto-launch stays off for this login), so it confirms.
+if ($("quit-slot")) $("quit-slot").replaceChildren(confirmButton("Quit widget",
+  () => api("/v1/widget/quit", {}), () => {}));
 
 let pending = null;
 function schedule() {

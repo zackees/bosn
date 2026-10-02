@@ -115,8 +115,8 @@ with its own single-use grant:
 - one **full view** (the dashboard).
 
 The pages never call native code. A click POSTs to the daemon
-(`/v1/widget/toggle`, `/open` and `/open-external`), and the widget picks the
-command up on its next one-second poll. External links open in the OS
+(`/v1/widget/toggle`, `/open`, `/open-external` and `/quit`), and the widget
+picks the command up on its next one-second poll. External links open in the OS
 browser only for `https` URLs on `github.com`, `gitlab.com` or a host listed
 in `[widget] external_hosts`.
 
@@ -137,10 +137,11 @@ bosn widget install      # systemd user unit, started with the graphical session
 - `bosn ci run` and `bosn ui` start it detached themselves when the daemon
   reports none and the terminal has a desktop.
 
-**Quitting.** Closing the bubble is a deliberate quit. The bubble has no
-title bar, so close it from the window manager (Alt+F4 while it has focus);
-a panel Quit button is #409. Quitting suppresses
-auto-launch until the next login (a new graphical session) or an explicit
+**Quitting.** The panel's **Quit widget** button (click it twice to confirm)
+and closing the bubble (Alt+F4 while it has focus; it has no title bar) are
+both a deliberate quit. The button sends `POST /v1/widget/quit`, which the
+daemon queues for the running widget like any other panel command.
+Quitting suppresses auto-launch until the next login (a new graphical session) or an explicit
 `bosn widget`. A crash is not a quit: systemd restarts it, backing off after
 five failures in a minute.
 

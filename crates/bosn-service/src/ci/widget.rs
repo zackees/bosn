@@ -1,5 +1,5 @@
 //! The desktop widget's daemon side: presence, dismissal, the command queue
-//! the dashboard fills (toggle, open, open-external) and the auto-launch
+//! the dashboard fills (toggle, open, open-external, quit) and the auto-launch
 //! decision. The widget is a separate user-session process that talks to the
 //! daemon only through typed CI requests; the daemon stays headless.
 
@@ -54,6 +54,8 @@ pub enum WidgetCommand {
     Open { path: String },
     /// Open an allowlisted external URL with the OS opener.
     OpenExternal { url: String },
+    /// Quit deliberately, as closing the bubble does (dismiss, then exit).
+    Quit,
 }
 
 /// Why the daemon considered launching the widget.
@@ -93,6 +95,8 @@ impl WidgetState {
             return false;
         }
         self.dismissed_session = None;
+        // A quit addressed the widget that was running, never its successor.
+        self.queue.retain(|command| *command != WidgetCommand::Quit);
         self.seen = Some((now, pid, session.into()));
         true
     }
@@ -258,6 +262,18 @@ mod tests {
         assert!(w.poll(t0, 99).is_empty(), "an unknown pid gets nothing");
         assert_eq!(w.poll(t0, 7).len(), MAX_QUEUED);
         assert!(w.poll(t0, 7).is_empty(), "drained once");
+    }
+
+    #[test]
+    fn a_quit_addresses_only_the_widget_that_was_running() {
+        let t0 = Instant::now();
+        let mut w = WidgetState::default();
+        w.hello(t0, 7, "s", false);
+        w.enqueue(WidgetCommand::Quit);
+        w.enqueue(WidgetCommand::Open { path: "/".into() });
+        // Widget 7 died before its next poll; its replacement must not quit.
+        assert!(w.hello(t0, 8, "s", false));
+        assert_eq!(w.poll(t0, 8), [WidgetCommand::Open { path: "/".into() }]);
     }
 
     #[test]

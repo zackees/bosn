@@ -487,3 +487,40 @@ fn the_dashboard_drives_the_widget_only_through_queued_allowlisted_commands() {
         );
     });
 }
+
+#[test]
+fn the_panel_quits_the_widget_only_with_a_same_origin_write() {
+    with_registry(|registry, dir| async move {
+        let (ci, _server, port) = listener(&dir, registry).await;
+        let cookie = sign_in(&ci, port).await;
+        let origin = format!("http://127.0.0.1:{port}");
+        let quit = |origin: Option<String>| {
+            let request = post(port, "/v1/widget/quit", &cookie, origin.as_deref(), "");
+            async move { raw(port, request).await }
+        };
+        assert_eq!(
+            quit(Some(origin.clone())).await.status,
+            400,
+            "no widget is running, so there is nothing to quit"
+        );
+        ci.handle(CiRequest::WidgetHello {
+            pid: 42,
+            session: "s1".into(),
+            explicit: false,
+        })
+        .await
+        .unwrap();
+        assert_eq!(quit(None).await.status, 403, "a missing Origin");
+        assert_eq!(
+            quit(Some("http://evil.example".into())).await.status,
+            403,
+            "a foreign Origin"
+        );
+        let allowed = quit(Some(origin)).await;
+        assert_eq!(allowed.status, 200, "{}", allowed.body);
+        let poll: crate::ci::WidgetReply =
+            serde_json::from_value(ci.handle(CiRequest::WidgetPoll { pid: 42 }).await.unwrap())
+                .unwrap();
+        assert_eq!(poll.commands, [crate::ci::widget::WidgetCommand::Quit]);
+    });
+}

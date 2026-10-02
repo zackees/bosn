@@ -1746,6 +1746,20 @@
             "url"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Quit deliberately, as closing the bubble does (dismiss, then exit).",
+          "properties": {
+            "command": {
+              "const": "quit",
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
         }
       ]
     },

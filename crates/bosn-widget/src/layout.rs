@@ -41,6 +41,9 @@ pub enum Step {
     External {
         url: String,
     },
+    /// The deliberate quit: dismiss for this session and exit the process
+    /// (which closes every window, so no window step precedes it).
+    Quit,
 }
 
 impl Step {
@@ -50,7 +53,7 @@ impl Step {
             Self::Open { window, .. } => Some(*window),
             Self::Show(window) | Self::Hide(window) | Self::Focus(window) => Some(*window),
             Self::Navigate { .. } => Some(Window::Full),
-            Self::External { .. } => None,
+            Self::External { .. } | Self::Quit => None,
         }
     }
 }
@@ -112,6 +115,7 @@ impl Layout {
                 ],
             },
             WidgetCommand::OpenExternal { url } => vec![Step::External { url }],
+            WidgetCommand::Quit => vec![Step::Quit],
         }
     }
 
@@ -120,7 +124,7 @@ impl Layout {
         match step {
             Step::Open { window, .. } | Step::Show(window) => *self.slot(*window) = Presence::Shown,
             Step::Hide(window) => *self.slot(*window) = Presence::Hidden,
-            Step::Focus(_) | Step::Navigate { .. } | Step::External { .. } => {}
+            Step::Focus(_) | Step::Navigate { .. } | Step::External { .. } | Step::Quit => {}
         }
     }
 }
@@ -222,6 +226,19 @@ mod tests {
                 Step::Focus(Window::Bubble)
             ]);
         }
+    }
+
+    #[test]
+    fn quit_exits_from_any_state_without_touching_a_window() {
+        let mut layout = Layout::default();
+        assert_eq!(apply(&mut layout, WidgetCommand::Quit), vec![Step::Quit]);
+        assert_eq!(layout, Layout::default());
+        apply(&mut layout, WidgetCommand::Show);
+        apply(&mut layout, WidgetCommand::Toggle);
+        let open = layout;
+        assert_eq!(apply(&mut layout, WidgetCommand::Quit), vec![Step::Quit]);
+        assert_eq!(layout, open, "the exit closes the windows, not a step");
+        assert_eq!(Step::Quit.window(), None);
     }
 
     #[test]
