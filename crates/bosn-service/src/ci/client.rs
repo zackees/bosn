@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use kernal_api::async_engine;
 
 use super::{
+    params::RunParams,
     provider::{self, Mode, Provider, Trigger},
     reply::Plan,
     snapshot::{self, BaseRef, Head},
@@ -31,6 +32,8 @@ pub struct SubmitOptions {
     pub timeout_secs: Option<u64>,
     /// Opt-in daemon-owned secrets by name (`github_token`).
     pub secrets: Vec<String>,
+    /// Workflow inputs, a matrix filter and extra env (#430).
+    pub params: RunParams,
 }
 
 /// Who is submitting: `BOSN_CI_ACTOR`, else an agent session when running
@@ -83,9 +86,12 @@ fn resolve(options: &SubmitOptions) -> Result<Resolved, Error> {
     let trigger = options.trigger.unwrap_or(Trigger::Push);
     let mode = options.mode.unwrap_or(Mode::Minimal);
     provider::validate(trigger, mode, head.dirty).map_err(refuse)?;
+    options.params.validate(trigger).map_err(refuse)?;
     let base = match trigger {
         Trigger::Pr => BaseRef::of_workspace(&head.root),
-        Trigger::Push | Trigger::Release => None,
+        Trigger::Push | Trigger::Release | Trigger::WorkflowDispatch | Trigger::WorkflowCall => {
+            None
+        }
     };
     Ok(Resolved {
         base,
@@ -112,6 +118,7 @@ pub fn plan(options: &SubmitOptions) -> Result<Plan, Error> {
         resolved.base.as_ref(),
         &repository,
         options.pr_number.unwrap_or(1),
+        &options.params.inputs,
     );
     Ok(Plan {
         schema_version: super::SCHEMA_VERSION,
@@ -129,6 +136,7 @@ pub fn plan(options: &SubmitOptions) -> Result<Plan, Error> {
         branch: head.branch,
         dirty: head.dirty,
         actor: options.actor.clone().unwrap_or_else(detect_actor),
+        params: options.params.clone(),
     })
 }
 
@@ -173,5 +181,6 @@ pub async fn stage_submission(
         pr_number: options.pr_number,
         timeout_secs: options.timeout_secs,
         secrets: options.secrets,
+        params: options.params,
     })
 }

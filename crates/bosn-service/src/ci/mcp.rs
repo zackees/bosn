@@ -134,10 +134,22 @@ struct RunArgs {
     timeout_secs: Option<u64>,
     #[serde(default)]
     github_token: bool,
+    /// `--input`, `--matrix` and `--env` (#430), validated with the plan.
+    #[serde(default)]
+    inputs: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    matrix: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    env: std::collections::BTreeMap<String, String>,
 }
 impl RunArgs {
     fn options(self) -> SubmitOptions {
         SubmitOptions {
+            params: super::params::RunParams {
+                inputs: self.inputs,
+                matrix: self.matrix,
+                env: self.env,
+            },
             workspace: self.workspace,
             provider: self.provider,
             engine: None,
@@ -330,11 +342,14 @@ fn run_schema() -> Value {
             "workflow": {"type": "string", "description": "Workflow file (default: .github/workflows/ci.yml, else the only workflow)."},
             "job": {"type": "string"},
             "provider": {"enum": ["github", "gitlab"]},
-            "trigger": {"enum": ["pr", "push", "release"]},
+            "trigger": {"enum": ["pr", "push", "release", "workflow_dispatch", "workflow_call"], "description": "workflow_dispatch and workflow_call take inputs."},
             "mode": {"enum": ["minimal", "test", "full"]},
             "pr_number": {"type": "integer", "minimum": 1},
             "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 43200},
-            "github_token": {"type": "boolean", "description": "Pass the daemon-owned github_token to the workflow."}
+            "github_token": {"type": "boolean", "description": "Pass the daemon-owned github_token to the workflow."},
+            "inputs": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Workflow inputs (trigger workflow_dispatch or workflow_call)."},
+            "matrix": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Run only the matrix legs whose key has this value (act --matrix K:V)."},
+            "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra job environment (act --env K=V); never a secret."}
         }
     })
 }
@@ -641,6 +656,26 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cancelled["cancelled"], true);
+    }
+
+    #[test]
+    fn run_arguments_carry_an_event_inputs_matrix_and_env() {
+        let options = serde_json::from_value::<RunArgs>(json!({
+            "workspace": "/x",
+            "trigger": "workflow_call",
+            "inputs": {"release_tag": "2.8.25", "mode": "candidate"},
+            "matrix": {"target": "x86_64-unknown-linux-musl"},
+            "env": {"PYTEST_ADDOPTS": "-s"}
+        }))
+        .unwrap()
+        .options();
+        assert_eq!(options.trigger, Some(Trigger::WorkflowCall));
+        assert_eq!(options.params.inputs["mode"], "candidate");
+        assert_eq!(options.params.matrix["target"], "x86_64-unknown-linux-musl");
+        assert_eq!(options.params.env["PYTEST_ADDOPTS"], "-s");
+        assert!(
+            serde_json::from_value::<RunArgs>(json!({"workspace": "/x", "inputs": [1]})).is_err()
+        );
     }
 
     #[test]

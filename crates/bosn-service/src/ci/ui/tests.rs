@@ -110,6 +110,7 @@ fn fake_record() -> crate::ci::RunRecord {
         pr_number: None,
         timeout_secs: None,
         secrets: Vec::new(),
+        params: Default::default(),
     };
     crate::ci::RunRecord::queued(
         "aaaaaaaa-bbbb-4ccc-8ddd-000000000001".into(),

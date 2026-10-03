@@ -8,8 +8,12 @@
 //! | `pr`      | `pull_request` + `ci-test`/`ci-full` label by mode  |
 //! | `push`    | `push` to the current branch                        |
 //! | `release` | `workflow_dispatch` with the exact `commit_sha`     |
+//! | `workflow_dispatch`, `workflow_call` | that event with the run's `--input`s (#430) |
 
-use std::path::{Component, Path};
+use std::{
+    collections::BTreeMap,
+    path::{Component, Path},
+};
 
 use serde_json::{Value, json};
 
@@ -21,8 +25,33 @@ vocabulary!(
 );
 vocabulary!(
     /// bosn's trigger vocabulary, mapped per provider.
-    Trigger, "trigger" { Pr => "pr", Push => "push", Release => "release" }
+    Trigger, "trigger" {
+        Pr => "pr",
+        Push => "push",
+        Release => "release",
+        WorkflowDispatch => "workflow_dispatch",
+        WorkflowCall => "workflow_call",
+    }
 );
+
+impl Trigger {
+    /// The events `--event` selects: they take `--input`s (#430).
+    pub const EVENTS: [Trigger; 2] = [Trigger::WorkflowDispatch, Trigger::WorkflowCall];
+
+    pub fn takes_inputs(self) -> bool {
+        Self::EVENTS.contains(&self)
+    }
+
+    /// `--event NAME`: one of [`Self::EVENTS`].
+    pub fn parse_event(value: &str) -> Result<Self, String> {
+        Self::EVENTS
+            .into_iter()
+            .find(|event| event.as_str() == value)
+            .ok_or_else(|| {
+                format!("unknown event {value:?} (expected workflow_dispatch, workflow_call)")
+            })
+    }
+}
 vocabulary!(
     /// How much of the CI to run (fleet `ci-test`/`ci-full` tiers).
     Mode, "mode" { Minimal => "minimal", Test => "test", Full => "full" }
@@ -134,7 +163,8 @@ pub fn repository(origin: Option<&str>) -> String {
 /// The trigger/mode combination rules, shared by every provider.
 pub fn validate(trigger: Trigger, mode: Mode, dirty: bool) -> Result<(), String> {
     match (trigger, mode) {
-        (Trigger::Release, Mode::Full) | (Trigger::Pr, _) | (Trigger::Push, _) => {}
+        (Trigger::Release, Mode::Full)
+        | (Trigger::Pr | Trigger::Push | Trigger::WorkflowDispatch | Trigger::WorkflowCall, _) => {}
         (Trigger::Release, _) => return Err("release requires --mode full".into()),
     }
     if trigger == Trigger::Release && dirty {
@@ -147,7 +177,9 @@ pub fn validate(trigger: Trigger, mode: Mode, dirty: bool) -> Result<(), String>
 
 /// The provider event name and payload act receives through `--eventpath`.
 /// A pull request names its `base` branch and commit when the snapshot
-/// carries one (#403), else only the default branch name.
+/// carries one (#403), else only the default branch name. `inputs` are a
+/// `workflow_dispatch`/`workflow_call` run's (#430).
+#[allow(clippy::too_many_arguments)]
 pub fn github_event(
     trigger: Trigger,
     mode: Mode,
@@ -156,6 +188,7 @@ pub fn github_event(
     base: Option<&BaseRef>,
     repository: &str,
     pr_number: u64,
+    inputs: &BTreeMap<String, String>,
 ) -> (&'static str, Value) {
     let branch = branch.unwrap_or("main");
     let repo = json!({"full_name": repository, "name": repository.rsplit('/').next()});
@@ -199,6 +232,15 @@ pub fn github_event(
             json!({
                 "ref": format!("refs/heads/{branch}"),
                 "inputs": {"tier": "full", "commit_sha": sha},
+                "repository": repo,
+            }),
+        ),
+        Trigger::WorkflowDispatch | Trigger::WorkflowCall => (
+            trigger.as_str(),
+            json!({
+                "ref": format!("refs/heads/{branch}"),
+                "after": sha,
+                "inputs": inputs,
                 "repository": repo,
             }),
         ),
@@ -275,8 +317,17 @@ mod tests {
     #[test]
     fn trigger_mapping_golden() {
         let sha = "a".repeat(40);
-        let (event, payload) =
-            github_event(Trigger::Pr, Mode::Test, &sha, Some("feat"), None, "o/r", 7);
+        let none = BTreeMap::new();
+        let (event, payload) = github_event(
+            Trigger::Pr,
+            Mode::Test,
+            &sha,
+            Some("feat"),
+            None,
+            "o/r",
+            7,
+            &none,
+        );
         assert_eq!(event, "pull_request");
         assert_eq!(payload["pull_request"]["labels"][0]["name"], "ci-test");
         assert_eq!(payload["pull_request"]["head"]["sha"], sha.as_str());
@@ -290,12 +341,30 @@ mod tests {
             branch: "trunk".into(),
             sha: "b".repeat(40),
         };
-        let (_, based) = github_event(Trigger::Pr, Mode::Test, &sha, None, Some(&base), "o/r", 7);
+        let (_, based) = github_event(
+            Trigger::Pr,
+            Mode::Test,
+            &sha,
+            None,
+            Some(&base),
+            "o/r",
+            7,
+            &none,
+        );
         assert_eq!(based["pull_request"]["base"]["ref"], "trunk");
         assert_eq!(based["pull_request"]["base"]["sha"], base.sha.as_str());
-        let (_, full) = github_event(Trigger::Pr, Mode::Full, &sha, None, None, "o/r", 7);
+        let (_, full) = github_event(Trigger::Pr, Mode::Full, &sha, None, None, "o/r", 7, &none);
         assert_eq!(full["pull_request"]["labels"][0]["name"], "ci-full");
-        let (_, minimal) = github_event(Trigger::Pr, Mode::Minimal, &sha, None, None, "o/r", 7);
+        let (_, minimal) = github_event(
+            Trigger::Pr,
+            Mode::Minimal,
+            &sha,
+            None,
+            None,
+            "o/r",
+            7,
+            &none,
+        );
         assert_eq!(minimal["pull_request"]["labels"], json!([]));
         let (event, push) = github_event(
             Trigger::Push,
@@ -305,15 +374,48 @@ mod tests {
             None,
             "o/r",
             0,
+            &none,
         );
         assert_eq!(
             (event, push["ref"].as_str()),
             ("push", Some("refs/heads/dev"))
         );
-        let (event, release) =
-            github_event(Trigger::Release, Mode::Full, &sha, None, None, "o/r", 0);
+        let (event, release) = github_event(
+            Trigger::Release,
+            Mode::Full,
+            &sha,
+            None,
+            None,
+            "o/r",
+            0,
+            &none,
+        );
         assert_eq!(event, "workflow_dispatch");
         assert_eq!(release["inputs"]["commit_sha"], sha.as_str());
+        // #430: the --event triggers carry the run's inputs.
+        let inputs = BTreeMap::from([("mode".to_owned(), "candidate".to_owned())]);
+        for trigger in Trigger::EVENTS {
+            let (event, payload) = github_event(
+                trigger,
+                Mode::Minimal,
+                &sha,
+                Some("dev"),
+                None,
+                "o/r",
+                0,
+                &inputs,
+            );
+            assert_eq!(event, trigger.as_str());
+            assert_eq!(payload["inputs"]["mode"], "candidate");
+            assert_eq!(payload["ref"], "refs/heads/dev");
+            assert!(validate(trigger, Mode::Minimal, true).is_ok());
+            assert_eq!(Trigger::parse_event(event).unwrap(), trigger);
+        }
+        assert!(Trigger::parse_event("push").is_err());
+        assert_eq!(
+            Trigger::parse("workflow_call").unwrap(),
+            Trigger::WorkflowCall
+        );
     }
 
     #[test]

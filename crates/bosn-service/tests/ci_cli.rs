@@ -117,6 +117,73 @@ fn plan_json_conforms_to_the_published_schema_and_text_is_golden() {
 }
 
 #[test]
+fn plan_takes_an_event_inputs_a_matrix_filter_and_env() {
+    // zackees/clud's installer lane (#430).
+    let root = tempfile::tempdir().unwrap();
+    let repo = repo(root.path());
+    let state = root.path().join("state");
+    let lane: &[&str] = &[
+        "ci",
+        "plan",
+        "--event",
+        "workflow_call",
+        "--input",
+        "release_tag=2.8.25",
+        "--input",
+        "mode=candidate",
+        "--matrix",
+        "target:x86_64-unknown-linux-musl",
+        "--env",
+        "PYTEST_ADDOPTS=-s",
+        "--json",
+    ];
+    let out = bosn(lane, &repo, &state);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&out.stdout).unwrap();
+    conforms(&plan, "Plan");
+    assert_eq!(plan["trigger"], "workflow_call");
+    assert_eq!(plan["event"], "workflow_call");
+    assert_eq!(plan["payload"]["inputs"]["release_tag"], "2.8.25");
+    assert_eq!(plan["payload"]["inputs"]["mode"], "candidate");
+    assert_eq!(
+        plan["params"]["matrix"]["target"],
+        "x86_64-unknown-linux-musl"
+    );
+    assert_eq!(plan["params"]["env"]["PYTEST_ADDOPTS"], "-s");
+    let text = bosn(&lane[..lane.len() - 1], &repo, &state);
+    assert!(
+        String::from_utf8_lossy(&text.stdout).contains(
+            "params: inputs: mode=candidate, release_tag=2.8.25; \
+             matrix: target:x86_64-unknown-linux-musl; env: PYTEST_ADDOPTS=-s\n"
+        ),
+        "{}",
+        String::from_utf8_lossy(&text.stdout)
+    );
+    // Refused before any daemon starts: a secret through --env, inputs for
+    // an event that takes none, and --event beside --trigger.
+    let cases: [(&[&str], &str); 4] = [
+        (&["ci", "run", "--env", "GITHUB_TOKEN=x"], "secrets"),
+        (&["ci", "plan", "--input", "a=1"], "--event"),
+        (
+            &["ci", "plan", "--event", "workflow_call", "--trigger", "pr"],
+            "--event or --trigger",
+        ),
+        (&["ci", "plan", "--event", "push"], "workflow_dispatch"),
+    ];
+    for (args, expected) in cases {
+        let out = bosn(args, &repo, &state);
+        assert_eq!(out.status.code(), Some(3), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(expected), "{args:?}: {stderr}");
+    }
+    assert!(!state.exists(), "plan never starts a daemon");
+}
+
+#[test]
 fn refusals_exit_3_without_starting_a_daemon() {
     let root = tempfile::tempdir().unwrap();
     let repo = repo(root.path());

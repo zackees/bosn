@@ -771,6 +771,10 @@
         "mode": {
           "$ref": "#/$defs/Mode"
         },
+        "params": {
+          "$ref": "#/$defs/RunParams",
+          "description": "Workflow inputs, matrix filter and extra env (#430); omitted when none."
+        },
         "payload": {
           "description": "The provider event payload, as act receives it."
         },
@@ -910,6 +914,34 @@
           "type": "object"
         }
       ]
+    },
+    "RunParams": {
+      "additionalProperties": false,
+      "description": "One run's workflow inputs, matrix filter and extra environment.",
+      "properties": {
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Extra environment for every job (act `--env K=V`); never a secret.",
+          "type": "object"
+        },
+        "inputs": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "`inputs.<K>` for a `workflow_dispatch` or `workflow_call` run.",
+          "type": "object"
+        },
+        "matrix": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Run only the matrix legs whose `K` is `V` (act `--matrix K:V`).",
+          "type": "object"
+        }
+      },
+      "type": "object"
     },
     "RunReport": {
       "description": "The `ci report --json` agent contract.",
@@ -1149,6 +1181,10 @@
         },
         "mode": {
           "$ref": "#/$defs/Mode"
+        },
+        "params": {
+          "$ref": "#/$defs/RunParams",
+          "description": "Workflow inputs, matrix filter and extra env (#430); omitted when none."
         },
         "payload_sha256": {
           "type": "string"
@@ -1642,6 +1678,10 @@
             "null"
           ]
         },
+        "params": {
+          "$ref": "#/$defs/RunParams",
+          "description": "Workflow inputs, a matrix filter and extra env (#430)."
+        },
         "pr_number": {
           "format": "uint64",
           "minimum": 0,
@@ -1708,7 +1748,9 @@
       "enum": [
         "pr",
         "push",
-        "release"
+        "release",
+        "workflow_dispatch",
+        "workflow_call"
       ],
       "type": "string"
     },

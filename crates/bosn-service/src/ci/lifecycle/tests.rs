@@ -64,6 +64,7 @@ pub fn plan(run: &str, deadline: Duration) -> EnginePlan {
             job: None,
             cache_namespace: "0".repeat(16),
             secrets: Default::default(),
+            params: Default::default(),
         },
         cache: test_cache(),
         deadline: async_engine::Deadline::after(deadline),

@@ -38,6 +38,7 @@ fn request(staging: &str, sha_byte: char) -> SubmitRequest {
         pr_number: None,
         timeout_secs: Some(5),
         secrets: Vec::new(),
+        params: Default::default(),
     }
 }
 
@@ -811,4 +812,5 @@ fn the_cache_volume_is_measured_and_cleared_only_while_nothing_runs() {
     });
 }
 
+mod params;
 mod spare;

@@ -63,6 +63,7 @@ pub mod limits;
 pub mod matrix_runner;
 pub mod mcp;
 pub mod model;
+pub mod params;
 pub mod pins;
 pub mod provider;
 pub mod remote_only;
