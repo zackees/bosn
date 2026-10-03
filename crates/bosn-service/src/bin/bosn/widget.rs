@@ -8,6 +8,9 @@ use std::{
     process::{Command, Stdio},
 };
 
+#[path = "widget/desktop.rs"]
+mod desktop;
+
 pub const USAGE: &str = "usage: bosn widget [--detach] [--state-dir STATE_DIR]
    or: bosn widget install [--state-dir STATE_DIR]   (systemd user unit; Linux)";
 
@@ -174,6 +177,7 @@ fn install_unit(binary: &Path, state_dir: &Path) {
     ] {
         let _ = Command::new("systemctl").args(args).status();
     }
+    desktop::install(Path::new(&home)).unwrap_or_else(|error| fail(&error));
     println!("installed {}", unit.display());
 }
 

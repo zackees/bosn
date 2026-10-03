@@ -164,31 +164,18 @@ opened once, at its final size, and then reused:
 - The full view navigates to the new page and takes focus, so there is only
   ever one.
 
-**KDE Plasma on Wayland.** The compositor decides stacking, the taskbar and
-placement, so the bubble's requests do nothing there. A KWin rule supplies
-them. It matches the app id and the bubble's title, `bosn bubble`; the panel
-(`bosn panel`) and the full view (`bosn`) stay ordinary windows. Set
-`position` to the bottom-right corner of your work area, minus the 72 px bubble
-and a margin. Then apply the rule, or declare the same keys in the desktop
-configuration (zackees/nixos, plasma-manager `window-rules`):
+**KDE Plasma on Wayland.** The compositor controls placement and stacking.
+`bosn widget install` installs and enables the `bosn-widget-corner` KWin script
+alongside the user service. It places only the bubble in the lower-right corner
+of its monitor's usable area, with a 24-pixel margin, leaving room for panels
+and docks, and follows panel and monitor geometry changes. It keeps the bubble
+above other windows and out of the taskbar and switcher. A bubble-only window
+rule prevents automatic creation from taking keyboard focus. The panel and full dashboard keep
+normal window behavior. Existing KWin scripts and window rules remain intact.
 
-```sh
-g=bosn-widget-bubble
-k() { kwriteconfig6 --file kwinrulesrc --group "$g" --key "$1" "$2"; }
-k Description "bosn widget bubble"
-k wmclass dev.bosn.widget; k wmclassmatch 1        # 1 = exact match
-k title "bosn bubble";     k titlematch 1
-k above true;              k aboverule 2           # 2 = force
-k noborder true;           k noborderrule 2
-k skiptaskbar true;        k skiptaskbarrule 2
-k skippager true;          k skippagerrule 2
-k skipswitcher true;       k skipswitcherrule 2
-k position "3887,1399";    k positionrule 2
-# With other rules already present, list them all here and count them.
-kwriteconfig6 --file kwinrulesrc --group General --key count 1
-kwriteconfig6 --file kwinrulesrc --group General --key rules "$g"
-qdbus org.kde.KWin /KWin reconfigure
-```
+A previously configured forced-position rule overrides scripted placement;
+remove that bubble-only position rule to use automatic placement. The script
+can be disabled in KDE's Window Management → KWin Scripts settings.
 
 On Wayland, size every window when it opens. A later resize is not applied on
 some hosts (zackees/kernal-api#390). Compositor-anchored placement without a
