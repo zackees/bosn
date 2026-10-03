@@ -9,4 +9,4 @@ exclude = ["crates/bosn-widget"]
 # `bosn` (crates.io) and `bosn-python` (PyPI, via maturin's dynamic version)
 # inherit it. The internal crates are never published and keep their own.
 [workspace.package]
-version = "0.1.11"
+version = "0.1.12"

@@ -76,10 +76,11 @@ pub fn act_artifact(architecture: &str) -> Option<ActArtifact> {
         "x86_64" | "amd64" => Some(ActArtifact {
             // act2, zackees' fork of nektos/act (zackees/ci.yml ACT-002):
             // GitHub-parity RUNNER_ENVIRONMENT, an init in hosted-runner job
-            // containers, and --workflow-overlay (#424).
-            url: "https://github.com/zackees/act2/releases/download/v0.2.89-act2.2/act_Linux_x86_64.tar.gz",
-            sha256: "77ab43695a69904566e8ea0c360a6c9a78f289e6fa9ab4fc4129ef1b05eb8b03",
-            binary_sha256: "2dc84749b9e06a61f3a55bb6f22e3b312606730a0a51e2a7c1dc6902619fa761",
+            // containers, --workflow-overlay (#424), and ordinary hosted
+            // Linux shell/Node identity with preserved Docker socket access.
+            url: "https://github.com/zackees/act2/releases/download/v0.2.89-act2.3/act_Linux_x86_64.tar.gz",
+            sha256: "c0e823da2bd54a5acbb0cae7a821a38af7992ee0a31b62327a52a470b8b72248",
+            binary_sha256: "e9ee37bdd60b5bcbcae4fe1addaeb75f64530acd07adbce25d1f6c5f92bfbae1",
         }),
         _ => None,
     }
