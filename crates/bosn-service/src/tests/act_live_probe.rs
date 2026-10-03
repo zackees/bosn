@@ -65,6 +65,7 @@ fn limits() -> ActEngineLimits {
     ActEngineLimits {
         memory_bytes: 28 << 30,
         storage_bytes: 20 << 30,
+        storage: crate::act_engine::EngineStorage::Memory,
         nano_cpus: 2_000_000_000,
         pids: 1024,
     }

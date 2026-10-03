@@ -49,28 +49,33 @@ pub fn observe_engine(
     let mounts = engine["Mounts"]
         .as_array()
         .ok_or_else(|| ActEngineError("missing mount observation".into()))?;
-    // The cache volume (if frozen) is checked on its own; every other
-    // reported mount must be one of the declared tmpfs mounts.
+    // The volumes (the frozen cache, a disk-backed engine's storage) are
+    // checked on their own; every other reported mount must be one of the
+    // declared tmpfs mounts.
     let tmpfs_mounts: Vec<&Value> = mounts.iter().filter(|m| m["Type"] != "volume").collect();
     let env = engine["Config"]["Env"]
         .as_array()
         .ok_or_else(|| ActEngineError("missing environment observation".into()))?;
-    let expected_tmpfs: BTreeMap<String, String> = [
+    let storage = EngineStorage::of(profile.tmpfs_policy);
+    let storage_tmpfs = (storage == EngineStorage::Memory).then(|| {
         (
-            "/var/lib/docker".into(),
+            STORAGE_TARGET.to_owned(),
             format!("rw,exec,nosuid,nodev,size={}", profile.storage_bytes),
-        ),
-        (
-            "/run".into(),
-            format!("rw,nosuid,nodev,size={}", profile.run_tmpfs_bytes),
-        ),
-        (
-            "/tmp".into(),
-            format!("rw,nosuid,nodev,size={}", profile.tmp_tmpfs_bytes),
-        ),
-    ]
-    .into_iter()
-    .collect();
+        )
+    });
+    let expected_tmpfs: BTreeMap<String, String> = storage_tmpfs
+        .into_iter()
+        .chain([
+            (
+                "/run".into(),
+                format!("rw,nosuid,nodev,size={}", profile.run_tmpfs_bytes),
+            ),
+            (
+                "/tmp".into(),
+                format!("rw,nosuid,nodev,size={}", profile.tmp_tmpfs_bytes),
+            ),
+        ])
+        .collect();
     let command: Vec<String> = serde_json::from_value(engine["Config"]["Cmd"].clone())
         .map_err(|error| ActEngineError(error.to_string()))?;
     if command_digest(&command)? != profile.init_command_sha256 {
@@ -102,8 +107,8 @@ pub fn observe_engine(
             .is_none_or(|v| !v.is_null() && !v.as_array().is_some_and(|v| v.is_empty()))
         || !empty(&host["Binds"])
         || !empty(&host["VolumesFrom"])
-        || !host_mounts_match(&host["Mounts"], profile.cache_volume.as_ref())
-        || !volume_mounts_match(mounts, profile.cache_volume.as_ref())
+        || !host_mounts_match(&host["Mounts"], profile.cache_volume.as_ref(), storage)
+        || !volume_mounts_match(mounts, profile.cache_volume.as_ref(), storage)
         || !empty(&host["PortBindings"])
         || tmpfs != expected_tmpfs
         // Docker may omit tmpfs entries from Mounts; declarations remain exact.

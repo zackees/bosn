@@ -542,12 +542,18 @@ impl ActEngineBackend for DockerActBackend {
             let info = self
                 .checked(
                     "docker info",
-                    owned(&["info", "--format", "{{.MemTotal}} {{.NCPU}}"]),
+                    owned(&[
+                        "info",
+                        "--format",
+                        "{{.MemTotal}} {{.NCPU}} {{.DockerRootDir}}",
+                    ]),
                     CONTROL_DEADLINE,
                 )
                 .await?;
             let meminfo = std::fs::read_to_string("/proc/meminfo").ok();
-            super::limits::HostResources::parse(&info, meminfo.as_deref())
+            super::limits::HostResources::parse(&info, meminfo.as_deref(), |root| {
+                kernal_api::resources_available_space(std::path::Path::new(root)).ok()
+            })
         })
     }
 

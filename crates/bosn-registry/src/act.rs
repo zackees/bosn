@@ -16,7 +16,17 @@ const PREFIX: &str = "act.engine.v1:";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActEngineTmpfsPolicy {
+    /// Docker storage on a private exec tmpfs (RAM, inside the memory limit).
     StorageExecRunTmpNoexecV1,
+    /// Docker storage on an anonymous disk volume that is removed with the
+    /// engine (#425); only `/run` and `/tmp` are tmpfs, both noexec.
+    DiskStorageRunTmpNoexecV1,
+}
+impl ActEngineTmpfsPolicy {
+    /// Whether the engine's storage is RAM that counts against its memory.
+    pub fn storage_in_memory(self) -> bool {
+        matches!(self, Self::StorageExecRunTmpNoexecV1)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -88,12 +98,18 @@ impl ActEngineCreationProfile {
         if let Some(cache) = &self.cache_volume {
             cache.validate()?;
         }
-        let reserved = self
-            .storage_bytes
+        // Disk-backed storage is not RAM: only the tmpfs mounts are reserved.
+        let in_memory = if self.tmpfs_policy.storage_in_memory() {
+            self.storage_bytes
+        } else {
+            0
+        };
+        let reserved = in_memory
             .checked_add(self.run_tmpfs_bytes)
             .and_then(|v| v.checked_add(self.tmp_tmpfs_bytes))
             .and_then(|v| v.checked_add(512 << 20));
         if self.storage_bytes < 1 << 20
+            || self.storage_bytes > i64::MAX as u64
             || self.memory_bytes > i64::MAX as u64
             || reserved.is_none_or(|v| v > self.memory_bytes)
             || self.run_tmpfs_bytes < 1 << 20

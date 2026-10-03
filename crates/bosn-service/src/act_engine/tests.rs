@@ -24,6 +24,7 @@ fn limits() -> ActEngineLimits {
     ActEngineLimits {
         memory_bytes: 8 << 30,
         storage_bytes: 4 << 30,
+        storage: EngineStorage::Memory,
         nano_cpus: 4_000_000_000,
         pids: 1024,
     }
@@ -620,5 +621,113 @@ else: sys.exit(9)
         if mode == "success" {
             assert_eq!(commands.lines().count(), 7);
         }
+    }
+}
+
+/// A disk-backed engine (#425): a budget larger than its whole memory limit.
+fn disk_limits() -> ActEngineLimits {
+    ActEngineLimits {
+        storage_bytes: 64 << 30,
+        storage: EngineStorage::Disk,
+        ..limits()
+    }
+}
+fn disk_intent() -> ActEngineIntent {
+    ActEngineIntent {
+        creation_profile: Some(creation_profile(disk_limits()).unwrap()),
+        ..intent()
+    }
+}
+fn disk_document() -> serde_json::Value {
+    let mut d = document();
+    let i = disk_intent();
+    d[0]["Config"]["Labels"] = json!(i.required_labels(OWNER).unwrap());
+    d[0]["HostConfig"]["Tmpfs"] = json!(disk_limits().tmpfs());
+    d[0]["HostConfig"]["Mounts"] = json!([{"Type":"volume","Target":"/var/lib/docker"}]);
+    d[0]["Mounts"] = json!([
+        {"Type":"volume","Name":"9".repeat(64),"Source":format!("/var/lib/docker/volumes/{}/_data","9".repeat(64)),"Destination":"/var/lib/docker","Driver":"local","Mode":"z","RW":true,"Propagation":""},
+        {"Type":"tmpfs","Destination":"/run"},
+        {"Type":"tmpfs","Destination":"/tmp"}
+    ]);
+    d
+}
+fn observe_disk(d: &Value, i: &ActEngineIntent, l: ActEngineLimits) -> bool {
+    observe_engine(
+        &serde_json::to_vec(d).unwrap(),
+        i,
+        OWNER,
+        &classic_identity(),
+        l,
+    )
+    .is_ok()
+}
+
+#[test]
+fn disk_storage_is_an_anonymous_volume_outside_the_memory_limit() {
+    let profile = creation_profile(disk_limits()).unwrap();
+    assert_eq!(
+        profile.tmpfs_policy,
+        ActEngineTmpfsPolicy::DiskStorageRunTmpNoexecV1
+    );
+    assert!(profile.storage_bytes > profile.memory_bytes);
+    assert_eq!(frozen_limits(&disk_intent()).unwrap(), disk_limits());
+    // The same budget in RAM cannot fit the memory limit.
+    assert!(
+        creation_profile(ActEngineLimits {
+            storage: EngineStorage::Memory,
+            ..disk_limits()
+        })
+        .is_err()
+    );
+    let args = create_arguments(&disk_intent(), OWNER, disk_limits()).unwrap();
+    assert!(
+        args.windows(2)
+            .any(|p| p[0] == "--mount" && p[1] == "type=volume,target=/var/lib/docker")
+    );
+    assert!(
+        !args
+            .iter()
+            .any(|v| v.starts_with("/var/lib/docker:") || v.contains("source="))
+    );
+    for path in ["/run:", "/tmp:"] {
+        assert!(
+            args.windows(2)
+                .any(|p| p[0] == "--tmpfs" && p[1].starts_with(path))
+        );
+    }
+    // A disk intent never creates a memory-backed engine, nor the reverse.
+    assert!(create_arguments(&disk_intent(), OWNER, limits()).is_err());
+    assert!(create_arguments(&intent(), OWNER, disk_limits()).is_err());
+}
+
+#[test]
+fn disk_storage_observation_accepts_only_its_own_anonymous_volume() {
+    let (i, l) = (disk_intent(), disk_limits());
+    assert!(observe_disk(&disk_document(), &i, l));
+    // Docker may omit the tmpfs entries, as for a memory-backed engine.
+    let mut quiet = disk_document();
+    quiet[0]["Mounts"] = json!([quiet[0]["Mounts"][0].clone()]);
+    assert!(observe_disk(&quiet, &i, l));
+    assert!(!observe_disk(&disk_document(), &intent(), limits()));
+    assert!(!observe_disk(&document(), &i, l));
+    for change in 0..8 {
+        let mut d = disk_document();
+        match change {
+            0 => d[0]["Mounts"][0]["Name"] = json!("foreign"),
+            1 => d[0]["Mounts"][0]["RW"] = json!(false),
+            2 => d[0]["Mounts"][0]["Destination"] = json!("/foreign"),
+            3 => d[0]["HostConfig"]["Mounts"][0]["Source"] = json!("foreign"),
+            4 => d[0]["HostConfig"]["Mounts"][0]["ReadOnly"] = json!(true),
+            5 => d[0]["HostConfig"]["Mounts"] = json!([]),
+            6 => {
+                d[0]["HostConfig"]["Tmpfs"]["/var/lib/docker"] =
+                    json!("rw,exec,nosuid,nodev,size=68719476736")
+            }
+            _ => {
+                let extra = d[0]["Mounts"][0].clone();
+                d[0]["Mounts"].as_array_mut().unwrap().push(extra);
+            }
+        }
+        assert!(!observe_disk(&d, &i, l), "{change}");
     }
 }

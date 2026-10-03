@@ -294,21 +294,37 @@ is not local evidence. Declare a job this way rather than guarding it with
   (`crates/bosn-service/src/act_engine`, #349): a privileged container of the
   pinned `docker:29.7.2` publisher manifest, named `bosn-act-<run>`, with a
   read-only root, a private cgroup namespace, bounded memory, CPUs and
-  processes, and its Docker storage on a private tmpfs. It carries the
+  processes, and its Docker storage on disk (or, when the host has no room,
+  a private tmpfs). It carries the
   registry's ownership labels and a frozen creation profile.
   - Its limits are sized from the host engine's machine (`docker info`, plus
-    `/proc/meminfo` when that is the same machine): memory is half the total,
-    at most three quarters of what is available, held between 4 and 48 GiB;
-    the storage tmpfs, which is RAM and counts against that memory, is three
-    quarters of it, always leaving 2 GiB; CPUs are min(cores, 8); 4096
-    processes. Neither limit reserves RAM until it is written; both only
-    bound a runaway job. Any of them can be pinned in `<state>/config.toml`
-    (pinning only `storage_gib` grows the sized memory to fit it):
+    `/proc/meminfo` and the free space under Docker's root directory when
+    that is the same machine): memory is half the total, at most three
+    quarters of what is available, held between 4 and 48 GiB; CPUs are
+    min(cores, 8); 4096 processes. Memory reserves no RAM until it is
+    written; it only bounds a runaway job.
+  - **Storage is disk by default (#425).** The engine's `/var/lib/docker` is
+    an anonymous Docker volume on the host's disk, removed with the engine
+    (`docker container rm --volumes`), so concurrent builds' `target/` dirs
+    never compete with the host for RAM. Its budget is the free disk under
+    Docker's root less a 16 GiB margin, rounded down to 8 GiB and capped at
+    128 GiB (72 GiB with 89 GiB free); it is checked before the run, not a
+    quota. When the free disk cannot be read (Docker Desktop's VM, a remote
+    engine) the budget is 64 GiB. When the budget is under 24 GiB, storage
+    falls back to a RAM tmpfs inside the memory limit, three quarters of it
+    and always leaving 2 GiB (36 GiB of a 48 GiB engine): that tmpfs on a
+    96 GiB host was too small for zackees/clud's three concurrent Rust jobs,
+    which peak at 32 GiB plus soldr's 5 GiB free floor.
+  - Any of them can be pinned in `<state>/config.toml`. `storage_gib` is the
+    disk budget (refused when the free disk cannot hold it with the margin,
+    if `storage = "disk"` is set; otherwise storage falls back to memory) or
+    the tmpfs size (pinning only it then grows the sized memory to fit):
 
     ```toml
     [engine]
     memory_gib = 16
     storage_gib = 10
+    storage = "disk"   # or "memory"; default: disk when the host has room
     cpus = 4
     pids = 4096
     spares = 0   # no prepared spare engine (default 1)
@@ -320,7 +336,8 @@ is not local evidence. Declare a job this way rather than guarding it with
   - While act runs, the engine's storage is sampled (`df` inside the engine)
     every few seconds. The log notes its peak; when under 5 GiB is left on a
     mostly used engine it warns at once, and a run that then fails says so
-    in its `reason` (`bosn ci report`), naming `storage_gib`. A step that a
+    in its `reason` (`bosn ci report`), naming `storage_gib`. On disk, `df`
+    reports the host filesystem holding the volume. A step that a
     free-space guard refused (soldr will not build under 5 GiB) or that hit
     ENOSPC is explained rather than failing silently (#392).
   - **One prepared spare engine (#410).** Once a daemon has taken its first

@@ -96,20 +96,50 @@ pub(crate) fn verify_cache_volume(
 /// registry label itself is checked separately.
 const ANY_REGISTRY: &str = "00000000-0000-4000-8000-000000000000";
 
-/// `HostConfig.Mounts`: nothing, or exactly the frozen cache volume.
-pub(super) fn host_mounts_match(host: &Value, cache: Option<&ActEngineCacheVolume>) -> bool {
-    let Some(cache) = cache else {
+/// The volume mounts an engine is created with: the frozen cache volume
+/// (named) and, for disk-backed storage, the anonymous storage volume.
+fn expected_volumes(
+    cache: Option<&ActEngineCacheVolume>,
+    storage: EngineStorage,
+) -> Vec<(Option<&str>, &str)> {
+    let cache = cache.map(|cache| (Some(cache.name.as_str()), cache.target.as_str()));
+    let disk = (storage == EngineStorage::Disk).then_some((None, STORAGE_TARGET));
+    cache.into_iter().chain(disk).collect()
+}
+
+/// `HostConfig.Mounts`: exactly the expected volume mounts, read-write.
+pub(super) fn host_mounts_match(
+    host: &Value,
+    cache: Option<&ActEngineCacheVolume>,
+    storage: EngineStorage,
+) -> bool {
+    let expected = expected_volumes(cache, storage);
+    if expected.is_empty() {
         return empty(host);
-    };
-    let Some([mount]) = host.as_array().map(Vec::as_slice) else {
+    }
+    let Some(mounts) = host.as_array() else {
         return false;
     };
+    mounts.len() == expected.len()
+        && expected.iter().all(|(source, target)| {
+            mounts
+                .iter()
+                .filter(|mount| host_mount_is(mount, *source, target))
+                .count()
+                == 1
+        })
+}
+
+fn host_mount_is(mount: &Value, source: Option<&str>, target: &str) -> bool {
     let Some(fields) = mount.as_object() else {
         return false;
     };
     mount["Type"] == "volume"
-        && mount["Source"].as_str() == Some(cache.name.as_str())
-        && mount["Target"].as_str() == Some(cache.target.as_str())
+        && match source {
+            Some(name) => mount["Source"].as_str() == Some(name),
+            None => mount.get("Source").is_none_or(|source| source == ""),
+        }
+        && mount["Target"].as_str() == Some(target)
         && mount
             .get("ReadOnly")
             .is_none_or(|read_only| read_only == false)
@@ -128,18 +158,29 @@ fn volume_options_are_plain(options: &Value) -> bool {
     })
 }
 
-/// The runtime `Mounts` entries that are volumes: none, or exactly the
-/// frozen cache volume, read-write, on the local driver.
-pub(super) fn volume_mounts_match(mounts: &[Value], cache: Option<&ActEngineCacheVolume>) -> bool {
+/// The runtime `Mounts` entries that are volumes: exactly the expected
+/// ones, read-write, on the local driver. The anonymous storage volume has a
+/// Docker-generated 64-hex name.
+pub(super) fn volume_mounts_match(
+    mounts: &[Value],
+    cache: Option<&ActEngineCacheVolume>,
+    storage: EngineStorage,
+) -> bool {
     let volumes: Vec<&Value> = mounts.iter().filter(|m| m["Type"] == "volume").collect();
-    match cache {
-        None => volumes.is_empty(),
-        Some(cache) => {
-            matches!(volumes.as_slice(), [volume]
-                if volume["Name"].as_str() == Some(cache.name.as_str())
-                    && volume["Destination"].as_str() == Some(cache.target.as_str())
-                    && volume["Driver"] == "local"
-                    && volume["RW"] == true)
-        }
-    }
+    let expected = expected_volumes(cache, storage);
+    volumes.len() == expected.len()
+        && expected.iter().all(|(name, target)| {
+            volumes
+                .iter()
+                .filter(|volume| {
+                    volume["Name"].as_str().is_some_and(|actual| match name {
+                        Some(name) => actual == *name,
+                        None => hexadecimal(actual, 64),
+                    }) && volume["Destination"].as_str() == Some(*target)
+                        && volume["Driver"] == "local"
+                        && volume["RW"] == true
+                })
+                .count()
+                == 1
+        })
 }

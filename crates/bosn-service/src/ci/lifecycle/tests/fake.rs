@@ -92,12 +92,14 @@ pub const FAKE_HOST: crate::ci::limits::HostResources = crate::ci::limits::HostR
     total_memory: 16 << 30,
     available_memory: 12 << 30,
     cpus: 2,
+    available_disk: Some(200 << 30),
 };
 /// A host with room for a spare.
 pub const ROOMY_HOST: crate::ci::limits::HostResources = crate::ci::limits::HostResources {
     total_memory: 64 << 30,
     available_memory: 60 << 30,
     cpus: 8,
+    available_disk: Some(200 << 30),
 };
 pub(super) fn later(record: &ActEngineRecord) -> f64 {
     now_seconds().max(record.updated_at)

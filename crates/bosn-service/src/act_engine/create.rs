@@ -39,7 +39,7 @@ pub(crate) fn engine_command() -> Vec<String> {
         "bosn-act-engine-init",
         "dockerd",
         "--feature=containerd-snapshotter=true",
-        // overlayfs on the private tmpfs: a new container shares the image's
+        // overlayfs on the private storage: a new container shares the image's
         // layers instead of copying them, as `native` did (~5 s and ~5 GiB
         // of RAM-backed storage per job container, plus a slower image load).
         "--storage-driver=overlayfs",
@@ -51,12 +51,45 @@ pub(crate) fn engine_command() -> Vec<String> {
     .map(str::to_owned)
     .collect()
 }
+/// Where the engine's Docker storage (`/var/lib/docker`) is mounted.
+pub(crate) const STORAGE_TARGET: &str = "/var/lib/docker";
+
+/// What backs an engine's Docker storage (#425).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngineStorage {
+    /// A private exec tmpfs: RAM, inside the engine's memory limit, capped at
+    /// `storage_bytes`.
+    Memory,
+    /// An anonymous volume on the host engine's disk, removed with the
+    /// engine. `storage_bytes` is the free-disk budget it was sized against,
+    /// not a quota, and none of it counts against memory.
+    Disk,
+}
+
+impl EngineStorage {
+    pub(crate) fn policy(self) -> ActEngineTmpfsPolicy {
+        match self {
+            Self::Memory => ActEngineTmpfsPolicy::StorageExecRunTmpNoexecV1,
+            Self::Disk => ActEngineTmpfsPolicy::DiskStorageRunTmpNoexecV1,
+        }
+    }
+
+    pub(crate) fn of(policy: ActEngineTmpfsPolicy) -> Self {
+        match policy {
+            ActEngineTmpfsPolicy::StorageExecRunTmpNoexecV1 => Self::Memory,
+            ActEngineTmpfsPolicy::DiskStorageRunTmpNoexecV1 => Self::Disk,
+        }
+    }
+}
+
 /// Limits apply to the entire isolated engine and all its descendants.
-/// Storage is private tmpfs; the engine's writable root is disabled.
+/// Storage is a private tmpfs or an anonymous disk volume ([`EngineStorage`]);
+/// the engine's writable root is disabled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActEngineLimits {
     pub memory_bytes: u64,
     pub storage_bytes: u64,
+    pub storage: EngineStorage,
     pub nano_cpus: u64,
     pub pids: u64,
 }
@@ -72,8 +105,14 @@ impl std::error::Error for ActEngineError {}
 
 impl ActEngineLimits {
     pub(crate) fn validate(self) -> Result<(), ActEngineError> {
+        // Only memory-backed storage is carved out of the memory limit.
+        let in_memory = match self.storage {
+            EngineStorage::Memory => self.storage_bytes,
+            EngineStorage::Disk => (16 << 20) + (64 << 20),
+        };
         if self.storage_bytes < 1 << 20
-            || self.memory_bytes.saturating_sub(self.storage_bytes) < 512 << 20
+            || self.storage_bytes > i64::MAX as u64
+            || self.memory_bytes.saturating_sub(in_memory) < 512 << 20
             || self.memory_bytes > i64::MAX as u64
             || self.nano_cpus < 1_000_000
             || self.nano_cpus > 256_000_000_000
@@ -86,27 +125,22 @@ impl ActEngineLimits {
     }
 
     pub(super) fn tmpfs(self) -> BTreeMap<String, String> {
-        [
-            ("/var/lib/docker", self.storage_bytes),
-            ("/run", 16 << 20),
-            ("/tmp", 64 << 20),
-        ]
-        .into_iter()
-        // Docker 29.7.2 daemon/oci_linux.go defaults user tmpfs to noexec.
-        // Snapshots must execute container binaries; only their private
-        // storage mount clears that default. /run and /tmp remain noexec.
-        .map(|(path, bytes)| {
-            let execution = if path == "/var/lib/docker" {
-                ",exec"
-            } else {
-                ""
-            };
-            (
-                path.into(),
-                format!("rw{execution},nosuid,nodev,size={bytes}"),
-            )
-        })
-        .collect()
+        let storage =
+            (self.storage == EngineStorage::Memory).then_some((STORAGE_TARGET, self.storage_bytes));
+        storage
+            .into_iter()
+            .chain([("/run", 16 << 20), ("/tmp", 64 << 20)])
+            // Docker 29.7.2 daemon/oci_linux.go defaults user tmpfs to noexec.
+            // Snapshots must execute container binaries; only their private
+            // storage mount clears that default. /run and /tmp remain noexec.
+            .map(|(path, bytes)| {
+                let execution = if path == STORAGE_TARGET { ",exec" } else { "" };
+                (
+                    path.into(),
+                    format!("rw{execution},nosuid,nodev,size={bytes}"),
+                )
+            })
+            .collect()
     }
 }
 
@@ -136,7 +170,7 @@ pub(crate) fn creation_profile(
         pids: limits.pids,
         run_tmpfs_bytes: 16 << 20,
         tmp_tmpfs_bytes: 64 << 20,
-        tmpfs_policy: ActEngineTmpfsPolicy::StorageExecRunTmpNoexecV1,
+        tmpfs_policy: limits.storage.policy(),
         init_command_sha256: command_digest(&engine_command())?,
         cache_volume: None,
     };
@@ -156,6 +190,7 @@ pub(crate) fn frozen_limits(intent: &ActEngineIntent) -> Result<ActEngineLimits,
     let limits = ActEngineLimits {
         memory_bytes: profile.memory_bytes,
         storage_bytes: profile.storage_bytes,
+        storage: EngineStorage::of(profile.tmpfs_policy),
         nano_cpus: profile.nano_cpus,
         pids: profile.pids,
     };
@@ -227,6 +262,13 @@ pub fn create_arguments(
     ];
     for (path, options) in limits.tmpfs() {
         args.extend(["--tmpfs".into(), format!("{path}:{options}")]);
+    }
+    if limits.storage == EngineStorage::Disk {
+        // Anonymous, so `container rm --volumes` removes it with the engine.
+        args.extend([
+            "--mount".into(),
+            format!("type=volume,target={STORAGE_TARGET}"),
+        ]);
     }
     if let Some(cache) = &cache {
         args.extend(["--mount".into(), cache_mount_argument(cache)]);
@@ -454,6 +496,9 @@ pub async fn remove_owned_engine(
             "container".into(),
             "rm".into(),
             "--force".into(),
+            // A disk-backed engine's anonymous storage volume goes with it;
+            // named volumes (the machine cache) are never removed.
+            "--volumes".into(),
             observed.engine_id.clone(),
         ],
     )
