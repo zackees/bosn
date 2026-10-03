@@ -267,7 +267,7 @@ def test_failed_build_allows_the_wrapper_to_finish_its_diagnostic(backend):
         sys.executable,
         "-c",
         "import pathlib,sys,time; "
-        "print('{\"reason\":\"build-finished\",\"success\":false}', flush=True); "
+        'print(\'{"reason":"build-finished","success":false}\', flush=True); '
         "time.sleep(0.2); pathlib.Path(sys.argv[1]).write_text('final diagnostic')",
         str(marker),
     ]
