@@ -34,3 +34,7 @@ cmd = "soldr toolchain ensure --json && uv sync --frozen --all-groups --no-edita
 [task.ci-engine-check]
 stack = "test"
 cmd = "soldr toolchain ensure --json && soldr cargo check -p bosn-service --locked"
+
+[task.ci-engine-test]
+stack = "test"
+cmd = "soldr toolchain ensure --json && soldr cargo test -p bosn-service --lib ci::engine --locked"
