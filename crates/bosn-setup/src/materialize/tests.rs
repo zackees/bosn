@@ -125,10 +125,12 @@ fn manifest_context_preserves_alternate_dockerfile_and_empty_directory() {
                 ManifestBuildEntry::File {
                     path: "docker/Dockerfile".into(),
                     content: b"FROM scratch\nCOPY payload /payload\n".to_vec(),
+                    executable: false,
                 },
                 ManifestBuildEntry::File {
                     path: "payload".into(),
                     content: b"ok\n".to_vec(),
+                    executable: false,
                 },
             ],
         )
@@ -140,6 +142,45 @@ fn manifest_context_preserves_alternate_dockerfile_and_empty_directory() {
         fs::ContextPathKind::Directory
     );
     assert!(verify_materialized_assets(DIGEST, &root).is_ok());
+}
+
+#[test]
+fn manifest_context_keeps_a_files_execute_bit_and_stays_private() {
+    let (_temp, store, _workspace) = store_and_workspace();
+    let entries = [
+        ManifestBuildEntry::File {
+            path: "Dockerfile".into(),
+            content: b"FROM scratch\nCOPY tool /tool\n".to_vec(),
+            executable: false,
+        },
+        ManifestBuildEntry::File {
+            path: "tool".into(),
+            content: b"#!/bin/sh\n".to_vec(),
+            executable: true,
+        },
+    ];
+    let root = store
+        .materialize_manifest_context(DIGEST, "Dockerfile", &entries)
+        .unwrap();
+    let executable = |name: &str| {
+        fs::context_path_metadata_no_follow(&root.join(name))
+            .unwrap()
+            .executable
+    };
+    // Windows has no per-file execute bit.
+    assert_eq!(
+        executable("tool"),
+        !kernal_api::platform::host::target_is_windows()
+    );
+    assert!(!executable("Dockerfile"));
+    // The private-asset checks still accept it, on first use and on reuse.
+    assert!(verify_materialized_assets(DIGEST, &root).is_ok());
+    assert_eq!(
+        store
+            .materialize_manifest_context(DIGEST, "Dockerfile", &entries)
+            .unwrap(),
+        root
+    );
 }
 
 #[test]
@@ -156,6 +197,7 @@ fn manifest_context_rejects_escaping_links_and_fails_closed_without_kernel_creat
                 ManifestBuildEntry::File {
                     path: "Dockerfile".into(),
                     content: b"FROM scratch\n".to_vec(),
+                    executable: false,
                 },
                 ManifestBuildEntry::Symlink {
                     path: "link".into(),
@@ -178,6 +220,7 @@ fn prepare_verification_rejects_a_mutated_typed_link() {
         ExpectedAsset {
             relative: "alias".into(),
             kind: ExpectedAssetKind::Symlink("Dockerfile".into()),
+            executable: false,
         },
     ];
     atomic_write_new(

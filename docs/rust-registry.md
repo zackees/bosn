@@ -18,7 +18,7 @@ Execution-session lease IDs are read and written as `Vec<String>` and volume
 intent labels as `BTreeMap<String, String>`; malformed persisted JSON is a
 typed registry error, never silently accepted.
 
-`kernal-api` is consumed from crates.io, pinned exactly to `=0.1.24`, and
+`kernal-api` is consumed from crates.io, pinned exactly to `=0.1.25`, and
 `python ci/verify_release_dependencies.py crates/bosn-registry/Cargo.toml`
 passes. A git, path, or `[patch]`/`[replace]` source is rejected by both that
 release check and `ci/verify_kernel_boundary.py`.
@@ -27,7 +27,7 @@ For source inspection only (never as a Cargo path dependency), use:
 
 ```text
 git clone https://github.com/zackees/kernal-api _vender/kernal-api
-git -C _vender/kernal-api checkout v0.1.24
+git -C _vender/kernal-api checkout v0.1.25
 ```
 
 ## Python-v4 bridge guard

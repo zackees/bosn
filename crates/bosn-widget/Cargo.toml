@@ -12,7 +12,7 @@ description = "bosn's floating desktop widget: a bubble, a panel and a full-view
 
 [dependencies]
 bosn-service = { path = "../bosn-service" }
-kernal-api = { version = "=0.1.24", default-features = false, features = ["fs", "tauri-webview"] }
+kernal-api = { version = "=0.1.25", default-features = false, features = ["fs", "tauri-webview"] }
 
 [dev-dependencies]
 serde_json = "=1.0.149"

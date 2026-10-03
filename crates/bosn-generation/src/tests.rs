@@ -14,6 +14,7 @@ fn context_records_are_ordered_and_typed() {
             ContextEntry::File {
                 path: "a".into(),
                 bytes: b"x".to_vec(),
+                executable: false,
             },
         ],
     };
@@ -419,4 +420,19 @@ fn manifest() -> Manifest {
         bosn_core::ManifestRoots::new("m", "build", "workspace"),
     )
     .unwrap()
+}
+
+#[test]
+fn a_files_execute_bit_is_identity_significant() {
+    let observation = |executable| ContextObservation {
+        materialization_root: "build".into(),
+        entries: vec![ContextEntry::File {
+            path: "tool".into(),
+            bytes: b"#!/bin/sh\n".to_vec(),
+            executable,
+        }],
+    };
+    let digest =
+        |o: &ContextObservation| content_digest(&manifest(), manifest().stack("s").unwrap(), o);
+    assert_ne!(digest(&observation(false)), digest(&observation(true)));
 }

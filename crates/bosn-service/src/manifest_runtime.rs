@@ -35,9 +35,14 @@ pub(crate) async fn manifest_dockerfile_build_plan(
         let mut entries = Vec::new();
         for entry in &context.entries {
             match entry {
-                ContextEntry::File { path, bytes } => entries.push(ManifestBuildEntry::File {
+                ContextEntry::File {
+                    path,
+                    bytes,
+                    executable,
+                } => entries.push(ManifestBuildEntry::File {
                     path: path.clone(),
                     content: bytes.clone(),
+                    executable: *executable,
                 }),
                 ContextEntry::Directory { path } => {
                     entries.push(ManifestBuildEntry::Directory { path: path.clone() })
@@ -54,7 +59,9 @@ pub(crate) async fn manifest_dockerfile_build_plan(
             .entries
             .iter()
             .find_map(|entry| match entry {
-                ContextEntry::File { path, bytes } if path == dockerfile => Some(bytes.as_slice()),
+                ContextEntry::File { path, bytes, .. } if path == dockerfile => {
+                    Some(bytes.as_slice())
+                }
                 _ => None,
             })
             .ok_or_else(|| "manifest Dockerfile context has no root Dockerfile".to_owned())?;

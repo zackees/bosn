@@ -83,7 +83,7 @@ migration-test-helper = ["bosn-registry/migration-test-helper"]
 bosn-core = { path = "../bosn-core" }
 bosn-engine = { path = "../bosn-engine" }
 # external
-kernal-api = { version = "=0.1.24", default-features = false }
+kernal-api = { version = "=0.1.25", default-features = false }
 libc = { version = "=0.2.189", optional = true }
 
 [dev-dependencies]
@@ -101,7 +101,7 @@ def test_manifest_drops_internal_dependencies_and_feature_items(tmp_path: Path) 
     assert "# internal facade crates" not in text
     assert 'native-test-helper = ["dep:libc"]' in text
     assert "migration-test-helper = []" in text
-    assert 'kernal-api = { version = "=0.1.24"' in text
+    assert 'kernal-api = { version = "=0.1.25"' in text
     assert 'tempfile = "=3.27.0"' in text
 
 
