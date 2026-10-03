@@ -4,7 +4,7 @@ Bosn is being migrated under [issue #153](https://github.com/zackees/bosn/issues
 The application domain, daemon protocol, SQLite state registry, Docker engine
 seam, native CLI, PyO3 binding, MCP server, and URL setup path are Rust code.
 `kernal-api` is the OS boundary, pinned exactly to the published crates.io
-release `=0.1.24`.
+release `=0.1.25`.
 
 The authoritative implementation/fixture/consumer inventory is the
 [issue #153 coverage matrix](issue153-coverage-matrix.md). It explicitly
