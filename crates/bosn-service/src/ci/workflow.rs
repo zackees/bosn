@@ -61,6 +61,10 @@ pub struct Step {
     pub name: Option<String>,
     pub uses: Option<String>,
     pub run: Option<String>,
+    /// The action's inputs; they decide whether bosn can stub it
+    /// ([`super::remote_only::classify`]).
+    #[serde(default)]
+    pub with: BTreeMap<String, serde_yaml::Value>,
 }
 
 impl Step {

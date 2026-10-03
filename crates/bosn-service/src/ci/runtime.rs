@@ -754,6 +754,11 @@ impl CiRuntime {
                         localized.trapped
                     ));
                 }
+                for job in &localized.pages_stubbed {
+                    observer.note(&format!(
+                        "job {job}: actions/configure-pages is stubbed locally with the repository's GitHub Pages URLs (GATE-012); the build runs"
+                    ));
+                }
                 for (job, reason) in &localized.remote_only {
                     observer.note(&format!(
                         "job {job} runs only on GitHub (GATE-012): {reason}; it is reported remote_only, not run"

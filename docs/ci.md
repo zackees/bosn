@@ -263,6 +263,31 @@ the reason. The run log notes each such job. The job is then reported
 is not local evidence. Declare a job this way rather than guarding it with
 `if: ${{ !env.ACT }}`, which hides the reason and skips its dependents.
 
+**Pages build jobs run locally.** A Pages *build* job uses
+`actions/configure-pages` only to read the site's metadata, then builds,
+validates and uploads the site with `actions/upload-pages-artifact`. That
+work is local-safe, and only `actions/deploy-pages` needs GitHub. So bosn
+does not confine such a job. In the run's copy of the workflow, each
+configure-pages step becomes a local stub (`crates/bosn-service/src/ci/pages.rs`).
+The stub keeps the step's `id`, `name` and `if:`, and writes its outputs for
+the repository's GitHub Pages site:
+
+| output | project site `owner/repo` | user site `owner/owner.github.io` |
+| --- | --- | --- |
+| `base_url` | `https://owner.github.io/repo` | `https://owner.github.io` |
+| `origin` | `https://owner.github.io` | `https://owner.github.io` |
+| `host` | `owner.github.io` | `owner.github.io` |
+| `base_path` | `/repo` | (empty) |
+
+`actions/upload-pages-artifact` runs as written, against act's per-run
+artifact server. A configure-pages step with `static_site_generator` or
+`generator_config_file` edits the generator's config from the live site, so
+its job stays confined. `actions/deploy-pages`, PyPI trusted publishing and
+the rest of the registry stay confined as before. One function,
+`remote_only::classify`, decides whether a `uses:` step runs as written, is
+stubbed (`LOCAL_STUBS`) or is confined (`ACTIONS`). The run log names each
+stubbed job.
+
 ## What runs, and where
 
 - **Provider and engine are separate axes.** The provider is auto-detected:
