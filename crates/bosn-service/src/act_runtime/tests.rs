@@ -133,6 +133,7 @@ mod startup_recovery {
                         crate::act_engine::creation_profile(crate::act_engine::ActEngineLimits {
                             memory_bytes: 6 << 30,
                             storage_bytes: 4 << 30,
+                            storage: crate::act_engine::EngineStorage::Memory,
                             nano_cpus: 1_000_000_000,
                             pids: 256,
                         })

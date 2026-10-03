@@ -1,7 +1,9 @@
 //! How full an engine's private storage got during a run, and what a run
 //! that failed with it nearly full says about it (#392).
 //!
-//! The storage is the engine's `/var/lib/docker` tmpfs. While act runs, the
+//! The storage is the engine's `/var/lib/docker`: an anonymous volume on the
+//! host's disk, whose `df` is that filesystem's, or a RAM tmpfs (#425,
+//! [`super::limits`]). While act runs, the
 //! lifecycle samples it every [`SAMPLE_INTERVAL`] and keeps the peak, so a
 //! step that a tool refused for lack of space (soldr will not build with
 //! under 5 GiB free) or that hit ENOSPC is explained in the run's log and
@@ -119,7 +121,8 @@ pub fn failure_reason(peak: StorageUsage) -> Option<String> {
         format!(
             "the engine's storage ran low ({} at its peak): a step that needs free space \
              (soldr refuses to build under 5 GiB) or hit \"no space left on device\" may have \
-             failed for it; raise storage_gib under [engine] in <state>/config.toml",
+             failed for it; free disk on the Docker host (disk-backed storage) or raise \
+             storage_gib under [engine] in <state>/config.toml",
             peak.describe()
         )
     })
