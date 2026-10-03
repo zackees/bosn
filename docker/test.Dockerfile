@@ -4,7 +4,7 @@ FROM python:3.13-slim-bookworm@sha256:00faa2debb87529f9f0764e9491d8ba400a3678976
 COPY --from=uv /uv /uvx /bin/
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends git libatomic1 build-essential pkg-config libssl-dev patchelf \
+    && apt-get install --yes --no-install-recommends git libatomic1 build-essential pkg-config libssl-dev patchelf nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # Bootstrap only reviewed binary wheels; source builds use the repository's
