@@ -37,4 +37,4 @@ cmd = "soldr toolchain ensure --json && soldr cargo check -p bosn-service --lock
 
 [task.ci-engine-test]
 stack = "test"
-cmd = "soldr toolchain ensure --json && soldr cargo test -p bosn-service --lib ci::engine --locked"
+cmd = "soldr toolchain ensure --json && soldr cargo test -p bosn-service --lib ci::engine --locked && soldr cargo test -p bosn-service --lib ci::pins --locked && uv run --no-project --with pytest pytest tests/test_runner_tools.py"

@@ -16,6 +16,8 @@ pub use bosn_core::act::ACT_VERSION;
 /// The runner image every `ubuntu-*` label maps to: the linux/amd64 manifest
 /// of `catthehacker/ubuntu:act-24.04`.
 pub const RUNNER_IMAGE: &str = "docker.io/catthehacker/ubuntu@sha256:4f2d5083a9d10d018c1c511eb8665cd480553c11975e78fd903a46daa830768b";
+/// Original PATH of the pinned runner, preserved when adding hosted tools.
+pub const RUNNER_PATH: &str = "/opt/acttoolcache/node/24.19.0/x64/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin";
 /// The config [`RUNNER_IMAGE`]'s manifest names.
 pub const RUNNER_CONFIG: &str =
     "sha256:cb041d0df9a749a73358ded823dd44f7c24111ef3efd152a3e6f3f4e3846f153";
@@ -88,6 +90,19 @@ mod tests {
     use super::*;
     use kernal_api::hash::Sha256Hasher;
     use serde_json::{Value, json};
+
+    #[test]
+    fn runner_path_matches_pinned_image_config() {
+        let config: Value = serde_json::from_slice(RUNNER_CONFIG_BYTES).unwrap();
+        let expected = format!("PATH={RUNNER_PATH}");
+        assert!(
+            config["config"]["Env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| { entry.as_str() == Some(expected.as_str()) })
+        );
+    }
 
     fn digest(bytes: &[u8]) -> String {
         format!("sha256:{}", Sha256Hasher::digest(bytes))
