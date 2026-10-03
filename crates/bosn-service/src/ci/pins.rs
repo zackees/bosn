@@ -75,9 +75,9 @@ pub fn act_artifact(architecture: &str) -> Option<ActArtifact> {
             // act2, zackees' fork of nektos/act (zackees/ci.yml ACT-002):
             // GitHub-parity RUNNER_ENVIRONMENT, an init in hosted-runner job
             // containers, and --workflow-overlay (#424).
-            url: "https://github.com/zackees/act2/releases/download/v0.2.89-act2.1/act_Linux_x86_64.tar.gz",
-            sha256: "bf25cb70b13e7d2ba6ecc624c9000d0a1ee2d09e0c5a849f344706d35ae4f0f5",
-            binary_sha256: "b2c5353156dad75f220cf4f03356b44b332a9fd9f36dc7f5f89173edee2f3b75",
+            url: "https://github.com/zackees/act2/releases/download/v0.2.89-act2.2/act_Linux_x86_64.tar.gz",
+            sha256: "77ab43695a69904566e8ea0c360a6c9a78f289e6fa9ab4fc4129ef1b05eb8b03",
+            binary_sha256: "2dc84749b9e06a61f3a55bb6f22e3b312606730a0a51e2a7c1dc6902619fa761",
         }),
         _ => None,
     }
