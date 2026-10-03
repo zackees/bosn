@@ -82,7 +82,7 @@ pub fn collect_context(
 ) -> Result<ContextObservation, CollectorError> {
     collect_context_inner(root, dockerfile, limits, None)
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn collect_context_checkpoint(
     root: &Path,
     dockerfile: Option<&str>,

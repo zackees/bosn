@@ -69,11 +69,11 @@ pub fn default_state_dir() -> PathBuf {
         if let Some(value) = std::env::var_os("LOCALAPPDATA") {
             return PathBuf::from(value).join("bosn");
         }
-        return kernal_api::platform::host::home_dir()
+        kernal_api::platform::host::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("AppData")
             .join("Local")
-            .join("bosn");
+            .join("bosn")
     }
     #[cfg(not(target_os = "windows"))]
     {
