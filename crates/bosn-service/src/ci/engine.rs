@@ -1,23 +1,14 @@
 //! The isolated engine act runs against.
 //!
-//! The engine itself is #349's owned Act engine ([`crate::act_engine`]): the
-//! pinned `docker:29.7.2` image, created only after its intent (with a frozen
-//! creation profile) is durable, with a read-only root, private tmpfs storage,
-//! a private cgroup namespace and no host path or socket. Its one named mount
-//! is the machine-wide cache volume, frozen into that profile and verified
-//! before creation and on every observation. Creation, observation and
-//! retirement all go through that layer.
+//! #349's owned engine ([`crate::act_engine`]) freezes its creation profile
+//! before creating the pinned Docker image with a read-only root, private
+//! storage/cgroup namespace and no host path or socket. Its verified machine
+//! cache mount survives; everything else goes with the engine on retirement.
 //!
-//! [`DockerActBackend`] adds what `bosn ci` does *inside* a created engine:
-//! act runs there through `docker exec`, so it only ever sees the nested
-//! engine's private socket. Every artifact is pinned in [`super::pins`]: the
-//! act release is fetched into the cache volume from its pinned URL, and it
-//! and the binary inside are checked against their sha256s; the runner image
-//! is loaded from the cache volume (or pulled by digest once) and proven to
-//! be the pinned manifest and config; the frozen source and event payload
-//! are streamed in; act's tool cache is seeded from, and saved back to, it.
-//! Everything act creates lives in the engine's private storage, which goes
-//! with the engine.
+//! [`DockerActBackend`] runs act through the nested engine's private socket.
+//! [`super::pins`] verifies the act archive/binary and runner manifest/config.
+//! Frozen source and event payloads are streamed in; completed tool-cache
+//! installs are seeded and saved through the machine-wide volume.
 
 use std::{collections::BTreeMap, future::Future, path::Path, pin::Pin, time::Duration};
 
@@ -30,6 +21,7 @@ use kernal_api::async_engine::{self, CancellationToken};
 use crate::{RegistryActor, act_engine};
 
 mod lines;
+mod runner_tools;
 mod toolcache;
 use lines::LineBuffer;
 #[cfg(test)]
@@ -153,6 +145,7 @@ impl ActInvocation {
             "--artifact-server-path".into(),
             format!("{ENGINE_WORK}/artifacts"),
         ];
+        args.extend(["--env".into(), runner_tools::path_env()]);
         let runner = runner_tag();
         for label in LOCAL_RUNNER_LABELS {
             args.push("-P".into());
@@ -736,6 +729,12 @@ impl ActEngineBackend for DockerActBackend {
             self.checked(
                 "tool cache seed",
                 Self::exec(engine, &seed_toolcache_script()),
+                PULL_DEADLINE,
+            )
+            .await?;
+            self.checked(
+                "runner stock tools",
+                Self::exec(engine, &runner_tools::prepare_script()),
                 PULL_DEADLINE,
             )
             .await?;

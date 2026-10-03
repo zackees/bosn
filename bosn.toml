@@ -28,3 +28,13 @@ cmd = "soldr toolchain ensure --json && soldr cargo test --workspace --exclude b
 [task.lint]
 stack = "test"
 cmd = "soldr toolchain ensure --json && uv sync --frozen --all-groups --no-editable && uv run --no-sync python ci/lint.py"
+
+# A focused compile for edits to the local CI engine; preserves the same
+# isolated, persistent Rust build state as rust-test without running suites.
+[task.ci-engine-check]
+stack = "test"
+cmd = "soldr toolchain ensure --json && soldr cargo check -p bosn-service --locked"
+
+[task.ci-engine-test]
+stack = "test"
+cmd = "soldr toolchain ensure --json && soldr cargo test -p bosn-service --lib ci::engine --locked && soldr cargo test -p bosn-service --lib ci::pins --locked && uv run --no-project --with pytest pytest tests/test_runner_tools.py"
