@@ -142,6 +142,12 @@ impl ActInvocation {
             "--pull=false".into(),
             "--action-cache-path".into(),
             format!("{ENGINE_CACHE}/actions"),
+            // The legacy action cache clones into one shared directory per
+            // action ref, so concurrent runs on one engine race on it
+            // (zackees/clud#1724, zackees/ci.yml#213). The new cache keeps
+            // one bare git store per action and extracts each run's copy
+            // from it instead of checking a working tree out in place.
+            "--use-new-action-cache".into(),
             "--cache-server-path".into(),
             format!("{ENGINE_CACHE}/actcache/{}", self.cache_namespace),
             // Per engine, so concurrent runs never share artifacts or ports.
@@ -899,7 +905,14 @@ mod tests {
         assert!(args.iter().all(|a| !a.contains("docker.sock")));
         assert!(args.contains(&format!("ubuntu-latest={}", runner_tag())));
         assert!(args.contains(&format!("{ENGINE_CACHE}/actcache/0123456789abcdef")));
-        assert!(args.contains(&format!("{ENGINE_CACHE}/actions")));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--action-cache-path" && w[1] == format!("{ENGINE_CACHE}/actions"))
+        );
+        assert!(
+            args.iter().any(|a| a == "--use-new-action-cache"),
+            "the shared action cache must use act's race-free store (zackees/clud#1724)"
+        );
         assert!(args.windows(2).any(|w| w == ["-s", "GITHUB_TOKEN"]));
         assert!(
             args.iter().all(|a| !a.contains("ghp_secretvalue")),
