@@ -264,4 +264,7 @@ pub struct Plan {
     pub branch: Option<String>,
     pub dirty: bool,
     pub actor: String,
+    /// Workflow inputs, matrix filter and extra env (#430); omitted when none.
+    #[serde(default, skip_serializing_if = "super::params::RunParams::is_empty")]
+    pub params: super::params::RunParams,
 }

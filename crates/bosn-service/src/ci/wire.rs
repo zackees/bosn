@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     model::RunTree,
+    params::RunParams,
     provider::{self, Mode, Provider, Trigger},
     scheduler::RunKey,
     snapshot::BaseRef,
@@ -85,6 +86,9 @@ pub struct SubmitRequest {
     /// Opt-in daemon-owned secrets by name (only `github_token`).
     #[serde(default)]
     pub secrets: Vec<String>,
+    /// Workflow inputs, a matrix filter and extra env (#430).
+    #[serde(default, skip_serializing_if = "RunParams::is_empty")]
+    pub params: RunParams,
 }
 
 impl SubmitRequest {
@@ -136,6 +140,9 @@ impl SubmitRequest {
         {
             return refuse("unknown secret (only github_token is supported)");
         }
+        self.params
+            .validate(self.trigger)
+            .map_err(CiError::refused)?;
         provider::validate(self.trigger, self.mode, self.dirty).map_err(CiError::refused)
     }
 
@@ -294,6 +301,9 @@ pub struct RunRecord {
     pub log_records: u64,
     #[serde(default)]
     pub tree: RunTree,
+    /// Workflow inputs, matrix filter and extra env (#430); omitted when none.
+    #[serde(default, skip_serializing_if = "RunParams::is_empty")]
+    pub params: RunParams,
 }
 
 impl RunRecord {
@@ -335,6 +345,7 @@ impl RunRecord {
             secrets: request.secrets.clone(),
             log_records: 0,
             tree: RunTree::default(),
+            params: request.params.clone(),
         }
     }
 
@@ -393,6 +404,7 @@ impl RunRecord {
             payload_sha256: self.payload_sha256.clone(),
             timeout_secs: self.timeout_secs,
             secrets: self.secrets.clone(),
+            params: self.params.clone(),
         }
     }
 }

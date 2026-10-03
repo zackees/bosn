@@ -108,6 +108,7 @@ impl CiRuntime {
                 job: record.job.clone(),
                 cache_namespace: record.cache_namespace(),
                 secrets: self.secrets(record)?,
+                params: record.params.clone(),
             },
             cache: spec.cache,
             deadline,

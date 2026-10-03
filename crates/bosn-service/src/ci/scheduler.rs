@@ -19,6 +19,8 @@ pub struct RunKey {
     pub payload_sha256: String,
     pub timeout_secs: u64,
     pub secrets: Vec<String>,
+    /// Inputs, matrix filter and env (#430): a different run when they differ.
+    pub params: super::params::RunParams,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,6 +146,7 @@ mod tests {
             payload_sha256: "p".into(),
             timeout_secs: 60,
             secrets: Vec::new(),
+            params: Default::default(),
         }
     }
 

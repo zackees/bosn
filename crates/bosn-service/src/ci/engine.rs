@@ -108,6 +108,8 @@ pub struct ActInvocation {
     /// Passed to act as `-s NAME`; values travel only in the docker client's
     /// environment (`exec --env NAME`), never in argv.
     pub secrets: SecretEnv,
+    /// act `--input`, `--matrix` and `--env` (#430), validated at submit.
+    pub params: super::params::RunParams,
 }
 
 /// The `runs-on` labels act runs locally, all on the pinned runner image;
@@ -161,6 +163,7 @@ impl ActInvocation {
             args.push("-j".into());
             args.push(job.clone());
         }
+        args.extend(self.params.act_args());
         args
     }
 }
@@ -894,6 +897,7 @@ mod tests {
             job: Some("lint".into()),
             cache_namespace: "0123456789abcdef".into(),
             secrets: SecretEnv(vec![("GITHUB_TOKEN".into(), "ghp_secretvalue".into())]),
+            params: Default::default(),
         }
         .args();
         assert!(args.iter().all(|a| !a.contains("docker.sock")));
@@ -926,6 +930,7 @@ mod tests {
             job: None,
             cache_namespace: "0123456789abcdef".into(),
             secrets: SecretEnv::default(),
+            params: Default::default(),
         };
         let overlay = format!("{ENGINE_WORK}/overlay");
         let args = invocation.args();

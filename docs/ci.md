@@ -8,6 +8,9 @@ bosn daemon creates for that run and removes afterwards. It serves agents
 ```sh
 bosn ci run --wait                      # push trigger, minimal mode, ci.yml
 bosn ci run --trigger pr --mode test    # pull_request + ci-test label
+bosn ci run --workflow .github/workflows/installer-check.yml --job public-host \
+  --event workflow_call --input release_tag=2.8.25 --input mode=candidate \
+  --matrix target:x86_64-unknown-linux-musl --env PYTEST_ADDOPTS=-s
 bosn ci list
 bosn ci show RUN                        # Run -> stage -> job -> step tree
 bosn ci logs RUN --follow               # or --since-seq N --limit N
@@ -272,6 +275,24 @@ is not local evidence. Declare a job this way rather than guarding it with
   - `push` maps to `push` on the current branch.
   - `release` maps to `workflow_dispatch` with `commit_sha`. It requires
     `--mode full` and a clean tree.
+  - `--event workflow_dispatch|workflow_call` (#430) runs that event, with
+    the run's `--input`s in the payload's `inputs`. It replaces `--trigger`
+    (giving both is refused), and is recorded as the run's trigger. MCP and
+    `bosn.Client` take these as `trigger` values.
+- **Inputs, a matrix filter and env (#430).** `--input K=V`, `--matrix K:V`
+  and `--env K=V` repeat, and reach act as `--input`, `--matrix` and
+  `--env`. MCP and `bosn.Client` take `inputs`, `matrix` and `env` objects.
+  - Keys start with a letter or `_` and hold letters, digits, `_` and `-`
+    (env names: letters, digits and `_`), at most 100 bytes. Values are at
+    most 4 KiB, with no control characters; a matrix value has no `:`. At
+    most 32 of each, and a key given twice is refused.
+  - `--input` needs `--event`; `--matrix` and `--env` work with any trigger.
+  - **Secrets never travel through `--env`.** A name holding `TOKEN`,
+    `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL` or `PRIVATE_KEY`, or in the
+    runner's `GITHUB_`, `ACTIONS_`, `RUNNER_` or `ACT_` namespace, is
+    refused. `--github-token` remains the one secret, passed as act `-s`.
+  - They are recorded on the run (`params` in `bosn ci show --json`, a
+    `params:` line in its text) and in `bosn ci plan`.
 - **Uncommitted work runs.** The client snapshots the working tree as-is: tracked
   and untracked files, honouring `.gitignore`. Deleted files are left out,
   symlinks are copied as links (never followed), executable bits are kept, and
@@ -407,7 +428,7 @@ is not local evidence. Declare a job this way rather than guarding it with
   `bosn ci runners set-limit N`.
   - Identical submissions share one run ID. "Identical" means the same SHA,
     dirty digest, workflow, job, trigger, mode, provider, engine, event payload
-    (branch, PR number, repository) and timeout.
+    (branch, PR number, repository, inputs), matrix filter, env and timeout.
   - `drain` stops new runs from starting, and `resume` restarts them. Neither
     affects running jobs.
 - **Actor.** Every run records who submitted it. `BOSN_CI_ACTOR` sets it

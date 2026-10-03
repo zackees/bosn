@@ -16,12 +16,13 @@ use bosn_service::{
         Conclusion, JsonReply, LogsQuery, RunState, RunView, RunnerAction, RunnerStatus,
         SubmitOptions,
         model::{ItemConclusion, ItemStatus},
+        params::RunParams,
         provider::{Mode, Provider, Trigger},
     },
 };
 use kernal_api::async_engine::{Runtime, RuntimeBuilder};
 
-pub const USAGE: &str = "usage: bosn ci plan [--workspace P] [--provider github] [--workflow F] [--job J] [--trigger pr|push|release] [--mode minimal|test|full] [--sha S] [--json]
+pub const USAGE: &str = "usage: bosn ci plan [--workspace P] [--provider github] [--workflow F] [--job J] [--trigger pr|push|release | --event workflow_dispatch|workflow_call] [--input K=V]... [--matrix K:V]... [--env K=V]... [--mode minimal|test|full] [--sha S] [--json]
    or: bosn ci plan --adapter RELATIVE_JSON --workspace P --event pull_request|push|release --mode minimal|test|full --sha 40_HEX --repo-owner O --repo-name N [--base-sha S] [--pr-number N --head-owner O --head-name N --head-ref R --base-ref R --author-login L] [--json]  (fleet adapter V1 plan, JSON on stdout)
    or: bosn ci run <plan options> [--engine act] [--pr-number N] [--timeout-secs N] [--github-token] [--wait [--deadline-ms N]] [--json]
    or: bosn ci list [--workspace P] [--state queued|running|done] [--limit N] [--json]
@@ -43,9 +44,13 @@ const EXIT_REFUSED: i32 = 3;
 const EXIT_NOT_FINISHED: i32 = 2;
 const POLL: Duration = Duration::from_millis(500);
 
+/// Flags that may repeat; every value is kept, in order (#430).
+const REPEATABLE: &[&str] = &["--input", "--matrix", "--env"];
+
 /// Parsed `--flag value` / `--switch` arguments plus positionals.
 struct Flags {
     values: BTreeMap<&'static str, String>,
+    repeated: BTreeMap<&'static str, Vec<String>>,
     switches: BTreeSet<&'static str>,
     positional: Vec<String>,
 }
@@ -58,6 +63,7 @@ impl Flags {
     ) -> Result<Self, String> {
         let mut flags = Self {
             values: BTreeMap::new(),
+            repeated: BTreeMap::new(),
             switches: BTreeSet::new(),
             positional: Vec::new(),
         };
@@ -68,7 +74,9 @@ impl Flags {
                 let value = arguments
                     .next()
                     .ok_or_else(|| format!("{flag} needs a value"))??;
-                if flags.values.insert(flag, value).is_some() {
+                if REPEATABLE.contains(flag) {
+                    flags.repeated.entry(flag).or_default().push(value);
+                } else if flags.values.insert(flag, value).is_some() {
                     return Err(format!("{flag} given twice"));
                 }
             } else if let Some(switch) = switches.iter().find(|s| **s == argument) {
@@ -82,6 +90,10 @@ impl Flags {
             }
         }
         Ok(flags)
+    }
+    /// Every value of a [`REPEATABLE`] flag.
+    fn all(&self, flag: &str) -> &[String] {
+        self.repeated.get(flag).map_or(&[], Vec::as_slice)
     }
     fn get(&self, flag: &str) -> Option<&str> {
         self.values.get(flag).map(String::as_str)
@@ -118,6 +130,10 @@ const PLAN_FLAGS: &[&str] = &[
     "--workflow",
     "--job",
     "--trigger",
+    "--event",
+    "--input",
+    "--matrix",
+    "--env",
     "--mode",
     "--sha",
     "--engine",
@@ -191,6 +207,30 @@ pub fn run(mut arguments: impl Iterator<Item = OsString>, alias: Option<&str>) {
     }
 }
 
+/// `--trigger` or `--event` (the events that take `--input`s, #430).
+fn trigger(flags: &Flags) -> Result<Option<Trigger>, Failure> {
+    match (flags.get("--trigger"), flags.get("--event")) {
+        (Some(_), Some(_)) => Err("give --event or --trigger, not both".into()),
+        (trigger, None) => Ok(trigger.map(Trigger::parse).transpose()?),
+        (None, Some(event)) => Ok(Some(Trigger::parse_event(event)?)),
+    }
+}
+
+/// The repeated `--input K=V`, `--matrix K:V` and `--env K=V`.
+fn params(flags: &Flags) -> Result<RunParams, Failure> {
+    let mut params = RunParams::default();
+    for value in flags.all("--input") {
+        params.add_input(value)?;
+    }
+    for value in flags.all("--matrix") {
+        params.add_matrix(value)?;
+    }
+    for value in flags.all("--env") {
+        params.add_env(value)?;
+    }
+    Ok(params)
+}
+
 fn submit_options(flags: &Flags) -> Result<SubmitOptions, Failure> {
     Ok(SubmitOptions {
         workspace: PathBuf::from(flags.get("--workspace").unwrap_or(".")),
@@ -198,7 +238,7 @@ fn submit_options(flags: &Flags) -> Result<SubmitOptions, Failure> {
         engine: flags.get("--engine").map(str::to_string),
         workflow: flags.get("--workflow").map(str::to_string),
         job: flags.get("--job").map(str::to_string),
-        trigger: flags.get("--trigger").map(Trigger::parse).transpose()?,
+        trigger: trigger(flags)?,
         mode: flags.get("--mode").map(Mode::parse).transpose()?,
         actor: None,
         sha: flags.get("--sha").map(str::to_string),
@@ -209,6 +249,7 @@ fn submit_options(flags: &Flags) -> Result<SubmitOptions, Failure> {
         } else {
             Vec::new()
         },
+        params: params(flags)?,
     })
 }
 
@@ -274,6 +315,9 @@ fn plan(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
         println!("mode: {}", p.mode.as_str());
         println!("sha: {}{}", p.sha, if p.dirty { " +dirty" } else { "" });
         println!("actor: {}", p.actor);
+        if let Some(params) = p.params.describe() {
+            println!("params: {params}");
+        }
     });
     Ok(0)
 }
@@ -695,6 +739,10 @@ fn print_tree(view: &RunView) {
         if run.dirty.is_some() { " +dirty" } else { "" },
         run.workflow,
     );
+    println!("  trigger: {} ({})", run.trigger.as_str(), run.event);
+    if let Some(params) = run.params.describe() {
+        println!("  params: {params}");
+    }
     if let Some(reason) = &run.reason {
         println!("  reason: {reason}");
     }
