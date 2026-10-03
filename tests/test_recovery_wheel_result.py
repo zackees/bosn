@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ci"))
-import recovery_wheel_result as gate  # noqa: E402
+import recovery_wheel_result as gate
 
 LOG_ALL = """[wheel-smoke] inspect wheel archive
 [wheel-smoke] create isolated virtual environment

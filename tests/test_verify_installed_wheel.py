@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ci"))
-import verify_installed_wheel as verifier  # noqa: E402
+import verify_installed_wheel as verifier
 
 
 def write_windows_wheel(path: Path, *, tag: str) -> None:

@@ -2,6 +2,7 @@
 
 use super::*;
 
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 pub(crate) fn tools_list() -> Value {
     let mut list = json!({
         "tools": [

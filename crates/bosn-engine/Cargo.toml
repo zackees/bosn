@@ -17,3 +17,6 @@ native-test-helper = ["dep:libc"]
 name = "bosn-engine-native-helper"
 path = "src/bin/bosn-engine-native-helper.rs"
 required-features = ["native-test-helper"]
+
+[lints]
+workspace = true

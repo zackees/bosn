@@ -382,6 +382,11 @@ pub(crate) fn verify_volume_observation(
     Ok(())
 }
 
+#[expect(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "baseline, ci.yml#229"
+)]
 pub(crate) fn verify_actual_configuration(
     observed: &SetupEnsureObservedContainer,
     expected: &DerivedEnsure,

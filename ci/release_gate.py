@@ -40,8 +40,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from verify_full_coverage import REQUIRED  # noqa: E402
-from verify_release import release_version  # noqa: E402
+from verify_full_coverage import REQUIRED
+from verify_release import release_version
 
 SHA = re.compile(r"^[0-9a-f]{40}$")
 CI_WORKFLOW = ".github/workflows/ci.yml"

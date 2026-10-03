@@ -249,6 +249,7 @@ fn stack_generation_real_roots_selected_and_resolver_receipts() {
     );
 }
 #[test]
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn stack_generation_create_time_fields_roll_but_workdir_and_tasks_do_not() {
     let root = tempfile::tempdir().unwrap();
     let root_name = root.path().to_str().unwrap();

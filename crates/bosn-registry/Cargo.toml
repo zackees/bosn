@@ -29,3 +29,6 @@ serde_json = { version = "=1.0.149", features = ["float_roundtrip"] }
 kernal-api = { version = "=0.1.25", default-features = false, features = ["sqlite", "fs", "ipc", "secure-random", "hash-sha256"] }
 
 [dev-dependencies]
+
+[lints]
+workspace = true

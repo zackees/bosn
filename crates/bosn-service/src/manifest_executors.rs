@@ -159,6 +159,7 @@ impl DockerManifestAppTaskExecutor {
     }
 }
 impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
+    #[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
     fn execute<'a>(
         &'a self,
         request: ManifestAppTaskJobRequest,
@@ -478,6 +479,7 @@ pub(crate) enum ManifestGuestTaskOutcome {
 /// SSH configuration: [`GuestSshCommand`] itself hard-codes loopback and this
 /// function derives every remaining field from the current manifest receipt.
 #[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 pub(crate) async fn execute_manifest_guest_ssh_task(
     transport: &dyn GuestSshTaskTransport,
     state_dir: &Path,

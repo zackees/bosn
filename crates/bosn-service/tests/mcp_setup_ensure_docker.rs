@@ -438,6 +438,7 @@ fn ensure_arguments(workspace: &Path, config: &Path) -> Value {
 /// labels before removing only the exact test app and never removes images.
 #[test]
 #[ignore = "requires a local Docker daemon and the pinned Alpine image"]
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn live_docker_mcp_setup_ensure_creates_and_reuses_one_managed_app() {
     let engine = DockerEngine::docker();
     let expected_image = pinned_alpine_identity(&engine);

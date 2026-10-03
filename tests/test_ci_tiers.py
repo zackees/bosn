@@ -9,7 +9,7 @@ import pytest
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ci"))
-import select_ci_tier  # noqa: E402
+import select_ci_tier
 
 ROOT = Path(__file__).resolve().parents[1]
 CI = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())

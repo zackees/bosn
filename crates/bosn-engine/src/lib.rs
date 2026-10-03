@@ -472,6 +472,7 @@ impl DockerEngine {
     /// the deadline) for the consumer, and only a consumer stalled that long
     /// returns `OutputConsumerSlow` and reaps the client; a dropped receiver
     /// returns `OutputConsumerClosed`.
+    #[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
     pub async fn stream(
         &self,
         options: RunOptions,

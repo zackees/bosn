@@ -112,6 +112,7 @@ pub enum SetupEnsureCommand {
 }
 
 impl SetupEnsureCommand {
+    #[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
     fn docker_args(&self) -> Vec<String> {
         match self {
             Self::VolumeInspect { volume_name } => vec![
@@ -429,6 +430,7 @@ impl From<CommandError> for SetupEnsureError {
 /// refuses uncertainty; it does not adopt, delete, replace, stop, or GC any
 /// existing Docker container.  Registry persistence and reconciliation are
 /// separate future layers.
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 pub async fn ensure_setup_app<E: SetupEnsureEngine>(
     engine: &E,
     request: SetupEnsureRequest<'_>,

@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ci"))
-import ci_queue_timing as timing  # noqa: E402
+import ci_queue_timing as timing
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "ci_queue_timing"
 BEFORE = FIXTURES / "run_34865549628.json"

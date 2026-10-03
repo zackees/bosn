@@ -207,6 +207,7 @@ fn add_labels(
     Ok(())
 }
 
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn rewrite_container(object: &mut Map<String, Value>, settings: &ProxySettings) -> io::Result<()> {
     let host = object
         .entry("HostConfig")

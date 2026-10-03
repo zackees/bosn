@@ -20,6 +20,7 @@ pass whose inputs did not change:
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -76,7 +77,12 @@ LANES: dict[str, list[list[str]]] = {
 
 
 def run_lane(name: str) -> int:
-    for command in LANES[name]:
+    commands = LANES[name]
+    if name == "rust" and os.environ.get("BOSN_TEST_ISOLATED") != "1":
+        # Build scripts link host executables even during Clippy. The managed
+        # Linux image supplies their C runtime and keeps Cargo state writable.
+        commands = [["bosn", "run", "--task", "rust-lint"]]
+    for command in commands:
         print(f"\n>>> [{name}] {' '.join(command)}", flush=True)
         started = time.monotonic()
         code = subprocess.run(command, cwd=ROOT).returncode

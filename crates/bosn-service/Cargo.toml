@@ -33,3 +33,6 @@ native-tls = "=0.2.18"
 tempfile = "=3.27.0"
 # The synthetic engine lets the removal path be exercised without a real Docker.
 bosn-engine = { path = "../bosn-engine", features = ["native-test-helper"] }
+
+[lints]
+workspace = true

@@ -344,6 +344,7 @@ pub(crate) enum Reply {
     CiError(String),
     Jobs(String),
 }
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 pub(crate) fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
     match v.code {
         10 => Ok(Reply::Pong(v.daemon_version)),

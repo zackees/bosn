@@ -1,6 +1,8 @@
 #[cfg(unix)]
+use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::{fs, process::Command};
+use std::process::Command;
 
 #[test]
 fn bosn_payload_maps_literal_ci_labels_and_release_dispatch() {
@@ -66,6 +68,7 @@ fn bosn_payload_rejects_mismatched_events_and_missing_pr_identity() {
     }
 }
 
+#[cfg(unix)]
 fn commit_workflow(root: &std::path::Path, workflow: &str) -> String {
     assert!(root.join(workflow).is_file());
     let init = Command::new("git")

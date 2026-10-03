@@ -128,6 +128,11 @@ pub(crate) fn classify_manifest_recovery_observation(
 /// exact identity before a fixed `container start`. We intentionally do not
 /// create a missing object, repair registry state, search Docker, or continue
 /// when a source path/build context is gone or changed.
+#[expect(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "baseline, ci.yml#229"
+)]
 pub(crate) async fn recover_manifest_startup(
     actor: &RegistryActor,
     state_dir: &Path,

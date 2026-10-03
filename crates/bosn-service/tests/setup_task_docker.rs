@@ -184,6 +184,7 @@ fn assert_removed_task_container(engine: &DockerEngine, short_id: &str) {
 /// nor deletes images or containers.
 #[test]
 #[ignore = "requires a local Docker daemon and the pinned Alpine image"]
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn live_docker_setup_task_runs_only_the_declared_one_file_task() {
     let engine = DockerEngine::docker();
     require_pinned_alpine(&engine);

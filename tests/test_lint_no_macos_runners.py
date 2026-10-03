@@ -8,7 +8,7 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ci"))
-import lint_no_macos_runners as lint  # noqa: E402
+import lint_no_macos_runners as lint
 
 
 def test_current_workflows_allow_only_full_and_release_macos_runner() -> None:

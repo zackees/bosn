@@ -10,6 +10,10 @@ description = "bosn's floating desktop widget: a bubble, a panel and a full-view
 # daemon, wheels and CI must not.
 [workspace]
 
+[lints.clippy]
+cognitive_complexity = "warn"
+too_many_lines = "warn"
+
 [dependencies]
 bosn-service = { path = "../bosn-service" }
 kernal-api = { version = "=0.1.25", default-features = false, features = ["fs", "tauri-webview"] }

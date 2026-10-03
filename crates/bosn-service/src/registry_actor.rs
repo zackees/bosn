@@ -2,6 +2,11 @@
 
 use super::*;
 
+#[expect(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "baseline, ci.yml#229"
+)]
 pub(crate) async fn registry_actor(
     mut registry: Registry,
     mut receiver: async_engine::Receiver<DbCommand>,

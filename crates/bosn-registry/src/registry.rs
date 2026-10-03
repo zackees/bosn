@@ -153,6 +153,7 @@ impl Registry {
     ) -> Result<(), Error> {
         Self::validate_inner(connection, path, true)
     }
+    #[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
     pub(crate) fn validate_inner(
         connection: &Connection,
         path: &Path,

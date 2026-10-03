@@ -10,3 +10,7 @@ exclude = ["crates/bosn-widget"]
 # inherit it. The internal crates are never published and keep their own.
 [workspace.package]
 version = "0.1.12"
+
+[workspace.lints.clippy]
+cognitive_complexity = "warn"
+too_many_lines = "warn"

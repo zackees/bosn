@@ -13,7 +13,8 @@ ruff-cache = { scope = "machine", destination = "/root/.cache/ruff" }
 pyright-cache = { scope = "machine", destination = "/root/.cache/pyright-python" }
 cargo-home = { scope = "machine", destination = "/root/.cargo" }
 rustup-home = { scope = "machine", destination = "/root/.rustup" }
-rust-target = { scope = "stack", destination = "/repo/target" }
+rust-target = { scope = "stack", destination = "/target" }
+wheel-staging = { scope = "stack", destination = "/repo/.bosn-build" }
 soldr-state = { scope = "stack", destination = "/root/.soldr" }
 
 [task.test]
@@ -24,6 +25,10 @@ cmd = "soldr toolchain ensure --json && uv sync --frozen --all-groups --no-edita
 [task.rust-test]
 stack = "test"
 cmd = "soldr toolchain ensure --json && soldr cargo test --workspace --exclude bosn-python --locked && PYO3_PYTHON=$(command -v python3) soldr cargo test -p bosn-python --lib --locked --no-default-features --features embedded-python-tests"
+
+[task.rust-lint]
+stack = "test"
+cmd = "soldr toolchain ensure --json && python ci/local_gate.py --lane rust"
 
 [task.lint]
 stack = "test"

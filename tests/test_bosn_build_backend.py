@@ -33,6 +33,7 @@ def test_soldr_environment_exists(monkeypatch):
 
 @pytest.fixture
 def backend(monkeypatch, tmp_path):
+    monkeypatch.delenv("CARGO_TARGET_DIR", raising=False)
     fake = ModuleType("maturin")
     names = (
         "build_wheel",
@@ -46,7 +47,8 @@ def backend(monkeypatch, tmp_path):
     )
 
     def original_hook(*args, **kwargs):
-        assert os.environ["CARGO"].startswith(str(tmp_path / "target/bosn-wheel-toolchain"))
+        target = Path(os.environ.get("CARGO_TARGET_DIR", str(tmp_path / "target")))
+        assert os.environ["CARGO"].startswith(str(target / "bosn-wheel-toolchain"))
         assert os.environ["MATURIN_NO_INSTALL_RUST"] == "1"
         return "fixture"
 
@@ -66,7 +68,7 @@ def backend(monkeypatch, tmp_path):
 
     def linked(command, **kwargs):
         calls.append(command)
-        directory = tmp_path / "target/bosn-wheel-toolchain"
+        directory = Path(command[command.index("--shim-dir") + 1])
         directory.mkdir(parents=True, exist_ok=True)
         tools = []
         for name in ("cargo", "rustfmt", "clippy-driver", "rustc", "rustdoc"):
@@ -258,6 +260,22 @@ def test_unproven_native_executable_refuses(backend, invalid):
         module._cargo_native_executable(io.BytesIO(stream))
 
 
+def test_failed_build_allows_the_wrapper_to_finish_its_diagnostic(backend):
+    module, _ = backend
+    marker = module._ROOT / "diagnostic-flushed"
+    command = [
+        sys.executable,
+        "-c",
+        "import pathlib,sys,time; "
+        'print(\'{"reason":"build-finished","success":false}\', flush=True); '
+        "time.sleep(0.2); pathlib.Path(sys.argv[1]).write_text('final diagnostic')",
+        str(marker),
+    ]
+    with pytest.raises(RuntimeError, match="did not finish successfully"):
+        module._run_native_build(command)
+    assert marker.read_text() == "final diagnostic"
+
+
 def test_artifact_stream_overflow_terminates_and_reaps_live_producer(backend, monkeypatch):
     module, _ = backend
     monkeypatch.setattr(module, "_MAX_ARTIFACT_BYTES", 1024)
@@ -289,12 +307,18 @@ def test_actual_fake_frontdoor_executable(backend):
         assert result.stdout == "soldr-routed:metadata"
 
 
-def test_repeated_wheel_does_not_reuse_repaired_cargo_alias(backend, monkeypatch):
+@pytest.mark.parametrize("redirect_target", [None, "absolute", "relative"])
+def test_repeated_wheel_does_not_reuse_repaired_cargo_alias(backend, monkeypatch, redirect_target):
     import shutil
 
     module, _ = backend
     monkeypatch.setattr(module, "_build_native_cli", lambda: None)
     root = module._ROOT / "target"
+    if redirect_target:
+        root = module._ROOT / "external-target"
+        monkeypatch.setenv(
+            "CARGO_TARGET_DIR", str(root) if redirect_target == "absolute" else "external-target"
+        )
     deps = root / "release/deps/libbosn_native.so"
     primary = root / "release/libbosn_native.so"
     staged = root / "maturin/libbosn_native.so"

@@ -23,6 +23,7 @@ pub(super) async fn record(
 }
 /// Called only after this probe's runtime future has terminated. A persisted
 /// live claim alone is never grounds to interrupt another execution owner.
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 pub(super) async fn cleanup(
     registry: &RegistryActor,
     engine: &DockerEngine,

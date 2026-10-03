@@ -551,6 +551,7 @@ fn registry_diagnostics_wire_rejects_nonsemantic_or_unbounded_fields() {
 }
 
 #[test]
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn ensure_pipeline_does_not_reset_budget_and_never_mutates_after_prepare_or_ownership_failure() {
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let workspace = temporary.path().join("workspace");

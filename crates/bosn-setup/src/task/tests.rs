@@ -556,6 +556,7 @@ fn nonzero_cancellation_deadline_and_output_budget_are_terminal_and_bounded() {
 /// deadline) must be followed by a stop of the task's own processes in
 /// the same container: killing `docker exec` alone leaves them running.
 #[test]
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn an_interrupted_app_task_exec_stops_its_processes_in_the_container() {
     let temporary = tempfile::tempdir().unwrap();
     let workspace = temporary.path().join("workspace");

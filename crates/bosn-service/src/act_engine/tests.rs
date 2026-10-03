@@ -479,6 +479,7 @@ fn snapshot_storage_exec_is_required_but_other_tmpfs_cannot_gain_exec() {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn actor_commits_before_create_and_start_and_refuses_uncertain_removal() {
     use bosn_registry::{
         Registry,

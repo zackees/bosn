@@ -29,6 +29,11 @@ pub(crate) fn ci_error_wire(code: &str, message: String) -> ReplyWire {
     }
 }
 
+#[expect(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "baseline, ci.yml#229"
+)]
 pub(crate) async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Result<(), Error> {
     let ConnectionContext {
         actor,

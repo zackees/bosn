@@ -82,7 +82,7 @@ pub fn collect_context(
 ) -> Result<ContextObservation, CollectorError> {
     collect_context_inner(root, dockerfile, limits, None)
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn collect_context_checkpoint(
     root: &Path,
     dockerfile: Option<&str>,
@@ -91,6 +91,7 @@ fn collect_context_checkpoint(
 ) -> Result<ContextObservation, CollectorError> {
     collect_context_inner(root, dockerfile, limits, Some(checkpoint))
 }
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn collect_context_inner(
     root: &Path,
     dockerfile: Option<&str>,

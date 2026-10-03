@@ -4,6 +4,7 @@ mod common;
 use common::*;
 
 #[test]
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn missing_setup_repair_is_exact_atomic_idempotent_and_protects_ambiguous_state() {
     let (_directory, path) = database_path();
     let mut registry =
@@ -531,6 +532,7 @@ fn manifest_volume_rollover_retires_only_warm_spec_data() {
 }
 
 #[test]
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn manifest_generation_rollover_is_workspace_stack_scoped_and_keeps_sessions_protected() {
     let (_directory, path) = database_path();
     let mut registry =
@@ -665,6 +667,7 @@ fn manifest_generation_rollover_is_workspace_stack_scoped_and_keeps_sessions_pro
 }
 
 #[test]
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn setup_done_is_workspace_isolated_idempotent_and_preserves_shared_resources() {
     let (_directory, path) = database_path();
     let mut registry =

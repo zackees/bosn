@@ -4,7 +4,7 @@ FROM python:3.13-slim-bookworm@sha256:00faa2debb87529f9f0764e9491d8ba400a3678976
 COPY --from=uv /uv /uvx /bin/
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends git libatomic1 build-essential pkg-config libssl-dev patchelf nodejs \
+    && apt-get install --yes --no-install-recommends git libatomic1 build-essential pkg-config libssl-dev liblzma-dev patchelf nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # Bootstrap only reviewed binary wheels; source builds use the repository's
@@ -19,7 +19,7 @@ ENV UV_PROJECT_ENVIRONMENT=/venv \
     PYRIGHT_PYTHON_CACHE_DIR=/root/.cache/pyright-python \
     CARGO_HOME=/root/.cargo \
     RUSTUP_HOME=/root/.rustup \
-    CARGO_TARGET_DIR=/repo/target \
+    CARGO_TARGET_DIR=/target \
     PYTHONDONTWRITEBYTECODE=1
 
 # zackees/ci.yml GATE-005: the test guards (tests/conftest.py,

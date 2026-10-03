@@ -32,6 +32,7 @@ pub(crate) struct RunnerAttachment {
 /// host Docker socket, start the job's proxy. Every step that fails degrades
 /// to "run without it" with a log line: accounting must never be the reason
 /// a task cannot run.
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 pub(crate) async fn attach(
     context: &RunContext,
     container: &str,

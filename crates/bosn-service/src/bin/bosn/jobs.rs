@@ -103,6 +103,7 @@ fn attach_containers(view: &mut Value) {
     }
 }
 
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn print_table(view: &Value) {
     let mut out = String::new();
     let capacity = &view["capacity"];

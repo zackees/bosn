@@ -177,6 +177,7 @@ pub(crate) fn record_setup_ensure(
 /// this exact workspace/stack is retired. This is durable lifecycle accounting
 /// only: it never stops/deletes a container or image, and a failed upsert rolls
 /// the whole transition back without retiring the prior generation.
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 pub(crate) fn record_manifest_ensure(
     registry: &mut Registry,
     job_id: u64,

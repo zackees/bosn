@@ -69,11 +69,11 @@ pub fn default_state_dir() -> PathBuf {
         if let Some(value) = std::env::var_os("LOCALAPPDATA") {
             return PathBuf::from(value).join("bosn");
         }
-        return kernal_api::platform::host::home_dir()
+        kernal_api::platform::host::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("AppData")
             .join("Local")
-            .join("bosn");
+            .join("bosn")
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -225,6 +225,7 @@ fn valid_id(id: &Value) -> bool {
     id.is_null() || id.is_string() || id.is_number()
 }
 
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
     let Some(params) = params.as_object() else {
         return tool_error("tools/call params must be an object");

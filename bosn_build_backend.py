@@ -28,7 +28,16 @@ from uuid import uuid4
 import maturin
 
 _ROOT = Path(__file__).resolve().parent
-_WHEEL_DATA = _ROOT / "target" / "bosn-wheel-data"
+
+
+def _cargo_target_directory() -> Path:
+    directory = Path(environ.get("CARGO_TARGET_DIR", "target"))
+    return directory if directory.is_absolute() else _ROOT / directory
+
+
+# Maturin's data path comes from pyproject.toml, independently of Cargo's
+# target directory. The managed stack mounts this staging parent writable.
+_WHEEL_DATA = _ROOT / ".bosn-build" / "wheel-data"
 # The CLI is staged into the wheel's ``.data/scripts`` tree so pip installs it
 # as the ``bosn`` command on PATH (like soldr ships its own binary), rather than
 # behind a Python launcher.  On Linux its OpenSSL sidecars ride in the same
@@ -161,7 +170,7 @@ def _soldr_executable() -> str:
 def _soldr_toolchain_environment() -> Iterator[None]:
     """Use canonical Soldr shims; trusted builder provisions toolchain first."""
     soldr = _soldr_executable()
-    shim_dir = _ROOT / "target" / "bosn-wheel-toolchain"
+    shim_dir = _cargo_target_directory() / "bosn-wheel-toolchain"
     result = run(
         [soldr, "toolchain", "link", "--shim-dir", str(shim_dir), "--json"],
         cwd=_ROOT,
@@ -256,6 +265,14 @@ def _run_native_build(command: list[str]) -> Path:
         if code:
             raise CalledProcessError(code, command)
         return executable
+    except Exception:
+        # Cargo's failure record can precede the wrapper's final stderr flush.
+        # Preserve that diagnostic, with a bound for malformed producer output.
+        try:
+            process.wait(timeout=5)
+        except TimeoutExpired:
+            pass
+        raise
     finally:
         process.stdout.close()
         if process.poll() is None:
@@ -267,7 +284,7 @@ def _run_native_build(command: list[str]) -> Path:
                 process.wait()
 
 
-def _cargo_native_executable(artifacts) -> Path:
+def _cargo_native_executable(artifacts) -> Path:  # noqa: C901
     manifest = (_ROOT / "crates/bosn-python/Cargo.toml").resolve()
     matches = []
     finished = False
@@ -369,7 +386,7 @@ def _wheel_cache_copy_environment() -> Iterator[None]:
             environ["SOLDR_ZCCACHE_MODE"] = previous
 
 
-def _detach_repaired_cargo_aliases(target: _DarwinTarget | None) -> None:
+def _detach_repaired_cargo_aliases(target: _DarwinTarget | None) -> None:  # noqa: C901
     """Maturin restores a pristine primary, but Cargo deps may alias its stage.
 
     Replace only proven same-inode deps aliases with independent pristine bytes.
@@ -377,7 +394,7 @@ def _detach_repaired_cargo_aliases(target: _DarwinTarget | None) -> None:
     """
     if target is not None or not platform.startswith("linux"):
         return
-    base = _ROOT / "target"
+    base = _cargo_target_directory()
     staged = base / "maturin" / "libbosn_native.so"
     if not staged.exists():
         return

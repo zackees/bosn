@@ -17,6 +17,7 @@ use support::setup_docker::*;
 /// any candidate whose three expected Bosn ownership labels do not match.
 #[test]
 #[ignore = "requires a local Docker daemon and the pinned Alpine image"]
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn live_docker_setup_ensure_creates_and_reuses_one_managed_app() {
     let engine = DockerEngine::docker();
     let expected_image = pinned_alpine_identity(&engine);
@@ -153,6 +154,7 @@ fn live_docker_setup_ensure_creates_and_reuses_one_managed_app() {
 /// `soldr cargo test -j1 -p bosn-service --test setup_ensure_docker --locked -- --ignored --exact live_docker_setup_reconcile_repair_missing_retires_then_ensure_recreates_app`
 #[test]
 #[ignore = "requires a local Docker daemon and the pinned Alpine image"]
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn live_docker_setup_reconcile_repair_missing_retires_then_ensure_recreates_app() {
     let engine = DockerEngine::docker();
     let root = tempfile::tempdir().expect("temporary test root");
@@ -288,6 +290,7 @@ fn live_docker_setup_reconcile_repair_missing_retires_then_ensure_recreates_app(
 /// adoption is a registry restoration, not Docker lifecycle control.
 #[test]
 #[ignore = "requires a local Docker daemon and the pinned Alpine image"]
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn live_docker_setup_adopt_restores_lost_registry_without_touching_app() {
     let engine = DockerEngine::docker();
     let expected_image = pinned_alpine_identity(&engine);

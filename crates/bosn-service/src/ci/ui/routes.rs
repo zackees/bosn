@@ -52,6 +52,7 @@ impl Route {
         !matches!(self, Self::Redeem { .. })
     }
 
+    #[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
     pub fn parse(
         method: &str,
         path: &str,
@@ -288,6 +289,7 @@ mod tests {
     /// Table-driven: every route maps to exactly one typed operation; a new
     /// path cannot appear without changing this table.
     #[test]
+    #[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
     fn every_route_is_a_typed_operation() {
         let runs = format!("/v1/runs/{RUN}");
         type Case<'a> = (&'a str, String, Vec<(&'a str, &'a str)>, &'a str, Route);
@@ -477,6 +479,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::cognitive_complexity, reason = "baseline, ci.yml#229")]
     fn writes_need_origin_and_unknown_inputs_are_refused() {
         let toggle = parse("POST", "/v1/widget/toggle", &[], "").unwrap();
         assert!(toggle.is_write(), "widget commands are writes");

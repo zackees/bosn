@@ -4,6 +4,7 @@ use super::*;
 
 /// Parse a successful, bounded real `docker inspect` response. This function
 /// never interprets a failed or unavailable probe as ownership or absence.
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 pub fn observe_engine(
     document: &[u8],
     intent: &ActEngineIntent,

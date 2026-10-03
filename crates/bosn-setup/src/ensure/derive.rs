@@ -176,6 +176,7 @@ pub(crate) fn derive_creation(
     Ok(derived)
 }
 
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 pub(crate) fn validate_plan_shape(plan: &SetupPlan) -> Result<(), SetupEnsureError> {
     if plan.schema_version != SETUP_DOCUMENT_VERSION || !valid_hash(&plan.content_sha256) {
         return Err(SetupEnsureError::InvalidRequest("plan receipt is invalid"));

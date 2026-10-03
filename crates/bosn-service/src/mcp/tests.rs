@@ -335,6 +335,11 @@ fn exchange<B: Backend>(input: &str, backend: &mut B) -> Vec<Value> {
 }
 
 #[test]
+#[expect(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "baseline, ci.yml#229"
+)]
 fn stdio_initialize_lists_tools_and_calls_status() {
     let mut backend = FakeBackend::default();
     let replies = exchange(

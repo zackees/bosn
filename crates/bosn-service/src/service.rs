@@ -112,6 +112,11 @@ impl Service {
         self
     }
     /// Foreground lifecycle: acquires the sole registry writer before binding.
+    #[expect(
+        clippy::cognitive_complexity,
+        clippy::too_many_lines,
+        reason = "baseline, ci.yml#229"
+    )]
     pub async fn serve(self) -> Result<(), Error> {
         ipc::ensure_owner_private_directory(&self.state_dir)?;
         let db = self.state_dir.join("registry.sqlite3");

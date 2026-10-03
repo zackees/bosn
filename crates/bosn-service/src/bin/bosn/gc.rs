@@ -42,6 +42,7 @@ pub(crate) fn run_gc(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
 /// planning mode, not a widening of the token-bound owned-candidate apply: that protocol
 /// proves a positive (this resource is ours and safe), while this proves a negative (nothing
 /// proves this resource is ours, nothing uses it, and it is past its age gate).
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 pub(crate) fn run_gc_unmanaged(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
     let mut state_dir = None;
     let mut ttl_seconds = None;
