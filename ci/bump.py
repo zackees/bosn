@@ -98,7 +98,11 @@ def main(argv: list[str] | None = None, *, root: Path = ROOT, refresh_lock: bool
         subprocess.run(["cargo", "update", "--workspace", "--offline"], cwd=root, check=True)
     print(f"{current} -> {new}")
     if refresh_lock:
-        print("next: commit Cargo.toml and Cargo.lock, open a PR; merging it releases v" + new)
+        print(
+            "next: commit Cargo.toml and Cargo.lock, open a PR; once merged, release v"
+            + new
+            + " through the pretag gate (AGENTS.md)"
+        )
     return 0
 
 

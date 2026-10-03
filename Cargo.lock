@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "bosn"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "bosn-core",
  "bosn-engine",
@@ -151,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "bosn-python"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "bosn-core",
  "bosn-engine",
