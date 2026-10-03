@@ -67,7 +67,7 @@ cache-keys = [
 manifest-path = "crates/bosn-python/Cargo.toml"
 module-name = "bosn._native"
 python-source = "src"
-data = "target/bosn-wheel-data"
+data = ".bosn-build/wheel-data"
 targets = [
     { name = "bosn_native", kind = "cdylib" },
 ]

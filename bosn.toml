@@ -14,6 +14,7 @@ pyright-cache = { scope = "machine", destination = "/root/.cache/pyright-python"
 cargo-home = { scope = "machine", destination = "/root/.cargo" }
 rustup-home = { scope = "machine", destination = "/root/.rustup" }
 rust-target = { scope = "stack", destination = "/target" }
+wheel-staging = { scope = "stack", destination = "/repo/.bosn-build" }
 soldr-state = { scope = "stack", destination = "/root/.soldr" }
 
 [task.test]

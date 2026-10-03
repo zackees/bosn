@@ -35,7 +35,9 @@ def _cargo_target_directory() -> Path:
     return directory if directory.is_absolute() else _ROOT / directory
 
 
-_WHEEL_DATA = _cargo_target_directory() / "bosn-wheel-data"
+# Maturin's data path comes from pyproject.toml, independently of Cargo's
+# target directory. The managed stack mounts this staging parent writable.
+_WHEEL_DATA = _ROOT / ".bosn-build" / "wheel-data"
 # The CLI is staged into the wheel's ``.data/scripts`` tree so pip installs it
 # as the ``bosn`` command on PATH (like soldr ships its own binary), rather than
 # behind a Python launcher.  On Linux its OpenSSL sidecars ride in the same
