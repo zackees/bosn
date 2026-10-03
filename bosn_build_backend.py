@@ -265,6 +265,14 @@ def _run_native_build(command: list[str]) -> Path:
         if code:
             raise CalledProcessError(code, command)
         return executable
+    except Exception:
+        # Cargo's failure record can precede the wrapper's final stderr flush.
+        # Preserve that diagnostic, with a bound for malformed producer output.
+        try:
+            process.wait(timeout=5)
+        except TimeoutExpired:
+            pass
+        raise
     finally:
         process.stdout.close()
         if process.poll() is None:

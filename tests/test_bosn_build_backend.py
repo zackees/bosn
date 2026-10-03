@@ -260,6 +260,22 @@ def test_unproven_native_executable_refuses(backend, invalid):
         module._cargo_native_executable(io.BytesIO(stream))
 
 
+def test_failed_build_allows_the_wrapper_to_finish_its_diagnostic(backend):
+    module, _ = backend
+    marker = module._ROOT / "diagnostic-flushed"
+    command = [
+        sys.executable,
+        "-c",
+        "import pathlib,sys,time; "
+        "print('{\"reason\":\"build-finished\",\"success\":false}', flush=True); "
+        "time.sleep(0.2); pathlib.Path(sys.argv[1]).write_text('final diagnostic')",
+        str(marker),
+    ]
+    with pytest.raises(RuntimeError, match="did not finish successfully"):
+        module._run_native_build(command)
+    assert marker.read_text() == "final diagnostic"
+
+
 def test_artifact_stream_overflow_terminates_and_reaps_live_producer(backend, monkeypatch):
     module, _ = backend
     monkeypatch.setattr(module, "_MAX_ARTIFACT_BYTES", 1024)
