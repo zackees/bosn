@@ -131,6 +131,8 @@ struct RunArgs {
     trigger: Option<Trigger>,
     mode: Option<Mode>,
     pr_number: Option<u64>,
+    #[serde(default)]
+    pr_title: Option<String>,
     timeout_secs: Option<u64>,
     #[serde(default)]
     github_token: bool,
@@ -146,6 +148,7 @@ impl RunArgs {
     fn options(self) -> SubmitOptions {
         SubmitOptions {
             params: super::params::RunParams {
+                pr_title: self.pr_title,
                 inputs: self.inputs,
                 matrix: self.matrix,
                 env: self.env,
@@ -345,6 +348,7 @@ fn run_schema() -> Value {
             "trigger": {"enum": ["pr", "push", "release", "workflow_dispatch", "workflow_call"], "description": "workflow_dispatch and workflow_call take inputs."},
             "mode": {"enum": ["minimal", "test", "full"]},
             "pr_number": {"type": "integer", "minimum": 1},
+            "pr_title": {"type": "string", "maxLength": 4096, "description": "Synthetic PR title (trigger pr only); recorded in run identity."},
             "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 43200},
             "github_token": {"type": "boolean", "description": "Pass the daemon-owned github_token to the workflow."},
             "inputs": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Workflow inputs (trigger workflow_dispatch or workflow_call)."},
@@ -656,6 +660,21 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cancelled["cancelled"], true);
+    }
+
+    #[test]
+    fn pr_title_is_exposed_and_parsed_at_the_mcp_boundary() {
+        assert_eq!(run_schema()["properties"]["pr_title"]["type"], "string");
+        let options = serde_json::from_value::<RunArgs>(json!({
+            "workspace": "/x", "trigger": "pr", "pr_title": "[ci-linux] proof"
+        }))
+        .unwrap()
+        .options();
+        assert_eq!(options.params.pr_title.as_deref(), Some("[ci-linux] proof"));
+        options.params.validate(Trigger::Pr).unwrap();
+        assert!(
+            serde_json::from_value::<RunArgs>(json!({"workspace": "/x", "pr_title": 1})).is_err()
+        );
     }
 
     #[test]

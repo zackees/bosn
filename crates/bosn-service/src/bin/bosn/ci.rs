@@ -138,6 +138,7 @@ const PLAN_FLAGS: &[&str] = &[
     "--sha",
     "--engine",
     "--pr-number",
+    "--pr-title",
     "--timeout-secs",
     "--deadline-ms",
 ];
@@ -218,7 +219,10 @@ fn trigger(flags: &Flags) -> Result<Option<Trigger>, Failure> {
 
 /// The repeated `--input K=V`, `--matrix K:V` and `--env K=V`.
 fn params(flags: &Flags) -> Result<RunParams, Failure> {
-    let mut params = RunParams::default();
+    let mut params = RunParams {
+        pr_title: flags.get("--pr-title").map(str::to_string),
+        ..RunParams::default()
+    };
     for value in flags.all("--input") {
         params.add_input(value)?;
     }

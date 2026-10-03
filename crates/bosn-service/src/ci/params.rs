@@ -51,6 +51,9 @@ const RESERVED_ENV_PREFIXES: [&str; 4] = ["GITHUB_", "ACTIONS_", "RUNNER_", "ACT
 )]
 #[serde(deny_unknown_fields)]
 pub struct RunParams {
+    /// Explicit synthetic PR title; participates in run identity (#454).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_title: Option<String>,
     /// `inputs.<K>` for a `workflow_dispatch` or `workflow_call` run.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub inputs: BTreeMap<String, String>,
@@ -64,7 +67,10 @@ pub struct RunParams {
 
 impl RunParams {
     pub fn is_empty(&self) -> bool {
-        self.inputs.is_empty() && self.matrix.is_empty() && self.env.is_empty()
+        self.pr_title.is_none()
+            && self.inputs.is_empty()
+            && self.matrix.is_empty()
+            && self.env.is_empty()
     }
 
     /// Add one `--input K=V`.
@@ -88,6 +94,16 @@ impl RunParams {
     /// Bounded sizes, safe keys and values, no secret in the environment,
     /// and inputs only for an event that takes them.
     pub fn validate(&self, trigger: Trigger) -> Result<(), String> {
+        if let Some(title) = &self.pr_title {
+            if trigger != Trigger::Pr {
+                return Err("--pr-title requires --trigger pr".into());
+            }
+            if title.len() > MAX_VALUE || title.chars().any(char::is_control) {
+                return Err(
+                    "--pr-title exceeds the size limit or contains control characters".into(),
+                );
+            }
+        }
         for (what, map) in [
             ("--input", &self.inputs),
             ("--matrix", &self.matrix),
@@ -160,6 +176,9 @@ impl RunParams {
             })
         };
         let parts: Vec<String> = [
+            self.pr_title
+                .as_ref()
+                .map(|title| format!("pr-title: {title}")),
             part("inputs", &self.inputs, '='),
             part("matrix", &self.matrix, ':'),
             part("env", &self.env, '='),
@@ -383,5 +402,32 @@ mod tests {
         let json = serde_json::to_string(&params).unwrap();
         assert_eq!(serde_json::from_str::<RunParams>(&json).unwrap(), params);
         assert!(serde_json::from_str::<RunParams>(r#"{"secrets":{}}"#).is_err());
+    }
+    #[test]
+    fn pr_titles_are_bounded_and_only_valid_for_prs() {
+        let mut params = RunParams {
+            pr_title: Some("[ci-windows] title".into()),
+            ..RunParams::default()
+        };
+        assert!(!params.is_empty());
+        params.validate(Trigger::Pr).unwrap();
+        for trigger in [
+            Trigger::Push,
+            Trigger::Release,
+            Trigger::WorkflowCall,
+            Trigger::WorkflowDispatch,
+        ] {
+            assert!(params.validate(trigger).is_err());
+        }
+        for bad in [
+            "x".repeat(MAX_VALUE + 1),
+            "title\nother".into(),
+            "title\0".into(),
+        ] {
+            params.pr_title = Some(bad);
+            assert!(params.validate(Trigger::Pr).is_err());
+        }
+        params.pr_title = Some(String::new());
+        params.validate(Trigger::Pr).unwrap();
     }
 }
