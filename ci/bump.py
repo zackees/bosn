@@ -14,8 +14,10 @@ Cargo.toml. Everything else derives from it:
   - uv.lock records the project as dynamic, so it never changes on a bump.
 
 This rewrites that one line and refreshes Cargo.lock's workspace entries, so
-CI's `--locked` checks pass. Commit both files and open a PR: merging a
-version change to main releases it (.github/workflows/auto-release.yml).
+CI's `--locked` checks pass. Commit both files and open a PR. Merging a
+version change to main releases nothing by itself: a release is an explicit
+request for the exact merged SHA through the pretag gate (AGENTS.md,
+.github/workflows/auto-release.yml, ci/release_gate.py).
 
 Usage:
     ./bump patch    # 0.1.4 -> 0.1.5

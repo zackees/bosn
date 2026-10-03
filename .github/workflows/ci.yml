@@ -1,4 +1,7 @@
 name: CI
+# A full-tier dispatch is named for its candidate: ci/release_gate.py accepts
+# only a green run named `CI full <SHA>` as the release proof for <SHA>.
+run-name: ${{ inputs.tier == 'full' && inputs.commit_sha && format('CI full {0}', inputs.commit_sha) || github.event.pull_request.title || github.event.head_commit.message || 'CI' }}
 
 on:
   push:

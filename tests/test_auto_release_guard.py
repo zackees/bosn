@@ -1,231 +1,295 @@
-"""Run auto-release.yml's release guard for real, against a scratch git repository.
+"""The pretag release gate: auto-release.yml tags and publishes only an exact SHA on
+main whose full CI run is green, and only when someone asks for that SHA.
 
-The guard decides whether a push to main publishes a release, so it is tested as the
-exact bash in the workflow file rather than a copy of its logic.
+ci/release_gate.py is the guard's whole decision, so it is tested directly: the git
+checks against a scratch repository, the CI-run and issue checks against API-shaped
+documents, and the workflow wiring against the YAML itself.
 """
 
 from __future__ import annotations
 
 import os
 import shutil
-import stat
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
 
-WORKFLOW = Path(".github/workflows/auto-release.yml")
-ZEROS = "0" * 40
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "ci"))
+import release_gate as gate  # noqa: E402
+from verify_full_coverage import REQUIRED  # noqa: E402
+
+WORKFLOW = ROOT / ".github/workflows/auto-release.yml"
+CI = ROOT / ".github/workflows/ci.yml"
 # Hermetic git: a developer's global config (e.g. `tag.gpgSign`) must not change the result.
 HERMETIC_GIT = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
-# Hermetic shell: startup files a host injects into every non-interactive shell.
-HOST_SHELL_STARTUP = frozenset({"BASH_ENV", "ENV"})
+SHA = "a" * 40
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("git") is None or shutil.which("bash") is None, reason="needs git and bash"
-)
-
-
-def guard_script() -> str:
-    steps = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["guard"]["steps"]
-    (step,) = [step for step in steps if step.get("id") == "source"]
-    return step["run"]
+needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 
 
 def git(repo: Path, *args: str) -> str:
-    return subprocess.run(
-        ["git", *args],
-        cwd=repo,
-        env={**os.environ, **HERMETIC_GIT},
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    with tempfile.TemporaryFile("w+", encoding="utf-8") as out:
+        subprocess.run(
+            ["git", *args], cwd=repo, env={**os.environ, **HERMETIC_GIT}, check=True, stdout=out
+        )
+        out.seek(0)
+        return out.read().strip()
 
 
-def commit(repo: Path, version: str | None, message: str) -> str:
-    # The message rides along as a comment, so every commit changes Cargo.toml the way
-    # a real edit to it would, whether or not the version moves.
-    manifest = f"# {message}\n[workspace]\nmembers = []\n"
-    if version is not None:
-        manifest += f'\n[workspace.package]\nversion = "{version}"\n'
-    (repo / "Cargo.toml").write_text(manifest, encoding="utf-8")
+def commit(repo: Path, version: str, message: str) -> str:
+    (repo / "Cargo.toml").write_text(
+        f'# {message}\n[workspace]\nmembers = []\n\n[workspace.package]\nversion = "{version}"\n',
+        encoding="utf-8",
+    )
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", message)
     return git(repo, "rev-parse", "HEAD")
 
 
 @pytest.fixture
-def repo(tmp_path: Path) -> Path:
+def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir()
     git(repo, "init", "-q", "-b", "main")
-    git(repo, "config", "user.email", "guard@test.invalid")
-    git(repo, "config", "user.name", "guard test")
+    git(repo, "config", "user.email", "gate@test.invalid")
+    git(repo, "config", "user.name", "gate test")
+    for key, value in HERMETIC_GIT.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.chdir(repo)
     return repo
 
 
-def run_guard(
-    repo: Path,
-    tmp_path: Path,
-    *,
-    event: str,
-    released: set[str] = frozenset(),  # type: ignore[assignment]
-    ref_type: str = "branch",
-    ref_name: str = "main",
-    before: str = ZEROS,
-    input_tag: str = "",
-    input_dry_run: str = "",
-) -> tuple[int, dict[str, str]]:
-    # origin/main is the repository's own main, as the checkout sees it.
+def publish_main(repo: Path) -> None:
+    """origin/main is the repository's own main, as the guard's checkout sees it."""
     git(repo, "update-ref", "refs/remotes/origin/main", "refs/heads/main")
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    fake_gh = bin_dir / "gh"
-    # `gh release view TAG ...` succeeds only for a released tag.
-    fake_gh.write_text(
-        "#!/usr/bin/env bash\n"
-        f'released=" {" ".join(sorted(released))} "\n'
-        '[[ "$1 $2" == "release view" && "$released" == *" $3 "* ]]\n',
-        encoding="utf-8",
-    )
-    fake_gh.chmod(fake_gh.stat().st_mode | stat.S_IEXEC)
-    output = tmp_path / "output"
-    output.write_text("", encoding="utf-8")
-    env = {
-        # BASH_ENV (and sh's ENV) run in every non-interactive shell, so a host's could
-        # rewrite PATH after it is set here and shadow the fake gh.
-        **{k: v for k, v in os.environ.items() if k not in HOST_SHELL_STARTUP},
-        **HERMETIC_GIT,
-        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
-        "GITHUB_OUTPUT": str(output),
-        "GITHUB_STEP_SUMMARY": str(tmp_path / "summary"),
-        "GITHUB_REPOSITORY": "zackees/bosn",
-        "GH_TOKEN": "unused",
-        "EVENT": event,
-        "REF_TYPE": ref_type,
-        "REF_NAME": ref_name,
-        "BEFORE": before,
-        "INPUT_TAG": input_tag,
-        "INPUT_DRY_RUN": input_dry_run,
+
+
+def green_run(sha: str = SHA, overrides: dict[str, object] | None = None) -> dict[str, object]:
+    run: dict[str, object] = {
+        "id": 7,
+        "event": "workflow_dispatch",
+        "path": ".github/workflows/ci.yml",
+        "head_branch": "main",
+        "display_title": f"CI full {sha}",
+        "status": "completed",
+        "conclusion": "success",
+        "html_url": "https://github.com/zackees/bosn/actions/runs/7",
     }
-    completed = subprocess.run(
-        ["bash", "-c", guard_script()], cwd=repo, env=env, capture_output=True, text=True
-    )
-    outputs = dict(
-        line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines() if line
-    )
-    return completed.returncode, outputs
+    run.update(overrides or {})
+    return run
 
 
-# --- a push to main releases only a version change ---------------------------
+def green_jobs() -> list[dict[str, object]]:
+    names = (*REQUIRED, gate.COVERAGE_JOB, "Verify local gate", "Select CI tier")
+    return [
+        {"id": index, "name": name, "status": "completed", "conclusion": "success"}
+        for index, name in enumerate(names, 1)
+    ]
 
 
-def test_a_version_bump_on_main_releases_that_version(repo: Path, tmp_path: Path) -> None:
-    before = commit(repo, "0.1.4", "release 0.1.4")
-    head = commit(repo, "0.1.5", "bump")
-    code, out = run_guard(repo, tmp_path, event="push", before=before, released={"v0.1.4"})
-    assert code == 0
-    assert out == {"release": "true", "tag": "v0.1.5", "sha": head, "dry_run": "false"}
+# --- the candidate: exact, checked out, on main ---------------------------------
 
 
-def test_a_push_that_does_not_change_the_version_does_nothing(repo: Path, tmp_path: Path) -> None:
-    before = commit(repo, "0.1.4", "release 0.1.4")
-    commit(repo, "0.1.4", "an unrelated Cargo.toml edit")
-    code, out = run_guard(repo, tmp_path, event="push", before=before)
-    assert (code, out["release"]) == (0, "false")
+@needs_git
+def test_a_commit_on_main_is_a_candidate(repo: Path) -> None:
+    sha = commit(repo, "0.1.9", "release 0.1.9")
+    publish_main(repo)
+    gate.check_candidate(sha)
+    gate.check_tag("v0.1.9", sha)
 
 
-def test_introducing_the_workspace_version_does_not_release(repo: Path, tmp_path: Path) -> None:
-    # The merge that adds [workspace.package] must not ship: 0.1.4 already shipped.
-    before = commit(repo, None, "before single-source versioning")
-    commit(repo, "0.1.4", "single-source version")
-    code, out = run_guard(repo, tmp_path, event="push", before=before)
-    assert (code, out["release"]) == (0, "false")
+@needs_git
+def test_an_abbreviated_or_uppercase_sha_is_refused(repo: Path) -> None:
+    sha = commit(repo, "0.1.9", "release 0.1.9")
+    publish_main(repo)
+    for bad in (sha[:12], sha.upper(), "main"):
+        with pytest.raises(gate.GateError, match="40-character"):
+            gate.check_candidate(bad)
 
 
-def test_a_bump_that_is_already_released_does_nothing(repo: Path, tmp_path: Path) -> None:
-    before = commit(repo, "0.1.4", "release 0.1.4")
-    commit(repo, "0.1.5", "bump")
-    code, out = run_guard(repo, tmp_path, event="push", before=before, released={"v0.1.5"})
-    assert (code, out["release"]) == (0, "false")
-
-
-def test_a_bump_whose_tag_was_pushed_by_hand_leaves_it_to_that_run(
-    repo: Path, tmp_path: Path
-) -> None:
-    before = commit(repo, "0.1.4", "release 0.1.4")
-    commit(repo, "0.1.5", "bump")
-    git(repo, "tag", "v0.1.5")
-    code, out = run_guard(repo, tmp_path, event="push", before=before)
-    assert (code, out["release"]) == (0, "false")
-
-
-def test_the_first_push_of_a_branch_does_not_release(repo: Path, tmp_path: Path) -> None:
-    commit(repo, "0.1.5", "first")
-    code, out = run_guard(repo, tmp_path, event="push", before=ZEROS)
-    assert (code, out["release"]) == (0, "false")
-
-
-# --- the manual routes are unchanged -------------------------------------------
-
-
-def test_a_pushed_tag_releases_its_own_commit(repo: Path, tmp_path: Path) -> None:
-    tagged = commit(repo, "0.1.4", "release 0.1.4")
-    git(repo, "tag", "v0.1.4")
-    commit(repo, "0.1.4", "later work")
-    code, out = run_guard(repo, tmp_path, event="push", ref_type="tag", ref_name="v0.1.4")
-    assert code == 0
-    assert out == {"release": "true", "tag": "v0.1.4", "sha": tagged, "dry_run": "false"}
-
-
-def test_a_dry_run_of_an_unpushed_tag_rehearses_main(repo: Path, tmp_path: Path) -> None:
-    head = commit(repo, "0.1.5", "bump")
-    code, out = run_guard(
-        repo, tmp_path, event="workflow_dispatch", input_tag="v0.1.5", input_dry_run="true"
-    )
-    assert code == 0
-    assert out == {"release": "true", "tag": "v0.1.5", "sha": head, "dry_run": "true"}
-
-
-def test_publishing_a_tag_that_does_not_exist_is_refused(repo: Path, tmp_path: Path) -> None:
-    commit(repo, "0.1.5", "bump")
-    code, _ = run_guard(
-        repo, tmp_path, event="workflow_dispatch", input_tag="v0.1.5", input_dry_run="false"
-    )
-    assert code == 1
-
-
-def test_a_tag_off_main_is_refused(repo: Path, tmp_path: Path) -> None:
-    commit(repo, "0.1.4", "release 0.1.4")
+@needs_git
+def test_a_commit_off_main_is_refused(repo: Path) -> None:
+    commit(repo, "0.1.8", "release 0.1.8")
+    publish_main(repo)
     git(repo, "checkout", "-q", "-b", "side")
-    commit(repo, "0.1.5", "side work")
-    git(repo, "tag", "v0.1.5")
-    git(repo, "checkout", "-q", "main")
-    code, _ = run_guard(repo, tmp_path, event="push", ref_type="tag", ref_name="v0.1.5")
-    assert code == 1
+    side = commit(repo, "0.1.9", "side work")
+    with pytest.raises(gate.GateError, match="not reachable from origin/main"):
+        gate.check_candidate(side)
 
 
-# --- the guard sees only the fake gh, whatever the host's shell setup ---------
+@needs_git
+def test_the_candidate_must_be_what_is_checked_out(repo: Path) -> None:
+    first = commit(repo, "0.1.8", "release 0.1.8")
+    commit(repo, "0.1.9", "later")
+    publish_main(repo)
+    with pytest.raises(gate.GateError, match="checkout is"):
+        gate.check_candidate(first)
 
 
-def test_a_host_bash_env_cannot_put_another_gh_ahead_of_the_fake(
+@needs_git
+def test_an_existing_tag_may_only_name_the_candidate(repo: Path) -> None:
+    old = commit(repo, "0.1.9", "first try")
+    git(repo, "tag", "v0.1.9")
+    new = commit(repo, "0.1.9", "second try")
+    gate.check_tag("v0.1.9", old)  # resuming the same attempt
+    with pytest.raises(gate.GateError, match="already names"):
+        gate.check_tag("v0.1.9", new)
+
+
+# --- the proof: a green full CI run of exactly that SHA ---------------------------
+
+
+def test_a_green_full_dispatch_of_the_sha_is_proof() -> None:
+    gate.check_ci_run(gate.parse_run(green_run(), green_jobs()), SHA)
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"event": "push"}, "explicit dispatch"),
+        ({"event": "pull_request"}, "explicit dispatch"),
+        ({"path": ".github/workflows/auto-release.yml"}, "explicit dispatch"),
+        ({"head_branch": "feature"}, "not main"),
+        ({"display_title": f"CI full {'b' * 40}"}, "not a full run of"),
+        ({"display_title": "CI"}, "not a full run of"),
+        ({"status": "in_progress", "conclusion": None}, "in_progress"),
+        ({"conclusion": "failure"}, "failure"),
+        ({"conclusion": "cancelled"}, "cancelled"),
+    ],
+)
+def test_anything_but_a_green_full_dispatch_of_the_sha_is_refused(
+    override: dict[str, object], message: str
+) -> None:
+    with pytest.raises(gate.GateError, match=message):
+        gate.check_ci_run(gate.parse_run(green_run(SHA, override), green_jobs()), SHA)
+
+
+@pytest.mark.parametrize("name", [*REQUIRED, gate.COVERAGE_JOB])
+def test_every_full_tier_cell_must_have_run_and_passed(name: str) -> None:
+    jobs = green_jobs()
+    run = gate.parse_run(green_run(), [job for job in jobs if job["name"] != name])
+    with pytest.raises(gate.GateError, match="missing"):
+        gate.check_ci_run(run, SHA)
+    skipped = [{**job, "conclusion": "skipped"} if job["name"] == name else job for job in jobs]
+    with pytest.raises(gate.GateError, match="skipped"):
+        gate.check_ci_run(gate.parse_run(green_run(), skipped), SHA)
+
+
+def test_a_rerun_job_counts_by_its_latest_attempt() -> None:
+    jobs = green_jobs()
+    jobs.append({"id": 0, "name": REQUIRED[0], "status": "completed", "conclusion": "failure"})
+    gate.check_ci_run(gate.parse_run(green_run(), jobs), SHA)
+
+
+def test_ci_names_a_full_dispatch_for_its_candidate() -> None:
+    document = yaml.safe_load(CI.read_text(encoding="utf-8"))
+    assert "format('CI full {0}', inputs.commit_sha)" in document["run-name"]
+    assert "inputs.tier == 'full'" in document["run-name"]
+    assert gate.ci_title(SHA) == f"CI full {SHA}"
+
+
+# --- the optional release-request issue -------------------------------------------
+
+
+def test_an_open_issue_naming_the_candidate_and_tag_is_a_request() -> None:
+    body = f"Please release.\n\ncandidate_sha: `{SHA}`\ntag: v0.1.9\n"
+    gate.check_issue(gate.parse_issue({"number": 5, "state": "open", "body": body}), SHA, "v0.1.9")
+
+
+@pytest.mark.parametrize(
+    ("state", "body", "message"),
+    [
+        ("closed", f"candidate_sha: {SHA}\ntag: v0.1.9", "closed"),
+        ("open", f"candidate_sha: {'b' * 40}\ntag: v0.1.9", "names"),
+        ("open", f"candidate_sha: {SHA}\ntag: v0.1.8", "names"),
+        ("open", "release the latest main please", "names"),
+    ],
+)
+def test_an_issue_that_does_not_name_this_release_is_refused(
+    state: str, body: str, message: str
+) -> None:
+    issue = gate.parse_issue({"number": 5, "state": state, "body": body})
+    with pytest.raises(gate.GateError, match=message):
+        gate.check_issue(issue, SHA, "v0.1.9")
+
+
+# --- end to end: what the guard step writes ---------------------------------------
+
+
+@needs_git
+def test_resolve_writes_the_release_only_after_every_check(
     repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Some dev hosts (e.g. an agent shell) export BASH_ENV pointing at a script that
-    # re-prepends its own shim directory to PATH in every non-interactive bash. That
-    # shadowed the fake gh with the real one, which asked GitHub instead.
-    shim = tmp_path / "shim"
-    shim.mkdir()
-    real_gh = shim / "gh"
-    real_gh.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
-    real_gh.chmod(real_gh.stat().st_mode | stat.S_IEXEC)
-    bash_env = tmp_path / "bash_env.sh"
-    bash_env.write_text(f'PATH="{shim}:$PATH"; export PATH\n', encoding="utf-8")
-    monkeypatch.setenv("BASH_ENV", str(bash_env))
-    monkeypatch.setenv("ENV", str(bash_env))
-    before = commit(repo, "0.1.4", "release 0.1.4")
-    commit(repo, "0.1.5", "bump")
-    code, out = run_guard(repo, tmp_path, event="push", before=before, released={"v0.1.5"})
-    assert (code, out["release"]) == (0, "false")
+    sha = commit(repo, "0.1.9", "release 0.1.9")
+    publish_main(repo)
+    monkeypatch.setattr(
+        gate, "fetch_run", lambda _repo, _id, _token: gate.parse_run(green_run(sha), green_jobs())
+    )
+    body = f"candidate_sha: {sha}\ntag: v0.1.9"
+    monkeypatch.setattr(
+        gate,
+        "fetch_issue",
+        lambda _repo, _n, _token: gate.parse_issue({"number": 5, "state": "open", "body": body}),
+    )
+    output = tmp_path / "output"
+    argv = ["resolve", "--candidate-sha", sha, "--ci-run-id", "7", "--issue", "5"]
+    assert gate.main([*argv, "--dry-run", "false", "--output", str(output)]) == 0
+    assert output.read_text(encoding="utf-8").splitlines() == [
+        "release=true",
+        "tag=v0.1.9",
+        f"sha={sha}",
+        "dry_run=false",
+    ]
+    output.unlink()
+    monkeypatch.setattr(
+        gate,
+        "fetch_run",
+        lambda _repo, _id, _token: gate.parse_run(green_run(sha, {"conclusion": "failure"}), []),
+    )
+    assert gate.main([*argv, "--output", str(output)]) == 1
+    assert not output.exists(), "a refused release writes no outputs"
+
+
+# --- the workflow: dispatch only, and nothing before the guard ---------------------
+
+
+def release_workflow() -> Any:
+    return yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+
+
+def test_only_an_explicit_dispatch_can_start_a_release() -> None:
+    triggers = release_workflow()[True]  # PyYAML reads the `on:` key as True
+    assert set(triggers) == {"workflow_dispatch"}, "no version-bump or tag-push trigger"
+    inputs = triggers["workflow_dispatch"]["inputs"]
+    assert inputs["candidate_sha"]["required"] and inputs["full_ci_run_id"]["required"]
+    assert inputs["dry_run"]["default"] is True
+
+
+def test_every_job_waits_for_the_guard_and_the_guard_runs_the_gate() -> None:
+    jobs = release_workflow()["jobs"]
+    steps = jobs["guard"]["steps"]
+    assert steps[0]["with"]["ref"] == "${{ inputs.candidate_sha }}"
+    (source,) = [step for step in steps if step.get("id") == "source"]
+    assert "ci/release_gate.py resolve" in source["run"]
+    for name, job in jobs.items():
+        if name == "guard":
+            continue
+        needs = job["needs"] if isinstance(job["needs"], list) else [job["needs"]]
+        assert "guard" in needs, name
+        assert "needs.guard.outputs.release == 'true'" in job["if"], name
+
+
+def test_the_tag_is_created_only_by_the_release_job_at_the_guarded_sha() -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert "git tag" not in text and "git push" not in text
+    job = release_workflow()["jobs"]["github-release"]
+    (create,) = [s for s in job["steps"] if "gh release create" in s.get("run", "")]
+    assert create["env"]["RELEASE_SHA"] == "${{ needs.guard.outputs.sha }}"
+    assert '--target "$RELEASE_SHA"' in create["run"]
+    assert "needs.guard.outputs.dry_run == 'false'" in job["if"]
