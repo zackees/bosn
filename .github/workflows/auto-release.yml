@@ -1,16 +1,25 @@
 name: Release
 
-# Merging a version bump to main releases it, the way zackees/zccache and
-# zackees/soldr do: `./bump patch` changes `[workspace.package].version` in
-# Cargo.toml (the only place it is written), and when that change lands on main
-# this workflow builds, verifies, and publishes `v<version>`, creating the tag.
-# A push to main that does not change the version does nothing.
+# The pretag release gate (AGENTS.md "Releasing"; zackees/soldr#3343/#3345).
+# A release is requested only by dispatching this workflow with an exact
+# candidate SHA on main and the ID of a successful full CI run of that SHA:
 #
-# Two manual routes remain. Pushing a tag `vX.Y.Z` on main releases that tag.
-# `workflow_dispatch` runs a tag, dry by default: it builds and verifies every
-# wheel and publishes nothing, and a dry run of a tag that does not exist yet
-# rehearses main. A dispatch with dry_run=false publishes an existing tag, e.g.
-# to recover a failed run.
+#   gh workflow run ci.yml -f tier=full -f commit_sha=<SHA>        # proof
+#   gh workflow run auto-release.yml -f candidate_sha=<SHA> \
+#     -f full_ci_run_id=<ID> [-f issue=<N>] -f dry_run=false        # release
+#
+# The guard (ci/release_gate.py) refuses unless that CI run is an explicit
+# full-tier dispatch of ci.yml from main named `CI full <SHA>`, completed
+# green with every full-tier cell, and the SHA is reachable from main. Every
+# build and publishing job needs the guard, so the tag `v<version>` (created
+# by `gh release create --target <SHA>` in the last job) and every upload
+# happen only after it. An optional release-request issue must name the same
+# `candidate_sha:` and `tag:`; the release reports back to it.
+#
+# There is no push trigger: a version bump reaching main, or a pushed tag,
+# releases nothing. A failed attempt is retried by dispatching the same SHA
+# again, never by bumping the version. dry_run (the default) builds and
+# verifies every wheel and publishes nothing.
 #
 # The four wheel builds copy ci.yml's wheel lanes step for step, so a release
 # ships exactly what the required checks verified. They are copies, not a
@@ -25,24 +34,28 @@ name: Release
 # is already published and uploads only what is missing.
 
 on:
-  push:
-    branches: [main]
-    # Only a manifest change can change the version.
-    paths: [Cargo.toml]
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
-      tag:
-        description: Tag to release, e.g. v0.1.4 (a dry run may name one not pushed yet)
+      candidate_sha:
+        description: Exact commit on main to release (full 40-character SHA)
         required: true
         type: string
+      full_ci_run_id:
+        description: ID of a successful `CI full <candidate_sha>` dispatch run of ci.yml
+        required: true
+        type: string
+      issue:
+        description: Optional release-request issue naming candidate_sha and tag
+        type: string
+        default: ""
       dry_run:
         description: Build and verify everything, publish nothing
         type: boolean
         default: true
 
+# One release attempt at a time; never cancel one that may be publishing.
 concurrency:
-  group: bosn-release-${{ inputs.tag || github.ref_name }}
+  group: bosn-release
   cancel-in-progress: false
 
 permissions:
@@ -52,6 +65,10 @@ jobs:
   guard:
     name: Release guard
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      issues: read
     outputs:
       release: ${{ steps.source.outputs.release }}
       tag: ${{ steps.source.outputs.tag }}
@@ -60,78 +77,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.candidate_sha }}
           fetch-depth: 0
 
-      # Decides whether this run releases, which tag, and the one commit it builds.
-      - name: Resolve the release, and require it on main
-        id: source
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          EVENT: ${{ github.event_name }}
-          REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
-          BEFORE: ${{ github.event.before }}
-          INPUT_TAG: ${{ inputs.tag }}
-          INPUT_DRY_RUN: ${{ inputs.dry_run }}
-        run: |
-          set -euo pipefail
-          workspace_version() {  # [workspace.package].version at a revision, or nothing
-            git show "$1:Cargo.toml" 2>/dev/null | python3 -c \
-              'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["workspace"]["package"]["version"])' \
-              2>/dev/null || true
-          }
-          skip() {
-            echo "$1"
-            { echo "release=false"; echo "tag="; echo "sha="; echo "dry_run=true"; } >> "$GITHUB_OUTPUT"
-            echo "No release: $1" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          }
-
-          dry_run=false
-          sha=""
-          if [[ "$EVENT" == "workflow_dispatch" ]]; then
-            tag="$INPUT_TAG"
-            [[ "$INPUT_DRY_RUN" == "true" ]] && dry_run=true
-          elif [[ "$REF_TYPE" == "tag" ]]; then
-            tag="$REF_NAME"
-          else
-            # A push to main: release only if it changed the version.
-            new="$(workspace_version HEAD)"
-            old=""
-            [[ "$BEFORE" =~ ^0+$ ]] || old="$(workspace_version "$BEFORE")"
-            [[ -n "$new" ]] || { echo "::error::Cargo.toml has no [workspace.package] version" >&2; exit 1; }
-            [[ -n "$old" && "$new" != "$old" ]] || skip "the version did not change (${old:-none} -> $new)"
-            tag="v$new"
-            gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 \
-              && skip "$tag is already released"
-            git rev-parse -q --verify "refs/tags/$tag" > /dev/null \
-              && skip "tag $tag already exists; its own run releases it"
-            sha="$(git rev-parse HEAD)"
-            source="version bump $old -> $new on main"
-          fi
-
-          if [[ -z "$sha" ]]; then
-            if sha="$(git rev-parse -q --verify "refs/tags/${tag}^{commit}")"; then
-              source="tag $tag"
-            elif [[ "$dry_run" == "true" ]]; then
-              sha="$(git rev-parse origin/main)"
-              source="main (tag $tag does not exist yet)"
-            else
-              echo "::error::tag $tag does not exist" >&2
-              exit 1
-            fi
-          fi
-          git merge-base --is-ancestor "$sha" origin/main \
-            || { echo "::error::$tag ($sha) is not on main" >&2; exit 1; }
-          git checkout -q "$sha"
-          { echo "release=true"; echo "tag=$tag"; echo "sha=$sha"; echo "dry_run=$dry_run"; } >> "$GITHUB_OUTPUT"
-          echo "Releasing $tag from $source at $sha (dry run: $dry_run)" >> "$GITHUB_STEP_SUMMARY"
-
       - uses: actions/setup-python@v5
-        if: steps.source.outputs.release == 'true'
         with:
           python-version: "3.11"
+
+      # The pretag gate: the candidate is on main and full CI is green on it.
+      - name: Require full CI green on the exact candidate SHA
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          CI_RUN_ID: ${{ inputs.full_ci_run_id }}
+          ISSUE: ${{ inputs.issue }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: >-
+          python ci/release_gate.py resolve
+          --candidate-sha "$CANDIDATE_SHA" --ci-run-id "$CI_RUN_ID"
+          --issue "$ISSUE" --dry-run "$DRY_RUN"
+          --output "$GITHUB_OUTPUT" --summary "$GITHUB_STEP_SUMMARY"
 
       - name: Tag matches the release version, and nothing else declares one
         if: steps.source.outputs.release == 'true'
@@ -412,12 +378,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      issues: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: bosn-release-${{ env.RELEASE_TAG }}
           path: dist
 
+      # The tag is created here, by `--target`, after the guard's full-CI check.
       - name: Create, or verify the existing release's assets
         shell: bash
         env:
@@ -439,3 +407,18 @@ jobs:
           if [[ "$PYPI_RESULT" == "skipped" ]]; then
             echo "PyPI: not published (vars.PUBLISH_PYPI is not 'true')." >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Report to the release-request issue
+        if: inputs.issue != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ inputs.issue }}
+          RELEASE_SHA: ${{ needs.guard.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          url="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json url -q .url)"
+          gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" \
+            --body "Released [$RELEASE_TAG]($url) from \`$RELEASE_SHA\` by $RUN_URL after full CI passed on that SHA."
+          gh issue close "$ISSUE" --repo "$GITHUB_REPOSITORY" --reason completed
