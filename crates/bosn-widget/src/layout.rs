@@ -67,6 +67,7 @@ pub struct Layout {
 }
 
 impl Layout {
+    #[cfg(test)]
     pub fn presence(&self, window: Window) -> Presence {
         match window {
             Window::Bubble => self.bubble,
@@ -87,6 +88,26 @@ impl Layout {
     /// that needs it opens a new one.
     pub fn lost(&mut self, window: Window) {
         *self.slot(window) = Presence::Absent;
+    }
+
+    /// Reconcile status presence without taking focus during host loss/recovery.
+    pub fn status_steps(&self, hosted: bool) -> Vec<Step> {
+        match (hosted, self.bubble) {
+            (true, Presence::Shown) => vec![Step::Hide(Window::Bubble)],
+            (false, Presence::Absent) => vec![open_page(Window::Bubble)],
+            (false, Presence::Hidden) => vec![Step::Show(Window::Bubble)],
+            _ => vec![],
+        }
+    }
+
+    /// An explicit Show reveals details without toggling an already open panel.
+    pub fn show_panel_steps(&self) -> Vec<Step> {
+        match self.panel {
+            Presence::Absent => vec![open_page(Window::Panel)],
+            Presence::Hidden | Presence::Shown => {
+                vec![Step::Show(Window::Panel), Step::Focus(Window::Panel)]
+            }
+        }
     }
 
     /// The steps that carry out `command` from the current state.
@@ -158,6 +179,35 @@ mod tests {
             .iter()
             .filter(|step| matches!(step, Step::Open { .. }))
             .count()
+    }
+
+    #[test]
+    fn repeated_explicit_show_keeps_existing_details_visible() {
+        let mut layout = Layout::default();
+        for _ in 0..3 {
+            for step in layout.show_panel_steps() {
+                layout.record(&step);
+            }
+            assert_eq!(layout.presence(Window::Panel), Presence::Shown);
+        }
+    }
+
+    #[test]
+    fn host_loss_and_recovery_swap_status_presence_without_stealing_focus() {
+        let mut layout = Layout::default();
+        assert!(layout.status_steps(true).is_empty());
+        let fallback = layout.status_steps(false);
+        assert_eq!(opens(&fallback), 1);
+        for step in fallback {
+            layout.record(&step);
+        }
+        let hosted = layout.status_steps(true);
+        assert_eq!(hosted, vec![Step::Hide(Window::Bubble)]);
+        for step in hosted {
+            layout.record(&step);
+        }
+        assert!(layout.status_steps(true).is_empty());
+        assert_eq!(layout.status_steps(false), vec![Step::Show(Window::Bubble)]);
     }
 
     #[test]

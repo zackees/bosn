@@ -1,7 +1,11 @@
 // KDE Wayland owns window placement. Use the bubble's own monitor and usable
 // area, so panels/docks and negative monitor origins are respected.
+function isStatusWindow(window) {
+    return window.resourceClass === "dev.bosn.widget" &&
+        (window.caption === "bosn bubble" || window.caption === "bosn panel");
+}
 function placeBubble(window) {
-    if (window.resourceClass !== "dev.bosn.widget" || window.caption !== "bosn bubble") return;
+    if (!isStatusWindow(window)) return;
     const area = workspace.clientArea(KWin.MaximizeArea, window);
     const geometry = window.frameGeometry;
     const margin = 24;
@@ -31,7 +35,7 @@ function watch(window) {
         window.frameGeometryChanged.connect(placeAll);
         connectIfAvailable(window.windowShown, placeAll);
         connectIfAvailable(window.windowHidden, placeAll);
-    } else if (window.resourceClass === "dev.bosn.widget" && window.caption === "bosn bubble") {
+    } else if (isStatusWindow(window)) {
         window.outputChanged.connect(function () { placeBubble(window); });
         connectIfAvailable(window.windowShown, function () { placeBubble(window); });
     }

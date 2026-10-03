@@ -10,14 +10,16 @@ const dockChanged=signal();
 // Some Plasma versions omit dock visibility signals; geometry still works.
 const dock={dock:true, frameGeometryChanged:dockChanged};
 const bubble = { caption: 'bosn bubble', resourceClass: 'dev.bosn.widget', frameGeometry: {x:2667,y:761,width:72,height:72}, active:false, outputChanged:signal(), windowShown:signal() };
-const panel = { caption:'bosn panel', resourceClass:'dev.bosn.widget', frameGeometry:{x:20,y:30,width:420,height:640} };
+const panel = { caption:'bosn panel', resourceClass:'dev.bosn.widget', frameGeometry:{x:20,y:30,width:420,height:640}, active:false, outputChanged:signal(), windowShown:signal() };
 const other = { caption:'bosn bubble', resourceClass:'other', frameGeometry:{x:7,y:8,width:72,height:72} };
 let area = {x:1423,y:99,width:2560,height:1396};
 vm.runInNewContext(script, { KWin:{MaximizeArea:1}, workspace:{windowList:()=>[bubble,panel,other,dock], clientArea:()=>area, windowAdded:{connect:f=>added=f},screensChanged,virtualScreenGeometryChanged,windowRemoved:removed} });
 assert.equal(JSON.stringify(bubble.frameGeometry), JSON.stringify({x:3887,y:1399,width:72,height:72}));
 assert.equal(bubble.active,false);
 assert.equal(bubble.keepAbove,true);
-assert.equal(panel.frameGeometry.x,20);
+assert.equal(panel.frameGeometry.x,3539);
+assert.equal(panel.frameGeometry.y,831);
+assert.equal(panel.active,false);
 assert.equal(other.frameGeometry.x,7);
 area = {x:-1600,y:0,width:1600,height:860};
 const next = {...bubble,frameGeometry:{x:0,y:0,width:72,height:72}};

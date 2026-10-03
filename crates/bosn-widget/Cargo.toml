@@ -16,7 +16,10 @@ too_many_lines = "warn"
 
 [dependencies]
 bosn-service = { path = "../bosn-service" }
-kernal-api = { version = "=0.1.25", default-features = false, features = ["fs", "tauri-webview"] }
+kernal-api = { path = "/home/niteris/dev/ci.yml-extern/kernal-tray", default-features = false, features = ["fs", "tauri-webview", "system-tray"] }
 
 [dev-dependencies]
 serde_json = "=1.0.149"
+
+[patch.crates-io]
+kernal-api = { path = "/home/niteris/dev/ci.yml-extern/kernal-tray" }

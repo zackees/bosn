@@ -166,6 +166,7 @@ pub fn run(mut arguments: impl Iterator<Item = OsString>) {
 }
 
 fn install_unit(binary: &Path, state_dir: &Path) {
+    bosn_service::ci::config::enable_desktop_ui(state_dir).unwrap_or_else(|error| fail(&error));
     let home = std::env::var_os("HOME").unwrap_or_else(|| fail("HOME is not set"));
     let dir = Path::new(&home).join(".config/systemd/user");
     std::fs::create_dir_all(&dir).unwrap_or_else(|e| fail(&e.to_string()));
@@ -179,6 +180,34 @@ fn install_unit(binary: &Path, state_dir: &Path) {
     }
     desktop::install(Path::new(&home)).unwrap_or_else(|error| fail(&error));
     println!("installed {}", unit.display());
+    println!(
+        "dashboard enabled in {}",
+        state_dir.join("config.toml").display()
+    );
+    println!("{}", dashboard_readiness(state_dir));
+}
+
+/// Inspect the existing daemon without starting or restarting it or exposing a grant.
+fn dashboard_readiness(state_dir: &Path) -> &'static str {
+    let Ok(client) = bosn_service::Client::for_state(state_dir) else {
+        return "dashboard readiness could not be checked; configuration is ready for the next daemon start";
+    };
+    let Ok(runtime) = kernal_api::async_engine::RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+    else {
+        return "dashboard readiness could not be checked; configuration is ready for the next daemon start";
+    };
+    let ready = runtime.run(kernal_api::async_engine::timeout(
+        std::time::Duration::from_secs(2),
+        client.ci_ui_grant(Some("/".into())),
+    ));
+    match ready {
+        Ok(Ok(_)) => "running daemon dashboard is ready",
+        _ => {
+            "dashboard is not ready on the running daemon; start it, or restart it only after all active jobs finish"
+        }
+    }
 }
 
 #[cfg(test)]

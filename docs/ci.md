@@ -110,8 +110,12 @@ BOSN_UPDATE_SCHEMA=1 cargo test -p bosn-service published_schema
 session and opens three kinds of window onto daemon pages, each signed in
 with its own single-use grant:
 
-- a small **bubble** (`/widget/bubble`): running, queued and failed counts,
-  coloured by the worst state;
+- a **system-tray icon** on Linux desktops with a StatusNotifierItem host (KDE
+  Plasma and compatible trays): always active, with current CI status in its
+  title/tooltip. Clicking toggles details; its menu opens the dashboard or quits;
+- a small **bubble** (`/widget/bubble`) when a tray host is unavailable: running,
+  queued and failed counts, coloured by the worst state. Host loss reveals it;
+  host recovery hides it so the two status surfaces do not compete;
 - a **panel** (`/widget/panel`), toggled from the bubble: runs across
   workspaces with actor, branch, SHA (`+dirty`) and progress, plus runner
   controls;
@@ -124,10 +128,23 @@ browser only for `https` URLs on `github.com`, `gitlab.com` or a host listed
 in `[widget] external_hosts`.
 
 ```sh
-bosn widget              # run it (a second start shows the running bubble)
+bosn widget              # run it (a second start reveals details, or the fallback bubble)
 bosn widget --detach
 bosn widget install      # systemd user unit, started with the graphical session
 ```
+
+Installation enables `[ui] enabled = true` in the selected state's configuration,
+while preserving existing settings and comments. The service watches that same
+state directory; ordinary invocations use the default state, so install without
+`--state-dir` for normal activity. An already-running daemon with the dashboard
+disabled must restart after **all** active jobs finish before click-through
+pages work; installation never restarts it or interrupts jobs. Headless installs
+still default to no dashboard listener. The desktop executable remains a
+separate installation prerequisite (#444).
+
+For Linux widget implementation changes, `ci-widget` selects the existing
+WebKitGTK lint/test job without selecting unrelated full-tier platforms.
+Release candidates still require the complete full tier.
 
 **When it appears.** `[widget] auto_launch` is `always` (the default),
 `on-activity` or `never`.
@@ -166,12 +183,13 @@ opened once, at its final size, and then reused:
 
 **KDE Plasma on Wayland.** The compositor controls placement and stacking.
 `bosn widget install` installs and enables the `bosn-widget-corner` KWin script
-alongside the user service. It places only the bubble in the lower-right corner
+alongside the user service. It places the fallback bubble and details panel in the lower-right corner
 of its monitor's usable area, with a 24-pixel margin, leaving room for panels
 and docks, and follows panel and monitor geometry changes. It keeps the bubble
 above other windows and out of the taskbar and switcher. A bubble-only window
-rule prevents automatic creation from taking keyboard focus. The panel and full dashboard keep
-normal window behavior. Existing KWin scripts and window rules remain intact.
+rule prevents automatic bubble creation from taking keyboard focus. The details
+panel opens upward above the dock; explicit clicks alone give it focus. The full
+dashboard retains normal window behavior. Existing KWin scripts and window rules remain intact.
 
 A previously configured forced-position rule overrides scripted placement;
 remove that bubble-only position rule to use automatic placement. The script

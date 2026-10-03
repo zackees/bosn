@@ -14,6 +14,7 @@
 mod controller;
 mod layout;
 mod notify;
+mod tray;
 mod windows;
 
 use std::path::PathBuf;

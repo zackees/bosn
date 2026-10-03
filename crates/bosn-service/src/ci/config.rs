@@ -62,9 +62,82 @@ pub fn load(state_dir: &Path) -> Result<CiConfig, String> {
     }
 }
 
+/// Opt-in desktop installation enables the dashboard without rewriting user settings.
+/// Returns whether configuration changed. A running daemon still needs an idle restart.
+pub fn enable_desktop_ui(state_dir: &Path) -> Result<bool, String> {
+    use std::io::Write as _;
+    if load(state_dir)?.ui.enabled {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(state_dir).map_err(|e| e.to_string())?;
+    let path = state_dir.join("config.toml");
+    let original = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut document = original
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| e.to_string())?;
+    document["ui"]["enabled"] = toml_edit::value(true);
+    let changed = document.to_string();
+    toml::from_str::<CiConfig>(&changed).map_err(|e| e.to_string())?;
+    let staging =
+        kernal_api::platform::fs::TemporaryDirectory::in_directory(state_dir, "widget-config-")
+            .map_err(|e| e.to_string())?;
+    let staged = staging.path().join("config.toml");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+        .map_err(|e| e.to_string())?;
+    if let Ok(metadata) = std::fs::metadata(&path) {
+        file.set_permissions(metadata.permissions())
+            .map_err(|e| e.to_string())?;
+    }
+    file.write_all(changed.as_bytes())
+        .map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    drop(file);
+    if std::fs::read_to_string(&path).unwrap_or_default() != original {
+        return Err("configuration changed during desktop installation; retry".into());
+    }
+    std::fs::rename(&staged, &path).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_install_enables_ui_and_preserves_existing_policy_and_comments() {
+        let dir = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# my limits\n[engine]\ncpus = 3\n[widget]\nauto_launch = \"never\"\n",
+        )
+        .unwrap();
+        assert!(enable_desktop_ui(dir.path()).unwrap());
+        let enabled = load(dir.path()).unwrap();
+        assert!(enabled.ui.enabled);
+        assert_eq!(enabled.engine.cpus, Some(3));
+        assert_eq!(
+            enabled.widget.auto_launch,
+            super::super::widget::AutoLaunch::Never
+        );
+        let original = std::fs::read_to_string(&path).unwrap();
+        assert!(original.contains("# my limits"));
+        assert!(!enable_desktop_ui(dir.path()).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::write(&path, "[ui]\nenabeld = false\n").unwrap();
+        assert!(enable_desktop_ui(dir.path()).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[ui]\nenabeld = false\n"
+        );
+    }
 
     #[test]
     fn missing_file_is_disabled_and_typos_are_errors() {

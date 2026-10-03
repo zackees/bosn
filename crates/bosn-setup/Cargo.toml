@@ -13,7 +13,7 @@ path = "src/lib.rs"
 bosn-core = { path = "../bosn-core" }
 bosn-engine = { path = "../bosn-engine" }
 serde_json = "=1.0.149"
-kernal-api = { version = "=0.1.25", default-features = false, features = ["fs", "hash-sha256", "http-client", "ipc"] }
+kernal-api = { version = "=0.1.26", default-features = false, features = ["fs", "hash-sha256", "http-client", "ipc"] }
 
 [features]
 native-test-helper = ["bosn-engine/native-test-helper"]

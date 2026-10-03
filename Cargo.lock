@@ -117,6 +117,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]
@@ -193,6 +194,7 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]
@@ -1028,9 +1030,9 @@ dependencies = [
 
 [[package]]
 name = "kernal-api"
-version = "0.1.25"
+version = "0.1.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c9263b9e44550fa7e586dc641ff43e0f717c60870506feba6f5af8988a5d3a4"
+checksum = "f18d3cbb9bd8f6a590cf9b5a75297c542786fcef93bb3ff7245eb8f8b1b09561"
 dependencies = [
  "blake3",
  "bytes",
@@ -1746,9 +1748,9 @@ dependencies = [
 
 [[package]]
 name = "running-process"
-version = "4.10.14"
+version = "4.10.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02f0ff903e7b61396a074648fc6301668492de90aea4b5d09cc914eee9389e9b"
+checksum = "c040ca81d60235a6027ef3115629049829464758e1011500902c8a2355727812"
 dependencies = [
  "libc",
  "prost",
@@ -1763,11 +1765,12 @@ dependencies = [
 
 [[package]]
 name = "running-process-platform-internal"
-version = "4.10.14"
+version = "4.10.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6e5db04a966dfead09ff660b704c2461a05e8477249b8f10532b41a22219348"
+checksum = "0ef39418f8c71399ea811c5daba36f2325516cc02c3b2169473400411941ed5f"
 dependencies = [
  "libc",
+ "miniz_oxide",
  "sysinfo",
  "thiserror",
  "tokio",
@@ -1778,9 +1781,9 @@ dependencies = [
 
 [[package]]
 name = "running-process-protocol"
-version = "4.10.14"
+version = "4.10.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c32daa00db0c79106d3181f1e306efe92a59bd1b0429440bdc5e6debf3cc4345"
+checksum = "c51894dfa970ac24213066f37b33656fd92c7053ef3e94f184b70000d8cf48f7"
 dependencies = [
  "prost",
  "prost-build",
