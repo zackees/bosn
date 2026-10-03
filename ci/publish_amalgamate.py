@@ -147,6 +147,9 @@ def copy_cli_binary(source: Path, target_bin: Path, module_map: dict[str, str]) 
     shipped = target_bin / source.stem
     if shipped.exists():
         shutil.rmtree(shipped)
+    if submodules.is_dir():
+        # Embedded CLI assets must move alongside the Rust modules that include them.
+        shutil.copytree(submodules, shipped)
     files = [source, *sorted(submodules.rglob("*.rs"))] if submodules.is_dir() else [source]
     for path in files:
         target = target_bin / path.relative_to(source.parent)
