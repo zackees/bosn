@@ -25,6 +25,10 @@ cmd = "soldr toolchain ensure --json && uv sync --frozen --all-groups --no-edita
 stack = "test"
 cmd = "soldr toolchain ensure --json && soldr cargo test --workspace --exclude bosn-python --locked && PYO3_PYTHON=$(command -v python3) soldr cargo test -p bosn-python --lib --locked --no-default-features --features embedded-python-tests"
 
+[task.rust-lint]
+stack = "test"
+cmd = "soldr toolchain ensure --json && python ci/local_gate.py --lane rust"
+
 [task.lint]
 stack = "test"
 cmd = "soldr toolchain ensure --json && uv sync --frozen --all-groups --no-editable && uv run --no-sync python ci/lint.py"
