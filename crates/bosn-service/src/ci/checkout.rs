@@ -26,7 +26,8 @@
 //! committed.
 //!
 //! The same pass gives every POSIX-shell `run:` step the end-of-output trap
-//! of [`super::flush`] (#398), confines remote-only jobs
+//! of [`super::flush`] (#398), stubs `actions/configure-pages`
+//! ([`super::pages`]), confines remote-only jobs
 //! ([`super::remote_only`], GATE-012) and gates matrix legs on their own
 //! runner ([`super::matrix_runner`], #404), so the files are read and written
 //! once.
@@ -52,6 +53,9 @@ pub struct Localized {
     /// Remote-only jobs confined to a stub, with the reason
     /// ([`super::remote_only`]).
     pub remote_only: Vec<(String, String)>,
+    /// Jobs whose `actions/configure-pages` step became a local stub
+    /// ([`super::pages`]); the job itself runs.
+    pub pages_stubbed: Vec<String>,
     /// Matrix jobs whose legs bosn runs or reports unsupported by their own
     /// runner ([`super::matrix_runner`], #404).
     pub runner_gated: Vec<String>,
@@ -109,6 +113,8 @@ pub fn localize(
     let mut document: Value = serde_yaml::from_str(&text).map_err(io::Error::other)?;
     let mut changes = Localized::default();
     localize_document(&mut document, repository, &mut changes);
+    // Stub first: a job left with nothing GitHub-only is not confined.
+    changes.pages_stubbed = super::pages::stub_configure_pages(&mut document, repository);
     changes.remote_only = super::remote_only::confine(&mut document);
     changes.runner_gated = super::matrix_runner::gate(&mut document);
     changes.trapped = super::flush::add_traps(&mut document);
@@ -124,6 +130,7 @@ pub fn localize(
     localized.pinned.extend(changes.pinned);
     localized.trapped += changes.trapped;
     localized.remote_only.extend(changes.remote_only);
+    localized.pages_stubbed.extend(changes.pages_stubbed);
     localized.runner_gated.extend(changes.runner_gated);
     Ok(changed)
 }

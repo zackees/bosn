@@ -16,6 +16,10 @@
 //!   its name and any required check built on it behave exactly as before;
 //! - it uses an action from GATE-012's registry of act-impossible actions
 //!   ([`ACTIONS`], kept in step with `ci_lint.remote_only.REMOTE_ONLY_ACTIONS`);
+//!   an action in [`LOCAL_STUBS`] is not one: bosn serves it with a local
+//!   stub ([`super::pages`]), so the job runs (a Pages *build* job runs
+//!   locally; only `actions/deploy-pages` needs GitHub). [`classify`] is the
+//!   one decision for every `uses:`;
 //! - it requests `id-token: write` (act has no OIDC issuer).
 //!
 //! In the run's copy of the workflow ([`confine`]) such a job keeps its
@@ -24,6 +28,8 @@
 //! one that prints the reason. The run then reports it `remote_only` with
 //! that reason ([`super::model::RunTree::mark_remote_only`]): never a
 //! failure, never a coverage gap, since by policy it is no local evidence.
+
+use std::collections::BTreeMap;
 
 use serde_yaml::{Mapping, Value};
 
@@ -44,7 +50,6 @@ pub const ACTIONS: &[(&str, &str)] = &[
         "needs GitHub's dependency graph API",
     ),
     ("actions/deploy-pages", "deploys to GitHub Pages"),
-    ("actions/configure-pages", "needs a GitHub Pages site"),
     (
         "actions/attest-build-provenance",
         "needs an OIDC token and sigstore",
@@ -75,6 +80,59 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("coderabbitai/", "a CodeRabbit (GitHub App) action"),
 ];
 
+/// Actions bosn rewrites into a local stub step instead of confining the
+/// job (a GATE-012 refinement): a `uses:` prefix and what the stub does.
+/// `actions/configure-pages` only reads the site's Pages metadata; the stub
+/// sets the outputs a build reads (`base_url`, `origin`, `host`,
+/// `base_path`) for the repository's `https://<owner>.github.io/<repo>`
+/// site. `actions/upload-pages-artifact` needs no stub: it uploads through
+/// act's artifact server.
+pub const LOCAL_STUBS: &[(&str, &str)] = &[(
+    "actions/configure-pages",
+    "sets base_url, origin, host and base_path for the repository's project site",
+)];
+
+/// The `actions/configure-pages` inputs that make it edit a site
+/// generator's config from the live Pages site, which no stub can do.
+const PAGES_GENERATOR_INPUTS: &[&str] = &["static_site_generator", "generator_config_file"];
+
+/// What a local run does with one `uses:` step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StepClass {
+    /// act runs the action as written.
+    Local,
+    /// bosn replaces the step with a local stub ([`LOCAL_STUBS`]).
+    Stubbed,
+    /// The job is confined to a stub and reported `remote_only`: why.
+    Confined(String),
+}
+
+/// How a local run treats `uses` with inputs `with`: stubbed, confined, or
+/// run as written.
+pub fn classify(uses: &str, with: &BTreeMap<String, Value>) -> StepClass {
+    if let Some((prefix, _)) = LOCAL_STUBS
+        .iter()
+        .find(|(prefix, _)| uses.starts_with(prefix))
+    {
+        return match PAGES_GENERATOR_INPUTS
+            .iter()
+            .find(|input| with.contains_key(**input))
+        {
+            Some(input) => StepClass::Confined(format!(
+                "uses {prefix} with {input}: it edits the generator's config from the live \
+                 Pages site"
+            )),
+            None => StepClass::Stubbed,
+        };
+    }
+    ACTIONS
+        .iter()
+        .find(|(prefix, _)| uses.starts_with(prefix))
+        .map_or(StepClass::Local, |(prefix, why)| {
+            StepClass::Confined(format!("uses {prefix}: {why}"))
+        })
+}
+
 /// The job keys a confined job keeps: what decides whether, where and how
 /// often it runs. Everything else (steps, outputs, services, container,
 /// defaults, env) belongs to the work act cannot do.
@@ -104,13 +162,13 @@ pub fn reason(job: &Job) -> Option<String> {
             text
         });
     }
-    let registered = job.steps.iter().find_map(|step| {
-        let uses = step.uses.as_deref()?;
-        ACTIONS
+    let registered =
+        job.steps
             .iter()
-            .find(|(prefix, _)| uses.starts_with(prefix))
-            .map(|(prefix, why)| format!("uses {prefix}: {why}"))
-    });
+            .find_map(|step| match classify(step.uses.as_deref()?, &step.with) {
+                StepClass::Confined(why) => Some(why),
+                StepClass::Local | StepClass::Stubbed => None,
+            });
     if registered.is_some() {
         return registered;
     }
@@ -214,6 +272,57 @@ mod tests {
             "env:\n  CI_REMOTE_ONLY: null\n",
         ] {
             assert_eq!(reason(&job(runnable)), None, "{runnable}");
+        }
+    }
+
+    /// A Pages *build* job reads Pages metadata, builds and uploads the site:
+    /// it runs locally. Only the deploy needs GitHub.
+    #[test]
+    fn a_pages_build_job_runs_locally_and_only_its_deploy_is_confined() {
+        let build = "permissions: {contents: read, pages: write}\nsteps:\n  - uses: actions/checkout@v4\n  - run: make site\n  - uses: actions/configure-pages@v5\n  - uses: actions/upload-pages-artifact@v3\n    with: {path: site}\n";
+        assert_eq!(reason(&job(build)), None);
+        let deploy = "permissions: {pages: write, id-token: write}\nsteps:\n  - id: deployment\n    uses: actions/deploy-pages@v4\n";
+        assert!(reason(&job(deploy)).is_some());
+    }
+
+    /// The one classification of `uses:` steps: run as written, stubbed
+    /// locally, or confined with the job.
+    #[test]
+    fn every_action_is_run_stubbed_or_confined() {
+        let none = BTreeMap::new();
+        for local in [
+            "actions/checkout@v4",
+            "actions/upload-pages-artifact@v3",
+            "actions/upload-artifact@v4",
+            "actions/setup-python@v5",
+        ] {
+            assert_eq!(classify(local, &none), StepClass::Local, "{local}");
+        }
+        assert_eq!(
+            classify("actions/configure-pages@v5", &none),
+            StepClass::Stubbed
+        );
+        let generator =
+            BTreeMap::from([("static_site_generator".to_string(), Value::from("next"))]);
+        assert!(matches!(
+            classify("actions/configure-pages@v5", &generator),
+            StepClass::Confined(_)
+        ));
+        for confined in [
+            "actions/deploy-pages@v4",
+            "pypa/gh-action-pypi-publish@release/v1",
+            "actions/attest-build-provenance@v2",
+            "github/codeql-action/upload-sarif@v3",
+            "codecov/codecov-action@v5",
+        ] {
+            assert!(
+                matches!(classify(confined, &none), StepClass::Confined(_)),
+                "{confined}"
+            );
+        }
+        // Every stub is outside the confined registry.
+        for (stub, _) in LOCAL_STUBS {
+            assert!(ACTIONS.iter().all(|(prefix, _)| !stub.starts_with(prefix)));
         }
     }
 
