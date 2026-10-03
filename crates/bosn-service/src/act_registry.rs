@@ -122,6 +122,7 @@ impl RegistryActor {
     }
 }
 
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 pub(crate) fn apply(
     registry: &mut Registry,
     command: ActRegistryCommand,
@@ -284,6 +285,7 @@ mod tests {
     use kernal_api::platform::fs::TemporaryDirectory;
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
     fn daemon_intent_reply_follows_commit_and_duplicate_rolls_back() {
         let dir = TemporaryDirectory::new().unwrap();
         let path = dir.path().join("registry.sqlite3");

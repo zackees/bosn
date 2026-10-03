@@ -395,6 +395,7 @@ fn log(state: &ProxyState, method: &str, path: &str, outcome: &str) {
     }
 }
 
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 async fn handle(state: &ProxyState, request: http_server::Request) -> http_server::Response {
     let method = request.method().to_owned();
     let raw_path = request.path();

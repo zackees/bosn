@@ -166,6 +166,7 @@ pub(super) async fn recovery_control(
 /// (recording an unregistered engine's identity for cleanup only) and remove
 /// it through registry authorization. Startup recovery and `bosn ci`'s
 /// in-run cleanup share this path; a failure leaves the record pending.
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 pub(crate) async fn retire_engine(
     registry: &RegistryActor,
     engine: &DockerEngine,

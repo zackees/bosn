@@ -792,6 +792,7 @@ fn tampered_inputs_refuse_before_engine_mutation() {
 }
 
 #[test]
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn cancellation_deadline_output_and_nonzero_never_continue_to_mutation() {
     let temporary = tempfile::tempdir().unwrap();
     let workspace = temporary.path().join("workspace");

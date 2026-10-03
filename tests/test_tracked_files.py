@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ci"))
-from tracked_files import tracked_files  # noqa: E402
+from tracked_files import tracked_files
 
 
 def write(root: Path, files: dict[str, str]) -> None:

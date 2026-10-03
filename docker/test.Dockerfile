@@ -19,7 +19,7 @@ ENV UV_PROJECT_ENVIRONMENT=/venv \
     PYRIGHT_PYTHON_CACHE_DIR=/root/.cache/pyright-python \
     CARGO_HOME=/root/.cargo \
     RUSTUP_HOME=/root/.rustup \
-    CARGO_TARGET_DIR=/repo/target \
+    CARGO_TARGET_DIR=/target \
     PYTHONDONTWRITEBYTECODE=1
 
 # zackees/ci.yml GATE-005: the test guards (tests/conftest.py,

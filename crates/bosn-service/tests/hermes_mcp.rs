@@ -317,6 +317,11 @@ fn hermes_stdout(output: &std::process::Output) -> String {
 /// user-installed, pinned Hermes client and creates an isolated local daemon.
 #[test]
 #[ignore = "requires BOSN_HERMES_ACCEPTANCE=1 and Hermes Agent 0.21.0"]
+#[expect(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "baseline, ci.yml#229"
+)]
 fn hermes_agent_stdio_contract_survives_daemon_restart() {
     if env::var("BOSN_HERMES_ACCEPTANCE").as_deref() != Ok("1") {
         eprintln!("set BOSN_HERMES_ACCEPTANCE=1 to run the Hermes acceptance proof");

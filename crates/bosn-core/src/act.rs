@@ -193,6 +193,7 @@ fn unique(values: &[String]) -> Result<BTreeSet<&str>, ActAdapterError> {
     Ok(set)
 }
 impl ActAdapterV1 {
+    #[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
     pub fn validate(&self) -> Result<(), ActAdapterError> {
         if self.schema_version != ACT_ADAPTER_SCHEMA
             || self.pins.interface_schema != 1
@@ -308,6 +309,7 @@ pub fn parse_act_adapter_json(bytes: &[u8]) -> Result<ActAdapterV1, ActAdapterEr
     Ok(adapter)
 }
 /// Resolve requirements without claiming to evaluate GitHub or Act workflow ifs.
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 pub fn resolve_act_event(
     adapter: &ActAdapterV1,
     event: ActEvent,
@@ -515,6 +517,7 @@ mod conformance_tests {
         parse_act_adapter_json(&serde_json::to_vec(&adapter_document()).unwrap()).unwrap()
     }
     #[test]
+    #[expect(clippy::cognitive_complexity, reason = "baseline, ci.yml#229")]
     fn every_event_mode_combination_is_explicit() {
         for event in [ActEvent::PullRequest, ActEvent::Push, ActEvent::Release] {
             for mode in [ActMode::Minimal, ActMode::Test, ActMode::Full] {

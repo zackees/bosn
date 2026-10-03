@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "ci"))
 
-import lint_kbi  # noqa: E402
+import lint_kbi
 
 
 def codes(source: str) -> list[str]:

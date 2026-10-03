@@ -80,7 +80,11 @@ line-length = 100
 src = ["src", "tests", "ci"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+select = ["E", "F", "I", "UP", "B", "C901", "RUF100"]
+external = ["S310"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
 
 [tool.pyright]
 include = ["src", "tests", "ci"]

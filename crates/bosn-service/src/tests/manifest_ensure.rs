@@ -140,6 +140,7 @@ fn daemon_start_reproves_then_starts_only_an_exact_stopped_manifest_container() 
 }
 
 #[test]
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn daemon_start_refuses_manifest_source_drift_without_inspecting_or_starting() {
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let state = temporary.path().join("state");

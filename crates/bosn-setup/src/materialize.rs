@@ -750,6 +750,7 @@ fn verify_complete_assets(
 /// it is handed to a Docker build.  This deliberately treats the durable
 /// receipt as untrusted input: a changed file, link, extra build-context entry,
 /// or mismatched content-addressed root fails closed.
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 pub(crate) fn verify_materialized_assets(
     content_hash: &str,
     asset_root: &Path,

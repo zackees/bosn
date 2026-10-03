@@ -84,7 +84,7 @@ def _nul(data: bytes, offset: int) -> str:
     return data[offset:end].decode("utf-8", errors="strict")
 
 
-def inspect_macho(data: bytes, *, target: Target, expected_filetype: int, name: str) -> None:
+def inspect_macho(data: bytes, *, target: Target, expected_filetype: int, name: str) -> None:  # noqa: C901
     if len(data) < 32:
         fail(f"{name}: too short to be a Mach-O 64 file")
     magic, cputype, _subtype, filetype, command_count, command_size, _flags, _reserved = (

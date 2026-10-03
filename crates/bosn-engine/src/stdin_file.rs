@@ -6,6 +6,7 @@ impl DockerEngine {
     /// Stream a regular file into this exact transport's piped stdin without
     /// retaining the input in memory. This is transport only, not ownership
     /// authorization. Killing the client does not prove a remote exec stopped.
+    #[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
     pub async fn capture_with_stdin_file_async(
         &self,
         file: std::fs::File,

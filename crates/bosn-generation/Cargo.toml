@@ -23,3 +23,6 @@ tempfile = "=3.27.0"
 name = "bosn-generation-resolver-helper"
 path = "src/bin/bosn-generation-resolver-helper.rs"
 required-features = ["native-test-helper"]
+
+[lints]
+workspace = true

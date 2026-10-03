@@ -225,6 +225,7 @@ fn valid_id(id: &Value) -> bool {
     id.is_null() || id.is_string() || id.is_number()
 }
 
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn call_tool<B: Backend>(params: Value, backend: &mut B) -> Value {
     let Some(params) = params.as_object() else {
         return tool_error("tools/call params must be an object");

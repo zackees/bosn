@@ -384,6 +384,7 @@ fn setup_adoption_restores_absent_records_but_refuses_incompatible_existing_stat
 }
 
 #[test]
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn setup_ensure_generation_rollover_retires_only_prior_setup_containers() {
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let path = temporary.path().join("registry.sqlite3");

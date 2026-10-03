@@ -19,6 +19,7 @@ impl DockerSetupTaskExecutor {
     }
 }
 impl SetupTaskExecutor for DockerSetupTaskExecutor {
+    #[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
     fn execute<'a>(
         &'a self,
         request: SetupTaskJobRequest,
@@ -157,6 +158,7 @@ impl DockerSetupAppTaskExecutor {
     }
 }
 impl SetupAppTaskExecutor for DockerSetupAppTaskExecutor {
+    #[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
     fn execute<'a>(
         &'a self,
         request: SetupAppTaskJobRequest,

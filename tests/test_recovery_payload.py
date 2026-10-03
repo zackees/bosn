@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ci"))
-import recovery_payload as payload  # noqa: E402
+import recovery_payload as payload
 
 LC_LOAD_DYLIB = 0x0C
 

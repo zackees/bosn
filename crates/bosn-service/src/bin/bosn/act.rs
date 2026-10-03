@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 
 use super::ci::adapter::{self, adapter_checkout, committed_adapter_file};
 
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 pub fn run(mut arguments: impl Iterator<Item = OsString>) {
     let Some(verb) = arguments.next() else {
         fail("expected plan, payload, run, or report")

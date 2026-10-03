@@ -25,6 +25,7 @@ pub fn import_python_v4(
 
 // The callback is test-only plumbing for a deterministic replacement race.
 // Production callers always use the public wrapper above.
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 pub(crate) fn import_python_v4_inner(
     state_dir: &Path,
     source: &Path,
@@ -387,6 +388,7 @@ pub(crate) fn event_sequence(c: &Connection) -> Result<Option<i64>, Error> {
     }
     Ok(sequence)
 }
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 pub(crate) fn validate_v4_schema(c: &Connection) -> Result<(), Error> {
     let tables = import_all(
         c,

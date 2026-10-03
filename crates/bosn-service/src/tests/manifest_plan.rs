@@ -220,6 +220,7 @@ fn manifest_macos_guest_accepts_only_dockurr_digest_and_exact_storage_contract()
 }
 
 #[test]
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn manifest_dockerfile_plan_materializes_one_selected_context_and_rolls_generation() {
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let state = temporary.path().join("state");

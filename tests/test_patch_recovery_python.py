@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ci"))
-import patch_recovery_python as patcher  # noqa: E402
+import patch_recovery_python as patcher
 
 LC_LOAD_DYLIB = 0x0C
 

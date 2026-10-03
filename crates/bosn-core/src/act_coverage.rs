@@ -200,6 +200,7 @@ pub struct ActCoverageReport {
     pub documentary_only: bool,
 }
 /// All provenance fields are documentary assertions. This result cannot authorize mutations.
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 pub fn reconcile_act_coverage(
     required: &[ActRequiredCell],
     graph: &[ActGraphObservation],

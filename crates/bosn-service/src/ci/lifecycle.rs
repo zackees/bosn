@@ -380,6 +380,11 @@ const CLEANUP_BUDGET: Duration = Duration::from_secs(180);
 
 /// Run one workflow on a fresh isolated engine. Never panics on engine
 /// faults; every path ends in a cleanup attempt whose result is reported.
+#[expect(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "baseline, ci.yml#229"
+)]
 pub async fn run_on_engine(
     registry: &RegistryActor,
     backend: &dyn ActEngineBackend,

@@ -2,6 +2,11 @@
 
 use super::*;
 
+#[expect(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "baseline, ci.yml#229"
+)]
 pub(crate) async fn job_actor(
     mut jobs: Jobs,
     mut receiver: async_engine::Receiver<JobCommand>,
@@ -648,6 +653,7 @@ async fn cancel_job_in_actor(
     result
 }
 
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 pub(crate) fn launch_started_setup_jobs(
     jobs: &mut Jobs,
     requests: &mut BTreeMap<u64, SetupJobRequest>,

@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ci"))
-import verify_full_coverage as full  # noqa: E402
+import verify_full_coverage as full
 
 
 def test_all_cells_must_succeed() -> None:

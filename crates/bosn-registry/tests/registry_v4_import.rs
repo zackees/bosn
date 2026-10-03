@@ -80,6 +80,7 @@ fn v4_import_refuses_malformed_marker_before_touching_source_or_destination() {
 }
 
 #[test]
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn v4_import_preserves_retired_rows_events_and_sets_reconciliation_gate() {
     let (directory, source) = database_path();
     let destination = directory.path().join("destination.sqlite3");

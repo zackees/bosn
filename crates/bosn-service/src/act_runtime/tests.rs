@@ -96,6 +96,7 @@ mod startup_recovery {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
     fn startup_recovery_absence_faults_pages_and_seal() {
         const OWNER: &str = "11111111-2222-4333-8444-555555555555";
         for mode in [

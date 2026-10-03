@@ -271,6 +271,7 @@ pub fn resolve_images(
 /// reaps the direct client before this future returns. `options.deadline` and
 /// `options.output_limit` are budgets for the entire resolution operation,
 /// rather than budgets repeated for every inspect/pull/reinspect child.
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 pub async fn resolve_images_streaming(
     engine: &DockerEngine,
     required: &[ExternalImageIdentity],

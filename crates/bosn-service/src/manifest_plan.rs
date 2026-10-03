@@ -52,6 +52,7 @@ pub(crate) async fn manifest_stack_task_setup_plan_at(
 /// operation.  A selected task is injected only after it is proven to belong
 /// to the selected stack; this remains a finite translation to the existing
 /// typed setup primitives, not a generic manifest runner.
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 pub(crate) async fn manifest_stack_plan(
     request_workspace: &Path,
     request_manifest: &str,

@@ -16,6 +16,11 @@ use support::setup_docker::*;
 /// ownership separately for each exact name.
 #[test]
 #[ignore = "requires a local Docker daemon and the pinned Alpine image"]
+#[expect(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "baseline, ci.yml#229"
+)]
 fn live_docker_setup_gc_apply_removes_only_retired_generation() {
     let engine = DockerEngine::docker();
     let expected_image = pinned_alpine_identity(&engine);
@@ -243,6 +248,7 @@ fn live_docker_setup_gc_apply_removes_only_retired_generation() {
 /// and the exact `PINNED_ALPINE` base image to have been pre-pulled.
 #[test]
 #[ignore = "requires a local Docker daemon and the pinned Alpine image"]
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn live_docker_setup_ensure_builds_and_reuses_inline_app() {
     let engine = DockerEngine::docker();
     // Check the base before creating any Bosn state. The inline build is then
@@ -418,6 +424,7 @@ fn live_docker_setup_ensure_builds_and_reuses_inline_app() {
 /// setup document itself exists only at one HTTPS URL.
 #[test]
 #[ignore = "requires a local Docker daemon and the pinned Alpine image"]
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 fn live_docker_setup_ensure_fetches_one_https_document_then_reuses_it_offline() {
     let engine = DockerEngine::docker();
     let expected_image = pinned_alpine_identity(&engine);

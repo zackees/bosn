@@ -458,7 +458,7 @@ def install_command(installer: str, *, python: Path, wheel: Path) -> list[str]:
     return [uv, "pip", "install", "--python", str(python), "--no-deps", str(wheel)]
 
 
-def verify_installed_wheel(wheel: Path, installer: str = "uv") -> None:
+def verify_installed_wheel(wheel: Path, installer: str = "uv") -> None:  # noqa: C901
     phase("inspect wheel archive")
     assert_platform_wheel_contents(wheel)
 
