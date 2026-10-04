@@ -3217,3 +3217,20 @@ uncontrolled migration, identify every relevant writer group, preserve the
 engine-owned generation reader, and bind the control operation to the verified
 private engine. A frozen flag alone is not a source-quiescence receipt. This
 is an investigation direction, not an implemented freezer or publication proof.
+
+
+### Backing-filesystem attribution correction (2026-10-04, candidate)
+
+A source survey found that `ci/engine.rs::storage_usage` exclusively executes
+`df -Pk /var/lib/docker`. For a disk-backed anonymous volume this describes the
+whole host backing filesystem: the 1508/1830 GiB reported during gate29 is not
+that engine's allocation. The candidate labels warnings, peak logs and failure
+explanations as backing-filesystem pressure and explicitly excludes attribution
+to engine-owned bytes. The measurement and low-space thresholds are unchanged.
+
+This is a reporting correction, not an allocation implementation. Engine-owned
+allocated-byte measurement, cross-class inode deduplication and separate Docker
+backing/VHD observations remain required. Do not add these filesystem counters
+to shared-cache totals or derive deletion eligibility from them. The four storage unit tests and two affected failure/lifecycle tests passed
+in isolated Docker via `soldr cargo`; `git diff --check` passed. Review and the
+required publication gate remain pending; production remains unchanged.
