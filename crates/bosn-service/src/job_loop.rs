@@ -708,8 +708,47 @@ pub(crate) fn launch_started_setup_jobs(
             run,
         };
         let manifest_registry = registry.clone();
+        let state_dir = executors.state_dir.clone();
         tasks.spawn(async move {
-            let (logs, mut log_receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
+            let (text_logs, mut log_receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
+            let logs = if let Some(state_dir) = state_dir {
+                let raw = async {
+                    let run_id = ci::wire::new_uuid().await.map_err(|e| e.message)?;
+                    let raw = crate::raw_run_log::RawRunLog::create(&state_dir, &run_id)
+                        .map_err(|e| e.to_string())?;
+                    Ok::<_, String>(raw)
+                }
+                .await;
+                match raw {
+                    Ok(raw) => {
+                        let path = raw.root().display().to_string();
+                        let sink = crate::raw_run_log::JobLogSink::durable(text_logs, raw);
+                        let _ = sink.send(format!("[bosn] raw output: {path}")).await;
+                        sink
+                    }
+                    Err(error) => {
+                        let kind = match request {
+                            SetupJobRequest::Prepare(_) => SetupJobKind::Prepare,
+                            SetupJobRequest::Task(_) => SetupJobKind::Task,
+                            SetupJobRequest::AppTask(_) => SetupJobKind::AppTask,
+                            SetupJobRequest::Ensure(_) => SetupJobKind::Ensure,
+                            SetupJobRequest::ManifestEnsure(_) => SetupJobKind::ManifestEnsure,
+                            SetupJobRequest::ManifestConverge(_) => SetupJobKind::ManifestConverge,
+                            SetupJobRequest::ManifestAppTask(_) => SetupJobKind::ManifestAppTask,
+                        };
+                        let _ = task_sender
+                            .send(JobCommand::Completed {
+                                id,
+                                kind,
+                                result: Err(format!("could not create raw run log: {error}")),
+                            })
+                            .await;
+                        return;
+                    }
+                }
+            } else {
+                crate::raw_run_log::JobLogSink::transient(text_logs)
+            };
             let log_sender = task_sender.clone();
             let forwarder = async_engine::launch(async move {
                 while let Some(line) = log_receiver.recv().await {
@@ -853,7 +892,7 @@ pub(crate) async fn execute_manifest_converge(
     request: ManifestConvergeJobRequest,
     executor: &dyn ManifestEnsureExecutor,
     cancellation: &async_engine::CancellationToken,
-    logs: &async_engine::Sender<String>,
+    logs: &crate::raw_run_log::JobLogSink,
     registry: &RegistryActor,
     job_sender: &async_engine::Sender<JobCommand>,
 ) -> Result<String, String> {

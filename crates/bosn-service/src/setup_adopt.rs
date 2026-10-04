@@ -23,7 +23,7 @@ impl SetupAdoptExecutor for DockerSetupAdoptExecutor {
         &'a self,
         request: SetupAdoptRequest,
         cancellation: &'a async_engine::CancellationToken,
-        logs: &'a async_engine::Sender<String>,
+        logs: &'a crate::raw_run_log::JobLogSink,
     ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>> {
         Box::pin(async move {
             if !request.confirm {
@@ -145,7 +145,7 @@ pub(crate) async fn execute_setup_ensure_pipeline<E: SetupImageEngine + SetupEns
     pipeline: &SetupEnsurePipeline<'_>,
     cancellation: &async_engine::CancellationToken,
     events: &async_engine::Sender<EngineEvent>,
-    logs: &async_engine::Sender<String>,
+    logs: &crate::raw_run_log::JobLogSink,
 ) -> Result<PreparedSetupEnsure, String> {
     if cancellation.is_cancelled() {
         return Err("setup ensure cancelled".into());

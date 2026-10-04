@@ -146,7 +146,7 @@ pub trait SetupPrepareExecutor: Send + Sync {
         &'a self,
         request: SetupPrepareRequest,
         cancellation: &'a async_engine::CancellationToken,
-        logs: &'a async_engine::Sender<String>,
+        logs: &'a crate::raw_run_log::JobLogSink,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
 }
 
@@ -158,7 +158,7 @@ pub trait SetupTaskExecutor: Send + Sync {
         &'a self,
         request: SetupTaskJobRequest,
         cancellation: &'a async_engine::CancellationToken,
-        logs: &'a async_engine::Sender<String>,
+        logs: &'a crate::raw_run_log::JobLogSink,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
 }
 
@@ -170,7 +170,7 @@ pub trait SetupAppTaskExecutor: Send + Sync {
         &'a self,
         request: SetupAppTaskJobRequest,
         cancellation: &'a async_engine::CancellationToken,
-        logs: &'a async_engine::Sender<String>,
+        logs: &'a crate::raw_run_log::JobLogSink,
         session: &'a dyn SetupAppTaskSessionRecorder,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
 }
@@ -202,7 +202,7 @@ pub trait SetupEnsureExecutor: Send + Sync {
         &'a self,
         request: SetupEnsureJobRequest,
         cancellation: &'a async_engine::CancellationToken,
-        logs: &'a async_engine::Sender<String>,
+        logs: &'a crate::raw_run_log::JobLogSink,
     ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>>;
 }
 /// Testable semantic boundary for a single manifest stack ensure. It receives
@@ -212,7 +212,7 @@ pub trait ManifestEnsureExecutor: Send + Sync {
         &'a self,
         request: ManifestEnsureJobRequest,
         cancellation: &'a async_engine::CancellationToken,
-        logs: &'a async_engine::Sender<String>,
+        logs: &'a crate::raw_run_log::JobLogSink,
         registry: &'a RegistryActor,
     ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>>;
 }
@@ -223,7 +223,7 @@ pub trait ManifestAppTaskExecutor: Send + Sync {
         &'a self,
         request: ManifestAppTaskJobRequest,
         cancellation: &'a async_engine::CancellationToken,
-        logs: &'a async_engine::Sender<String>,
+        logs: &'a crate::raw_run_log::JobLogSink,
         session: &'a dyn ManifestAppTaskSessionRecorder,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
 }
@@ -318,7 +318,7 @@ pub trait SetupAdoptExecutor: Send + Sync {
         &'a self,
         request: SetupAdoptRequest,
         cancellation: &'a async_engine::CancellationToken,
-        logs: &'a async_engine::Sender<String>,
+        logs: &'a crate::raw_run_log::JobLogSink,
     ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>>;
 }
 

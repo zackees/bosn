@@ -20,7 +20,7 @@ impl SetupPrepareExecutor for DockerSetupPrepareExecutor {
         &'a self,
         request: SetupPrepareRequest,
         cancellation: &'a async_engine::CancellationToken,
-        logs: &'a async_engine::Sender<String>,
+        logs: &'a crate::raw_run_log::JobLogSink,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
             let deadline = async_engine::Deadline::after(request.deadline);
@@ -93,7 +93,7 @@ impl SetupEnsureExecutor for DockerSetupEnsureExecutor {
         &'a self,
         request: SetupEnsureJobRequest,
         cancellation: &'a async_engine::CancellationToken,
-        logs: &'a async_engine::Sender<String>,
+        logs: &'a crate::raw_run_log::JobLogSink,
     ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>> {
         Box::pin(async move {
             // The two engine stages receive disjoint portions of one caller

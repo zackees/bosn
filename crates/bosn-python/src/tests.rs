@@ -1,11 +1,11 @@
 use super::*;
 #[cfg(feature = "embedded-python-tests")]
 use bosn_service::{
-    Service, SetupEnsureExecution, SetupEnsureExecutor, SetupEnsureImageResource,
+    JobLogSink, Service, SetupEnsureExecution, SetupEnsureExecutor, SetupEnsureImageResource,
     SetupEnsureResource, SetupPrepareExecutor, SetupTaskExecutor,
 };
 #[cfg(feature = "embedded-python-tests")]
-use kernal_api::async_engine::{self, CancellationToken, RuntimeBuilder, Sender};
+use kernal_api::async_engine::{self, CancellationToken, RuntimeBuilder};
 #[cfg(feature = "embedded-python-tests")]
 use std::{
     future::Future,
@@ -66,7 +66,7 @@ impl SetupPrepareExecutor for FakeSetupExecutor {
         &'a self,
         _request: SetupPrepareRequest,
         cancellation: &'a CancellationToken,
-        logs: &'a Sender<String>,
+        logs: &'a JobLogSink,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
             self.started.fetch_add(1, Ordering::SeqCst);
@@ -107,7 +107,7 @@ impl SetupTaskExecutor for FakeSetupTaskExecutor {
         &'a self,
         _request: SetupTaskJobRequest,
         cancellation: &'a CancellationToken,
-        logs: &'a Sender<String>,
+        logs: &'a JobLogSink,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
             self.started.fetch_add(1, Ordering::SeqCst);
@@ -148,7 +148,7 @@ impl SetupEnsureExecutor for FakeSetupEnsureExecutor {
         &'a self,
         request: SetupEnsureJobRequest,
         cancellation: &'a CancellationToken,
-        logs: &'a Sender<String>,
+        logs: &'a JobLogSink,
     ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>> {
         Box::pin(async move {
             self.started.fetch_add(1, Ordering::SeqCst);
@@ -287,10 +287,11 @@ fn python_client_submits_and_observes_fake_setup_job_without_docker() {
 
             wait_for(|| executor.started.load(Ordering::SeqCst) == 1).await;
             let page = wait_for_python_logs(&state, first).await;
-            assert_eq!(page.records.len(), 1);
+            assert_eq!(page.records.len(), 2);
             assert_eq!(page.records[0].cursor, 0);
-            assert_eq!(page.records[0].line, "[fake] setup preparation started");
-            assert_eq!(page.next, 1);
+            assert!(page.records[0].line.starts_with("[bosn] raw output: "));
+            assert_eq!(page.records[1].line, "[fake] setup preparation started");
+            assert_eq!(page.next, 2);
             assert!(!page.gap);
 
             let python_state = state.clone();
@@ -495,7 +496,8 @@ fn python_client_submits_and_cancels_coalesced_fake_setup_ensure_without_docker(
 
             wait_for(|| executor.started.load(Ordering::SeqCst) == 1).await;
             let page = wait_for_python_logs(&state, first).await;
-            assert_eq!(page.records[0].line, "[fake] setup ensure started");
+            assert!(page.records[0].line.starts_with("[bosn] raw output: "));
+            assert_eq!(page.records[1].line, "[fake] setup ensure started");
 
             let python_state = state.clone();
             std::thread::spawn(move || {
@@ -695,7 +697,7 @@ async fn wait_for_python_logs(state: &Path, id: u64) -> JobLogPage {
         .join()
         .expect("Python logs thread panicked")
         .unwrap();
-        if !page.records.is_empty() {
+        if page.records.len() >= 2 {
             return page;
         }
         async_engine::sleep(Duration::from_millis(10)).await;
