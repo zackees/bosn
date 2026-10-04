@@ -263,6 +263,9 @@ jobs:
 
   collect:
     name: Collect and verify the release set
+    permissions:
+      actions: read
+      contents: read
     needs: [guard, native-wheel, darwin-wheel, darwin-hosted-smoke]
     if: needs.guard.outputs.release == 'true'
     env:
@@ -289,6 +292,20 @@ jobs:
       - name: Exactly the four platform wheels, at the tagged version
         run: python ci/verify_release.py wheels --tag "$RELEASE_TAG" dist
 
+      - name: Download the desktop archive from the exact full CI run
+        uses: actions/download-artifact@v4
+        with:
+          name: bosn-widget-linux-${{ needs.guard.outputs.sha }}
+          run-id: ${{ inputs.full_ci_run_id }}
+          github-token: ${{ github.token }}
+          path: widget-dist
+
+      - name: Verify desktop archive source, version and checksums
+        env:
+          RELEASE_SHA: ${{ needs.guard.outputs.sha }}
+        run: |
+          python ci/widget_artifact.py verify "widget-dist/bosn-widget-${RELEASE_TAG}-x86_64-unknown-linux-gnu.tar.gz" --version "${RELEASE_TAG#v}" --source-sha "$RELEASE_SHA"
+
       - name: Package metadata renders on PyPI
         run: uv run --no-project --with twine twine check --strict dist/*
 
@@ -306,6 +323,12 @@ jobs:
         with:
           name: bosn-release-${{ env.RELEASE_TAG }}
           path: dist/*.whl
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bosn-desktop-${{ env.RELEASE_TAG }}
+          path: widget-dist/*
           if-no-files-found: error
 
   publish-pypi:
@@ -385,6 +408,11 @@ jobs:
           name: bosn-release-${{ env.RELEASE_TAG }}
           path: dist
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: bosn-desktop-${{ env.RELEASE_TAG }}
+          path: widget-dist
+
       # The tag is created here, by `--target`, after the guard's full-CI check.
       - name: Create, or verify the existing release's assets
         shell: bash
@@ -397,11 +425,11 @@ jobs:
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             existing="$(mktemp -d)"
             gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$existing"
-            for wheel in dist/*.whl; do
-              cmp "$wheel" "$existing/$(basename "$wheel")"
+            for asset in dist/*.whl widget-dist/*; do
+              cmp "$asset" "$existing/$(basename "$asset")"
             done
           else
-            gh release create "$RELEASE_TAG" dist/*.whl \
+            gh release create "$RELEASE_TAG" dist/*.whl widget-dist/* \
               --repo "$GITHUB_REPOSITORY" --target "$RELEASE_SHA" --generate-notes
           fi
           if [[ "$PYPI_RESULT" == "skipped" ]]; then

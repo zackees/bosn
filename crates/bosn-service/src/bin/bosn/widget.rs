@@ -8,6 +8,8 @@ use std::{
     process::{Command, Stdio},
 };
 
+#[path = "widget/artifact.rs"]
+mod artifact;
 #[path = "widget/desktop.rs"]
 mod desktop;
 
@@ -21,6 +23,9 @@ fn fail(message: &str) -> ! {
 
 /// `bosn-widget` beside this binary, else on `PATH`.
 pub fn widget_binary() -> Option<PathBuf> {
+    if let Some(installed) = artifact::installed_path().filter(|path| path.is_file()) {
+        return Some(installed);
+    }
     let name = if cfg!(windows) {
         "bosn-widget.exe"
     } else {
@@ -147,12 +152,13 @@ pub fn run(mut arguments: impl Iterator<Item = OsString>) {
         }
     }
     let state_dir = state_dir.unwrap_or_else(bosn_service::mcp::default_state_dir);
+    if install {
+        let binary = artifact::install().unwrap_or_else(|error| fail(&error.to_string()));
+        return install_unit(&binary, &state_dir);
+    }
     let binary = widget_binary().unwrap_or_else(|| {
         fail("bosn-widget is not installed (it ships with desktop builds; see docs/ci.md)")
     });
-    if install {
-        return install_unit(&binary, &state_dir);
-    }
     if detach {
         spawn_detached(&binary, &state_dir, false).unwrap_or_else(|e| fail(&e.to_string()));
         return;

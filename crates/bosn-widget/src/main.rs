@@ -48,6 +48,18 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() {
+    // Release verification works without a display, daemon or instance lock.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--build-info")) {
+        println!(
+            "{}",
+            serde_json::json!({
+                "version": env!("BOSN_WIDGET_VERSION"),
+                "source_sha": env!("BOSN_WIDGET_SOURCE_SHA"),
+                "target": env!("BOSN_WIDGET_TARGET"),
+            })
+        );
+        return;
+    }
     let args = match parse_args() {
         Ok(args) => args,
         Err(message) => {

@@ -505,6 +505,21 @@ jobs:
           soldr cargo clippy --manifest-path crates/bosn-widget/Cargo.toml --locked --all-targets -- -D warnings
           soldr cargo test --manifest-path crates/bosn-widget/Cargo.toml --locked
 
+      - name: Build and verify source-bound Linux desktop archive
+        env:
+          BOSN_WIDGET_SOURCE_SHA: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
+        run: |
+          soldr cargo build --release --manifest-path crates/bosn-widget/Cargo.toml --locked
+          version="$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          python ci/widget_artifact.py stage crates/bosn-widget/target/release/bosn-widget --version "$version" --source-sha "$BOSN_WIDGET_SOURCE_SHA"
+
+      - name: Retain exact-candidate desktop release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bosn-widget-linux-${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
+          path: widget-dist/*
+          if-no-files-found: error
+
   full-coverage:
     name: Full CI coverage (exact candidate SHA)
     if: ${{ !cancelled() && needs.select-tier.outputs.full == 'true' }}
