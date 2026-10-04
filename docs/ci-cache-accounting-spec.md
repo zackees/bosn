@@ -3043,3 +3043,32 @@ engines; it does not enable the new production generation profile, metadata-only
 overlay mount, quiescent successor publication or whole-machine scheduling.
 The default engine still follows the inspected legacy copy path until those
 production changes are implemented and verified.
+
+
+### Released-binary workflow verification (2026-10-04)
+
+The same actual hosted-runner workflow fixture was repeated with the verified
+released Linux x64 binary from `v0.2.89-act2.8`, rather than the source-built
+prototype CLI. Its binary SHA-256 is
+`743c13bf6c8ee8ff948a14f940f6d1033ab4e09d11d29d94fda8e1bbaeea8628`.
+All three jobs passed: two dependent jobs in one engine shared their writable
+cache, and a fresh second engine began with the same warm immutable payload.
+The first engine's settings mutation was visible to its dependent job and
+did not change the shared lower or the fresh engine's initial settings.
+
+All jobs read the same 16 MiB payload digest
+`811e721a3e02f4407710f89f854e913d9f5f661104f7e41c8610c58b13705f9d`.
+The upper payload had zero allocated blocks in both engines, despite hosted
+runner ownership setup; their final upper allocations were 20 KiB and 12 KiB.
+The fixture verified the metadata-only overlay mount mode. Both exact engine
+IDs and the shared lower volume were removed after checking their original
+experiment ownership labels. Evidence: local audit artifacts
+`retention-toolcache-cow-released-v8-workflow.{py,json,log}`.
+
+This verifies the released executable against the private workflow fixture.
+It does not activate production generation admission, prove daemon recovery
+or completed-install publication, measure the real 7.7 GiB cache's admission
+cost, or establish machine-wide accounting and automatic expiry. Production
+still installs act after engine startup and uses the whole-tree tool seed.
+The next implementation must change that startup and recovery contract before
+replacing the production seed with the verified shared-generation overlay.
