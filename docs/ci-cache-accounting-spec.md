@@ -1095,3 +1095,27 @@ Clippy passed, and the existing reviewer found no blocking issues. These tests
 use typed receipt fixtures: they do not prove actual automatic migration,
 durable migration receipts, peer exclusion or supervision. Act2 cold-cutover
 correction is tracked in PR #27; full CI is still running.
+
+### Participating legacy cache lifetime lease (candidate)
+
+Workflow and act-list invocations now acquire a shared FD 8 lock on
+`/bosn/cache/actcache/.legacy-migration.lock` before executing act. The descriptor
+survives exec and spans the server lifetime; OS process death releases it.
+Independent readers can run concurrently. New cached engine profiles freeze
+`SharedLegacyLeaseV1` and advertise the corresponding coordination label.
+Historical profiles omit the optional field, preserving their identity digest.
+
+The isolated process test passed (0.11 seconds): two readers coexist, exclusive
+migration is refused while either lives, killing the last reader releases the
+lease, and literal arguments survive the shell boundary. Engine tests passed
+(19), registry lifecycle tests passed (18), and spare tests passed (5). The
+existing historical digest assertion passed unchanged. Strict service
+all-target Clippy passed.
+
+This coordinates participating writers only. Older or unknown peers have no
+proven exclusion; instant inventory absence cannot prevent their future
+admission. Automatic migration remains guarded. Real workflow execution with
+the new wrapper, durable migration receipt reconciliation and watcher
+supervision remain unverified. Act2 PR #27 merged as
+`d874c3b6e9518e11c3137da8dd810f1f3f361db1`; exact-merge full CI run
+37188971746 is in progress, so the correction is not yet released.

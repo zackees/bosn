@@ -30,6 +30,12 @@ impl ActEngineTmpfsPolicy {
         matches!(self, Self::StorageExecRunTmpNoexecV1)
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActCacheCoordination {
+    SharedLegacyLeaseV1,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActEngineCreationProfile {
@@ -47,6 +53,9 @@ pub struct ActEngineCreationProfile {
     /// unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_volume: Option<ActEngineCacheVolume>,
+    /// Absent in historical profiles; their serialized identity stays unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_coordination: Option<ActCacheCoordination>,
 }
 /// A frozen named-volume mount: Docker's `local` driver, read-write, at
 /// `target`. The volume's ownership is verified before creation and the
@@ -97,6 +106,9 @@ impl ActEngineCacheVolume {
 }
 impl ActEngineCreationProfile {
     pub fn validate(&self) -> Result<(), Error> {
+        if self.cache_coordination.is_some() && self.cache_volume.is_none() {
+            return Err(Error::BadRow("cache coordination without shared cache"));
+        }
         if let Some(cache) = &self.cache_volume {
             cache.validate()?;
         }
@@ -310,6 +322,12 @@ impl ActEngineIntent {
             labels.insert("com.zackees.bosn.act.spare".into(), "true".into());
         }
         if let Some(profile) = &self.creation_profile {
+            if profile.cache_coordination.is_some() {
+                labels.insert(
+                    "com.zackees.bosn.act.cache-coordination".into(),
+                    "shared-legacy-lease-v1".into(),
+                );
+            }
             labels.insert(
                 "com.zackees.bosn.act.creation-profile-sha256".into(),
                 profile.digest()?,

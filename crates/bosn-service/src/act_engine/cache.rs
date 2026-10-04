@@ -39,6 +39,9 @@ pub(crate) fn creation_profile_with_cache(
     cache: Option<ActEngineCacheVolume>,
 ) -> Result<ActEngineCreationProfile, ActEngineError> {
     let mut profile = creation_profile(limits)?;
+    profile.cache_coordination = cache
+        .as_ref()
+        .map(|_| bosn_registry::act::ActCacheCoordination::SharedLegacyLeaseV1);
     profile.cache_volume = cache;
     profile
         .validate()

@@ -26,6 +26,7 @@ mod cache_usage;
 pub use cache_usage::HelperCleanupRetry;
 #[cfg(all(test, unix))]
 mod cache_usage_transport_tests;
+mod legacy_lease;
 mod lines;
 mod runner_tools;
 mod toolcache;
@@ -542,7 +543,7 @@ impl DockerActBackend {
             args.push(key.clone());
         }
         args.push(engine.into());
-        args.push(format!("{ENGINE_WORK}/bin/act"));
+        args.extend(legacy_lease::command());
         args
     }
 }

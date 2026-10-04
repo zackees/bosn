@@ -174,6 +174,7 @@ pub(crate) fn creation_profile(
         tmpfs_policy: limits.storage.policy(),
         init_command_sha256: command_digest(&engine_command())?,
         cache_volume: None,
+        cache_coordination: None,
     };
     profile
         .validate()

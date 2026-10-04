@@ -15,6 +15,7 @@ fn profile() -> ActEngineCreationProfile {
         tmpfs_policy: ActEngineTmpfsPolicy::StorageExecRunTmpNoexecV1,
         init_command_sha256: "a".repeat(64),
         cache_volume: None,
+        cache_coordination: None,
     }
 }
 fn intent() -> ActEngineIntent {
