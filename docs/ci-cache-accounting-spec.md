@@ -2540,3 +2540,65 @@ retirement must protect the selected generation and live readers, account before
 and after deletion, and preserve unknown/corrupt state. Generation/object/stage
 expiry, whole-machine accounting, old engine/image expiry and scoped builder
 pressure remain required. No shared object was deleted for this accounting slice.
+
+
+### Coordinated generation retirement (act2 PR #35)
+
+Implementation: https://github.com/zackees/act2/pull/35, candidate
+`f8709458548f5510264babb96f58baee6a0b9c15` (unreleased). Linux API
+`RetireToolGeneration(ctx, root, id, maxBytes)` removes one explicitly eligible
+unselected generation. The caller must establish age/pressure eligibility; this
+API does not choose candidates or implement an automated retention policy.
+
+The original catalog writer stays held while validating the current selection
+and its complete payload/reader coordination, validating the candidate manifest
+and complete tree, collecting bounded store metadata, and acquiring the original
+candidate reader mutex exclusively. Selection, admission and participating
+publication cannot race this decision. Selected generations and live reader
+holders are refused. Missing/corrupt selection or coordination is preserved and
+refused. Candidate control layout must contain exactly the canonical tree,
+manifest and reader mutex; unknown entries are preserved. Immutable shared
+objects are never removed by this primitive.
+
+Mount safety requires more than device identity. A same-filesystem bind mount
+can preserve expected metadata/hashes while exposing a shared object to recursive
+deletion. Independent review found this hazard in the initial implementation.
+The correction compares Linux statx mount IDs for the store root, generation
+namespace, candidate and every bounded descendant, without following symlinks.
+Unavailable mount identity or any boundary causes refusal before deletion.
+Production must exclude nonparticipating mount changes and writers during this
+operation; this is not a defense against a privileged actor changing mounts after
+validation. Both original coordination locks remain held through removal and
+parent-directory sync. An error can follow partial deletion or lost durability
+acknowledgement: reclaimed bytes must come from a fresh accounting observation,
+never the logical generation size or a boolean return value.
+
+Verified evidence:
+
+- Focused regression was RED because retirement did not exist, then GREEN:
+  selected generation stays intact, live reader prevents retirement, closing that
+  reader permits old-generation removal, current selection remains valid, and
+  the shared immutable object remains present.
+- Lost selection, unknown control entries and missing reader coordination refuse
+  deletion. Mount-ID refusal also has a deterministic injected-boundary test.
+- A real same-device bind mount in an owned isolated container was refused;
+  source/target device IDs agreed and the mounted shared object remained fully
+  valid afterward. The container had no host binds or network and was removed.
+- Exact-source gate passed in 21.68 seconds against all 2,569 exported files before
+  and after complete artifactcache tests, focused command tests, vet/lint with zero
+  findings, and Darwin/Windows compilation. Tree:
+  `c3539145d22d2bed423b87622dfc9faa7611e1f4`. The first final gate caught an
+  unchecked test unmount error; teardown now checks it. Cumulative independent
+  review changed from CHANGES REQUESTED to PASS after mount protection.
+- Private artifacts: `act2-generation-retirement-red.log`,
+  `act2-generation-retirement-actual-bind-mount.log`, and
+  `act2-generation-retirement-source-bound-gate.json`/`.log`.
+
+**Remaining required work:** Automated age/pressure selection, object expiry,
+owned-stage expiry, measured physical before/after reclamation and convergence,
+protected-overflow reporting and bounded retry after partial retirement. This
+API has no production Bosn caller yet. Selected-generation intent/reader handoff,
+engine lifetime/recovery integration, large-store admission cost, cross-class
+machine accounting, old image/container expiry and scoped builder pressure all
+remain open. PR #35 needs remote CI/merge and an exact-default-branch full-CI
+release before Bosn can pin and activate it.
