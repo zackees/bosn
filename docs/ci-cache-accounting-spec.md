@@ -466,3 +466,19 @@ The synthetic volume was then removed; the retained cache was preserved.
 The registry read-only handle now exposes the same bounded engine-record decoder
 as the writer handle (one row, at most 32 KiB), including registry-owner checks.
 The persisted cleanup-required correlation test verifies this read-only API.
+
+### Concurrent shared-input staging (local candidate)
+
+The act tarball and runner-image tar previously staged as `<path>.$$`. Shell
+PIDs are container-local, so distinct engines can collide on the same shared
+staging file. Both paths now use `mktemp` in the destination directory, followed
+by validation/save and atomic rename. A normal shell exit cleans the unique
+stage. Abrupt engine death can still leave a stage; stale-stage expiry and
+coordination to avoid redundant concurrent downloads remain open. The focused
+cache-script test passes. A live primitive probe ran two separate network-disabled
+containers against one synthetic volume: both had shell PID 1 and the identical
+legacy `/stage/input.1` path, while `mktemp` returned distinct shared-volume paths.
+The synthetic containers and volume were removed afterward. This proves the
+cross-container naming fix, not concurrent full artifact-download behavior or
+crash-stage expiry. Strict Clippy for all service targets and source-length/diff
+checks pass.

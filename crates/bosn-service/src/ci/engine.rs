@@ -819,8 +819,9 @@ fn install_act_script(act: ActArtifact) -> String {
     format!(
         "tgz={ENGINE_CACHE}/tools/act-{ACT_VERSION}-{sum}.tgz; mkdir -p {ENGINE_CACHE}/tools; \
          if ! echo \"{sum}  $tgz\" | sha256sum -c - >/dev/null 2>&1; then \
-           wget -q -O \"$tgz.$$\" '{url}' && \
-           echo \"{sum}  $tgz.$$\" | sha256sum -c - >/dev/null && mv \"$tgz.$$\" \"$tgz\"; \
+           stage=$(mktemp \"$tgz.XXXXXXXX\"); trap 'rm -f \"$stage\"' EXIT; \
+           wget -q -O \"$stage\" '{url}' && \
+           echo \"{sum}  $stage\" | sha256sum -c - >/dev/null && mv \"$stage\" \"$tgz\"; \
          fi; \
          tar -xzf \"$tgz\" -C {ENGINE_WORK}/bin act && \
          echo \"{binary}  {ENGINE_WORK}/bin/act\" | sha256sum -c - >/dev/null && \
@@ -849,7 +850,9 @@ fn load_runner_script() -> String {
          if ! {{ [ -f \"$tar\" ] && docker load -q -i \"$tar\" >/dev/null; }}; then \
            docker pull -q --platform linux/amd64 {RUNNER_IMAGE} >/dev/null && \
            docker tag {RUNNER_IMAGE} {tag} && \
-           docker save --platform linux/amd64 -o \"$tar.$$\" {tag} && mv \"$tar.$$\" \"$tar\"; \
+           stage=$(mktemp \"$tar.XXXXXXXX\") && \
+           trap 'rm -f \"$stage\"' EXIT && \
+           docker save --platform linux/amd64 -o \"$stage\" {tag} && mv \"$stage\" \"$tar\"; \
          fi; \
          docker image inspect {tag} >/dev/null"
     )
@@ -941,7 +944,7 @@ mod tests {
         assert!(install.contains("sha256sum -c"));
         let load = load_runner_script();
         assert!(load.contains("docker load") && load.contains(RUNNER_IMAGE));
-        assert!(load.contains("mv \"$tar.$$\" \"$tar\""), "atomic rename");
+        assert!(load.contains("mv \"$stage\" \"$tar\""), "atomic rename");
         let reload = reload_runner_script();
         assert!(reload.starts_with(&format!("rm -f {}", runner_tar())) && reload.ends_with(&load));
         assert!(
