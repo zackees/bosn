@@ -3314,3 +3314,24 @@ Primary source review passed; act2 PR #47 is open with full platform CI
 running. Release is pending: this candidate is not in act2.8 or Bosn's pin. It does not remove full payload hashing or prove concurrent wall-time
 improvement for 7.7 GiB trees. Production frozen selection, reader handoff,
 shared overlay, source quiescence, and automatic retention remain required.
+
+
+The native admission candidate also passed a real CLI concurrency comparison
+against the verified released act2.8 Linux binary on the same warm 1 GiB
+private tmpfs generation. Three simultaneous admissions per trial, three trials:
+act2.8 admitted 3/9 and refused the other 6 with catalog `timeout`; candidate
+`071d4299993b862aed724fd5da69bf166f792172` admitted 9/9. Candidate batch
+wall times were 0.967, 1.027 and 1.060 seconds, including Docker client overhead.
+All successful commands verified a nonempty inherited reader FD environment
+value. Candidate binary SHA-256:
+`61de1050ac88da869fd1dba0b49b30e6ce97b9a8dbaa70c413d3f96fdfcce1de`.
+
+Evidence: `.git/retention-native-admission-concurrent-runtime.{py,json,log}`.
+This is an actual simultaneous CLI admission test, not a production Bosn
+workflow or PID1 lifetime test. It confirms catalog contention can fail warm
+admission even on a 1 GiB tree, and that shortening exclusion resolves those
+observed failures without dropping payload validation. It does not establish
+cold-disk scaling, general starvation bounds, many-engine pressure limits,
+7.7 GiB performance, or complete gates under 60 seconds. The whole artifact-cache
+package passed with the race detector (22.734 seconds), including retention
+coverage, after the focused generation tests.
