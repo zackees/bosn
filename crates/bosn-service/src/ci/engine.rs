@@ -45,6 +45,7 @@ pub use maintenance_loop::MaintenanceTick;
 pub use migration::ImportAttempt;
 mod act_install;
 mod readiness;
+mod tool_recovery;
 use act_install::act_archive;
 pub(crate) use act_install::install_act_script;
 mod lines;

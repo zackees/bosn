@@ -63,7 +63,8 @@ impl ActToolRecoveryIntent {
         })
     }
 
-    pub(super) fn validate_record(&self, record: &ActEngineRecord) -> Result<(), Error> {
+    /// Recheck the frozen identity against its containing durable engine record.
+    pub fn validate_record(&self, record: &ActEngineRecord) -> Result<(), Error> {
         if *self != Self::from_record(record, self.created_at_seconds, self.expires_at_seconds)?
             || self.created_at_seconds as f64 > record.updated_at
             || (self.created_at_seconds as f64) < record.intent.created_at.floor()
