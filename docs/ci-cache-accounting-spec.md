@@ -2602,3 +2602,24 @@ engine lifetime/recovery integration, large-store admission cost, cross-class
 machine accounting, old image/container expiry and scoped builder pressure all
 remain open. PR #35 needs remote CI/merge and an exact-default-branch full-CI
 release before Bosn can pin and activate it.
+
+
+#### Physical reclamation evidence for the pressure loop
+
+A private Docker regression published a one-MiB object, selected a generation
+with one reference, then selected a successor with two references to that same
+inode. Retiring the unselected predecessor reduced observed allocated store
+bytes from 1,118,208 to 1,097,728: only 20,480 bytes were reclaimed, while the
+1,048,576-byte shared payload stayed allocated and valid. The selected successor
+and object retain three payload paths sharing one inode. The test checks positive
+metadata reclamation smaller than the payload, retained unique payload bytes,
+and reference-minus-unique bytes of two MiB; it does not require these exact
+filesystem-dependent allocation totals. Evidence:
+`act2-generation-reclamation-evidence.log`.
+
+The retention pressure loop must therefore use a fresh complete physical scan
+after each mutation, including partial deletion, and continue toward its target
+only while eligible candidates remain. Logical generation size is not a predicted
+reclamation credit. Reaching a protected/unknown-only remainder above the cap must
+report protected overflow rather than deleting selected/live/unknown state or
+claiming convergence. This loop and object retirement are not implemented yet.
