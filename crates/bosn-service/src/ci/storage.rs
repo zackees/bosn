@@ -116,7 +116,10 @@ pub fn low_warning(usage: StorageUsage) -> String {
 
 /// The log line closing a run's sampling.
 pub fn peak_note(peak: StorageUsage) -> String {
-    format!("engine storage backing filesystem peaked at {} (filesystem-wide; not engine-owned bytes)", peak.describe())
+    format!(
+        "engine storage backing filesystem peaked at {} (filesystem-wide; not engine-owned bytes)",
+        peak.describe()
+    )
 }
 
 /// Why a failed run may have failed, when its storage ran low.
@@ -199,7 +202,10 @@ mod tests {
     #[test]
     fn a_failed_run_on_low_storage_says_so_and_names_the_setting() {
         let reason = failure_reason(usage(20.0, 16.0)).unwrap();
-        assert!(reason.contains("storage backing filesystem ran low"), "{reason}");
+        assert!(
+            reason.contains("storage backing filesystem ran low"),
+            "{reason}"
+        );
         assert!(reason.contains("16.0 of 20.0 GiB used, 4.0 GiB free"));
         assert!(reason.contains("storage_gib"));
         assert_eq!(failure_reason(usage(36.0, 16.0)), None);
