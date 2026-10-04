@@ -44,6 +44,10 @@ pub struct Section {
     pub first_seq: Option<u64>,
     pub last_seq: Option<u64>,
     pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
     /// Exit code reported for a failing step, when the provider names one.
     pub exit_code: Option<i32>,
 }
@@ -64,6 +68,12 @@ pub struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub sections: Vec<Section>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -168,6 +178,9 @@ impl RunTree {
                 conclusion: None,
                 reason: None,
                 sections: Vec::new(),
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
             });
         }
         tree
@@ -294,6 +307,8 @@ impl RunTree {
                         first_seq: None,
                         last_seq: None,
                         duration_ms: None,
+                        started_at: None,
+                        completed_at: None,
                         exit_code: None,
                     },
                 );
@@ -413,18 +428,14 @@ impl ActParser {
         if job.status == ItemStatus::Queued {
             job.status = ItemStatus::InProgress;
         }
+        job.observe_start(act.time.as_deref());
         if notice == Notice::Unsupported {
             job.status = ItemStatus::Completed;
             job.conclusion = Some(ItemConclusion::Unsupported);
         }
         // An unsupported leg stays unsupported: bosn's gate step for it
         // ([`super::matrix_runner`]) ends in a successful job.
-        if let Some(result) = act.job_result
-            && job.conclusion != Some(ItemConclusion::Unsupported)
-        {
-            job.status = ItemStatus::Completed;
-            job.conclusion = Some(result.into());
-        }
+        job.observe_result(act.job_result, act.time.as_deref());
         let section = act.step().and_then(|step| {
             let index = match job
                 .sections
@@ -442,6 +453,8 @@ impl ActParser {
                         first_seq: None,
                         last_seq: None,
                         duration_ms: None,
+                        started_at: None,
+                        completed_at: None,
                         exit_code: None,
                     });
                     job.sections.len() - 1
@@ -460,11 +473,13 @@ impl ActParser {
                 if section.status == ItemStatus::Queued {
                     section.status = ItemStatus::InProgress;
                 }
+                section.observe_start(act.time.as_deref());
             }
             if let Some(result) = act.step_result {
                 section.status = ItemStatus::Completed;
                 section.conclusion = Some(result.into());
                 section.duration_ms = act.execution_time.map(|ns| ns / 1_000_000);
+                section.observe_end(act.time.as_deref());
             }
             if let Notice::ExitCode(code) = notice {
                 section.exit_code = Some(code);
@@ -491,6 +506,7 @@ fn section_name(step: Option<&str>, id: &str) -> String {
 struct ActLine {
     #[serde(default)]
     msg: String,
+    time: Option<String>,
     job: Option<String>,
     #[serde(rename = "jobID")]
     job_id: Option<String>,
@@ -643,6 +659,9 @@ pub use identity::JobIdentity;
 mod legs;
 #[cfg(test)]
 mod property_tests;
+mod timing;
+#[cfg(test)]
+mod timing_tests;
 #[cfg(test)]
 mod trap_tests;
 #[cfg(test)]

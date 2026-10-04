@@ -598,6 +598,12 @@
     },
     "Job": {
       "properties": {
+        "completed_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "conclusion": {
           "anyOf": [
             {
@@ -606,6 +612,14 @@
             {
               "type": "null"
             }
+          ]
+        },
+        "duration_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
           ]
         },
         "identity": {
@@ -641,6 +655,12 @@
             "$ref": "#/$defs/Section"
           },
           "type": "array"
+        },
+        "started_at": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "status": {
           "$ref": "#/$defs/ItemStatus"
@@ -1754,6 +1774,12 @@
     },
     "Section": {
       "properties": {
+        "completed_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "conclusion": {
           "anyOf": [
             {
@@ -1806,6 +1832,12 @@
         "stage": {
           "description": "`Setup`, `Pre`, `Main`, `Post` or `Complete` for GitHub.",
           "type": "string"
+        },
+        "started_at": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "status": {
           "$ref": "#/$defs/ItemStatus"
