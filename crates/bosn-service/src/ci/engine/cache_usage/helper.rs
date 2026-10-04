@@ -175,7 +175,6 @@ struct Mount {
     rw: bool,
 }
 
-
 impl DockerActBackend {
     pub(in crate::ci::engine) async fn recover_measurement(
         &self,

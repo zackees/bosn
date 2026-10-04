@@ -1655,3 +1655,9 @@ gate. No push, merge or release is asserted by this entry. A promoted candidate
 still needs production policy discovery/bootstrap, repository enrollment and
 old-peer exclusion; broader cache-class and host image/build-cache expiry remain
 open. The existing production guard will stay until those requirements are met.
+
+The first promotion gate correctly refused the candidate at Rust formatting
+(run `d52a8b2a-e1cc-4367-ac5e-eaf4b3a35696`, engine cleanup Removed). It found
+an extra blank line left when the helper test module was moved. Python static
+and repository guards passed; Rust tests and Linux tests were not claimed.
+The changed Rust files were formatted again before replaying the clean gate.
