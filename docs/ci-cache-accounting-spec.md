@@ -3871,3 +3871,32 @@ proof, completed publication/release/expiry transitions, retention of the source
 volume during cleanup and bounded recovery enumeration remain implementation
 work. The ordinary engine terminal state still requires source-volume absence;
 recovery must integrate with that lifecycle before normal enrollment is enabled.
+
+### Recovery reservation transport and act2 merge (candidate, 2026-10-04)
+
+Bosn candidate `542d7a5` adds `DockerActBackend::reserve_tool_recovery`.
+It revalidates frozen recovery intent against the containing engine record,
+requires the producer cache mount, formats whole-second RFC3339 pin timestamps,
+and writes a bounded immutable request into private engine work storage.
+Existing request files must be regular non-symlinks with the exact frozen bytes;
+new files use no-clobber creation. The command calls the verified installed act
+binary with the frozen lower payload bound and explicit mutation approval.
+
+A bounded strict typed receipt must match schema, store and every pin field,
+report publication, and have no partial/error/pending-stage state. Command
+failure or rejected receipt requires reconciliation and never establishes pin
+absence or permission to stop source writers. Tests reject uncertain publication
+and changed-generation receipts. Focused receipt validation and service
+all-target Clippy with warnings denied passed against the final source:
+`.git/retention-bosn-tool-recovery-transport-final-tests.log`.
+The prior durable intent slice received the sole primary review with no findings.
+The transport slice is awaiting review and is not called by normal planning;
+reservation acknowledgement persistence and later source lifetime phases remain
+required before activation. No source-stop or removal authority is added here.
+
+All act2 PR #50 checks passed on reviewed head `802f5ab` and the PR merged as
+`6c7ae11a0917c24e88035764c4de3f097dcd6c8f`. Existing full checks were dispatched
+on that exact default-branch commit as run `37241691702`:
+https://github.com/zackees/act2/actions/runs/37241691702
+The run is in progress. The candidate is not released or pinned by Bosn yet;
+exact default-branch CI and release artifact verification remain mandatory.
