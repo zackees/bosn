@@ -40,7 +40,7 @@ pub(super) fn declared(source: &Path, workflow: &str, repository: &str) -> Decla
     reader.declared
 }
 
-pub(super) fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 256
         && id

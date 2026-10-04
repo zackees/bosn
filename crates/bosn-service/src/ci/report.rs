@@ -39,7 +39,7 @@ pub fn conclude(
                     Conclusion::Incomplete,
                     Some("some jobs need runners bosn cannot supervise".into()),
                 )
-            } else if !declared.errors.is_empty() || declared.needs_qualified_identity {
+            } else if !declared.errors.is_empty() || tree.qualified_coverage_missing(declared) {
                 (
                     Conclusion::Incomplete,
                     Some(if declared.errors.is_empty() {

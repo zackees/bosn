@@ -56,6 +56,8 @@ pub struct Job {
     pub job_id: String,
     pub name: String,
     pub matrix: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<Vec<JobIdentity>>,
     pub status: ItemStatus,
     pub conclusion: Option<ItemConclusion>,
     /// Why the job did not run locally (a `remote_only` job's reason).
@@ -161,6 +163,7 @@ impl RunTree {
                 job_id: job.job_id.clone(),
                 name: job.name.clone(),
                 matrix: None,
+                identity: None,
                 status: ItemStatus::Queued,
                 conclusion: None,
                 reason: None,
@@ -261,7 +264,7 @@ impl RunTree {
                 job.conclusion,
                 Some(ItemConclusion::Success | ItemConclusion::Failure | ItemConclusion::Cancelled)
             );
-            let Some(steps) = declared.get(&job.job_id).filter(|_| ran) else {
+            let Some(steps) = declared.get(&job.declaration_key()).filter(|_| ran) else {
                 continue;
             };
             for (index, step) in steps.iter().enumerate() {
@@ -304,7 +307,7 @@ impl RunTree {
     pub fn mark_remote_only(&mut self, remote_only: &std::collections::BTreeMap<String, String>) {
         for job in self.jobs_mut() {
             if job.conclusion == Some(ItemConclusion::Success)
-                && let Some(reason) = remote_only.get(&job.job_id)
+                && let Some(reason) = remote_only.get(&job.declaration_key())
             {
                 job.conclusion = Some(ItemConclusion::RemoteOnly);
                 job.reason = Some(reason.clone());
@@ -390,8 +393,23 @@ impl ActParser {
             return Some(record(None, None, text, stream));
         };
         let notice = Notice::of(&act.msg);
-        let key = self.tree.leg_key(&key, act.matrix.as_ref());
-        let job = self.tree.job_for(&key, &job_id, act.matrix.as_ref());
+        let identity = act.qualified_identity();
+        let key = identity.as_ref().ok().and_then(|i| i.as_ref()).map_or_else(
+            || self.tree.leg_key(&key, act.matrix.as_ref()),
+            |i| identity::execution_key(i),
+        );
+        let valid_identity = identity.as_ref().ok().and_then(|i| i.as_deref());
+        let job = self
+            .tree
+            .job_for(&key, &job_id, act.matrix.as_ref(), valid_identity);
+        if valid_identity.is_some() {
+            job.name = job_name_from_key(act.job.as_deref().unwrap_or(&job_id));
+        }
+        if let Err(error) = identity {
+            job.status = ItemStatus::Completed;
+            job.conclusion = Some(ItemConclusion::Unsupported);
+            job.reason = Some(error);
+        }
         if job.status == ItemStatus::Queued {
             job.status = ItemStatus::InProgress;
         }
@@ -476,6 +494,8 @@ struct ActLine {
     job: Option<String>,
     #[serde(rename = "jobID")]
     job_id: Option<String>,
+    #[serde(rename = "jobIdentity")]
+    job_identity: Option<Vec<JobIdentity>>,
     matrix: Option<Value>,
     stage: Option<String>,
     step: Option<String>,
@@ -617,6 +637,9 @@ impl ActLine {
 
 #[cfg(test)]
 mod leg_tests;
+
+mod identity;
+pub use identity::JobIdentity;
 mod legs;
 #[cfg(test)]
 mod property_tests;

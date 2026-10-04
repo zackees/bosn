@@ -4,6 +4,92 @@
 
 use super::*;
 
+#[test]
+fn qualified_jobs_with_identical_display_names_remain_separate() {
+    let lines = [
+        r#"{"job":"same display","jobID":"test","jobIdentity":[{"jobID":"maintenance","matrix":{"os":"linux"}},{"jobID":"test","matrix":null}],"jobResult":"success"}"#,
+        r#"{"job":"same display","jobID":"test","jobIdentity":[{"jobID":"validation","matrix":{"os":"linux"}},{"jobID":"test","matrix":null}],"jobResult":"success"}"#,
+        r#"{"job":"same display","jobID":"test","jobIdentity":[{"jobID":"maintenance","matrix":{"os":"darwin"}},{"jobID":"test","matrix":null}],"jobResult":"success"}"#,
+    ];
+    let tree = fold("", &lines);
+    assert_eq!(tree.jobs().count(), 3);
+    assert!(
+        tree.jobs()
+            .all(|job| job.conclusion == Some(ItemConclusion::Success))
+    );
+}
+
+#[test]
+fn qualified_remote_jobs_and_unresolved_execution_paths_are_reported_correctly() {
+    use crate::ci::{
+        lifecycle::{CleanupEnd, EngineReport, ExecutionEnd},
+        report,
+        workflow::Declared,
+    };
+    let declared = Declared {
+        steps: [
+            ("maintenance/test".into(), Vec::new()),
+            ("validation/test".into(), Vec::new()),
+        ]
+        .into(),
+        remote_only: [("maintenance/test".into(), "GitHub maintenance".into())].into(),
+        needs_qualified_identity: true,
+        ..Declared::default()
+    };
+    let outcome = Ok(EngineReport {
+        execution: ExecutionEnd::Exited(0),
+        cleanup: CleanupEnd::Removed,
+        engine_id: None,
+        storage: None,
+    });
+    let remote = r#"{"job":"same display","jobID":"test","jobIdentity":[{"jobID":"maintenance","matrix":null},{"jobID":"test","matrix":null}],"jobResult":"success"}"#;
+    let local = r#"{"job":"same display","jobID":"test","jobIdentity":[{"jobID":"validation","matrix":null},{"jobID":"test","matrix":null}],"jobResult":"success"}"#;
+    let mut tree = fold("", &[remote, local]);
+    assert_eq!(
+        report::conclude(&outcome, &mut tree, &declared).0,
+        crate::ci::Conclusion::Success
+    );
+    assert_eq!(
+        tree.jobs()
+            .filter(|job| job.conclusion == Some(ItemConclusion::RemoteOnly))
+            .count(),
+        1
+    );
+    assert_eq!(
+        tree.jobs()
+            .filter(|job| job.conclusion == Some(ItemConclusion::Success))
+            .count(),
+        1
+    );
+    for unresolved in [
+        r#"{"job":"legacy","jobID":"test","jobResult":"success"}"#,
+        r#"{"job":"unknown","jobID":"test","jobIdentity":[{"jobID":"unknown","matrix":null},{"jobID":"test","matrix":null}],"jobResult":"success"}"#,
+        r#"{"job":"wrong-leaf","jobID":"test","jobIdentity":[{"jobID":"validation","matrix":null},{"jobID":"other","matrix":null}],"jobResult":"success"}"#,
+        r#"{"job":"wrong-matrix","jobID":"test","matrix":{"os":"linux"},"jobIdentity":[{"jobID":"validation","matrix":null},{"jobID":"test","matrix":{"os":"darwin"}}],"jobResult":"success"}"#,
+    ] {
+        let mut tree = fold("", &[local, unresolved]);
+        assert_eq!(
+            report::conclude(&outcome, &mut tree, &declared).0,
+            crate::ci::Conclusion::Incomplete
+        );
+    }
+}
+
+#[test]
+fn skipped_qualified_remote_job_stays_skipped() {
+    let mut tree = fold(
+        "",
+        &[
+            r#"{"job":"remote","jobID":"test","jobIdentity":[{"jobID":"maintenance","matrix":null},{"jobID":"test","matrix":null}],"jobResult":"skipped"}"#,
+        ],
+    );
+    tree.mark_remote_only(&[("maintenance/test".into(), "GitHub maintenance".into())].into());
+    assert_eq!(
+        tree.jobs().next().unwrap().conclusion,
+        Some(ItemConclusion::Skipped)
+    );
+}
+
 /// Recorded with act 0.2.88 from bosn's copy of the workflow beside it (the
 /// `wheel` job gated by [`crate::ci::matrix_runner`]).
 const RECORDED: &str =

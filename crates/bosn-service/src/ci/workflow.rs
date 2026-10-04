@@ -15,6 +15,8 @@ use serde::Deserialize;
 
 mod graph;
 
+pub(crate) use graph::valid_id as valid_job_id;
+
 /// One declared step of one job.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeclaredStep {

@@ -528,6 +528,15 @@
             }
           ]
         },
+        "identity": {
+          "items": {
+            "$ref": "#/$defs/JobIdentity"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "job_id": {
           "description": "Workflow job ID shared by matrix legs.",
           "type": "string"
@@ -588,6 +597,18 @@
         "total",
         "completed",
         "failed"
+      ],
+      "type": "object"
+    },
+    "JobIdentity": {
+      "properties": {
+        "jobID": {
+          "type": "string"
+        },
+        "matrix": true
+      },
+      "required": [
+        "jobID"
       ],
       "type": "object"
     },

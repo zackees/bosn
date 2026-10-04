@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use super::{ItemStatus, Job, RunTree, job_name_from_key};
+use super::{ItemStatus, Job, JobIdentity, RunTree, job_name_from_key};
 
 /// `<name>` for act's `<name>-<n>`.
 fn strip_leg_number(key: &str) -> &str {
@@ -82,8 +82,20 @@ impl RunTree {
     /// own key: act runs the called jobs as `<caller name>/<workflow>/<job>`,
     /// and they stand in for the caller the same way, in the caller's stage.
     /// Later legs (and called jobs) join their siblings, ordered by key.
-    pub(super) fn job_for(&mut self, key: &str, job_id: &str, matrix: Option<&Value>) -> &mut Job {
+    pub(super) fn job_for(
+        &mut self,
+        key: &str,
+        job_id: &str,
+        matrix: Option<&Value>,
+        identity: Option<&[JobIdentity]>,
+    ) -> &mut Job {
         if let Some((g, j)) = self.find(key) {
+            if self.groups[g].jobs[j].identity.as_deref() != identity {
+                self.groups[g].jobs[j].status = ItemStatus::Completed;
+                self.groups[g].jobs[j].conclusion = Some(super::ItemConclusion::Unsupported);
+                self.groups[g].jobs[j].reason =
+                    Some("execution identity changed within one job".into());
+            }
             return &mut self.groups[g].jobs[j];
         }
         let job = Job {
@@ -91,12 +103,13 @@ impl RunTree {
             job_id: job_id.into(),
             name: job_name_from_key(key),
             matrix: matrix.filter(|m| !m.is_null()).cloned(),
+            identity: identity.map(<[JobIdentity]>::to_vec),
             status: ItemStatus::Queued,
             conclusion: None,
             reason: None,
             sections: Vec::new(),
         };
-        if let Some((g, j)) = self.placeholder(key, job_id) {
+        if let Some((g, j)) = self.placeholder(key, job_id, identity.and_then(|i| i.first())) {
             let declared = &self.groups[g].jobs[j];
             // A matrix leg or a called job is named by its own key; the
             // declared job itself keeps its declared name.
@@ -131,7 +144,12 @@ impl RunTree {
 
     /// The declared, not yet reported job a record replaces: its own job ID,
     /// or the reusable-workflow caller whose name prefixes its key.
-    fn placeholder(&self, key: &str, job_id: &str) -> Option<(usize, usize)> {
+    fn placeholder(
+        &self,
+        key: &str,
+        job_id: &str,
+        caller: Option<&JobIdentity>,
+    ) -> Option<(usize, usize)> {
         let called_by = |job: &Job| {
             key.strip_prefix(job.name.as_str())
                 .is_some_and(|rest| rest.starts_with('/'))
@@ -143,7 +161,10 @@ impl RunTree {
                 .position(|job| {
                     job.key == job.job_id
                         && job.matrix.is_none()
-                        && (job.job_id == job_id || called_by(job))
+                        && caller.map_or_else(
+                            || job.job_id == job_id || called_by(job),
+                            |caller| job.job_id == caller.job_id,
+                        )
                 })
                 .map(|j| (g, j))
         })
