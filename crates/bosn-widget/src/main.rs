@@ -130,8 +130,12 @@ mod tests {
 
     #[test]
     fn explicit_second_start_sends_one_show_request_for_the_selected_state() {
-        let args = parse_args_from(["--state-dir", "/selected-state"].into_iter().map(Into::into))
-            .unwrap();
+        let args = parse_args_from(
+            ["--state-dir", "/selected-state"]
+                .into_iter()
+                .map(Into::into),
+        )
+        .unwrap();
         let mut requests = Vec::new();
         reveal_existing(&args, |state| requests.push(state.to_path_buf()));
         assert_eq!(requests, [PathBuf::from("/selected-state")]);
