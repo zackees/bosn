@@ -1073,3 +1073,25 @@ Import race tests passed (1.177 seconds), and pinned lint reported 0 issues.
 This follow-up is not yet released: Bosn's act2.5 pin still has the old edge
 case, and production enrollment remains guarded. A corrected dependency release
 and verified pin are needed before automatic migration can be enabled.
+
+### Typed warm-import boundary (candidate, not activated)
+
+Bosn now builds source-quiescent import arguments using the validated repository
+hash, legacy source path, fixed cohort root and repository byte budget. Calling
+this builder requires prior legacy-writer exclusion; it does not establish that
+exclusion. Production planning remains guarded.
+
+Import JSON is eagerly decoded into typed reports and receipts with a 64 KiB
+input bound. Parsing checks schema, exact source/destination identity, policy
+ceiling, at most twelve receipts, unique positive archive IDs, lowercase SHA-256
+digests, count/omission consistency and checked byte totals. A separate warm
+publication check requires complete publication, no pending stage/error, known
+adequate headroom, retained-source evidence and a nonempty import when the source
+is populated. Published-but-partial output remains visible for reconciliation;
+it is not converted into absence or permission to blindly repeat import.
+
+Three isolated boundary tests passed (0.01 seconds), strict service-library
+Clippy passed, and the existing reviewer found no blocking issues. These tests
+use typed receipt fixtures: they do not prove actual automatic migration,
+durable migration receipts, peer exclusion or supervision. Act2 cold-cutover
+correction is tracked in PR #27; full CI is still running.

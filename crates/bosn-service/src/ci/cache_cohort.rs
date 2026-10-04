@@ -20,6 +20,9 @@ impl Namespace {
         }
         Ok(Self(value.into()))
     }
+    pub fn legacy_path(&self) -> String {
+        format!("{ENGINE_CACHE}/actcache/{}", self.0)
+    }
     pub fn path(&self) -> String {
         format!("{}/{}", root(), self.0)
     }
@@ -51,6 +54,24 @@ impl CachePolicy {
         ];
         args.extend(self.namespace_policy_args());
         args
+    }
+
+    /// Caller must exclude legacy writers before asserting source quiescence.
+    pub fn import_args_for_quiescent_source(self, namespace: &Namespace) -> Vec<String> {
+        vec![
+            "cache".into(),
+            "import".into(),
+            "--apply".into(),
+            "--source-quiescent".into(),
+            "--from".into(),
+            namespace.legacy_path(),
+            "--namespace".into(),
+            namespace.0.clone(),
+            "--max-bytes".into(),
+            self.repository_max_bytes.to_string(),
+            "--cache-server-path".into(),
+            root(),
+        ]
     }
 
     /// Independent maintenance covers idle namespaces after all servers close.
