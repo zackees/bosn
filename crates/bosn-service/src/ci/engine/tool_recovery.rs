@@ -111,6 +111,55 @@ impl DockerActBackend {
     }
 }
 
+impl DockerActBackend {
+    /// Ordered trusted persistence/transport seam. Caller freezes timestamps
+    /// before retrying. Completion gives no writer-stop or volume-removal proof.
+    pub async fn reserve_claimed_tool_recovery(
+        &self,
+        registry: &crate::RegistryActor,
+        run: &str,
+        token: &str,
+        created: i64,
+        expires: i64,
+    ) -> Result<(), String> {
+        use crate::act_registry::{ActRegistryCommand, ActRegistryReply};
+        registry
+            .act_registry(ActRegistryCommand::ToolRecoveryBegin {
+                run: run.into(),
+                token: token.into(),
+                created,
+                expires,
+            })
+            .await
+            .map_err(|e| format!("tool recovery intent: {e}"))?;
+        let record = match registry
+            .act_registry(ActRegistryCommand::Get { run: run.into() })
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            ActRegistryReply::Record(Some(record)) => record,
+            _ => return Err("tool recovery committed record missing".into()),
+        };
+        if record.execution_claim.as_deref() != Some(token) || record.execution.is_some() {
+            return Err("tool recovery claim changed before reservation".into());
+        }
+        self.reserve_tool_recovery(&record).await?;
+        let intent = record
+            .tool_recovery
+            .ok_or("tool recovery intent missing after reservation")?;
+        registry
+            .act_registry(ActRegistryCommand::ToolRecoveryReserved {
+                run: run.into(),
+                token: token.into(),
+                intent,
+                at: crate::ci::lifecycle::now_seconds(),
+            })
+            .await
+            .map_err(|e| format!("tool recovery acknowledgement requires reconciliation: {e}"))?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
