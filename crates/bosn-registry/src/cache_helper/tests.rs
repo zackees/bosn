@@ -1,0 +1,136 @@
+use super::*;
+
+const OWNER: &str = "11111111-2222-4333-8444-555555555555";
+const OTHER: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+const ID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+fn intent(index: usize) -> CacheHelperIntent {
+    CacheHelperIntent {
+        registry_id: OWNER.into(),
+        nonce: format!("{index:08x}-2222-4333-8444-555555555555"),
+        volume: "bosn-ci-cache-v1".into(),
+        image: format!("docker.io/library/docker@sha256:{ID}"),
+        created_at: 1.0,
+    }
+}
+
+#[test]
+fn pending_create_survives_restart_and_cannot_finish_without_a_known_id() {
+    let dir = fs::TemporaryDirectory::new().unwrap();
+    let path = dir.path().join("registry.sqlite3");
+    let value = intent(1);
+    let mut registry = Registry::create_writer(&path, OWNER).unwrap();
+    let mut tx = registry.begin_immediate().unwrap();
+    tx.begin_cache_helper(&value).unwrap();
+    tx.commit().unwrap();
+    drop(registry);
+    let mut registry = Registry::open_writer(&path).unwrap();
+    assert_eq!(
+        registry.cache_helper(&value.nonce).unwrap().unwrap().state,
+        CacheHelperState::Pending
+    );
+    let mut tx = registry.begin_immediate().unwrap();
+    assert!(tx.finish_cache_helper(&value.nonce, ID, 2.0).is_err());
+    tx.commit().unwrap();
+    let mut tx = registry.begin_immediate().unwrap();
+    tx.register_cache_helper(&value.nonce, ID, 2.0).unwrap();
+    tx.commit().unwrap();
+    drop(registry);
+    let mut registry = Registry::open_writer(&path).unwrap();
+    let record = registry.cache_helper(&value.nonce).unwrap().unwrap();
+    assert_eq!(record.state, CacheHelperState::Created);
+    assert_eq!(record.container_id.as_deref(), Some(ID));
+    let mut tx = registry.begin_immediate().unwrap();
+    tx.finish_cache_helper(&value.nonce, ID, 3.0).unwrap();
+    tx.commit().unwrap();
+    assert!(
+        registry
+            .pending_cache_helpers(None, 64)
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    let mut tx = registry.begin_immediate().unwrap();
+    assert!(
+        tx.begin_cache_helper(&value).is_err(),
+        "terminal nonces cannot be reused"
+    );
+    tx.commit().unwrap();
+    drop(registry);
+    let reader = Registry::open_read_only(&path).unwrap();
+    assert_eq!(
+        reader.cache_helper(&value.nonce).unwrap().unwrap().state,
+        CacheHelperState::Removed
+    );
+}
+
+#[test]
+fn helper_identity_conflicts_and_invalid_receipts_leave_the_claim_intact() {
+    let dir = fs::TemporaryDirectory::new().unwrap();
+    let mut registry = Registry::create_writer(dir.path().join("registry.sqlite3"), OWNER).unwrap();
+    let mut value = intent(2);
+    value.registry_id = OTHER.into();
+    let mut tx = registry.begin_immediate().unwrap();
+    assert!(tx.begin_cache_helper(&value).is_err());
+    tx.commit().unwrap();
+    value.registry_id = OWNER.into();
+    let mut tx = registry.begin_immediate().unwrap();
+    tx.begin_cache_helper(&value).unwrap();
+    assert!(
+        tx.register_cache_helper(&value.nonce, "bad-id", 2.0)
+            .is_err()
+    );
+    tx.register_cache_helper(&value.nonce, ID, 2.0).unwrap();
+    let different = "2".repeat(64);
+    assert!(
+        tx.register_cache_helper(&value.nonce, &different, 3.0)
+            .is_err()
+    );
+    assert!(
+        tx.finish_cache_helper(&value.nonce, &different, 3.0)
+            .is_err()
+    );
+    assert!(tx.finish_cache_helper(&value.nonce, ID, 1.0).is_err());
+    tx.commit().unwrap();
+    assert_eq!(
+        registry
+            .cache_helper(&value.nonce)
+            .unwrap()
+            .unwrap()
+            .container_id
+            .as_deref(),
+        Some(ID)
+    );
+}
+
+#[test]
+fn bounded_pending_pages_ignore_completed_history_and_advance_fairly() {
+    let dir = fs::TemporaryDirectory::new().unwrap();
+    let mut registry = Registry::create_writer(dir.path().join("registry.sqlite3"), OWNER).unwrap();
+    let mut tx = registry.begin_immediate().unwrap();
+    for index in 0..130 {
+        let value = intent(index);
+        tx.begin_cache_helper(&value).unwrap();
+        if index < 125 {
+            tx.register_cache_helper(&value.nonce, ID, 2.0).unwrap();
+            tx.finish_cache_helper(&value.nonce, ID, 3.0).unwrap();
+        }
+    }
+    tx.commit().unwrap();
+    assert!(registry.pending_cache_helpers(None, 0).is_err());
+    assert!(registry.pending_cache_helpers(None, 65).is_err());
+    let first = registry.pending_cache_helpers(None, 2).unwrap();
+    assert_eq!(first.items.len(), 2);
+    assert_eq!(first.items[0].intent.nonce, intent(125).nonce);
+    let second = registry
+        .pending_cache_helpers(first.next_nonce.as_deref(), 2)
+        .unwrap();
+    assert_eq!(second.items.len(), 2);
+    assert_eq!(second.items[0].intent.nonce, intent(127).nonce);
+    let last = registry
+        .pending_cache_helpers(second.next_nonce.as_deref(), 2)
+        .unwrap();
+    assert_eq!(last.items.len(), 1);
+    assert_eq!(last.items[0].intent.nonce, intent(129).nonce);
+    assert!(last.next_nonce.is_none());
+}

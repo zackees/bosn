@@ -4,7 +4,7 @@ use super::{CACHE_VOLUME, CacheVolume, DockerActBackend};
 use bosn_engine::DockerEngine;
 use kernal_api::platform::fs::TemporaryDirectory;
 
-fn fixture(success: bool, cleanup: &str) -> (TemporaryDirectory, DockerActBackend) {
+pub(super) fn fixture(success: bool, cleanup: &str) -> (TemporaryDirectory, DockerActBackend) {
     let dir = TemporaryDirectory::new().unwrap();
     let cache = CacheVolume::machine("11111111-2222-4333-8444-555555555555", 1.0).unwrap();
     let document = serde_json::json!([{

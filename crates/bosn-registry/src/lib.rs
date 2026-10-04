@@ -19,6 +19,7 @@ use kernal_api::{
 };
 
 pub mod act;
+pub mod cache_helper;
 mod gc_query;
 mod immediate;
 mod read_only;

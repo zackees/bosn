@@ -332,6 +332,7 @@ impl Service {
             let stop = self.stop.token();
             async_engine::launch(async move {
                 let mut cursor = None;
+                let mut helper_cursor = None;
                 loop {
                     if stop.is_cancelled() {
                         break;
@@ -356,6 +357,27 @@ impl Service {
                         }
                         Ok(Ok(Err(error))) => eprintln!("bosn CI cleanup retry failed: {error}"),
                         Ok(Err(_)) => eprintln!("bosn CI cleanup retry pass deadline exceeded"),
+                        Err(_) => break,
+                    }
+                    // Helper intents survive uncertain create/cleanup and daemon death.
+                    // Use an independent cursor and budget; helper failures do not
+                    // prevent the next engine cleanup pass from advancing.
+                    let retry = async_engine::timeout(
+                        Duration::from_secs(200),
+                        ci.retry_cache_helper_cleanup(&owner, helper_cursor.clone()),
+                    );
+                    match async_engine::cancellable(&stop, retry).await {
+                        Ok(Ok(Ok(report))) => {
+                            helper_cursor = report.next_nonce;
+                            if let Some(name) = report.removed {
+                                eprintln!("bosn CI helper cleanup removed {name}");
+                            }
+                            if let Some(reason) = report.deferred {
+                                eprintln!("bosn CI helper cleanup deferred: {reason}");
+                            }
+                        }
+                        Ok(Ok(Err(error))) => eprintln!("bosn CI helper cleanup failed: {error}"),
+                        Ok(Err(_)) => eprintln!("bosn CI helper cleanup deadline exceeded"),
                         Err(_) => break,
                     }
                     if async_engine::cancellable(

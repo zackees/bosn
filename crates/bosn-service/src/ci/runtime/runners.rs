@@ -52,9 +52,15 @@ impl CiRuntime {
     }
 
     async fn cache_usage(&self) -> Result<CacheUsage, CiError> {
+        let owner = self
+            .registry
+            .status()
+            .await
+            .map_err(|error| CiError::new("internal", error.to_string()))?
+            .registry_id;
         Ok(self
             .backend
-            .cache_usage(CACHE_VOLUME)
+            .tracked_cache_usage(CACHE_VOLUME, &self.registry, &owner)
             .await
             .unwrap_or_else(|error| CacheUsage {
                 volume: CACHE_VOLUME.into(),

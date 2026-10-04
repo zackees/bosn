@@ -85,8 +85,9 @@ unique UUID name and nonce label. A failed or invalid acknowledgement triggers
 typed discovery; identity and isolation must match before removing an immutable
 ID. Successful removal requires Docker's explicit absence verdict. Discovery
 that is absent, unreadable, malformed or mismatched remains pending, with the
-helper name in diagnostics. A later create or daemon death still needs durable
-reconciliation; diagnostics alone do not establish eventual cleanup.
+helper name in diagnostics. The service now commits a durable helper intent
+before create and retries uncertain cleanup through the existing maintenance
+worker; the verification scope and remaining crash-replay gap are below.
 Its read-only cache mount and masked engine data volume create no build cache.
 
 Verification: the two initial focused tests failed before the implementation
@@ -578,3 +579,44 @@ maintenance. Bosn still pins the released build without this flag. The policy
 remains opt-in; physical machine bytes, metadata and retained legacy inputs are
 outside the completed-archive ceiling. Warm cutover and automatic Bosn retries
 remain open.
+
+
+### Durable accounting-helper recovery (candidate, not released)
+
+Accounting requests now commit a typed helper intent through the sole registry
+writer before Docker create. The existing event ledger stores Pending, Created
+and Removed states; no second database or schema migration is introduced.
+Created records retain the immutable container ID before start or removal.
+Identity freezes the image digest, cache volume, nonce and ownership labels.
+Recovery verifies these plus the read-only mount and container isolation before
+removing that exact ID. Successful receipts require observed absence. Missing
+name lookup after uncertain create remains Pending because create may arrive
+later; known-ID absence can finish a Created record.
+
+An in-process active guard is installed before intent visibility and released
+on return or cancellation. The maintenance worker skips active measurements,
+pages at most eight batches of 64 records, and attempts one inactive helper per
+pass. Its helper cursor is independent of engine retirement and advances past
+deferred records. Engine and helper passes each have a 200-second outer budget;
+the worker sleeps 60 seconds after both passes, so this is not a fixed
+60-second cleanup deadline. Output paging is bounded; internal SQL scan cost
+and accumulated completed ledger history are not a physical storage ceiling.
+Shared volumes and foreign or mismatched containers are never removed.
+
+Verification in the isolated Rust container: registry library tests passed
+(5), service library tests passed (414; 6 ignored), and the focused accounting
+and helper suite passed (20, including its real-Docker replay). Registry tests
+close and reopen the writer between transitions and verify immutable IDs,
+owner checks, nonce reuse refusal and paging past completed history. The real
+private-engine replay discards a successful create acknowledgement and makes
+recovery inspection unavailable, leaving a persisted Pending intent and an
+actual orphan. A fresh backend recovers the verified ID from that ledger,
+removes it and records Removed. A subsequent tracked measurement returns
+positive allocated bytes with the shared cache intact.
+
+This proves durable state and backend replacement recovery. Actual daemon
+SIGKILL during helper creation and a timed background-worker recovery replay
+remain unverified. Engine partial-create failures in #452 are separate; helper
+recovery does not establish their resolution. Bosn still pins the released
+act2 without the candidate aggregate retention policy, so this change does not
+yet establish automatic machine-wide byte control.

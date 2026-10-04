@@ -9,7 +9,9 @@ const LABEL: &str = "io.bosn.cache.measurement";
 
 pub(super) struct Identity {
     pub name: String,
-    nonce: String,
+    pub(super) nonce: String,
+    image: String,
+    ownership: BTreeMap<String, String>,
 }
 
 impl Identity {
@@ -20,6 +22,8 @@ impl Identity {
         Ok(Self {
             name: format!("bosn-cache-measure-{nonce}"),
             nonce,
+            image: engine_image(),
+            ownership: BTreeMap::new(),
         })
     }
 
@@ -27,7 +31,54 @@ impl Identity {
         format!("{LABEL}={}", self.nonce)
     }
 
-    fn verify(&self, document: &str, volume: &str) -> Result<String, String> {
+    pub(super) fn from_intent(
+        intent: &bosn_registry::cache_helper::CacheHelperIntent,
+    ) -> Result<Self, String> {
+        intent.validate().map_err(|error| error.to_string())?;
+        let labels = bosn_core::ResourceLabels::new(
+            &intent.registry_id,
+            bosn_core::ResourceKind::Container,
+            "ci-cache-measurement",
+            &intent.nonce,
+            bosn_core::Scope::Spec,
+            "machine",
+            &intent.created_at.to_string(),
+            Some(bosn_core::Retention::Warm),
+        )
+        .map_err(|_| "cache helper ownership labels invalid".to_string())?;
+        Ok(Self {
+            name: intent.name(),
+            nonce: intent.nonce.clone(),
+            image: intent.image.clone(),
+            ownership: labels
+                .to_map()
+                .into_iter()
+                .map(|(key, value)| (key.into(), value))
+                .collect(),
+        })
+    }
+    pub(super) fn track(
+        &mut self,
+        owner: &str,
+        volume: &str,
+    ) -> Result<bosn_registry::cache_helper::CacheHelperIntent, String> {
+        let intent = bosn_registry::cache_helper::CacheHelperIntent {
+            registry_id: owner.into(),
+            nonce: self.nonce.clone(),
+            image: self.image.clone(),
+            volume: volume.into(),
+            created_at: crate::ci::lifecycle::now_seconds(),
+        };
+        *self = Self::from_intent(&intent)?;
+        Ok(intent)
+    }
+    pub(super) fn ownership_args(&self) -> Vec<String> {
+        self.ownership
+            .iter()
+            .flat_map(|(key, value)| ["--label".into(), format!("{key}={value}")])
+            .collect()
+    }
+    pub(super) fn verify(&self, document: &str, volume: &str) -> Result<String, String> {
         let rows: Vec<Helper> = serde_json::from_str(document)
             .map_err(|error| format!("helper inspection invalid: {error}"))?;
         let [row] = rows.as_slice() else {
@@ -39,7 +90,11 @@ impl Identity {
         if !valid_id(&row.id)
             || row.name != format!("/{}", self.name)
             || row.config.labels.get(LABEL) != Some(&self.nonce)
-            || row.config.image != engine_image()
+            || row.config.image != self.image
+            || self
+                .ownership
+                .iter()
+                .any(|(key, value)| row.config.labels.get(key) != Some(value))
             || !row.host_config.readonly_rootfs
             || row.host_config.privileged
             || row.host_config.network_mode != "none"
@@ -99,6 +154,7 @@ impl DockerActBackend {
         &self,
         identity: &Identity,
         volume: &str,
+        tracker: Option<&super::journal::Tracker<'_>>,
     ) -> Result<(), String> {
         let result = self
             .run(
@@ -120,7 +176,14 @@ impl DockerActBackend {
         let id = identity
             .verify(&document, volume)
             .map_err(|error| format!("helper {} needs cleanup: {error}", identity.name))?;
-        self.remove_measurement(&id).await
+        if let Some(tracker) = tracker {
+            tracker.register(&id).await?;
+        }
+        self.remove_measurement(&id).await?;
+        if let Some(tracker) = tracker {
+            tracker.finish(&id).await?;
+        }
+        Ok(())
     }
 
     pub(super) async fn confirm_measurement_absent(&self, id: &str) -> Result<(), String> {

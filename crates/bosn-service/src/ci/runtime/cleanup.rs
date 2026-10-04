@@ -10,6 +10,16 @@ pub(crate) struct CleanupRetry {
 }
 
 impl CiRuntime {
+    pub(crate) async fn retry_cache_helper_cleanup(
+        &self,
+        owner: &str,
+        cursor: Option<String>,
+    ) -> Result<super::super::engine::HelperCleanupRetry, String> {
+        self.backend
+            .retry_cache_helpers(&self.registry, owner, cursor)
+            .await
+    }
+
     /// Inspect at most 512 pending records and retire at most one engine.
     /// The persistent caller cursor prevents active or repeatedly failing
     /// records at the front from starving later cleanup. Registry ownership

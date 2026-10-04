@@ -9,7 +9,12 @@ use super::{
 };
 use crate::ci::{CacheClass, CacheComponent, CacheUsage};
 
+#[cfg(test)]
+mod durability_tests;
 mod helper;
+mod journal;
+mod retry;
+pub use retry::HelperCleanupRetry;
 
 const MAX_NAMESPACES: usize = 256;
 const MAX_ERRORS: usize = 16;
@@ -141,6 +146,13 @@ pub(super) fn volume_present(ok: bool, stderr: &[u8]) -> Result<bool, String> {
 
 impl DockerActBackend {
     pub(super) async fn measure_cache(&self, volume: &str) -> Result<CacheUsage, String> {
+        self.measure_cache_tracked(volume, None).await
+    }
+    pub(super) async fn measure_cache_tracked(
+        &self,
+        volume: &str,
+        context: Option<(&crate::RegistryActor, &str)>,
+    ) -> Result<CacheUsage, String> {
         if !self.volume_exists(volume).await? {
             return Ok(CacheUsage {
                 volume: volume.into(),
@@ -152,40 +164,47 @@ impl DockerActBackend {
         let mount = format!("type=volume,source={volume},target=/cache,readonly");
         // Name and label the helper before create so a lost acknowledgement
         // can be reconciled without removing an unverified container by name.
-        let identity = helper::Identity::new().await?;
+        let mut identity = helper::Identity::new().await?;
+        let _active = journal::ActiveHelper::claim(self, &identity.nonce);
+        let tracker = if let Some((registry, owner)) = context {
+            let intent = identity.track(owner, volume)?;
+            let tracker = journal::Tracker::new(registry, &identity.nonce);
+            tracker.begin(intent).await?;
+            Some(tracker)
+        } else {
+            None
+        };
+        let mut create_args = owned(&[
+            "create",
+            "--rm",
+            "--name",
+            &identity.name,
+            "--label",
+            &identity.label(),
+            "--pull",
+            "never",
+            "--network",
+            "none",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--memory",
+            "128m",
+            "--cpus",
+            "1",
+            "--tmpfs",
+            "/var/lib/docker",
+            "--mount",
+            &mount,
+            "--entrypoint",
+            "sh",
+            &image,
+            "-c",
+            SCRIPT,
+        ]);
+        create_args.splice(2..2, identity.ownership_args());
         let created = self
-            .checked(
-                "cache measure create",
-                owned(&[
-                    "create",
-                    "--rm",
-                    "--name",
-                    &identity.name,
-                    "--label",
-                    &identity.label(),
-                    "--pull",
-                    "never",
-                    "--network",
-                    "none",
-                    "--read-only",
-                    "--cap-drop",
-                    "ALL",
-                    "--memory",
-                    "128m",
-                    "--cpus",
-                    "1",
-                    "--tmpfs",
-                    "/var/lib/docker",
-                    "--mount",
-                    &mount,
-                    "--entrypoint",
-                    "sh",
-                    &image,
-                    "-c",
-                    SCRIPT,
-                ]),
-                CONTROL_DEADLINE,
-            )
+            .checked("cache measure create", create_args, CONTROL_DEADLINE)
             .await;
         let id = match created {
             Ok(id) if helper::valid_id(&id) => id,
@@ -193,13 +212,21 @@ impl DockerActBackend {
                 let error = result.err().unwrap_or_else(|| {
                     "cache measure create returned no immutable container ID".into()
                 });
-                let recovery = self.recover_measurement(&identity, volume).await;
+                let recovery = self
+                    .recover_measurement(&identity, volume, tracker.as_ref())
+                    .await;
                 return Err(match recovery {
                     Ok(()) => format!("{error}; measurement helper {} recovered", identity.name),
                     Err(recovery) => format!("{error}; {recovery}"),
                 });
             }
         };
+        if let Some(tracker) = &tracker {
+            tracker
+                .register(&id)
+                .await
+                .map_err(|error| format!("helper {} needs cleanup: {error}", identity.name))?;
+        }
         // Mounting a named volume can recreate it if a concurrent clear won
         // the race. Repeat its ownership check before starting the helper.
         let measured = match self.verify_measured_volume(volume).await {
@@ -214,6 +241,9 @@ impl DockerActBackend {
             Err(error) => Err(error),
         };
         self.remove_measurement(&id).await?;
+        if let Some(tracker) = &tracker {
+            tracker.finish(&id).await?;
+        }
         measured.map(|out| parse(volume, &out))
     }
 

@@ -87,6 +87,21 @@ pub enum ActRegistryCommand {
         after_run_id: Option<String>,
         limit: usize,
     },
+    HelperBegin(bosn_registry::cache_helper::CacheHelperIntent),
+    HelperRegister {
+        nonce: String,
+        id: String,
+        at: f64,
+    },
+    HelperFinish {
+        nonce: String,
+        id: String,
+        at: f64,
+    },
+    HelperPending {
+        after_nonce: Option<String>,
+        limit: usize,
+    },
     /// Latest state snapshot for one run (read-only).
     Get {
         run: String,
@@ -99,6 +114,7 @@ pub enum ActRegistryReply {
     Verified(Box<ActEngineRecord>),
     Claimed(Box<ActEngineRecord>),
     Recovery(ActEngineRecoveryPage),
+    Helpers(bosn_registry::cache_helper::CacheHelperPage),
     Record(Option<Box<ActEngineRecord>>),
 }
 
@@ -133,6 +149,7 @@ pub(crate) fn apply(
     if matches!(
         &command,
         ActRegistryCommand::Begin(_)
+            | ActRegistryCommand::HelperBegin(_)
             | ActRegistryCommand::Claim { .. }
             | ActRegistryCommand::ClaimSpare { .. }
             | ActRegistryCommand::SealStartup
@@ -182,6 +199,11 @@ pub(crate) fn apply(
         return registry
             .pending_act_engines(after_run_id.as_deref(), limit)
             .map(ActRegistryReply::Recovery);
+    }
+    if let ActRegistryCommand::HelperPending { after_nonce, limit } = command {
+        return registry
+            .pending_cache_helpers(after_nonce.as_deref(), limit)
+            .map(ActRegistryReply::Helpers);
     }
     if let ActRegistryCommand::Get { run } = command {
         return registry
@@ -267,8 +289,21 @@ pub(crate) fn apply(
             transaction.finalize_act_cleanup(&run, &proof, at)?;
             ActRegistryReply::Committed
         }
+        ActRegistryCommand::HelperBegin(intent) => {
+            transaction.begin_cache_helper(&intent)?;
+            ActRegistryReply::Committed
+        }
+        ActRegistryCommand::HelperRegister { nonce, id, at } => {
+            transaction.register_cache_helper(&nonce, &id, at)?;
+            ActRegistryReply::Committed
+        }
+        ActRegistryCommand::HelperFinish { nonce, id, at } => {
+            transaction.finish_cache_helper(&nonce, &id, at)?;
+            ActRegistryReply::Committed
+        }
         ActRegistryCommand::Pending { .. }
         | ActRegistryCommand::Get { .. }
+        | ActRegistryCommand::HelperPending { .. }
         | ActRegistryCommand::StartupInterrupt { .. }
         | ActRegistryCommand::SealStartup => {
             unreachable!("startup/read handled before transaction")
