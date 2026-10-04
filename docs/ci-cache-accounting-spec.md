@@ -881,3 +881,23 @@ into `docs/ci.schema.json`. No weakening of the schema parity gate was made.
 These results precede reconciliation with newer main changes and do not prove
 the merged candidate; current main is `5a5040fa`. Full verification after that
 reconciliation remains required before pushing a candidate.
+
+## Main reconciliation and exact-source gate
+
+Merge `1527ee9` incorporates main `5a5040fa`, including unresolved-create
+quarantine and authoritative source/run receipts. Startup recovery first
+requires main's container absence proof, then independently removes/verifies
+private storage before finalization. Both old and new test modules are retained.
+The single reviewer passed the merge follow-up. The merged service library
+suite passes: 429 cases, six ignored, no failures.
+
+Main updates the production act2 pin to `0.2.89-act2.4`; that release still
+does not contain this retention candidate. Act2 candidate `7902785` now has
+all checks successful in run 37184103814: full Linux, native Windows/macOS,
+lint and snapshot build. The earlier cancelled run is not substituted for it.
+
+The current source-bound pre-push gate requires released Bosn >= 0.1.12 and
+actual Rust/Linux workflow receipts. Host global Bosn is 0.1.10; an isolated
+`uvx --from bosn==0.1.12` environment resolves and reports 0.1.12 without
+replacing the user's global executable. Running the full gate/stamping the
+candidate is the next required step before pushing this Bosn branch.
