@@ -127,7 +127,10 @@ impl Immediate<'_> {
             .and_then(|row| text(row, 0))
     }
 
-    fn helper_record(&mut self, nonce: &str) -> Result<Option<CacheHelperRecord>, Error> {
+    pub(super) fn helper_record(
+        &mut self,
+        nonce: &str,
+    ) -> Result<Option<CacheHelperRecord>, Error> {
         let rows = self.transaction.query(
             "SELECT detail FROM events WHERE kind=? ORDER BY id DESC LIMIT 1",
             &[Value::Text(kind(nonce)?)],

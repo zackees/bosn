@@ -87,6 +87,7 @@ pub enum ActRegistryCommand {
         after_run_id: Option<String>,
         limit: usize,
     },
+    MaintenanceRecord(bosn_registry::cache_maintenance::MaintenanceSnapshot),
     HelperBegin(bosn_registry::cache_helper::CacheHelperIntent),
     HelperRegister {
         nonce: String,
@@ -212,6 +213,10 @@ pub(crate) fn apply(
     }
     let mut transaction = registry.begin_immediate()?;
     let reply = match command {
+        ActRegistryCommand::MaintenanceRecord(snapshot) => {
+            transaction.record_cache_maintenance(&snapshot)?;
+            ActRegistryReply::Committed
+        }
         ActRegistryCommand::Begin(intent) => {
             transaction.begin_act_engine(&intent)?;
             ActRegistryReply::Committed

@@ -34,6 +34,7 @@ mod maintenance_contention_tests;
 mod maintenance_helper;
 mod maintenance_lease;
 mod maintenance_loop;
+mod maintenance_reporting;
 mod migration;
 pub use maintenance::MaintenanceAttempt;
 pub use maintenance_helper::MaintenanceHelperAttempt;

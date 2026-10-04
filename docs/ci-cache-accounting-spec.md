@@ -1544,8 +1544,8 @@ Shutdown cancels recovery, execution, reporting or sleep; incomplete helper work
 remains in the durable journal for the established reconciliation path.
 
 This is a callable supervisor with an explicitly supplied trusted policy, not
-production daemon wiring or an enrollment API. Reports are typed but not yet
-persisted as maintenance history. Machine-wide duplicate-supervisor coordination,
+production daemon wiring or an enrollment API. Reports are typed; a bounded latest snapshot is now persisted before delivery
+(see the evidence below), rather than an unbounded maintenance history. Machine-wide duplicate-supervisor coordination,
 policy discovery/bootstrap, cancellation during individual Docker operations,
 old-peer exclusion and production admission still require work. The existing
 configuration guard stays in place. The actual idle periodic/restart proof
@@ -1586,3 +1586,53 @@ during an uncertain Docker operation. Those rollout requirements and broader
 cache-class/image/build-cache expiry remain open.
 
 Strict service all-target Clippy passed for maintenance exclusion (12.04 seconds).
+
+### Durable latest maintenance accounting (2026-10-04 candidate)
+
+The supervisor now commits a typed latest snapshot to its local registry before
+delivering each tick. The fixed meta key has a 4 KiB read/write ceiling and
+replaces the prior snapshot, so report retention cannot itself grow without
+bound. Registry and read-only registry readers can retrieve it after restart.
+This is the latest committed observation, not a machine-wide cumulative history.
+
+Observed snapshots retain command exit status, partial status, logical archive
+budget, nullable remaining/protected bytes and budget outcome. Total reclaimed
+archive bytes are computed with checked arithmetic only for complete root
+reports whose namespace retention data is all known. Partial or missing totals
+remain unknown. Transport/protocol errors use an explicit unknown outcome;
+cleanup and orphan-recovery errors remain separate. UTF-8 diagnostics are capped
+at 128 characters (at most 512 bytes). A failure replaces old totals rather than
+presenting a prior successful snapshot as current evidence.
+
+Helper references must match the registry's existing maintenance-role nonce and
+immutable container ID. Claimed cleanup success requires its durable journal
+state to be Removed. The trusted actor performs the transaction; no new client
+wire operation grants receipt or deletion authority. Snapshot persistence errors
+are reported separately without discarding maintenance/cleanup outcomes.
+Cancellation during an already-enqueued registry operation can leave its commit
+acknowledgement unknown; readers still see only committed snapshots.
+
+The isolated registry restart/conflict test passed (0.22 seconds): premature
+cleanup success and a different container ID were refused; reopening preserved
+the valid snapshot; a later unknown transport outcome replaced it and survived
+read-only reopening. Independent review passed. The actual periodic/restart
+proof with committed snapshot lookup passed in private Docker (64.33 seconds):
+two idle ticks, stop/restart, persistence acknowledgement before each delivered
+report, and a read-only latest snapshot matching the restarted helper ID.
+All fixture containers retired and the shared cache volume survived.
+
+This stores bounded local latest evidence. It does not aggregate snapshots from
+multiple registries, preserve cumulative reclaimed-byte history, retain all
+namespace receipts, expose a new user-facing maintenance-status command, or
+prove physical block reclamation. Current helper journal reconciliation may
+advance after a snapshot; its earlier cleanup error remains historical evidence.
+Production startup policy discovery/enrollment and broader image/build-cache
+and shared cache-class expiry remain open.
+
+The registry boundary also rejects a partial root carrying a claimed total
+reclamation value. The expanded registry test passed (4.61 seconds), accepting
+an unknown reclamation total for that partial report. This closes the typed
+snapshot invariant even for another future trusted caller.
+
+Final registry/service all-target Clippy passed (31.42 seconds), including the
+partial-reclamation guard and latest snapshot integration.

@@ -5,6 +5,7 @@ use kernal_api::async_engine::{self, CancellationToken};
 use std::time::Duration;
 
 pub struct MaintenanceTick {
+    pub persistence: Result<(), String>,
     /// Recovery advances fairly even if a prior helper cannot be observed.
     pub recovery: Result<HelperCleanupRetry, String>,
     /// Separate maintenance and cleanup results are preserved inside the attempt.
@@ -57,14 +58,24 @@ impl DockerActBackend {
                 ),
                 Err(_) => return,
             };
+            let mut tick = MaintenanceTick {
+                recovery,
+                attempt,
+                persistence: Ok(()),
+            };
+            tick.persistence = match async_engine::cancellable(
+                stop,
+                super::maintenance_reporting::persist(registry, &tick),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => return,
+            };
             // Backpressure prevents an unbounded history or unsupervised next
             // pass. Shutdown also interrupts a disconnected/stalled consumer.
             if !matches!(
-                async_engine::cancellable(
-                    stop,
-                    reports.send(MaintenanceTick { recovery, attempt })
-                )
-                .await,
+                async_engine::cancellable(stop, reports.send(tick)).await,
                 Ok(Ok(()))
             ) {
                 return;
@@ -96,7 +107,7 @@ mod tests {
                 .unwrap()
                 .contains("bosn-456-live-v2-engine")
         );
-        with_registry(|registry, _| async move {
+        with_registry(|registry, _directory| async move {
             let backend = DockerActBackend::default();
             let policy: CachePolicy = toml::from_str("repository_max_bytes=104857600\naggregate_max_bytes=209715200\nmax_age_secs=2592000\nunused_age_secs=604800\nmaintenance_interval_secs=60\n").unwrap();
             let (reports, mut receiver) = async_engine::channel(1);
@@ -115,6 +126,7 @@ mod tests {
                     .unwrap()
                     .unwrap();
                     assert!(report.recovery.is_ok());
+                    assert!(report.persistence.is_ok(), "{:?}", report.persistence);
                     let attempt = report.attempt.unwrap();
                     assert!(attempt.cleanup.is_ok(), "{:?}", attempt.cleanup);
                     attempt.outcome.unwrap().require_complete().unwrap();
@@ -138,7 +150,22 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
+                assert!(report.persistence.is_ok(), "{:?}", report.persistence);
+                let snapshot =
+                    bosn_registry::Registry::open_read_only(_directory.join("registry.sqlite3"))
+                        .unwrap()
+                        .latest_cache_maintenance()
+                        .unwrap()
+                        .unwrap();
+                assert!(matches!(
+                    snapshot.outcome,
+                    bosn_registry::cache_maintenance::MaintenanceOutcome::Observed {
+                        partial: false,
+                        ..
+                    }
+                ));
                 let attempt = report.attempt.unwrap();
+                assert_eq!(snapshot.helper.unwrap().container_id, attempt.container_id);
                 assert!(attempt.cleanup.is_ok());
                 attempt.outcome.unwrap().require_complete().unwrap();
                 restart.cancel();
