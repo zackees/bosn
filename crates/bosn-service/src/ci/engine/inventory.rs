@@ -28,17 +28,18 @@ impl DockerActBackend {
     ) -> Result<InventoryAttempt, String> {
         let binary = format!("{}/bin/act", super::ENGINE_WORK);
         let output = self
-            .docker
-            .with_args(owned(&[
-                "exec",
-                engine,
-                &binary,
-                "cache",
-                "audit",
-                "--cache-server-path",
-                &namespace.path(),
-            ]))
-            .capture_async(RunOptions::bounded(Duration::from_secs(30), 64 * 1024))
+            .run_bounded(
+                owned(&[
+                    "exec",
+                    engine,
+                    &binary,
+                    "cache",
+                    "audit",
+                    "--cache-server-path",
+                    &namespace.path(),
+                ]),
+                RunOptions::bounded(Duration::from_secs(30), 64 * 1024),
+            )
             .await
             .map_err(|e| format!("current cache inventory is unknown: {e}"))?;
         // A nonzero command can still provide valid busy/partial evidence.

@@ -23,6 +23,7 @@ use crate::{RegistryActor, act_engine};
 #[cfg(all(test, unix))]
 mod cache_staging_tests;
 mod cache_usage;
+mod control;
 pub use cache_usage::HelperCleanupRetry;
 #[cfg(all(test, unix))]
 mod cache_usage_transport_tests;
@@ -337,18 +338,6 @@ impl DockerActBackend {
             docker,
             active_helpers: Default::default(),
         }
-    }
-
-    async fn run(
-        &self,
-        args: Vec<String>,
-        deadline: Duration,
-    ) -> Result<bosn_engine::CommandResult, String> {
-        self.docker
-            .with_args(args)
-            .capture_async(RunOptions::bounded(deadline, CONTROL_OUTPUT))
-            .await
-            .map_err(|e| e.to_string())
     }
 
     async fn checked(

@@ -143,6 +143,62 @@ fn helper_identity_conflicts_and_invalid_receipts_leave_the_claim_intact() {
 }
 
 #[test]
+fn identical_cleanup_registration_does_not_grow_the_audit_ledger() {
+    let dir = fs::TemporaryDirectory::new().unwrap();
+    let path = dir.path().join("registry.sqlite3");
+    let value = intent(150);
+    let mut registry = Registry::create_writer(&path, OWNER).unwrap();
+    let mut tx = registry.begin_immediate().unwrap();
+    tx.begin_cache_helper(&value).unwrap();
+    tx.register_cache_helper(&value.nonce, ID, 2.0).unwrap();
+    tx.commit().unwrap();
+    for at in 3..103 {
+        let mut tx = registry.begin_immediate().unwrap();
+        tx.register_cache_helper(&value.nonce, ID, f64::from(at))
+            .unwrap();
+        tx.commit().unwrap();
+    }
+    let snapshots = registry
+        .events(0, 256)
+        .unwrap()
+        .items
+        .into_iter()
+        .filter(|event| event.kind == kind(&value.nonce).unwrap())
+        .count();
+    assert_eq!(snapshots, 2, "identical retries must not append snapshots");
+    drop(registry);
+    let mut registry = Registry::open_writer(&path).unwrap();
+    let record = registry.cache_helper(&value.nonce).unwrap().unwrap();
+    assert_eq!(record.state, CacheHelperState::Created);
+    assert_eq!(record.container_id.as_deref(), Some(ID));
+    assert_eq!(record.updated_at, 2.0);
+    let mut tx = registry.begin_immediate().unwrap();
+    assert!(tx.register_cache_helper(&value.nonce, ID, 1.0).is_err());
+    tx.finish_cache_helper(&value.nonce, ID, 103.0).unwrap();
+    assert!(tx.register_cache_helper(&value.nonce, ID, 104.0).is_err());
+    assert!(tx.begin_cache_helper(&value).is_err());
+    tx.commit().unwrap();
+    let snapshots = registry
+        .events(0, 256)
+        .unwrap()
+        .items
+        .into_iter()
+        .filter(|event| event.kind == kind(&value.nonce).unwrap())
+        .count();
+    assert_eq!(
+        snapshots, 3,
+        "terminal absence is a real durable transition"
+    );
+    assert!(
+        registry
+            .pending_cache_helpers(None, 64)
+            .unwrap()
+            .items
+            .is_empty()
+    );
+}
+
+#[test]
 fn bounded_pending_pages_ignore_completed_history_and_advance_fairly() {
     let dir = fs::TemporaryDirectory::new().unwrap();
     let mut registry = Registry::create_writer(dir.path().join("registry.sqlite3"), OWNER).unwrap();

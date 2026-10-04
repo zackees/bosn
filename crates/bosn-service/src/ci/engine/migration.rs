@@ -54,9 +54,10 @@ impl DockerActBackend {
         ]);
         args.push(namespace.path());
         let output = self
-            .docker
-            .with_args(args)
-            .capture_async(RunOptions::bounded(Duration::from_secs(30), 64 * 1024))
+            .run_bounded(
+                args,
+                RunOptions::bounded(Duration::from_secs(30), 64 * 1024),
+            )
             .await
             .map_err(|e| format!("cache publication recovery remains unresolved: {e}"))?;
         if !output.ok() {
@@ -100,9 +101,10 @@ impl DockerActBackend {
         args.extend(legacy_lease::migration_command());
         args.extend(policy.import_args_for_quiescent_source(namespace));
         let result = self
-            .docker
-            .with_args(args)
-            .capture_async(RunOptions::bounded(Duration::from_secs(90), 64 * 1024))
+            .run_bounded(
+                args,
+                RunOptions::bounded(Duration::from_secs(90), 64 * 1024),
+            )
             .await
             .map_err(|error| format!("cache import publication is unknown: {error}"))?;
         let diagnostic: String = String::from_utf8_lossy(&result.stderr)
