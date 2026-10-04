@@ -104,7 +104,13 @@ async function loadLog(filter) {
   for (let page = 0; page < 40; page++) {
     const q = new URLSearchParams({ since_seq: since, limit: 1000, ...filter });
     const logs = await api(`/v1/runs/${selected}/logs?${q}`);
-    pre.append(logs.records.map((r) => r.text).join("\n") + (logs.records.length ? "\n" : ""));
+    const lines = document.createDocumentFragment();
+    for (const record of logs.records) {
+      const stream = record.stream === "stderr" ? "stderr" : record.stream === "stdout" ? "stdout" : "bosn";
+      lines.append(el("span", { class: `log-line ${stream}` },
+        el("span", { class: "log-channel" }, `[${stream}] `), record.text), "\n");
+    }
+    pre.append(lines);
     since = logs.next_seq;
     if (!logs.more) break;
   }
