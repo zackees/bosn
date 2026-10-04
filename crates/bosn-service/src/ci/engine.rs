@@ -548,7 +548,11 @@ impl DockerActBackend {
 
     /// `docker exec` arguments that run act in the work tree, with a
     /// writable home on the engine's storage (its root is read-only).
-    fn act_exec(engine: &str, secrets: &SecretEnv) -> Vec<String> {
+    fn act_exec(
+        engine: &str,
+        secrets: &SecretEnv,
+        route: Option<&super::cache_cohort::CacheRoute>,
+    ) -> Vec<String> {
         let mut args = owned(&["exec", "-w"]);
         args.push(format!("{ENGINE_WORK}/src"));
         for (key, value) in [
@@ -567,7 +571,11 @@ impl DockerActBackend {
             args.push(key.clone());
         }
         args.push(engine.into());
-        args.extend(legacy_lease::command());
+        let legacy = match route {
+            Some(super::cache_cohort::CacheRoute::Legacy(namespace)) => Some(namespace),
+            _ => None,
+        };
+        args.extend(legacy_lease::command(legacy));
         args
     }
 }
@@ -804,7 +812,7 @@ impl ActEngineBackend for DockerActBackend {
         workflow: &'a str,
     ) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(async move {
-            let mut args = Self::act_exec(engine, &SecretEnv::default());
+            let mut args = Self::act_exec(engine, &SecretEnv::default(), None);
             args.extend(owned(&["-l", "-W", workflow, "--workflow-overlay"]));
             args.push(format!("{ENGINE_WORK}/overlay"));
             self.checked("act -l", args, CONTROL_DEADLINE).await
@@ -823,7 +831,8 @@ impl ActEngineBackend for DockerActBackend {
             if let super::cache_cohort::CacheRoute::Cohort { policy, .. } = invocation.cache_route {
                 self.agree_cache_policy(engine, policy).await?;
             }
-            let mut args = Self::act_exec(engine, &invocation.secrets);
+            let mut args =
+                Self::act_exec(engine, &invocation.secrets, Some(&invocation.cache_route));
             args.extend(invocation.args());
             let (events, mut receiver) = async_engine::channel(256);
             let docker = invocation
