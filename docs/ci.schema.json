@@ -19,17 +19,90 @@
       ],
       "type": "object"
     },
-    "CacheUsage": {
-      "description": "The machine-wide cache volume (act tools, runner image, action\ncheckouts and the per-repository `actions/cache` store).",
+    "CacheClass": {
+      "enum": [
+        "tools",
+        "images",
+        "actions",
+        "toolcache",
+        "actcache"
+      ],
+      "type": "string"
+    },
+    "CacheComponent": {
       "properties": {
-        "bytes": {
-          "description": "`None` when the volume does not exist.",
+        "allocated_bytes": {
           "format": "uint64",
           "minimum": 0,
           "type": [
             "integer",
             "null"
           ]
+        },
+        "bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "class": {
+          "$ref": "#/$defs/CacheClass"
+        },
+        "namespace": {
+          "description": "Repository hash for an act cache store; absent for class totals.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "class"
+      ],
+      "type": "object"
+    },
+    "CacheUsage": {
+      "description": "The machine-wide cache volume (act tools, runner image, action\ncheckouts and the per-repository `actions/cache` store).",
+      "properties": {
+        "allocated_bytes": {
+          "default": null,
+          "description": "Allocated filesystem blocks, as measured by `du -k`. Components\nare separate samples and must not be summed with this total.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "bytes": {
+          "description": "Apparent bytes (file lengths), retained for older clients. `None`\nwhen the volume is absent or measurement failed; inspect `partial`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "components": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/CacheComponent"
+          },
+          "type": "array"
+        },
+        "errors": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "partial": {
+          "default": false,
+          "description": "Unknown/incomplete measurements never mean an empty cache.",
+          "type": "boolean"
         },
         "volume": {
           "type": "string"

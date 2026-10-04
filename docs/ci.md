@@ -449,6 +449,9 @@ stubbed job.
 
 ## Caches (machine-wide)
 
+The [CI cache and Docker footprint living spec](ci-cache-accounting-spec.md)
+tracks shared-cache behavior, measured gaps, and implementation/test status.
+
 Every engine mounts one bosn-labelled named volume, `bosn-ci-cache-v1`, at
 `/bosn/cache`. It is a volume rather than a host directory because the
 privileged engine writes as root, and Docker Desktop shares no host paths
@@ -500,9 +503,16 @@ All runtime state is under the daemon state directory (`ci/`):
   `pull_request.base.ref` and `.sha` name the same commit (#403). It is kept
   for the newest 10 runs so they can be retried.
 
-`runners cache` reports the size of the machine-wide cache volume, and
-`runners clear-cache` removes it. Removal is refused while a run executes,
-and the next run recreates the volume cold.
+`runners cache` reports apparent file bytes and allocated filesystem blocks
+for the shared volume, its cache classes and repository namespaces. JSON
+includes `partial` and `errors`; an unreadable cache is unknown, never empty.
+Namespace details are capped at the largest or unknown 256 stores; omitted
+details make the report partial while volume totals stay independent.
+The CLI shows the largest contributors. Samples can change during active
+writes, and class totals include their namespace entries, so do not add them
+again to the volume total. `runners clear-cache` removes the whole volume;
+removal is refused while a run executes, and the next run recreates it cold.
+The living spec records verification and the remaining retention work.
 
 The newest 200 finished runs are kept; `runners prune-cache --older-than-secs N
 --max-bytes N` prunes further.

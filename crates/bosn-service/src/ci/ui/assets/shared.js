@@ -74,7 +74,11 @@ function humanBytes(bytes) {
 }
 
 function cacheText(cache) {
-  return cache.bytes === null ? "cache: none" : `cache: ${humanBytes(cache.bytes)}`;
+  const bytes = cache.allocated_bytes ?? cache.bytes;
+  const size = bytes === null ? (cache.partial ? "unknown" : "none") : humanBytes(bytes);
+  const archives = cache.components?.find((part) => part.class === "actcache" && part.namespace === null);
+  const archiveBytes = archives?.allocated_bytes ?? archives?.bytes;
+  return `cache: ${size}${archiveBytes == null ? "" : ` · archives ${humanBytes(archiveBytes)}`}${cache.partial ? " · partial" : ""}`;
 }
 
 function runnersText(r) {

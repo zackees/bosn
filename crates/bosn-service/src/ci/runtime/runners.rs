@@ -52,15 +52,16 @@ impl CiRuntime {
     }
 
     async fn cache_usage(&self) -> Result<CacheUsage, CiError> {
-        let bytes = self
+        Ok(self
             .backend
-            .cache_bytes(CACHE_VOLUME)
+            .cache_usage(CACHE_VOLUME)
             .await
-            .map_err(|e| CiError::new("internal", e))?;
-        Ok(CacheUsage {
-            volume: CACHE_VOLUME.into(),
-            bytes,
-        })
+            .unwrap_or_else(|error| CacheUsage {
+                volume: CACHE_VOLUME.into(),
+                partial: true,
+                errors: vec![error.chars().take(1024).collect()],
+                ..CacheUsage::default()
+            }))
     }
 
     /// Remove the machine-wide cache volume. Refused while a run executes;

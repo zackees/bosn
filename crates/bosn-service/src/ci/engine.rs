@@ -20,6 +20,9 @@ use kernal_api::async_engine::{self, CancellationToken};
 
 use crate::{RegistryActor, act_engine};
 
+mod cache_usage;
+#[cfg(all(test, unix))]
+mod cache_usage_transport_tests;
 mod lines;
 mod runner_tools;
 mod toolcache;
@@ -253,7 +256,10 @@ pub trait ActEngineBackend: Send + Sync {
     /// best-effort, before the engine is removed.
     fn save_toolcache<'a>(&'a self, engine: &'a str) -> BoxFuture<'a, Result<(), String>>;
     /// The cache volume's size in bytes; `None` when it does not exist.
-    fn cache_bytes<'a>(&'a self, volume: &'a str) -> BoxFuture<'a, Result<Option<u64>, String>>;
+    fn cache_usage<'a>(
+        &'a self,
+        volume: &'a str,
+    ) -> BoxFuture<'a, Result<super::CacheUsage, String>>;
     /// Remove the cache volume. The host engine refuses while any container
     /// (another daemon's run included) still uses it.
     fn remove_cache<'a>(&'a self, volume: &'a str) -> BoxFuture<'a, Result<(), String>>;
@@ -310,10 +316,10 @@ impl DockerActBackend {
     }
 
     async fn volume_exists(&self, volume: &str) -> Result<bool, String> {
-        Ok(self
+        let result = self
             .run(owned(&["volume", "inspect", volume]), CONTROL_DEADLINE)
-            .await?
-            .ok())
+            .await?;
+        cache_usage::volume_present(result.ok(), &result.stderr)
     }
 
     async fn wait_ready(&self, engine: &str) -> Result<(), String> {
@@ -636,37 +642,11 @@ impl ActEngineBackend for DockerActBackend {
         })
     }
 
-    fn cache_bytes<'a>(&'a self, volume: &'a str) -> BoxFuture<'a, Result<Option<u64>, String>> {
-        Box::pin(async move {
-            if !self.volume_exists(volume).await? {
-                return Ok(None);
-            }
-            // Measured read-only with the pinned engine image (present once
-            // any run created the volume): no extra image is pulled.
-            let mount = format!("type=volume,source={volume},target=/cache,readonly");
-            let image = engine_image();
-            let du = owned(&[
-                "run",
-                "--rm",
-                "--pull",
-                "never",
-                "--network",
-                "none",
-                "--mount",
-                &mount,
-                "--entrypoint",
-                "du",
-                &image,
-                "-sb",
-                "/cache",
-            ]);
-            let out = self.checked("cache size", du, PULL_DEADLINE).await?;
-            out.split_whitespace()
-                .next()
-                .and_then(|bytes| bytes.parse().ok())
-                .map(Some)
-                .ok_or_else(|| format!("cache size: unexpected output {out:?}"))
-        })
+    fn cache_usage<'a>(
+        &'a self,
+        volume: &'a str,
+    ) -> BoxFuture<'a, Result<super::CacheUsage, String>> {
+        Box::pin(self.measure_cache(volume))
     }
 
     fn remove_cache<'a>(&'a self, volume: &'a str) -> BoxFuture<'a, Result<(), String>> {
