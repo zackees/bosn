@@ -73,6 +73,20 @@ pub(crate) fn run_scan(mut arguments: impl Iterator<Item = std::ffi::OsString>) 
     }
     println!("scan");
     print_census(census);
+    let owned = bosn_service::owned_accounting::summarize(&scan.artifacts, census.partial);
+    println!("Bosn storage (Docker approximate sizes):");
+    for row in owned.classes {
+        let bytes = row
+            .approximate_bytes
+            .map_or_else(|| "unknown".into(), bosn_service::unmanaged::human_bytes);
+        println!(
+            "  {}: {} objects, {} attached, {} detached, {bytes}",
+            row.class.as_str(),
+            row.objects,
+            row.attached_objects,
+            row.detached_objects
+        );
+    }
     for detail in &scan.unreadable {
         eprintln!("scan: partial: {detail}");
     }
@@ -216,6 +230,7 @@ pub(crate) fn scan_json(
         "partial": census.partial,
         "classes": classes,
         "protected": protected,
+        "owned_storage": bosn_service::owned_accounting::summarize(&scan.artifacts, census.partial),
         "foreign_reclaimable": foreign_reclaimable,
         "unreadable": scan.unreadable,
     })

@@ -75,6 +75,7 @@ mod manifest_plan;
 mod manifest_recovery;
 mod manifest_runtime;
 pub mod mcp;
+pub mod owned_accounting;
 mod registry_actor;
 mod registry_api;
 mod registry_records;

@@ -427,3 +427,23 @@ a valid different registry's machine cache; local driver/scope, empty options
 and identity labels remain mandatory. Ten focused accounting tests and the
 new malformed-label/foreign-driver/bind-option boundary test pass in isolation.
 Strict Clippy for all service targets and source-length/include checks also pass.
+
+### Machine-wide owned volume breakdown (local candidate)
+
+`bosn scan --json` now adds `owned_storage`, derived from the same read-only
+Docker census. Valid label sets from every registry are included and grouped
+as shared CI cache, private CI storage, or other Bosn volumes, with attached and
+detached object counts. Malformed Bosn labels make the summary partial. Names
+alone never establish ownership. Missing sizes keep the class byte total null,
+rather than reporting a known subtotal as the complete footprint.
+
+These are Docker's rounded approximate sizes, not allocated-block samples. They
+must not be added to the shared-cache `du` result, because that would count the
+same volume twice. This summary grants no deletion authority and does not yet
+join private volumes to registry cleanup state. Legacy anonymous volumes remain
+outside this labelled breakdown. Four focused isolated aggregation tests pass;
+The final CLI built and a read-only live scan of the isolated engine succeeded
+in JSON and readable modes: one detached retained shared-cache volume,
+805,100,000 approximate bytes, zero private CI volumes, and no partial reads.
+Final strict Clippy verification passes for all service targets, including the
+readable-output change. Source-length/include and diff checks pass.
