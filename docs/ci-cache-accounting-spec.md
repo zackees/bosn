@@ -3968,3 +3968,12 @@ The sole primary reviewer found no blocking issues in the acknowledgement and
 actor reservation slices. Exact default-branch act2 CI run `37241691702` now
 completed successfully on `6c7ae11a0917c24e88035764c4de3f097dcd6c8f`.
 Release preparation can proceed; no candidate release or Bosn pin is claimed yet.
+
+After clean exact-commit CI and duplicate tag/release absence checks, annotated
+tag `v0.2.89-act2.10` was pushed. Tag object
+`fa12b182110e83ce8f01d9ae2b63d8948e6fd7a6` peels to tested default-branch commit
+`6c7ae11a0917c24e88035764c4de3f097dcd6c8f`. The existing Go tag release workflow
+is in progress as run `37242493394`:
+https://github.com/zackees/act2/actions/runs/37242493394
+Release completion, independent archive/executable digests, architecture and
+embedded-version verification remain pending. Bosn's shipped pin is unchanged.
