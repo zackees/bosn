@@ -90,7 +90,9 @@ impl RunTree {
                 job.status != ItemStatus::Queued && job.conclusion != Some(ItemConclusion::Skipped)
             })
             .any(|job| {
-                (declared.needs_qualified_identity && job.identity.is_none())
+                (declared.needs_qualified_identity
+                    && job.identity.is_none()
+                    && !declared.steps.contains_key(&job.job_id))
                     || (job.identity.is_some()
                         && !declared.steps.contains_key(&job.declaration_key()))
             })

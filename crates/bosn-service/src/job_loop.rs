@@ -716,6 +716,7 @@ pub(crate) fn launch_started_setup_jobs(
                     let run_id = ci::wire::new_uuid().await.map_err(|e| e.message)?;
                     let raw = crate::raw_run_log::RawRunLog::create(&state_dir, &run_id)
                         .map_err(|e| e.to_string())?;
+                    raw.write_metadata(&run_id, id).map_err(|e| e.to_string())?;
                     Ok::<_, String>(raw)
                 }
                 .await;
