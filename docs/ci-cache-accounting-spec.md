@@ -1024,3 +1024,16 @@ and snapshot. Dependency release approval is being prepared; no tag exists yet.
 The namespace test and strict service library Clippy passed for the command
 builders, and review verified flag mapping. Execution of those builders remains
 unverified and production activation stays guarded.
+
+### Dependency release and source-gate checkpoint
+
+The exact-source Bosn gate at b0860ff passed Rust (477 seconds) and Linux
+(485 seconds), reusing Python-static and passing guards. It exited successfully
+and stamped the candidate as `445265cfa97e` after 962 seconds. This gate covers
+the accounting/lifecycle candidate; it does not cover the later retention wiring.
+
+The user approved act2 v0.2.89-act2.5 and established standing authorization
+for necessary act2 releases in AGENTS.md. The annotated tag points to
+`7e6f010fa7cc7171083329b2cf3d18f1566e3468`, whose full CI passed. Existing
+release workflow run 37187501368 is running. Binary/checksum verification and
+Bosn pin updates remain pending; no production retention activation is claimed.
