@@ -28,7 +28,7 @@ impl ManifestEnsureExecutor for DockerManifestEnsureExecutor {
         &'a self,
         request: ManifestEnsureJobRequest,
         cancellation: &'a async_engine::CancellationToken,
-        logs: &'a async_engine::Sender<String>,
+        logs: &'a crate::raw_run_log::JobLogSink,
         registry: &'a RegistryActor,
     ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>> {
         Box::pin(async move {
@@ -164,7 +164,7 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
         &'a self,
         request: ManifestAppTaskJobRequest,
         cancellation: &'a async_engine::CancellationToken,
-        logs: &'a async_engine::Sender<String>,
+        logs: &'a crate::raw_run_log::JobLogSink,
         session: &'a dyn ManifestAppTaskSessionRecorder,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
@@ -219,7 +219,7 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                     &self.github_upstream,
                     credential,
                     self.github_cache.clone(),
-                    Some(logs.clone()),
+                    Some((**logs).clone()),
                 )
                 .await
                 .map_err(|_| "GitHub API proxy could not start".to_owned())?;
@@ -457,7 +457,7 @@ async fn stop_retired_generations(
     session: &dyn ManifestAppTaskSessionRecorder,
     workspace: &str,
     stack: &str,
-    logs: &async_engine::Sender<String>,
+    logs: &crate::raw_run_log::JobLogSink,
 ) -> Result<(), String> {
     for line in session.stop_retired_generations(workspace, stack).await {
         logs.send(line)
@@ -490,7 +490,7 @@ pub(crate) async fn execute_manifest_guest_ssh_task(
     deadline: &async_engine::Deadline,
     output_limit: usize,
     cancellation: &async_engine::CancellationToken,
-    logs: &async_engine::Sender<String>,
+    logs: &crate::raw_run_log::JobLogSink,
     events: &async_engine::Sender<EngineEvent>,
     session: &dyn ManifestAppTaskSessionRecorder,
 ) -> Result<String, String> {

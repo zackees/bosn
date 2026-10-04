@@ -34,7 +34,8 @@ fn guest_task_uses_only_daemon_identity_loopback_and_retains_uncertain_session()
         running: true,
     };
     let (events, _receiver) = async_engine::channel(8);
-    let (logs, _log_receiver) = async_engine::channel(8);
+    let (text_logs, _log_receiver) = async_engine::channel(8);
+    let logs = crate::raw_run_log::JobLogSink::transient(text_logs);
     let cancellation = CancellationSource::new();
     let token = cancellation.token();
     RuntimeBuilder::current_thread()
@@ -118,7 +119,8 @@ fn guest_task_cancellation_after_remote_start_is_uncertain() {
         running: true,
     };
     let (events, _receiver) = async_engine::channel(8);
-    let (logs, _log_receiver) = async_engine::channel(8);
+    let (text_logs, _log_receiver) = async_engine::channel(8);
+    let logs = crate::raw_run_log::JobLogSink::transient(text_logs);
     let cancellation = CancellationSource::new();
     let token = cancellation.token();
     RuntimeBuilder::current_thread()
@@ -195,7 +197,8 @@ fn guest_payload_is_copied_before_the_declared_task_with_no_raw_transport_inputs
         running: true,
     };
     let (events, _receiver) = async_engine::channel(8);
-    let (logs, _log_receiver) = async_engine::channel(8);
+    let (text_logs, _log_receiver) = async_engine::channel(8);
+    let logs = crate::raw_run_log::JobLogSink::transient(text_logs);
     let cancellation = CancellationSource::new();
     let token = cancellation.token();
     RuntimeBuilder::current_thread()
@@ -284,7 +287,8 @@ fn failed_guest_payload_upload_never_starts_or_records_the_task() {
         running: true,
     };
     let (events, _receiver) = async_engine::channel(8);
-    let (logs, _log_receiver) = async_engine::channel(8);
+    let (text_logs, _log_receiver) = async_engine::channel(8);
+    let logs = crate::raw_run_log::JobLogSink::transient(text_logs);
     let cancellation = CancellationSource::new();
     let token = cancellation.token();
     let error = RuntimeBuilder::current_thread()

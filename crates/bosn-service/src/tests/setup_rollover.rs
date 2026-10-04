@@ -371,6 +371,7 @@ fn cancellation_queued_at_registry_handoff_is_rejected_after_persisted_success()
                 Jobs::new(1),
                 job_receiver,
                 SetupExecutors {
+                    state_dir: None,
                     prepare: Arc::new(SlowFakeSetupExecutor::new()),
                     task: Arc::new(FakeSetupTaskExecutor::new()),
                     app_task: Arc::new(FakeSetupAppTaskExecutor::new(None)),
@@ -574,7 +575,8 @@ fn ensure_pipeline_does_not_reset_budget_and_never_mutates_after_prepare_or_owne
         let deadline = async_engine::Deadline::after(Duration::from_secs(1));
         let cancellation = CancellationSource::new();
         let (events, _event_receiver) = async_engine::channel(8);
-        let (logs, _log_receiver) = async_engine::channel(8);
+        let (text_logs, _log_receiver) = async_engine::channel(8);
+        let logs = crate::raw_run_log::JobLogSink::transient(text_logs);
         let pipeline = SetupEnsurePipeline {
             plan: &plan,
             workspace: workspace.clone(),
@@ -620,7 +622,8 @@ fn ensure_pipeline_does_not_reset_budget_and_never_mutates_after_prepare_or_owne
         let deadline = async_engine::Deadline::after(Duration::from_secs(1));
         let cancellation = CancellationSource::new();
         let (events, _event_receiver) = async_engine::channel(8);
-        let (logs, _log_receiver) = async_engine::channel(8);
+        let (text_logs, _log_receiver) = async_engine::channel(8);
+        let logs = crate::raw_run_log::JobLogSink::transient(text_logs);
         let pipeline = SetupEnsurePipeline {
             plan: &plan,
             workspace: workspace.clone(),
@@ -676,7 +679,8 @@ fn ensure_pipeline_does_not_reset_budget_and_never_mutates_after_prepare_or_owne
         let deadline = async_engine::Deadline::after(Duration::from_secs(1));
         let cancellation = CancellationSource::new();
         let (events, _event_receiver) = async_engine::channel(8);
-        let (logs, _log_receiver) = async_engine::channel(8);
+        let (text_logs, _log_receiver) = async_engine::channel(8);
+        let logs = crate::raw_run_log::JobLogSink::transient(text_logs);
         let pipeline = SetupEnsurePipeline {
             plan: &plan,
             workspace,

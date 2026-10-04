@@ -182,6 +182,7 @@ pub(crate) enum SetupJobRequest {
 
 #[derive(Clone)]
 pub(crate) struct SetupExecutors {
+    pub(crate) state_dir: Option<PathBuf>,
     pub(crate) prepare: Arc<dyn SetupPrepareExecutor>,
     pub(crate) task: Arc<dyn SetupTaskExecutor>,
     pub(crate) app_task: Arc<dyn SetupAppTaskExecutor>,

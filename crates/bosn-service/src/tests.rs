@@ -24,7 +24,8 @@ fi
         let base = DockerEngine::synthetic_for_test("/bin/sh", ["-c", SCRIPT, "fake-docker"]);
         let (engine, passthrough_env) = secrets.docker_engine(&base);
         let mut masker = SecretMasker::new(secrets.values.iter().map(|(_, value)| value));
-        let (logs, mut log_receiver) = async_engine::channel::<String>(1024);
+        let (text_logs, mut log_receiver) = async_engine::channel::<String>(1024);
+        let logs = crate::raw_run_log::JobLogSink::transient(text_logs);
         let (events, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
         let forwarder = async_engine::launch(async move {
             while let Some(event) = receiver.recv().await {
@@ -326,7 +327,7 @@ impl SetupPrepareExecutor for SlowFakeSetupExecutor {
         &'a self,
         _request: SetupPrepareRequest,
         cancellation: &'a async_engine::CancellationToken,
-        logs: &'a async_engine::Sender<String>,
+        logs: &'a crate::raw_run_log::JobLogSink,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
             self.started.fetch_add(1, Ordering::SeqCst);
@@ -404,7 +405,7 @@ impl SetupTaskExecutor for FakeSetupTaskExecutor {
         &'a self,
         request: SetupTaskJobRequest,
         cancellation: &'a async_engine::CancellationToken,
-        logs: &'a async_engine::Sender<String>,
+        logs: &'a crate::raw_run_log::JobLogSink,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
             self.started.fetch_add(1, Ordering::SeqCst);
@@ -527,7 +528,7 @@ impl SetupAppTaskExecutor for FakeSetupAppTaskExecutor {
         &'a self,
         request: SetupAppTaskJobRequest,
         _cancellation: &'a async_engine::CancellationToken,
-        logs: &'a async_engine::Sender<String>,
+        logs: &'a crate::raw_run_log::JobLogSink,
         session: &'a dyn SetupAppTaskSessionRecorder,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
@@ -566,7 +567,7 @@ impl ManifestAppTaskExecutor for FakeManifestAppTaskExecutor {
         &'a self,
         request: ManifestAppTaskJobRequest,
         _cancellation: &'a async_engine::CancellationToken,
-        logs: &'a async_engine::Sender<String>,
+        logs: &'a crate::raw_run_log::JobLogSink,
         session: &'a dyn ManifestAppTaskSessionRecorder,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
@@ -604,7 +605,7 @@ impl SetupEnsureExecutor for FakeSetupEnsureExecutor {
         &'a self,
         request: SetupEnsureJobRequest,
         cancellation: &'a async_engine::CancellationToken,
-        logs: &'a async_engine::Sender<String>,
+        logs: &'a crate::raw_run_log::JobLogSink,
     ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>> {
         Box::pin(async move {
             self.started.fetch_add(1, Ordering::SeqCst);
@@ -673,7 +674,7 @@ impl ManifestEnsureExecutor for FakeManifestEnsureExecutor {
         &'a self,
         request: ManifestEnsureJobRequest,
         _cancellation: &'a async_engine::CancellationToken,
-        logs: &'a async_engine::Sender<String>,
+        logs: &'a crate::raw_run_log::JobLogSink,
         _registry: &'a RegistryActor,
     ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>> {
         Box::pin(async move {

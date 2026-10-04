@@ -39,7 +39,7 @@ pub(crate) async fn attach(
     workspace: &Path,
     proxy_dir: Option<&str>,
     rules: &[CacheRule],
-    logs: &async_engine::Sender<String>,
+    logs: &crate::raw_run_log::JobLogSink,
 ) -> RunnerAttachment {
     let runners = &context.runners;
     let record = &context.record;
@@ -172,7 +172,7 @@ pub(crate) async fn attach(
 impl RunnerAttachment {
     /// Stop the proxy and remove everything the job created (containers,
     /// networks, non-cache volumes), then log what was removed.
-    pub(crate) async fn finish(mut self, logs: &async_engine::Sender<String>) {
+    pub(crate) async fn finish(mut self, logs: &crate::raw_run_log::JobLogSink) {
         let proxied = self.proxy.is_some();
         if let Some(mut proxy) = self.proxy.take() {
             proxy.stop();

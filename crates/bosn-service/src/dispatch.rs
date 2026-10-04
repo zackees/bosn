@@ -483,6 +483,7 @@ pub(crate) async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Re
                 match request {
                     Some(request) => {
                         let (logs, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
+                        let logs = crate::raw_run_log::JobLogSink::transient(logs);
                         let drain = async_engine::launch(async move {
                             while receiver.recv().await.is_some() {}
                         });

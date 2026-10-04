@@ -105,7 +105,21 @@ fn setup_prepare_job_is_prompt_coalesced_logged_and_cancellable_without_docker()
             // Slow execution does not occupy the daemon request actor.
             client.ping().await.unwrap();
             let logs = wait_for_logs(&client, first).await;
-            assert_eq!(logs.records[0].line, "[fake] preparation started");
+            assert!(logs.records[0].line.starts_with("[bosn] raw output: "));
+            let mut fake_logged = false;
+            for _ in 0..100 {
+                let page = client.job_logs(first, 0, 16).await.unwrap();
+                if page
+                    .records
+                    .iter()
+                    .any(|record| record.line == "[fake] preparation started")
+                {
+                    fake_logged = true;
+                    break;
+                }
+                async_engine::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(fake_logged, "the executor's output reaches the job log");
 
             let changed = SetupPrepareRequest {
                 config: "https://example.invalid/other.toml".into(),
@@ -357,7 +371,7 @@ impl ManifestAppTaskExecutor for CancellableManifestAppTaskExecutor {
         &'a self,
         request: ManifestAppTaskJobRequest,
         cancellation: &'a async_engine::CancellationToken,
-        _logs: &'a async_engine::Sender<String>,
+        _logs: &'a crate::raw_run_log::JobLogSink,
         _session: &'a dyn ManifestAppTaskSessionRecorder,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
@@ -747,7 +761,7 @@ impl ManifestAppTaskExecutor for TickingManifestAppTaskExecutor {
         &'a self,
         request: ManifestAppTaskJobRequest,
         cancellation: &'a async_engine::CancellationToken,
-        logs: &'a async_engine::Sender<String>,
+        logs: &'a crate::raw_run_log::JobLogSink,
         _session: &'a dyn ManifestAppTaskSessionRecorder,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {

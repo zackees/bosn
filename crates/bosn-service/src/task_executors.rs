@@ -24,7 +24,7 @@ impl SetupTaskExecutor for DockerSetupTaskExecutor {
         &'a self,
         request: SetupTaskJobRequest,
         cancellation: &'a async_engine::CancellationToken,
-        logs: &'a async_engine::Sender<String>,
+        logs: &'a crate::raw_run_log::JobLogSink,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
             // Both engine stages are sequential. Partitioning this one input
@@ -163,7 +163,7 @@ impl SetupAppTaskExecutor for DockerSetupAppTaskExecutor {
         &'a self,
         request: SetupAppTaskJobRequest,
         cancellation: &'a async_engine::CancellationToken,
-        logs: &'a async_engine::Sender<String>,
+        logs: &'a crate::raw_run_log::JobLogSink,
         session: &'a dyn SetupAppTaskSessionRecorder,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
@@ -430,9 +430,10 @@ pub(crate) fn mask_engine_event(masker: &mut SecretMasker, event: EngineEvent) -
 }
 
 pub(crate) async fn forward_engine_event(
-    logs: &async_engine::Sender<String>,
+    logs: &crate::raw_run_log::JobLogSink,
     event: EngineEvent,
 ) -> Result<(), String> {
+    logs.append(&event)?;
     let (stream, bytes) = match event {
         EngineEvent::Stdout(bytes) => ("stdout", bytes),
         EngineEvent::Stderr(bytes) => ("stderr", bytes),

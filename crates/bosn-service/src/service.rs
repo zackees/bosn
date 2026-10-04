@@ -186,6 +186,7 @@ impl Service {
             }),
             job_receiver,
             SetupExecutors {
+                state_dir: Some(self.state_dir.clone()),
                 prepare: Arc::clone(&self.setup_executor),
                 task: Arc::clone(&self.setup_task_executor),
                 app_task: Arc::clone(&self.setup_app_task_executor),
