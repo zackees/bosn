@@ -297,6 +297,7 @@ impl ActEngineBackend for FakeBackend {
         engine: &'a str,
         _source: &'a std::path::Path,
         _event: &'a std::path::Path,
+        _generation: Option<&'a bosn_registry::act::ActToolGenerationBinding>,
     ) -> crate::ci::engine::BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             assert!(self.live_id(engine), "prepare addresses the engine by ID");

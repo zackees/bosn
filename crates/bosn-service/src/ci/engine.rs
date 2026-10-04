@@ -53,7 +53,7 @@ mod toolcache;
 use lines::LineBuffer;
 #[cfg(test)]
 use lines::MAX_LINE;
-use toolcache::{save_toolcache_script, seed_toolcache_script};
+use toolcache::{prepare_toolcache_script, save_toolcache_script};
 
 pub use super::pins::{ACT_VERSION, ActArtifact, RUNNER_IMAGE, act_artifact, runner_tag};
 
@@ -253,6 +253,7 @@ pub trait ActEngineBackend: Send + Sync {
         engine: &'a str,
         source: &'a Path,
         event: &'a Path,
+        generation: Option<&'a bosn_registry::act::ActToolGenerationBinding>,
     ) -> BoxFuture<'a, Result<(), String>>;
     /// `act -l` for the workflow (declared jobs and their stages).
     fn list<'a>(
@@ -767,11 +768,12 @@ impl ActEngineBackend for DockerActBackend {
         engine: &'a str,
         source: &'a Path,
         event: &'a Path,
+        generation: Option<&'a bosn_registry::act::ActToolGenerationBinding>,
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             self.checked(
                 "tool cache seed",
-                Self::exec(engine, &seed_toolcache_script()),
+                Self::exec(engine, &prepare_toolcache_script(generation)?),
                 PULL_DEADLINE,
             )
             .await?;

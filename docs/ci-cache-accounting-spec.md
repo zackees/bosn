@@ -3533,3 +3533,32 @@ Separately, the act2.9 pin's gate34 failed at the stalled-discovery shutdown
 latency assertion (6.998 seconds against a five-second ceiling), after format
 and Clippy passed. That failure is retained and under investigation; no gate34
 attestation authorizes publication.
+
+### Native overlay preparation and real jobs (working implementation, 2026-10-04)
+
+`prepare_run` now receives the frozen typed generation binding from its engine
+intent. Legacy plans retain their seed path; a bound generation uses the new
+`toolcache_overlay.sh`. Before mounting, the script checks PID1's original reader
+FD, exact expected reader path and device/inode identity. It refuses missing or
+invalid descriptors, a nonempty target, and preexisting upper/work paths. The
+selected immutable generation is the overlay lower; upper/work live in the
+engine's private `/var/lib/docker`. The mount explicitly requests metacopy.
+
+The actual generated overlay script passed in a released act2.9 engine using
+Bosn's init command and dockerd flags. Two real nested job containers mounted
+`act-toolcache`: job one changed the payload mode and wrote private settings;
+job two observed both changes and the identical payload hash. The 16 MiB payload
+copy-up occupied zero upper blocks. The shared generation acquired no settings
+file. Independent exclusive-reader probing remained blocked until engine removal.
+All owned fixture containers/volumes were cleaned up. Evidence:
+`.git/retention-native-overlay-jobs-proof.json` and its executable fixture.
+All 14 existing scoped lifecycle tests passed (one physical cohort test ignored);
+evidence `.git/retention-native-overlay-lifecycle-tests.log`.
+
+This connects preparation to a bound plan, but the normal runtime planner still
+creates unbound plans. Before activation, completed private upper installs must
+be published after writer exclusion, disk storage must survive until verified
+publication/recovery, and recovery must revalidate live reader/mount identity.
+The existing ordinary-exit legacy saver is not native generation publication;
+it must not be used as proof that new overlay installs persist to a fresh engine.
+Automatic generation selection and maintenance are still absent.
