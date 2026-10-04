@@ -2195,7 +2195,8 @@ Linux 286s), stamped `6d1b8a77fd0cb2036c811548830cc8de41dee65c` for tree
 `ff728e2a68bc4b2fc5339989c9dc487b6a8f4f85`; pinned verification and required
 remote PR checks passed. No Bosn release was made.
 
-The local act2 candidate `01a69fa` now publishes a per-generation
+The act2 candidate `01a69fa`, published in
+[act2 PR #31](https://github.com/zackees/act2/pull/31), creates a per-generation
 `.readers-v1.bolt` coordination file in the private stage before directory sync
 and atomic publication. Reuse refuses missing reader coordination. The typed
 `AcquireToolGenerationLease` API validates a canonical established store,
@@ -2231,6 +2232,16 @@ reviewer returned PASS for the corrected slice. Artifacts:
 `act2-tool-generation-catalog-reader-red.log`,
 `act2-tool-generation-reader-catalog-fixes.log`,
 `act2-tool-generation-reader-final-checks.log`.
+
+Source-bound checks then passed on the clean committed candidate: all 2,547
+exported Git files matched the private Docker build source before and after
+execution. Complete cache tests, focused tool command tests, vet, lint and
+Darwin/Windows compilation passed in 18 seconds. Source SHA:
+`01a69faac05e88cf0e2b5b84b23c2adeb47995a1`; tree:
+`f6fe365745366bd8e698997c903511c352947f6e`. This scoped local gate does not
+replace full act2 CI on the exact release candidate. Artifacts:
+`act2-immutable-source-bound-gate.json` and its execution log. No act2 release
+or Bosn activation is claimed.
 
 Admission currently audits the full payload while holding the catalog lock.
 Its cost on the surveyed 7.7 GiB cache has not been measured; this is a
