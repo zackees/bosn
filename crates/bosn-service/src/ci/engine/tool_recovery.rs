@@ -47,7 +47,9 @@ fn require_reservation(text: &str, expected: &RecoveryPin, root: &str) -> Result
             "tool recovery reservation unacknowledged or differs from frozen intent".into(),
         );
     }
-    let _identical_retry = report.reused;
+    // `reused` is informational only: an identical retry is safe because the
+    // pin comparison above matches the complete frozen intent, not because
+    // act2 reported the work as already done.
     Ok(())
 }
 

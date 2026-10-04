@@ -4030,13 +4030,29 @@ now constructs the proof from real Docker observations
   returns without rewriting the timestamp.
 
 **Preservation guard.** `remove_storage_volume` now refuses while a record
-holds an unreleased recovery intent, so private disk and terminal metadata are
-not finalized ahead of publication. The underlying destructive primitive was
+holds a **live** recovery reference, so private disk and terminal metadata are
+not finalized ahead of publication. Retention is bounded by the reference's own
+finite lifetime rather than by a release transition that does not exist yet: an
+expired reference is an abandoned recovery, so the volume is reclaimable
+instead of wedging cleanup and leaking the disk forever. The guard is
+fail-closed for the whole (at most 24 hour) window in which a helper could
+still publish through that reference. The underlying destructive primitive was
 made module-private (`remove_private_storage`), so the guarded entry is the only
 crate-reachable path and the guard cannot be bypassed by adding a caller. This
 is a structural guarantee rather than a unit test, because an
 `ActEngineRecord` cannot be constructed outside the registry; the registry-side
 receipt boundaries are already covered by the existing focused recovery tests.
+The liveness/expiry predicate itself is a pure function and is unit-tested.
+
+Pre-push review of the branch raised a blocking defect that was fixed here: the
+first guard keyed only on the presence of a recovery intent, which is never
+cleared, so one recovery run would have wedged its record in `CleanupRequired`
+forever — leaking a volume and a registry row and re-failing the same
+retirement on every later cleanup pass. Keying on expiry gives that path a
+bounded escape. The review also flagged the retained-source predicate as a
+near-verbatim copy of the private-storage predicate; both now share one
+`verify_owned_local_volume` predicate that takes the expected name and labels
+from the caller, so a Docker-reported name can never substitute a volume.
 
 Workspace Clippy with warnings denied and `--all-targets` passed, and `./lint`
 (including file length and include-base) passed. Host test execution is

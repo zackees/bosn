@@ -36,26 +36,41 @@ pub(super) struct DockerVolume {
     pub(super) labels: Option<BTreeMap<String, String>>,
 }
 
-fn verify(document: &[u8], intent: &ActEngineIntent, owner: &str) -> Result<(), ActEngineError> {
+/// The one predicate that decides whether an observed volume is the private
+/// local volume a bosn intent owns. Ambiguous, absent or unparsable output is
+/// always a refusal; the expected name comes from the caller, never from
+/// Docker, so a rename can never substitute a different volume.
+pub(super) fn verify_owned_local_volume(
+    document: &[u8],
+    expected_name: &str,
+    expected_labels: &BTreeMap<String, String>,
+) -> Result<(), ActEngineError> {
     let volumes: Vec<DockerVolume> =
         serde_json::from_slice(document).map_err(|e| ActEngineError(e.to_string()))?;
     let [volume] = volumes.as_slice() else {
         return Err(ActEngineError("ambiguous private storage volume".into()));
     };
-    if Some(&volume.name) != intent.storage_volume_name().as_ref()
+    if volume.name != expected_name
         || volume.driver != "local"
         || volume.scope != "local"
         || volume
             .options
             .as_ref()
             .is_some_and(|options| !options.is_empty())
-        || volume.labels.as_ref() != Some(&labels(intent, owner)?)
+        || volume.labels.as_ref() != Some(expected_labels)
     {
         return Err(ActEngineError(
             "private storage volume ownership does not match".into(),
         ));
     }
     Ok(())
+}
+
+fn verify(document: &[u8], intent: &ActEngineIntent, owner: &str) -> Result<(), ActEngineError> {
+    let expected = intent
+        .storage_volume_name()
+        .ok_or_else(|| ActEngineError("private storage volume ownership does not match".into()))?;
+    verify_owned_local_volume(document, &expected, &labels(intent, owner)?)
 }
 
 async fn present(engine: &DockerEngine, name: &str) -> Result<bool, ActEngineError> {

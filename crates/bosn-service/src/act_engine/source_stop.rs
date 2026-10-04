@@ -12,16 +12,28 @@
 //! while a record holds an unreleased recovery intent, so the source volume
 //! survives for the recovering reader and terminal metadata stays unfinalized.
 
-use super::storage_volume::DockerVolume;
 use super::*;
 use bosn_registry::act::{
     ActEngineIntent, ActEngineRecord, ActToolRecoveryIntent, ActToolSourceStopProof,
 };
 
-/// A record with a frozen recovery intent still owes publication and release.
-/// Its private source volume must survive engine retirement.
+/// A recovery reference protects the source volume only while it is live.
+///
+/// The lifetime is finite by construction (act2 caps it at 24 hours), so an
+/// expired reference is an **abandoned** recovery: the helper can no longer
+/// publish through it, and holding the private disk forever would wedge cleanup
+/// and leak the volume. Retention therefore ends at expiry rather than
+/// requiring a release transition that does not exist yet.
+fn reference_is_live(frozen: &ActToolRecoveryIntent, now: f64) -> bool {
+    (frozen.expires_at_seconds as f64) > now
+}
+
+/// A record still holding a live recovery reference keeps its source volume.
 pub(crate) fn source_retained_by_recovery(record: &ActEngineRecord) -> bool {
-    record.tool_recovery.is_some()
+    record
+        .tool_recovery
+        .as_ref()
+        .is_some_and(|frozen| reference_is_live(frozen, crate::act_runtime::now()))
 }
 
 /// Prove the frozen source volume is still present and still ours.
@@ -34,7 +46,7 @@ fn verify_retained_source(
     intent: &ActEngineIntent,
     frozen: &ActToolRecoveryIntent,
     owner: &str,
-) -> Result<String, ActEngineError> {
+) -> Result<(), ActEngineError> {
     let expected = intent
         .storage_volume_name()
         .ok_or_else(|| ActEngineError("tool recovery needs named source storage".into()))?;
@@ -43,25 +55,11 @@ fn verify_retained_source(
             "recovery source volume does not match the engine intent".into(),
         ));
     }
-    let volumes: Vec<DockerVolume> =
-        serde_json::from_slice(document).map_err(|e| ActEngineError(e.to_string()))?;
-    let [volume] = volumes.as_slice() else {
-        return Err(ActEngineError("ambiguous recovery source volume".into()));
-    };
-    if volume.name != expected
-        || volume.driver != "local"
-        || volume.scope != "local"
-        || volume
-            .options
-            .as_ref()
-            .is_some_and(|options| !options.is_empty())
-        || volume.labels.as_ref() != Some(&super::storage_volume::labels(intent, owner)?)
-    {
-        return Err(ActEngineError(
-            "recovery source volume ownership does not match".into(),
-        ));
-    }
-    Ok(expected)
+    super::storage_volume::verify_owned_local_volume(
+        document,
+        &frozen.source_volume,
+        &super::storage_volume::labels(intent, owner)?,
+    )
 }
 
 /// Build the exact trusted proof from frozen identity. Engine absence is
@@ -174,10 +172,7 @@ mod tests {
     fn exact_retained_source_is_accepted() {
         let intent = disk_intent();
         let frozen = frozen(&intent);
-        assert_eq!(
-            verify_retained_source(&inspect(owned(&intent)), &intent, &frozen, OWNER).unwrap(),
-            frozen.source_volume
-        );
+        assert!(verify_retained_source(&inspect(owned(&intent)), &intent, &frozen, OWNER).is_ok());
     }
 
     #[test]
@@ -221,6 +216,18 @@ mod tests {
         let mut frozen = frozen(&intent);
         frozen.source_volume = "someone-elses-volume".into();
         assert!(verify_retained_source(&inspect(owned(&intent)), &intent, &frozen, OWNER).is_err());
+    }
+
+    #[test]
+    fn retention_ends_when_the_reference_expires() {
+        let intent = disk_intent();
+        let frozen = frozen(&intent);
+        // Live while the finite lifetime has not elapsed...
+        assert!(reference_is_live(&frozen, 19.0));
+        // ...and an abandoned reference releases the private source disk rather
+        // than wedging cleanup forever.
+        assert!(!reference_is_live(&frozen, 20.0));
+        assert!(!reference_is_live(&frozen, 100_000.0));
     }
 
     #[test]
