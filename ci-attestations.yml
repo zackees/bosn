@@ -19,7 +19,7 @@ gates:
   rust/all/fmt: {lane: rust}                # rustfmt --check
   rust/all/boundary: {lane: rust}           # kernal-api boundary, locked resolution
   rust/x86_64-unknown-linux-gnu/clippy: {lane: rust}
-  rust/x86_64-unknown-linux-gnu/test: {lane: tests}    # workspace + embedded-Python tests, in bosn
+  rust/x86_64-unknown-linux-gnu/test: {lane: rust}    # workspace + embedded-Python tests, in bosn
   python/x86_64-unknown-linux-gnu/test: {lane: tests}  # pytest (not docker-marked), in bosn
 jobs:
   ci.yml:lint-no-macos-runners: [general/all/ci-policy]

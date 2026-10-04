@@ -7,6 +7,7 @@ import json
 import platform
 import re
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,7 +37,12 @@ RUST = Selection(
     (
         RequiredJob("verify", ("Verify the local-gate attestation and decide attested skips",)),
         RequiredJob(
-            "rust", ("Verify kernal-api boundary and locked resolution", "Test Rust workspace")
+            "rust",
+            (
+                "Rust format and Clippy",
+                "Verify kernal-api boundary and locked resolution",
+                "Test Rust workspace",
+            ),
         ),
     ),
 )
@@ -275,11 +281,20 @@ def run_selection(selection: Selection) -> int:
         return 1
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--selection", choices=("rust", "linux"), required=True)
-    args = parser.parse_args()
-    return run_selection(RUST if args.selection == "rust" else LINUX)
+    parser.add_argument("--lane", choices=("py-static", "guards", "rust", "tests"))
+    args = parser.parse_args(argv)
+    for lane in (args.lane,) if args.lane else ("py-static", "guards", "rust", "tests"):
+        if lane in {"py-static", "guards"}:
+            code = subprocess.run(
+                [sys.executable, "ci/local_gate.py", "--lane", lane], cwd=ROOT
+            ).returncode
+        else:
+            code = run_selection(RUST if lane == "rust" else LINUX)
+        if code:
+            return code
+    return 0
 
 
 if __name__ == "__main__":
