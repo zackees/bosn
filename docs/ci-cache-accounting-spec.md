@@ -667,3 +667,25 @@ The draft introduces no version bump or release. It is not merged, not a
 verified release artifact, and not a Bosn pin update. Bosn policy arguments,
 independent helper supervision, verified warm migration and physical pressure
 control remain required integration work.
+
+### Owned-volume warnings in doctor (local Bosn candidate)
+
+`bosn doctor` now renders owned-volume footprint warnings from its existing
+machine census, before unmanaged warning/acknowledgement handling. No second
+Docker scan is added. It uses the existing default thresholds (5 GiB or 25
+objects) across the nonoverlapping owned volume classes. Partial accounting or
+unknown sizes also warn when owned or invalid-labeled volumes are observed.
+An unavailable empty census does not claim an owned footprint.
+
+Warnings show each observed class's Docker approximate bytes and attachment
+counts, link users to `bosn scan --json`, and direct shared-cache owners to
+`bosn ci runners cache` for actual block accounting. They preserve retained
+volume release contracts and convey no removal authority. They remain on
+stderr, so `doctor --json` stdout keeps its existing report shape. An unmanaged
+acknowledgement does not suppress the independent owned warning.
+
+Two focused RED warning signals became GREEN; all eight owned-accounting tests
+pass in the isolated Rust container. Strict Clippy for all service targets,
+source-length/include gates and slice review pass. This is a visibility
+improvement, not a free-space pressure controller or automatic owned GC. No
+new live host measurement was required for this warning change.

@@ -65,6 +65,59 @@ pub enum LifecycleRead {
 }
 
 impl OwnedStorage {
+    /// Size warnings share the existing census; they never authorize removal.
+    pub fn warning_lines(&self, threshold: bosn_core::WarningThreshold) -> Vec<String> {
+        let objects: u64 = self.classes.iter().map(|row| row.objects).sum();
+        if objects == 0 && self.invalid_label_volumes == 0 {
+            return Vec::new();
+        }
+        let bytes = self.classes.iter().try_fold(0_i128, |total, row| {
+            total.checked_add(row.approximate_bytes?)
+        });
+        if !self.partial
+            && objects < threshold.objects
+            && bytes.is_some_and(|bytes| bytes < threshold.bytes)
+        {
+            return Vec::new();
+        }
+        let mut lines = vec![format!(
+            "Bosn-owned Docker volume footprint (approximate sizes{})",
+            if self.partial {
+                "; accounting incomplete"
+            } else {
+                ""
+            }
+        )];
+        for row in self.classes.iter().filter(|row| row.objects > 0) {
+            let size = row
+                .approximate_bytes
+                .map_or_else(|| "unknown".into(), crate::unmanaged::human_bytes);
+            lines.push(format!(
+                "  {}: {} objects, {} attached, {} detached, {size}",
+                row.class.as_str(),
+                row.objects,
+                row.attached_objects,
+                row.detached_objects
+            ));
+        }
+        if self.invalid_label_volumes > 0 {
+            lines.push(format!(
+                "  {} volumes have incomplete or invalid Bosn ownership labels",
+                self.invalid_label_volumes
+            ));
+        }
+        lines.push("  inspect owned storage: bosn scan --json".into());
+        if self
+            .classes
+            .iter()
+            .any(|row| row.class == StorageClass::SharedCiCache && row.objects > 0)
+        {
+            lines.push("  measure shared cache blocks: bosn ci runners cache".into());
+        }
+        lines.push("  retained volumes require explicit release; attachment state alone is not removal authority".into());
+        lines
+    }
+
     /// Correlate only this read-only registry; foreign or absent history stays explicit.
     pub fn correlate(&mut self, registry: Option<&bosn_registry::ReadOnlyRegistry>) {
         let Some(registry) = registry else {
@@ -234,6 +287,37 @@ mod tests {
             age_seconds: Some(1.0),
         }
     }
+    #[test]
+    fn large_owned_storage_warns_even_without_unmanaged_objects() {
+        let report = summarize(&[volume("owner", Some(100), true)], false);
+        let lines = report.warning_lines(bosn_core::WarningThreshold {
+            bytes: 80,
+            objects: 10,
+        });
+        assert!(lines.iter().any(|line| line.contains("private CI storage")));
+        assert!(lines.iter().any(|line| line.contains("1 attached")));
+        assert!(lines.iter().any(|line| line.contains("bosn scan --json")));
+        assert!(lines.iter().all(|line| !line.contains("--apply")));
+    }
+
+    #[test]
+    fn owned_unknown_sizes_warn_but_empty_or_small_complete_storage_does_not() {
+        let threshold = bosn_core::WarningThreshold {
+            bytes: 80,
+            objects: 10,
+        };
+        let unknown = summarize(&[volume("owner", None, false)], false);
+        let lines = unknown.warning_lines(threshold);
+        assert!(lines.iter().any(|line| line.contains("unknown")));
+        assert!(lines.iter().any(|line| line.contains("incomplete")));
+        assert!(summarize(&[], true).warning_lines(threshold).is_empty());
+        assert!(
+            summarize(&[volume("owner", Some(10), false)], false)
+                .warning_lines(threshold)
+                .is_empty()
+        );
+    }
+
     #[test]
     fn all_registries_and_detached_storage_are_counted_once() {
         let report = summarize(

@@ -48,7 +48,7 @@ pub(crate) fn run_doctor(arguments: impl Iterator<Item = std::ffi::OsString>) {
     doctor_unmanaged_warning(&state_dir);
 }
 
-/// Print the unmanaged-artifact warning after a doctor report, if it applies.
+/// Print owned-volume and unmanaged-artifact warnings from one census.
 ///
 /// An unreachable engine is reported as unavailable rather than as a warning: crying
 /// "not known to be clean" on every machine without Docker would make the loud warning the
@@ -56,6 +56,10 @@ pub(crate) fn run_doctor(arguments: impl Iterator<Item = std::ffi::OsString>) {
 pub(crate) fn doctor_unmanaged_warning(state_dir: &Path) {
     let config = census_config(None);
     let (scan, _) = scan_host(state_dir, config);
+    let owned = bosn_service::owned_accounting::summarize(&scan.artifacts, scan.census.partial);
+    for line in owned.warning_lines(warning_threshold(None, None)) {
+        eprintln!("{line}");
+    }
     if scan.census.classes.is_empty() && !scan.unreadable.is_empty() {
         eprintln!("unmanaged artifacts: census unavailable (is the Docker engine reachable?)");
         return;
