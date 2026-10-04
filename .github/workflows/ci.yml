@@ -147,6 +147,8 @@ jobs:
           version: "0.9.27"
           toolchain: "1.95.0"
           prebuild-deps: none
+          # A restored solo snapshot can lack the on-demand Clippy binary.
+          solo-toolchain-cache: "false"
 
       # No hand-keyed target cache (#361 phase 3): the former
       # Swatinem/rust-cache `rust-workspace-v1` key was invalidated by hand.
