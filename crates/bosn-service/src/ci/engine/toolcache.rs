@@ -29,6 +29,19 @@ pub(super) fn seed_toolcache_script() -> String {
     )
 }
 
+const OVERLAY_RECIPE: &str = include_str!("toolcache_overlay.sh");
+
+fn overlay_recipe() -> String {
+    OVERLAY_RECIPE
+        .replace("@STORE@", &format!("{ENGINE_CACHE}/toolstore-v1"))
+        .replace("@TARGET@", TOOLCACHE_MOUNT)
+}
+
+/// Freeze the exact preparation recipe independently of the generation ID.
+pub(super) fn overlay_recipe_sha256() -> String {
+    kernal_api::hash::sha256_bytes(overlay_recipe().as_bytes()).to_hex()
+}
+
 /// A typed generation is admitted by engine PID1 before this overlay is built.
 /// The private upper is shared by jobs in this engine, never by fresh engines.
 pub(super) fn prepare_toolcache_script(
@@ -38,10 +51,10 @@ pub(super) fn prepare_toolcache_script(
         return Ok(seed_toolcache_script());
     };
     generation.validate().map_err(|error| error.to_string())?;
-    Ok(include_str!("toolcache_overlay.sh")
-        .replace("@STORE@", &format!("{ENGINE_CACHE}/toolstore-v1"))
-        .replace("@GENERATION@", &generation.id)
-        .replace("@TARGET@", TOOLCACHE_MOUNT))
+    if generation.overlay_recipe_sha256 != overlay_recipe_sha256() {
+        return Err("tool overlay recipe differs from frozen producer".into());
+    }
+    Ok(overlay_recipe().replace("@GENERATION@", &generation.id))
 }
 
 /// Save each completed install the machine-wide copy lacks: copied to a temp

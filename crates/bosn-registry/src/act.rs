@@ -114,10 +114,13 @@ impl ActEngineCacheVolume {
 pub struct ActToolGenerationBinding {
     pub id: String,
     pub max_payload_bytes: u64,
+    /// Exact producer preparation recipe, including native reader checks.
+    pub overlay_recipe_sha256: String,
 }
 impl ActToolGenerationBinding {
     pub fn validate(&self) -> Result<(), Error> {
         if !hex(&self.id, 64)
+            || !hex(&self.overlay_recipe_sha256, 64)
             || self.max_payload_bytes == 0
             || self.max_payload_bytes > i64::MAX as u64
         {

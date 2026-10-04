@@ -3562,3 +3562,28 @@ publication/recovery, and recovery must revalidate live reader/mount identity.
 The existing ordinary-exit legacy saver is not native generation publication;
 it must not be used as proof that new overlay installs persist to a fresh engine.
 Automatic generation selection and maintenance are still absent.
+
+### Effective overlay and frozen preparation recipe (2026-10-04)
+
+The binding now also requires `overlay_recipe_sha256`. The producer hashes the
+exact preparation script with canonical store/target paths and the generation
+placeholder; the separately frozen generation ID completes its inputs. Creation
+and preparation refuse a recipe mismatch, so a new daemon cannot silently use a
+changed overlay recipe with a previously frozen generation profile. Profiles
+without a generation still omit the entire binding.
+
+After mount, the actual script reads `/proc/self/mountinfo` and requires exactly
+one matching writable overlay with the exact lower/upper/work paths and effective
+`metacopy=on`. Success of the mount command alone is insufficient. The updated
+real two-job fixture passed these checks with zero allocated blocks for the
+16 MiB metadata-only upper payload. A helper without a live PID1 native reader
+was refused before overlay setup (`native tool reader descriptor missing`). The
+original reader continued excluding a writer until engine removal. Fixture
+cleanup completed. Evidence: `.git/retention-native-overlay-jobs-proof.json`;
+the earlier successful pre-verification report is retained separately.
+
+The focused frozen-profile test also passed with rejection of a changed recipe
+digest: `.git/retention-native-overlay-recipe-binding-test.log`. No automatic
+runtime selection, native publication, recovery fencing or expiry activation is
+claimed. The act2.9 pin retry gate35 passed its Rust lane in 415 seconds; its
+Linux lane is still running, so publication remains unauthorized by that gate.

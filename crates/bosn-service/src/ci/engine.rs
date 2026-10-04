@@ -55,6 +55,10 @@ use lines::LineBuffer;
 use lines::MAX_LINE;
 use toolcache::{prepare_toolcache_script, save_toolcache_script};
 
+pub(crate) fn tool_overlay_recipe_sha256() -> String {
+    toolcache::overlay_recipe_sha256()
+}
+
 pub use super::pins::{ACT_VERSION, ActArtifact, RUNNER_IMAGE, act_artifact, runner_tag};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;

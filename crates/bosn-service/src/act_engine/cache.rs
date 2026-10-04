@@ -46,6 +46,13 @@ pub(crate) fn creation_profile_with_tools(
     cache: Option<ActEngineCacheVolume>,
     generation: Option<bosn_registry::act::ActToolGenerationBinding>,
 ) -> Result<ActEngineCreationProfile, ActEngineError> {
+    if generation.as_ref().is_some_and(|generation| {
+        generation.overlay_recipe_sha256 != crate::ci::engine::tool_overlay_recipe_sha256()
+    }) {
+        return Err(ActEngineError(
+            "tool overlay recipe differs from frozen producer".into(),
+        ));
+    }
     let mut profile = creation_profile(limits)?;
     profile.cache_coordination = cache
         .as_ref()
@@ -290,7 +297,8 @@ mod ownership_tests {
             serde_json::to_value(creation_profile_with_cache(limits, Some(cache)).unwrap())
                 .unwrap();
         document["tool_generation"] = serde_json::json!({
-            "id": "a".repeat(64), "max_payload_bytes": 33554432
+            "id": "a".repeat(64), "max_payload_bytes": 33554432,
+            "overlay_recipe_sha256": crate::ci::engine::tool_overlay_recipe_sha256()
         });
         let profile: ActEngineCreationProfile = serde_json::from_value(document).unwrap();
         profile.validate().unwrap();
@@ -318,6 +326,14 @@ mod ownership_tests {
                 .any(|pair| pair == ["--max-bytes", "33554432"])
         );
         assert!(args.contains(&format!("{}/toolstore-v1", crate::ci::engine::ENGINE_CACHE)));
+        let mut altered = intent.creation_profile.clone().unwrap();
+        altered
+            .tool_generation
+            .as_mut()
+            .unwrap()
+            .overlay_recipe_sha256 = "f".repeat(64);
+        intent.creation_profile = Some(altered);
+        assert!(create_arguments(&intent, ANY_REGISTRY, limits).is_err());
     }
 
     #[test]

@@ -21,3 +21,24 @@ docker volume create act-toolcache >/dev/null
 [ ! -e "$work" ] && [ ! -L "$work" ] || exit 1
 mkdir "$upper" "$work"
 mount -t overlay overlay -o "metacopy=on,lowerdir=$lower,upperdir=$upper,workdir=$work" "$target"
+# Verify the effective kernel mount, including metacopy; a successful command
+# alone does not establish the requested allocation/sharing contract.
+awk -v target="$target" -v lower="$lower" -v upper="$upper" -v work="$work" '
+$5 == target {
+    count++
+    separator = 0
+    for (i = 7; i <= NF; i++) if ($i == "-") { separator = i; break }
+    if (!separator || $(separator + 1) != "overlay") next
+    split($6, mount_flags, ",")
+    for (i in mount_flags) if (mount_flags[i] == "rw") mount_rw = 1
+    split($(separator + 3), overlay_flags, ",")
+    for (i in overlay_flags) {
+        if (overlay_flags[i] == "rw") overlay_rw = 1
+        if (overlay_flags[i] == "metacopy=on") metacopy = 1
+        if (overlay_flags[i] == "lowerdir=" lower) lower_ok = 1
+        if (overlay_flags[i] == "upperdir=" upper) upper_ok = 1
+        if (overlay_flags[i] == "workdir=" work) work_ok = 1
+    }
+}
+END { exit !(count == 1 && mount_rw && overlay_rw && metacopy && lower_ok && upper_ok && work_ok) }
+' /proc/self/mountinfo
