@@ -4,6 +4,16 @@ use super::*;
 
 #[test]
 fn setup_ensure_job_is_prompt_coalesced_bounded_and_cancellable_without_docker() {
+    // Admission awaits the durable audit commit. Keep this protocol timing
+    // fixture independent of Linux overlay fsync latency; this does not assert
+    // a disk-backed production acknowledgement latency guarantee.
+    #[cfg(target_os = "linux")]
+    let temporary = kernal_api::platform::fs::TemporaryDirectory::in_directory(
+        std::path::Path::new("/dev/shm"),
+        "bosn-service-ensure-",
+    )
+    .unwrap();
+    #[cfg(not(target_os = "linux"))]
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let state = temporary.path().join("state");
     let workspace = temporary.path().join("workspace");

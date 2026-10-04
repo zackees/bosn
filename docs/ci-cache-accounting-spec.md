@@ -1767,3 +1767,30 @@ redaction and partial/protected-over-budget evidence with unknown reclamation
 and failed cleanup. The published typed JSON Schema was regenerated and its
 equality test passed. All-target service Clippy passed (31.05 seconds), and
 independent review passed for the Rust, JSON Schema and documentation changes.
+
+### Read-only participating policy discovery (follow-up candidate)
+
+The backend can now discover the canonical shared policy through the existing
+journaled helper lifecycle. The helper mounts the owned cache volume read-only,
+uses a shared nonblocking policy lock and never creates a record or lock. A
+missing volume or record returns explicit absence; malformed, oversized,
+unsupported, noncanonical or busy records return an error. Discovery does not
+authorize defaults, bootstrap policy, enroll repositories or exclude older
+daemons. Production routing and supervisor startup remain open.
+
+Two focused tests passed, including absence without filesystem changes and
+canonical policy validation. The real private-Docker discovery test passed in
+0.42 seconds: it read the agreed 100 MiB repository / 200 MiB aggregate policy,
+retired its helper and left no pending helper intent.
+
+Promotion gate c0819217-e6e3-401a-b403-5d29030cb74f failed after 367
+seconds; cleanup was Removed. Format, Clippy and boundary checks passed. The
+service suite had 459 passes and one failure in the setup admission timing
+fixture. That fixture also awaits the SQLite audit commit, so the follow-up
+uses Linux memory-backed storage while retaining the 250 ms protocol assertion,
+durable events, coalescing, cancellation and restart assertions. This does not
+prove a disk-backed production acknowledgement SLO. The 20 focused setup
+tests passed in 0.71 seconds. Accounting and helper recovery tests passed
+(20 tests, four explicit live prerequisites ignored, 0.34 seconds), format
+passed and final all-target service Clippy passed in 7.03 seconds. Independent
+review passed. The integrated candidate still requires its exact-source gate.
