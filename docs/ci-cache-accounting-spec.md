@@ -648,3 +648,22 @@ A fresh server retrieves that entry and its exact bytes through loopback HTTP.
 The focused watcher race tests and pinned lint pass. This closes the earlier
 empty-store-only verification limitation for watcher byte collection; it still
 does not prove actual SIGKILL handling or Bosn supervision.
+
+### Candidate handoff and graceful cancellation
+
+The act2 implementation is published for review as draft
+[act2 PR #22](https://github.com/zackees/act2/pull/22), head `8a2e84f`.
+The complete candidate diff and the graceful-interrupt follow-up passed the
+single-reviewer local gate. A fresh full artifactcache race run passed in
+16.778 seconds; focused CLI policy/offline/watcher race tests and pinned lint
+also passed. A candidate CLI was built inside the isolated Go container.
+Sending its maintenance watcher the first real SIGINT after its initial JSON
+report produced a successful exit. The watcher now combines the CLI's graceful
+job context and force context through the existing EarlyCancelContext helper;
+the focused repro previously required force cancellation and now passes.
+
+Latest published act2 remains `v0.2.89-act2.3` as checked during this handoff.
+The draft introduces no version bump or release. It is not merged, not a
+verified release artifact, and not a Bosn pin update. Bosn policy arguments,
+independent helper supervision, verified warm migration and physical pressure
+control remain required integration work.
