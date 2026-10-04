@@ -308,4 +308,62 @@ os.execv('/bin/cp', ['cp', *sys.argv[1:]])
             String::from_utf8_lossy(&result.stderr)
         );
     }
+    #[test]
+    #[ignore = "requires the isolated bosn-456-live-v2 Docker engine"]
+    fn real_engine_shell_rehydrates_completed_tools_without_hidden_stages() {
+        assert!(
+            std::env::var("DOCKER_HOST")
+                .unwrap()
+                .contains("bosn-456-live-v2-engine")
+        );
+        let directory = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let cidfile = directory.path().join("container-id");
+        kernal_api::async_engine::RuntimeBuilder::multi_thread()
+            .enable_all().build().unwrap().run(async {
+                use super::super::{DockerActBackend, CONTROL_DEADLINE, engine_image, owned};
+                let backend = DockerActBackend::default();
+                let target = "/var/lib/docker/rehydrated";
+                let seed = seed_toolcache_script()
+                    .replace("docker volume create act-toolcache >/dev/null", "true")
+                    .replace(TOOLCACHE_MOUNT, target);
+                let source = format!("{TOOLCACHE_MOUNT}/Python/1/x64");
+                let inner = format!("{TOOLCACHE_MOUNT}/soldr-syslib/linux-x64/zstd/1/slug");
+                let script = format!(
+                    "mkdir -p '{source}' '{inner}' '{target}'; \
+                     printf warm > '{source}/payload'; printf complete > '{source}.complete'; \
+                     printf inner > '{inner}/payload'; printf complete > '{inner}/.complete'; \
+                     {}; \
+                     mkdir -p {ENGINE_CACHE}/toolcache/.saving-orphan/install; \
+                     printf unfinished > {ENGINE_CACHE}/toolcache/.saving-orphan/install/partial; \
+                     {seed}; \
+                     test \"$(cat '{target}/Python/1/x64/payload')\" = warm; \
+                     test -f '{target}/Python/1/x64.complete'; \
+                     test \"$(cat '{target}/soldr-syslib/linux-x64/zstd/1/slug/payload')\" = inner; \
+                     test -f '{target}/soldr-syslib/linux-x64/zstd/1/slug/.complete'; \
+                     test ! -e '{target}/.saving-orphan'; printf verified",
+                    save_toolcache_script(),
+                );
+                let nonce = crate::ci::new_uuid().await.unwrap();
+                let image = engine_image();
+                let cidfile_text = cidfile.to_str().unwrap();
+                let result = backend.checked("real tool cache copy", owned(&[
+                    "run", "--rm", "--cidfile", cidfile_text, "--name", &format!("bosn-toolcache-proof-{nonce}"),
+                    "--label", &format!("io.bosn.test.toolcache={nonce}"), "--pull", "never",
+                    "--network", "none", "--read-only", "--cap-drop", "ALL", "--memory", "128m", "--cpus", "1",
+                    "--tmpfs", ENGINE_CACHE, "--tmpfs", "/var/lib/docker", "--entrypoint", "sh", &image, "-ec", &script,
+                ]), CONTROL_DEADLINE).await;
+                // Reconcile the exact created ID even if run timed out. This
+                // test never names a user container or mounts a real cache.
+                let id = std::fs::read_to_string(&cidfile).unwrap();
+                let id = id.trim();
+                assert!(id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+                let inspect = backend.run(owned(&["container", "inspect", id]), CONTROL_DEADLINE).await.unwrap();
+                if inspect.ok() {
+                    backend.checked("tool cache proof cleanup", owned(&["rm", "-f", id]), CONTROL_DEADLINE).await.unwrap();
+                }
+                let absent = backend.run(owned(&["container", "inspect", id]), CONTROL_DEADLINE).await.unwrap();
+                assert!(!absent.ok() && String::from_utf8_lossy(&absent.stderr).to_ascii_lowercase().contains("no such container"), "helper absence unproven: {id}");
+                assert_eq!(result.unwrap(), "verified");
+            });
+    }
 }

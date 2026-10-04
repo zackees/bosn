@@ -23,25 +23,30 @@ pressure control remain open; successful private-engine retirement removes
 that engine's nested containers, images and build cache. Historical entries
 below record intermediate states and must not be read as current rollout status.
 
-Act2 v0.2.89-act2.6 is released from `d874c3b6`: exact-commit full CI
-37188971746 and release run 37189703504 passed. The Linux x86_64 archive
-SHA-256 is `75b703169f0feddec6724a98f7c88a5f115116036eeddeb443721675633879e2`;
+Act2 v0.2.89-act2.7 is released from
+`1a6782d5bbabb715f425cad5601b1f706fc23fa8` (merged PR #28). Exact-commit
+full CI 37190653388 and release run 37191477610 passed. The Linux x86_64
+archive SHA-256 is
+`61d640112af87278075c70cd67412ec9c44ceffd1e269e88632d50d4a83ebd27`;
 the extracted binary SHA-256 is
-`319dc105a22da9fb29cb08ee98457f0ebd9d50ea7b89ac7b311ccf26b6f623e8`.
+`328147f59cc101aa86cc826ecb5e7b2493f74765d520d4809997b2a9c6ba56bd`.
 Published checksums match, and the isolated binary reports
-`act version 0.2.89-act2.6`. The candidate pin now selects these verified bytes.
-This fixes budget-induced empty warm cutover; it does not activate Bosn policy.
+`act version 0.2.89-act2.7`. The candidate pin selects these verified bytes.
+Four pin consistency tests and the actual published audit/watch command contract
+passed; strict service all-target Clippy passed (28.59 seconds).
 
-Act2 PR #28 merged as `1a6782d5bbabb715f425cad5601b1f706fc23fa8` after
-full PR CI passed. Exact-merge full CI run 37190653388 also passed. The
-v0.2.89-act2.7 tag is pushed through the existing release workflow; artifact
-verification remains pending, and Bosn still pins verified act2.6. This receipt
-feature is not in act2.6. Bosn's typed parser checks exact namespace identity,
-historical and current byte ceilings, retained-source warmth, fingerprints and
-bounded archive receipts. Four isolated boundary tests and strict
-service-library Clippy passed; parsing historical evidence cannot authorize
-enrollment. The exclusive import executor preserves partial publication on
-nonzero exits but is not yet invoked by production planning.
+This release includes the act2.6 empty-cutover fix and historical publication
+receipts. Bosn's typed parser checks exact namespace identity, historical and
+current byte ceilings, retained-source warmth, fingerprints and bounded archive
+receipts. Four isolated boundary tests passed; parsing historical evidence
+cannot authorize enrollment. The exclusive import executor preserves partial
+publication on nonzero exits but is not yet invoked by production planning.
+
+The tool-cache candidate uses unique save stages and skips hidden unfinished
+stages when rehydrating fresh engines. Its actual pinned-engine shell proof
+passed, alongside deterministic concurrency and completed-install tests. These
+changes are not yet shipped on Bosn main; policy activation and storage ceilings
+remain open.
 
 ## Survey and evidence (2026-10-03)
 
@@ -1238,3 +1243,21 @@ blockers. This proves deterministic equal-PID isolation and avoids private-disk
 duplication of unfinished saves; it does not introduce tool-install TTL/quotas,
 abandoned-stage pruning or improve every pre-existing copy-failure path.
 Real engine workflow coverage of this new seed/save slice remains pending.
+
+### Verified act2.7 artifacts and pinned-engine tool-cache shell
+
+The act2.7 release workflow 37191477610 succeeded on exact merge commit
+`1a6782d5bbabb715f425cad5601b1f706fc23fa8`, whose full CI run 37190653388
+also succeeded. Published archive checksums and extracted binary identity were
+verified before changing the candidate pin. Four pin tests passed (0.01 seconds),
+and the published audit/watch CLI contract passed (0.12 seconds). This command
+test does not yet verify Bosn parsing an actual historical receipt.
+
+The actual pinned engine image's shell executed the generated tool-cache save
+and seed scripts successfully (1 test, 0.23 seconds). The helper had a read-only
+root, no network, dropped capabilities and only disposable tmpfs cache/work
+paths. It restored both sibling and inner completion conventions while excluding
+a hidden orphan stage. Its immutable container ID was confirmed absent afterward.
+This verifies the BusyBox shell path; actual workflow tool-install activity,
+expiry and quotas remain unverified. Strict service all-target Clippy passed
+after the shell test and new pin (28.59 seconds). Independent review passed.
