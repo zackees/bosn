@@ -137,6 +137,8 @@ impl Service {
             }
             Err(error) => return Err(Error::Io(error)),
         };
+        let _run_http = run_http::start(&self.state_dir).await.map_err(Error::Io)?;
+        eprintln!("bosn run output listening on {}", _run_http.local_addr);
         let act_owner = registry.registry_id()?;
         let act_image_proofs = act_engine::bundled_engine_manifests()
             .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?;

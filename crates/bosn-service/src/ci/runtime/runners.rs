@@ -84,11 +84,15 @@ impl CiRuntime {
         }
         // The spare engine mounts the volume: retire it first.
         self.spares.retire_all().await;
-        let removed = self.backend.remove_cache(CACHE_VOLUME).await;
+        let cleared = match self.backend.remove_cache(CACHE_VOLUME).await {
+            Ok(()) => self.cache_usage().await,
+            Err(error) => Err(CiError::new("internal", error)),
+        };
+        // Measure the removed volume before dispatch may prepare a new spare
+        // and recreate it. Otherwise the reply races that preparation.
         self.lock().clearing_cache = false;
         self.kick();
-        removed.map_err(|e| CiError::new("internal", e))?;
-        self.cache_usage().await
+        cleared
     }
 
     /// Remove finished runs by age, total size, or beyond the retention
