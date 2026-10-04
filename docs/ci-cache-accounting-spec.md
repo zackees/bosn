@@ -3424,10 +3424,60 @@ Windows all completed successfully. A clean checkout, unchanged default-branch
 head and absence of both the tag and release were verified before tagging.
 Annotated `v0.2.89-act2.9` tag object
 `60b924efb73d76ff3368fc28cded65190c9597b1` peels to that exact commit.
-Existing release workflow run `37235462650` is running on the tag.
+Existing release workflow run `37235462650` passed on the tag.
 
 Pre-tag evidence: `.git/act2-native-admission-release-v9-pretag-gate.json`.
 Release archives, independent asset digests, binary headers/versions and Linux
 runtime smoke still require verification. Bosn's pin remains act2.8 until those
 checks pass. This release step alone does not activate production shared tools,
 archive cohort migration, per-class automatic expiry or machine-wide allocation.
+
+
+### Released act2.9 artifact verification and overlay recovery evidence (2026-10-04)
+
+All 11 act2.9 release archives passed checks against the checksum manifest and
+independent GitHub asset digests/sizes, executable architecture headers, and
+embedded version strings. Linux x86_64 executed in the private Go container and
+reported `0.2.89-act2.9`. Other platforms have static artifact verification and
+exact-commit CI evidence, not local native execution. Evidence:
+`.git/act2-native-admission-release-v9-verification.json`.
+
+Accounting PR #505 merged as `eb8cac903cf0df2df605567bc73721e4f585ad58`.
+Its exact combined candidate passed gate33 in 999 seconds. Storage pressure is
+now explicitly backing-filesystem usage, not engine-owned cache allocation;
+this wording correction does not implement cross-class physical accounting.
+
+The post-stop overlay fixture now passes. A task-owned source container used an
+immutable lower and retained disk upper/work; chmod created a metadata-only
+16 MiB payload copy-up with zero allocated upper blocks. After label-checked
+source removal, a fresh helper reconstructed the metacopy overlay and explicitly
+remounted the merged view read-only. Released act2.8 published completed
+`Python/3.13/x64` and `New/2/x64` objects. Payload hash and mode 600 matched,
+changed private settings were published, lower settings stayed unchanged, and
+upper payload allocation remained zero blocks. All fixture containers and three
+volumes were removed after label checks. Evidence:
+`.git/retention-post-stop-overlay-recovery-proof.json`.
+
+The helper mounted retained upper/work storage writable to construct the overlay;
+only the merged publication source was read-only. This controlled kernel/native
+publication fixture does not prove production Bosn lifecycle fencing, original
+reader handoff, migration, arbitrary writer exclusion, whiteout/opaque/redirect
+handling, or memory-storage recovery. Production post-stop recovery remains
+unimplemented. Earlier capability/remount setup failures are retained separately;
+they were corrected before this success was recorded.
+
+
+Released act2.9 repeated the warm 1 GiB concurrent admission fixture: three
+simultaneous readers across three trials succeeded 9/9, versus act2.8's 3/9
+(the other six hit catalog-lock timeouts). Released act2.9 batch wall times were
+1.339, 1.312 and 1.369 seconds including Docker client overhead. Commands asserted
+a nonempty lease-FD environment value; this does not independently prove full
+production descriptor lifetime or PID1 handoff. Evidence:
+`.git/retention-native-admission-released-v9-runtime.json`.
+
+This branch now updates Bosn's act version, Linux archive URL, archive digest and
+executable digest to verified act2.9. Source review and the complete local gate
+remain required before publication. The released native admission optimization
+permits concurrent content validation while the original generation reader
+protects the payload; it does not weaken corruption checks or activate Bosn's
+pending shared-cache lifecycle.
