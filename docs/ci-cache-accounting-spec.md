@@ -1003,3 +1003,24 @@ bypass; run planning, spare kickoff and spare planning now use the same
 `load_engine` guard. The config test proves parsed policy is refused at that
 boundary; it does not directly instrument backend creation counts. The existing
 reviewer passed the corrected slice. Retention activation remains incomplete.
+
+### Coordinated command mapping (candidate, not activated)
+
+Bosn now constructs act2 server and independent watcher arguments from the
+typed policy. Both use `actcache/cohort-v1`; repository namespace parsing only
+accepts a 16-character lowercase hexadecimal direct child. Server and watcher
+share the same byte/age settings. The watcher passes an explicit aggregate
+ceiling and interval, rather than relying on server shutdown for idle cleanup.
+These command builders are not yet invoked by production admission. Warm import,
+legacy-peer exclusion, receipts, supervision and verified pinning are still
+required before removing the planning guard. CLI contract validation is pending.
+
+The two existing live Bosn cache tests passed at b0860ff (2 tests, 100.65
+seconds): a later job restores an earlier job's archive, and a subsequent run
+with a different engine ID restores and verifies the saved bytes. This proves
+existing shared-cache reuse, not yet quota enforcement. Full act2 checks run
+37186796787 passed on merge SHA 7e6f010, including Linux, Windows, macOS, lint
+and snapshot. Dependency release approval is being prepared; no tag exists yet.
+The namespace test and strict service library Clippy passed for the command
+builders, and review verified flag mapping. Execution of those builders remains
+unverified and production activation stays guarded.

@@ -4,11 +4,11 @@ use serde::Deserialize;
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(try_from = "Input")]
 pub struct CachePolicy {
-    pub repository_max_bytes: i64,
-    pub aggregate_max_bytes: i64,
-    pub max_age_secs: u64,
-    pub unused_age_secs: u64,
-    pub maintenance_interval_secs: u64,
+    pub(crate) repository_max_bytes: i64,
+    pub(crate) aggregate_max_bytes: i64,
+    pub(crate) max_age_secs: u64,
+    pub(crate) unused_age_secs: u64,
+    pub(crate) maintenance_interval_secs: u64,
 }
 
 #[derive(Deserialize)]
