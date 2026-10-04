@@ -20,6 +20,8 @@ use kernal_api::async_engine::{self, CancellationToken};
 
 use crate::{RegistryActor, act_engine};
 
+#[cfg(all(test, unix))]
+mod cache_staging_tests;
 mod cache_usage;
 #[cfg(all(test, unix))]
 mod cache_usage_transport_tests;
@@ -818,10 +820,11 @@ fn work_dirs_script() -> String {
 fn install_act_script(act: ActArtifact) -> String {
     format!(
         "tgz={ENGINE_CACHE}/tools/act-{ACT_VERSION}-{sum}.tgz; mkdir -p {ENGINE_CACHE}/tools; \
+         exec 9>>\"$tgz.lock\"; flock -x 9; \
          if ! echo \"{sum}  $tgz\" | sha256sum -c - >/dev/null 2>&1; then \
            stage=$(mktemp \"$tgz.XXXXXXXX\"); trap 'rm -f \"$stage\"' EXIT; \
            wget -q -O \"$stage\" '{url}' && \
-           echo \"{sum}  $stage\" | sha256sum -c - >/dev/null && mv \"$stage\" \"$tgz\"; \
+           echo \"{sum}  $stage\" | sha256sum -c - >/dev/null && mv \"$stage\" \"$tgz\" || exit 1; \
          fi; \
          tar -xzf \"$tgz\" -C {ENGINE_WORK}/bin act && \
          echo \"{binary}  {ENGINE_WORK}/bin/act\" | sha256sum -c - >/dev/null && \
@@ -843,16 +846,32 @@ fn runner_tar() -> String {
 /// Shell that loads the runner image tar from the cache volume, or pulls
 /// the pinned image, tags it [`runner_tag`] and saves the tar atomically.
 fn load_runner_script() -> String {
+    format!("{} {}", runner_input_lock(true), load_runner_body())
+}
+
+fn runner_input_lock(shared: bool) -> String {
+    format!(
+        "mkdir -p {ENGINE_CACHE}/images; exec 9>>{}.lock; flock -{} 9;",
+        runner_tar(),
+        if shared { "s" } else { "x" }
+    )
+}
+
+fn load_runner_body() -> String {
     let tag = runner_tag();
     let tar = runner_tar();
+    let restore = "[ -f \"$tar\" ] && docker load -q -i \"$tar\" >/dev/null";
     format!(
         "tar={tar}; mkdir -p {ENGINE_CACHE}/images; \
-         if ! {{ [ -f \"$tar\" ] && docker load -q -i \"$tar\" >/dev/null; }}; then \
+         if ! {{ {restore}; }}; then \
+           flock -x 9; \
+           if ! {{ {restore}; }}; then \
            docker pull -q --platform linux/amd64 {RUNNER_IMAGE} >/dev/null && \
            docker tag {RUNNER_IMAGE} {tag} && \
            stage=$(mktemp \"$tar.XXXXXXXX\") && \
            trap 'rm -f \"$stage\"' EXIT && \
-           docker save --platform linux/amd64 -o \"$stage\" {tag} && mv \"$stage\" \"$tar\"; \
+           docker save --platform linux/amd64 -o \"$stage\" {tag} && mv \"$stage\" \"$tar\" || exit 1; \
+           fi; \
          fi; \
          docker image inspect {tag} >/dev/null"
     )
@@ -862,10 +881,11 @@ fn load_runner_script() -> String {
 /// loaded, then pull and save again.
 fn reload_runner_script() -> String {
     format!(
-        "rm -f {tar}; docker image rm -f {tag} >/dev/null 2>&1 || :; {load}",
+        "{lock} rm -f {tar}; docker image rm -f {tag} >/dev/null 2>&1 || :; {load}",
+        lock = runner_input_lock(false),
         tar = runner_tar(),
         tag = runner_tag(),
-        load = load_runner_script(),
+        load = load_runner_body(),
     )
 }
 
@@ -946,7 +966,10 @@ mod tests {
         assert!(load.contains("docker load") && load.contains(RUNNER_IMAGE));
         assert!(load.contains("mv \"$stage\" \"$tar\""), "atomic rename");
         let reload = reload_runner_script();
-        assert!(reload.starts_with(&format!("rm -f {}", runner_tar())) && reload.ends_with(&load));
+        assert!(
+            reload.contains(&format!("rm -f {}", runner_tar()))
+                && reload.ends_with(&load_runner_body())
+        );
         assert!(
             install.contains(act.binary_sha256),
             "the extracted binary is checked too"

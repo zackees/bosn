@@ -482,3 +482,29 @@ The synthetic containers and volume were removed afterward. This proves the
 cross-container naming fix, not concurrent full artifact-download behavior or
 crash-stage expiry. Strict Clippy for all service targets and source-length/diff
 checks pass.
+
+The next shared-input slice adds a per-artifact `flock` on a persistent
+shared-volume lock file. The pinned Docker image provides BusyBox `flock`.
+New engines take an exclusive lock before checking/downloading the act tarball.
+Runner archives load under shared locks, allowing concurrent warm restores;
+a missing/failed restore upgrades to exclusive and rechecks before pulling or
+publishing. Refresh takes the exclusive lock before
+removing an invalid tar. File descriptors release on process/engine death;
+lock files must not be unlinked, which could split coordination across inodes.
+Legacy executables ignore these locks. A live two-container probe verified that
+an exclusive holder excludes another process, and killing the holder releases
+the lock without deleting its file. The synthetic resources were removed. Full
+artifact-level concurrency/failure verification and final checks remain pending.
+An isolated test now executes the production runner-cache shell with a
+deterministic Docker transport: two cold callers issue exactly one pull/save;
+two warm callers overlap their loads and issue no pull/save. It passes in
+0.88 seconds. This verifies shell coordination with mocked Docker operations;
+live artifact correctness and failure/stale-stage cleanup remain open.
+The concurrency test now uses a warm-reader barrier instead of timing sleeps.
+A failed-save injection reproduced a false success: the shell reached image
+inspection after publication failed. Runner and act publication chains now
+explicitly exit on failure, before consuming or reporting the cached input.
+The failure test also checks stage cleanup and subsequent lock reuse; it went
+from RED to GREEN and passed in 1.32 seconds after the explicit failure exits.
+Final strict Clippy for all service targets and source-length/include/diff checks
+pass. A real fresh-engine cache-restore rerun is the next verification gate.
