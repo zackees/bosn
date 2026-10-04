@@ -77,6 +77,32 @@ fn qualified_remote_jobs_and_unresolved_execution_paths_are_reported_correctly()
 }
 
 #[test]
+fn direct_job_without_qualified_identity_is_covered_beside_reusable_jobs() {
+    use crate::ci::workflow::Declared;
+
+    let declared = Declared {
+        steps: [
+            ("rust".into(), Vec::new()),
+            ("reusable/test".into(), Vec::new()),
+        ]
+        .into(),
+        needs_qualified_identity: true,
+        ..Declared::default()
+    };
+    let direct = fold(
+        "",
+        &[r#"{"job":"rust","jobID":"rust","jobResult":"success"}"#],
+    );
+    assert!(!direct.qualified_coverage_missing(&declared));
+
+    let nested = fold(
+        "",
+        &[r#"{"job":"test","jobID":"test","jobResult":"success"}"#],
+    );
+    assert!(nested.qualified_coverage_missing(&declared));
+}
+
+#[test]
 fn skipped_qualified_remote_job_stays_skipped() {
     let mut tree = fold(
         "",
