@@ -14,7 +14,7 @@ from pathlib import Path
 import tomllib
 
 
-def verify(manifest: Path, expected_version: str = "=0.1.25") -> list[str]:
+def verify(manifest: Path, expected_version: str = "=0.1.27") -> list[str]:
     data = tomllib.loads(manifest.read_text(encoding="utf-8"))
     errors: list[str] = []
     dependency = data.get("dependencies", {}).get("kernal-api")
@@ -83,7 +83,7 @@ def _contains_kernel_source(value: object) -> bool:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("manifest", type=Path)
-    parser.add_argument("--expected-version", default="=0.1.25")
+    parser.add_argument("--expected-version", default="=0.1.27")
     args = parser.parse_args()
     errors = verify(args.manifest, args.expected_version)
     if errors:

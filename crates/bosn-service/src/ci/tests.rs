@@ -40,8 +40,7 @@ fn request(staging: &str, sha_byte: char) -> SubmitRequest {
         base: None,
         origin: Some("https://github.com/o/r.git".into()),
         pr_number: None,
-        // Leave room for heavily loaded CI hosts; timeout tests override this.
-        timeout_secs: Some(30),
+        timeout_secs: Some(5),
         secrets: Vec::new(),
         params: Default::default(),
     }

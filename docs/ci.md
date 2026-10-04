@@ -107,11 +107,17 @@ BOSN_UPDATE_SCHEMA=1 cargo test -p bosn-service published_schema
 
 `bosn-widget` is a separate binary. It links the webview toolkit, so the
 `bosn` CLI, the daemon and headless installs never do. It runs in the user
-session and opens three kinds of window onto daemon pages, each signed in
-with its own single-use grant:
+session, keeps status in the desktop tray, and opens daemon pages only when
+requested, each signed in with its own single-use grant:
 
-- a small **bubble** (`/widget/bubble`): running, queued and failed counts,
-  coloured by the worst state;
+- a **system-tray icon** on Linux desktops with a StatusNotifierItem host (KDE
+  Plasma and compatible trays): always active, with current CI status in its
+  title/tooltip. Clicking toggles details; its menu opens the dashboard or quits;
+- a small **bubble** (`/widget/bubble`) when a tray host is unavailable: running,
+  queued and failed counts, coloured by the worst state. It opens only on an
+  explicit request with live KDE dock placement; host loss and activity never
+  open it. Other desktops keep compact windows hidden until a supported dock
+  placement strategy is available (kernal-api#393);
 - a **panel** (`/widget/panel`), toggled from the bubble: runs across
   workspaces with actor, branch, SHA (`+dirty`) and progress, plus runner
   controls;
@@ -124,10 +130,28 @@ browser only for `https` URLs on `github.com`, `gitlab.com` or a host listed
 in `[widget] external_hosts`.
 
 ```sh
-bosn widget              # run it (a second start shows the running bubble)
+bosn widget              # run it (a second start reveals details, or the fallback bubble)
 bosn widget --detach
 bosn widget install      # systemd user unit, started with the graphical session
 ```
+
+Installation enables `[ui] enabled = true` in the selected state's configuration,
+while preserving existing settings and comments. The service watches that same
+state directory; ordinary invocations use the default state, so install without
+`--state-dir` for normal activity. An already-running daemon with the dashboard
+disabled must restart after **all** active jobs finish before click-through
+pages work; installation never restarts it or interrupts jobs. Headless installs
+still default to no dashboard listener. A matching Linux x86-64 executable is downloaded from the CLI version's published
+GitHub release by `bosn widget install`. The installer verifies the release asset's
+SHA256 digest, source commit, version, target and executable checksum before
+atomically replacing its managed copy under `~/.local/share/bosn/widget/`. It
+fails if the matching artifact is absent; it does not select another version.
+The desktop runtime needs GTK 3, WebKitGTK 4.1 and libsoup 3. The headless CLI
+and its four platform wheels remain separate from the desktop archive.
+
+For Linux widget implementation changes, `ci-widget` selects the existing
+WebKitGTK lint/test job without selecting unrelated full-tier platforms.
+Release candidates still require the complete full tier.
 
 **When it appears.** `[widget] auto_launch` is `always` (the default),
 `on-activity` or `never`.
@@ -156,22 +180,27 @@ silent.
 opened once, at its final size, and then reused:
 
 - The bubble is undecorated and transparent, and asks to stay above other
-  windows and out of the taskbar. On X11, Windows and macOS it also asks for a
-  fixed spot near the top-left corner, because kernal-api cannot report the
-  work area yet (zackees/kernal-api#393). On macOS, leaving the taskbar puts the
-  whole widget process in the accessory policy, with no Dock icon or menu bar.
-- The panel is shown and hidden; it is not closed and reopened.
+  windows and out of the taskbar. Compact windows are created only when the
+  installed KDE Wayland dock placement is enabled, loaded and executing its
+  geometry handler. Bounded live probes require a fresh compositor-owned
+  readiness transition after successful geometry readback; stale configuration
+  or an unloaded/failed script keeps compact windows hidden. No fixed top-left or
+  compositor-default center position is requested. A portable work-area
+  capability remains tracked in zackees/kernal-api#393.
+- The panel is shown and hidden by explicit clicks; startup and activity never
+  open it or take focus. It is not closed and reopened.
 - The full view navigates to the new page and takes focus, so there is only
   ever one.
 
 **KDE Plasma on Wayland.** The compositor controls placement and stacking.
 `bosn widget install` installs and enables the `bosn-widget-corner` KWin script
-alongside the user service. It places only the bubble in the lower-right corner
+alongside the user service. It places the fallback bubble and details panel in the lower-right corner
 of its monitor's usable area, with a 24-pixel margin, leaving room for panels
 and docks, and follows panel and monitor geometry changes. It keeps the bubble
 above other windows and out of the taskbar and switcher. A bubble-only window
-rule prevents automatic creation from taking keyboard focus. The panel and full dashboard keep
-normal window behavior. Existing KWin scripts and window rules remain intact.
+rule prevents the explicitly requested fallback bubble from taking keyboard focus. The details
+panel opens upward above the dock; explicit clicks alone give it focus. The full
+dashboard retains normal window behavior. Existing KWin scripts and window rules remain intact.
 
 A previously configured forced-position rule overrides scripted placement;
 remove that bubble-only position rule to use automatic placement. The script

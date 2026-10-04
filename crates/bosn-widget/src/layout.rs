@@ -67,6 +67,7 @@ pub struct Layout {
 }
 
 impl Layout {
+    #[cfg(test)]
     pub fn presence(&self, window: Window) -> Presence {
         match window {
             Window::Bubble => self.bubble,
@@ -87,6 +88,33 @@ impl Layout {
     /// that needs it opens a new one.
     pub fn lost(&mut self, window: Window) {
         *self.slot(window) = Presence::Absent;
+    }
+
+    /// Only explicit commands create compact windows; activity never does.
+    pub fn has_compact_window(&self) -> bool {
+        self.bubble != Presence::Absent || self.panel != Presence::Absent
+    }
+
+    /// Hide compact surfaces if live placement disappears, without taking focus.
+    pub fn status_steps(&self, hosted: bool, positioned: bool) -> Vec<Step> {
+        let mut steps = Vec::new();
+        if self.bubble == Presence::Shown && (hosted || !positioned) {
+            steps.push(Step::Hide(Window::Bubble));
+        }
+        if self.panel == Presence::Shown && !positioned {
+            steps.push(Step::Hide(Window::Panel));
+        }
+        steps
+    }
+
+    /// An explicit Show reveals details without toggling an already open panel.
+    pub fn show_panel_steps(&self) -> Vec<Step> {
+        match self.panel {
+            Presence::Absent => vec![open_page(Window::Panel)],
+            Presence::Hidden | Presence::Shown => {
+                vec![Step::Show(Window::Panel), Step::Focus(Window::Panel)]
+            }
+        }
     }
 
     /// The steps that carry out `command` from the current state.
@@ -158,6 +186,43 @@ mod tests {
             .iter()
             .filter(|step| matches!(step, Step::Open { .. }))
             .count()
+    }
+
+    #[test]
+    fn activity_never_opens_compact_windows_even_with_healthy_placement() {
+        let layout = Layout::default();
+        for hosted in [false, true] {
+            for positioned in [false, true] {
+                assert!(layout.status_steps(hosted, positioned).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_explicit_show_keeps_existing_details_visible() {
+        let mut layout = Layout::default();
+        for _ in 0..3 {
+            for step in layout.show_panel_steps() {
+                layout.record(&step);
+            }
+            assert_eq!(layout.presence(Window::Panel), Presence::Shown);
+        }
+    }
+
+    #[test]
+    fn placement_loss_hides_explicit_details_without_stealing_focus() {
+        let mut layout = Layout::default();
+        for step in layout.plan(WidgetCommand::Toggle) {
+            layout.record(&step);
+        }
+        assert!(layout.has_compact_window());
+        assert!(layout.status_steps(false, true).is_empty());
+        let hidden = layout.status_steps(true, false);
+        assert_eq!(hidden, vec![Step::Hide(Window::Panel)]);
+        for step in hidden {
+            layout.record(&step);
+        }
+        assert!(layout.status_steps(false, true).is_empty());
     }
 
     #[test]

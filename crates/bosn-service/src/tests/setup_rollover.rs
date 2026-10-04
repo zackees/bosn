@@ -162,6 +162,7 @@ fn setup_ensure_rollover_is_visible_through_daemon_registry_diagnostics() {
     drop(registry);
 
     RuntimeBuilder::multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap()
@@ -216,6 +217,7 @@ fn cancelled_setup_ensure_does_not_persist_or_retire_existing_resources() {
     drop(initial_registry);
     let fake = Arc::new(FakeSetupEnsureExecutor::new());
     RuntimeBuilder::multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap()
@@ -283,6 +285,7 @@ fn shutdown_cancelled_setup_ensure_keeps_a_durable_terminal_event() {
     std::fs::create_dir(&workspace).unwrap();
     let fake = Arc::new(FakeSetupEnsureExecutor::new());
     RuntimeBuilder::multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap()
@@ -335,6 +338,7 @@ fn cancellation_queued_at_registry_handoff_is_rejected_after_persisted_success()
     std::fs::create_dir(&state).unwrap();
     std::fs::create_dir(&workspace).unwrap();
     RuntimeBuilder::multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap()

@@ -294,11 +294,13 @@ impl Jobs {
     /// turns: the next admission goes to the first workspace (in key order)
     /// after the one served last, wrapping around.
     fn pump(&mut self) {
+        self.pump_at(Instant::now());
+    }
+    fn pump_at(&mut self, now: Instant) {
         if self.closing {
             return;
         }
         let mut lapsed = Vec::new();
-        let now = Instant::now();
         for class in [JobClass::Control, JobClass::Runner] {
             let mut deferred = Vec::new();
             while self.running.get(&class).copied().unwrap_or(0) < self.cap(class) {
@@ -332,7 +334,7 @@ impl Jobs {
                 job.state = JobState::Running;
                 job.slot = slot;
                 job.started_at = Some(SystemTime::now());
-                job.last_progress = Some(Instant::now());
+                job.last_progress = Some(now);
                 *self.running.entry(class).or_default() += 1;
                 self.started.push_back(id);
             }
@@ -353,7 +355,7 @@ impl Jobs {
                     .into(),
             );
             // Finishing a never-started job admits the next one in turn.
-            self.finish(id, JobState::Cancelled, Some("cancelled".into()));
+            self.finish_at(id, JobState::Cancelled, Some("cancelled".into()), now);
         }
     }
     fn lease_stale(&self, id: u64, now: Instant) -> bool {
@@ -420,7 +422,7 @@ impl Jobs {
                 .get(&id)
                 .is_some_and(|job| job.state == JobState::Queued)
             {
-                self.pump();
+                self.pump_at(now);
             }
         }
     }
@@ -473,6 +475,15 @@ impl Jobs {
         ok: bool,
         error: Option<String>,
     ) -> Result<(), JobError> {
+        self.settle_with_error_at(id, ok, error, Instant::now())
+    }
+    fn settle_with_error_at(
+        &mut self,
+        id: u64,
+        ok: bool,
+        error: Option<String>,
+        now: Instant,
+    ) -> Result<(), JobError> {
         let state = self.jobs.get(&id).ok_or(JobError::Unknown)?.state;
         if state.terminal() {
             return Err(JobError::Finished);
@@ -484,10 +495,11 @@ impl Jobs {
         } else {
             JobState::Failed
         };
-        self.finish(
+        self.finish_at(
             id,
             terminal,
             (terminal == JobState::Failed).then_some(error).flatten(),
+            now,
         );
         Ok(())
     }
@@ -506,6 +518,9 @@ impl Jobs {
         }
     }
     fn finish(&mut self, id: u64, state: JobState, error: Option<String>) {
+        self.finish_at(id, state, error, Instant::now());
+    }
+    fn finish_at(&mut self, id: u64, state: JobState, error: Option<String>, now: Instant) {
         let key = self.jobs[&id].key();
         let was_running = matches!(
             self.jobs[&id].state,
@@ -539,7 +554,7 @@ impl Jobs {
         }
         self.finished.push_back(id);
         self.retire_finished();
-        self.pump();
+        self.pump_at(now);
     }
     /// Keep the newest [`RETAINED_FINISHED_JOBS`] terminal jobs (and their
     /// logs). Older ones are forgotten once they have been finished for

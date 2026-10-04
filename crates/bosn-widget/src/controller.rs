@@ -1,4 +1,4 @@
-//! The widget's control loop: register with the daemon, open the bubble,
+//! The widget's control loop: register with the daemon and desktop tray,
 //! then poll for commands (toggle the panel, open the full view, open an
 //! allowlisted external link, quit) and watch for finished runs to notify
 //! about.
@@ -16,7 +16,7 @@ use kernal_api::{
 };
 
 use crate::{
-    layout::{Layout, Presence, Step},
+    layout::{Layout, Step},
     notify::Notifier,
     windows::Window,
 };
@@ -35,7 +35,7 @@ pub fn single_instance(state_dir: &Path) -> Option<OwnedFileLock> {
     kernal_api::platform::fs::try_lock_exclusive_owned(file).ok()
 }
 
-/// A second `bosn widget`: ask the running one to show its bubble.
+/// A second `bosn widget`: ask the running one to reveal details.
 pub fn ask_running_widget_to_show(state_dir: &Path) {
     let Ok(client) = Client::for_state(state_dir) else {
         return;
@@ -131,7 +131,22 @@ impl Windows {
         client: &Client,
     ) -> Flow {
         self.forget_closed().await;
-        for step in self.layout.plan(command) {
+        self.perform(self.layout.plan(command), views, client).await
+    }
+
+    async fn show_panel(&mut self, views: &ExternalWebviewClient, client: &Client) -> Flow {
+        self.forget_closed().await;
+        self.perform(self.layout.show_panel_steps(), views, client)
+            .await
+    }
+
+    async fn perform(
+        &mut self,
+        steps: Vec<Step>,
+        views: &ExternalWebviewClient,
+        client: &Client,
+    ) -> Flow {
+        for step in steps {
             if step == Step::Quit {
                 return Flow::Quit;
             }
@@ -142,6 +157,36 @@ impl Windows {
                     self.forget(window);
                 }
                 return Flow::Continue;
+            }
+        }
+        Flow::Continue
+    }
+
+    async fn synchronize_status(
+        &mut self,
+        hosted: bool,
+        views: &ExternalWebviewClient,
+        client: &Client,
+    ) {
+        let positioned = self.layout.has_compact_window() && crate::placement::configured().await;
+        for step in self.layout.status_steps(hosted, positioned) {
+            if self.execute(&step, views, client).await {
+                self.layout.record(&step);
+            } else if let Some(window) = step.window() {
+                self.forget(window);
+            }
+        }
+    }
+
+    async fn tray_events(
+        &mut self,
+        tray: &kernal_api::system_tray::TrayHandle,
+        views: &ExternalWebviewClient,
+        client: &Client,
+    ) -> Flow {
+        while let Some(event) = tray.try_event() {
+            if self.apply(crate::tray::command(event), views, client).await == Flow::Quit {
+                return Flow::Quit;
             }
         }
         Flow::Continue
@@ -161,10 +206,18 @@ impl Windows {
                 *self.slot(*window) = opened;
                 ok
             }
-            Step::Show(window) => match self.slot(*window) {
-                Some(handle) => handle.show().await.is_ok(),
-                None => false,
-            },
+            Step::Show(window) => {
+                if *window != Window::Full && !crate::placement::configured().await {
+                    if let Some(handle) = self.slot(*window) {
+                        let _ = handle.hide().await;
+                    }
+                    return false;
+                }
+                match self.slot(*window) {
+                    Some(handle) => handle.show().await.is_ok(),
+                    None => false,
+                }
+            }
             Step::Hide(window) => match self.slot(*window) {
                 Some(handle) => handle.hide().await.is_ok(),
                 None => false,
@@ -208,6 +261,9 @@ async fn open(
     window: Window,
     path: &str,
 ) -> Option<WebviewHandle> {
+    if window != Window::Full && !crate::placement::configured().await {
+        return None;
+    }
     let url = page_url(client, path).await?;
     let options = window.options(views.window_support()).ok()?;
     views
@@ -225,11 +281,14 @@ async fn closed(handle: &WebviewHandle) -> bool {
         .is_ok()
 }
 
-pub async fn run(views: ExternalWebviewClient, state_dir: std::path::PathBuf, explicit: bool) {
-    let session = session_id();
-    let pid = std::process::id();
+async fn connect_daemon(
+    state_dir: &Path,
+    pid: u32,
+    session: &str,
+    explicit: bool,
+) -> Option<Client> {
     let client = loop {
-        match Client::for_state(&state_dir) {
+        match Client::for_state(state_dir) {
             Ok(client) => break client,
             Err(_) => async_engine::sleep(POLL).await,
         }
@@ -237,7 +296,7 @@ pub async fn run(views: ExternalWebviewClient, state_dir: std::path::PathBuf, ex
     let hello = loop {
         let request = CiRequest::WidgetHello {
             pid,
-            session: session.clone(),
+            session: session.into(),
             explicit,
         };
         match widget(&client, request).await {
@@ -246,17 +305,40 @@ pub async fn run(views: ExternalWebviewClient, state_dir: std::path::PathBuf, ex
             Err(_) => async_engine::sleep(POLL).await,
         }
     };
-    if !hello.allowed {
+    hello.allowed.then_some(client)
+}
+
+pub async fn run(views: ExternalWebviewClient, state_dir: std::path::PathBuf, explicit: bool) {
+    let session = session_id();
+    let pid = std::process::id();
+    let Some(client) = connect_daemon(&state_dir, pid, &session, explicit).await else {
         let _ = views.request_exit();
         return;
-    }
+    };
     let mut windows = Windows::default();
     let mut notifier = Notifier::default();
+    let mut tray = crate::tray::register().await;
+    let mut ticks = 0u32;
     loop {
-        if windows.layout.presence(Window::Bubble) == Presence::Absent {
-            windows.apply(WidgetCommand::Show, &views, &client).await;
+        let online = tray.as_ref().is_some_and(|tray| tray.is_online());
+        windows.synchronize_status(online, &views, &client).await;
+        if let Some(tray) = &tray
+            && windows.tray_events(tray, &views, &client).await == Flow::Quit
+        {
+            quit(&client, &views, &session).await;
+            return;
         }
-        if let Some(bubble) = &windows.bubble
+        ticks = ticks.wrapping_add(1);
+        if ticks.is_multiple_of(20) && tray.is_none() {
+            tray = crate::tray::register().await;
+        }
+        if ticks.is_multiple_of(5)
+            && let Some(tray) = &tray
+        {
+            crate::tray::update(tray, &client).await;
+        }
+        if !online
+            && let Some(bubble) = &windows.bubble
             && closed(bubble).await
         {
             // Closing the bubble is the deliberate "quit".
@@ -266,7 +348,12 @@ pub async fn run(views: ExternalWebviewClient, state_dir: std::path::PathBuf, ex
         match widget(&client, CiRequest::WidgetPoll { pid }).await {
             Ok(reply) => {
                 for command in reply.commands {
-                    if windows.apply(command, &views, &client).await == Flow::Quit {
+                    let flow = if command == WidgetCommand::Show && online {
+                        windows.show_panel(&views, &client).await
+                    } else {
+                        windows.apply(command, &views, &client).await
+                    };
+                    if flow == Flow::Quit {
                         quit(&client, &views, &session).await;
                         return;
                     }

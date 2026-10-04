@@ -305,8 +305,8 @@ fn a_queued_job_whose_follower_is_gone_is_cancelled_not_started() {
     let gone = queued(jobs.submit_class("b", "s", "x", JobClass::Runner).unwrap());
     let next = queued(jobs.submit_class("c", "s", "x", JobClass::Runner).unwrap());
     jobs.lease(gone, Duration::from_millis(1), start);
-    std::thread::sleep(Duration::from_millis(5));
-    jobs.settle(running, true).unwrap();
+    jobs.settle_with_error_at(running, true, None, start + Duration::from_millis(5))
+        .unwrap();
     assert_eq!(jobs.jobs[&gone].state, JobState::Cancelled);
     assert!(jobs.jobs[&gone].started_at.is_none(), "never started");
     assert_eq!(
@@ -324,14 +324,16 @@ fn a_quiet_followers_queued_job_waits_and_starts_when_it_polls_again() {
     let quiet = queued(jobs.submit_class("b", "s", "x", JobClass::Runner).unwrap());
     let other = queued(jobs.submit_class("c", "s", "x", JobClass::Runner).unwrap());
     jobs.lease(quiet, Duration::from_millis(40), start);
-    std::thread::sleep(Duration::from_millis(25));
+    let quiet_at = start + Duration::from_millis(25);
     // Past half its lease: held back, and the slot goes to the next job.
-    jobs.settle(running, true).unwrap();
+    jobs.settle_with_error_at(running, true, None, quiet_at)
+        .unwrap();
     assert_eq!(jobs.jobs[&quiet].state, JobState::Queued);
     assert_eq!(jobs.jobs[&other].state, JobState::Running);
-    jobs.settle(other, true).unwrap();
+    jobs.settle_with_error_at(other, true, None, quiet_at)
+        .unwrap();
     assert_eq!(jobs.jobs[&quiet].state, JobState::Queued, "still quiet");
     // Its follower polls: it starts at once.
-    jobs.touch(quiet, Instant::now());
+    jobs.touch(quiet, quiet_at);
     assert_eq!(jobs.jobs[&quiet].state, JobState::Running);
 }

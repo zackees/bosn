@@ -6,7 +6,11 @@ use super::*;
 fn second_daemon_is_refused_while_first_holds_writer() {
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let state = temporary.path().join("state");
-    let runtime = RuntimeBuilder::multi_thread().enable_all().build().unwrap();
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
     runtime.run(async {
         let first = async_engine::launch(Service::new(state.clone()).serve());
         let client = wait_for_client(&state).await;
@@ -24,7 +28,11 @@ fn second_daemon_is_refused_while_first_holds_writer() {
 fn status_actor_serves_concurrent_typed_requests_before_clean_stop() {
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let state = temporary.path().join("state");
-    let runtime = RuntimeBuilder::multi_thread().enable_all().build().unwrap();
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
     runtime.run(async {
         let server = async_engine::launch(Service::new(state.clone()).serve());
         let client = wait_for_client(&state).await;
@@ -71,7 +79,11 @@ fn daemon_registry_diagnostics_are_bounded_safe_and_read_only() {
     tx.commit().unwrap();
     drop(registry);
     let before = std::fs::metadata(&db).unwrap().len();
-    let runtime = RuntimeBuilder::multi_thread().enable_all().build().unwrap();
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
     runtime.run(async {
         let server = async_engine::launch(Service::new(state.clone()).serve());
         let client = wait_for_client(&state).await;
@@ -153,7 +165,11 @@ fn peer_authorization_fails_closed_for_empty_or_other_user() {
 fn unsupported_request_protocol_returns_typed_error_response() {
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let state = temporary.path().join("state");
-    let runtime = RuntimeBuilder::multi_thread().enable_all().build().unwrap();
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
     runtime.run(async {
         let server = async_engine::launch(Service::new(state.clone()).serve());
         let client = wait_for_client(&state).await;
@@ -209,7 +225,11 @@ fn unsupported_request_protocol_returns_typed_error_response() {
 fn malformed_oversized_and_stalled_clients_do_not_block_a_healthy_client() {
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let state = temporary.path().join("state");
-    let runtime = RuntimeBuilder::multi_thread().enable_all().build().unwrap();
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
     runtime.run(async {
         let server = async_engine::launch(Service::new(state.clone()).serve());
         let client = wait_for_client(&state).await;
@@ -253,7 +273,11 @@ fn malformed_oversized_and_stalled_clients_do_not_block_a_healthy_client() {
 fn slow_drip_frame_has_one_absolute_deadline() {
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let state = temporary.path().join("state");
-    let runtime = RuntimeBuilder::multi_thread().enable_all().build().unwrap();
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
     runtime.run(async {
         let server = async_engine::launch(Service::new(state.clone()).serve());
         let client = wait_for_client(&state).await;
@@ -281,7 +305,11 @@ fn slow_drip_frame_has_one_absolute_deadline() {
 fn existing_database_aliases_share_endpoint_identity() {
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let state = temporary.path().join("state");
-    let runtime = RuntimeBuilder::multi_thread().enable_all().build().unwrap();
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
     runtime.run(async {
         let server = async_engine::launch(Service::new(state.clone()).serve());
         let client = wait_for_client(&state).await;
@@ -320,7 +348,11 @@ fn a_state_dir_too_long_for_sun_path_still_serves() {
         "{}",
         ep.display()
     );
-    let runtime = RuntimeBuilder::multi_thread().enable_all().build().unwrap();
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
     runtime.run(async {
         let server = async_engine::launch(Service::new(state.clone()).serve());
         let client = wait_for_client(&state).await;
@@ -349,7 +381,11 @@ fn regular_preexisting_endpoint_is_preserved_and_writer_is_released() {
     let ep = endpoint(&state).unwrap();
     std::fs::write(ep.display(), b"do not remove").unwrap();
 
-    let runtime = RuntimeBuilder::multi_thread().enable_all().build().unwrap();
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
     runtime.run(async {
         assert!(matches!(
             Service::new(state.clone()).serve().await,
@@ -387,7 +423,11 @@ fn legacy_or_reconciliation_gated_registry_refuses_before_listening_or_mutation(
         }
         let before = std::fs::read(&db).unwrap();
         let ep = endpoint(&state).unwrap();
-        let runtime = RuntimeBuilder::multi_thread().enable_all().build().unwrap();
+        let runtime = RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
         runtime.run(async {
             let result = Service::new(state.clone()).serve().await;
             if reconciliation_required {
@@ -416,7 +456,11 @@ fn doctor_is_daemon_owned_read_only_and_uses_a_typed_fake_engine() {
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let state = temporary.path().join("state");
     let fake = Arc::new(FakeDoctorExecutor::ready());
-    let runtime = RuntimeBuilder::multi_thread().enable_all().build().unwrap();
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
     runtime.run(async {
         let server = async_engine::launch(
             Service::new(state.clone())
@@ -494,7 +538,11 @@ fn doctor_missing_daemon_is_typed_and_does_not_create_state() {
 fn doctor_executor_deadline_is_typed_without_waiting_for_a_slow_engine() {
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let state = temporary.path().join("state");
-    let runtime = RuntimeBuilder::multi_thread().enable_all().build().unwrap();
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
     runtime.run(async {
         let server = async_engine::launch(
             Service::new(state.clone())
@@ -518,7 +566,11 @@ fn independent_state_directories_serve_concurrently() {
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let left = temporary.path().join("left");
     let right = temporary.path().join("right");
-    let runtime = RuntimeBuilder::multi_thread().enable_all().build().unwrap();
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
     runtime.run(async {
         let left_server = async_engine::launch(Service::new(left.clone()).serve());
         let right_server = async_engine::launch(Service::new(right.clone()).serve());

@@ -6,7 +6,11 @@ use super::*;
 fn fresh_daemon_serves_typed_client_and_releases_writer() {
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let state = temporary.path().join("state");
-    let runtime = RuntimeBuilder::multi_thread().enable_all().build().unwrap();
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
     runtime.run(async {
         let first = async_engine::launch(Service::new(state.clone()).serve());
         let client = wait_for_client(&state).await;
@@ -29,6 +33,7 @@ fn typed_job_submission_is_authenticated_and_coalesces() {
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let state = temporary.path().join("state");
     RuntimeBuilder::multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap()
@@ -71,6 +76,7 @@ fn setup_prepare_job_is_prompt_coalesced_logged_and_cancellable_without_docker()
     std::fs::create_dir(&workspace).unwrap();
     let fake = Arc::new(SlowFakeSetupExecutor::new());
     RuntimeBuilder::multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap()
@@ -162,6 +168,7 @@ fn setup_task_job_is_prompt_coalesced_bounded_and_cancellable_without_docker() {
     std::fs::create_dir(&workspace).unwrap();
     let fake = Arc::new(FakeSetupTaskExecutor::new());
     RuntimeBuilder::multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap()
@@ -238,6 +245,7 @@ fn setup_app_task_is_prompt_typed_and_clears_its_durable_session() {
     let (gate, mut control) = execution_gate();
     let fake = Arc::new(FakeSetupAppTaskExecutor::new(Some(gate)));
     RuntimeBuilder::multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap()
@@ -292,6 +300,7 @@ fn manifest_app_task_is_prompt_typed_and_clears_its_durable_session() {
     let (gate, mut control) = execution_gate();
     let fake = Arc::new(FakeManifestAppTaskExecutor::new(gate));
     RuntimeBuilder::multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap()
@@ -387,6 +396,7 @@ fn a_followed_app_task_is_cancelled_once_its_follower_stops_polling() {
         output_limit: 4096,
     };
     RuntimeBuilder::multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap()
@@ -607,6 +617,7 @@ fn setup_task_stops_after_prepare_failure_before_running_task() {
     std::fs::create_dir(&workspace).unwrap();
     let fake = Arc::new(FakeSetupTaskExecutor::new());
     RuntimeBuilder::multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap()
@@ -794,6 +805,7 @@ fn app_tasks_from_distinct_workspaces_run_in_parallel_up_to_the_slots() {
         tick: None,
     });
     RuntimeBuilder::multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap()
@@ -876,6 +888,7 @@ fn a_silent_task_is_torn_down_as_stalled_and_a_chatty_one_is_not() {
         tick: None,
     });
     RuntimeBuilder::multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap()
@@ -911,6 +924,7 @@ fn a_silent_task_is_torn_down_as_stalled_and_a_chatty_one_is_not() {
     });
     let state = temporary.path().join("state2");
     RuntimeBuilder::multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap()

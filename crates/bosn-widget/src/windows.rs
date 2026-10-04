@@ -4,25 +4,16 @@
 //! never resized, because a resize after the first frame is not applied on
 //! KDE Plasma Wayland (zackees/kernal-api#390).
 
-use kernal_api::webview::{
-    BestEffort, WebviewWindowOptions, WebviewWindowSupport, WindowOptionsError,
-};
+use kernal_api::webview::{WebviewWindowOptions, WebviewWindowSupport, WindowOptionsError};
 
 /// The application id every widget window carries: the Wayland
 /// `xdg_toplevel` app id a KWin window rule matches (`docs/ci.md`).
 pub const APP_ID: &str = "dev.bosn.widget";
 
-/// Where the bubble asks to sit on displays that honour a requested
-/// position (X11, Windows, macOS): a fixed logical offset from the top-left
-/// of the virtual desktop, below a macOS menu bar. The facade cannot report
-/// the work area yet, so the bottom-right corner is unknowable
-/// (zackees/kernal-api#393). Wayland ignores it; a KWin rule places it.
-pub const BUBBLE_FALLBACK_POSITION: (i32, i32) = (24, 64);
-
 /// One of the widget's windows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Window {
-    /// The always-present status bubble.
+    /// The dock-adjacent status fallback when the tray host is absent.
     Bubble,
     /// The panel the bubble toggles.
     Panel,
@@ -65,7 +56,7 @@ impl Window {
     /// `support`.
     pub fn options(
         self,
-        support: WebviewWindowSupport,
+        _support: WebviewWindowSupport,
     ) -> Result<WebviewWindowOptions, WindowOptionsError> {
         let (width, height) = self.size();
         let options = WebviewWindowOptions::new(self.title(), width, height)?;
@@ -74,18 +65,11 @@ impl Window {
                 // Keep-above and taskbar exclusion are requests even where the
                 // display ignores them (Wayland): the KWin rule supplies them
                 // there, and asking costs nothing.
-                let bubble = options
+                Ok(options
                     .decorations(false)
                     .transparent(true)
                     .always_on_top(true)
-                    .skip_taskbar(true);
-                match support.position {
-                    BestEffort::Requested => {
-                        let (x, y) = BUBBLE_FALLBACK_POSITION;
-                        bubble.initial_position(x, y)
-                    }
-                    BestEffort::Unsupported => Ok(bubble),
-                }
+                    .skip_taskbar(true))
             }
             Self::Panel | Self::Full => Ok(options),
         }
@@ -95,6 +79,7 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kernal_api::webview::BestEffort;
 
     fn support(outcome: BestEffort) -> WebviewWindowSupport {
         WebviewWindowSupport {
@@ -129,11 +114,11 @@ mod tests {
     }
 
     #[test]
-    fn the_bubble_asks_for_a_position_only_where_the_display_honours_one() {
+    fn the_compositor_owns_dock_relative_position_on_every_display() {
         let requested = Window::Bubble
             .options(support(BestEffort::Requested))
             .unwrap();
-        assert_eq!(requested.logical_position(), Some(BUBBLE_FALLBACK_POSITION));
+        assert_eq!(requested.logical_position(), None);
         let wayland = Window::Bubble
             .options(support(BestEffort::Unsupported))
             .unwrap();
