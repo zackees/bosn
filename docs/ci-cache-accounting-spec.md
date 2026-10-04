@@ -3945,3 +3945,26 @@ this new orchestration against a live engine. Normal runtime enrollment remains
 unactivated. Source-stop proof, source-volume preservation, publication/release
 phases and bounded recovery enumeration are still required. Act2 exact default
 branch full CI run `37241691702` remains live; it has not been restarted.
+
+### Durable source-stop phase (candidate, 2026-10-04)
+
+The engine snapshot now records source stop separately from terminal volume
+removal. The trusted source-stop receipt binds exact engine name/ID and retained
+source-volume identity, requires cleanup_requested state and an acknowledged,
+unexpired lower reservation, and persists a monotonic timestamp. Decoder checks
+refuse absent acknowledgement and inconsistent state/time. Wrong engine identity
+and a receipt before cleanup refuse without advancing recovery state. A client
+exit or failed runtime probe cannot establish this receipt.
+
+Two focused recovery tests and registry all-target Clippy with warnings denied
+passed: `.git/retention-bosn-tool-source-stop-green.log`. The initial combined
+test exceeded the 100-line function lint; it was split by intent and source-stop
+responsibility with a shared fixture. No assertion or limit was relaxed.
+Runtime Docker probes and source-volume preservation are not wired yet; the
+ordinary terminal path still requires volume absence. This persistence phase
+alone gives no helper publication or storage-removal authority.
+
+The sole primary reviewer found no blocking issues in the acknowledgement and
+actor reservation slices. Exact default-branch act2 CI run `37241691702` now
+completed successfully on `6c7ae11a0917c24e88035764c4de3f097dcd6c8f`.
+Release preparation can proceed; no candidate release or Bosn pin is claimed yet.
