@@ -15,6 +15,9 @@ fn staged(runtime: &CiRuntime, id: &str) {
     let source = runtime.staging_dir(id).join("source");
     std::fs::create_dir_all(&source).unwrap();
     std::fs::write(source.join("README"), "x").unwrap();
+    let workflows = source.join(".github/workflows");
+    std::fs::create_dir_all(&workflows).unwrap();
+    std::fs::write(workflows.join("ci.yml"), "jobs:\n  a:\n    steps: []\n").unwrap();
 }
 
 fn request(staging: &str, sha_byte: char) -> SubmitRequest {
@@ -76,7 +79,38 @@ async fn wait_done(runtime: &CiRuntime, run: &str) -> RunRecord {
         }
         async_engine::sleep(Duration::from_millis(10)).await;
     }
-    panic!("run {run} did not finish");
+    let record = runtime.record(run).unwrap();
+    panic!(
+        "run {run} did not finish: state {:?}, conclusion {:?}, reason {:?}, cleanup {:?}, engine {:?}",
+        record.state, record.conclusion, record.reason, record.cleanup, record.engine_id
+    );
+}
+
+#[test]
+fn invalid_original_workflow_never_establishes_a_successful_run() {
+    with_registry(|registry, dir| async move {
+        let backend = Arc::new(FakeBackend::default());
+        let runtime = CiRuntime::start(&dir, registry, backend, 1);
+        let staging = new_uuid().await.unwrap();
+        staged(&runtime, &staging);
+        std::fs::write(
+            runtime
+                .staging_dir(&staging)
+                .join("source/.github/workflows/ci.yml"),
+            "jobs: [",
+        )
+        .unwrap();
+        let submitted: SubmitReply = call(
+            &runtime,
+            CiRequest::Submit {
+                request: Box::new(request(&staging, 'a')),
+            },
+        )
+        .await;
+        let done = wait_done(&runtime, &submitted.run).await;
+        assert_eq!(done.conclusion, Some(Conclusion::Incomplete));
+        assert!(done.reason.unwrap().contains("workflow cannot be parsed"));
+    });
 }
 
 #[test]
@@ -539,6 +573,7 @@ fn steps_act_never_mentioned_are_listed_as_skipped_in_jobs_that_ran() {
         )]
         .into(),
         remote_only: Default::default(),
+        ..Declared::default()
     };
     let mut tree = parser.tree;
     let (conclusion, _) = report::conclude(

@@ -10,6 +10,7 @@ fn setup_ensure_job_is_prompt_coalesced_bounded_and_cancellable_without_docker()
     std::fs::create_dir(&workspace).unwrap();
     let fake = Arc::new(FakeSetupEnsureExecutor::new());
     RuntimeBuilder::multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap()
@@ -97,6 +98,7 @@ fn setup_ensure_stops_after_prepare_failure_or_ownership_mismatch_without_mutati
         std::fs::create_dir(&workspace).unwrap();
         let fake = Arc::new(FakeSetupEnsureExecutor::new());
         RuntimeBuilder::multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()
             .unwrap()
@@ -180,6 +182,7 @@ fn setup_ensure_persists_container_and_content_addressed_image_across_daemon_res
     for _ in 0..2 {
         let fake = Arc::new(FakeSetupEnsureExecutor::new());
         RuntimeBuilder::multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()
             .unwrap()

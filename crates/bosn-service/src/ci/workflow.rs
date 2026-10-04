@@ -13,6 +13,10 @@ use std::{collections::BTreeMap, path::Path};
 
 use serde::Deserialize;
 
+mod graph;
+
+pub(crate) use graph::valid_id as valid_job_id;
+
 /// One declared step of one job.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeclaredStep {
@@ -29,6 +33,9 @@ pub struct Declared {
     pub steps: DeclaredSteps,
     /// Remote-only jobs (GATE-012) by workflow job ID, with the reason.
     pub remote_only: BTreeMap<String, String>,
+    /// Unresolved declarations never establish complete local coverage.
+    pub errors: Vec<String>,
+    pub needs_qualified_identity: bool,
 }
 
 #[derive(Deserialize)]
@@ -40,6 +47,7 @@ struct Workflow {
 /// One workflow job, read only for the fields bosn acts on.
 #[derive(Debug, Default, Deserialize)]
 pub struct Job {
+    pub uses: Option<String>,
     #[serde(default)]
     pub steps: Vec<Step>,
     #[serde(default)]
@@ -88,10 +96,7 @@ impl Step {
 /// Parse the workflow file's jobs. A workflow that cannot be read or parsed
 /// yields no declarations (act reports what it can on its own).
 pub fn declared(source: &Path, workflow: &str, repository: &str) -> Declared {
-    std::fs::read_to_string(source.join(workflow))
-        .ok()
-        .and_then(|text| parse_for_repository(&text, Some(repository)))
-        .unwrap_or_default()
+    graph::declared(source, workflow, repository)
 }
 
 #[cfg(test)]
@@ -99,6 +104,7 @@ fn parse(text: &str) -> Option<Declared> {
     parse_for_repository(text, None)
 }
 
+#[cfg(test)]
 fn parse_for_repository(text: &str, repository: Option<&str>) -> Option<Declared> {
     let workflow: Workflow = serde_yaml::from_str(text).ok()?;
     let mut declared = Declared::default();
@@ -129,6 +135,83 @@ fn parse_for_repository(text: &str, repository: Option<&str>) -> Option<Declared
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_reusable_remote_jobs_keep_their_caller_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let workflows = root.path().join(".github/workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(workflows.join("entry.yml"), "jobs:\n  maintenance:\n    uses: ./.github/workflows/maintenance.yml\n  validation:\n    uses: ./.github/workflows/validation.yml\n").unwrap();
+        std::fs::write(workflows.join("maintenance.yml"), "jobs:\n  cache-budget:\n    env:\n      CI_REMOTE_ONLY: true\n    steps:\n      - run: echo remote\n").unwrap();
+        std::fs::write(
+            workflows.join("validation.yml"),
+            "jobs:\n  cache-budget:\n    steps:\n      - run: echo local\n",
+        )
+        .unwrap();
+        let result = declared(root.path(), ".github/workflows/entry.yml", "zackees/bosn");
+        assert_eq!(result.remote_only.len(), 1);
+        assert!(result.remote_only.contains_key("maintenance/cache-budget"));
+        assert!(!result.remote_only.contains_key("validation/cache-budget"));
+        assert!(!result.remote_only.contains_key("cache-budget"));
+        assert!(result.errors.is_empty());
+        assert!(result.needs_qualified_identity);
+    }
+
+    #[test]
+    fn unresolved_local_calls_are_explicit_declaration_errors() {
+        for uses in [
+            "owner/repo/.github/workflows/test.yml@main",
+            "./.github/workflows/missing.yml",
+            "./.github/workflows/entry.yml",
+            "./.github/workflows/../../../escape.yml",
+            "${{ inputs.workflow }}",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let workflows = root.path().join(".github/workflows");
+            std::fs::create_dir_all(&workflows).unwrap();
+            std::fs::write(
+                workflows.join("entry.yml"),
+                format!("jobs:\n  caller:\n    uses: '{uses}'\n"),
+            )
+            .unwrap();
+            let result = declared(root.path(), ".github/workflows/entry.yml", "zackees/bosn");
+            assert!(!result.errors.is_empty(), "{uses}");
+            assert!(result.needs_qualified_identity, "{uses}");
+        }
+    }
+
+    #[test]
+    fn declaration_reads_are_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("oversized.yml"),
+            " ".repeat(256 * 1024 + 1),
+        )
+        .unwrap();
+        assert!(
+            !declared(root.path(), "oversized.yml", "zackees/bosn")
+                .errors
+                .is_empty()
+        );
+        assert!(
+            !declared(root.path(), "absent.yml", "zackees/bosn")
+                .errors
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_declarations_reject_symlinked_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("original.yml"), "jobs: {}\n").unwrap();
+        std::os::unix::fs::symlink("original.yml", root.path().join("alias.yml")).unwrap();
+        assert!(
+            !declared(root.path(), "alias.yml", "zackees/bosn")
+                .errors
+                .is_empty()
+        );
+    }
 
     /// #405: the run's localized copy has bosn's end-of-output trap on every
     /// `run:` script; a declared (e.g. skipped) step keeps its written name.
