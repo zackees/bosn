@@ -3841,3 +3841,33 @@ Normal durable intent, bounded recovery scheduling, source volume lifetime,
 publication completion and reference release still require Bosn integration.
 It is not proof of automatic enrollment, compiler/archive persistence, machine
 ceilings, cross-class inode accounting or old image/build/container expiry.
+
+### Bosn durable recovery intent persistence (candidate, 2026-10-04)
+
+Bosn candidate `6313f42` adds optional typed `ActToolRecoveryIntent` to the
+self-contained engine registry snapshot. Historical records omit it. Under the
+exact unexecuted registered engine claim, `begin_act_tool_recovery` binds the
+original engine ID, deterministic named private source volume, shared cache
+volume and frozen native lower. Its owner digest includes registry identity,
+engine/run identity and the complete frozen creation profile. Recovery requires
+persistent named disk storage; anonymous disk and memory-only profiles refuse.
+Creation/expiry timestamps are frozen once, with a positive lifetime at most
+24 hours. Whole-second reference timestamps preserve the registry's more precise
+monotonic transition clock. An identical retry reuses intent; changed intent
+refuses. Decoding rechecks the binding against the containing engine record.
+
+The intent transaction rolls back without commit and survives writer close and
+reopen after commit. Tests verify changed claim/lifetime refusal and the finite
+lifetime bound. All 19 engine-registry lifecycle tests passed in 11.24 seconds;
+registry all-target Clippy with warnings denied passed. Evidence:
+`.git/retention-bosn-tool-recovery-intent-{red,green,boundaries}.log`.
+The initial missing-API compilation evidence also contained a fixture typo in
+the preexisting claim method name; it was corrected before the passing runs.
+
+This persistence API does not acknowledge act2 reservation, establish source
+quiescence, permit storage removal or schedule a recovery helper. It is not
+called by the normal runtime yet. Reservation acknowledgement, source-stop
+proof, completed publication/release/expiry transitions, retention of the source
+volume during cleanup and bounded recovery enumeration remain implementation
+work. The ordinary engine terminal state still requires source-volume absence;
+recovery must integrate with that lifecycle before normal enrollment is enabled.
