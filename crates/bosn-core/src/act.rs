@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const ACT_ADAPTER_SCHEMA: u32 = 1;
-pub const ACT_VERSION: &str = "0.2.89-act2.4";
+pub const ACT_VERSION: &str = "0.2.89-act2.5";
 const MAX_DOCUMENT_BYTES: usize = 1 << 20;
 const MAX_CELLS: usize = 4096;
 

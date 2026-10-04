@@ -53,6 +53,8 @@ mod vocabulary {
 }
 
 pub mod cache_cohort;
+#[cfg(all(test, unix))]
+mod cache_cohort_cli_tests;
 pub mod cache_policy;
 pub mod checkout;
 pub mod client;

@@ -1037,3 +1037,23 @@ for necessary act2 releases in AGENTS.md. The annotated tag points to
 `7e6f010fa7cc7171083329b2cf3d18f1566e3468`, whose full CI passed. Existing
 release workflow run 37187501368 is running. Binary/checksum verification and
 Bosn pin updates remain pending; no production retention activation is claimed.
+
+### Verified act2.5 dependency pin (candidate)
+
+Release run 37187501368 passed and published v0.2.89-act2.5 from the exact
+full-CI-verified merge SHA 7e6f010. The Linux x86_64 archive matches published
+checksums (`d116cc9e5ca040f4807763f562476275015e9d9bdf5c3a2ac598c182c0be0a9e`).
+The extracted binary digest is
+`ea682586fbf32aef140cfd2dc620d883be29f14650daadd6d1cd29ed34292ea1`;
+its actual isolated invocation reports `act version 0.2.89-act2.5`. Bosn's
+version, archive URL and both digests now pin these verified bytes.
+
+The command contract test passed against the exact-merge snapshot: namespace
+audit reports missing with null counts/bytes; missing-root watcher reports
+partial/unknown budget outcome and stops successfully on its first SIGINT.
+The initial fixture mistakenly expected missing audit to be partial/nonzero;
+actual execution and review corrected the test, not the production contract.
+Strict service-library Clippy passed. The published-binary contract test passed (1 test, 0.05 seconds). Production policy activation remains guarded pending warm migration
+and supervision. Accounting/lifecycle PR #473 merged as
+`b23398aef9f9c12eb314e0835ca7a508391a07fd` after required checks passed;
+full hosted macOS/release checks were not requested or claimed.
