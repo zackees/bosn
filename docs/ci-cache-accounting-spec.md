@@ -2122,10 +2122,55 @@ again (14.25 seconds), and `go vet` passed. The act2 candidate is committed at
 Artifacts: `act2-toolcache-publish-red.log`,
 `act2-toolcache-publish-green.log`, `act2-toolcache-boundaries.log`.
 
+The publisher also has a full-operation fault test: inject a final directory
+sync failure after the no-replace rename, observe `published=true` together
+with `partial=true`, then verify a subsequent normal publication reuses that
+same object and acknowledges durability. This tests truthful uncertain-state
+reporting and replay; it does not simulate a power loss or prove crash survival
+for every filesystem. Artifact: `act2-toolcache-durability-replay.log`.
+
 This is local work, not released or enrolled by Bosn. Publication gates,
-durability fault evidence, generation assembly, reader protection, accounting
+power-loss evidence, reader protection, accounting
 and coordinated expiry remain open. The publisher alone does not solve
 per-engine tool copying or authorize deletion of existing caches.
+
+#### In-progress immutable generation assembly
+
+The act2 candidate `cbbd365` adds `cache tool-generation --manifest ...
+--cache-server-path ... --max-bytes ... --apply`. A bounded, typed schema-1
+specification lists install paths and closed object IDs. Assembly rejects empty
+or overlapping paths, path escapes, completion-marker collisions, missing or
+corrupt objects, and an exceeded logical payload-byte bound. The specification
+is limited to 64 KiB and 256 installs; the complete tree remains subject to the
+100,000-entry and depth bounds.
+
+Under the same participating writer lock as object publication, it validates
+every object, creates new directories and relative symlinks, and hard-links
+file data only from closed objects. It preserves object file metadata and
+materializes sibling completion markers. A sorted typed manifest identifies
+the complete generation. Stage re-audit, file/directory sync, atomic no-replace
+rename and final directory sync precede success. Reuse requires a complete
+manifest/payload audit; unexpected existing data is preserved and rejected.
+The resulting tree must be exposed as a read-only lower. Writable use would
+mutate the shared file inodes and is not an approved enrollment path.
+
+The CLI regression failed before implementation (`unknown flag: --manifest`)
+and passed afterward. It proves a repeated recipe reuses the generation,
+reordered installs yield the same ID, and both old and successor generations
+share the original object's file inode rather than copying it. The old
+generation does not acquire the successor's additional install. Boundary tests
+passed for invalid requests, cancellation, budget failure, missing objects and
+unexpected existing payload. Full artifact-cache package tests passed (14.27
+seconds), `go vet` passed, golangci-lint reported zero issues, and the existing
+reviewer returned PASS. Artifacts: `act2-tool-generation-red.log`,
+`act2-tool-generation-green.log`, `act2-tool-generation-boundaries.log`,
+`act2-tool-generation-package-checks.log`.
+
+The reported generation bytes bound logical file payload; they are not a
+physical allocation total. Generation assembly does not yet supply lifetime
+reader protection, safe retirement, policy convergence or Bosn enrollment.
+Those remain necessary before production activation. The candidate is local
+and unpublished.
 
 #### Next implementation contract: immutable generations and private writes
 
