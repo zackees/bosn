@@ -2,9 +2,10 @@
 use super::*;
 use bosn_core::{ResourceKind, ResourceLabels, Retention, Scope};
 use bosn_engine::DockerEngine;
+use bosn_registry::act::ActEngineRecord;
 use serde::Deserialize;
 
-fn labels(
+pub(super) fn labels(
     intent: &ActEngineIntent,
     owner: &str,
 ) -> Result<BTreeMap<String, String>, ActEngineError> {
@@ -112,9 +113,30 @@ pub(crate) async fn ensure_storage_volume(
     verify(&document, intent, owner)
 }
 
+/// Remove a retiring engine's private storage, unless native tool recovery
+/// still needs it.
+///
+/// A record carrying an unreleased recovery intent keeps its source volume:
+/// the recovering reader still holds the overlay it contains. Publication and
+/// reference release must be integrated before this guard is relaxed, so that
+/// path never falls back to deleting private disk.
+pub(crate) async fn remove_storage_volume(
+    engine: &DockerEngine,
+    record: &ActEngineRecord,
+    owner: &str,
+) -> Result<(), ActEngineError> {
+    if super::source_retained_by_recovery(record) {
+        return Err(ActEngineError(
+            "native tool recovery retains the private source volume".into(),
+        ));
+    }
+    remove_private_storage(engine, &record.intent, owner).await
+}
+
 /// Exact named storage only. Attached volumes are refused by Docker; removal
 /// is never forced. A successful exact listing is required before receipt.
-pub(crate) async fn remove_storage_volume(
+/// Module-private so [`remove_storage_volume`] stays the only reachable path.
+async fn remove_private_storage(
     engine: &DockerEngine,
     intent: &ActEngineIntent,
     owner: &str,
@@ -232,7 +254,7 @@ else: sys.exit(2)
                 .build()
                 .unwrap()
                 .run(async {
-                    let result = remove_storage_volume(&engine, &intent, OWNER).await;
+                    let result = remove_private_storage(&engine, &intent, OWNER).await;
                     assert_eq!(
                         result.is_ok(),
                         matches!(mode, "success" | "slow-remove"),
@@ -241,7 +263,9 @@ else: sys.exit(2)
                     if mode == "lost_ack" {
                         assert!(!state.exists());
                         assert!(
-                            remove_storage_volume(&engine, &intent, OWNER).await.is_ok(),
+                            remove_private_storage(&engine, &intent, OWNER)
+                                .await
+                                .is_ok(),
                             "a successful later list may establish absence"
                         );
                     }

@@ -3977,3 +3977,70 @@ is in progress as run `37242493394`:
 https://github.com/zackees/act2/actions/runs/37242493394
 Release completion, independent archive/executable digests, architecture and
 embedded-version verification remain pending. Bosn's shipped pin is unchanged.
+
+### act2.10 release verification and Bosn pin rollout (2026-10-04)
+
+Act2 release run `37242493394` completed **successfully** on exact default-branch
+commit `6c7ae11a0917c24e88035764c4de3f097dcd6c8f`; the release is no longer a
+draft. All 11 archives plus `checksums.txt` were downloaded and verified
+independently:
+
+- every archive matches its release `checksums.txt` entry **and** the GitHub
+  asset digest (the manifest and the API digests are byte-identical);
+- every archive's GitHub-reported size matches the downloaded size;
+- executable architecture confirmed per archive via `llvm-readobj`: Mach-O
+  `arm64`/`x86-64`; ELF `EM_AARCH64`, `EM_ARM` (armv6 and armv7), `EM_386`,
+  `EM_RISCV`, `EM_X86_64`; COFF `IMAGE_FILE_MACHINE_ARM64`, `_I386`, `_AMD64`;
+  all of file type executable;
+- every binary embeds the literal `0.2.89-act2.10`;
+- the Linux x86_64 binary **executed**: `act --version` reports
+  `0.2.89-act2.10`, and `cache tool-recovery reserve|release` expose the typed
+  `--record` / `--apply` / `--max-bytes` surface this recovery work depends on.
+
+Bosn's pin moved to `v0.2.89-act2.10`
+(`crates/bosn-core/src/act.rs`, `crates/bosn-service/src/ci/pins.rs`) with the
+Linux x86_64 archive digest `2e6ed85cd71f17d8f27aa9b66a7c5d338c9927b14b884cf8eeed489c7e707df8`
+and extracted executable digest
+`4ac7dd7f5660daae13b53f06f12dc3c27e6cff77ede042925078d9c4a69f6e65`, both
+measured from the verified release rather than transcribed.
+
+### Runtime source-stop probe and source-volume retention (2026-10-04)
+
+The source-stop phase is no longer a durable field only — the trusted runtime
+now constructs the proof from real Docker observations
+(`crates/bosn-service/src/act_engine/source_stop.rs`):
+
+- `stop_source_writers` runs the retained-volume half of the phase. It
+  `docker volume inspect`s the **frozen** source volume name (never a name
+  Docker volunteers) and requires exactly one volume whose driver/scope are
+  `local`, whose options are empty, and whose ownership labels are exactly this
+  daemon's for this intent. Anything ambiguous, unparsable, renamed, relabelled,
+  networked or mounted is a refusal.
+- The typed `ActToolSourceStopProof` is then built only from frozen identity —
+  engine name from the intent, engine ID from the record, and the frozen source
+  volume — and both must agree with the recovery intent. An unresolved or
+  different engine ID refuses.
+- Engine absence is the other half: startup recovery already proves it with
+  two independent exact listings before this probe runs, and the ordinary
+  `remove_owned_engine` path reaches the probe only after its own absence
+  checks.
+- A record with a frozen intent but no acknowledged reservation refuses. An
+  ordinary engine with no recovery intent skips the phase entirely.
+- The proof is idempotent: an already-recorded stop re-verifies ownership and
+  returns without rewriting the timestamp.
+
+**Preservation guard.** `remove_storage_volume` now refuses while a record
+holds an unreleased recovery intent, so private disk and terminal metadata are
+not finalized ahead of publication. The underlying destructive primitive was
+made module-private (`remove_private_storage`), so the guarded entry is the only
+crate-reachable path and the guard cannot be bypassed by adding a caller. This
+is a structural guarantee rather than a unit test, because an
+`ActEngineRecord` cannot be constructed outside the registry; the registry-side
+receipt boundaries are already covered by the existing focused recovery tests.
+
+Workspace Clippy with warnings denied and `--all-targets` passed, and `./lint`
+(including file length and include-base) passed. Host test execution is
+refused by `ci/test_guard.sh` by design, so the new unit tests compile here and
+execute in the local gate's isolated lane. Normal runtime enrollment remains
+legacy and unactivated; publication, merge-into-generation, reference release,
+source-volume removal and bounded recovery enumeration remain open.

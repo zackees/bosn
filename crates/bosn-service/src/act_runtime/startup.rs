@@ -233,7 +233,13 @@ pub(crate) async fn retire_engine(
     }
     if named.iter().all(Vec::is_empty) {
         confirm_absence(record.engine_id.as_deref())?;
-        crate::act_engine::remove_storage_volume(engine, intent, owner)
+        // Engine absence is the writer-quiescence half of the source stop; the
+        // retained-volume ownership probe is the other half. Both must hold
+        // before a native recovery record can advance.
+        crate::act_engine::stop_source_writers(registry, engine, record, owner)
+            .await
+            .map_err(|e| error(e.to_string()))?;
+        crate::act_engine::remove_storage_volume(engine, record, owner)
             .await
             .map_err(|e| error(e.to_string()))?;
         registry

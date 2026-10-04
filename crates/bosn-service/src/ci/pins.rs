@@ -78,11 +78,13 @@ pub fn act_artifact(architecture: &str) -> Option<ActArtifact> {
             // GitHub-parity RUNNER_ENVIRONMENT, an init in hosted-runner job
             // containers, --workflow-overlay (#424), and ordinary hosted
             // Linux shell/Node identity with preserved Docker socket access,
-            // concurrent v4 artifact block assembly, raw stream tagging, and
-            // immutable generation admission with bounded physical retention.
-            url: "https://github.com/zackees/act2/releases/download/v0.2.89-act2.9/act_Linux_x86_64.tar.gz",
-            sha256: "935a4e9cf8b02a7b561f49196f10c29c6fb17deb705ef217bfc4bd378125a10e",
-            binary_sha256: "0eff1ee213f98efdee124ff80d50e96d83e214dbf34daf417bac33df2be9780a",
+            // concurrent v4 artifact block assembly, raw stream tagging,
+            // immutable generation admission with bounded physical retention,
+            // and typed durable tool-recovery references (reserve/release)
+            // with a finite lifetime that fence the v2 recovery store.
+            url: "https://github.com/zackees/act2/releases/download/v0.2.89-act2.10/act_Linux_x86_64.tar.gz",
+            sha256: "2e6ed85cd71f17d8f27aa9b66a7c5d338c9927b14b884cf8eeed489c7e707df8",
+            binary_sha256: "4ac7dd7f5660daae13b53f06f12dc3c27e6cff77ede042925078d9c4a69f6e65",
         }),
         _ => None,
     }

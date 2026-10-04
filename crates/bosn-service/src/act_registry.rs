@@ -34,6 +34,13 @@ pub enum ActRegistryCommand {
         intent: bosn_registry::act::ActToolRecoveryIntent,
         at: f64,
     },
+    /// Trusted runtime receipt that the engine holding the last source reader
+    /// is absent and its private source volume is still retained and ours.
+    ToolRecoverySourceStopped {
+        run: String,
+        proof: bosn_registry::act::ActToolSourceStopProof,
+        at: f64,
+    },
     Register {
         run: String,
         observed: ActEngineObservation,
@@ -258,6 +265,10 @@ pub(crate) fn apply(
             at,
         } => {
             transaction.acknowledge_act_tool_recovery(&run, &token, &intent, at)?;
+            ActRegistryReply::Committed
+        }
+        ActRegistryCommand::ToolRecoverySourceStopped { run, proof, at } => {
+            transaction.record_act_tool_source_stopped(&run, &proof, at)?;
             ActRegistryReply::Committed
         }
         ActRegistryCommand::Register { run, observed, at } => {

@@ -16,7 +16,7 @@ use std::{
 fn hash(bytes: &[u8]) -> String {
     format!("sha256:{}", Sha256Hasher::digest(bytes))
 }
-fn now() -> f64 {
+pub(crate) fn now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0.0, |t| t.as_secs_f64())

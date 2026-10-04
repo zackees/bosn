@@ -557,7 +557,8 @@ pub async fn remove_owned_engine(
             ));
         }
     }
-    remove_storage_volume(engine, &record.intent, &record.registry_id).await?;
+    crate::act_engine::stop_source_writers(registry, engine, &record, &record.registry_id).await?;
+    remove_storage_volume(engine, &record, &record.registry_id).await?;
     registry
         .act_registry(ActRegistryCommand::Finalize {
             run: run.into(),
