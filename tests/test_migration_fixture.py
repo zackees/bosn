@@ -4,46 +4,18 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import sqlite3
 import subprocess
 import sys
+import sysconfig
+import tempfile
 from pathlib import Path
 
 import pytest
 
+from native_binary import native_binary
+
 FIXTURE = Path(__file__).parent / "fixtures" / "migration" / "create_python_v4_registry.py"
-
-
-def _native_cli_command() -> list[str]:
-    """Return the workspace CLI command on both developer and CI hosts.
-
-    ``soldr`` is the local build wrapper used for fast Rust iteration, but it
-    is intentionally not required by the GitHub Actions images.  The test
-    still invokes the same Cargo binary with the same locked dependency graph
-    when the wrapper is unavailable.
-    """
-    if soldr := shutil.which("soldr"):
-        return [soldr, "cargo"]
-    return ["cargo"]
-
-
-def test_native_cli_command_uses_cargo_when_soldr_is_not_installed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(shutil, "which", lambda executable: None)
-
-    assert _native_cli_command() == ["cargo"]
-
-
-def test_native_cli_command_uses_soldr_when_available(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        shutil,
-        "which",
-        lambda executable: "/opt/bin/soldr" if executable == "soldr" else None,
-    )
-
-    assert _native_cli_command() == ["/opt/bin/soldr", "cargo"]
 
 
 def test_python_v4_registry_fixture_covers_import_relationships(tmp_path: Path) -> None:
@@ -131,16 +103,13 @@ def test_native_cli_imports_the_complete_v4_fixture_without_changing_source(
     )
     os.chmod(marker, 0o600)
     source_before = source.read_bytes()
+    binary = native_binary()
+    scripts = sysconfig.get_path("scripts")
+    assert scripts and binary.parent.resolve() == Path(scripts).resolve(), (
+        "migration acceptance requires the candidate CLI installed in this environment"
+    )
     command = [
-        *_native_cli_command(),
-        "run",
-        "-j1",
-        "-p",
-        "bosn-service",
-        "--bin",
-        "bosn",
-        "--locked",
-        "--",
+        str(binary),
         "registry",
         "import-v4",
         "--legacy-state-dir",
@@ -150,8 +119,12 @@ def test_native_cli_imports_the_complete_v4_fixture_without_changing_source(
         "--yes",
         "--json",
     ]
-    completed = subprocess.run(command, check=True, text=True, capture_output=True)
-    receipt = json.loads(completed.stdout.splitlines()[-1])
+    # ./install already built this candidate's release CLI. Test that artifact
+    # rather than compiling an unrelated debug profile serially with cargo run.
+    with tempfile.TemporaryFile() as output:
+        subprocess.run(command, check=True, stdout=output, stderr=subprocess.STDOUT)
+        output.seek(0)
+        receipt = json.loads(output.read().decode("utf-8").splitlines()[-1])
     assert receipt == {
         "action": "registry_import_v4",
         "reconciliation_required": True,
@@ -179,9 +152,12 @@ def test_native_cli_imports_the_complete_v4_fixture_without_changing_source(
         assert connection.execute(
             "SELECT id,name,retention FROM resources WHERE id='volume-pinned'"
         ).fetchone() == ("volume-pinned", "bosn-synthetic-guest-disk", "pinned")
-    repeated = subprocess.run(command, text=True, capture_output=True)
+    with tempfile.TemporaryFile() as output:
+        repeated = subprocess.run(command, stdout=output)
+        output.seek(0)
+        repeated_receipt = json.loads(output.read().decode("utf-8"))
     assert repeated.returncode != 0
-    assert json.loads(repeated.stdout) == {
+    assert repeated_receipt == {
         "action": "registry_import_v4",
         "error": "cutover refused",
     }
