@@ -14,6 +14,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Instant,
 };
 
 // A promptness fixture must own its interpreter: other parallel libtest
@@ -250,6 +251,7 @@ fn python_client_submits_and_observes_fake_setup_job_without_docker() {
                     .serve(),
             );
             let wire_client = wait_for_client(&state).await;
+            let submitted = Instant::now();
             let python_state = state.clone();
             let python_workspace = workspace.clone();
             let (first, second) = std::thread::spawn(move || {
@@ -280,6 +282,7 @@ fn python_client_submits_and_observes_fake_setup_job_without_docker() {
             .join()
             .expect("Python submit thread panicked")
             .unwrap();
+            assert!(submitted.elapsed() < Duration::from_millis(250));
             assert_eq!(first, second);
 
             wait_for(|| executor.started.load(Ordering::SeqCst) == 1).await;
@@ -354,6 +357,7 @@ fn python_client_submits_and_cancels_coalesced_fake_setup_task_without_docker() 
                     .serve(),
             );
             let wire_client = wait_for_client(&state).await;
+            let submitted = Instant::now();
             let python_state = state.clone();
             let python_workspace = workspace.clone();
             let (first, second) = std::thread::spawn(move || {
@@ -386,6 +390,7 @@ fn python_client_submits_and_cancels_coalesced_fake_setup_task_without_docker() 
             .join()
             .expect("Python submit thread panicked")
             .unwrap();
+            assert!(submitted.elapsed() < Duration::from_millis(250));
             assert_eq!(first, second);
 
             wait_for(|| executor.started.load(Ordering::SeqCst) == 1).await;
@@ -454,6 +459,7 @@ fn python_client_submits_and_cancels_coalesced_fake_setup_ensure_without_docker(
                     .serve(),
             );
             let wire_client = wait_for_client(&state).await;
+            let submitted = Instant::now();
             let python_state = state.clone();
             let python_workspace = workspace.clone();
             let (first, second) = std::thread::spawn(move || {
@@ -484,6 +490,7 @@ fn python_client_submits_and_cancels_coalesced_fake_setup_ensure_without_docker(
             .join()
             .expect("Python submit thread panicked")
             .unwrap();
+            assert!(submitted.elapsed() < Duration::from_millis(250));
             assert_eq!(first, second);
 
             wait_for(|| executor.started.load(Ordering::SeqCst) == 1).await;
