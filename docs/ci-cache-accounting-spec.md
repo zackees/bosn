@@ -1261,3 +1261,36 @@ a hidden orphan stage. Its immutable container ID was confirmed absent afterward
 This verifies the BusyBox shell path; actual workflow tool-install activity,
 expiry and quotas remain unverified. Strict service all-target Clippy passed
 after the shell test and new pin (28.59 seconds). Independent review passed.
+
+### Actual Bosn import transport and published historical receipt
+
+The isolated private-Docker proof passed using published act2.7 through
+`DockerActBackend::import_cache_for_quiescent_source` (1 test, 2.83 seconds).
+A Go HTTP fixture reserved, uploaded and committed an 80-byte archive, then
+closed its legacy server before exporting the source. The test imported that
+source through the actual exclusive lease wrapper and required exit zero plus
+complete warm-publication evidence. It then called the published historical
+receipt command and parsed its output through Bosn's `PublicationReceipt`.
+The receipt identified 80 imported bytes; source file names and SHA-256 hashes
+matched before and after import. Exact helper-container absence was verified.
+
+The helper mounted only disposable tmpfs paths, had a read-only root, no network
+and dropped capabilities. File streaming uses Bosn's existing bounded transport;
+failed operation checks return through exact cleanup. Docker auto-removal and
+a finite helper lifetime also cover a lost acknowledgement or panic. Initial
+fixture errors concerned container absence wording, directory enumeration and
+the absolute act binary path; they are not production RED signals. Independent
+review passed after fixing unbounded fixture streaming and panic-before-cleanup.
+
+Reproduce with the opt-in test
+`published_binary_import_preserves_source_and_has_typed_historical_receipt`,
+`BOSN_ACT_RETENTION_TEST_BINARY` pointing at the verified release,
+`BOSN_ACT_IMPORT_SOURCE_TAR` containing a closed HTTP-seeded legacy namespace
+`0123456789abcdef`, and the isolated Docker transport. This verifies actual
+command/schema interoperability and source preservation. It does not establish
+automatic enrollment, old-peer exclusion, crash-safe routing, watcher supervision
+or restored workflow hits from the new cohort. Those remain activation gates.
+
+Strict service all-target Clippy passed after the final import fixture changes
+(60.84 seconds). The proof and review are complete for this slice; the full
+source gate is still required before pushing the retention candidate.

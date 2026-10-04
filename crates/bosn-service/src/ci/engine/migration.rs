@@ -1,4 +1,7 @@
 //! Bounded import execution. Production admission remains guarded.
+#[cfg(all(test, unix))]
+#[path = "migration_live_tests.rs"]
+mod live_tests;
 use super::{DockerActBackend, RunOptions, legacy_lease, owned};
 use crate::ci::{cache_cohort::Namespace, cache_import::ImportReport, cache_policy::CachePolicy};
 use std::time::Duration;
