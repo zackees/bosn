@@ -3284,3 +3284,33 @@ The source still validates content on selection and again on reader admission;
 production integration should avoid redundant planning validation where the
 native admission already supplies the required proof, while preserving exact
 frozen generation identity and refusal on missing or changed data.
+
+
+### Writer uncertainty and concurrent native admission checkpoint (2026-10-04)
+
+Bosn PR #504 is merged as `753d8a1575c6a8bc6a5a5085c353a387acf1afa9`.
+Its full local gate passed in 998 seconds (Rust 448, Linux 550), exact stamped
+commit `49ba670ab6a28e07cdfa42b1e7165ff3da4ac8eb` verified, and remote checks
+passed before merge. Known cancellation, timeout and execution failure now skip
+legacy tool saving. Ordinary reported exits still retain best-effort saving:
+client exit alone still does not establish native publisher source quiescence.
+
+The act2 admission survey found that generation payload hashing holds the
+store-wide catalog mutex for the entire validation. That serializes independent
+engines' large-cache admission and unrelated publication. Candidate act2
+`071d429` acquires the original generation reader under catalog exclusion,
+then releases the catalog before hashing. The reader excludes generation
+retirement while content validation still runs unchanged. Failed validation
+closes the reader and returns no admitted lease; native exec retains the exact
+original descriptor as before.
+
+The focused regression was RED with the old lock scope. GREEN coverage proves
+the catalog is available during validation, another admission and unrelated
+generation publication proceed, the current generation's exclusive reader-lock
+writer remains blocked, and failed validation releases the reader. Existing
+generation tests passed, including the race detector, in isolated Docker.
+Evidence: `.git/retention-native-admission-lock-{red,green,race}.log`.
+Review/publication/release are pending: this candidate is not in act2.8 or Bosn's
+pin. It does not remove full payload hashing or prove concurrent wall-time
+improvement for 7.7 GiB trees. Production frozen selection, reader handoff,
+shared overlay, source quiescence, and automatic retention remain required.
