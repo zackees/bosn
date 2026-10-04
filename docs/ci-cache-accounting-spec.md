@@ -45,6 +45,8 @@ cannot authorize enrollment. The exclusive import executor preserves partial
 publication on nonzero exits but is not yet invoked by production planning.
 A local registry journal now persists import intent and recovers historical
 publication after restart. It is not machine-wide routing or enrollment state.
+The candidate also executes bounded independent maintenance passes and consumes
+typed retention outcomes. Periodic helper supervision is still unfinished.
 
 The tool-cache candidate uses unique save stages and skips hidden unfinished
 stages when rehydrating fresh engines. Its actual pinned-engine shell proof
@@ -1373,3 +1375,50 @@ sustained physical-footprint convergence remain required.
 Strict service all-target Clippy passed after the final three-engine fixture
 (7.71 seconds). This routing slice is verified locally; the exact-source gate
 is still required before pushing the retention candidate.
+
+### Bounded idle-cohort maintenance and truthful outcomes
+
+Bosn now builds a single-pass maintenance command from the same typed policy
+used by the watch command, with no workflow server required. The executor
+captures at most 64 KiB with a 30-second transport deadline and parses stdout
+even when the command exits nonzero. A valid partial report remains visible;
+transport or invalid-output failure means unknown outcome, not zero reclamation
+or proof that no deletion occurred. The caller must separately supervise and
+retire the verified helper, including remote execution after transport failure.
+
+The typed report binds the exact cohort root and aggregate ceiling, validates
+namespace identities and repository ceilings, and bounds stores/pages/receipts
+to 64/12/32. Receipt counts and bytes use checked arithmetic and unique IDs.
+Complete reports need known totals and complete namespace evidence. Stable
+remaining bytes must equal namespace retention totals. Protection is sampled
+separately at root and namespace level, so each value is bounded independently;
+these samples must not be summed or asserted equal across time. A complete pass
+with `budget_met=false` is distinct from an incomplete/unknown pass. These are
+logical completed-archive bytes, not allocated filesystem blocks.
+
+Four isolated boundary tests passed, including a protection-boundary RED/GREEN
+regression. The first parser rejected a legitimate complete report whose archive
+crossed act2's five-minute protection boundary between root and namespace
+samples; validation now accepts those independently bounded measurements. An
+actual published-binary run also exposed a mistaken full-path namespace
+assumption: act2 emits basenames within its root-bound report. That candidate
+parser mismatch was corrected without changing the dependency protocol.
+
+The final idle-expiry/replay proof passed against published act2.7 in genuine
+private Docker (1 test, 1.20 seconds): no workflow/cache server was alive, an
+old imported archive expired, exactly 80 bytes and one deletion were reported,
+current archive bytes became zero, and a second pass reported no new reclamation.
+The legacy source hashes stayed unchanged and exact helper absence was verified.
+Independent review passed; strict service all-target Clippy passed (17.82 seconds).
+
+This is a callable bounded pass, not an enabled periodic supervisor. Shared
+machine policy/routing, durable helper creation/recovery, restart scheduling,
+old-peer exclusion and production enrollment remain required. The configuration
+guard stays. No expiry for other shared cache classes or sustained physical
+footprint ceiling is claimed by this proof.
+
+The actual nonzero transport path was then verified against published act2.7:
+a missing cohort returned a nonzero partial report with unknown byte totals,
+and Bosn retained that typed outcome. The expanded proof passed (0.96 seconds);
+strict all-target Clippy passed again (6.48 seconds). This closes command-exit
+handling for the tested missing-root case; it is not crash-supervisor coverage.

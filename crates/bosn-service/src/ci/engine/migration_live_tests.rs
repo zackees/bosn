@@ -44,6 +44,12 @@ fn published_binary_import_preserves_source_and_has_typed_historical_receipt() {
                 namespace: namespace.as_str().into(), nonce: nonce.clone(), max_bytes: 100, created_at: 1.0,
             }).map_err(|e| e.to_string())?;
             tx.commit().map_err(|e| e.to_string())?;
+            let missing = backend.maintain_cache_cohort(id, policy).await?;
+            if missing.exit_code == 0 || !missing.report.partial
+                || missing.report.remaining_completed_bytes.is_some()
+                || missing.require_complete().is_ok() {
+                return Err("missing cohort must preserve nonzero partial/unknown evidence".into());
+            }
             if backend.reconcile_cache_import_publication(&mut registry, id, &namespace, policy, 2.0).await.is_ok() {
                 return Err("missing receipt must leave publication unresolved".into());
             }
@@ -66,6 +72,26 @@ fn published_binary_import_preserves_source_and_has_typed_historical_receipt() {
             let parsed = PublicationReceipt::parse(receipt.as_bytes(), &namespace, policy)?;
             if parsed.imported_bytes != 80 {
                 return Err("unexpected historical receipt bytes".into());
+            }
+            // No workflow or cache HTTP server is alive. Expire old imported
+            // content through an independent bounded maintenance command.
+            let expiry: CachePolicy = toml::from_str("repository_max_bytes=100\naggregate_max_bytes=200\nmax_age_secs=1\nunused_age_secs=1\nmaintenance_interval_secs=1\n").map_err(|e| e.to_string())?;
+            let maintenance = backend.maintain_cache_cohort(id, expiry).await?;
+            maintenance.require_budget_met()?;
+            if maintenance.report.remaining_completed_bytes != Some(0) {
+                return Err("idle expired cohort archive was not removed".into());
+            }
+            let stores = maintenance.report.namespaces.as_ref().ok_or("maintenance namespace evidence missing")?;
+            let [store] = stores.as_slice() else { return Err("unexpected maintenance namespaces".into()); };
+            let eviction = store.retention.as_ref().ok_or("eviction evidence missing")?;
+            if eviction.reclaimed_archive_bytes != 80 || eviction.deleted_count != 1 || store.archive_bytes != Some(0) {
+                return Err("idle removal did not have exact archive evidence".into());
+            }
+            let repeated = backend.maintain_cache_cohort(id, expiry).await?;
+            repeated.require_budget_met()?;
+            if repeated.report.namespaces.as_ref().is_none_or(|stores| stores.iter().any(|store|
+                store.retention.as_ref().is_none_or(|report| report.reclaimed_archive_bytes != 0 || report.deleted_count != 0))) {
+                return Err("repeated maintenance counted reclamation twice".into());
             }
             let after = backend.checked("source after", owned(&["exec", id, "sh", "-ec", &snapshot]), super::super::CONTROL_DEADLINE).await?;
             if before != after {

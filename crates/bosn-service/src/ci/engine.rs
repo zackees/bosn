@@ -27,7 +27,9 @@ pub use cache_usage::HelperCleanupRetry;
 #[cfg(all(test, unix))]
 mod cache_usage_transport_tests;
 mod legacy_lease;
+mod maintenance;
 mod migration;
+pub use maintenance::MaintenanceAttempt;
 pub use migration::ImportAttempt;
 mod lines;
 mod runner_tools;

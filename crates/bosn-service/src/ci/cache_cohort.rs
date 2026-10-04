@@ -99,6 +99,16 @@ impl CachePolicy {
 
     /// Independent maintenance covers idle namespaces after all servers close.
     pub fn maintenance_args(self) -> Vec<String> {
+        let mut args = self.maintenance_pass_args();
+        args.extend([
+            "--watch".into(),
+            format!("{}s", self.maintenance_interval_secs),
+        ]);
+        args
+    }
+
+    /// One bounded pass for a supervisor; no workflow server is required.
+    pub fn maintenance_pass_args(self) -> Vec<String> {
         let mut args = vec![
             "cache".into(),
             "prune-cohort".into(),
@@ -107,8 +117,6 @@ impl CachePolicy {
             root(),
             "--max-bytes".into(),
             self.aggregate_max_bytes.to_string(),
-            "--watch".into(),
-            format!("{}s", self.maintenance_interval_secs),
         ];
         args.extend(self.namespace_policy_args());
         args
