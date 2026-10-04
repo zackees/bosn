@@ -2474,6 +2474,69 @@ is advisory: selection and subsequent explicit-ID engine admission can race with
 future retirement, so the production planner must coordinate the intent/reader
 handoff or refuse and replan; it cannot mount from this report alone. Full payload
 validation remains an unbenchmarked admission/update cost for the 7.7 GiB cache.
-Generation/object/stage expiry, physical inode accounting, production frozen
+Generation/object/stage expiry, machine-wide physical accounting, production frozen
 profile and recovery, actual job overlay mounts and quiescent completed-install
 publication, old image/container expiry and scoped builder pressure remain open.
+
+
+### Bounded tool-store inode accounting (act2 PR #34)
+
+Implementation: https://github.com/zackees/act2/pull/34, candidate
+`84511a0b61f6461af0487f65f30fc562846ee5ec` (unreleased). Linux API
+`AuditToolStoreUsage(ctx, root, maxEntries)` and command
+`act cache tool-usage --cache-server-path STORE --max-entries N` inventory a
+recognized existing store while holding its original catalog writer lock. Missing
+coordination is refused, never initialized as part of inventory. Participating
+publication and selection cannot mutate the store during this observation.
+
+The bounded metadata walk includes root directories, objects, generations,
+private stages, manifests, coordination files and unknown entries. It follows no
+symlink targets, refuses a different filesystem device, pages directory reads,
+limits entries to the caller's positive bound (at most one million), limits depth
+to 72 for store namespace prefixes, and has a 30-second context deadline. Payload
+publication retains its existing depth-64 limit. No payload contents are read or
+hashed by accounting.
+
+Typed results distinguish four totals:
+
+| Field | Meaning |
+| --- | --- |
+| `allocated_bytes` | Inode blocks times 512, once per device/inode; includes directory/control allocation |
+| `apparent_bytes` | Regular-file and symlink-text size, once per device/inode |
+| `unique_file_bytes` | Regular-file size, once per device/inode |
+| `referenced_file_bytes` | Regular-file size at every path, including hardlink references |
+
+All byte totals are null on an incomplete scan, cancellation, invalid bounds,
+missing coordination, crossing, or arithmetic failure. Observed entry/inode counts
+may describe a subset; they are not complete totals. Negative sizes and overflow
+are refused. The report includes observation time, device, partial status and a
+bounded diagnostic. CLI emits the typed partial report and exits with an error.
+
+Verified evidence:
+
+- A one-MiB immutable object referenced through two generations has four payload
+  paths sharing one inode; referenced minus unique regular-file bytes is three MiB.
+- Independent GNU `du` comparisons agree with both allocated and apparent totals,
+  including manifest/control allocation and excluding a five-MiB external symlink
+  target. The first apparent-size comparison failed because directory `st_size`
+  was included; the implementation was corrected before publication.
+- A sparse sixteen-MiB unknown file contributes its full apparent size and fewer
+  allocated bytes. Its inclusion establishes footprint, not deletion eligibility.
+- Entry exhaustion, cancellation, invalid bounds and missing catalog coordination
+  produce null totals. Command tests cover successful and partial JSON reports.
+- Exact-source gate compared all 2,564 exported files, bytes and modes before and
+  after complete artifactcache tests, focused tool commands, vet, zero lint findings,
+  and Darwin/Windows compilation. Gate passed in 21.03 seconds on tree
+  `ade0e002ad94645cdba030b74f4dadae4265e3d0`; independent read-only review passed.
+  Private evidence: `act2-tool-store-usage-source-bound-gate.json`/`.log`,
+  `act2-tool-store-usage-apparent-red.log`, and `act2-tool-store-usage-checks.log`.
+
+**Limits and next work:** This measures one tool store. It does not deduplicate
+inodes across separately scanned stores/classes, measure filesystem journal or
+Docker backing-store allocation, or impose a machine-wide quota. Nonparticipating
+writers can still invalidate a coordinated observation, so production cutover must
+exclude old writers. PR #34 is not released or activated in Bosn. Coordinated
+retirement must protect the selected generation and live readers, account before
+and after deletion, and preserve unknown/corrupt state. Generation/object/stage
+expiry, whole-machine accounting, old engine/image expiry and scoped builder
+pressure remain required. No shared object was deleted for this accounting slice.
