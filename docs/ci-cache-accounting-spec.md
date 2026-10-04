@@ -3652,3 +3652,38 @@ Bosn PR #507 is merged as `420c1ddbc889cacfc7f3f524129158f138cee871`.
 The verified act2.9 version/archive/executable pin and accumulated measurement
 spec are now on main. The native engine integration branch was rebased onto that
 exact main commit; its production lifetime activation is still incomplete.
+
+### Recovery reservation publication and older-peer fence (candidate, 2026-10-04)
+
+`PublishToolRecoveryPin` now publishes a typed reservation after full generation
+validation under its original reader. Payload validation releases the catalog;
+publication reacquires it and re-reads reference state. The owner record is
+immutable: identical retry reuses it, differing generation/time intent is refused.
+Publication stages are tracked by the existing original-inode ownership ledger.
+A synced file is linked atomically without replacement, then the reference
+namespace is synced. Partial outcomes never prove absence. An injected final
+parent-sync failure reports published-but-partial; retry reconciles and syncs it.
+
+Before acknowledging a reservation, the same catalog writer changes the store
+marker to `bosn-tool-snapshots-v2`. The new runtime accepts both epochs; released
+act2.9 validates only v1 under that original lock and refuses the fenced store.
+Only marker metadata changes: warm selection, objects, generations and original
+catalog/reader inodes remain intact. Fence stages also use the owned stage ledger.
+A failed fence or reference acknowledgement requires reconciliation; it does not
+authorize stopping source writers. Existing legacy stores are not silently
+upgraded by ordinary access or initialized as empty during refusal.
+
+An actual released act2.9 binary admitted a private store before reservation and
+refused it afterward (`invalid tool store marker`). The candidate retained the
+same warm generation and both original coordination inodes. Evidence:
+`.git/retention-native-recovery-pin-fence-probe.json`. Its small fixture remains
+only in the private Go container. No shared machine store was changed.
+
+Focused retention/publication/snapshot race tests passed in 1.486 seconds.
+Tests cover immutable retry, uncertain parent sync and validation that releases
+the catalog while retaining the original generation reader. Evidence:
+`.git/retention-native-recovery-pin-publication-{red,green,race,fence-tests}.log`.
+The API initially failed to compile because it was absent, then passed. Full
+package/lint/platform/release gates and review remain pending. Verified release,
+expired-record cleanup, CLI integration and Bosn's publication/source-volume
+lifecycle still require implementation; normal planning remains unactivated.
