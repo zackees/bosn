@@ -9,7 +9,7 @@ fn stalled_maintenance_client_does_not_delay_runtime_shutdown() {
     let script = directory.path().join("docker.py");
     std::fs::write(
         &script,
-        "import os, pathlib, sys, time\nassert 'prune-cohort' in sys.argv\npathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\ntime.sleep(12)\nsys.exit(1)\n",
+        "import os, pathlib, sys, time\nassert 'prune-cohort' in sys.argv\nmarker=pathlib.Path(sys.argv[1]); pending=marker.with_suffix('.pending')\npending.write_text(str(os.getpid()))\npending.replace(marker)\ntime.sleep(12)\nsys.exit(1)\n",
     )
     .unwrap();
     let backend = DockerActBackend::new(bosn_engine::DockerEngine::synthetic_for_test(
@@ -50,13 +50,18 @@ fn stalled_maintenance_client_does_not_delay_runtime_shutdown() {
         latency < Duration::from_secs(5),
         "shutdown took {latency:?}"
     );
+    // The fixture publishes a complete PID before cancellation can observe it.
+    // Session drop notifies the background process actor. Observe completed
+    // reaping within the same shutdown budget instead of racing that notification.
+    let remaining = Duration::from_secs(5).saturating_sub(latency);
     let pid = std::fs::read_to_string(marker).unwrap();
     let absent = kernal_api::run_bounded_command(
         kernal_api::SpawnSpec::new("python3")
             .arg("-c")
-            .arg("import os, sys\ntry: os.kill(int(sys.argv[1]), 0)\nexcept ProcessLookupError: sys.exit(0)\nsys.exit(1)")
-            .arg(pid),
-        Duration::from_secs(2),
+            .arg("import os, sys, time\npid=int(sys.argv[1]); deadline=time.monotonic()+float(sys.argv[2])\nwhile True:\n try: os.kill(pid,0)\n except ProcessLookupError: sys.exit(0)\n if time.monotonic()>=deadline: sys.exit(1)\n time.sleep(.005)")
+            .arg(pid)
+            .arg(remaining.as_secs_f64().to_string()),
+        remaining + Duration::from_secs(1),
         1024,
     )
     .unwrap();
@@ -64,5 +69,10 @@ fn stalled_maintenance_client_does_not_delay_runtime_shutdown() {
         absent.exit.raw_code(),
         0,
         "owned maintenance client survived"
+    );
+    let completed = cancelled_at.lock().unwrap().unwrap().elapsed();
+    assert!(
+        completed < Duration::from_secs(5),
+        "owned-client reaping exceeded shutdown budget: {completed:?}"
     );
 }
