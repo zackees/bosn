@@ -3778,3 +3778,22 @@ creation on the private container's read-only root; this is retained in
 `.git/retention-native-recovery-pin-refactored-full-tests.log`. A separate CLI
 race run uses an explicit private writable XDG cache directory, without changing
 production code or tests. Its result and the existing primary review are pending.
+
+The existing sole primary reviewer completed all 18 changed Go files at
+`802f5ab` with no blocking findings. Publication retains the original reader
+across validation outside catalog exclusion; fencing and immutable publication
+follow catalog reacquisition. Release continues to require durable caller
+completion and exclusion of republishing. Review does not prove Bosn enrollment.
+
+Windows amd64 and Darwin amd64/arm64 builds of the changed CLI/artifact-cache
+packages passed with CGO disabled:
+`.git/retention-native-recovery-pin-platform-builds.log` (terminal exit zero).
+These are compile checks, not native platform execution or full release CI.
+The complete CLI suite still fails in this private environment: default archive
+server setup uses the read-only home cache even with a writable XDG action cache.
+An isolated daemon resolved the earlier missing-socket error, without using the
+host Docker socket. Failure evidence remains in
+`.git/retention-native-recovery-pin-refactored-cmd-isolated-tests.log`.
+Focused recovery CLI tests passed; the full CLI package is not claimed green.
+Full remote CI must establish the release candidate gate in its normal test
+fixture before any release. No tests or assertions were weakened.
