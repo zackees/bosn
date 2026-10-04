@@ -929,3 +929,21 @@ hardlink fallback to full copying. This demonstrates reuse plus a remaining
 copy cost; it is not sustained convergence or a machine-wide physical cap.
 Bounded raw observations and gate receipts remain in task-owned Git metadata
 and logs. A draft PR body records scope and gaps, but push awaits a valid gate.
+
+### Cleanup deadline diagnosis
+
+Release tag v0.1.12 resolves to `08c7c8cdb262b980d56fd9fccbe9b6156fc6ec82`.
+Its exact engine deletion uses the generic 30-second `docker_control` helper.
+The candidate retains that per-command bound despite the 180-second outer
+lifecycle budget: increasing the outer budget alone cannot extend deletion.
+Candidate named-volume deletion likewise uses a 10-second storage-control
+bound. The successful workflow followed by cleanup timeout and later engine
+absence therefore exposes a concrete remaining deletion-budget gap, including
+possible delayed completion after a caller timeout.
+
+Next correction must distinguish short observation/create control operations
+from potentially slower exact authorized deletion, account for all reserved
+commands in startup and online budgets, and test a delayed removal that exceeds
+the old bound. Timeout still leaves durable pending state; only exact container
+and storage absence may finalize retirement. The existing named-storage/online
+retry changes do not by themselves prove this deadline failure resolved.
