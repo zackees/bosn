@@ -517,9 +517,15 @@ pub async fn run_on_engine(
             Ok(ExecEnd::Cancelled) => ExecutionEnd::Cancelled,
             Err(error) => ExecutionEnd::EngineFailed(error),
         };
-        // Keep the run's tool-cache installs while the claim still holds.
-        if held.verify().await.is_ok() {
-            save_toolcache(backend, held.engine(), observer, &mut laps).await;
+        // A stopped launching client on cancellation/timeout does not prove
+        // remote workflow writers have stopped. Preserve the previous warm
+        // machine cache instead of copying from an uncertain live source.
+        if matches!(&end, ExecutionEnd::Exited(_)) {
+            if held.verify().await.is_ok() {
+                save_toolcache(backend, held.engine(), observer, &mut laps).await;
+            }
+        } else {
+            observer.note("tool cache not saved: workflow writers are not proven stopped");
         }
         if let Err(error) = commit(
             registry,

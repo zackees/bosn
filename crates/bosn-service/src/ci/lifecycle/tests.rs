@@ -370,6 +370,11 @@ fn every_fault_point_ends_terminal_or_cleanup_required() {
                 terminal(&record(&registry, &dir, &run).await, outcome);
             }
             assert_ne!(report.execution, ExecutionEnd::Exited(0));
+            assert_eq!(
+                *backend.saved_while_live.lock().unwrap(),
+                0,
+                "uncertain execution must not publish shared tools: case {i}"
+            );
             assert_eq!(backend.live(), 0, "case {i}");
         }
     });
@@ -386,7 +391,11 @@ fn cancellation_mid_run_is_cancelled_and_cleaned() {
         let token = source.token();
         let run = run_id(20);
         let canceller = async {
-            async_engine::sleep(Duration::from_millis(100)).await;
+            let started = async_engine::Deadline::after(Duration::from_secs(5));
+            while *backend.executions.lock().unwrap() == 0 {
+                assert!(!started.is_elapsed(), "workflow never reached execution");
+                async_engine::sleep(Duration::from_millis(10)).await;
+            }
             source.cancel();
         };
         let (report, ()) = async_engine::join(
@@ -401,6 +410,11 @@ fn cancellation_mid_run_is_cancelled_and_cleaned() {
         )
         .await;
         assert_eq!(report.execution, ExecutionEnd::Cancelled);
+        assert_eq!(
+            *backend.saved_while_live.lock().unwrap(),
+            0,
+            "cancelled launching client does not prove tool writers quiescent"
+        );
         assert_eq!(report.cleanup, CleanupEnd::Removed);
         terminal(
             &record(&registry, &dir, &run).await,
