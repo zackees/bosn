@@ -1444,3 +1444,45 @@ scheduling remain unfinished. Production enrollment remains guarded.
 
 Strict registry/service all-target Clippy passed (20.89 seconds), after moving
 the new test module to the end of its file to satisfy the existing lint gate.
+
+### Bounded durable maintenance helper (2026-10-04 candidate)
+
+`maintain_cache_with_helper` now drives one independent pass through an owned
+helper. It verifies the existing shared volume, commits a maintenance intent
+before create and registers the immutable ID before start. It rechecks the
+volume and helper profile before executing. The helper has no network, no
+capabilities, a read-only root, 128 MiB memory and one CPU; its writable private
+executable tmpfs is limited to 64 MiB. A finite 300-second lifetime with Docker
+auto-removal bounds abandoned execution after start. A never-started create
+still requires durable journal recovery; no auto-removal claim applies to it.
+
+Act installs offline from the machine archive under its artifact lock, verifying
+both archive and extracted binary digests and the version. There is no download
+fallback in this helper. An absent or corrupt archive is a visible error rather
+than permission to discard cached data. The normal workflow installer and this
+helper share one archive-path builder. The callable pass does not bootstrap a
+missing archive; supervised scheduling must address that explicitly.
+
+The returned helper result separates maintenance outcome from cleanup outcome.
+Cleanup re-verifies ownership before exact-ID removal and requires explicit
+absence plus durable journal completion. An acknowledged ID that has already
+auto-removed can finish after explicit absence. An unacknowledged create remains
+pending when its outcome cannot be observed. Existing online/restart helper
+recovery understands the new role. The named shared volume is preserved.
+
+The actual published act2.7 pass succeeded in genuine private Docker (1.09
+seconds): complete typed maintenance evidence, zero expired fixture bytes under
+a long-age policy, exact helper absence, journal Removed state, and preserved
+owned shared cache. Independent review passed. The real lost-create-acknowledgement and temporary inspection-outage proof
+also passed (0.78 seconds): a fresh backend recovered the pending intent,
+verified and removed its exact container, committed Removed and successfully
+measured the preserved shared volume afterward.
+
+This is bounded orchestration, not an enabled periodic/restart scheduler.
+Production policy consensus, legacy-peer exclusion and repository enrollment
+remain incomplete and guarded. Image/build-cache pressure and expiry for other
+shared cache classes remain open; logical archive retention does not prove
+physical machine footprint convergence.
+
+Strict service all-target Clippy passed (18.52 seconds), after extracting the
+Docker creation profile to satisfy the existing function-length gate.

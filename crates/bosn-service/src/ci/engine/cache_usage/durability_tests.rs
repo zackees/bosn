@@ -175,6 +175,16 @@ fn a_foreign_labelled_helper_is_preserved_with_its_pending_intent() {
 #[test]
 #[ignore = "requires the isolated bosn-456-live-v2 Docker engine"]
 fn real_orphaned_helper_is_recovered_from_its_durable_intent_by_a_new_backend() {
+    real_orphaned_helper(false);
+}
+
+#[test]
+#[ignore = "requires the isolated bosn-456-live-v2 Docker engine"]
+fn real_orphaned_maintenance_helper_recovers_after_lost_create_acknowledgement() {
+    real_orphaned_helper(true);
+}
+
+fn real_orphaned_helper(maintenance: bool) {
     assert_eq!(
         std::env::var("DOCKER_HOST").unwrap(),
         "tcp://bosn-456-live-v2-engine:2375"
@@ -206,10 +216,20 @@ exec /usr/local/bin/docker "$@"
                 dir.path().as_os_str().to_owned(),
             ],
         ));
-        let error = original
-            .measure_cache_tracked(super::super::CACHE_VOLUME, Some((&registry, OWNER)))
-            .await
-            .unwrap_err();
+        let error = if maintenance {
+            let policy = toml::from_str(
+                "repository_max_bytes=1073741824\naggregate_max_bytes=2147483648\nmax_age_secs=2592000\nunused_age_secs=604800\nmaintenance_interval_secs=300\n",
+            ).unwrap();
+            original
+                .maintain_cache_with_helper(&registry, OWNER, policy)
+                .await
+                .unwrap_err()
+        } else {
+            original
+                .measure_cache_tracked(super::super::CACHE_VOLUME, Some((&registry, OWNER)))
+                .await
+                .unwrap_err()
+        };
         assert!(error.contains("needs cleanup"), "{error}");
         let page = registry
             .act_registry(crate::act_registry::ActRegistryCommand::HelperPending {
@@ -234,6 +254,7 @@ exec /usr/local/bin/docker "$@"
         let reader = Registry::open_read_only(state.join("registry.sqlite3")).unwrap();
         let record = reader.cache_helper(&nonce).unwrap().unwrap();
         assert_eq!(record.state, CacheHelperState::Removed);
+        assert_eq!(record.intent.role.is_some(), maintenance);
         assert_eq!(record.container_id.as_deref(), Some(created_id.trim()));
         let sample = restarted
             .measure_cache_tracked(super::super::CACHE_VOLUME, Some((&registry, OWNER)))

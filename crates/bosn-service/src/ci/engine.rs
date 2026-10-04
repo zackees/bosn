@@ -28,8 +28,10 @@ pub use cache_usage::HelperCleanupRetry;
 mod cache_usage_transport_tests;
 mod legacy_lease;
 mod maintenance;
+mod maintenance_helper;
 mod migration;
 pub use maintenance::MaintenanceAttempt;
+pub use maintenance_helper::MaintenanceHelperAttempt;
 pub use migration::ImportAttempt;
 mod lines;
 mod runner_tools;
@@ -863,7 +865,7 @@ fn work_dirs_script() -> String {
 /// missing or corrupt tarball from the pinned URL; prints `act --version`.
 fn install_act_script(act: ActArtifact) -> String {
     format!(
-        "tgz={ENGINE_CACHE}/tools/act-{ACT_VERSION}-{sum}.tgz; mkdir -p {ENGINE_CACHE}/tools; \
+        "tgz={archive}; mkdir -p {ENGINE_CACHE}/tools; \
          exec 9>>\"$tgz.lock\"; flock -x 9; \
          if ! echo \"{sum}  $tgz\" | sha256sum -c - >/dev/null 2>&1; then \
            stage=$(mktemp \"$tgz.XXXXXXXX\"); trap 'rm -f \"$stage\"' EXIT; \
@@ -876,7 +878,12 @@ fn install_act_script(act: ActArtifact) -> String {
         url = act.url,
         sum = act.sha256,
         binary = act.binary_sha256,
+        archive = act_archive(act),
     )
+}
+
+fn act_archive(act: ActArtifact) -> String {
+    format!("{ENGINE_CACHE}/tools/act-{ACT_VERSION}-{}.tgz", act.sha256)
 }
 
 /// The runner image tar in the cache volume.
