@@ -1675,3 +1675,46 @@ zero failed, 15 ignored, 35.70 seconds. Production run deadlines are unchanged.
 This is evidence of load-dependent test observation, not a proof of production
 latency. The exact-source promotion gate still needs a successful replay; its
 Linux lane did not run in either failed attempt.
+
+The third gate (`6dbc5fe7-c19e-472e-b7b6-ac1e32f48ac8`, cleanup Removed,
+481 seconds) passed format, Clippy, boundary checks and the service suite,
+including the corrected burst test. It then failed an embedded Python fixture:
+two setup submissions exceeded its 250-millisecond timing assertion
+(`crates/bosn-python/src/tests.rs:494`). The failure needs investigation before
+the next replay. No successful promotion or Linux-lane coverage is claimed.
+
+Private-Docker investigation found that fixture's timer included spawning its
+Python thread and attaching to the interpreter before either submission call.
+An instrumented isolated sample measured the two API calls at 10.40 milliseconds
+and passed; this does not identify the precise timing of the failed gate sample.
+The fixture now measures the API calls after attachment, retaining their
+250-millisecond bound and the isolated process's ten-second outer deadline.
+Coalescing, raw-log and cancellation assertions remain. This test adjustment
+does not alter production behavior or establish end-to-end startup latency.
+All seven embedded Python tests passed in private Docker (0.85 seconds), and
+independent review passed for the measurement adjustment.
+Python all-target Clippy with embedded-test features also passed (57.62 seconds).
+
+### Cancellation at the Docker create acknowledgement boundary
+
+A follow-up private-Docker proof cancels the actual maintenance helper future
+after Docker creates its container but before the client returns the immutable
+ID. The durable intent remains Pending without an acknowledged container ID,
+and cancellation releases the backend's active-helper guard. A fresh backend
+recovers the exact helper from its frozen labels/profile, commits Removed,
+confirms the immutable ID absent, and measures the shared cache successfully.
+The first version of this proof passed in 60.21 seconds. Its wrapper deliberately
+withholds the acknowledgement for 60 seconds; that total includes runtime
+shutdown waiting for the outstanding command. It does not establish prompt
+command cancellation or prompt daemon shutdown. The expanded proof separately
+bounds maintenance-future cancellation return to five seconds and checks the
+unacknowledged journal shape and explicit immutable-ID absence. That expanded
+proof passed (one test, 63.29 seconds): maintenance-future cancellation returned
+in 72.197 microseconds. The deliberate client command still delayed fixture
+shutdown, so prompt daemon shutdown during an outstanding Docker command remains
+unverified. Production startup wiring remains open.
+
+Final service all-target Clippy passed (61.42 seconds) after splitting the
+proof's cancellation operation from its recovery fixture. Independent review
+passed for the proof and that extraction. The verified follow-up is now included
+in the next promotion candidate; the exact-source gate has not passed.

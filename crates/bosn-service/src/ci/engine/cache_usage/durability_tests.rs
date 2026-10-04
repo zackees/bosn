@@ -175,16 +175,22 @@ fn a_foreign_labelled_helper_is_preserved_with_its_pending_intent() {
 #[test]
 #[ignore = "requires the isolated bosn-456-live-v2 Docker engine"]
 fn real_orphaned_helper_is_recovered_from_its_durable_intent_by_a_new_backend() {
-    real_orphaned_helper(false);
+    real_orphaned_helper(false, false);
 }
 
 #[test]
 #[ignore = "requires the isolated bosn-456-live-v2 Docker engine"]
 fn real_orphaned_maintenance_helper_recovers_after_lost_create_acknowledgement() {
-    real_orphaned_helper(true);
+    real_orphaned_helper(true, false);
 }
 
-fn real_orphaned_helper(maintenance: bool) {
+#[test]
+#[ignore = "requires the isolated bosn-456-live-v2 Docker engine"]
+fn cancelled_maintenance_create_recovers_from_durable_intent_without_acknowledgement() {
+    real_orphaned_helper(true, true);
+}
+
+fn real_orphaned_helper(maintenance: bool, cancel_create: bool) {
     assert_eq!(
         std::env::var("DOCKER_HOST").unwrap(),
         "tcp://bosn-456-live-v2-engine:2375"
@@ -198,6 +204,7 @@ base=$1
 shift
 if [ "$1" = create ]; then
   /usr/local/bin/docker "$@" > "$base/created-id" || exit
+  if [ -f "$base/cancel-create" ]; then sleep 60; fi
   echo 'simulated lost create acknowledgement' >&2
   exit 1
 fi
@@ -209,6 +216,9 @@ exec /usr/local/bin/docker "$@"
 "#,
         )
         .unwrap();
+        if cancel_create {
+            std::fs::write(dir.path().join("cancel-create"), "").unwrap();
+        }
         let original = DockerActBackend::new(bosn_engine::DockerEngine::synthetic_for_test(
             "sh",
             [
@@ -220,10 +230,14 @@ exec /usr/local/bin/docker "$@"
             let policy = toml::from_str(
                 "repository_max_bytes=1073741824\naggregate_max_bytes=2147483648\nmax_age_secs=2592000\nunused_age_secs=604800\nmaintenance_interval_secs=300\n",
             ).unwrap();
-            original
-                .maintain_cache_with_helper(&registry, OWNER, policy)
-                .await
-                .unwrap_err()
+            if cancel_create {
+                cancel_created_helper(&original, &registry, policy, dir.path()).await
+            } else {
+                original
+                    .maintain_cache_with_helper(&registry, OWNER, policy)
+                    .await
+                    .unwrap_err()
+            }
         } else {
             original
                 .measure_cache_tracked(super::super::CACHE_VOLUME, Some((&registry, OWNER)))
@@ -243,6 +257,10 @@ exec /usr/local/bin/docker "$@"
         };
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].state, CacheHelperState::Pending);
+        if cancel_create {
+            assert!(page.items[0].container_id.is_none());
+            assert!(original.active_helpers.lock().unwrap().is_empty());
+        }
         let nonce = page.items[0].intent.nonce.clone();
         let created_id = std::fs::read_to_string(dir.path().join("created-id")).unwrap();
         let restarted = DockerActBackend::new(bosn_engine::DockerEngine::docker());
@@ -256,6 +274,10 @@ exec /usr/local/bin/docker "$@"
         assert_eq!(record.state, CacheHelperState::Removed);
         assert_eq!(record.intent.role.is_some(), maintenance);
         assert_eq!(record.container_id.as_deref(), Some(created_id.trim()));
+        restarted
+            .confirm_measurement_absent(created_id.trim())
+            .await
+            .unwrap();
         let sample = restarted
             .measure_cache_tracked(super::super::CACHE_VOLUME, Some((&registry, OWNER)))
             .await
@@ -263,4 +285,42 @@ exec /usr/local/bin/docker "$@"
         assert!(!sample.partial, "{:?}", sample.errors);
         assert!(sample.allocated_bytes.is_some_and(|bytes| bytes > 0));
     });
+}
+
+async fn cancel_created_helper(
+    original: &DockerActBackend,
+    registry: &crate::RegistryActor,
+    policy: crate::ci::cache_policy::CachePolicy,
+    directory: &std::path::Path,
+) -> String {
+    let stop = kernal_api::async_engine::CancellationSource::new();
+    let cancelled_at = std::sync::Mutex::new(None);
+    let token = stop.token();
+    let attempt = kernal_api::async_engine::cancellable(
+        &token,
+        original.maintain_cache_with_helper(registry, OWNER, policy),
+    );
+    let observer = async {
+        let created =
+            kernal_api::async_engine::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    if std::fs::read_to_string(directory.join("created-id"))
+                        .is_ok_and(|id| id.trim().len() == 64)
+                    {
+                        break;
+                    }
+                    kernal_api::async_engine::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+        *cancelled_at.lock().unwrap() = Some(std::time::Instant::now());
+        stop.cancel();
+        created.expect("real Docker creation must precede cancellation");
+    };
+    let (result, ()) = kernal_api::async_engine::join(attempt, observer).await;
+    assert!(result.is_err(), "create acknowledgement must not arrive");
+    let latency = cancelled_at.lock().unwrap().unwrap().elapsed();
+    assert!(latency < std::time::Duration::from_secs(5), "{latency:?}");
+    eprintln!("cancelled create returned in {latency:?}");
+    "cancelled create needs cleanup".to_string()
 }
