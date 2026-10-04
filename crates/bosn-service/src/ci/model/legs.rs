@@ -108,6 +108,9 @@ impl RunTree {
             conclusion: None,
             reason: None,
             sections: Vec::new(),
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
         };
         if let Some((g, j)) = self.placeholder(key, job_id, identity.and_then(|i| i.first())) {
             let declared = &self.groups[g].jobs[j];
