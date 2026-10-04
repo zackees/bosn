@@ -88,6 +88,7 @@ pub enum ActRegistryCommand {
         limit: usize,
     },
     MaintenanceRecord(bosn_registry::cache_maintenance::MaintenanceSnapshot),
+    MaintenanceLatest,
     HelperBegin(bosn_registry::cache_helper::CacheHelperIntent),
     HelperRegister {
         nonce: String,
@@ -117,6 +118,7 @@ pub enum ActRegistryReply {
     Recovery(ActEngineRecoveryPage),
     Helpers(bosn_registry::cache_helper::CacheHelperPage),
     Record(Option<Box<ActEngineRecord>>),
+    Maintenance(Option<bosn_registry::cache_maintenance::MaintenanceSnapshot>),
 }
 
 impl RegistryActor {
@@ -210,6 +212,11 @@ pub(crate) fn apply(
         return registry
             .act_engine(&run)
             .map(|record| ActRegistryReply::Record(record.map(Box::new)));
+    }
+    if matches!(command, ActRegistryCommand::MaintenanceLatest) {
+        return registry
+            .latest_cache_maintenance()
+            .map(ActRegistryReply::Maintenance);
     }
     let mut transaction = registry.begin_immediate()?;
     let reply = match command {
@@ -307,6 +314,7 @@ pub(crate) fn apply(
             ActRegistryReply::Committed
         }
         ActRegistryCommand::Pending { .. }
+        | ActRegistryCommand::MaintenanceLatest
         | ActRegistryCommand::Get { .. }
         | ActRegistryCommand::HelperPending { .. }
         | ActRegistryCommand::StartupInterrupt { .. }

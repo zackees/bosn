@@ -443,6 +443,16 @@ fn python_client_submits_and_cancels_coalesced_fake_setup_ensure_without_docker(
         return;
     }
     Python::initialize();
+    // This timing fixture measures asynchronous admission, which also awaits
+    // the SQLite audit commit. Linux overlay fsync latency is machine-load
+    // dependent; use memory-backed storage for the protocol timing check.
+    #[cfg(target_os = "linux")]
+    let temporary = kernal_api::platform::fs::TemporaryDirectory::in_directory(
+        std::path::Path::new("/dev/shm"),
+        "bosn-python-ensure-",
+    )
+    .unwrap();
+    #[cfg(not(target_os = "linux"))]
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let state = temporary.path().join("state");
     let workspace = temporary.path().join("workspace");

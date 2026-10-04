@@ -171,13 +171,17 @@ pub struct CancelReply {
     pub state: RunState,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RunnersReply {
     pub runners: RunnerStatus,
     pub pruned_runs: Option<Vec<String>>,
     /// Set by `cache_usage` and `clear_cache`.
     #[serde(default)]
     pub cache: Option<CacheUsage>,
+    /// Latest local registry evidence, requested with cache usage; not current
+    /// inventory, cumulative reclamation or a physical footprint guarantee.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<super::maintenance_status::MaintenanceStatus>,
 }
 
 /// The machine-wide cache volume (act tools, runner image, action

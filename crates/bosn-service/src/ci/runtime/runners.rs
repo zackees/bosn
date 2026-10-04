@@ -6,6 +6,23 @@ use super::*;
 impl CiRuntime {
     pub(super) async fn runners(&self, action: RunnerAction) -> Result<RunnersReply, CiError> {
         let (mut pruned, mut cache) = (None, None);
+        let maintenance = if matches!(action, RunnerAction::CacheUsage) {
+            use super::super::maintenance_status::MaintenanceStatus;
+            use crate::act_registry::{ActRegistryCommand, ActRegistryReply};
+            Some(
+                match self
+                    .registry
+                    .act_registry(ActRegistryCommand::MaintenanceLatest)
+                    .await
+                {
+                    Ok(ActRegistryReply::Maintenance(Some(snapshot))) => snapshot.into(),
+                    Ok(ActRegistryReply::Maintenance(None)) => MaintenanceStatus::NeverObserved,
+                    _ => MaintenanceStatus::Unavailable,
+                },
+            )
+        } else {
+            None
+        };
         match &action {
             RunnerAction::PruneCache {
                 older_than_secs,
@@ -48,6 +65,7 @@ impl CiRuntime {
             runners: status,
             pruned_runs: pruned,
             cache,
+            maintenance,
         })
     }
 

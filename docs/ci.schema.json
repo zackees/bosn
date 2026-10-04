@@ -834,6 +834,135 @@
       ],
       "type": "object"
     },
+    "MaintenanceResult": {
+      "oneOf": [
+        {
+          "properties": {
+            "status": {
+              "const": "unknown",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "budget_bytes": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "budget_met": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "exit_code": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "partial": {
+              "type": "boolean"
+            },
+            "protected_bytes": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "reclaimed_archive_bytes": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "remaining_completed_bytes": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "status": {
+              "const": "observed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "exit_code",
+            "partial",
+            "budget_bytes"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "MaintenanceStatus": {
+      "oneOf": [
+        {
+          "properties": {
+            "status": {
+              "const": "never_observed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "status": {
+              "const": "unavailable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "cleanup_failed": {
+              "type": "boolean"
+            },
+            "observed_at": {
+              "format": "double",
+              "type": "number"
+            },
+            "outcome": {
+              "$ref": "#/$defs/MaintenanceResult"
+            },
+            "recovery_failed": {
+              "type": "boolean"
+            },
+            "status": {
+              "const": "recorded",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "observed_at",
+            "recovery_failed",
+            "cleanup_failed",
+            "outcome"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "Mode": {
       "description": "How much of the CI to run (fleet `ci-test`/`ci-full` tiers).",
       "enum": [
@@ -1593,6 +1722,17 @@
           ],
           "default": null,
           "description": "Set by `cache_usage` and `clear_cache`."
+        },
+        "maintenance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MaintenanceStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Latest local registry evidence, requested with cache usage; not current\ninventory, cumulative reclamation or a physical footprint guarantee."
         },
         "pruned_runs": {
           "items": {

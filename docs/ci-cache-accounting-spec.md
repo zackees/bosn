@@ -1695,6 +1695,30 @@ All seven embedded Python tests passed in private Docker (0.85 seconds), and
 independent review passed for the measurement adjustment.
 Python all-target Clippy with embedded-test features also passed (57.62 seconds).
 
+The fourth exact-source gate (`5847ae1f-0d10-4e5d-b415-854a9b043cce`,
+375 seconds, cleanup Removed) again passed the service suite but failed the
+embedded Python submission assertion: the two calls themselves took 410.23 ms.
+Excluding interpreter attachment did not resolve the gate failure. Submission
+latency and the fixture's actual asynchronous-admission contract need further
+investigation; no successful promotion or Linux-lane receipt is claimed.
+
+The current-thread runtime experiment did not resolve the failure (private
+fixture measured 254.86 ms) and was reverted. Code inspection shows setup-ensure
+awaits a durable SQLite submission audit before acknowledgement, unlike the
+other fake submission cases. Eight WAL/FULL commit samples in the genuine Docker
+harness took 292.66–605.72 ms on `/tmp` disk storage and 0.014–0.040 ms on
+`/dev/shm`. These samples demonstrate that storage latency alone can exceed the
+fixture's 250 ms bound; they do not attribute every millisecond of the failed
+gate sample. The Linux protocol timing fixture now owns a RAM-backed temporary
+directory, retaining the SQLite audit, 250 ms API check, coalescing and subsequent
+log/cancellation assertions. Other platforms retain their original temporary
+storage. Disk-backed production acknowledgement latency remains unbounded by
+this timing proof; ordinary durable registry and service tests are unchanged.
+All seven embedded Python tests passed with this fixture (0.33 seconds), and
+independent review passed. The exact-source promotion replay is still required.
+Embedded-feature Python all-target Clippy passed (44.81 seconds), and Rust
+format checks passed for the integrated status reporting and timing fixture.
+
 ### Cancellation at the Docker create acknowledgement boundary
 
 A follow-up private-Docker proof cancels the actual maintenance helper future
@@ -1718,3 +1742,28 @@ Final service all-target Clippy passed (61.42 seconds) after splitting the
 proof's cancellation operation from its recovery fixture. Independent review
 passed for the proof and that extraction. The verified follow-up is now included
 in the next promotion candidate; the exact-source gate has not passed.
+
+### Maintenance evidence in cache accounting (follow-up candidate)
+
+`bosn runners cache` now requests the fixed latest-maintenance row through the
+trusted registry actor's read path, without entering a write transaction. Its
+typed reply distinguishes no recorded pass, unavailable registry evidence and
+a recorded unknown or observed outcome. The CLI prints the last observation's
+Unix timestamp, inventory completeness, command exit code, logical archive
+budget result and reclaimed archive bytes; unknown totals stay unknown. Helper
+recovery and cleanup failures remain separate. Raw helper diagnostics, nonce
+and immutable container ID are omitted from this public summary.
+
+This is the latest evidence in the queried daemon's registry, not a current
+machine-wide inventory, cross-registry aggregate, active-supervisor indicator,
+cumulative reclamation counter or physical disk convergence guarantee. An old
+daemon's reply omitting this optional field still decodes. Default production
+planning still uses warm legacy caches and rejects configured retention; this
+read-only visibility change does not enroll a repository or start maintenance.
+
+Focused private-Docker maintenance tests passed (seven tests, five explicitly
+ignored live prerequisites, 4.43 seconds), including unknown diagnostic
+redaction and partial/protected-over-budget evidence with unknown reclamation
+and failed cleanup. The published typed JSON Schema was regenerated and its
+equality test passed. All-target service Clippy passed (31.05 seconds), and
+independent review passed for the Rust, JSON Schema and documentation changes.
