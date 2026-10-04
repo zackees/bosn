@@ -56,6 +56,9 @@ pub struct ActEngineCreationProfile {
     /// Absent in historical profiles; their serialized identity stays unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_coordination: Option<ActCacheCoordination>,
+    /// Exact immutable tool generation admitted by the engine startup process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_generation: Option<ActToolGenerationBinding>,
 }
 /// A frozen named-volume mount: Docker's `local` driver, read-write, at
 /// `target`. The volume's ownership is verified before creation and the
@@ -104,8 +107,33 @@ impl ActEngineCacheVolume {
         Ok(())
     }
 }
+/// Frozen native reader policy. Store location is producer-defined, not a path
+/// supplied by the client. Omitted bindings preserve historical profile bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActToolGenerationBinding {
+    pub id: String,
+    pub max_payload_bytes: u64,
+}
+impl ActToolGenerationBinding {
+    pub fn validate(&self) -> Result<(), Error> {
+        if !hex(&self.id, 64)
+            || self.max_payload_bytes == 0
+            || self.max_payload_bytes > i64::MAX as u64
+        {
+            return Err(Error::BadRow("act tool generation binding"));
+        }
+        Ok(())
+    }
+}
 impl ActEngineCreationProfile {
     pub fn validate(&self) -> Result<(), Error> {
+        if let Some(generation) = &self.tool_generation {
+            generation.validate()?;
+            if self.cache_volume.is_none() || self.cache_coordination.is_none() {
+                return Err(Error::BadRow("tool generation without coordinated cache"));
+            }
+        }
         if self.cache_coordination.is_some() && self.cache_volume.is_none() {
             return Err(Error::BadRow("cache coordination without shared cache"));
         }

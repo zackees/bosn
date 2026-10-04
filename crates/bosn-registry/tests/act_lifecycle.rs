@@ -16,6 +16,7 @@ fn profile() -> ActEngineCreationProfile {
         init_command_sha256: "a".repeat(64),
         cache_volume: None,
         cache_coordination: None,
+        tool_generation: None,
     }
 }
 fn intent() -> ActEngineIntent {

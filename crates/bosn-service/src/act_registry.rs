@@ -362,6 +362,7 @@ mod tests {
                 init_command_sha256: "a".repeat(64),
                 cache_volume: None,
                 cache_coordination: None,
+                tool_generation: None,
             }),
         };
         let runtime = kernal_api::async_engine::RuntimeBuilder::multi_thread()
@@ -496,6 +497,7 @@ mod tests {
                 init_command_sha256: "a".repeat(64),
                 cache_volume: None,
                 cache_coordination: None,
+                tool_generation: None,
             }),
         }
     }

@@ -3504,3 +3504,32 @@ and `docker-init` chain and excludes an independent writer for the live engine.
 The initial fixture attempt misread the typed update report shape; it failed
 before engine creation and cleaned up all resources. Its retained failure is
 separate from the corrected successful lifetime experiment.
+
+### Frozen generation startup integration (working implementation, 2026-10-04)
+
+The integration branch adds an optional typed `ActToolGenerationBinding` to the
+persisted creation profile: a canonical SHA-256 generation ID and positive,
+signed-64-bit-bounded payload validation ceiling. It requires a coordinated
+shared cache. Absent bindings are omitted from serialization, preserving the
+historical profile identity. New engine creation recomputes the complete frozen
+command, refusing a changed binding paired with an old command digest.
+
+The generated cache bootstrap installs the verified pinned act, closes its
+archive descriptor, then invokes native `cache tool-exec` against the fixed
+`/bosn/cache/toolstore-v1` store before replacing itself with the existing engine
+init chain. The generation ID and payload bound are individual argv values.
+This command path is implemented, but runtime planning does not yet select or
+freeze bindings. Generation admission precedes any eventual tool overlay; no
+production overlay or lifecycle activation is claimed.
+
+The focused test failed because the persisted profile rejected the generation
+field, then passed with typed persistence and command binding. Evidence:
+`.git/retention-native-reader-profile-red.log` and `-green.log`. All 24 scoped engine boundary tests passed, and the stalled-discovery shutdown
+regression passed alone (one test, 0.27 seconds for the test run). This does not
+establish the cause of the earlier full-suite latency failure. Evidence:
+`.git/retention-native-reader-profile-scoped.log`. This branch is not reviewed,
+gated or published.
+Separately, the act2.9 pin's gate34 failed at the stalled-discovery shutdown
+latency assertion (6.998 seconds against a five-second ceiling), after format
+and Clippy passed. That failure is retained and under investigation; no gate34
+attestation authorizes publication.
