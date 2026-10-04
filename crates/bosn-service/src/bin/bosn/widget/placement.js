@@ -57,7 +57,6 @@ workspace.virtualScreenGeometryChanged.connect(placeAll);
 // placement handler and reads the resulting geometry. Never run the marker:
 // it is an empty, compositor-owned script object used only for readiness.
 const marker = "bosn-widget-corner-ready-v1";
-let markerPresent = false;
 let pulsePending = false;
 const health = new QTimer();
 health.interval = 500;
@@ -69,16 +68,20 @@ health.timeout.connect(function () {
         return;
     }
     pulsePending = true;
-    function complete(result) {
-        const accepted = markerPresent ? result === true : typeof result === "number" && result >= 0;
-        if (!accepted) { health.stop(); return; }
-        markerPresent = !markerPresent;
-        pulsePending = false;
-    }
-    if (markerPresent) {
-        callDBus("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "unloadScript", marker, complete);
-    } else {
-        callDBus("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "loadScript", "/dev/null", marker, complete);
-    }
+    // Script restarts can leave the empty marker loaded. Query compositor state
+    // each time; a local toggle also races KWin's deferred script destruction.
+    callDBus("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "isScriptLoaded", marker, function (present) {
+        if (typeof present !== "boolean") { health.stop(); return; }
+        function complete(result) {
+            const accepted = present ? result === true : typeof result === "number" && result >= 0;
+            if (!accepted) { health.stop(); return; }
+            pulsePending = false;
+        }
+        if (present) {
+            callDBus("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "unloadScript", marker, complete);
+        } else {
+            callDBus("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "loadScript", "/dev/null", marker, complete);
+        }
+    });
 });
 health.start();

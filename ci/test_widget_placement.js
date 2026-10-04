@@ -7,7 +7,16 @@ let added;
 let timer;
 const calls=[];
 function QTimer() { timer=this; this.timeout=signal(); this.start=()=>{}; this.stop=()=>{this.stopped=true;}; }
-function callDBus(...args) { calls.push(args); const callback=args.at(-1); if(typeof callback === "function") callback(args[3] === "unloadScript" ? true : 3); }
+let markerPresent = false;
+function callDBus(...args) {
+    calls.push(args);
+    const callback = args.at(-1);
+    let result;
+    if (args[3] === 'isScriptLoaded') result = markerPresent;
+    else if (args[3] === 'unloadScript') { result = markerPresent; markerPresent = false; }
+    else { result = markerPresent ? -1 : 3; markerPresent = true; }
+    if (typeof callback === 'function') callback(result);
+}
 function signal() { const callbacks=[]; return { connect:f=>callbacks.push(f), emit:()=>callbacks.forEach(f=>f()) }; }
 const screensChanged=signal(), virtualScreenGeometryChanged=signal(), removed=signal();
 const dockChanged=signal();
