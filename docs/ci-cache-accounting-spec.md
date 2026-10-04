@@ -3587,3 +3587,37 @@ digest: `.git/retention-native-overlay-recipe-binding-test.log`. No automatic
 runtime selection, native publication, recovery fencing or expiry activation is
 claimed. The act2.9 pin retry gate35 passed its Rust lane in 415 seconds; its
 Linux lane is still running, so publication remains unauthorized by that gate.
+
+### Pending lower protection survey and RED retention contract (2026-10-04)
+
+Act2's retirement paths protect the current selection and original live reader
+locks. They have no durable reference for a stopped engine's pending overlay.
+If every holder dies and another generation becomes current, the old lower is
+eligible for age/pressure retirement even while pending private upper data needs
+it. The successful live-helper experiment does not cover this holder-free gap.
+
+A new focused contract test on act2 default commit
+`3016b36fbb439b557b76675945b0ab33e02cc14d` initializes a generation, selects a
+successor, and writes a proposed canonical unexpired recovery reference under
+`.tool-recovery-pins-v1`. No reader process remains. Aggressive native retention
+removes the old generation; the test fails because that lower is absent.
+Evidence: `.git/retention-native-recovery-pin-red.log`; working test
+`pkg/artifactcache/tool_recovery_pin_linux_test.go` in the sibling act2 worktree.
+This demonstrates a missing desired recovery contract, not support for an
+existing pin protocol. No shared machine store was used or pruned.
+
+Required implementation: publish a bounded typed reservation under the original
+catalog lock before stopping source writers; bind canonical owner/generation and
+an explicit finite expiry; retain its referenced lower and objects without a
+living process; reject malformed/ambiguous inventory before destructive work;
+report protected allocation/overflow; permit convergence after verified release
+or expiry. The native record is a protection request, not proof of Docker source
+ownership or writer exclusion. Bosn must separately persist publication intent,
+verify source/volume identity and absence, keep recovery state until publication
+or authorized bounded expiry, and then reconcile both reference and source-volume
+cleanup. Automatic planning remains disabled until these lifetimes are connected.
+
+The act2.9 pin's exact gate35 completed successfully in 791 seconds (Rust 415,
+Linux 376); the clean stamped head `30c76a974291e65d613ef32249fe1a08fc90aa32`
+passed pull-request attestation verification. No full-objective completion is
+implied by that pin gate.
