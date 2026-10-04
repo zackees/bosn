@@ -28,9 +28,13 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args, String> {
+    parse_args_from(std::env::args_os().skip(1))
+}
+
+fn parse_args_from(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Args, String> {
     let mut state_dir = None;
     let mut explicit = true;
-    let mut args = std::env::args_os().skip(1);
+    let mut args = args;
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--state-dir") => {
@@ -46,6 +50,12 @@ fn parse_args() -> Result<Args, String> {
         state_dir: state_dir.unwrap_or_else(bosn_service::mcp::default_state_dir),
         explicit,
     })
+}
+
+fn reveal_existing(args: &Args, show: impl FnOnce(&std::path::Path)) {
+    if args.explicit {
+        show(&args.state_dir);
+    }
 }
 
 fn main() {
@@ -68,10 +78,9 @@ fn main() {
             std::process::exit(2);
         }
     };
-    // One widget per user: a second start asks the running one to show its
-    // details, then exits successfully.
+    // Explicit second starts reveal details; session autostart stays quiet.
     let Some(lock) = controller::single_instance(&args.state_dir) else {
-        controller::ask_running_widget_to_show(&args.state_dir);
+        reveal_existing(&args, controller::ask_running_widget_to_show);
         return;
     };
     let runtime = match RuntimeBuilder::multi_thread()
@@ -102,4 +111,29 @@ fn main() {
     let code = host.run();
     drop(lock);
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn autostart_does_not_send_a_show_request_to_an_existing_widget() {
+        for arguments in [
+            vec!["--autostart", "--state-dir", "/state"],
+            vec!["--state-dir", "/state", "--autostart"],
+        ] {
+            let args = parse_args_from(arguments.into_iter().map(Into::into)).unwrap();
+            reveal_existing(&args, |_| panic!("autostart sent a Show request"));
+        }
+    }
+
+    #[test]
+    fn explicit_second_start_sends_one_show_request_for_the_selected_state() {
+        let args = parse_args_from(["--state-dir", "/selected-state"].into_iter().map(Into::into))
+            .unwrap();
+        let mut requests = Vec::new();
+        reveal_existing(&args, |state| requests.push(state.to_path_buf()));
+        assert_eq!(requests, [PathBuf::from("/selected-state")]);
+    }
 }
