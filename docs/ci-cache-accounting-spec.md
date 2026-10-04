@@ -3919,3 +3919,29 @@ That transport adjustment still needs its final focused validation. Neither the
 persistence nor transport is called by normal lifecycle planning yet. Source
 stop, source-volume retention and completed publication/release transitions
 remain implementation work. Full act2 exact-merge CI remains in progress.
+
+### Trusted actor reservation orchestration (candidate, 2026-10-04)
+
+The backend now exposes an ordered `reserve_claimed_tool_recovery` seam:
+commit exact frozen intent through the trusted registry actor, read its committed
+snapshot, confirm claim continuity, execute the strict act2 reservation transport,
+then commit acknowledgement through that same actor. Lost command/commit replies
+require reconciliation with the original intent and timestamps. This is a
+trusted daemon operation, with no new client/protobuf authority. Recovery
+admission closes the actor's startup-interruption window even if refused; a
+focused actor test verifies that the live claim cannot subsequently be withdrawn
+through startup recovery.
+
+All four actor tests passed (0.38-second test execution) and service all-target
+Clippy with warnings denied passed after moving the implementation before its
+test module. Evidence: `.git/retention-bosn-tool-recovery-actor-final.log` and
+`.git/retention-bosn-tool-recovery-actor-clippy-green.log`. The earlier lint failure
+is retained in the actor wiring/final logs. The final request-length adjustment
+also passed focused receipt validation and service Clippy in
+`.git/retention-bosn-tool-recovery-ack-transport-final.log`.
+
+These tests cover actor authority and compilation, not an end-to-end call through
+this new orchestration against a live engine. Normal runtime enrollment remains
+unactivated. Source-stop proof, source-volume preservation, publication/release
+phases and bounded recovery enumeration are still required. Act2 exact default
+branch full CI run `37241691702` remains live; it has not been restarted.
