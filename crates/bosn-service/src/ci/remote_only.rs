@@ -148,6 +148,15 @@ const KEPT: &[&str] = &[
 
 /// Why `job` can only run on GitHub, or `None` when act can run it.
 pub fn reason(job: &Job) -> Option<String> {
+    reason_with_repository(job, None)
+}
+
+/// Classify the frozen original using the same repository as localization.
+pub fn reason_in_repository(job: &Job, repository: &str) -> Option<String> {
+    reason_with_repository(job, Some(repository))
+}
+
+fn reason_with_repository(job: &Job, repository: Option<&str>) -> Option<String> {
     if let Some(declared) = job.env.get(MARKER).filter(|v| !v.is_null()) {
         let text = match declared {
             Value::String(text) => text.trim().to_string(),
@@ -165,7 +174,7 @@ pub fn reason(job: &Job) -> Option<String> {
     let registered = job
         .steps
         .iter()
-        .filter(|step| !inactive(step.condition.as_ref(), None))
+        .filter(|step| !inactive(step.condition.as_ref(), repository))
         .find_map(|step| match classify(step.uses.as_deref()?, &step.with) {
             StepClass::Confined(why) => Some(why),
             StepClass::Local | StepClass::Stubbed => None,
@@ -333,7 +342,12 @@ mod tests {
 
     #[test]
     fn inactive_registered_steps_leave_the_test_job_runnable() {
-        assert_eq!(reason(&job("steps:\n  - run: go test ./...\n  - uses: codecov/codecov-action@v5\n    if: false\n")), None);
+        assert_eq!(
+            reason(&job(
+                "steps:\n  - run: go test ./...\n  - uses: codecov/codecov-action@v5\n    if: false\n"
+            )),
+            None
+        );
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("checks.yml");
         let output = root.path().join("localized.yml");
@@ -351,6 +365,9 @@ mod tests {
         );
         assert_eq!(changes.inactive_remote_steps, 1);
         assert_eq!(test.steps[1].condition, Some(Value::Bool(false)));
+        // Runtime conclusions read the frozen original, not the overlay.
+        let declared = super::super::workflow::declared(root.path(), "checks.yml", "zackees/act2");
+        assert!(declared.remote_only.is_empty());
     }
 
     #[test]

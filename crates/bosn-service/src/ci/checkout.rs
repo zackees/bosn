@@ -385,10 +385,12 @@ mod tests {
             format!("actions/checkout zackees/ci.yml@{PIN}"),
             "an unnamed step is named after what it fetches"
         );
-        assert!(steps[1]["run"]
-            .as_str()
-            .unwrap()
-            .contains("dest=\"$GITHUB_WORKSPACE\"\n"));
+        assert!(
+            steps[1]["run"]
+                .as_str()
+                .unwrap()
+                .contains("dest=\"$GITHUB_WORKSPACE\"\n")
+        );
     }
 
     #[test]
