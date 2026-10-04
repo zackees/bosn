@@ -143,3 +143,45 @@ impl Immediate<'_> {
         self.store_act_record(&record)
     }
 }
+
+/// Trusted runtime receipt after exact engine-absence and retained-volume
+/// ownership probes. A client exit or failed probe must never construct it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActToolSourceStopProof {
+    pub engine_name: String,
+    pub engine_id: String,
+    pub source_volume: String,
+}
+
+impl Immediate<'_> {
+    pub fn record_act_tool_source_stopped(
+        &mut self,
+        run: &str,
+        proof: &ActToolSourceStopProof,
+        at: f64,
+    ) -> Result<(), Error> {
+        let mut record = self
+            .act_record(run)?
+            .ok_or(Error::BadRow("act intent missing"))?;
+        record.check_time(at)?;
+        let intent = record
+            .tool_recovery
+            .as_ref()
+            .ok_or(Error::BadRow("tool recovery intent missing"))?;
+        if record.state != ActEngineState::CleanupRequired
+            || record.tool_recovery_reserved_at.is_none()
+            || proof.engine_name != record.intent.engine_name()
+            || proof.engine_id != intent.engine_id
+            || proof.source_volume != intent.source_volume
+            || at >= intent.expires_at_seconds as f64
+        {
+            return Err(Error::BadRow("tool recovery source stop proof"));
+        }
+        if record.tool_recovery_source_stopped_at.is_some() {
+            return Ok(());
+        }
+        record.tool_recovery_source_stopped_at = Some(at);
+        record.updated_at = at;
+        self.store_act_record(&record)
+    }
+}

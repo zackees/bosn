@@ -9,7 +9,7 @@ use bosn_core::ResourceLabels;
 use serde::{Deserialize, Serialize};
 
 mod recovery;
-pub use recovery::ActToolRecoveryIntent;
+pub use recovery::{ActToolRecoveryIntent, ActToolSourceStopProof};
 mod spare;
 pub use spare::ActEngineBinding;
 
@@ -243,6 +243,8 @@ pub struct ActEngineRecord {
     pub tool_recovery: Option<ActToolRecoveryIntent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_recovery_reserved_at: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_recovery_source_stopped_at: Option<f64>,
 }
 /// Keyset page ordered by immutable canonical run UUID, independent of state.
 #[derive(Clone, Debug, PartialEq)]
@@ -402,6 +404,19 @@ impl ActEngineRecord {
         }) {
             return Err(Error::BadRow("tool recovery reservation acknowledgement"));
         }
+        if self.tool_recovery_source_stopped_at.is_some_and(|at| {
+            !at.is_finite()
+                || at > self.updated_at
+                || self
+                    .tool_recovery_reserved_at
+                    .is_none_or(|reserved| at < reserved)
+                || !matches!(
+                    self.state,
+                    ActEngineState::CleanupRequired | ActEngineState::Terminal
+                )
+        }) {
+            return Err(Error::BadRow("tool recovery source stop snapshot"));
+        }
         if let Some(recovery) = &self.tool_recovery {
             recovery.validate_record(self)?;
         }
@@ -535,6 +550,7 @@ impl Immediate<'_> {
             binding: None,
             tool_recovery: None,
             tool_recovery_reserved_at: None,
+            tool_recovery_source_stopped_at: None,
         })
     }
     /// Exact ownership predicate for both registration and pending-intent
