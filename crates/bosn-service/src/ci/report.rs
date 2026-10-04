@@ -39,6 +39,18 @@ pub fn conclude(
                     Conclusion::Incomplete,
                     Some("some jobs need runners bosn cannot supervise".into()),
                 )
+            } else if !declared.errors.is_empty() || declared.needs_qualified_identity {
+                (
+                    Conclusion::Incomplete,
+                    Some(if declared.errors.is_empty() {
+                        "reusable workflows require qualified execution identity".into()
+                    } else {
+                        format!(
+                            "workflow declarations are incomplete: {}",
+                            declared.errors.join("; ")
+                        )
+                    }),
+                )
             } else if !tree
                 .jobs()
                 .any(|j| j.conclusion == Some(ItemConclusion::Success))
@@ -229,6 +241,7 @@ mod tests {
                 "reads this run from the GitHub API".to_string(),
             )]
             .into(),
+            ..Declared::default()
         };
         let (conclusion, reason) = conclude(
             &Ok(EngineReport {
