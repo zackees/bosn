@@ -2959,3 +2959,87 @@ this fixed Bosn main so the required documentation publication gate includes
 the corrected shutdown test. This checkpoint does not claim an act2 feature
 release, production generation admission, machine-wide convergence, or automatic
 expiry of all owned engine/image/builder-cache classes.
+
+
+### Actual hosted-workflow sharing: metadata copy-up regression
+
+A private nested-Docker experiment built act from the exact reviewed source
+`6db80530c2d81f6b517a35fe2c8d98dbafbe7bc2`, used Bosn's pinned Ubuntu runner
+image, and mounted a task-owned read-only lower containing a 16 MiB payload and
+completed install marker. Two actual dependent act workflow jobs read the same
+payload; the second observed the first job's settings change. Both workflows
+completed successfully, but the physical-efficiency assertion was RED: the
+runner's recursive ownership reconciliation copied the entire payload into the
+private upper. Its payload allocated 32,768 blocks (512 bytes each), and the
+upper grew from zero to 16,404 KiB. Plain Docker jobs had not exercised that
+hosted-user setup, so their earlier small-upper result did not cover this case.
+
+The same experiment is GREEN with the tool overlay mounted `metacopy=on`,
+confirmed in the live engine's mountinfo. Two actual hosted workflow jobs share
+changes in the first engine; a job in a second fresh engine reads the original
+warm lower. All three payload digests match. Upper growth is 20 KiB and 12 KiB;
+upper payload entries have logical size 16 MiB but zero allocated blocks. Small
+settings writes copy their data while the shared payload remains in the lower.
+Both exact owned engines and the lower volume were removed after label checks.
+
+[Kernel OverlayFS documentation](https://docs.kernel.org/filesystems/overlayfs.html#metadata-only-copy-up)
+explains that metadata-only copy-up delays payload copying for ownership/mode
+changes until a write needs file data. It requires trusted upper/lower layers;
+production must enforce that boundary, check support and actual mounted mode,
+and refuse/replan rather than silently regress to full payload copies or an
+empty cache. This fixture used fresh task-owned layers, not arbitrary imported
+overlay metadata.
+
+This establishes actual act workflow sharing and the metadata allocation
+requirement in a controlled prototype. It does not prove Bosn's frozen
+production profile, immutable-generation/native-reader admission, actual
+completed-install publication, daemon/uncertain-start recovery, sustained
+whole-machine pressure convergence, or cache-action sharing. Artifact and
+report evidence: `retention-toolcache-cow-actual-workflow-metadata-copy-red` and
+`retention-toolcache-cow-actual-workflow-experiment` JSON/log/script under the
+session git artifacts. First transport, minimal-runner-image and capacity
+failures are retained separately; their owned fixtures were cleaned. The pinned
+runner needed about 2,752,220 KiB of inner image storage, and the successful
+fixture gave each engine a 4 GiB private storage tmpfs instead of 2 GiB.
+
+### Release and documentation publication checkpoint
+
+Act2 #43 is merged as `2029595941c40866b7114bf62b33d52ea54fc781`. Full default-
+branch CI run `37226748284` passed all five required jobs on that exact commit.
+A clean default-branch candidate checkout, absent tag/release and unchanged
+remote master were verified before pushing necessary tag `v0.2.89-act2.8`.
+Its existing tag-triggered release workflow is publishing; binary/checksum
+verification and Bosn pin update are still pending. No runtime activation is
+claimed.
+
+The consolidated object/stage/CLI/selection spec passed the complete pinned
+Bosn gate in 921 seconds (Rust474s/Linux447s), and exact verification accepted
+stamped source `e68f8fe5e7b387ca77a67491898090752632a907`, tree `ea1e13959129`.
+Independent documentation review passes; its PR is being published. This
+follow-up records the newer workflow experiment and release evidence.
+
+
+### Verified act2.8 artifact and Bosn pin candidate
+
+The release workflow `37227718381` succeeded on the exact fully tested candidate
+`2029595941c40866b7114bf62b33d52ea54fc781`; the annotated release tag resolves
+to that same commit. All eleven release archives match both the checksums file
+and GitHub asset digests. Their contained binaries have the expected target
+architecture and embedded version. The actual Linux x86_64 binary reports
+`act version 0.2.89-act2.8` inside the private Linux container; released
+`tool-retain` and `tool-exec` command flags are present.
+
+The Linux x86_64 archive digest is
+`95b1b7f01da6f5ca22e206847d419c80fa04198f0cd568f986f96448ba7230d4`;
+its binary digest is
+`743c13bf6c8ee8ff948a14f940f6d1033ab4e09d11d29d94fda8e1bbaeea8628`.
+The Bosn candidate updates the one ACT_VERSION constant, artifact URL and both
+digests together. The stock runner image remains the pinned published image.
+Source review and Bosn's required source-bound gate are pending before push.
+The consolidated spec is now merged in Bosn #499, main `fe0a3d3d`.
+
+This pin makes the verified retention and native-reader CLI available to Bosn
+engines; it does not enable the new production generation profile, metadata-only
+overlay mount, quiescent successor publication or whole-machine scheduling.
+The default engine still follows the inspected legacy copy path until those
+production changes are implemented and verified.
