@@ -702,3 +702,23 @@ on job `111376046334` in run `37181922413`; no replacement run was started.
 Lint, spelling, snapshot and both host-environment lanes had completed
 successfully at that observation. Linux completion and end-to-end Bosn quota
 integration remain unproven until their corresponding evidence exists.
+
+### Verified CI snapshot available for integration experiments
+
+Downloaded Linux amd64 artifact `11295491838` from act2 run `37181922413`.
+The extracted binary SHA-256 is
+`ae923c1fdba91a95b358218e767b3f8e82085574de6e127704be34aabfd9af45`.
+Its build information identifies clean revision
+`52a1ce794a4cdbcd0983b1fdf92e1bf0a628f0cc`, Linux amd64, CGO disabled,
+and version `0.0.0-SNAPSHOT-52a1ce7`. GitHub's commit record confirms that this
+is the PR merge snapshot with parents `60c84bbf` (current master) and `8a2e84f`
+(the reviewed candidate). It is not the PR branch SHA itself.
+
+The actual downloaded binary was executed only in the isolated Go container.
+It exposes the quota/cohort/watch flags, emits a typed partial report for a
+missing maintenance root without creating that root, and exits successfully
+on its first real SIGINT. This provides a provenance-checked executable for
+local integration experiments while Linux CI continues. The artifact is a
+CI snapshot, not an approved release or permanent download pin; Bosn's
+released artifact/version checks remain unchanged. Warm workflow execution
+with this binary and automatic Bosn policy/supervision are still unverified.
