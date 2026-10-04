@@ -1,5 +1,5 @@
 //! One bounded maintenance pass, independent of workflow servers.
-use super::{DockerActBackend, ENGINE_WORK, RunOptions, owned};
+use super::{DockerActBackend, RunOptions, owned};
 use crate::ci::{cache_maintenance::CohortReport, cache_policy::CachePolicy};
 use std::time::Duration;
 
@@ -33,8 +33,8 @@ impl DockerActBackend {
         engine: &str,
         policy: CachePolicy,
     ) -> Result<MaintenanceAttempt, String> {
-        let binary = format!("{ENGINE_WORK}/bin/act");
-        let mut args = owned(&["exec", engine, &binary]);
+        let mut args = owned(&["exec", engine]);
+        args.extend(super::maintenance_lease::command());
         args.extend(policy.maintenance_pass_args());
         let output = self
             .docker

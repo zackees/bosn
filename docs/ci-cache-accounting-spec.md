@@ -1557,3 +1557,32 @@ review passed. This does not test cancellation during create/exec or establish
 production daemon wiring.
 
 Strict service all-target Clippy passed for the supervisor (24.83 seconds).
+
+### Participating maintenance exclusion (2026-10-04 candidate)
+
+The actual maintenance command now opens
+`actcache/.bosn-maintenance-v1.lock` in the shared machine volume and acquires
+an exclusive nonblocking lease on FD 6. It then execs the verified act binary
+with unchanged literal arguments. The descriptor spans the command lifetime;
+process/container death releases the lease. A competing participating pass
+returns exit 75 with `machine cache maintenance busy` before invoking act.
+The bounded maintenance adapter preserves that diagnostic as an outcome error,
+not as successful reclamation or a complete empty report. The helper still
+retires and its durable journal finishes. The scheduler reports the contention
+and tries again on a later tick.
+
+The genuine private-Docker proof passed (2.24 seconds): two independent backend
+instances shared the same volume; one owned helper held the lease, a competitor
+was refused and cleaned up, killing/removing the exact holder released the
+lease, and the competitor's next pass completed. The shared volume survived.
+The fixture cleans its holder before asserting operation errors; existing helper
+identity verification and explicit absence gates are used. Review passed.
+
+This excludes participating maintenance commands, not helper creation itself,
+nonparticipating older binaries or workflow cache servers. Act2's cache-server
+root/store locks remain a separate boundary. It does not establish production
+policy discovery/enrollment, durable maintenance outcome history, or cancellation
+during an uncertain Docker operation. Those rollout requirements and broader
+cache-class/image/build-cache expiry remain open.
+
+Strict service all-target Clippy passed for maintenance exclusion (12.04 seconds).

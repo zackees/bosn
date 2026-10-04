@@ -124,7 +124,7 @@ impl DockerActBackend {
     }
 }
 
-fn helper_create_args(identity: &helper::Identity) -> Vec<String> {
+pub(super) fn helper_create_args(identity: &helper::Identity) -> Vec<String> {
     let mount = format!("type=volume,source={CACHE_VOLUME},target=/bosn/cache");
     let mut args = owned(&[
         "create",

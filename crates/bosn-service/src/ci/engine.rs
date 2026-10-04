@@ -29,7 +29,10 @@ mod cache_usage_transport_tests;
 mod legacy_lease;
 mod machine_policy;
 mod maintenance;
+#[cfg(test)]
+mod maintenance_contention_tests;
 mod maintenance_helper;
+mod maintenance_lease;
 mod maintenance_loop;
 mod migration;
 pub use maintenance::MaintenanceAttempt;
