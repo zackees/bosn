@@ -17,10 +17,15 @@ use super::ENGINE_CACHE;
 pub(super) const TOOLCACHE_VOLUME: &str = "act-toolcache";
 pub(super) const TOOLCACHE_MOUNT: &str = "/var/lib/docker/volumes/act-toolcache/_data";
 
+/// Copy visible published entries; hidden save stages and control files stay
+/// in the shared store instead of consuming every fresh engine's private disk.
 pub(super) fn seed_toolcache_script() -> String {
     format!(
-        "mkdir -p {ENGINE_CACHE}/toolcache && docker volume create {TOOLCACHE_VOLUME} >/dev/null && \
-         cp -a {ENGINE_CACHE}/toolcache/. {TOOLCACHE_MOUNT}/"
+        "src={ENGINE_CACHE}/toolcache; mkdir -p \"$src\" && docker volume create {TOOLCACHE_VOLUME} >/dev/null && \
+         for entry in \"$src\"/*; do \
+           [ -e \"$entry\" ] || [ -L \"$entry\" ] || continue; \
+           cp -a \"$entry\" {TOOLCACHE_MOUNT}/ || exit $?; \
+         done"
     )
 }
 
@@ -32,11 +37,13 @@ pub(super) fn seed_toolcache_script() -> String {
 /// complete.
 pub(super) fn save_toolcache_script() -> String {
     format!(
-        "src={TOOLCACHE_MOUNT}; dst={ENGINE_CACHE}/toolcache; [ -d \"$src\" ] || exit 0; cd \"$src\"; \
+        "src={TOOLCACHE_MOUNT}; dst={ENGINE_CACHE}/toolcache; [ -d \"$src\" ] || exit 0; mkdir -p \"$dst\" || exit $?; cd \"$src\" || exit $?; \
+         new_stage() {{ tmp=$(mktemp -d \"$dst/.saving-XXXXXXXX\") || return $?; \
+           mkdir -p \"$dst/${{dir%/*}}\" || {{ code=$?; rm -rf \"$tmp\"; return \"$code\"; }}; }}; \
          for marker in */*/*.complete; do \
            [ -f \"$marker\" ] || continue; dir=${{marker%.complete}}; \
            [ -d \"$dir\" ] && [ ! -e \"$dst/$marker\" ] || continue; \
-           tmp=\"$dst/.saving-$$\"; rm -rf \"$tmp\"; mkdir -p \"$tmp\" \"$dst/${{dir%/*}}\"; \
+           new_stage || exit $?; \
            cp -a \"$dir\" \"$tmp/install\" && mv -T \"$tmp/install\" \"$dst/$dir\" 2>/dev/null && \
              cp \"$marker\" \"$dst/$marker\"; \
            rm -rf \"$tmp\"; \
@@ -44,7 +51,7 @@ pub(super) fn save_toolcache_script() -> String {
          find . -mindepth 3 -type f -name .complete | while read -r stamp; do \
            dir=${{stamp%/.complete}}; dir=${{dir#./}}; \
            [ ! -e \"$dst/$dir\" ] || continue; \
-           tmp=\"$dst/.saving-$$\"; rm -rf \"$tmp\"; mkdir -p \"$tmp\" \"$dst/${{dir%/*}}\"; \
+           new_stage || exit $?; \
            cp -a \"$dir\" \"$tmp/install\" && mv -T \"$tmp/install\" \"$dst/$dir\" 2>/dev/null; \
            rm -rf \"$tmp\"; \
          done"
@@ -183,5 +190,122 @@ mod tests {
         );
         save(&src, &cache);
         no_leftovers(&cache.join("toolcache"));
+    }
+    #[test]
+    fn seeding_does_not_copy_unfinished_publication_stages() {
+        let tmp = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let cache = tmp.path().join("cache");
+        let target = tmp.path().join("private");
+        write(cache.join("toolcache/Python/3.11/x64/bin/python"), "warm");
+        write(cache.join("toolcache/Python/3.11/x64.complete"), "");
+        write(
+            cache.join("toolcache/.saving-collision/install/partial"),
+            "unfinished",
+        );
+        std::fs::create_dir_all(&target).unwrap();
+        let script = seed_toolcache_script()
+            .replace(ENGINE_CACHE, &cache.to_string_lossy())
+            .replace(TOOLCACHE_MOUNT, &target.to_string_lossy())
+            .replace("docker volume create act-toolcache >/dev/null", "true");
+        let result = std::process::Command::new("sh")
+            .args(["-ec", &script])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("Python/3.11/x64/bin/python")).unwrap(),
+            "warm"
+        );
+        assert!(
+            !target.join(".saving-collision").exists(),
+            "a fresh engine must not duplicate an unfinished cache save"
+        );
+    }
+
+    #[cfg(unix)]
+    const CONCURRENT_SAVE: &str = r##"
+import json, os, pathlib, signal, subprocess, sys, tempfile, time
+with tempfile.TemporaryDirectory() as directory:
+    root = pathlib.Path(directory)
+    cache = root / 'cache'
+    cache.mkdir()
+    tools = root / 'bin'
+    tools.mkdir()
+    spy = tools / 'cp'
+    spy.write_text("""#!/usr/bin/env python3
+import os, pathlib, sys, time
+if sys.argv[-1].endswith('/install'):
+    pathlib.Path(os.environ['BOSN_STAGE_FILE']).write_text(str(pathlib.Path(sys.argv[-1]).parent))
+    deadline = time.monotonic() + 10
+    while not pathlib.Path(os.environ['BOSN_STAGE_RELEASE']).exists():
+        assert time.monotonic() < deadline, 'stage release timed out'
+        time.sleep(0.01)
+os.execv('/bin/cp', ['cp', *sys.argv[1:]])
+""")
+    spy.chmod(0o700)
+    children = []
+    stages = []
+    release = root / 'release'
+    try:
+        for index, tool in enumerate(['Python', 'node']):
+            source = root / ('source-' + str(index))
+            install = source / tool / '1' / 'x64'
+            install.mkdir(parents=True)
+            (install / 'payload').write_text(tool)
+            (install.parent / 'x64.complete').write_text('')
+            stage = root / ('stage-' + str(index))
+            # Separate engines can have the same PID. Replay that collision
+            # deterministically; mktemp-based publication has no PID token.
+            script = json.loads(sys.argv[1]).replace(sys.argv[2], str(cache)).replace(sys.argv[3], str(source)).replace('$$', '12345')
+            child = subprocess.Popen(['sh', '-ec', script],
+                env={**os.environ, 'PATH':str(tools)+':'+os.environ['PATH'],
+                     'BOSN_STAGE_FILE':str(stage), 'BOSN_STAGE_RELEASE':str(release)},
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+            children.append(child)
+            deadline = time.monotonic() + 5
+            while not stage.exists():
+                assert child.poll() is None, child.communicate(timeout=5)
+                assert time.monotonic() < deadline, 'copy never reached publication stage'
+                time.sleep(0.01)
+            stages.append(stage.read_text())
+        assert stages[0] != stages[1], 'different engines reused one publication stage'
+        release.touch()
+        for child in children:
+            output, errors = child.communicate(timeout=10)
+            assert child.returncode == 0, (child.returncode, output, errors)
+        for tool in ['Python', 'node']:
+            assert (cache / 'toolcache' / tool / '1' / 'x64' / 'payload').read_text() == tool
+        assert not list((cache / 'toolcache').glob('.saving*'))
+    finally:
+        for child in children:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.communicate(timeout=5)
+"##;
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_engines_with_equal_pids_publish_through_distinct_stages() {
+        let result = std::process::Command::new("python3")
+            .args([
+                "-c",
+                CONCURRENT_SAVE,
+                &serde_json::to_string(&save_toolcache_script()).unwrap(),
+                ENGINE_CACHE,
+                TOOLCACHE_MOUNT,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 }

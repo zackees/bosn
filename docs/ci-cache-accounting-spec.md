@@ -32,14 +32,16 @@ Published checksums match, and the isolated binary reports
 `act version 0.2.89-act2.6`. The candidate pin now selects these verified bytes.
 This fixes budget-induced empty warm cutover; it does not activate Bosn policy.
 
-Act2 PR #28 adds bounded historical import receipts published with the namespace
-for lost-acknowledgement recovery. The full artifactcache race suite passed
-(17.031 seconds), actual Cobra receipt/cutover tests passed, and native Windows
-and macOS PR checks passed. Full PR CI is still running; this receipt feature
-is not in act2.6. Bosn's typed parser checks exact namespace identity, historical
-and current byte ceilings, retained-source warmth, fingerprints and bounded
-archive receipts. Four isolated boundary tests and strict service-library
-Clippy passed; parsing historical evidence cannot authorize enrollment.
+Act2 PR #28 merged as `1a6782d5bbabb715f425cad5601b1f706fc23fa8` after
+full PR CI passed. Exact-merge full CI run 37190653388 also passed. The
+v0.2.89-act2.7 tag is pushed through the existing release workflow; artifact
+verification remains pending, and Bosn still pins verified act2.6. This receipt
+feature is not in act2.6. Bosn's typed parser checks exact namespace identity,
+historical and current byte ceilings, retained-source warmth, fingerprints and
+bounded archive receipts. Four isolated boundary tests and strict
+service-library Clippy passed; parsing historical evidence cannot authorize
+enrollment. The exclusive import executor preserves partial publication on
+nonzero exits but is not yet invoked by production planning.
 
 ## Survey and evidence (2026-10-03)
 
@@ -1213,3 +1215,26 @@ no blockers. These tests do not prove actual automatic migration or supervision.
 Act2 receipt PR #28 merged as `1a6782d5bbabb715f425cad5601b1f706fc23fa8`
 after full PR CI passed. Exact-merge full CI run 37190653388 is in progress;
 the receipt feature remains unreleased and absent from the act2.6 candidate pin.
+
+### Tool-cache save isolation and efficient fresh-engine seeding (candidate)
+
+A focused RED test found that the old whole-root `cp -a` seeding copied hidden
+`.saving-*` directories into every fresh engine. A second RED test replayed
+equal PIDs from separate private engines with a controlled copy barrier: both
+publishers used the same `.saving-$$` path. One could remove or reuse another's
+unfinished stage, despite their different install destinations.
+
+Save now creates an exclusive `mktemp -d` stage for each install, with one
+shared shell setup function. Cleanup targets that invocation's own stage. Seed
+copies visible published top-level entries and skips hidden stages/control
+files. Sibling completion markers, inner stamps and existing warm entries
+retain their existing behavior. The collision fixture terminates only its
+spawned process groups, including blocked copy children on failure.
+
+Four actual shell/copy tests passed (0.52 seconds), including both corrected
+RED signals and the two existing completion conventions. Strict service
+all-target Clippy passed (71.37 seconds), and independent review found no
+blockers. This proves deterministic equal-PID isolation and avoids private-disk
+duplication of unfinished saves; it does not introduce tool-install TTL/quotas,
+abandoned-stage pruning or improve every pre-existing copy-failure path.
+Real engine workflow coverage of this new seed/save slice remains pending.
