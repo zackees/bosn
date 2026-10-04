@@ -31,6 +31,7 @@ fn request(staging: &str, sha_byte: char) -> SubmitRequest {
         sha: sha_byte.to_string().repeat(40),
         branch: Some("main".into()),
         tree_digest: "d".repeat(64),
+        git_tree: None,
         dirty: false,
         commit: None,
         base: None,
@@ -814,3 +815,5 @@ fn the_cache_volume_is_measured_and_cleared_only_while_nothing_runs() {
 
 mod params;
 mod spare;
+
+mod source_identity;
