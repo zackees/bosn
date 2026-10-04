@@ -3621,3 +3621,34 @@ The act2.9 pin's exact gate35 completed successfully in 791 seconds (Rust 415,
 Linux 376); the clean stamped head `30c76a974291e65d613ef32249fe1a08fc90aa32`
 passed pull-request attestation verification. No full-objective completion is
 implied by that pin gate.
+
+### Durable lower retention checks (working candidate, 2026-10-04)
+
+Act2's recovery-reference contract is now GREEN in the working sibling branch.
+The original catalog writer guards a bounded inventory of canonical typed pin
+records: owner and generation SHA-256 IDs, schema 1, creation and explicit expiry,
+with at most a 24-hour lifetime, 10,000 records and 1,024 bytes per record. Active
+references must name a valid existing canonical generation manifest. Future
+creation times, malformed/oversized records, owner mismatches, symlinks and
+missing active lowers refuse retention before mutation. Context cancellation is
+checked during the bounded scan.
+
+The automatic generation sweep preserves unexpired referenced generations and
+includes them in protected-generation/overflow reporting. Direct generation
+retirement enforces the same check. Object retention retains the surviving
+generations' references through its existing generation inventory. Expired
+references cease protecting generations. The sweep reads the reference inventory
+once under the catalog lock rather than rescanning it for every candidate.
+
+Focused retention/recovery boundary tests passed:
+`.git/retention-native-recovery-pin-green.log` and
+`.git/retention-native-recovery-pin-boundaries.log`. Test fixtures currently write
+records directly. Safe reservation publication, acknowledgement recovery,
+verified release, expired-record cleanup, CLI integration, review and release
+remain implementation work; no production pin enrollment is claimed. This does
+not yet preserve a source volume or implement writer exclusion in Bosn.
+
+Bosn PR #507 is merged as `420c1ddbc889cacfc7f3f524129158f138cee871`.
+The verified act2.9 version/archive/executable pin and accumulated measurement
+spec are now on main. The native engine integration branch was rebased onto that
+exact main commit; its production lifetime activation is still incomplete.
