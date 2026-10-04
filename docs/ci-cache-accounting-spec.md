@@ -542,3 +542,28 @@ recovery. Interruption, intervening lookup and cohort deferral tests pass; the f
 cache package passes race testing (17.315 seconds),
 and Go lint reports zero issues. These changes remain unshipped and do not change
 Bosn's released act2 pin or close the automatic maintenance/cutover gaps above.
+
+### Automatic act2 shutdown retention (local candidate)
+
+An explicit `--cache-server-cohort-max-bytes` policy now invokes aggregate
+maintenance after the cache server stops and releases its cohort lease. Active
+peers/transfers defer collection; the last normal shutdown retries under the
+existing five-second operation limit and full namespace preflight. The typed
+`RetentionOnClose()` outcome and `cache_retention` log field distinguish partial
+or deferred work from completed collection and protected overage. Repeat close
+does not repeat maintenance. The CLI closes on function exit, including watch
+exit and early errors, and keeps cleanup independent of workflow cancellation.
+
+RED: shutdown left 240 completed archive bytes under a 160-byte ceiling. GREEN:
+eight cycles add cold data, restore the warm 80-byte archive through fresh
+servers, and each shutdown leaves at most 160 bytes without an explicit prune.
+The cache package passes race testing (16.969 seconds); active-peer deferral,
+last-peer retry, protected overage, cancellation and lease release are covered.
+CLI policy/offline checks and lint cover the new flag and context wiring.
+
+This closes the normal act2 shutdown-to-maintenance handoff, not the host retry
+or Bosn integration gap. Killed servers and deferred/protected work require host
+maintenance. Bosn still pins the released build without this flag. The policy
+remains opt-in; physical machine bytes, metadata and retained legacy inputs are
+outside the completed-archive ceiling. Warm cutover and automatic Bosn retries
+remain open.
