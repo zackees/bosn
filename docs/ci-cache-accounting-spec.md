@@ -2107,6 +2107,16 @@ Initial execution found and fixed missing coordination-file initialization.
 The complete artifact-cache package test run passed (14.27 seconds), `go vet`
 passed for the cache and command packages, and their golangci-lint run reported
 zero issues after scanner decomposition and explicit returns.
+Review then found external symlinks could violate object closure and eager
+directory enumeration could defeat the entry bound. Both were corrected:
+links must be relative and resolve inside the object (dangling/cyclic links
+are rejected), traversal reads 256 entries per page with a depth limit of 64,
+and initial-store recognition reads at most two entries. Absolute, parent and
+transitive symlink escape regressions failed before their fixes and passed
+afterward; excessive-depth refusal and all existing focused tests also passed.
+The corrected package/command lint run reported zero issues. Re-review is
+pending. Artifacts: `act2-toolcache-link-red.log`,
+`act2-toolcache-transitive-link-red.log`, `act2-toolcache-review-fixes.log`.
 Artifacts: `act2-toolcache-publish-red.log`,
 `act2-toolcache-publish-green.log`, `act2-toolcache-boundaries.log`.
 
