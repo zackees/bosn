@@ -39,6 +39,57 @@ pub struct OwnedStorage {
     pub classes: Vec<StorageSummary>,
     pub private_volumes: Vec<PrivateVolume>,
     pub private_volumes_omitted: usize,
+    pub other_volumes: Vec<OwnedVolume>,
+    pub other_volumes_omitted: usize,
+}
+
+/// Advisory contributor details. Labels and attachment state do not prove
+/// lifecycle/release eligibility; no candidate token or deletion authority.
+#[derive(Debug, Serialize)]
+pub struct OwnedVolume {
+    pub volume: String,
+    pub registry: String,
+    pub workspace: String,
+    pub stack: String,
+    pub generation: String,
+    pub scope: &'static str,
+    pub retention: &'static str,
+    pub approximate_bytes: Option<i128>,
+    pub attached: bool,
+    pub inspection: VolumeInspection,
+}
+
+impl OwnedVolume {
+    fn observed(artifact: &ObservedArtifact, labels: &ResourceLabels) -> Self {
+        Self {
+            volume: artifact.id.clone(),
+            registry: labels.registry.clone(),
+            workspace: labels.workspace.clone(),
+            stack: labels.stack.clone(),
+            generation: labels.generation.clone(),
+            scope: labels.scope.as_str(),
+            retention: labels.retention.as_str(),
+            approximate_bytes: artifact.bytes.filter(|bytes| *bytes >= 0),
+            attached: artifact.signals.in_use,
+            inspection: if matches!(labels.scope, Scope::Stack | Scope::Machine)
+                || labels.retention == Retention::Pinned
+            {
+                VolumeInspection::DurableReleasePreview
+            } else {
+                VolumeInspection::RegistryHistory
+            },
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeInspection {
+    /// Inspect owning registry history. Foreign registries remain unknown.
+    RegistryHistory,
+    /// Run the existing read-only manifest volume-release preview in the
+    /// owning registry/workspace; it alone establishes eligible candidates.
+    DurableReleasePreview,
 }
 
 #[derive(Debug, Serialize)]
@@ -155,6 +206,8 @@ pub fn summarize(artifacts: &[ObservedArtifact], scan_partial: bool) -> OwnedSto
         invalid_label_volumes: 0,
         private_volumes: Vec::new(),
         private_volumes_omitted: 0,
+        other_volumes: Vec::new(),
+        other_volumes_omitted: 0,
         classes: [
             StorageClass::SharedCiCache,
             StorageClass::PrivateCiStorage,
@@ -192,6 +245,11 @@ pub fn summarize(artifacts: &[ObservedArtifact], scan_partial: bool) -> OwnedSto
             .iter_mut()
             .find(|row| row.class == class)
             .unwrap();
+        if class == StorageClass::OtherBosnVolume {
+            report
+                .other_volumes
+                .push(OwnedVolume::observed(artifact, &labels));
+        }
         if class == StorageClass::PrivateCiStorage {
             report.private_volumes.push(PrivateVolume {
                 volume: artifact.id.clone(),
@@ -233,6 +291,14 @@ pub fn summarize(artifacts: &[ObservedArtifact], scan_partial: bool) -> OwnedSto
     });
     report.private_volumes_omitted = report.private_volumes.len().saturating_sub(64);
     report.private_volumes.truncate(64);
+    report.other_volumes.sort_by(|a, b| {
+        b.approximate_bytes
+            .unwrap_or(i128::MAX)
+            .cmp(&a.approximate_bytes.unwrap_or(i128::MAX))
+            .then_with(|| a.volume.cmp(&b.volume))
+    });
+    report.other_volumes_omitted = report.other_volumes.len().saturating_sub(64);
+    report.other_volumes.truncate(64);
     report
 }
 
@@ -287,6 +353,63 @@ mod tests {
             age_seconds: Some(1.0),
         }
     }
+    #[test]
+    fn retained_owned_contributors_are_visible_without_authorizing_release() {
+        let mut artifact = volume("owner", Some(100), false);
+        artifact.id = "bosn-v-machine-retained".into();
+        artifact
+            .labels
+            .insert(bosn_core::LABEL_SCOPE.into(), "machine".into());
+        artifact
+            .labels
+            .insert(bosn_core::LABEL_RETENTION.into(), "pinned".into());
+        let report = summarize(&[artifact], false);
+        assert_eq!(report.other_volumes.len(), 1);
+        let detail = &report.other_volumes[0];
+        assert_eq!(detail.volume, "bosn-v-machine-retained");
+        assert_eq!(detail.registry, "owner");
+        assert_eq!(detail.scope, "machine");
+        assert_eq!(detail.retention, "pinned");
+        assert!(!detail.attached);
+        assert_eq!(detail.inspection, VolumeInspection::DurableReleasePreview);
+        assert_eq!(report.classes[2].approximate_bytes, Some(100));
+        let json = serde_json::to_value(report).unwrap();
+        let contributors = json.get("other_volumes").and_then(|v| v.as_array());
+        assert!(
+            contributors.is_some_and(|rows| rows.len() == 1),
+            "retained owned bytes need a size-ranked contributor, not only a class sum"
+        );
+    }
+
+    #[test]
+    fn other_volume_details_preserve_unknowns_and_totals_with_bounded_output() {
+        let mut artifacts: Vec<_> = (0..70)
+            .map(|n| {
+                let mut artifact = volume(&format!("owner{n}"), Some(n), n % 2 == 0);
+                artifact.id = format!("bosn-other-{n}");
+                artifact
+            })
+            .collect();
+        let mut unknown = volume("unknown", None, false);
+        unknown.id = "bosn-other-unknown".into();
+        artifacts.push(unknown);
+        let report = summarize(&artifacts, false);
+        assert_eq!(report.other_volumes.len(), 64);
+        assert_eq!(report.other_volumes_omitted, 7);
+        assert_eq!(report.other_volumes[0].volume, "bosn-other-unknown");
+        assert_eq!(report.other_volumes[0].approximate_bytes, None);
+        assert_eq!(report.other_volumes[1].approximate_bytes, Some(69));
+        assert_eq!(
+            report.other_volumes[1].inspection,
+            VolumeInspection::RegistryHistory
+        );
+        assert_eq!(report.classes[2].objects, 71);
+        assert_eq!(report.classes[2].unknown_size_objects, 1);
+        assert_eq!(report.classes[2].approximate_bytes, None);
+        assert!(report.partial);
+        assert!(report.private_volumes.is_empty());
+    }
+
     #[test]
     fn large_owned_storage_warns_even_without_unmanaged_objects() {
         let report = summarize(&[volume("owner", Some(100), true)], false);

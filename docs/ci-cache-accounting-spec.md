@@ -833,3 +833,32 @@ namespace byte/age policy and optional close-time aggregate policy; supervise
 The source-quiescent flag is caller responsibility, not a detector of old
 peers. This test does not authorize automatic source deletion or prove those
 Bosn daemon paths are implemented.
+
+## Other owned-volume contributors (candidate)
+
+`bosn scan --json` now exposes `other_volumes` and `other_volumes_omitted`
+within its existing owned-storage report. Each contributor identifies the volume,
+registry, workspace, stack, generation, scope, retention, attachment state and
+approximate Docker bytes. The 64 largest or unknown contributors remain visible;
+class counts and size semantics still cover all observed objects. These are
+not allocated-block measurements and cannot be added to shared-cache `du` totals.
+
+A typed advisory inspection hint distinguishes registry-history investigation
+from the existing read-only manifest durable-release preview for stack/machine
+or pinned data. Preview must use the owning registry/workspace and is itself
+responsible for establishing any eligible token. Labels, names, detached state
+and this contributor list establish no deletion authority; foreign/untracked
+and pinned data are preserved. No cleanup command was added or executed.
+
+A RED test showed retained bytes lacked any contributor detail. After the fix,
+ten owned-accounting tests pass in genuine isolated Docker. Strict all-target
+Clippy and source length/include gates also pass. Tests verify
+identity/retention visibility, unknown-first ranking, a 71-object/64-detail bound,
+unchanged totals and foreign-registry handling. The single reviewer passed this
+slice; full branch review remains unclaimed.
+
+CI run 37183643367 for act2 `578ce2b` ultimately ended cancelled: Linux was
+automatically superseded by the later test commit, not proven passing. Its
+Windows/macOS/lint/snapshot jobs passed. At current `7902785`, run 37184103814
+passed native Windows/macOS (including command cutover tests) and lint; Linux
+and snapshot were still running at the latest sample.
