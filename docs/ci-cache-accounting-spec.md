@@ -3310,7 +3310,7 @@ generation publication proceed, the current generation's exclusive reader-lock
 writer remains blocked, and failed validation releases the reader. Existing
 generation tests passed, including the race detector, in isolated Docker.
 Evidence: `.git/retention-native-admission-lock-{red,green,race}.log`.
-Review/publication/release are pending: this candidate is not in act2.8 or Bosn's
-pin. It does not remove full payload hashing or prove concurrent wall-time
+Primary source review passed; act2 PR #47 is open with full platform CI
+running. Release is pending: this candidate is not in act2.8 or Bosn's pin. It does not remove full payload hashing or prove concurrent wall-time
 improvement for 7.7 GiB trees. Production frozen selection, reader handoff,
 shared overlay, source quiescence, and automatic retention remain required.
