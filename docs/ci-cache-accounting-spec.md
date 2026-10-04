@@ -620,3 +620,22 @@ remain unverified. Engine partial-create failures in #452 are separate; helper
 recovery does not establish their resolution. Bosn still pins the released
 act2 without the candidate aggregate retention policy, so this change does not
 yet establish automatic machine-wide byte control.
+
+### Supervised act2 aggregate retry (local candidate)
+
+The candidate now adds `cache prune-cohort --apply --watch 1m`, emitting a JSON
+report for each bounded pass and retrying busy or incomplete outcomes after
+the interval. This provides a maintenance process independent of cache-server
+shutdown, including stores left behind by crashed servers. It uses existing
+exclusive cohort leases and refuses incomplete or legacy inventories before
+deletion. Single-pass failures retain their error exit; invalid intervals and
+policies fail before maintenance. Cancellation stops future passes.
+
+Focused CLI race tests turn the missing --watch repro GREEN and verify repeated
+partial reports plus recovery after an actual running handler releases its
+root lease. The retry lease test uses an empty store; byte convergence is still
+supported by the separate eight-cycle archive workload. Bosn does not yet
+launch or supervise this command, and its released act2 pin lacks it. Safe
+machine-wide warm migration, old-peer exclusion, headroom and physical storage
+admission remain open. This is a tested maintenance mechanism, not evidence of
+automatic Bosn byte-budget enforcement.
