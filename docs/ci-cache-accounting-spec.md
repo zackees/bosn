@@ -3797,3 +3797,10 @@ host Docker socket. Failure evidence remains in
 Focused recovery CLI tests passed; the full CLI package is not claimed green.
 Full remote CI must establish the release candidate gate in its normal test
 fixture before any release. No tests or assertions were weakened.
+
+The clean reviewed recovery candidate was pushed as act2 PR #50:
+https://github.com/zackees/act2/pull/50
+at exact head `802f5ab09ba44c26e6088b14c7598750a8acec23`.
+The PR body discloses the private-environment full CLI failure and incomplete
+Bosn enrollment. Existing remote full checks are the next verification gate;
+no release or Bosn pin change has been made for this candidate.
