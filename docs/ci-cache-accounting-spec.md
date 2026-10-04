@@ -48,7 +48,8 @@ publication after restart. It is not machine-wide routing or enrollment state.
 The candidate also executes bounded independent maintenance passes in durable
 finite-lived helpers and consumes typed retention outcomes. Participating cohort
 workflow engines and maintenance helpers now require the same shared policy
-record. Periodic scheduling and production enrollment are still unfinished.
+record. A callable cancellable periodic supervisor is now implemented; production
+startup policy discovery and enrollment remain unfinished.
 
 The tool-cache candidate uses unique save stages and skips hidden unfinished
 stages when rehydrating fresh engines. Its actual pinned-engine shell proof
@@ -1523,3 +1524,36 @@ fixture containers. These participating workflow and maintenance tests use the
 same machine policy (100 MiB repository, 200 MiB aggregate, 30-day maximum age,
 seven-day unused age, 60-second maintenance interval). This is not a production
 machine-policy migration or contention/retry throughput proof.
+
+### Callable periodic maintenance supervisor (2026-10-04 candidate)
+
+`supervise_cache_maintenance` runs independently of workflow engines. It starts
+with an immediate bounded helper-recovery pass, then an independent maintenance
+helper pass. Recovery has a 200-second budget and carries its fair cursor between
+ticks. A maintenance attempt has a 600-second outer budget, including pinned-image
+availability and the existing bounded helper operations. Started helpers retain
+their 300-second finite lifetime. Recovery errors do not erase maintenance
+outcomes or permanently suppress all subsequent passes.
+
+Each tick reports recovery and maintenance separately, preserving maintenance
+outcome versus cleanup status. A bounded report channel applies backpressure:
+the supervisor cannot launch further passes while the consumer is stalled.
+After reporting, it waits the configured interval before another pass. A fresh
+supervisor has no stale in-memory next-run timestamp and attempts immediately.
+Shutdown cancels recovery, execution, reporting or sleep; incomplete helper work
+remains in the durable journal for the established reconciliation path.
+
+This is a callable supervisor with an explicitly supplied trusted policy, not
+production daemon wiring or an enrollment API. Reports are typed but not yet
+persisted as maintenance history. Machine-wide duplicate-supervisor coordination,
+policy discovery/bootstrap, cancellation during individual Docker operations,
+old-peer exclusion and production admission still require work. The existing
+configuration guard stays in place. The actual idle periodic/restart proof
+passed in private Docker (73.75 seconds): two ticks with distinct helper IDs,
+complete typed maintenance outcomes, exact helper absence, stop during the
+interval and immediate restart pass within its 15-second observation budget.
+The shared volume survived and no fixture containers remained. Independent
+review passed. This does not test cancellation during create/exec or establish
+production daemon wiring.
+
+Strict service all-target Clippy passed for the supervisor (24.83 seconds).
