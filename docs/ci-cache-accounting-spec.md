@@ -901,3 +901,31 @@ actual Rust/Linux workflow receipts. Host global Bosn is 0.1.10; an isolated
 `uvx --from bosn==0.1.12` environment resolves and reports 0.1.12 without
 replacing the user's global executable. Running the full gate/stamping the
 candidate is the next required step before pushing this Bosn branch.
+
+## Actual gate cleanup failure on released Bosn 0.1.12
+
+The clean-source gate at `7179b6e` used isolated released Bosn 0.1.12
+(act2 0.2.89-act2.3) and its own registry/state. Rust run
+`e9701619-7ebb-4d51-8a91-c1001ce38b6e` passed with executed-step proof
+in 489 seconds and reported cleanup removed. Linux run
+`d58306d1-8da5-4af1-bff8-90046524e57a` completed all required workflow
+steps successfully (act exit 0): Install, Lint, and Test. Python results
+were 257 passed / 10 skipped; live Docker acceptance requires explicit opt-in.
+The overall run nevertheless ended error: engine cleanup failed with
+`Docker CLI exceeded its deadline`. The gate correctly refused attestation
+and exited 1 after 1114 seconds; this branch was not pushed.
+
+A subsequent exact-ID Docker inspection reported the Linux engine absent.
+That late observation does not rewrite the failed run or prove independent
+private-storage absence. No broad prune or user-daemon restart was performed.
+This is current live evidence extending #445 beyond its previously observed
+0.1.10 scope. Candidate online retry/named-storage behavior still needs to be
+validated against this workload before calling the failure resolved.
+
+Both successive fresh engines restored cached inputs. The Linux run restored
+a roughly 693 MB archive; the Rust run saved tools in 0.3 seconds. Linux
+native install prepared packages in 3m27s and uv reported a cross-filesystem
+hardlink fallback to full copying. This demonstrates reuse plus a remaining
+copy cost; it is not sustained convergence or a machine-wide physical cap.
+Bounded raw observations and gate receipts remain in task-owned Git metadata
+and logs. A draft PR body records scope and gaps, but push awaits a valid gate.
