@@ -369,23 +369,25 @@ impl ActParser {
     /// ([`super::flush`]): it is neither folded nor given a seq.
     pub fn feed(&mut self, seq: u64, line: &str) -> Option<LogRecord> {
         let line = line.trim_end_matches(['\r', '\n']);
-        let record = |job: Option<String>, section: Option<String>, text: String| LogRecord {
-            seq,
-            stream: "stdout".into(),
-            job,
-            section,
-            text,
-        };
+        let record =
+            |job: Option<String>, section: Option<String>, text: String, stream: &str| LogRecord {
+                seq,
+                stream: stream.into(),
+                job,
+                section,
+                text,
+            };
         let Ok(mut act) = serde_json::from_str::<ActLine>(line) else {
             if !line.trim().is_empty() {
                 self.tree.malformed_lines += 1;
             }
-            return Some(record(None, None, line.into()));
+            return Some(record(None, None, line.into(), "stdout"));
         };
         act.untrap();
         let text = act.text()?;
+        let stream = act.output_stream();
         let (Some(key), Some(job_id)) = (act.job_key(), act.job_id()) else {
-            return Some(record(None, None, text));
+            return Some(record(None, None, text, stream));
         };
         let notice = Notice::of(&act.msg);
         let key = self.tree.leg_key(&key, act.matrix.as_ref());
@@ -451,7 +453,7 @@ impl ActParser {
             }
             owned.then(|| format!("{}:{}", section.stage, section.id))
         });
-        Some(record(Some(key), section, text))
+        Some(record(Some(key), section, text, stream))
     }
 }
 
@@ -492,6 +494,16 @@ struct ActLine {
     execution_time: Option<u64>,
     #[serde(default)]
     raw_output: bool,
+    raw_stream: Option<RawStream>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum RawStream {
+    Stdout,
+    Stderr,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, schemars::JsonSchema)]
@@ -549,6 +561,13 @@ struct StepRef {
 }
 
 impl ActLine {
+    fn output_stream(&self) -> &'static str {
+        if self.raw_output && matches!(self.raw_stream, Some(RawStream::Stderr)) {
+            "stderr"
+        } else {
+            "stdout"
+        }
+    }
     /// Name and announce a step as the workflow wrote it: act names an
     /// unnamed `run:` step after its script, which in the run's copy starts
     /// with bosn's end-of-output trap. The step's own output is left alone.
@@ -655,6 +674,37 @@ mod tests {
         let (_, records) = parse(LIST, &lines);
         let texts: Vec<_> = records.iter().map(|r| r.text.as_str()).collect();
         assert_eq!(texts, ["⭐ Run Main one", "ok", "fatal: no newline"]);
+        assert!(
+            records
+                .iter()
+                .all(|r| r.section.as_deref() == Some("Main:0"))
+        );
+    }
+
+    #[test]
+    fn raw_act_lines_keep_their_source_stream() {
+        let raw = |message: &str, stream: Option<&str>| {
+            let mut line = serde_json::json!({"job": "w/a", "jobID": "a", "msg": message,
+                "raw_output": true, "stage": "Main", "step": "one", "stepID": ["0"]});
+            if let Some(stream) = stream {
+                line["raw_stream"] = stream.into();
+            }
+            line.to_string()
+        };
+        let lines = [
+            raw("out\n", Some("stdout")),
+            raw("err\n", Some("stderr")),
+            raw("old\n", None),
+        ]
+        .join("\n");
+        let (_, records) = parse(LIST, &lines);
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| r.stream.as_str())
+                .collect::<Vec<_>>(),
+            ["stdout", "stderr", "stdout"]
+        );
         assert!(
             records
                 .iter()
