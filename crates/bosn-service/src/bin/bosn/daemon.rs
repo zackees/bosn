@@ -90,6 +90,10 @@ pub(crate) fn run_daemon(mut arguments: impl Iterator<Item = std::ffi::OsString>
             .map(|(state_dir, runners)| DaemonInvocation::Serve { state_dir, runners }),
         "status" => parse_daemon_client_arguments(arguments)
             .map(|(state_dir, json)| DaemonInvocation::Status { state_dir, json }),
+        "url" => parse_daemon_client_arguments(arguments)
+            .map(|(state_dir, json)| DaemonInvocation::Url { state_dir, json }),
+        "token" => parse_daemon_client_arguments(arguments)
+            .map(|(state_dir, json)| DaemonInvocation::Token { state_dir, json }),
         "stop" => parse_daemon_client_arguments(arguments)
             .map(|(state_dir, json)| DaemonInvocation::Stop { state_dir, json }),
         _ => Err(()),
@@ -134,29 +138,7 @@ pub(crate) fn run_daemon(mut arguments: impl Iterator<Item = std::ffi::OsString>
             println!("daemon stopped");
         }
         DaemonInvocation::Status { state_dir, json } => {
-            let Ok(client) = Client::for_state(&state_dir) else {
-                daemon_failure("status", json)
-            };
-            // Ask for the version first: it is the one request every daemon
-            // release answers, so a mismatch is reported, not a bare failure.
-            let daemon_version = runtime.run(client.daemon_version()).ok();
-            let status = match runtime.run(client.status()) {
-                Ok(status) => status,
-                Err(_) => {
-                    if let Some(mismatch) = daemon_version.as_deref().and_then(|version| {
-                        bosn_service::daemon_version_mismatch(
-                            &state_dir,
-                            env!("CARGO_PKG_VERSION"),
-                            version,
-                        )
-                    }) && !json
-                    {
-                        eprintln!("bosn daemon status: {mismatch}");
-                    }
-                    daemon_failure("status", json)
-                }
-            };
-            print_daemon_status(&status, daemon_version.as_deref(), &state_dir, json);
+            run_daemon_status(&runtime, &state_dir, json);
         }
         DaemonInvocation::Stop { state_dir, json } => {
             if Client::for_state(&state_dir)
@@ -173,7 +155,35 @@ pub(crate) fn run_daemon(mut arguments: impl Iterator<Item = std::ffi::OsString>
                 println!("daemon stopped");
             }
         }
+        DaemonInvocation::Url { state_dir, json } => {
+            print_run_http_value(&runtime, &state_dir, "url", json);
+        }
+        DaemonInvocation::Token { state_dir, json } => {
+            print_run_http_value(&runtime, &state_dir, "token", json);
+        }
     }
+}
+
+fn run_daemon_status(runtime: &kernal_api::async_engine::Runtime, state_dir: &Path, json: bool) {
+    let Ok(client) = Client::for_state(state_dir) else {
+        daemon_failure("status", json)
+    };
+    // Ask for the version first: it is the one request every daemon
+    // release answers, so a mismatch is reported, not a bare failure.
+    let daemon_version = runtime.run(client.daemon_version()).ok();
+    let status = match runtime.run(client.status()) {
+        Ok(status) => status,
+        Err(_) => {
+            if let Some(mismatch) = daemon_version.as_deref().and_then(|version| {
+                bosn_service::daemon_version_mismatch(state_dir, env!("CARGO_PKG_VERSION"), version)
+            }) && !json
+            {
+                eprintln!("bosn daemon status: {mismatch}");
+            }
+            daemon_failure("status", json)
+        }
+    };
+    print_daemon_status(&status, daemon_version.as_deref(), state_dir, json);
 }
 
 pub(crate) enum DaemonInvocation {
@@ -182,6 +192,14 @@ pub(crate) enum DaemonInvocation {
         runners: RunnerOverrides,
     },
     Status {
+        state_dir: PathBuf,
+        json: bool,
+    },
+    Url {
+        state_dir: PathBuf,
+        json: bool,
+    },
+    Token {
         state_dir: PathBuf,
         json: bool,
     },
@@ -196,6 +214,8 @@ impl DaemonInvocation {
         match self {
             Self::Serve { .. } => "serve",
             Self::Status { .. } => "status",
+            Self::Url { .. } => "url",
+            Self::Token { .. } => "token",
             Self::Stop { .. } => "stop",
         }
     }
@@ -203,7 +223,10 @@ impl DaemonInvocation {
     pub(crate) fn json(&self) -> bool {
         match self {
             Self::Serve { .. } => false,
-            Self::Status { json, .. } | Self::Stop { json, .. } => *json,
+            Self::Status { json, .. }
+            | Self::Url { json, .. }
+            | Self::Token { json, .. }
+            | Self::Stop { json, .. } => *json,
         }
     }
 }
@@ -274,6 +297,33 @@ pub(crate) fn daemon_failure(action: &str, json: bool) -> ! {
         eprintln!("bosn daemon {action}: request failed");
     }
     std::process::exit(1)
+}
+
+fn print_run_http_value(
+    runtime: &kernal_api::async_engine::Runtime,
+    state_dir: &Path,
+    field: &str,
+    json_output: bool,
+) {
+    let live = Client::for_state(state_dir)
+        .and_then(|client| runtime.run(client.status()))
+        .is_ok();
+    if !live {
+        daemon_failure(field, json_output);
+    }
+    let path = state_dir.join(format!("run-http.{field}"));
+    let value = match std::fs::read_to_string(path) {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => daemon_failure(field, json_output),
+    };
+    if json_output {
+        let mut reply = serde_json::Map::new();
+        reply.insert("action".into(), json!(format!("daemon_{field}")));
+        reply.insert(field.into(), json!(value.trim()));
+        println!("{}", serde_json::Value::Object(reply));
+    } else {
+        println!("{}", value.trim());
+    }
 }
 
 pub(crate) fn print_daemon_status(

@@ -80,6 +80,7 @@ pub mod raw_run_log;
 mod registry_actor;
 mod registry_api;
 mod registry_records;
+mod run_http;
 pub mod runners;
 pub mod secrets;
 mod service;

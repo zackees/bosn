@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import re
 import subprocess
@@ -234,6 +235,16 @@ def run_captured(argv: list[str]) -> Captured:
         return Captured(child.returncode, output.read().decode("utf-8", errors="replace"))
 
 
+def bosn_argv() -> list[str]:
+    """Select a published runner while a broken current release is being fixed."""
+    version = os.environ.get("BOSN_GATE_VERSION")
+    if not version:
+        return ["bosn"]
+    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise ValueError("BOSN_GATE_VERSION must be a published x.y.z version")
+    return ["uvx", "--from", f"bosn=={version}", "bosn"]
+
+
 def head_sha() -> str:
     status = run_captured(["git", "status", "--porcelain"])
     head = run_captured(["git", "rev-parse", "HEAD"])
@@ -243,8 +254,7 @@ def head_sha() -> str:
 
 
 def command(selection: Selection) -> list[str]:
-    return [
-        "bosn",
+    argv = bosn_argv() + [
         "ci",
         "run",
         "--workspace",
@@ -268,12 +278,16 @@ def command(selection: Selection) -> list[str]:
         "3600000",
         "--json",
     ]
+    state_dir = os.environ.get("BOSN_GATE_STATE_DIR")
+    if state_dir:
+        argv.extend(["--state-dir", str(Path(state_dir).resolve())])
+    return argv
 
 
 def run_selection(selection: Selection) -> int:
     try:
         head = head_sha()
-        version = run_captured(["bosn", "--version"])
+        version = run_captured(bosn_argv() + ["--version"])
         error = version_error(version.output, version.returncode)
         if error:
             raise ValueError(error)
