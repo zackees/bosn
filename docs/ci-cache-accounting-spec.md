@@ -3804,3 +3804,40 @@ at exact head `802f5ab09ba44c26e6088b14c7598750a8acec23`.
 The PR body discloses the private-environment full CLI failure and incomplete
 Bosn enrollment. Existing remote full checks are the next verification gate;
 no release or Bosn pin change has been made for this candidate.
+
+### Physical post-stop recovery and a fresh engine (candidate, 2026-10-04)
+
+A task-owned isolated-Docker experiment now exercises recovery through the act2
+candidate CLI (`802f5ab`), the native PID1 reader and the current Bosn overlay
+preparation recipe. Two inner jobs share changed settings and a metadata-only
+payload mode change; the 16 MiB upper payload still allocates zero blocks. The
+shared immutable lower remains unchanged. A durable recovery reservation is
+acknowledged before the engine is removed; its source disk volume is retained.
+
+After engine removal the original reader admits an exclusive probe. Selection
+is advanced with an additional completed Node install. A pressure/age sweep
+preserves the stopped engine's now-unselected lower through its recovery
+reference. A helper takes that original native reader, mounts the saved overlay,
+reads the identical payload hash and changed settings, and publishes the closed
+Python install. Updating the latest generation preserves the newer Node install.
+A fresh engine with a new empty private disk then mounts that selected lower;
+an actual inner job sees both the recovered settings and newer Node payload,
+with the original Python payload hash. The helper and fresh engine are removed,
+reference release is durably acknowledged, and a subsequent sweep retires the
+old lower. All task-labelled containers and volumes are verified and removed.
+
+Evidence: `.git/retention-native-poststop-recovery-proof.{py,json,log}`.
+The first candidate build used dynamic linking unavailable in the Alpine
+fixture; a CGO-disabled build corrected the harness. A second attempt reached
+reference protection but the harness treated a JSON null retired list as an
+array. Both failed attempts and complete cleanup evidence are retained in
+`retention-native-poststop-recovery-{dynamic-build,null-receipt}-failure` files.
+No production assertion or retention limit was changed to obtain this result.
+
+This is a controlled physical proof of warm recovery across fresh engines.
+It manually supplies trusted source-volume ownership and stopped-writer evidence
+and directly drives the CLI, bypassing the normal Bosn planner/registry cleanup.
+Normal durable intent, bounded recovery scheduling, source volume lifetime,
+publication completion and reference release still require Bosn integration.
+It is not proof of automatic enrollment, compiler/archive persistence, machine
+ceilings, cross-class inode accounting or old image/build/container expiry.
