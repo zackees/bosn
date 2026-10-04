@@ -228,6 +228,10 @@ pub struct CacheComponent {
     pub class: CacheClass,
     /// Repository hash for an act cache store; absent for class totals.
     pub namespace: Option<String>,
+    /// Store path relative to the shared volume. Distinguishes retained legacy
+    /// and imported stores for the same repository; never deletion authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_path: Option<String>,
     pub bytes: Option<u64>,
     pub allocated_bytes: Option<u64>,
 }

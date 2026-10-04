@@ -774,3 +774,31 @@ CI now selects the lease and separate-process transfer tests as well as import
 tests. Review found no concrete protocol defect; native Windows execution of
 this correction remains pending. This does not complete Bosn policy wiring,
 maintenance supervision, warm cutover or machine-wide physical budgeting.
+
+## Warm-cutover store accounting (candidate)
+
+The integration destination layout is `actcache/cohort-v1/<repository hash>`,
+separate from retained legacy `actcache/<repository hash>`. The class and volume
+totals already contain both. Namespace diagnostics now additionally enumerate
+the cohort layout and expose optional `store_path`, relative to the shared
+volume, so equal repository hashes cannot hide the retained source or import.
+The CLI shows that path and remains compatible with older replies lacking it.
+Top-256 namespace limits apply across both layouts; these separate non-atomic
+samples must not be added to the inclusive class/volume total. This path is
+accounting provenance, not deletion authority or proof of cohort enrollment.
+
+An actual shell measurement in isolated Docker was RED (only one namespace
+reported for two same-repository stores), then GREEN. The fixture checks both
+paths, distinct apparent/allocated measurements, and exclusion of a symlinked
+namespace. Malformed/uppercase cohort hashes remain partial. Targeted accounting
+tests pass: 17 passed, two live-Docker cases intentionally excluded from this
+slice. Strict all-target bosn-service Clippy also passes. Source length/include gates
+pass and the single reviewer passed this
+slice; full Bosn branch review remains unclaimed.
+
+Act2 `578ce2b` native Windows and macOS jobs in run 37183643367 passed,
+including imports, read-only lease exclusion and separate-process transfer
+protection; lint also passed. Full Linux and snapshot jobs were still running
+when sampled. This supersedes the pending native correction result above.
+Bosn still pins the older released act2: no automatic migration, new-root
+server routing, retention flags or maintenance supervisor is enabled yet.

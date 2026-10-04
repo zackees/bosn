@@ -716,10 +716,12 @@ fn print_cache(cache: &bosn_service::ci::CacheUsage) {
     components
         .sort_by_key(|component| std::cmp::Reverse(component.allocated_bytes.or(component.bytes)));
     for component in components.into_iter().take(20) {
-        let identity = component.namespace.as_ref().map_or_else(
-            || component.class.as_str().into(),
-            |namespace| format!("{}/{}", component.class.as_str(), namespace),
-        );
+        let identity = component.store_path.clone().unwrap_or_else(|| {
+            component.namespace.as_ref().map_or_else(
+                || component.class.as_str().into(),
+                |namespace| format!("{}/{}", component.class.as_str(), namespace),
+            )
+        });
         let size = component
             .allocated_bytes
             .or(component.bytes)

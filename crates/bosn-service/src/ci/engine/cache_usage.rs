@@ -57,10 +57,11 @@ pub(super) fn parse(volume: &str, output: &str) -> CacheUsage {
         if fields[0] == "total" {
             report.bytes = bytes;
             report.allocated_bytes = allocated_bytes;
-        } else if let Some((class, namespace)) = identity {
+        } else if let Some((class, namespace, store_path)) = identity {
             report.components.push(CacheComponent {
                 class,
                 namespace,
+                store_path,
                 bytes,
                 allocated_bytes,
             });
@@ -105,7 +106,7 @@ fn bound_components(report: &mut CacheUsage) {
                     .unwrap_or(u64::MAX)
                     .cmp(&a.allocated_bytes.or(a.bytes).unwrap_or(u64::MAX))
             })
-            .then_with(|| a.namespace.cmp(&b.namespace))
+            .then_with(|| a.store_path.cmp(&b.store_path))
     });
     report.components.truncate(classes + MAX_NAMESPACES);
     measurement_error(
@@ -117,18 +118,31 @@ fn bound_components(report: &mut CacheUsage) {
     );
 }
 
-fn component_identity(key: &str) -> Option<(CacheClass, Option<String>)> {
-    if let Some(namespace) = key.strip_prefix("namespace:") {
+fn component_identity(key: &str) -> Option<(CacheClass, Option<String>, Option<String>)> {
+    let store = key
+        .strip_prefix("namespace:")
+        .map(|namespace| (namespace, "actcache"))
+        .or_else(|| {
+            key.strip_prefix("cohort-v1:")
+                .map(|namespace| (namespace, "actcache/cohort-v1"))
+        });
+    if let Some((namespace, root)) = store {
         return (namespace.len() == 16
             && namespace
                 .bytes()
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
-        .then(|| (CacheClass::Actcache, Some(namespace.into())));
+        .then(|| {
+            (
+                CacheClass::Actcache,
+                Some(namespace.into()),
+                Some(format!("{root}/{namespace}")),
+            )
+        });
     }
     CLASSES
         .iter()
         .find(|class| class.as_str() == key)
-        .map(|class| (*class, None))
+        .map(|class| (*class, None, None))
 }
 
 /// Only Docker's explicit absence verdict can mean an absent cache. Engine
@@ -352,6 +366,8 @@ mod tests {
         for output in [
             "total 1 2\ntotal 3 4",
             "namespace:../../foreign 1 2",
+            "cohort-v1:../../foreign 1 2",
+            "cohort-v1:0123456789abcdeF 1 2",
             "tools 1 2 3",
             "tools overflow 2",
         ] {
@@ -371,6 +387,16 @@ mod tests {
         let namespace = root.path().join("actcache/0123456789abcdef");
         std::fs::create_dir_all(&namespace).unwrap();
         std::fs::write(namespace.join("archive"), "cached").unwrap();
+        let imported = root.path().join("actcache/cohort-v1/0123456789abcdef");
+        std::fs::create_dir_all(&imported).unwrap();
+        std::fs::write(imported.join("archive"), "imported").unwrap();
+        #[cfg(unix)]
+        {
+            let foreign = root.path().join("outside");
+            std::fs::create_dir_all(foreign.join("fedcba9876543210")).unwrap();
+            std::os::unix::fs::symlink(&foreign, root.path().join("actcache/1111111111111111"))
+                .unwrap();
+        }
         let script = SCRIPT.replace("root=/cache", &format!("root='{}'", root.path().display()));
         let output = kernal_api::run_bounded_command(
             kernal_api::SpawnSpec::new("sh")
@@ -386,6 +412,27 @@ mod tests {
         assert_eq!(output.exit.raw_code(), 0);
         let report = parse("test", &String::from_utf8_lossy(&output.stdout));
         assert!(!report.partial, "{report:?}");
+        assert_eq!(
+            report
+                .components
+                .iter()
+                .filter(|c| c.namespace.is_some())
+                .count(),
+            2,
+            "retained legacy and imported stores must remain separately visible"
+        );
+        let stores: BTreeSet<_> = report
+            .components
+            .iter()
+            .filter_map(|c| c.store_path.as_deref())
+            .collect();
+        assert_eq!(
+            stores,
+            BTreeSet::from([
+                "actcache/0123456789abcdef",
+                "actcache/cohort-v1/0123456789abcdef"
+            ])
+        );
         assert!(report.bytes.unwrap() > report.allocated_bytes.unwrap());
         assert!(
             report.components.iter().any(
