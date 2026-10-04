@@ -241,6 +241,8 @@ pub struct ActEngineRecord {
     /// Frozen before reserving a native lower; absent in historical records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_recovery: Option<ActToolRecoveryIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_recovery_reserved_at: Option<f64>,
 }
 /// Keyset page ordered by immutable canonical run UUID, independent of state.
 #[derive(Clone, Debug, PartialEq)]
@@ -391,6 +393,15 @@ impl ActEngineIntent {
 impl ActEngineRecord {
     fn validate(&self) -> Result<(), Error> {
         self.intent.validate()?;
+        if self.tool_recovery_reserved_at.is_some_and(|at| {
+            !at.is_finite()
+                || at > self.updated_at
+                || self.tool_recovery.as_ref().is_none_or(|intent| {
+                    at < intent.created_at_seconds as f64 || at >= intent.expires_at_seconds as f64
+                })
+        }) {
+            return Err(Error::BadRow("tool recovery reservation acknowledgement"));
+        }
         if let Some(recovery) = &self.tool_recovery {
             recovery.validate_record(self)?;
         }
@@ -523,6 +534,7 @@ impl Immediate<'_> {
             updated_at: intent.created_at,
             binding: None,
             tool_recovery: None,
+            tool_recovery_reserved_at: None,
         })
     }
     /// Exact ownership predicate for both registration and pending-intent

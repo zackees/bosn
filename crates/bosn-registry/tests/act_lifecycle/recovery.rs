@@ -73,6 +73,25 @@ fn tool_recovery_intent_survives_restart_and_refuses_changed_claim_or_lifetime()
             .begin_act_tool_recovery(RUN, CLAIM, 4, 3605)
             .is_err()
     );
+    let mut tx = registry.begin_immediate().unwrap();
+    tx.acknowledge_act_tool_recovery(RUN, CLAIM, &frozen, 5.0)
+        .unwrap();
+    tx.commit().unwrap();
+    assert_eq!(
+        registry
+            .act_engine(RUN)
+            .unwrap()
+            .unwrap()
+            .tool_recovery_reserved_at,
+        Some(5.0)
+    );
+    assert!(
+        registry
+            .begin_immediate()
+            .unwrap()
+            .acknowledge_act_tool_recovery(RUN, CLAIM, &frozen, 3604.0)
+            .is_err()
+    );
     assert_eq!(
         registry.act_engine(RUN).unwrap().unwrap().tool_recovery,
         Some(frozen)

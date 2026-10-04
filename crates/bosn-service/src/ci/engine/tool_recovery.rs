@@ -96,8 +96,9 @@ impl DockerActBackend {
             .and_then(|p| p.tool_generation.as_ref())
             .ok_or("tool recovery generation missing")?
             .max_payload_bytes;
+        let encoded_len = encoded.len();
         let script = format!(
-            "record={path}; expected='{encoded}'; if [ -e \"$record\" ] || [ -L \"$record\" ]; then [ -f \"$record\" ] && [ ! -L \"$record\" ] && [ \"$(wc -c <\"$record\")\" -le 1024 ] && [ \"$(cat \"$record\")\" = \"$expected\" ] || {{ echo 'tool recovery record differs or is unsafe' >&2; exit 1; }}; else (set -C; printf '%s' \"$expected\" >\"$record\"); fi; exec {ENGINE_WORK}/bin/act --cache-server-path {root} cache tool-recovery reserve --record \"$record\" --max-bytes {max} --apply"
+            "record={path}; expected='{encoded}'; if [ -e \"$record\" ] || [ -L \"$record\" ]; then [ -f \"$record\" ] && [ ! -L \"$record\" ] && [ \"$(wc -c <\"$record\")\" -eq {encoded_len} ] && [ \"$(cat \"$record\")\" = \"$expected\" ] || {{ echo 'tool recovery record differs or is unsafe' >&2; exit 1; }}; else (set -C; printf '%s' \"$expected\" >\"$record\"); fi; exec {ENGINE_WORK}/bin/act --cache-server-path {root} cache tool-recovery reserve --record \"$record\" --max-bytes {max} --apply"
         );
         let receipt = self
             .checked(

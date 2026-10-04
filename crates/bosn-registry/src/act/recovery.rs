@@ -112,3 +112,34 @@ impl Immediate<'_> {
         self.store_act_record(&record)
     }
 }
+
+impl Immediate<'_> {
+    /// Trusted runtime supplies this only after an exact non-partial act2 receipt.
+    /// Recording protection does not prove source writers stopped.
+    pub fn acknowledge_act_tool_recovery(
+        &mut self,
+        run: &str,
+        token: &str,
+        intent: &ActToolRecoveryIntent,
+        at: f64,
+    ) -> Result<(), Error> {
+        let mut record = self
+            .act_record(run)?
+            .ok_or(Error::BadRow("act intent missing"))?;
+        record.check_time(at)?;
+        if record.state != ActEngineState::Registered
+            || record.execution_claim.as_deref() != Some(token)
+            || record.execution.is_some()
+            || record.tool_recovery.as_ref() != Some(intent)
+            || at >= intent.expires_at_seconds as f64
+        {
+            return Err(Error::BadRow("tool recovery acknowledgement transition"));
+        }
+        if record.tool_recovery_reserved_at.is_some() {
+            return Ok(());
+        }
+        record.tool_recovery_reserved_at = Some(at);
+        record.updated_at = at;
+        self.store_act_record(&record)
+    }
+}
