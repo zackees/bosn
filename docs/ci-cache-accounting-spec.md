@@ -2678,3 +2678,284 @@ gate remains pending. No production cancellation code changed. This evidence
 does not prove that stopping a Docker client stops a remote command, nor does it
 close the daemon-crash, uncertain creation/start, or engine-lifetime recovery
 requirements.
+
+
+### Verified object retirement and pressure-sweep integration
+
+Act2 PR #38 adds `RetireToolObject(ctx, root, id, maxBytes, maxGenerations)`.
+The original catalog writer spans complete current-selection validation, bounded
+retained-generation manifest inventory, verified object payload/layout and mount
+identity checks, removal and root-directory sync. Every retained generation
+reference protects its object, including idle old generations and live readers.
+Unknown namespace entries, missing/corrupt manifests, and exhausted reference
+bounds refuse deletion. Candidate objects must have exactly the closed tree and
+manifest control layout. Unknown state and unverified payloads stay intact.
+
+Missing API regression was RED then GREEN: an object stays while selected,
+while an old reader lives, and while its idle old generation remains; after that
+last generation is retired, object deletion reclaims at least its one-MiB payload
+allocation and the selected replacement remains valid. Strengthened tests use an
+otherwise unreferenced orphan to prove unknown/missing/bounded reference refusal.
+Complete package tests, vet/lint and cumulative review passed. Exact-source gate
+passed in 20.65 seconds on `f63c19243cf128b35923e2d626bad303922b9344`, tree
+`958851bf886d9e565ec5b4fad70490c6365c7d3e`, covering 2,578 exported files and
+Darwin/Windows compilation. Evidence: `act2-tool-object-retirement-source-bound-gate`
+JSON/log and `act2-tool-object-retirement-reference-checks.log`.
+
+The following local `feat/tool-object-retention-policy` slice integrates object
+retirement into the age/pressure sweep. A real failing regression showed that
+retiring generation metadata alone left an unreferenced one-MiB object allocated.
+It now passes: bounded object candidates are inventoried before mutation,
+generation retirement runs first, then verified unreferenced objects expire by
+age or pressure, oldest first. Each attempted mutation gets fresh accounting.
+Typed reports distinguish retired/protected objects and generations. Referenced
+objects are protected without claiming a failure; unknown/corrupt reference state
+is partial and preserved. The catalog writer remains held throughout both sweeps.
+Full package tests, vet/lint and review pass; exact-source gate on
+`e9281ab` is pending. Production activation remains absent.
+
+Stage expiry, automatic production scheduling, CLI entry point, last-use evidence,
+7.7-GiB scan efficiency, whole-machine cross-class allocation and sustained caps
+remain open. These slices have not been released or pinned into Bosn. Old
+containers/images and scoped builder-cache pressure remain separate required
+parts of the original objective.
+
+
+#### Crash-leftover stage ownership gap
+
+Source inspection confirms object and generation publishers create private stages
+with `MkdirTemp`, report their paths and attempt deferred cleanup. They do not
+persist ownership evidence for a later crash-recovery sweep. A stage-looking
+prefix is therefore insufficient proof for deleting a discovered old directory.
+The planned fix records typed relative path, creation time and original
+filesystem/inode identity in synced ownership files while the original catalog
+writer is held. The catalog descriptor remains a read-only mutex. Publication and cleanup must retire this record after successful
+rename/removal. Crash windows before registration leave unknown preserved state;
+a record after rename must never authorize deleting a replacement at its old path.
+
+Focused new regressions are RED with missing stage-ownership and expiry APIs:
+original catalog exclusion blocks expiry during a living publisher, registered
+old stages expire, same-prefix unregistered directories remain, and replacement
+inode identities refuse deletion. Stage cleanup must also apply bounded metadata
+and mount-ID checks and report physical accounting after mutation. No stage was
+deleted from a production/shared cache during this investigation. Evidence:
+`act2-tool-stage-retention-red.log`. This work remains unimplemented.
+
+
+### Durable stage ownership and bounded expiry (local implementation)
+
+Candidate `32ce983` wires registered stage creation into both object and generation
+publishers. Ownership records live in `.tool-publication-ownership-v1`, coordinated
+by the original catalog writer. An attempted bbolt transaction failed in the
+focused tests because coordination descriptors intentionally stay read-only; that
+mutex contract was preserved and the design moved to separately synced files.
+Each exclusive record leaf is the SHA-256 of a typed relative stage path, with
+canonical schema-1 JSON (at most 1,024 bytes), original device/inode/mount identity
+and UTC creation time. Stage parent, record file and ownership directory are
+synced before payload fill. Records are bounded at ten thousand; creation refuses
+at capacity before creating another stage. Unknown or malformed ledger state
+refuses recovery rather than inferring ownership from names.
+
+`RetireToolStages(ctx, root, expireBefore, maxEntries)` holds catalog exclusion,
+requires an explicit age cutoff and bounded complete store inventory, and deletes
+only registered expired stages with matching original inode and mount identity.
+Descendant mount-ID validation rejects bind mounts; unregistered stage-looking
+directories and replacement identities stay intact. Cleanup reports physical
+allocation after each attempt. Publication/removal sync precedes record deletion.
+A stale record whose original path is absent is cleared after parent sync without
+touching any published destination. Failed registration retains `pending_stage`
+for the private footprint. Deferred publisher cleanup uses bounded time derived
+from the caller context with cancellation detached for recovery.
+
+Verified regressions: original catalog prevents expiry while a publisher lives;
+registered old stage expires; unknown prefix is preserved; replacement directory
+identity refuses; a lost post-rename sync acknowledgement leaves an ownership
+record that recovery clears while the published object remains fully valid.
+Independent review caught creation of record 10,001 at capacity. Fixed regression
+uses ten thousand actual records, proves refusal before stage creation, then
+confirms an existing expired stage remains recoverable. Full package tests,
+vet/lint and cumulative review pass. Final exact-source gate is running.
+Evidence: `act2-tool-stage-capacity-check.log`,
+`act2-tool-stage-publication-checks2.log`, `act2-tool-stage-split-lint.log` and
+`act2-tool-stage-source-bound-gate` JSON/log.
+
+Not released or activated in Bosn. Stage expiry is not yet part of the combined
+retention scheduler or CLI. Earlier unregistered leftovers are deliberately
+preserved until separate ownership evidence exists. Root-level selection JSON
+stages are still a separate lifecycle requirement. Large-store efficiency,
+production overlay/reader admission, whole-machine accounting and old engine,
+image and scoped builder-cache expiry remain required.
+
+
+### Combined sweep and native retention command
+
+Act2 PR #41 runs owned stage expiry before generation/object retirement under the
+same original catalog writer. Selection, complete initial accounting and bounded
+candidate inventories validate before mutations. A partial stage result stops
+later deletion; fresh stage allocation becomes the next sweep's observation.
+Regression was RED with a registered one-MiB stage remaining, then GREEN for
+stage removal, physical reclamation and selected-generation preservation. Full
+package tests, vet/lint, review and exact-source gate passed in 22.40 seconds on
+`edd6acc1e331c53883424229493153caa1e8628b`, tree
+`4d980f78cf235b7d826bd2926dd1c4faf39e4124` (2,586 exported files).
+
+Local CLI candidate `e6eaabc` exposes the sweep:
+
+```sh
+act cache tool-retain --cache-server-path /absolute/tool-store \
+  --max-allocated-bytes 8589934592 --max-payload-bytes 17179869184 \
+  --expire-before 2026-10-01T00:00:00Z \
+  --max-entries 1000000 --max-candidates 10000 --apply
+```
+
+These are example policy values, not default production settings. All bounds and
+an explicit RFC3339 cutoff are required. Missing `--apply` refuses before mutation;
+`tool-usage` remains the read-only inventory command. The retention command emits
+a typed JSON report before returning an error for partial results or protected
+overflow. A complete pass that remains over cap therefore does not masquerade as
+successful quota convergence. The cap is scoped tool-store inode allocation,
+not machine-wide or Docker backing allocation.
+
+Command regression was RED with the command/flags absent, then GREEN: omitted
+`--apply` preserves an old generation, explicit mutation retires it, cap-one emits
+complete protected-overflow JSON and nonzero status, and the selected successor
+remains valid. Command vet/lint and cumulative review pass; final exact-source
+CLI gate is running. Evidence: `act2-tool-stage-policy-source-bound-gate` JSON/log,
+`act2-tool-retention-cli-red.log`, `-green.log` and CLI source-bound gate JSON/log.
+
+The dependent PR chain has been reconstructed on current act2 master to resolve
+conflicts from earlier squash merges; rebuilt trees exactly match reviewed trees.
+PR #37's updated exact-source gate passed on `6684ba9`. Rebuilt later commits
+still require their own source verification before branch updates. All changes
+remain unreleased and unused by production Bosn. Automatic scheduling, frozen
+engine profile and reader handoff, real workflow overlay/publication, selection
+JSON stage lifecycle, large-store efficiency, whole-machine accounting and old
+engine/image/scoped-builder expiry remain required.
+
+
+### Retention and selection recovery checkpoint (2026-10-04)
+
+The reconstructed act2 branch chain retains the previously reviewed source trees.
+Each pushed candidate passed a fresh exact-source scoped gate: stage ownership
+`dd8e94b` (2,585 exported files), combined stage policy `57fffbd` (2,586 files),
+and retention CLI `9fa189c` (2,588 files). Coverage includes full artifactcache
+tests, focused tool-command tests, vet, lint, and Darwin/Windows compilation.
+These gates do not replace full CI on the exact default-branch release commit.
+PRs #40, #41 and #42 are updated; their parent object-retirement PR #38 is waiting
+for a rerun of Linux CI after an unrelated hosted-runner test hit GitHub's API
+rate limit. Downstream conflicts must be resolved against each actual merged
+parent before their remote gates and merge. No newer act2 release or Bosn pin
+is claimed.
+
+The remaining selection temporary-file ownership gap has a local implementation
+in `8143cf3`. Selection JSON is now written inside the existing registered
+`.tool-stage-` private directory while holding the original catalog writer.
+The file and its directory are synced before the pointer rename. Successful
+selection and stage cleanup leave no ownership record. A failed post-rename
+root sync reports `Selected=true`, `Partial=true`, and the owned directory in
+`PendingSelection`; cleanup deliberately preserves that uncertainty for recovery.
+The existing stage expiry verifies the original inode and mount, then removes
+only the private directory and its record. It preserves the selected pointer and
+published generation; unknown historical `.tool-current-stage-` files remain
+unregistered and cannot be deleted from a name or age inference.
+
+The focused regression was RED because the prior implementation reported an
+empty pending path after injected sync failure. It is now GREEN: recovery expires
+the owned stage, pointer bytes remain identical, full selected-generation
+validation succeeds, and a successful retry leaves no ownership rows. Full
+artifactcache tests, focused command tests, vet/lint and cumulative independent
+review pass. Final exact-source scoped verification passes for `8143cf3334a930a40a674a9bc8d0267cd0561642` (2,588 exported files, 29.73 seconds), including Darwin/Windows compilation. This is bounded
+recovery of owned staging, not daemon-crash or remote-command lifetime proof.
+Production handoff, real jobs sharing the warm generation across fresh engines,
+whole-machine cross-class accounting, automatic expiry of owned containers/images
+and scoped builder cache, and sustained pressure convergence remain required.
+
+
+### Merged object retirement and rebased retention chain
+
+Act2 #38's Linux rerun passed and the object-retirement primitive merged as
+`e8b69c8`. PRs #39–#43 are now reconstructed on that actual merged parent.
+Fresh source-bound gates pass before every branch update, and each reconstructed
+tree is identical to its reviewed predecessor:
+
+| Slice | Exact source commit | Exported files |
+| --- | --- | --- |
+| Object sweep (#39) | `8d84fc2e39974771030b7e6d8b4c6253d292d0d9` | 2,580 |
+| Stage ownership (#40) | `c58390b1cb0cf27a988236dff4c66c99eb85ee50` | 2,585 |
+| Combined stage policy (#41) | `f02fe9bf97231916035f7b71d19ff34baed9db4b` | 2,586 |
+| Retention CLI (#42) | `bf47a59619ed8cb84bb2dcff1bd6700c79d53172` | 2,588 |
+| Selection-stage recovery (#43) | `6db80530c2d81f6b517a35fe2c8d98dbafbe7bc2` | 2,588 |
+
+The private Go harness's 6 GiB tmpfs filled during the final source export:
+3.2 GiB of build cache, 849 MiB of modules, 283 MiB of lint cache and repeated
+116 MiB source copies were observed. The incomplete export was not used for
+push or verification. A new task-owned, read-only-root container with a 12 GiB
+private tmpfs received the existing Go caches and a complete clean source export.
+Disabling networking initially failed existing cache-server tests' outbound-IP
+discovery; restoring the original bridge configuration fixed the harness. The
+final source-bound gate passes in 74.24 seconds, with full cache tests, focused
+commands, vet/lint and Darwin/Windows compilation, and 4.5 GiB observed tmpfs use.
+This is test-harness capacity evidence, not proof of production cache convergence.
+
+Bosn's committed shutdown-fixture correction passed its exact-source Rust lane
+in 669 seconds with clean-source and executed-step proof. Its Linux lane remains
+running; no completed full Bosn gate or publication is claimed yet. Act2 remote
+checks are running on the reconstructed heads. Preserve ancestry with ordinary
+merge commits for this chain where repository settings permit; exact default-
+branch full CI and artifact checks remain required before the necessary release.
+No release newer than act2.7 exists, and Bosn still has no activation of these
+shared-tool-generation retention features.
+
+
+### Production bootstrap boundary: current code and required change
+
+Inspection of `act_engine/create.rs` and `ci/engine.rs` confirms that the
+controller currently registers and starts the created engine before
+`prepare_engine` waits for readiness and installs the pinned act binary.
+`prepare_run` then copies the legacy tool cache into the inner volume. The current
+PID-1 command executes `ENGINE_INIT` directly; it does not admit or retain a
+shared-tool-generation reader. The earlier native-exec experiment therefore
+does not establish production reader ownership.
+
+The production change must freeze the tool-store mount, chosen generation and
+act artifact digests together with the exact startup command. Bootstrap can
+reuse the current digest-verified cached archive installation before entering
+the existing engine INIT, then replace PID 1 through `act cache tool-exec` so
+the original reader descriptor survives into INIT and the running engine.
+Installing act only after readiness cannot supply that startup guarantee.
+The inner writable tool-cache volume must be an overlay of the verified
+read-only generation and private upper/work directories, rather than the
+current whole-tree seed copy.
+
+Downloading or staging before reader admission leaves a possible retirement
+race. The helper must refuse missing or invalid chosen generations; the
+controller must replan/retry from the latest valid warm selection, never
+substitute an empty cache. Durable engine ownership remains required before
+creation/start, recovery must validate the frozen profile, and uncertain start
+or cleanup must not release protection based only on client cancellation or
+daemon death. Completed installs may publish successors only after actual
+workflow writers are quiescent. These are planned production requirements,
+not implemented behavior or completed lifetime proof. Large-cache admission
+currently hashes full payloads and still requires measured optimization.
+
+
+### Publication checkpoint after passing gates (2026-10-04)
+
+Act2 #39, #40, #41 and #42 are merged with ordinary merge commits after all
+remote checks passed on their exact reviewed heads. Their ancestry is retained
+for the remaining selection-stage PR #43, now retargeted to master. Its Linux
+check remains pending. Full release CI on the final default-branch candidate
+has not yet been dispatched, and act2.7 remains Bosn's pin.
+
+Bosn #497 is merged as `51df270e`: the atomic PID fixture and bounded reaping
+observation passed the complete local gate in 1,379 seconds (Rust669s, Linux710s).
+The pinned verifier accepted stamped source `9407300a38d78bfb27fda619a47f52145579812f`
+and remote local-gate attestation/minimal checks passed. Earlier pending-gate
+statements describe the preceding checkpoint. Production cancellation behavior
+is unchanged; remote-command and engine-lifetime proof remains outstanding.
+
+The queued object/stage/CLI/selection documentation is being consolidated onto
+this fixed Bosn main so the required documentation publication gate includes
+the corrected shutdown test. This checkpoint does not claim an act2 feature
+release, production generation admission, machine-wide convergence, or automatic
+expiry of all owned engine/image/builder-cache classes.
