@@ -10,6 +10,9 @@ pub fn root() -> String {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Namespace(String);
 impl Namespace {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
     pub fn parse(value: &str) -> Result<Self, String> {
         if value.len() != 16
             || !value

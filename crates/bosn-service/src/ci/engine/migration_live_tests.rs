@@ -1,6 +1,7 @@
 //! Actual published-binary import through Bosn's Docker transport.
 use super::*;
 use crate::ci::cache_import::PublicationReceipt;
+use bosn_registry::cache_migration::CacheMigrationIntent;
 use std::path::Path;
 
 #[test]
@@ -35,11 +36,32 @@ fn published_binary_import_preserves_source_and_has_typed_historical_receipt() {
             let before = backend.checked("source before", owned(&["exec", id, "sh", "-ec", &snapshot]), super::super::CONTROL_DEADLINE).await?;
             let namespace = Namespace::parse("0123456789abcdef")?;
             let policy: CachePolicy = toml::from_str("repository_max_bytes=100\naggregate_max_bytes=200\nmax_age_secs=3600\nunused_age_secs=1800\nmaintenance_interval_secs=60\n").map_err(|e| e.to_string())?;
+            let directory = kernal_api::platform::fs::TemporaryDirectory::new().map_err(|e| e.to_string())?;
+            let path = directory.path().join("registry.sqlite3");
+            let mut registry = Registry::create_writer(&path, &nonce).map_err(|e| e.to_string())?;
+            let mut tx = registry.begin_immediate().map_err(|e| e.to_string())?;
+            tx.begin_cache_migration(&CacheMigrationIntent {
+                namespace: namespace.as_str().into(), nonce: nonce.clone(), max_bytes: 100, created_at: 1.0,
+            }).map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+            if backend.reconcile_cache_import_publication(&mut registry, id, &namespace, policy, 2.0).await.is_ok() {
+                return Err("missing receipt must leave publication unresolved".into());
+            }
             let attempt = backend.import_cache_for_quiescent_source(id, &namespace, policy).await?;
             attempt.require_warm_publication()?;
             if attempt.report.imported_count != 1 || attempt.report.imported_bytes != 80 {
                 return Err("unexpected warm import count or bytes".into());
             }
+            // Discard command acknowledgement before any journal publication.
+            drop(attempt);
+            drop(registry);
+            let mut registry = Registry::open_writer(&path).map_err(|e| e.to_string())?;
+            backend.reconcile_cache_import_publication(&mut registry, id, &namespace, policy, 3.0).await?;
+            let record = registry.cache_migration(namespace.as_str()).map_err(|e| e.to_string())?.ok_or("intent lost")?;
+            if record.publication.as_ref().is_none_or(|proof| proof.imported_bytes != 80) {
+                return Err("historical publication was not recovered durably".into());
+            }
+            backend.reconcile_cache_import_publication(&mut registry, id, &namespace, policy, 4.0).await?;
             let receipt = backend.checked("historical receipt", owned(&["exec", id, "/var/lib/docker/bosn-ci/bin/act", "cache", "import-receipt", "--cache-server-path", &namespace.path()]), super::super::CONTROL_DEADLINE).await?;
             let parsed = PublicationReceipt::parse(receipt.as_bytes(), &namespace, policy)?;
             if parsed.imported_bytes != 80 {

@@ -41,6 +41,8 @@ current byte ceilings, retained-source warmth, fingerprints and bounded archive
 receipts. Four isolated boundary tests passed; parsing historical evidence
 cannot authorize enrollment. The exclusive import executor preserves partial
 publication on nonzero exits but is not yet invoked by production planning.
+A local registry journal now persists import intent and recovers historical
+publication after restart. It is not machine-wide routing or enrollment state.
 
 The tool-cache candidate uses unique save stages and skips hidden unfinished
 stages when rehydrating fresh engines. Its actual pinned-engine shell proof
@@ -1294,3 +1296,43 @@ or restored workflow hits from the new cohort. Those remain activation gates.
 Strict service all-target Clippy passed after the final import fixture changes
 (60.84 seconds). The proof and review are complete for this slice; the full
 source gate is still required before pushing the retention candidate.
+
+### Durable local import intent and historical publication recovery
+
+The registry stores a bounded typed migration record under a namespace-specific
+indexed `meta` key, without a schema migration or second database. An immediate
+transaction commits the nonce, namespace, original import ceiling and creation
+time before import. A second begin is refused even for the same nonce; an
+unresolved import must be reconciled rather than repeated blindly. Publication
+contains the historical source fingerprint, imported count/bytes and retained
+source bytes. Conflicting publication never replaces the recorded evidence;
+identical recovery is idempotent. Rollback leaves no intent.
+
+Bosn's recovery method reads the actual act2 historical receipt with a 30-second
+deadline and 64 KiB output bound. It requires an existing local intent, exact
+legacy/cohort namespace paths, complete typed receipt checks and the original
+import ceiling. Missing, malformed or failed reads leave the intent unresolved.
+Successful evidence is committed in an immediate transaction. This call does
+not rerun import or delete source data.
+
+Two isolated registry tests passed (0.44 seconds), covering rollback, reopen,
+duplicate refusal, conflicting nonce/fingerprint, invalid warm byte evidence,
+invalid time and idempotent recovery. The actual private-Docker published-binary
+proof passed (1 test, 4.28 seconds): missing receipt first remained unresolved,
+then a closed HTTP-seeded 80-byte archive was imported, the command acknowledgement
+was discarded before journaling publication, and the registry was reopened.
+Recovery recorded the actual act2.7 receipt and repeated safely. Source hashes
+remained unchanged and exact helper-container absence was confirmed. Independent
+review passed.
+
+This is local recovery evidence, not daemon-wide automatic startup reconciliation
+or machine-wide routing. The act2 historical receipt does not carry Bosn's nonce,
+so this journal does not prove correlation to a unique import invocation. Before
+enrollment, callers still need current inventory, publication durability, shared
+routing state and exclusion of older writers. The production configuration guard
+remains in place. No automatic migration or physical storage ceiling is claimed.
+
+Strict registry/service all-target Clippy passed (50.64 seconds) after correcting
+a collapsible conditional flagged by the first lint attempt. The task Docker
+engine also reported no remaining import-proof helper containers. The retention
+candidate remains local pending the exact-source gate and broader activation work.

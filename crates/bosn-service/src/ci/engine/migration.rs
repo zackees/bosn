@@ -3,7 +3,12 @@
 #[path = "migration_live_tests.rs"]
 mod live_tests;
 use super::{DockerActBackend, RunOptions, legacy_lease, owned};
-use crate::ci::{cache_cohort::Namespace, cache_import::ImportReport, cache_policy::CachePolicy};
+use crate::ci::{
+    cache_cohort::Namespace,
+    cache_import::{ImportReport, PublicationReceipt},
+    cache_policy::CachePolicy,
+};
+use bosn_registry::{Registry, cache_migration::CachePublicationEvidence};
 use std::time::Duration;
 
 /// A command outcome and its publication evidence are independent facts.
@@ -24,6 +29,63 @@ impl ImportAttempt {
 }
 
 impl DockerActBackend {
+    /// Recover publication after a lost acknowledgement. The persisted intent
+    /// must precede import; a historical receipt does not authorize routing.
+    pub async fn reconcile_cache_import_publication(
+        &self,
+        registry: &mut Registry,
+        engine: &str,
+        namespace: &Namespace,
+        policy: CachePolicy,
+        at: f64,
+    ) -> Result<(), String> {
+        let record = registry
+            .cache_migration(namespace.as_str())
+            .map_err(|e| e.to_string())?
+            .ok_or("cache migration intent missing; publication remains unresolved")?;
+        let binary = format!("{}/bin/act", super::ENGINE_WORK);
+        let mut args = owned(&[
+            "exec",
+            engine,
+            &binary,
+            "cache",
+            "import-receipt",
+            "--cache-server-path",
+        ]);
+        args.push(namespace.path());
+        let output = self
+            .docker
+            .with_args(args)
+            .capture_async(RunOptions::bounded(Duration::from_secs(30), 64 * 1024))
+            .await
+            .map_err(|e| format!("cache publication recovery remains unresolved: {e}"))?;
+        if !output.ok() {
+            return Err(format!(
+                "cache publication recovery remains unresolved: {}",
+                String::from_utf8_lossy(&output.stderr)
+                    .chars()
+                    .take(256)
+                    .collect::<String>()
+            ));
+        }
+        let receipt = PublicationReceipt::parse(&output.stdout, namespace, policy)?;
+        if receipt.max_bytes != record.intent.max_bytes {
+            return Err("historical import ceiling differs from frozen migration intent".into());
+        }
+        let proof = CachePublicationEvidence {
+            source_fingerprint: receipt.source_fingerprint,
+            imported_count: receipt.imported_count,
+            imported_bytes: receipt.imported_bytes,
+            retained_source_archive_bytes: receipt
+                .retained_source_archive_bytes
+                .ok_or("unknown retained source")?,
+        };
+        let mut tx = registry.begin_immediate().map_err(|e| e.to_string())?;
+        tx.record_cache_publication(namespace.as_str(), &record.intent.nonce, &proof, at)
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
     /// Call only after persisting migration intent and excluding older peers.
     /// The exclusive lifetime lease excludes participating servers. It cannot
     /// establish exclusion of older writers that do not use that protocol.
