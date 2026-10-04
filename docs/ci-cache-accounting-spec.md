@@ -1119,3 +1119,9 @@ the new wrapper, durable migration receipt reconciliation and watcher
 supervision remain unverified. Act2 PR #27 merged as
 `d874c3b6e9518e11c3137da8dd810f1f3f361db1`; exact-merge full CI run
 37188971746 is in progress, so the correction is not yet released.
+
+The private-Docker `ci_live` warm-cache tests subsequently passed with the
+new lifetime wrapper and frozen profiles (2 tests, 61.07 seconds): a later job
+restored an earlier job's archive, and a successive run restored it through a
+distinct fresh private engine. This verifies continued warm legacy sharing;
+it does not verify cohort migration or retention-policy activation.
