@@ -3764,3 +3764,17 @@ validation; focused retention/recovery race tests still pass (1.519 seconds,
 `.git/retention-native-recovery-pin-refactor-tests.log`). Lint is not yet green;
 publication/retention refactoring and final formatting remain required before
 review or shipping. No correctness gate was relaxed.
+
+### Recovery candidate lint refactor (2026-10-04)
+
+Act2 candidate `802f5ab` separates verified reservation publication, reference
+namespace preparation, atomic linking/stage cleanup and post-expiry allocation
+audit. The original lock/reader scopes and partial acknowledgement behavior are
+preserved. Lint now reports zero issues:
+`.git/retention-native-recovery-pin-refactored-lint.log`.
+The complete artifact-cache race suite passed in 21.477 seconds after this
+refactor. The combined CLI package run stopped at a default cache directory
+creation on the private container's read-only root; this is retained in
+`.git/retention-native-recovery-pin-refactored-full-tests.log`. A separate CLI
+race run uses an explicit private writable XDG cache directory, without changing
+production code or tests. Its result and the existing primary review are pending.
