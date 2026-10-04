@@ -117,6 +117,9 @@ where
     let dir = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let path = dir.path().join("registry.sqlite3");
     RuntimeBuilder::multi_thread()
+        // Each parallel fixture owns its pool; retain concurrent execution
+        // without multiplying the container's CPU-sized pool per test.
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap()

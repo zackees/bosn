@@ -78,7 +78,11 @@ async fn wait_done(runtime: &CiRuntime, run: &str) -> RunRecord {
         }
         async_engine::sleep(Duration::from_millis(10)).await;
     }
-    panic!("run {run} did not finish");
+    let record = runtime.record(run).unwrap();
+    panic!(
+        "run {run} did not finish: state {:?}, conclusion {:?}, reason {:?}, cleanup {:?}, engine {:?}",
+        record.state, record.conclusion, record.reason, record.cleanup, record.engine_id
+    );
 }
 
 #[test]
