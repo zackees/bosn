@@ -2394,3 +2394,86 @@ recovery must verify its mount and live original-inode holder. Coordinated curre
 selection, actual overlay mounting, completed-install publication with writer
 exclusion, efficient admission of the 7.7 GiB cache, generation/object expiry,
 physical accounting and image/container/scoped build-cache expiry remain required.
+
+
+### Durable warm selection and concurrent completed-install updates (candidate, 2026-10-04)
+
+The native handoff spec is merged in [Bosn PR #490](https://github.com/zackees/bosn/pull/490),
+merge `eafc7975840567fe0407533c64955a7b80e97185`, after the exact-source
+local gate passed in 525 seconds and required remote checks passed. Native
+handoff code is merged in [act2 PR #32](https://github.com/zackees/act2/pull/32),
+merge `09d1ad66486e04514d651362f4c0a155bc9ac7f5`; no release or Bosn pin
+update for that merge is claimed.
+
+[Act2 PR #33](https://github.com/zackees/act2/pull/33), candidate
+`3dd0deddbb4b99f589638a7c575453f169af0759`, implements selection separately
+from immutable generation publication:
+
+```sh
+# Deliberate first selection during store setup or explicit recovery only:
+act cache tool-update --manifest COMPLETED_INSTALLS.json \
+  --cache-server-path STORE --max-bytes POSITIVE --apply --initialize
+
+# Normal completed-install update; never a missing-cache bootstrap fallback:
+act cache tool-update --manifest ONLY_CHANGED_INSTALLS.json \
+  --cache-server-path STORE --max-bytes POSITIVE --apply
+
+# Advisory validated selection; does not hold a lifetime reader:
+act cache tool-current --cache-server-path STORE --max-bytes POSITIVE
+```
+
+`UpdateToolGeneration` takes the original catalog writer lock, validates the
+latest selected manifest, full payload and reader coordination, and merges only
+supplied install paths into that latest recipe. An exact path replaces its prior
+object reference; unrelated completed installs stay warm. The complete merged
+recipe is validated and assembled while holding the same catalog lock, then a
+synced private JSON stage replaces `.tool-current-v1.json` atomically and the
+store directory is synced. Its typed report separates generation publication
+from selection. Private selection-stage cleanup failures retain a reported
+`pending_selection` path. The payload-byte ceiling is logical, not unique inode
+allocation or a machine-wide disk quota.
+
+Initialization is an explicitly named API (`InitializeToolGeneration`) and CLI
+flag, required only when selection is unset. It refuses an existing pointer.
+Ordinary updates refuse missing or malformed selection rather than constructing
+a smaller cold successor. A new engine must never automatically call initialization
+because an ordinary selection lookup failed. Deliberate recovery must first
+establish which warm state is authoritative; the API does not infer that proof.
+
+Verified tests:
+
+- Concurrent updates from two stale engines retain three completed installs;
+  a living reader on the first generation does not block successor publication,
+  and the first generation remains unchanged. Repeating an unchanged update
+  verifies/reuses the selected generation.
+- CLI regression was RED with unknown `--manifest`, then GREEN: separate update
+  recipes retain earlier warm payloads and `tool-current` reports the successor.
+- A further actual RED showed a lost pointer silently bootstrapping and discarding
+  prior installs. The explicit-initialization fix is GREEN: ordinary update refuses
+  and leaves the pointer absent and old generation data intact.
+- Byte-budget refusal preserves warm selection; symlink, oversize, unknown schema
+  or field, missing generation and missing reader coordination are preserved and
+  refused. No fallback empty selection is emitted by the current command.
+- Full API injection after selection rename reports `selected=true, partial=true`
+  on lost final directory-sync acknowledgement. An ordinary update retry verifies
+  and reuses the existing publication, then converges. A visible first selection
+  must be retried as an ordinary update, since initialization refuses existing data.
+
+Scoped exact-source gate passed in 17.40 seconds: 2,558 exported source files
+matched private Docker bytes/modes before and after full artifactcache tests,
+focused tool commands including selection, vet/lint with zero findings, and
+Darwin/Windows unsupported-stub compilation. Candidate tree:
+`7c6308cd9a1c259e867508e6100a32ba4823f110`; cumulative independent review
+passed with one reviewer. Artifacts in the task's private git directory:
+`act2-tool-selection-red.log`, `-green.log`, `-command-red.log`,
+`-lost-pointer-red.log`, `-fixes.log`, `-final-checks.log`, and
+`act2-generation-selection-source-bound-gate.json`/`.log`.
+
+**Not yet proven:** PR #33 is unreleased and not activated in Bosn. Current lookup
+is advisory: selection and subsequent explicit-ID engine admission can race with
+future retirement, so the production planner must coordinate the intent/reader
+handoff or refuse and replan; it cannot mount from this report alone. Full payload
+validation remains an unbenchmarked admission/update cost for the 7.7 GiB cache.
+Generation/object/stage expiry, physical inode accounting, production frozen
+profile and recovery, actual job overlay mounts and quiescent completed-install
+publication, old image/container expiry and scoped builder pressure remain open.
