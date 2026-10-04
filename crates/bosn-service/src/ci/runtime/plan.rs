@@ -106,7 +106,9 @@ impl CiRuntime {
                     .join(&record.workflow)
                     .is_file(),
                 job: record.job.clone(),
-                cache_namespace: record.cache_namespace(),
+                cache_route: super::super::cache_cohort::CacheRoute::Legacy(
+                    super::super::cache_cohort::Namespace::parse(&record.cache_namespace())?,
+                ),
                 secrets: self.secrets(record)?,
                 params: record.params.clone(),
             },

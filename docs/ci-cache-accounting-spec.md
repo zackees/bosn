@@ -16,6 +16,8 @@ sustained physical-footprint convergence. No new Bosn release is claimed.
 
 The retention candidate is in `../bosn-extern/bosn-retention`. It includes typed
 policy/arguments/import evidence and participating legacy-session leases.
+The execution path now carries a typed legacy/cohort route; production planning
+still explicitly selects legacy, and rejects configured retention.
 Production planning still refuses configured retention: warm migration, old-peer
 exclusion, durable routing and independent watcher supervision are unfinished.
 Tools/images/actions/tool-install expiry and host owned-image/build-cache
@@ -1336,3 +1338,38 @@ Strict registry/service all-target Clippy passed (50.64 seconds) after correctin
 a collapsible conditional flagged by the first lint attempt. The task Docker
 engine also reported no remaining import-proof helper containers. The retention
 candidate remains local pending the exact-source gate and broader activation work.
+
+### Typed routes reach actual workflow execution
+
+`ActInvocation` now carries a typed `CacheRoute` instead of an arbitrary namespace
+string. Legacy routes use the validated direct-child repository path; cohort
+routes pass the shared root, repository/aggregate byte ceilings and age/interval
+flags through the existing policy builder. There is exactly one cache-server
+path in the execution argv. The production planner validates its derived
+namespace and selects `Legacy` explicitly; it cannot infer enrollment from a
+local journal or historical receipt. Retention configuration remains guarded.
+
+The published act2.7 CLI accepted the full workflow planning argv for both routes
+(1 test, 1.12 seconds). Four engine invocation tests, eight parameter tests and
+fourteen lifecycle tests passed. These preserve runner pinning, overlay selection,
+secret handling, execution claims and cleanup behavior.
+
+An isolated real owned-engine proof then passed across two fresh engines
+(1 test, 42.43 seconds). The first run saved an `actions/cache` archive and
+a later job restored its file contents. A successive run restored those bytes
+through a different private engine using the same explicit cohort route. Both
+lifecycle reports proved cleanup, and the task Docker engine had no remaining
+run containers. This exercises actual execution through the new route, not only
+argument generation. The final three-engine extension also passed (1 test,
+73.01 seconds): a different namespace using the same cache key reported no
+hit and had no restored file. All three engines had distinct immutable IDs
+and successful lifecycle cleanup. Independent review passed.
+
+This fixture creates new coordinated namespaces; it does not migrate a live
+legacy repository or authorize production enrollment. Shared machine routing,
+old-peer exclusion, independent watcher supervision, other cache classes and
+sustained physical-footprint convergence remain required.
+
+Strict service all-target Clippy passed after the final three-engine fixture
+(7.71 seconds). This routing slice is verified locally; the exact-source gate
+is still required before pushing the retention candidate.

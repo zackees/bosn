@@ -103,9 +103,8 @@ pub struct ActInvocation {
     /// bosn rewrote the workflow, so act runs the overlay's copy (#424).
     pub workflow_overlaid: bool,
     pub job: Option<String>,
-    /// Repository identity (hex) that namespaces the act cache server store,
-    /// so two repositories' `actions/cache` keys never meet.
-    pub cache_namespace: String,
+    /// Typed repository route; cohort selection requires verified enrollment.
+    pub cache_route: super::cache_cohort::CacheRoute,
     /// Passed to act as `-s NAME`; values travel only in the docker client's
     /// environment (`exec --env NAME`), never in argv.
     pub secrets: SecretEnv,
@@ -148,12 +147,11 @@ impl ActInvocation {
             // Legacy in-place checkouts race between concurrent runs
             // (zackees/clud#1724); the new cache extracts per run.
             "--use-new-action-cache".into(),
-            "--cache-server-path".into(),
-            format!("{ENGINE_CACHE}/actcache/{}", self.cache_namespace),
             // Per engine, so concurrent runs never share artifacts or ports.
             "--artifact-server-path".into(),
             format!("{ENGINE_WORK}/artifacts"),
         ];
+        args.extend(self.cache_route.args());
         args.extend(["--env".into(), runner_tools::path_env()]);
         let runner = runner_tag();
         for label in LOCAL_RUNNER_LABELS {

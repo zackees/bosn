@@ -292,7 +292,9 @@ mod tests {
             workflow: ".github/workflows/installer-check.yml".into(),
             workflow_overlaid: false,
             job: Some("public-host".into()),
-            cache_namespace: "0123456789abcdef".into(),
+            cache_route: crate::ci::cache_cohort::CacheRoute::Legacy(
+                crate::ci::cache_cohort::Namespace::parse("0123456789abcdef").unwrap(),
+            ),
             secrets: Default::default(),
             params: installer(),
         }

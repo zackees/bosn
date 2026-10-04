@@ -6,6 +6,26 @@ pub fn root() -> String {
     format!("{ENGINE_CACHE}/actcache/cohort-v1")
 }
 
+/// An execution route selected by the trusted planner. Choosing a cohort is
+/// not enrollment: its caller must first establish shared routing, current
+/// inventory and writer exclusion. Production planning currently uses Legacy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CacheRoute {
+    Legacy(Namespace),
+    Cohort {
+        namespace: Namespace,
+        policy: CachePolicy,
+    },
+}
+impl CacheRoute {
+    pub fn args(&self) -> Vec<String> {
+        match self {
+            Self::Legacy(namespace) => vec!["--cache-server-path".into(), namespace.legacy_path()],
+            Self::Cohort { namespace, policy } => policy.server_args(namespace),
+        }
+    }
+}
+
 /// Repository identity is a single direct-child hash, never an arbitrary path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Namespace(String);

@@ -9,6 +9,8 @@ use std::{
 };
 
 mod fake;
+#[path = "live_cohort.rs"]
+mod live_cohort;
 pub use fake::*;
 
 #[derive(Default)]
@@ -62,7 +64,9 @@ pub fn plan(run: &str, deadline: Duration) -> EnginePlan {
             workflow: ".github/workflows/ci.yml".into(),
             workflow_overlaid: false,
             job: None,
-            cache_namespace: "0".repeat(16),
+            cache_route: crate::ci::cache_cohort::CacheRoute::Legacy(
+                crate::ci::cache_cohort::Namespace::parse(&"0".repeat(16)).unwrap(),
+            ),
             secrets: Default::default(),
             params: Default::default(),
         },
