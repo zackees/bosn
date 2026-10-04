@@ -89,6 +89,17 @@ class BosnGateProofTests(unittest.TestCase):
     def test_complete_test_tier_receipt_passes(self) -> None:
         self.assertIsNone(self.error(self.receipt()))
 
+    def test_published_runner_override_uses_isolated_state(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"BOSN_GATE_VERSION": "0.1.13", "BOSN_GATE_STATE_DIR": "/work/state"},
+        ):
+            self.assertEqual(["uvx", "--from", "bosn==0.1.13", "bosn"], bosn_gate.bosn_argv())
+            self.assertEqual(["--state-dir", "/work/state"], bosn_gate.command(bosn_gate.RUST)[-2:])
+        with patch.dict("os.environ", {"BOSN_GATE_VERSION": "not-a-version"}):
+            with self.assertRaises(ValueError):
+                bosn_gate.bosn_argv()
+
     def test_minimal_placeholder_cannot_prove_python_or_docker_tests(self) -> None:
         receipt = self.receipt()
         params = bosn_gate.document(receipt["params"])
