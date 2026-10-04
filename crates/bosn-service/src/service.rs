@@ -327,6 +327,13 @@ impl Service {
                 }
             })
         };
+        // Existing cohort policy authorizes idle maintenance independently of jobs.
+        let cohort_maintenance = {
+            let ci = ci.clone();
+            let owner = act_owner.clone();
+            let stop = self.stop.token();
+            async_engine::launch(async move { ci.maintain_existing_cohort(&owner, &stop).await })
+        };
         // Retry durable cleanup online; failed retirement must not wait for restart.
         // This worker never uses startup interruption authority or shared prune.
         let _ci_cleanup = {
@@ -460,6 +467,8 @@ impl Service {
         jobs.stop().await;
         drop(jobs);
         let _ = job_worker.await;
+        // Finish cancellation while the registry writer can still reconcile helpers.
+        let _ = cohort_maintenance.await;
         actor.stop().await;
         let _ = worker.await;
         Ok(())

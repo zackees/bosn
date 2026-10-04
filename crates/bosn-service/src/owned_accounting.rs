@@ -530,6 +530,7 @@ mod tests {
                 tmpfs_policy: ActEngineTmpfsPolicy::NamedDiskStorageRunTmpNoexecV2,
                 init_command_sha256: "a".repeat(64),
                 cache_volume: None,
+                cache_coordination: None,
             }),
         };
         let mut writer = bosn_registry::Registry::create_writer(&path, owner).unwrap();

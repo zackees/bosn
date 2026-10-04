@@ -7,7 +7,9 @@ fn invocation_never_names_a_host_socket_and_pins_runners() {
         workflow: ".github/workflows/ci.yml".into(),
         workflow_overlaid: false,
         job: Some("lint".into()),
-        cache_namespace: "0123456789abcdef".into(),
+        cache_route: crate::ci::cache_cohort::CacheRoute::Legacy(
+            crate::ci::cache_cohort::Namespace::parse("0123456789abcdef").unwrap(),
+        ),
         secrets: SecretEnv(vec![("GITHUB_TOKEN".into(), "ghp_secretvalue".into())]),
         params: Default::default(),
     }
@@ -42,7 +44,9 @@ fn act_reads_rewrites_from_the_overlay() {
         workflow: ".github/workflows/ci.yml".into(),
         workflow_overlaid: false,
         job: None,
-        cache_namespace: "0123456789abcdef".into(),
+        cache_route: crate::ci::cache_cohort::CacheRoute::Legacy(
+            crate::ci::cache_cohort::Namespace::parse("0123456789abcdef").unwrap(),
+        ),
         secrets: SecretEnv::default(),
         params: Default::default(),
     };

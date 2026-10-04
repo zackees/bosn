@@ -159,6 +159,7 @@ use std::{
     },
 };
 pub(crate) mod act_live_probe;
+mod cache_maintenance;
 mod daemon;
 mod daemon_jobs;
 mod guest;

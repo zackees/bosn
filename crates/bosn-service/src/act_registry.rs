@@ -87,6 +87,8 @@ pub enum ActRegistryCommand {
         after_run_id: Option<String>,
         limit: usize,
     },
+    MaintenanceRecord(bosn_registry::cache_maintenance::MaintenanceSnapshot),
+    MaintenanceLatest,
     HelperBegin(bosn_registry::cache_helper::CacheHelperIntent),
     HelperRegister {
         nonce: String,
@@ -116,6 +118,7 @@ pub enum ActRegistryReply {
     Recovery(ActEngineRecoveryPage),
     Helpers(bosn_registry::cache_helper::CacheHelperPage),
     Record(Option<Box<ActEngineRecord>>),
+    Maintenance(Option<bosn_registry::cache_maintenance::MaintenanceSnapshot>),
 }
 
 impl RegistryActor {
@@ -210,8 +213,17 @@ pub(crate) fn apply(
             .act_engine(&run)
             .map(|record| ActRegistryReply::Record(record.map(Box::new)));
     }
+    if matches!(command, ActRegistryCommand::MaintenanceLatest) {
+        return registry
+            .latest_cache_maintenance()
+            .map(ActRegistryReply::Maintenance);
+    }
     let mut transaction = registry.begin_immediate()?;
     let reply = match command {
+        ActRegistryCommand::MaintenanceRecord(snapshot) => {
+            transaction.record_cache_maintenance(&snapshot)?;
+            ActRegistryReply::Committed
+        }
         ActRegistryCommand::Begin(intent) => {
             transaction.begin_act_engine(&intent)?;
             ActRegistryReply::Committed
@@ -302,6 +314,7 @@ pub(crate) fn apply(
             ActRegistryReply::Committed
         }
         ActRegistryCommand::Pending { .. }
+        | ActRegistryCommand::MaintenanceLatest
         | ActRegistryCommand::Get { .. }
         | ActRegistryCommand::HelperPending { .. }
         | ActRegistryCommand::StartupInterrupt { .. }
@@ -348,6 +361,7 @@ mod tests {
                 tmpfs_policy: bosn_registry::act::ActEngineTmpfsPolicy::StorageExecRunTmpNoexecV1,
                 init_command_sha256: "a".repeat(64),
                 cache_volume: None,
+                cache_coordination: None,
             }),
         };
         let runtime = kernal_api::async_engine::RuntimeBuilder::multi_thread()
@@ -481,6 +495,7 @@ mod tests {
                 tmpfs_policy: bosn_registry::act::ActEngineTmpfsPolicy::StorageExecRunTmpNoexecV1,
                 init_command_sha256: "a".repeat(64),
                 cache_volume: None,
+                cache_coordination: None,
             }),
         }
     }

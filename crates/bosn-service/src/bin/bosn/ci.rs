@@ -700,6 +700,9 @@ fn runners(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
         if let Some(cache) = &r.cache {
             print_cache(cache);
         }
+        if let Some(maintenance) = &r.maintenance {
+            println!("{}", maintenance.summary());
+        }
     });
     Ok(0)
 }

@@ -52,6 +52,13 @@ mod vocabulary {
 }
 }
 
+pub mod cache_cohort;
+#[cfg(all(test, unix))]
+mod cache_cohort_cli_tests;
+pub mod cache_import;
+pub mod cache_inventory;
+pub mod cache_maintenance;
+pub mod cache_policy;
 pub mod checkout;
 pub mod client;
 pub mod config;
@@ -60,6 +67,7 @@ pub mod events;
 pub mod flush;
 pub mod lifecycle;
 pub mod limits;
+pub mod maintenance_status;
 pub mod matrix_runner;
 pub mod mcp;
 pub mod model;

@@ -167,7 +167,13 @@ fn setup_ensure_rollover_is_visible_through_daemon_registry_diagnostics() {
         .build()
         .unwrap()
         .run(async {
-            let server = async_engine::launch(Service::new(state.clone()).serve());
+            let server = async_engine::launch(
+                Service::new(state.clone())
+                    .with_act_backend(Arc::new(crate::ci::lifecycle::tests::FakeBackend::with(
+                        Default::default(),
+                    )))
+                    .serve(),
+            );
             let client = wait_for_client(&state).await;
             let page = client.registry_resources(0, 16).await.unwrap();
             assert_eq!(
@@ -224,6 +230,9 @@ fn cancelled_setup_ensure_does_not_persist_or_retire_existing_resources() {
         .run(async {
             let server = async_engine::launch(
                 Service::new(state.clone())
+                    .with_act_backend(Arc::new(crate::ci::lifecycle::tests::FakeBackend::with(
+                        Default::default(),
+                    )))
                     .with_setup_ensure_executor(fake.clone())
                     .serve(),
             );
@@ -292,6 +301,9 @@ fn shutdown_cancelled_setup_ensure_keeps_a_durable_terminal_event() {
         .run(async {
             let server = async_engine::launch(
                 Service::new(state.clone())
+                    .with_act_backend(Arc::new(crate::ci::lifecycle::tests::FakeBackend::with(
+                        Default::default(),
+                    )))
                     .with_setup_ensure_executor(fake.clone())
                     .serve(),
             );

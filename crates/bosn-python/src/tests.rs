@@ -443,6 +443,16 @@ fn python_client_submits_and_cancels_coalesced_fake_setup_ensure_without_docker(
         return;
     }
     Python::initialize();
+    // This timing fixture measures asynchronous admission, which also awaits
+    // the SQLite audit commit. Linux overlay fsync latency is machine-load
+    // dependent; use memory-backed storage for the protocol timing check.
+    #[cfg(target_os = "linux")]
+    let temporary = kernal_api::platform::fs::TemporaryDirectory::in_directory(
+        std::path::Path::new("/dev/shm"),
+        "bosn-python-ensure-",
+    )
+    .unwrap();
+    #[cfg(not(target_os = "linux"))]
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let state = temporary.path().join("state");
     let workspace = temporary.path().join("workspace");
@@ -460,15 +470,17 @@ fn python_client_submits_and_cancels_coalesced_fake_setup_ensure_without_docker(
                     .serve(),
             );
             let wire_client = wait_for_client(&state).await;
-            let submitted = Instant::now();
             let python_state = state.clone();
             let python_workspace = workspace.clone();
-            let (first, second) = std::thread::spawn(move || {
+            let (first, second, elapsed) = std::thread::spawn(move || {
                 Python::initialize();
                 Python::attach(|py| {
                     let python_client = Client {
                         state_dir: python_state,
                     };
+                    // Measure the API calls after this thread attaches to
+                    // Python; thread startup and GIL acquisition are separate.
+                    let submitted = Instant::now();
                     let first = python_client.submit_setup_ensure(
                         python_workspace.clone(),
                         "https://example.invalid/setup.toml".into(),
@@ -485,13 +497,13 @@ fn python_client_submits_and_cancels_coalesced_fake_setup_ensure_without_docker(
                         4 * 1024,
                         py,
                     )?;
-                    Ok::<_, PyErr>((first, second))
+                    Ok::<_, PyErr>((first, second, submitted.elapsed()))
                 })
             })
             .join()
             .expect("Python submit thread panicked")
             .unwrap();
-            assert!(submitted.elapsed() < Duration::from_millis(250));
+            assert!(elapsed < Duration::from_millis(250), "{elapsed:?}");
             assert_eq!(first, second);
 
             wait_for(|| executor.started.load(Ordering::SeqCst) == 1).await;

@@ -17,6 +17,17 @@ an explicit request for an exact candidate SHA on `main`, refused unless full
 CI already passed on that SHA. Nothing tags or publishes on a version bump or a
 pushed tag; never create a release tag by hand.
 
+## act2 dependency release authorization
+
+Act2 releases are always authorized when necessary to implement or ship Bosn
+work. Proceed without asking for additional release approval. Before tagging,
+require full act2 CI to pass on the exact candidate commit SHA, use a clean
+checkout of act2's default branch, and verify that the tag and release do not
+already exist. Publish through act2's existing tag-triggered release workflow.
+Verify the resulting binaries and checksums before updating Bosn's pinned
+version and artifact digests. Record release evidence and rollout status in the
+living implementation spec.
+
 ## Code rules (hard gates in `./lint`)
 
 - **Single responsibility and DRY.** Parse inputs eagerly into typed structs

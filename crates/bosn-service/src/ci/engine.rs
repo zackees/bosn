@@ -26,6 +26,22 @@ mod cache_usage;
 pub use cache_usage::HelperCleanupRetry;
 #[cfg(all(test, unix))]
 mod cache_usage_transport_tests;
+mod inventory;
+mod legacy_lease;
+mod machine_policy;
+mod maintenance;
+#[cfg(test)]
+mod maintenance_contention_tests;
+mod maintenance_helper;
+mod maintenance_lease;
+mod maintenance_loop;
+mod maintenance_reporting;
+mod migration;
+pub use inventory::InventoryAttempt;
+pub use maintenance::MaintenanceAttempt;
+pub use maintenance_helper::MaintenanceHelperAttempt;
+pub use maintenance_loop::MaintenanceTick;
+pub use migration::ImportAttempt;
 mod lines;
 mod runner_tools;
 mod toolcache;
@@ -100,9 +116,8 @@ pub struct ActInvocation {
     /// bosn rewrote the workflow, so act runs the overlay's copy (#424).
     pub workflow_overlaid: bool,
     pub job: Option<String>,
-    /// Repository identity (hex) that namespaces the act cache server store,
-    /// so two repositories' `actions/cache` keys never meet.
-    pub cache_namespace: String,
+    /// Typed repository route; cohort selection requires verified enrollment.
+    pub cache_route: super::cache_cohort::CacheRoute,
     /// Passed to act as `-s NAME`; values travel only in the docker client's
     /// environment (`exec --env NAME`), never in argv.
     pub secrets: SecretEnv,
@@ -145,12 +160,11 @@ impl ActInvocation {
             // Legacy in-place checkouts race between concurrent runs
             // (zackees/clud#1724); the new cache extracts per run.
             "--use-new-action-cache".into(),
-            "--cache-server-path".into(),
-            format!("{ENGINE_CACHE}/actcache/{}", self.cache_namespace),
             // Per engine, so concurrent runs never share artifacts or ports.
             "--artifact-server-path".into(),
             format!("{ENGINE_WORK}/artifacts"),
         ];
+        args.extend(self.cache_route.args());
         args.extend(["--env".into(), runner_tools::path_env()]);
         let runner = runner_tag();
         for label in LOCAL_RUNNER_LABELS {
@@ -282,6 +296,17 @@ pub trait ActEngineBackend: Send + Sync {
     ) -> BoxFuture<'a, Result<HelperCleanupRetry, String>> {
         let _ = (registry, owner, cursor);
         Box::pin(async { Ok(HelperCleanupRetry::default()) })
+    }
+    /// Maintain only an existing cohort with an agreed shared machine policy.
+    /// Backends without shared stores have no background maintenance work.
+    fn maintain_existing_cohort<'a>(
+        &'a self,
+        registry: &'a RegistryActor,
+        owner: &'a str,
+        stop: &'a CancellationToken,
+    ) -> BoxFuture<'a, ()> {
+        let _ = (registry, owner, stop);
+        Box::pin(async {})
     }
     /// Remove the cache volume. The host engine refuses while any container
     /// (another daemon's run included) still uses it.
@@ -542,7 +567,7 @@ impl DockerActBackend {
             args.push(key.clone());
         }
         args.push(engine.into());
-        args.push(format!("{ENGINE_WORK}/bin/act"));
+        args.extend(legacy_lease::command());
         args
     }
 }
@@ -692,6 +717,14 @@ impl ActEngineBackend for DockerActBackend {
     ) -> BoxFuture<'a, Result<HelperCleanupRetry, String>> {
         Box::pin(self.retry_measurements(registry, owner, cursor))
     }
+    fn maintain_existing_cohort<'a>(
+        &'a self,
+        registry: &'a RegistryActor,
+        owner: &'a str,
+        stop: &'a CancellationToken,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(self.supervise_existing_cohort(registry, owner, stop))
+    }
     fn remove_cache<'a>(&'a self, volume: &'a str) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             if !self.volume_exists(volume).await? {
@@ -787,6 +820,9 @@ impl ActEngineBackend for DockerActBackend {
         lines: &'a async_engine::Sender<EngineLine>,
     ) -> BoxFuture<'a, Result<ExecEnd, String>> {
         Box::pin(async move {
+            if let super::cache_cohort::CacheRoute::Cohort { policy, .. } = invocation.cache_route {
+                self.agree_cache_policy(engine, policy).await?;
+            }
             let mut args = Self::act_exec(engine, &invocation.secrets);
             args.extend(invocation.args());
             let (events, mut receiver) = async_engine::channel(256);
@@ -860,7 +896,7 @@ fn work_dirs_script() -> String {
 /// missing or corrupt tarball from the pinned URL; prints `act --version`.
 fn install_act_script(act: ActArtifact) -> String {
     format!(
-        "tgz={ENGINE_CACHE}/tools/act-{ACT_VERSION}-{sum}.tgz; mkdir -p {ENGINE_CACHE}/tools; \
+        "tgz={archive}; mkdir -p {ENGINE_CACHE}/tools; \
          exec 9>>\"$tgz.lock\"; flock -x 9; \
          if ! echo \"{sum}  $tgz\" | sha256sum -c - >/dev/null 2>&1; then \
            stage=$(mktemp \"$tgz.XXXXXXXX\"); trap 'rm -f \"$stage\"' EXIT; \
@@ -873,7 +909,12 @@ fn install_act_script(act: ActArtifact) -> String {
         url = act.url,
         sum = act.sha256,
         binary = act.binary_sha256,
+        archive = act_archive(act),
     )
+}
+
+fn act_archive(act: ActArtifact) -> String {
+    format!("{ENGINE_CACHE}/tools/act-{ACT_VERSION}-{}.tgz", act.sha256)
 }
 
 /// The runner image tar in the cache volume.

@@ -6,6 +6,61 @@ Update the survey, implementation table and verification evidence in the same
 change as each implementation step. The desired behavior below is a contract,
 not a claim that it is already implemented. Related issue: #456.
 
+## Current implementation status (2026-10-04)
+
+Accounting/lifecycle foundation PR #473 merged as `b23398ae`. It adds
+bounded owned-footprint diagnostics, private-storage identity/reconciliation,
+and coordinated cleanup deadlines. Actual private-Docker tests prove shared
+archive hits across jobs and successive fresh engines; they do not prove
+sustained physical-footprint convergence. No new Bosn release is claimed.
+
+The retention candidate is in `../bosn-extern/bosn-retention`. It includes typed
+policy/arguments/import evidence and participating legacy-session leases.
+The execution path now carries a typed legacy/cohort route; production planning
+still explicitly selects legacy, and rejects configured retention.
+Production planning still refuses configured retention: warm migration, old-peer
+exclusion and durable routing are unfinished. A follow-up now wires independent
+maintenance for an already agreed cohort into normal daemon startup; default
+legacy stores are still outside that retention policy.
+Tools/images/actions/tool-install expiry and host owned-image/build-cache
+pressure control remain open; successful private-engine retirement removes
+that engine's nested containers, images and build cache. Historical entries
+below record intermediate states and must not be read as current rollout status.
+
+Act2 v0.2.89-act2.7 is released from
+`1a6782d5bbabb715f425cad5601b1f706fc23fa8` (merged PR #28). Exact-commit
+full CI 37190653388 and release run 37191477610 passed. The Linux x86_64
+archive SHA-256 is
+`61d640112af87278075c70cd67412ec9c44ceffd1e269e88632d50d4a83ebd27`;
+the extracted binary SHA-256 is
+`328147f59cc101aa86cc826ecb5e7b2493f74765d520d4809997b2a9c6ba56bd`.
+Published checksums match, and the isolated binary reports
+`act version 0.2.89-act2.7`. The candidate pin selects these verified bytes.
+Four pin consistency tests and the actual published audit/watch command contract
+passed; strict service all-target Clippy passed (28.59 seconds).
+
+This release includes the act2.6 empty-cutover fix and historical publication
+receipts. Bosn's typed parser checks exact namespace identity, historical and
+current byte ceilings, retained-source warmth, fingerprints and bounded archive
+receipts. Four isolated boundary tests passed; parsing historical evidence
+cannot authorize enrollment. The exclusive import executor preserves partial
+publication on nonzero exits but is not yet invoked by production planning.
+A local registry journal now persists import intent and recovers historical
+publication after restart. It is not machine-wide routing or enrollment state.
+The candidate also executes bounded independent maintenance passes in durable
+finite-lived helpers and consumes typed retention outcomes. Participating cohort
+workflow engines and maintenance helpers now require the same shared policy
+record. The periodic supervisor is callable in the promotion candidate. The
+next follow-up discovers existing shared policy at normal daemon startup and
+starts that supervisor without workflow jobs. Automatic policy bootstrap and
+repository enrollment remain unfinished.
+
+The tool-cache candidate uses unique save stages and skips hidden unfinished
+stages when rehydrating fresh engines. Its actual pinned-engine shell proof
+passed, alongside deterministic concurrency and completed-install tests. These
+changes are not yet shipped on Bosn main; policy activation and storage ceilings
+remain open.
+
 ## Survey and evidence (2026-10-03)
 
 The read-only host audit in #456 measured ~859 GiB under `/var/lib/docker`.
@@ -967,3 +1022,866 @@ passed with an 11-second removal, exceeding its previous 10-second bound. Strict
 service all-target Clippy passed. The existing reviewer found no blocking issues.
 The full isolated service suite passed: 429 tests, 6 ignored, 0 failed.
 A new exact-source workflow gate remains required before shipping this correction.
+
+### Retention integration boundary (in progress)
+
+Act2 PR #22 merged as `7e6f010fa7cc7171083329b2cf3d18f1566e3468`.
+Full checks on that exact merge SHA are running in run 37186796787; no new
+tag/release or Bosn pin update has been made. Typed `[cache]` configuration now
+requires explicit positive repository/aggregate archive byte ceilings and
+positive maximum-age, unused-age, and maintenance intervals in seconds. It
+rejects unknown fields, inconsistent ceilings and act2 duration overflow.
+These settings govern completed archive lengths, not a physical machine cap.
+
+Production planning currently refuses configured retention with an explicit
+rollout error. Activation remains dependent on a verified release pin, safe
+warm import into the coordinated root, and maintenance supervision. Existing
+legacy shared-cache execution remains the default. This preparatory boundary
+does not claim that configured quotas are yet enforced.
+
+### Live lifecycle verification at b0860ff
+
+The candidate CLI built in the genuine isolated Rust harness. Against the
+private Docker engine, `the_host_engine_is_unchanged_after_every_way_a_run_can_end`
+passed (1 test, 282.13 seconds). After the warm-up baseline, exact owned-container,
+network, volume and engine-image inventories returned to baseline after success,
+failure, timeout, client SIGKILL and daemon SIGKILL/restart. The timeout scenario
+verified intent-derived named storage, volume-only mounts and a nested Docker
+engine distinct from its parent. Shared cache inputs persisted across the fresh
+engines. This validates candidate lifecycle cleanup under these workloads, not
+archive retention, sustained physical convergence or cleanup under full-disk
+conditions. The separate exact-source gate still uses released Bosn 0.1.12.
+
+The policy boundary test passed; both config tests passed, and strict service
+library Clippy passed in the isolated container. Review caught a spare-planning
+bypass; run planning, spare kickoff and spare planning now use the same
+`load_engine` guard. The config test proves parsed policy is refused at that
+boundary; it does not directly instrument backend creation counts. The existing
+reviewer passed the corrected slice. Retention activation remains incomplete.
+
+### Coordinated command mapping (candidate, not activated)
+
+Bosn now constructs act2 server and independent watcher arguments from the
+typed policy. Both use `actcache/cohort-v1`; repository namespace parsing only
+accepts a 16-character lowercase hexadecimal direct child. Server and watcher
+share the same byte/age settings. The watcher passes an explicit aggregate
+ceiling and interval, rather than relying on server shutdown for idle cleanup.
+These command builders are not yet invoked by production admission. Warm import,
+legacy-peer exclusion, receipts, supervision and verified pinning are still
+required before removing the planning guard. CLI contract validation is pending.
+
+The two existing live Bosn cache tests passed at b0860ff (2 tests, 100.65
+seconds): a later job restores an earlier job's archive, and a subsequent run
+with a different engine ID restores and verifies the saved bytes. This proves
+existing shared-cache reuse, not yet quota enforcement. Full act2 checks run
+37186796787 passed on merge SHA 7e6f010, including Linux, Windows, macOS, lint
+and snapshot. Dependency release approval is being prepared; no tag exists yet.
+The namespace test and strict service library Clippy passed for the command
+builders, and review verified flag mapping. Execution of those builders remains
+unverified and production activation stays guarded.
+
+### Dependency release and source-gate checkpoint
+
+The exact-source Bosn gate at b0860ff passed Rust (477 seconds) and Linux
+(485 seconds), reusing Python-static and passing guards. It exited successfully
+and stamped the candidate as `445265cfa97e` after 962 seconds. This gate covers
+the accounting/lifecycle candidate; it does not cover the later retention wiring.
+
+The user approved act2 v0.2.89-act2.5 and established standing authorization
+for necessary act2 releases in AGENTS.md. The annotated tag points to
+`7e6f010fa7cc7171083329b2cf3d18f1566e3468`, whose full CI passed. Existing
+release workflow run 37187501368 is running. Binary/checksum verification and
+Bosn pin updates remain pending; no production retention activation is claimed.
+
+### Verified act2.5 dependency pin (candidate)
+
+Release run 37187501368 passed and published v0.2.89-act2.5 from the exact
+full-CI-verified merge SHA 7e6f010. The Linux x86_64 archive matches published
+checksums (`d116cc9e5ca040f4807763f562476275015e9d9bdf5c3a2ac598c182c0be0a9e`).
+The extracted binary digest is
+`ea682586fbf32aef140cfd2dc620d883be29f14650daadd6d1cd29ed34292ea1`;
+its actual isolated invocation reports `act version 0.2.89-act2.5`. Bosn's
+version, archive URL and both digests now pin these verified bytes.
+
+The command contract test passed against the exact-merge snapshot: namespace
+audit reports missing with null counts/bytes; missing-root watcher reports
+partial/unknown budget outcome and stops successfully on its first SIGINT.
+The initial fixture mistakenly expected missing audit to be partial/nonzero;
+actual execution and review corrected the test, not the production contract.
+Strict service-library Clippy passed. The published-binary contract test passed (1 test, 0.05 seconds). Production policy activation remains guarded pending warm migration
+and supervision. Accounting/lifecycle PR #473 merged as
+`b23398aef9f9c12eb314e0835ca7a508391a07fd` after required checks passed;
+full hosted macOS/release checks were not requested or claimed.
+
+### Warm migration refuses a budget-induced cold cutover (act2 follow-up)
+
+Inspection and a focused RED test exposed an act2.5 import gap: two completed
+80-byte source archives with a 79-byte import ceiling published an empty
+cohort destination. The retained source survived, but destination existence
+then prevented a warmer retry. This conflicts with warm migration.
+
+The act2 candidate now refuses before staging/publication if completed
+archives were skipped for budget and none fit. Tests prove destination absence,
+unchanged source metadata, a successful 80-byte retry and actual HTTP restore
+of the retained archive. Genuinely empty-source initialization remains allowed.
+Import race tests passed (1.177 seconds), and pinned lint reported 0 issues.
+This follow-up is not yet released: Bosn's act2.5 pin still has the old edge
+case, and production enrollment remains guarded. A corrected dependency release
+and verified pin are needed before automatic migration can be enabled.
+
+### Typed warm-import boundary (candidate, not activated)
+
+Bosn now builds source-quiescent import arguments using the validated repository
+hash, legacy source path, fixed cohort root and repository byte budget. Calling
+this builder requires prior legacy-writer exclusion; it does not establish that
+exclusion. Production planning remains guarded.
+
+Import JSON is eagerly decoded into typed reports and receipts with a 64 KiB
+input bound. Parsing checks schema, exact source/destination identity, policy
+ceiling, at most twelve receipts, unique positive archive IDs, lowercase SHA-256
+digests, count/omission consistency and checked byte totals. A separate warm
+publication check requires complete publication, no pending stage/error, known
+adequate headroom, retained-source evidence and a nonempty import when the source
+is populated. Published-but-partial output remains visible for reconciliation;
+it is not converted into absence or permission to blindly repeat import.
+
+Three isolated boundary tests passed (0.01 seconds), strict service-library
+Clippy passed, and the existing reviewer found no blocking issues. These tests
+use typed receipt fixtures: they do not prove actual automatic migration,
+durable migration receipts, peer exclusion or supervision. Act2 cold-cutover
+correction is tracked in PR #27; full CI is still running.
+
+### Participating legacy cache lifetime lease (candidate)
+
+Workflow and act-list invocations now acquire a shared FD 8 lock on
+`/bosn/cache/actcache/.legacy-migration.lock` before executing act. The descriptor
+survives exec and spans the server lifetime; OS process death releases it.
+Independent readers can run concurrently. New cached engine profiles freeze
+`SharedLegacyLeaseV1` and advertise the corresponding coordination label.
+Historical profiles omit the optional field, preserving their identity digest.
+
+The isolated process test passed (0.11 seconds): two readers coexist, exclusive
+migration is refused while either lives, killing the last reader releases the
+lease, and literal arguments survive the shell boundary. Engine tests passed
+(19), registry lifecycle tests passed (18), and spare tests passed (5). The
+existing historical digest assertion passed unchanged. Strict service
+all-target Clippy passed.
+
+This coordinates participating writers only. Older or unknown peers have no
+proven exclusion; instant inventory absence cannot prevent their future
+admission. Automatic migration remains guarded. Real workflow execution with
+the new wrapper, durable migration receipt reconciliation and watcher
+supervision remain unverified. Act2 PR #27 merged as
+`d874c3b6e9518e11c3137da8dd810f1f3f361db1`; exact-merge full CI run
+37188971746 is in progress, so the correction is not yet released.
+
+The private-Docker `ci_live` warm-cache tests subsequently passed with the
+new lifetime wrapper and frozen profiles (2 tests, 61.07 seconds): a later job
+restored an earlier job's archive, and a successive run restored it through a
+distinct fresh private engine. This verifies continued warm legacy sharing;
+it does not verify cohort migration or retention-policy activation.
+
+### Verified act2.6 pin and historical receipt boundary
+
+The published act2.6 CLI contract test passed (1 test, 0.16 seconds), as did
+four pin/proof consistency tests. The dependency is verified; production cache
+policy remains guarded. Four typed import/receipt boundary tests passed and
+strict library Clippy passed. Historical receipt validation shares the same
+checked archive count/digest/byte logic as import reports, binds both source
+and destination to the repository namespace, and requires a valid source
+fingerprint, original import ceiling, current repository ceiling and known
+retained-source warmth. It refuses populated-source empty evidence.
+
+The record is creation-time evidence only: current inventory, durable routing,
+publication reconciliation and old-writer exclusion remain caller obligations.
+This parser is prepared for act2 PR #28 and is not invoked against act2.6,
+which does not include the receipt command. Independent review found no blockers.
+Issue #456 now records merged accounting work and exact dependency release
+evidence while leaving the full acceptance criteria open.
+
+The actual private-Docker workflow tests also passed with the verified act2.6
+pin (2 tests, 140.91 seconds): a later job restored an earlier job's archive,
+and a successive run restored saved bytes through a distinct fresh private
+engine. These exercise artifact verification and the legacy lease wrapper in
+real runs. They establish continued warm reuse, not policy activation or
+sustained image/container/build-cache footprint convergence.
+
+### Exclusive import lifetime and truthful command transport (candidate)
+
+Bosn's import executor now uses a nonblocking exclusive FD 8 legacy-session
+lease across the actual act process. Participating live sessions refuse import
+immediately; an importer excludes participating readers until process death.
+The OS releases the lease on termination. Older peers still need independent
+exclusion, and the caller must persist intent before invoking this method.
+Production planning remains guarded.
+
+Import execution has a 90-second command deadline and a 64 KiB output bound.
+It parses stdout even on nonzero exit, preserving published-but-partial evidence
+instead of discarding it through a generic checked-command helper. Command exit
+and publication report are separate typed facts: warm acceptance requires exit
+zero plus complete valid warm publication. Transport/parsing failure leaves
+publication unresolved; it is never converted into destination absence or
+permission to blindly repeat import.
+
+Two isolated synthetic transport tests passed (0.09 seconds), including a
+nonzero exit with published/partial output and contradictory success evidence.
+The actual process lease test passed (0.55 seconds): readers coexist, import
+refuses contention, importer excludes readers, and termination releases both
+lease modes. Strict service all-target Clippy passed. Independent review found
+no blockers. These tests do not prove actual automatic migration or supervision.
+
+Act2 receipt PR #28 merged as `1a6782d5bbabb715f425cad5601b1f706fc23fa8`
+after full PR CI passed. Exact-merge full CI run 37190653388 is in progress;
+the receipt feature remains unreleased and absent from the act2.6 candidate pin.
+
+### Tool-cache save isolation and efficient fresh-engine seeding (candidate)
+
+A focused RED test found that the old whole-root `cp -a` seeding copied hidden
+`.saving-*` directories into every fresh engine. A second RED test replayed
+equal PIDs from separate private engines with a controlled copy barrier: both
+publishers used the same `.saving-$$` path. One could remove or reuse another's
+unfinished stage, despite their different install destinations.
+
+Save now creates an exclusive `mktemp -d` stage for each install, with one
+shared shell setup function. Cleanup targets that invocation's own stage. Seed
+copies visible published top-level entries and skips hidden stages/control
+files. Sibling completion markers, inner stamps and existing warm entries
+retain their existing behavior. The collision fixture terminates only its
+spawned process groups, including blocked copy children on failure.
+
+Four actual shell/copy tests passed (0.52 seconds), including both corrected
+RED signals and the two existing completion conventions. Strict service
+all-target Clippy passed (71.37 seconds), and independent review found no
+blockers. This proves deterministic equal-PID isolation and avoids private-disk
+duplication of unfinished saves; it does not introduce tool-install TTL/quotas,
+abandoned-stage pruning or improve every pre-existing copy-failure path.
+Real engine workflow coverage of this new seed/save slice remains pending.
+
+### Verified act2.7 artifacts and pinned-engine tool-cache shell
+
+The act2.7 release workflow 37191477610 succeeded on exact merge commit
+`1a6782d5bbabb715f425cad5601b1f706fc23fa8`, whose full CI run 37190653388
+also succeeded. Published archive checksums and extracted binary identity were
+verified before changing the candidate pin. Four pin tests passed (0.01 seconds),
+and the published audit/watch CLI contract passed (0.12 seconds). This command
+test does not yet verify Bosn parsing an actual historical receipt.
+
+The actual pinned engine image's shell executed the generated tool-cache save
+and seed scripts successfully (1 test, 0.23 seconds). The helper had a read-only
+root, no network, dropped capabilities and only disposable tmpfs cache/work
+paths. It restored both sibling and inner completion conventions while excluding
+a hidden orphan stage. Its immutable container ID was confirmed absent afterward.
+This verifies the BusyBox shell path; actual workflow tool-install activity,
+expiry and quotas remain unverified. Strict service all-target Clippy passed
+after the shell test and new pin (28.59 seconds). Independent review passed.
+
+### Actual Bosn import transport and published historical receipt
+
+The isolated private-Docker proof passed using published act2.7 through
+`DockerActBackend::import_cache_for_quiescent_source` (1 test, 2.83 seconds).
+A Go HTTP fixture reserved, uploaded and committed an 80-byte archive, then
+closed its legacy server before exporting the source. The test imported that
+source through the actual exclusive lease wrapper and required exit zero plus
+complete warm-publication evidence. It then called the published historical
+receipt command and parsed its output through Bosn's `PublicationReceipt`.
+The receipt identified 80 imported bytes; source file names and SHA-256 hashes
+matched before and after import. Exact helper-container absence was verified.
+
+The helper mounted only disposable tmpfs paths, had a read-only root, no network
+and dropped capabilities. File streaming uses Bosn's existing bounded transport;
+failed operation checks return through exact cleanup. Docker auto-removal and
+a finite helper lifetime also cover a lost acknowledgement or panic. Initial
+fixture errors concerned container absence wording, directory enumeration and
+the absolute act binary path; they are not production RED signals. Independent
+review passed after fixing unbounded fixture streaming and panic-before-cleanup.
+
+Reproduce with the opt-in test
+`published_binary_import_preserves_source_and_has_typed_historical_receipt`,
+`BOSN_ACT_RETENTION_TEST_BINARY` pointing at the verified release,
+`BOSN_ACT_IMPORT_SOURCE_TAR` containing a closed HTTP-seeded legacy namespace
+`0123456789abcdef`, and the isolated Docker transport. This verifies actual
+command/schema interoperability and source preservation. It does not establish
+automatic enrollment, old-peer exclusion, crash-safe routing, watcher supervision
+or restored workflow hits from the new cohort. Those remain activation gates.
+
+Strict service all-target Clippy passed after the final import fixture changes
+(60.84 seconds). The proof and review are complete for this slice; the full
+source gate is still required before pushing the retention candidate.
+
+### Durable local import intent and historical publication recovery
+
+The registry stores a bounded typed migration record under a namespace-specific
+indexed `meta` key, without a schema migration or second database. An immediate
+transaction commits the nonce, namespace, original import ceiling and creation
+time before import. A second begin is refused even for the same nonce; an
+unresolved import must be reconciled rather than repeated blindly. Publication
+contains the historical source fingerprint, imported count/bytes and retained
+source bytes. Conflicting publication never replaces the recorded evidence;
+identical recovery is idempotent. Rollback leaves no intent.
+
+Bosn's recovery method reads the actual act2 historical receipt with a 30-second
+deadline and 64 KiB output bound. It requires an existing local intent, exact
+legacy/cohort namespace paths, complete typed receipt checks and the original
+import ceiling. Missing, malformed or failed reads leave the intent unresolved.
+Successful evidence is committed in an immediate transaction. This call does
+not rerun import or delete source data.
+
+Two isolated registry tests passed (0.44 seconds), covering rollback, reopen,
+duplicate refusal, conflicting nonce/fingerprint, invalid warm byte evidence,
+invalid time and idempotent recovery. The actual private-Docker published-binary
+proof passed (1 test, 4.28 seconds): missing receipt first remained unresolved,
+then a closed HTTP-seeded 80-byte archive was imported, the command acknowledgement
+was discarded before journaling publication, and the registry was reopened.
+Recovery recorded the actual act2.7 receipt and repeated safely. Source hashes
+remained unchanged and exact helper-container absence was confirmed. Independent
+review passed.
+
+This is local recovery evidence, not daemon-wide automatic startup reconciliation
+or machine-wide routing. The act2 historical receipt does not carry Bosn's nonce,
+so this journal does not prove correlation to a unique import invocation. Before
+enrollment, callers still need current inventory, publication durability, shared
+routing state and exclusion of older writers. The production configuration guard
+remains in place. No automatic migration or physical storage ceiling is claimed.
+
+Strict registry/service all-target Clippy passed (50.64 seconds) after correcting
+a collapsible conditional flagged by the first lint attempt. The task Docker
+engine also reported no remaining import-proof helper containers. The retention
+candidate remains local pending the exact-source gate and broader activation work.
+
+### Typed routes reach actual workflow execution
+
+`ActInvocation` now carries a typed `CacheRoute` instead of an arbitrary namespace
+string. Legacy routes use the validated direct-child repository path; cohort
+routes pass the shared root, repository/aggregate byte ceilings and age/interval
+flags through the existing policy builder. There is exactly one cache-server
+path in the execution argv. The production planner validates its derived
+namespace and selects `Legacy` explicitly; it cannot infer enrollment from a
+local journal or historical receipt. Retention configuration remains guarded.
+
+The published act2.7 CLI accepted the full workflow planning argv for both routes
+(1 test, 1.12 seconds). Four engine invocation tests, eight parameter tests and
+fourteen lifecycle tests passed. These preserve runner pinning, overlay selection,
+secret handling, execution claims and cleanup behavior.
+
+An isolated real owned-engine proof then passed across two fresh engines
+(1 test, 42.43 seconds). The first run saved an `actions/cache` archive and
+a later job restored its file contents. A successive run restored those bytes
+through a different private engine using the same explicit cohort route. Both
+lifecycle reports proved cleanup, and the task Docker engine had no remaining
+run containers. This exercises actual execution through the new route, not only
+argument generation. The final three-engine extension also passed (1 test,
+73.01 seconds): a different namespace using the same cache key reported no
+hit and had no restored file. All three engines had distinct immutable IDs
+and successful lifecycle cleanup. Independent review passed.
+
+This fixture creates new coordinated namespaces; it does not migrate a live
+legacy repository or authorize production enrollment. Shared machine routing,
+old-peer exclusion, independent watcher supervision, other cache classes and
+sustained physical-footprint convergence remain required.
+
+Strict service all-target Clippy passed after the final three-engine fixture
+(7.71 seconds). This routing slice is verified locally; the exact-source gate
+is still required before pushing the retention candidate.
+
+### Bounded idle-cohort maintenance and truthful outcomes
+
+Bosn now builds a single-pass maintenance command from the same typed policy
+used by the watch command, with no workflow server required. The executor
+captures at most 64 KiB with a 30-second transport deadline and parses stdout
+even when the command exits nonzero. A valid partial report remains visible;
+transport or invalid-output failure means unknown outcome, not zero reclamation
+or proof that no deletion occurred. The caller must separately supervise and
+retire the verified helper, including remote execution after transport failure.
+
+The typed report binds the exact cohort root and aggregate ceiling, validates
+namespace identities and repository ceilings, and bounds stores/pages/receipts
+to 64/12/32. Receipt counts and bytes use checked arithmetic and unique IDs.
+Complete reports need known totals and complete namespace evidence. Stable
+remaining bytes must equal namespace retention totals. Protection is sampled
+separately at root and namespace level, so each value is bounded independently;
+these samples must not be summed or asserted equal across time. A complete pass
+with `budget_met=false` is distinct from an incomplete/unknown pass. These are
+logical completed-archive bytes, not allocated filesystem blocks.
+
+Four isolated boundary tests passed, including a protection-boundary RED/GREEN
+regression. The first parser rejected a legitimate complete report whose archive
+crossed act2's five-minute protection boundary between root and namespace
+samples; validation now accepts those independently bounded measurements. An
+actual published-binary run also exposed a mistaken full-path namespace
+assumption: act2 emits basenames within its root-bound report. That candidate
+parser mismatch was corrected without changing the dependency protocol.
+
+The final idle-expiry/replay proof passed against published act2.7 in genuine
+private Docker (1 test, 1.20 seconds): no workflow/cache server was alive, an
+old imported archive expired, exactly 80 bytes and one deletion were reported,
+current archive bytes became zero, and a second pass reported no new reclamation.
+The legacy source hashes stayed unchanged and exact helper absence was verified.
+Independent review passed; strict service all-target Clippy passed (17.82 seconds).
+
+This is a callable bounded pass, not an enabled periodic supervisor. Shared
+machine policy/routing, durable helper creation/recovery, restart scheduling,
+old-peer exclusion and production enrollment remain required. The configuration
+guard stays. No expiry for other shared cache classes or sustained physical
+footprint ceiling is claimed by this proof.
+
+The actual nonzero transport path was then verified against published act2.7:
+a missing cohort returned a nonzero partial report with unknown byte totals,
+and Bosn retained that typed outcome. The expanded proof passed (0.96 seconds);
+strict all-target Clippy passed again (6.48 seconds). This closes command-exit
+handling for the tested missing-root case; it is not crash-supervisor coverage.
+
+### Durable maintenance helper identity (2026-10-04 candidate)
+
+The existing helper journal now accepts an explicit `maintenance_v1` role.
+Historical measurement records omit the role and keep their previous names and
+serialization. Maintenance records use a distinct name, nonce label and ownership
+scope. Recovery requires their exact pinned image, immutable container ID, isolated
+profile and single writable named-volume mount at `/bosn/cache`; accounting
+helpers still require a read-only mount at `/cache`. Unknown roles are rejected.
+The shared cache volume is not authorized for deletion by either role.
+
+Isolated Docker verification passed all four registry helper tests and the new
+service profile test. These cover historical JSON, durable role recovery after
+registry reopen, unknown role rejection, cross-role mismatch, wrong destination,
+read-only maintenance mounts and extra mounts. Independent review passed.
+
+This establishes recovery identity only. Maintenance create/start orchestration,
+offline verified act installation, finite helper lifetime and periodic/restart
+scheduling remain unfinished. Production enrollment remains guarded.
+
+Strict registry/service all-target Clippy passed (20.89 seconds), after moving
+the new test module to the end of its file to satisfy the existing lint gate.
+
+### Bounded durable maintenance helper (2026-10-04 candidate)
+
+`maintain_cache_with_helper` now drives one independent pass through an owned
+helper. It verifies the existing shared volume, commits a maintenance intent
+before create and registers the immutable ID before start. It rechecks the
+volume and helper profile before executing. The helper has no network, no
+capabilities, a read-only root, 128 MiB memory and one CPU; its writable private
+executable tmpfs is limited to 64 MiB. A finite 300-second lifetime with Docker
+auto-removal bounds abandoned execution after start. A never-started create
+still requires durable journal recovery; no auto-removal claim applies to it.
+
+Act installs offline from the machine archive under its artifact lock, verifying
+both archive and extracted binary digests and the version. There is no download
+fallback in this helper. An absent or corrupt archive is a visible error rather
+than permission to discard cached data. The normal workflow installer and this
+helper share one archive-path builder. The callable pass does not bootstrap a
+missing archive; supervised scheduling must address that explicitly.
+
+The returned helper result separates maintenance outcome from cleanup outcome.
+Cleanup re-verifies ownership before exact-ID removal and requires explicit
+absence plus durable journal completion. An acknowledged ID that has already
+auto-removed can finish after explicit absence. An unacknowledged create remains
+pending when its outcome cannot be observed. Existing online/restart helper
+recovery understands the new role. The named shared volume is preserved.
+
+The actual published act2.7 pass succeeded in genuine private Docker (1.09
+seconds): complete typed maintenance evidence, zero expired fixture bytes under
+a long-age policy, exact helper absence, journal Removed state, and preserved
+owned shared cache. Independent review passed. The real lost-create-acknowledgement and temporary inspection-outage proof
+also passed (0.78 seconds): a fresh backend recovered the pending intent,
+verified and removed its exact container, committed Removed and successfully
+measured the preserved shared volume afterward.
+
+This is bounded orchestration, not an enabled periodic/restart scheduler.
+Production policy consensus, legacy-peer exclusion and repository enrollment
+remain incomplete and guarded. Image/build-cache pressure and expiry for other
+shared cache classes remain open; logical archive retention does not prove
+physical machine footprint convergence.
+
+Strict service all-target Clippy passed (18.52 seconds), after extracting the
+Docker creation profile to satisfy the existing function-length gate.
+
+### Participating machine policy agreement (2026-10-04 candidate)
+
+Cohort workflow execution and independent maintenance now agree on a fixed
+schema-1 record at `actcache/.bosn-cohort-policy-v1` in the shared machine volume.
+All validated policy fields are compared in a fixed numeric representation.
+A nonblocking exclusive lock serializes publication; a unique staging file and
+hard-link publication prevent overwriting an existing agreement. Conflicts
+return exit 78 and preserve the old record; contention returns 75. No policy
+change API or automatic replacement exists. Legacy routes do not claim this
+record. The agreement happens before cohort act execution or pruning.
+
+The isolated shell proof passed: initial publication, agreement from a new
+process, conflicting aggregate ceiling refused and original bytes unchanged,
+with no staging-file leak. Actual private-Docker helper verification also passed
+with a compatible policy and refused a conflicting policy while still retiring
+both helpers and preserving the shared volume. Review passed.
+
+This coordinates participating callers only. It does not enroll namespaces,
+recover a deleted agreement, exclude old/nonparticipating writers, prove record
+provenance against arbitrary cache-volume writes, or establish power-loss
+persistence. Losing/replacing this record while existing servers run is not a
+supported policy transition. Production activation remains guarded. A trusted
+scheduler still needs policy discovery/bootstrap, duplicate-pass coordination,
+restart/cancellation supervision and durable reporting before rollout.
+
+Strict service all-target Clippy passed (24.65 seconds). The actual cohort
+workflow proof then passed through the new agreement path (97.45 seconds):
+a later job restored saved bytes, a distinct fresh engine restored them again,
+and a third repository namespace using the same cache key stayed isolated.
+All three owned engines retired and the private Docker daemon had no remaining
+fixture containers. These participating workflow and maintenance tests use the
+same machine policy (100 MiB repository, 200 MiB aggregate, 30-day maximum age,
+seven-day unused age, 60-second maintenance interval). This is not a production
+machine-policy migration or contention/retry throughput proof.
+
+### Callable periodic maintenance supervisor (2026-10-04 candidate)
+
+`supervise_cache_maintenance` runs independently of workflow engines. It starts
+with an immediate bounded helper-recovery pass, then an independent maintenance
+helper pass. Recovery has a 200-second budget and carries its fair cursor between
+ticks. A maintenance attempt has a 600-second outer budget, including pinned-image
+availability and the existing bounded helper operations. Started helpers retain
+their 300-second finite lifetime. Recovery errors do not erase maintenance
+outcomes or permanently suppress all subsequent passes.
+
+Each tick reports recovery and maintenance separately, preserving maintenance
+outcome versus cleanup status. A bounded report channel applies backpressure:
+the supervisor cannot launch further passes while the consumer is stalled.
+After reporting, it waits the configured interval before another pass. A fresh
+supervisor has no stale in-memory next-run timestamp and attempts immediately.
+Shutdown cancels recovery, execution, reporting or sleep; incomplete helper work
+remains in the durable journal for the established reconciliation path.
+
+This is a callable supervisor with an explicitly supplied trusted policy, not
+production daemon wiring or an enrollment API. Reports are typed; a bounded latest snapshot is now persisted before delivery
+(see the evidence below), rather than an unbounded maintenance history. Machine-wide duplicate-supervisor coordination,
+policy discovery/bootstrap, cancellation during individual Docker operations,
+old-peer exclusion and production admission still require work. The existing
+configuration guard stays in place. The actual idle periodic/restart proof
+passed in private Docker (73.75 seconds): two ticks with distinct helper IDs,
+complete typed maintenance outcomes, exact helper absence, stop during the
+interval and immediate restart pass within its 15-second observation budget.
+The shared volume survived and no fixture containers remained. Independent
+review passed. This does not test cancellation during create/exec or establish
+production daemon wiring.
+
+Strict service all-target Clippy passed for the supervisor (24.83 seconds).
+
+### Participating maintenance exclusion (2026-10-04 candidate)
+
+The actual maintenance command now opens
+`actcache/.bosn-maintenance-v1.lock` in the shared machine volume and acquires
+an exclusive nonblocking lease on FD 6. It then execs the verified act binary
+with unchanged literal arguments. The descriptor spans the command lifetime;
+process/container death releases the lease. A competing participating pass
+returns exit 75 with `machine cache maintenance busy` before invoking act.
+The bounded maintenance adapter preserves that diagnostic as an outcome error,
+not as successful reclamation or a complete empty report. The helper still
+retires and its durable journal finishes. The scheduler reports the contention
+and tries again on a later tick.
+
+The genuine private-Docker proof passed (2.24 seconds): two independent backend
+instances shared the same volume; one owned helper held the lease, a competitor
+was refused and cleaned up, killing/removing the exact holder released the
+lease, and the competitor's next pass completed. The shared volume survived.
+The fixture cleans its holder before asserting operation errors; existing helper
+identity verification and explicit absence gates are used. Review passed.
+
+This excludes participating maintenance commands, not helper creation itself,
+nonparticipating older binaries or workflow cache servers. Act2's cache-server
+root/store locks remain a separate boundary. It does not establish production
+policy discovery/enrollment, durable maintenance outcome history, or cancellation
+during an uncertain Docker operation. Those rollout requirements and broader
+cache-class/image/build-cache expiry remain open.
+
+Strict service all-target Clippy passed for maintenance exclusion (12.04 seconds).
+
+### Durable latest maintenance accounting (2026-10-04 candidate)
+
+The supervisor now commits a typed latest snapshot to its local registry before
+delivering each tick. The fixed meta key has a 4 KiB read/write ceiling and
+replaces the prior snapshot, so report retention cannot itself grow without
+bound. Registry and read-only registry readers can retrieve it after restart.
+This is the latest committed observation, not a machine-wide cumulative history.
+
+Observed snapshots retain command exit status, partial status, logical archive
+budget, nullable remaining/protected bytes and budget outcome. Total reclaimed
+archive bytes are computed with checked arithmetic only for complete root
+reports whose namespace retention data is all known. Partial or missing totals
+remain unknown. Transport/protocol errors use an explicit unknown outcome;
+cleanup and orphan-recovery errors remain separate. UTF-8 diagnostics are capped
+at 128 characters (at most 512 bytes). A failure replaces old totals rather than
+presenting a prior successful snapshot as current evidence.
+
+Helper references must match the registry's existing maintenance-role nonce and
+immutable container ID. Claimed cleanup success requires its durable journal
+state to be Removed. The trusted actor performs the transaction; no new client
+wire operation grants receipt or deletion authority. Snapshot persistence errors
+are reported separately without discarding maintenance/cleanup outcomes.
+Cancellation during an already-enqueued registry operation can leave its commit
+acknowledgement unknown; readers still see only committed snapshots.
+
+The isolated registry restart/conflict test passed (0.22 seconds): premature
+cleanup success and a different container ID were refused; reopening preserved
+the valid snapshot; a later unknown transport outcome replaced it and survived
+read-only reopening. Independent review passed. The actual periodic/restart
+proof with committed snapshot lookup passed in private Docker (64.33 seconds):
+two idle ticks, stop/restart, persistence acknowledgement before each delivered
+report, and a read-only latest snapshot matching the restarted helper ID.
+All fixture containers retired and the shared cache volume survived.
+
+This stores bounded local latest evidence. It does not aggregate snapshots from
+multiple registries, preserve cumulative reclaimed-byte history, retain all
+namespace receipts, expose a new user-facing maintenance-status command, or
+prove physical block reclamation. Current helper journal reconciliation may
+advance after a snapshot; its earlier cleanup error remains historical evidence.
+Production startup policy discovery/enrollment and broader image/build-cache
+and shared cache-class expiry remain open.
+
+The registry boundary also rejects a partial root carrying a claimed total
+reclamation value. The expanded registry test passed (4.61 seconds), accepting
+an unknown reclamation total for that partial report. This closes the typed
+snapshot invariant even for another future trusted caller.
+
+Final registry/service all-target Clippy passed (31.42 seconds), including the
+partial-reclamation guard and latest snapshot integration.
+
+### Current-main integration and promotion gate (2026-10-04 candidate)
+
+The retention branch was rebased onto main `219ee2b1` (Bosn 0.1.14 preparation,
+verified desktop widget and raw task-stream persistence). The configuration
+conflict was resolved by preserving both desktop opt-in UI installation and
+retention admission checks. The existing desktop test now includes a cache
+policy, checks that installation preserves it and verifies that installing the
+UI cannot bypass the enrollment guard.
+
+The accumulated candidate is being prepared for a PR through the repository's
+clean exact-source local gate. The gate must replay both the Rust and Linux
+workflow lanes through released Bosn, validate executed-step/source receipts,
+and stamp tree-bound attestations before push. Focused private-Docker proofs
+above establish their stated behavior; they do not substitute for this promotion
+gate. No push, merge or release is asserted by this entry. A promoted candidate
+still needs production policy discovery/bootstrap, repository enrollment and
+old-peer exclusion; broader cache-class and host image/build-cache expiry remain
+open. The existing production guard will stay until those requirements are met.
+
+The first promotion gate correctly refused the candidate at Rust formatting
+(run `d52a8b2a-e1cc-4367-ac5e-eaf4b3a35696`, engine cleanup Removed). It found
+an extra blank line left when the helper test module was moved. Python static
+and repository guards passed; Rust tests and Linux tests were not claimed.
+The changed Rust files were formatted again before replaying the clean gate.
+
+The second gate (`33f51278-d38e-4018-a2e4-24f590db7a37`, cleanup Removed)
+passed format, Clippy and kernel boundary checks but failed the 50-submission,
+10-key concurrency test: its roughly five-second observation window expired
+with a run still Running before an engine ID was recorded. The private Docker
+service suite reproduced the failure (457 passed, one failed, 15 ignored),
+while that test alone passed in 2.14 seconds. Its burst-specific observation
+budget is now bounded at 30 seconds, and it additionally requires every run's
+conclusion to be Success; timeout/error completion cannot satisfy the test.
+With this change the full private Docker service suite passed: 458 passed,
+zero failed, 15 ignored, 35.70 seconds. Production run deadlines are unchanged.
+This is evidence of load-dependent test observation, not a proof of production
+latency. The exact-source promotion gate still needs a successful replay; its
+Linux lane did not run in either failed attempt.
+
+The third gate (`6dbc5fe7-c19e-472e-b7b6-ac1e32f48ac8`, cleanup Removed,
+481 seconds) passed format, Clippy, boundary checks and the service suite,
+including the corrected burst test. It then failed an embedded Python fixture:
+two setup submissions exceeded its 250-millisecond timing assertion
+(`crates/bosn-python/src/tests.rs:494`). The failure needs investigation before
+the next replay. No successful promotion or Linux-lane coverage is claimed.
+
+Private-Docker investigation found that fixture's timer included spawning its
+Python thread and attaching to the interpreter before either submission call.
+An instrumented isolated sample measured the two API calls at 10.40 milliseconds
+and passed; this does not identify the precise timing of the failed gate sample.
+The fixture now measures the API calls after attachment, retaining their
+250-millisecond bound and the isolated process's ten-second outer deadline.
+Coalescing, raw-log and cancellation assertions remain. This test adjustment
+does not alter production behavior or establish end-to-end startup latency.
+All seven embedded Python tests passed in private Docker (0.85 seconds), and
+independent review passed for the measurement adjustment.
+Python all-target Clippy with embedded-test features also passed (57.62 seconds).
+
+The fourth exact-source gate (`5847ae1f-0d10-4e5d-b415-854a9b043cce`,
+375 seconds, cleanup Removed) again passed the service suite but failed the
+embedded Python submission assertion: the two calls themselves took 410.23 ms.
+Excluding interpreter attachment did not resolve the gate failure. Submission
+latency and the fixture's actual asynchronous-admission contract need further
+investigation; no successful promotion or Linux-lane receipt is claimed.
+
+The current-thread runtime experiment did not resolve the failure (private
+fixture measured 254.86 ms) and was reverted. Code inspection shows setup-ensure
+awaits a durable SQLite submission audit before acknowledgement, unlike the
+other fake submission cases. Eight WAL/FULL commit samples in the genuine Docker
+harness took 292.66–605.72 ms on `/tmp` disk storage and 0.014–0.040 ms on
+`/dev/shm`. These samples demonstrate that storage latency alone can exceed the
+fixture's 250 ms bound; they do not attribute every millisecond of the failed
+gate sample. The Linux protocol timing fixture now owns a RAM-backed temporary
+directory, retaining the SQLite audit, 250 ms API check, coalescing and subsequent
+log/cancellation assertions. Other platforms retain their original temporary
+storage. Disk-backed production acknowledgement latency remains unbounded by
+this timing proof; ordinary durable registry and service tests are unchanged.
+All seven embedded Python tests passed with this fixture (0.33 seconds), and
+independent review passed. The exact-source promotion replay is still required.
+Embedded-feature Python all-target Clippy passed (44.81 seconds), and Rust
+format checks passed for the integrated status reporting and timing fixture.
+
+### Cancellation at the Docker create acknowledgement boundary
+
+A follow-up private-Docker proof cancels the actual maintenance helper future
+after Docker creates its container but before the client returns the immutable
+ID. The durable intent remains Pending without an acknowledged container ID,
+and cancellation releases the backend's active-helper guard. A fresh backend
+recovers the exact helper from its frozen labels/profile, commits Removed,
+confirms the immutable ID absent, and measures the shared cache successfully.
+The first version of this proof passed in 60.21 seconds. Its wrapper deliberately
+withholds the acknowledgement for 60 seconds; that total includes runtime
+shutdown waiting for the outstanding command. It does not establish prompt
+command cancellation or prompt daemon shutdown. The expanded proof separately
+bounds maintenance-future cancellation return to five seconds and checks the
+unacknowledged journal shape and explicit immutable-ID absence. That expanded
+proof passed (one test, 63.29 seconds): maintenance-future cancellation returned
+in 72.197 microseconds. The deliberate client command still delayed fixture
+shutdown, so prompt daemon shutdown during an outstanding Docker command remains
+unverified. Production startup wiring remains open.
+
+Final service all-target Clippy passed (61.42 seconds) after splitting the
+proof's cancellation operation from its recovery fixture. Independent review
+passed for the proof and that extraction. The verified follow-up is now included
+in the next promotion candidate; the exact-source gate has not passed.
+
+### Maintenance evidence in cache accounting (follow-up candidate)
+
+`bosn runners cache` now requests the fixed latest-maintenance row through the
+trusted registry actor's read path, without entering a write transaction. Its
+typed reply distinguishes no recorded pass, unavailable registry evidence and
+a recorded unknown or observed outcome. The CLI prints the last observation's
+Unix timestamp, inventory completeness, command exit code, logical archive
+budget result and reclaimed archive bytes; unknown totals stay unknown. Helper
+recovery and cleanup failures remain separate. Raw helper diagnostics, nonce
+and immutable container ID are omitted from this public summary.
+
+This is the latest evidence in the queried daemon's registry, not a current
+machine-wide inventory, cross-registry aggregate, active-supervisor indicator,
+cumulative reclamation counter or physical disk convergence guarantee. An old
+daemon's reply omitting this optional field still decodes. Default production
+planning still uses warm legacy caches and rejects configured retention; this
+read-only visibility change does not enroll a repository or start maintenance.
+
+Focused private-Docker maintenance tests passed (seven tests, five explicitly
+ignored live prerequisites, 4.43 seconds), including unknown diagnostic
+redaction and partial/protected-over-budget evidence with unknown reclamation
+and failed cleanup. The published typed JSON Schema was regenerated and its
+equality test passed. All-target service Clippy passed (31.05 seconds), and
+independent review passed for the Rust, JSON Schema and documentation changes.
+
+### Read-only participating policy discovery (follow-up candidate)
+
+The backend can now discover the canonical shared policy through the existing
+journaled helper lifecycle. The helper mounts the owned cache volume read-only,
+uses a shared nonblocking policy lock and never creates a record or lock. A
+missing volume or record returns explicit absence; malformed, oversized,
+unsupported, noncanonical or busy records return an error. Discovery does not
+authorize defaults, bootstrap policy, enroll repositories or exclude older
+daemons. Production routing and supervisor startup remain open.
+
+Two focused tests passed, including absence without filesystem changes and
+canonical policy validation. The real private-Docker discovery test passed in
+0.42 seconds: it read the agreed 100 MiB repository / 200 MiB aggregate policy,
+retired its helper and left no pending helper intent.
+
+Promotion gate c0819217-e6e3-401a-b403-5d29030cb74f failed after 367
+seconds; cleanup was Removed. Format, Clippy and boundary checks passed. The
+service suite had 459 passes and one failure in the setup admission timing
+fixture. That fixture also awaits the SQLite audit commit, so the follow-up
+uses Linux memory-backed storage while retaining the 250 ms protocol assertion,
+durable events, coalescing, cancellation and restart assertions. This does not
+prove a disk-backed production acknowledgement SLO. The 20 focused setup
+tests passed in 0.71 seconds. Accounting and helper recovery tests passed
+(20 tests, four explicit live prerequisites ignored, 0.34 seconds), format
+passed and final all-target service Clippy passed in 7.03 seconds. Independent
+review passed. The integrated candidate still requires its exact-source gate.
+
+### Current destination inventory before warm admission (follow-up candidate)
+
+Bosn now reads act2 `cache audit` through a supplied verified engine, using a
+30-second deadline and 64 KiB output bound. The initial page has at most 12
+entries; act2's count, logical archive byte total and fingerprint describe its
+whole-store scan. Continuation entries are not represented as a full exported
+catalog. Typed validation rejects identity/schema mismatches, contradictory
+page/count/byte evidence, invalid entries and unbounded diagnostics. Missing,
+busy, partial, failed-command and unknown inventory cannot satisfy the current
+inventory requirement. Nonzero commands retain valid partial evidence.
+
+The published act2.7 private-Docker import/expiry proof passed in 1.66 seconds.
+Current inventory first observed the imported archive (one entry, 80 bytes);
+after independent idle maintenance it observed zero entries/bytes and a changed
+fingerprint while the historical import receipt still described the original
+publication. Source hashes remained unchanged and the exact helper was removed.
+A focused parser test passed and service all-target Clippy passed (18.09 seconds)
+before the live fixture extension. The initial final lint attempt exposed the
+fixture's 106-line function; extracting its current-inventory assertion kept
+the gate intact. The expanded live proof passed again, and final all-target
+Clippy passed in 18.91 seconds. Independent review passed.
+
+This supplies current sampled evidence, not an enrollment transaction, snapshot
+lease across routing publication, proof of old-peer exclusion or physical block
+accounting. Production admission and maintenance startup remain open.
+
+Promotion gate c602bb62-eaf2-4906-9027-5aa290ad1d9c completed after 378
+seconds with all Rust workspace tests and lint steps successful, but its Bosn
+0.1.14 driver marked the overall run Incomplete: reusable-workflow execution
+identity was not qualified. Cleanup was Removed. This is not a passing gate
+receipt; the Linux lane was not run. Bosn 0.1.15 is now available as a released
+driver and the next gate will use an isolated state directory with that version.
+
+### Normal daemon startup maintains existing agreed cohorts (follow-up)
+
+Normal `Service::serve` now starts the independent cache maintenance worker and
+keeps the registry writer alive until worker cancellation finishes. It polls
+for an existing canonical shared policy; no volume/record means no defaults,
+bootstrap, migration or deletion. Discovery errors persist an Unknown latest
+result without a helper reference and retry after 60 seconds. Once discovered,
+the bounded periodic supervisor runs independently of job admission and saves
+its latest outcome before the service consumer receives it. The existing FD6
+nonblocking cross-daemon lock continues to exclude concurrent maintenance
+commands, though duplicate helper creation is still possible.
+
+Each maintenance helper additionally requires the existing canonical policy on
+its actual mounted volume, rather than publishing policy itself. A replaced
+volume or removed/conflicting record cannot inherit cached in-memory agreement.
+Explicit participating cohort workflow execution still publishes agreement;
+maintenance never opts legacy repositories into the cohort or deletes source
+stores. Production route selection remains Legacy and configured cohort
+retention stays refused pending warm enrollment and old-peer coordination.
+
+The genuine private-Docker normal-daemon fixture passed in 1.45 seconds: startup
+without submitted jobs discovered the existing policy, recorded a successful
+complete budget outcome, stopped normally and left the exact helper journal
+Removed. The no-volume/Docker-outage test issued only volume inspection, never
+helper creation or maintenance; absence left no snapshot and outage persisted
+Unknown. Focused safety tests and all-target Clippy passed (14.12 seconds).
+The tightened per-helper existing-policy check and full service suite are being
+verified; no shipped startup behavior or prompt uncertain-command shutdown
+guarantee is claimed yet. Other shared cache classes and host image/build-cache
+expiry remain open.
+
+The tightened policy check passed the real idle-daemon proof again (2.66
+seconds). Full-suite runs exposed setup-only fixtures using the real CI backend:
+background discovery legitimately added helper intent events to their exact
+setup event expectations. Setup and rollover fixtures now explicitly supply
+the existing fake CI backend; their setup executors and exact event assertions
+are retained. The corrected full suite and final lint are running.
+
+The promotion candidate before this startup follow-up passed its Rust lane
+under the released Bosn 0.1.15 driver (375 seconds), with exact-source executed
+step evidence. Its Linux lane is running as
+41f19684-93f1-4b0d-bb80-de4603894b89. This supersedes the earlier driver
+0.1.14 Incomplete result but does not yet establish a complete promotion gate.
+
+After both setup fixture groups used explicit fake CI backends, the full private
+Docker service suite passed: 463 passed, zero failed, 18 explicit live/large
+prerequisites ignored. Final service all-target Clippy passed in 19.67 seconds.
+The normal-startup slice and fixture isolation received independent review.
+The preceding promotion candidate now has a complete passing exact-source gate:
+Rust 375 seconds, Linux 332 seconds, total 707 seconds, stamped commit
+85bc9afcba5760b4c3c418479c240a6620bc5a01 and tree
+d27b7f0616d9e4dfccc9118d35d759896af1dd53. The startup follow-up still
+requires its own integrated exact-source gate before promotion.

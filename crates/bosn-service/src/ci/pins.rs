@@ -79,9 +79,9 @@ pub fn act_artifact(architecture: &str) -> Option<ActArtifact> {
             // containers, --workflow-overlay (#424), and ordinary hosted
             // Linux shell/Node identity with preserved Docker socket access,
             // concurrent v4 artifact block assembly, and raw stream tagging.
-            url: "https://github.com/zackees/act2/releases/download/v0.2.89-act2.4/act_Linux_x86_64.tar.gz",
-            sha256: "7fa5bb0bea4cb01fe2cba2c31b14ad6e30e5f62c9934904487965c0af39fec9b",
-            binary_sha256: "7e7a285bc18078dbbb7ddc46de3928f3df221812e5e96011b186fef3f554b37f",
+            url: "https://github.com/zackees/act2/releases/download/v0.2.89-act2.7/act_Linux_x86_64.tar.gz",
+            sha256: "61d640112af87278075c70cd67412ec9c44ceffd1e269e88632d50d4a83ebd27",
+            binary_sha256: "328147f59cc101aa86cc826ecb5e7b2493f74765d520d4809997b2a9c6ba56bd",
         }),
         _ => None,
     }

@@ -11,8 +11,8 @@ use crate::ci::{CacheClass, CacheComponent, CacheUsage};
 
 #[cfg(test)]
 mod durability_tests;
-mod helper;
-mod journal;
+pub(super) mod helper;
+pub(super) mod journal;
 mod retry;
 pub use retry::HelperCleanupRetry;
 
@@ -173,6 +173,18 @@ impl DockerActBackend {
                 ..CacheUsage::default()
             });
         }
+        self.read_cache_tracked(volume, context, SCRIPT)
+            .await
+            .map(|output| parse(volume, &output))
+    }
+
+    /// Fixed trusted readers share the same read-only helper and journal.
+    pub(in crate::ci::engine) async fn read_cache_tracked(
+        &self,
+        volume: &str,
+        context: Option<(&crate::RegistryActor, &str)>,
+        script: &'static str,
+    ) -> Result<String, String> {
         self.verify_measured_volume(volume).await?;
         let image = engine_image();
         let mount = format!("type=volume,source={volume},target=/cache,readonly");
@@ -214,7 +226,7 @@ impl DockerActBackend {
             "sh",
             &image,
             "-c",
-            SCRIPT,
+            script,
         ]);
         create_args.splice(2..2, identity.ownership_args());
         let created = self
@@ -258,10 +270,10 @@ impl DockerActBackend {
         if let Some(tracker) = &tracker {
             tracker.finish(&id).await?;
         }
-        measured.map(|out| parse(volume, &out))
+        measured
     }
 
-    async fn remove_measurement(&self, id: &str) -> Result<(), String> {
+    pub(in crate::ci::engine) async fn remove_measurement(&self, id: &str) -> Result<(), String> {
         let result = self
             .run(owned(&["rm", "-f", "-v", id]), CONTROL_DEADLINE)
             .await
@@ -280,7 +292,10 @@ impl DockerActBackend {
         ))
     }
 
-    async fn verify_measured_volume(&self, volume: &str) -> Result<(), String> {
+    pub(in crate::ci::engine) async fn verify_measured_volume(
+        &self,
+        volume: &str,
+    ) -> Result<(), String> {
         let document = self
             .checked(
                 "cache ownership",

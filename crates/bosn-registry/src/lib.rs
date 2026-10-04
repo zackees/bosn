@@ -20,6 +20,8 @@ use kernal_api::{
 
 pub mod act;
 pub mod cache_helper;
+pub mod cache_maintenance;
+pub mod cache_migration;
 mod gc_query;
 mod immediate;
 mod read_only;
