@@ -80,14 +80,25 @@ Docker outage, permission error, malformed sample, or failed measurement is
 reported as partial/unknown. Only Docker's explicit `no such volume` verdict
 reports absence. The temporary reader uses Docker auto-removal and explicit
 cleanup by its immutable ID after every read result, including a measurement command deadline.
-Cleanup errors identify the container for recovery. Discovery after a create
-command that returns no ID still needs partial-create recovery verification.
+Cleanup errors identify the container for recovery. Each create now carries a
+unique UUID name and nonce label. A failed or invalid acknowledgement triggers
+typed discovery; identity and isolation must match before removing an immutable
+ID. Successful removal requires Docker's explicit absence verdict. Discovery
+that is absent, unreadable, malformed or mismatched remains pending, with the
+helper name in diagnostics. A later create or daemon death still needs durable
+reconciliation; diagnostics alone do not establish eventual cleanup.
 Its read-only cache mount and masked engine data volume create no build cache.
 
 Verification: the two initial focused tests failed before the implementation
 (missing allocated bytes/components, missing partial flag), then passed.
 Real sparse-file measurement, malformed/duplicate records, Docker outage,
 public runner error reporting and failed-helper cleanup are covered by tests.
+Eight helper transport tests pass, including a replay where real Docker creates
+the helper but a wrapper discards the acknowledgement. Recovery removes that
+verified helper; a subsequent real measurement succeeds with nonzero allocated
+bytes and leaves the shared cache intact. Tests also reject successful remove
+responses without observed absence and preserve mismatched helper identities.
+The replay uses the isolated private Docker engine, not the host Docker data.
 The generated CI schema was refreshed from the Rust types in an isolated
 container with a writable docs mount.
 

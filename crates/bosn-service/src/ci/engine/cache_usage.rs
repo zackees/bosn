@@ -9,6 +9,8 @@ use super::{
 };
 use crate::ci::{CacheClass, CacheComponent, CacheUsage};
 
+mod helper;
+
 const MAX_NAMESPACES: usize = 256;
 const MAX_ERRORS: usize = 16;
 
@@ -148,14 +150,19 @@ impl DockerActBackend {
         self.verify_measured_volume(volume).await?;
         let image = engine_image();
         let mount = format!("type=volume,source={volume},target=/cache,readonly");
-        // Create first so cleanup always names the immutable ID, even if a
-        // measurement times out. Mask the image's declared data volume.
-        let id = self
+        // Name and label the helper before create so a lost acknowledgement
+        // can be reconciled without removing an unverified container by name.
+        let identity = helper::Identity::new().await?;
+        let created = self
             .checked(
                 "cache measure create",
                 owned(&[
                     "create",
                     "--rm",
+                    "--name",
+                    &identity.name,
+                    "--label",
+                    &identity.label(),
                     "--pull",
                     "never",
                     "--network",
@@ -179,10 +186,20 @@ impl DockerActBackend {
                 ]),
                 CONTROL_DEADLINE,
             )
-            .await?;
-        if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err("cache measure create returned no immutable container ID".into());
-        }
+            .await;
+        let id = match created {
+            Ok(id) if helper::valid_id(&id) => id,
+            result => {
+                let error = result.err().unwrap_or_else(|| {
+                    "cache measure create returned no immutable container ID".into()
+                });
+                let recovery = self.recover_measurement(&identity, volume).await;
+                return Err(match recovery {
+                    Ok(()) => format!("{error}; measurement helper {} recovered", identity.name),
+                    Err(recovery) => format!("{error}; {recovery}"),
+                });
+            }
+        };
         // Mounting a named volume can recreate it if a concurrent clear won
         // the race. Repeat its ownership check before starting the helper.
         let measured = match self.verify_measured_volume(volume).await {
@@ -206,8 +223,10 @@ impl DockerActBackend {
             .await
             .map_err(|error| format!("{error}; measurement container {id} needs cleanup"))?;
         let detail = String::from_utf8_lossy(&result.stderr);
-        if result.ok()
-            || detail.to_ascii_lowercase().contains("no such container:")
+        if result.ok() {
+            return self.confirm_measurement_absent(id).await;
+        }
+        if detail.to_ascii_lowercase().contains("no such container:")
             || detail.to_ascii_lowercase().contains("no such object:")
         {
             return Ok(());
