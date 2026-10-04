@@ -3017,3 +3017,29 @@ Bosn gate in 921 seconds (Rust474s/Linux447s), and exact verification accepted
 stamped source `e68f8fe5e7b387ca77a67491898090752632a907`, tree `ea1e13959129`.
 Independent documentation review passes; its PR is being published. This
 follow-up records the newer workflow experiment and release evidence.
+
+
+### Verified act2.8 artifact and Bosn pin candidate
+
+The release workflow `37227718381` succeeded on the exact fully tested candidate
+`2029595941c40866b7114bf62b33d52ea54fc781`; the annotated release tag resolves
+to that same commit. All eleven release archives match both the checksums file
+and GitHub asset digests. Their contained binaries have the expected target
+architecture and embedded version. The actual Linux x86_64 binary reports
+`act version 0.2.89-act2.8` inside the private Linux container; released
+`tool-retain` and `tool-exec` command flags are present.
+
+The Linux x86_64 archive digest is
+`95b1b7f01da6f5ca22e206847d419c80fa04198f0cd568f986f96448ba7230d4`;
+its binary digest is
+`743c13bf6c8ee8ff948a14f940f6d1033ab4e09d11d29d94fda8e1bbaeea8628`.
+The Bosn candidate updates the one ACT_VERSION constant, artifact URL and both
+digests together. The stock runner image remains the pinned published image.
+Source review and Bosn's required source-bound gate are pending before push.
+The consolidated spec is now merged in Bosn #499, main `fe0a3d3d`.
+
+This pin makes the verified retention and native-reader CLI available to Bosn
+engines; it does not enable the new production generation profile, metadata-only
+overlay mount, quiescent successor publication or whole-machine scheduling.
+The default engine still follows the inspected legacy copy path until those
+production changes are implemented and verified.
