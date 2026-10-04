@@ -229,7 +229,7 @@ verification resources; none is a new production runner or cache contract.
 |---|---|---|---|
 | 1 | Inventory current caches, accounting and cleanup; record a host sample | Code paths, current tests, read-only audit | Complete (survey above) |
 | 2 | Expose a typed breakdown for the shared cache and owned engine volumes | Focused RED to GREEN tests with accurate partial/unknown behavior | Shared cache implemented and tested in this branch; engine/retained-volume attribution open |
-| 3 | Add age/size policy for disposable act cache data and active-use coordination | Concurrent live runs retain hits; over-limit idle data shrinks; no cross-repo reads | act2 byte limit and cross-process transfer RED to GREEN; policy settings and idle-server maintenance tested; offline and aggregate completed-archive maintenance implemented locally; Bosn integration and migration open |
+| 3 | Add age/size policy for disposable act cache data and active-use coordination | Concurrent live runs retain hits; over-limit idle data shrinks; no cross-repo reads | act2 byte limit and cross-process transfer RED to GREEN; policy settings and idle-server maintenance tested; offline and aggregate completed-archive maintenance implemented locally; Bosn integration and automatic warm cutover open |
 | 4 | Account for and expire eligible old CI engines, host images and build cache | Fault/restart live Docker tests, exact ownership checks, repeated-run footprint trend | Existing lifecycle passes live end-state/restart tests; image/build-cache attribution, expiry and online failure recovery open |
 | 5 | Wire pressure diagnostics and verify sustained warm workloads | Repeated cold/warm benchmark plus disk growth under the configured ceiling | Open |
 
@@ -287,7 +287,8 @@ for each server lifetime; aggregate maintenance holds it exclusively before
 namespace locks/metadata. Live servers defer the aggregate pass, and new namespace
 creation cannot cross a running pass. Existing legacy namespaces cannot silently
 enroll. A new directory cohort is needed so released act2 peers never write it;
-completed-archive migration is still open and required to preserve warm reuse.
+completed-archive import is now implemented locally, while automatic Bosn
+quiescence/cutover remain open.
 
 The aggregate pass validates all namespaces before deletion and refuses busy,
 legacy, unknown, partial or oversized inventories. Up to 64 namespaces are
@@ -301,5 +302,32 @@ lint pass for this slice. Namespace report ordering is deterministic.
 
 This is an archive-length budget, not a physical machine footprint ceiling. Other
 cache classes, metadata and temporary data remain accounted separately. Scheduled
-Bosn integration/retry, warm migration, host image/build-cache expiry and sustained
+Bosn integration/retry, automatic warm cutover, host image/build-cache expiry and sustained
 concurrent workloads remain open; the production pin and cache path are unchanged.
+
+### Warm migration progress (local candidate)
+
+Act2 provides bounded completed-archive import from a quiescent legacy namespace
+into a new cohort. The source metadata is held read-only; files and retention
+timestamps remain unchanged. Recent completed archives are selected within an
+explicit positive byte bound. The importer checks lengths, source/destination
+SHA-256 and a final source inventory fingerprint, then publishes a synced staged
+namespace by atomic rename under the exclusive cohort lease. Existing targets
+are refused. Failed staging cleans only the exact generated directory or reports
+its pending path; unpublished work has no successful import receipts.
+
+A fixture with no transfer-coordination file demonstrates a real HTTP lookup and
+download hit from a fresh candidate server after import. Source metadata stays
+byte-identical and new reservations do not collide with imported IDs. Byte-bound,
+overwrite/cancellation/corruption and changed-source staging cleanup cases are
+covered. Import receipts are bounded to twelve details with an omitted count.
+The full artifactcache race suite, focused offline CLI/policy tests and final
+migration-specific race check pass; pinned lint reports zero issues.
+
+This migration requires legacy servers to be stopped: holding their metadata
+lock can fail active requests, and it cannot coordinate arbitrary file writers
+outside that protocol. The CLI requires explicit quiescence acknowledgement;
+Bosn must verify quiescence rather than treating that flag as evidence. Import
+copies rather than removes legacy archives, so retained legacy bytes and temporary
+duplication must be included in headroom. Bosn integration, automatic safe cutover,
+retry, sustained workload and host image/build-cache expiry remain open.
