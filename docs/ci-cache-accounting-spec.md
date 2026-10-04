@@ -639,3 +639,12 @@ launch or supervise this command, and its released act2 pin lacks it. Safe
 machine-wide warm migration, old-peer exclusion, headroom and physical storage
 admission remain open. This is a tested maintenance mechanism, not evidence of
 automatic Bosn byte-budget enforcement.
+
+The watcher now also has a retained-data workload proof: real metadata/storage
+fixtures contain 240 completed archive bytes with shutdown retention disabled.
+An age-only pass leaves them intact; the watched CLI's 80-byte aggregate budget
+removes the eligible cold entries and leaves the recently used warm entry.
+A fresh server retrieves that entry and its exact bytes through loopback HTTP.
+The focused watcher race tests and pinned lint pass. This closes the earlier
+empty-store-only verification limitation for watcher byte collection; it still
+does not prove actual SIGKILL handling or Bosn supervision.
