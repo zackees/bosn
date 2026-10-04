@@ -3335,3 +3335,43 @@ cold-disk scaling, general starvation bounds, many-engine pressure limits,
 7.7 GiB performance, or complete gates under 60 seconds. The whole artifact-cache
 package passed with the race detector (22.734 seconds), including retention
 coverage, after the focused generation tests.
+
+
+### Post-stop read-only publication survey (2026-10-04, fixture only)
+
+A controlled private-Docker fixture retained a task-owned named source volume
+while removing its writer container. The writer advanced from 10 to 21 after
+its launching client reported exit code 0. After label-checked source-container
+removal, inspection confirmed its absence and no volume attachments. A separate
+controlled finalizer wrote the completion marker and exited; it was removed
+before the publisher started. A fresh helper mounted the exact original source
+volume read-only and a distinct task-owned destination volume read-write.
+
+The verified released act2.8 CLI published a complete `sibling-v1` object from
+that read-only source. Payload remained `23` over the stability check and the
+published payload matched it. Native report: published=true, partial=false,
+2 payload bytes and 2 entries. All source/finalizer/helper containers and both
+volumes were label-checked and removed; cleanup completed.
+
+Evidence: `.git/retention-post-stop-publication-proof.{py,json,log}`. Earlier
+streaming and noexec-tmpfs harness failures are preserved separately as
+`retention-post-stop-publication-proof-{stream,exec}-failure.{json,log}`; their
+resources were cleaned up and they are not successful publication evidence.
+
+For disk-backed production runs this supports investigating publication from
+retained private storage *after* proven source-engine shutdown, instead of
+claiming quiescence from client exit or a completion marker. Required integration:
+freeze the exact named storage identity; protect it against cleanup/GC throughout
+the handoff; prove original engine/process absence and refuse unknown or foreign
+attachments; mount that original source read-only in an owned publisher; retain
+old-generation protection while reconstructing any merged overlay; publish only
+completed entries into the latest selected generation; then reconcile helper
+and source-volume removal. Partial publication must preserve the prior shared
+selection and expose pending storage/byte-budget evidence for bounded retry or
+safe expiry.
+
+This fixture does not implement that lifecycle, recover overlays/metacopy data,
+prove arbitrary workflow process/cgroup exclusion, or authorize removal of active
+engines. It does not apply to memory-backed private storage, which disappears
+with its engine; that mode requires a separately verified handoff while data
+still exists. Bosn still uses legacy best-effort tool saving on ordinary exits.
