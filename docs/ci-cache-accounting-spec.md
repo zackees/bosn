@@ -439,11 +439,30 @@ rather than reporting a known subtotal as the complete footprint.
 
 These are Docker's rounded approximate sizes, not allocated-block samples. They
 must not be added to the shared-cache `du` result, because that would count the
-same volume twice. This summary grants no deletion authority and does not yet
-join private volumes to registry cleanup state. Legacy anonymous volumes remain
-outside this labelled breakdown. Four focused isolated aggregation tests pass;
-The final CLI built and a read-only live scan of the isolated engine succeeded
+same volume twice. This summary grants no deletion authority. The bounded
+correlation slice below adds registry cleanup state. Legacy anonymous volumes remain
+outside this labelled breakdown. The initial four aggregation tests pass.
+Before the correlation slice, the CLI built and a read-only live scan succeeded
 in JSON and readable modes: one detached retained shared-cache volume,
 805,100,000 approximate bytes, zero private CI volumes, and no partial reads.
 Final strict Clippy verification passes for all service targets, including the
 readable-output change. Source-length/include and diff checks pass.
+
+The next local slice adds up to 64 private-volume detail rows (largest/unknown
+first, with an explicit omitted count). `scan` opens only its selected registry
+read-only and correlates each matching owner/intent-derived volume with the
+durable engine state and any spare run binding. Foreign registry, unavailable
+registry, absent record, unreadable record and identity mismatch are separate
+typed outcomes. Correlation is diagnostic and cannot authorize deletion. This
+slice passed six focused isolated accounting tests, including persisted
+cleanup-required state, unavailable/foreign/missing history, and bounded details
+without losing object totals or hiding unknown sizes. Strict Clippy passes for
+all service and registry targets after extracting volume classification into
+its own function. All 18 registry lifecycle regression tests pass. The final
+CLI built and a live read-only scan of a synthetic labelled private volume in
+the isolated engine reported its exact intent/registry identity, detached status,
+zero bytes and unavailable lifecycle history (not matched cleanup authority).
+The synthetic volume was then removed; the retained cache was preserved.
+The registry read-only handle now exposes the same bounded engine-record decoder
+as the writer handle (one row, at most 32 KiB), including registry-owner checks.
+The persisted cleanup-required correlation test verifies this read-only API.

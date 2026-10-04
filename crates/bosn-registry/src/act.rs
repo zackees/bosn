@@ -771,23 +771,7 @@ impl Immediate<'_> {
 }
 impl Registry {
     pub fn act_engine(&self, run: &str) -> Result<Option<ActEngineRecord>, Error> {
-        let rows = self.connection.query(
-            "SELECT detail FROM events WHERE kind=? ORDER BY id DESC LIMIT 1",
-            &[Value::Text(kind(run)?)],
-            QueryLimits {
-                max_rows: 1,
-                max_bytes: 32768,
-            },
-        )?;
-        let record = rows
-            .first()
-            .map(|r| decode(&text(r, 0)?, run))
-            .transpose()?;
-        let owner = self.registry_id()?;
-        if record.as_ref().is_some_and(|r| owner != r.registry_id) {
-            return Err(Error::ResourceIdentityConflict);
-        }
-        Ok(record)
+        read_act_engine(&self.connection, &self.registry_id()?, run)
     }
     /// Bounded active recovery page using immutable run-ID keyset ordering.
     /// Follow next_run_id until absent; retiring earlier pages cannot skip work.
@@ -831,5 +815,34 @@ impl Registry {
                 .clone()
         });
         Ok(ActEngineRecoveryPage { items, next_run_id })
+    }
+}
+
+fn read_act_engine(
+    connection: &Connection,
+    owner: &str,
+    run: &str,
+) -> Result<Option<ActEngineRecord>, Error> {
+    let rows = connection.query(
+        "SELECT detail FROM events WHERE kind=? ORDER BY id DESC LIMIT 1",
+        &[Value::Text(kind(run)?)],
+        QueryLimits {
+            max_rows: 1,
+            max_bytes: 32768,
+        },
+    )?;
+    let record = rows
+        .first()
+        .map(|r| decode(&text(r, 0)?, run))
+        .transpose()?;
+    if record.as_ref().is_some_and(|r| owner != r.registry_id) {
+        return Err(Error::ResourceIdentityConflict);
+    }
+    Ok(record)
+}
+
+impl ReadOnlyRegistry {
+    pub fn act_engine(&self, run: &str) -> Result<Option<ActEngineRecord>, Error> {
+        read_act_engine(&self.connection, &self.registry_id()?, run)
     }
 }

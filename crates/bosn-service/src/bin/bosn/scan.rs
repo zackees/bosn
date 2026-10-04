@@ -67,13 +67,18 @@ pub(crate) fn run_scan(mut arguments: impl Iterator<Item = std::ffi::OsString>) 
         }
         return;
     }
+    let mut owned = bosn_service::owned_accounting::summarize(&scan.artifacts, census.partial);
+    let registry = bosn_registry::Registry::open_read_only(state_dir.join("registry.sqlite3")).ok();
+    owned.correlate(registry.as_ref());
     if json_output {
-        println!("{}", scan_json(scan, warning.as_ref(), acknowledged));
+        println!(
+            "{}",
+            scan_json(scan, warning.as_ref(), acknowledged, &owned)
+        );
         return;
     }
     println!("scan");
     print_census(census);
-    let owned = bosn_service::owned_accounting::summarize(&scan.artifacts, census.partial);
     println!("Bosn storage (Docker approximate sizes):");
     for row in owned.classes {
         let bytes = row
@@ -182,6 +187,7 @@ pub(crate) fn scan_json(
     scan: bosn_service::unmanaged::UnmanagedCensus,
     warning: Option<&bosn_core::Warning>,
     acknowledged: bool,
+    owned: &bosn_service::owned_accounting::OwnedStorage,
 ) -> serde_json::Value {
     let census = &scan.census;
     let classes: Vec<_> = census
@@ -230,7 +236,7 @@ pub(crate) fn scan_json(
         "partial": census.partial,
         "classes": classes,
         "protected": protected,
-        "owned_storage": bosn_service::owned_accounting::summarize(&scan.artifacts, census.partial),
+        "owned_storage": owned,
         "foreign_reclaimable": foreign_reclaimable,
         "unreadable": scan.unreadable,
     })
