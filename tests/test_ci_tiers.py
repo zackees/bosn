@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import tomllib
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ci"))
@@ -123,7 +124,10 @@ def test_native_backend_and_compiler_fixtures_have_provisioned_tools() -> None:
         ]
         assert consumers and max(soldr, uv) < min(consumers)
         assert steps[soldr]["with"]["version"] == "0.9.27"
-        assert steps[soldr]["with"]["toolchain"] == "1.95.0"
+        declared = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]
+        assert steps[soldr]["with"].get("toolchain", declared["channel"]) == "1.95.0"
+        if job is CI["jobs"]["rust"]:
+            assert {"rustfmt", "clippy"} <= set(declared["components"])
 
 
 def test_label_changes_reselect_same_sha() -> None:

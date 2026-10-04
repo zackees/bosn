@@ -241,7 +241,10 @@ jobs:
 
       - name: Install
         if: needs.select-tier.outputs.test == 'true'
-        run: ./install
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes pkg-config libssl-dev patchelf
+          ./install
 
       - name: Lint
         if: needs.select-tier.outputs.test == 'true'
