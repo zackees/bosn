@@ -3481,3 +3481,26 @@ remain required before publication. The released native admission optimization
 permits concurrent content validation while the original generation reader
 protects the payload; it does not weaken corruption checks or activate Bosn's
 pending shared-cache lifecycle.
+
+### Original native reader through real engine PID1 (2026-10-04)
+
+A released act2.9 fixture published and selected a quiescent 16 MiB tool
+install in a task-owned volume, then created a fresh privileged engine in the
+private test daemon. `tool-exec` replaced itself with Bosn's actual `ENGINE_INIT`
+command and the same pinned dockerd arguments. The engine reached Docker
+readiness. `/proc/1/environ` recorded lease FD 7 and `/proc/1/fd/7` referenced the
+original selected generation's `.readers-v1.bolt`. An independent helper sharing
+the same store failed a nonblocking exclusive flock while the engine was alive
+(exit 1, no diagnostic); after label-checked engine removal the same command
+succeeded (exit 0). Both fixture containers and both volumes were removed after
+ownership/attachment checks. Evidence:
+`.git/retention-native-pid1-handoff-proof.json` and its executable fixture.
+
+The fixture used the production init command and dockerd flags, but directly
+created its engine: no production planner, frozen generation binding, automatic
+migration, tool overlay preparation, job execution or post-stop publication is
+claimed. It establishes that native original-reader handoff survives the shell
+and `docker-init` chain and excludes an independent writer for the live engine.
+The initial fixture attempt misread the typed update report shape; it failed
+before engine creation and cleaned up all resources. Its retained failure is
+separate from the corrected successful lifetime experiment.
