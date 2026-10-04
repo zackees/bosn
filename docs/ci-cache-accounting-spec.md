@@ -3043,3 +3043,107 @@ engines; it does not enable the new production generation profile, metadata-only
 overlay mount, quiescent successor publication or whole-machine scheduling.
 The default engine still follows the inspected legacy copy path until those
 production changes are implemented and verified.
+
+
+### Released-binary workflow verification (2026-10-04)
+
+The same actual hosted-runner workflow fixture was repeated with the verified
+released Linux x64 binary from `v0.2.89-act2.8`, rather than the source-built
+prototype CLI. Its binary SHA-256 is
+`743c13bf6c8ee8ff948a14f940f6d1033ab4e09d11d29d94fda8e1bbaeea8628`.
+All three jobs passed: two dependent jobs in one engine shared their writable
+cache, and a fresh second engine began with the same warm immutable payload.
+The first engine's settings mutation was visible to its dependent job and
+did not change the shared lower or the fresh engine's initial settings.
+
+All jobs read the same 16 MiB payload digest
+`811e721a3e02f4407710f89f854e913d9f5f661104f7e41c8610c58b13705f9d`.
+The upper payload had zero allocated blocks in both engines, despite hosted
+runner ownership setup; their final upper allocations were 20 KiB and 12 KiB.
+The fixture verified the metadata-only overlay mount mode. Both exact engine
+IDs and the shared lower volume were removed after checking their original
+experiment ownership labels. Evidence: local audit artifacts
+`retention-toolcache-cow-released-v8-workflow.{py,json,log}`.
+
+This verifies the released executable against the private workflow fixture.
+It does not activate production generation admission, prove daemon recovery
+or completed-install publication, measure the real 7.7 GiB cache's admission
+cost, or establish machine-wide accounting and automatic expiry. Production
+still installs act after engine startup and uses the whole-tree tool seed.
+The next implementation must change that startup and recovery contract before
+replacing the production seed with the verified shared-generation overlay.
+
+
+### Production startup candidate: verified act before engine INIT (2026-10-04)
+
+After pin PR #501 merged as `139953f509075ff59a60c19d49414e5abe1e3f9f`,
+the next source candidate changes the actual cache-backed engine command.
+`creation_profile_with_cache` now freezes a bootstrap command that installs
+the pinned archive, checks both archive and extracted binary SHA-256, closes
+the archive writer descriptor, and replaces itself with the existing PID-1
+INIT → docker-init → dockerd chain. The shared install script is extracted
+into `ci/engine/act_install.rs`; startup and post-readiness verification use
+the same implementation. Creation refuses an act version/archive identity
+that differs from this startup artifact and refuses a noncanonical cache
+mount. Engines without the cache retain their original command identity.
+Historical engine recovery still checks its recorded command digest; it does
+not substitute the new producer's command. This source is not yet published.
+
+The focused regression was RED on the old command and GREEN after the change.
+A second RED showed that creation accepted a mismatched recorded artifact;
+it is now refused. All 21 engine-boundary tests passed. The compiled Rust
+command generator was also exercised in the private Docker daemon: a valid
+released archive started dockerd 29.7.2 in 1.66 seconds, exposed the verified
+act2.8 binary, and allowed exclusive acquisition of the archive writer lock
+while the engine remained live. A corrupt cached archive with no network
+exited with code 1 after 5.46 seconds. The exact observed Docker command
+matched the compiled generator. Both engines and the cache fixture volume
+were ownership-checked and removed. Audit evidence is
+`retention-bootstrap-{focused-red,focused-green,identity-red,identity-green,generated-command,runtime-proof}`
+(local logs and the runtime proof's Python/JSON artifacts).
+
+Because installation now precedes readiness, readiness has the previous
+30-minute install allowance plus the previous 60-second daemon allowance.
+It parses Docker's startup state into a typed struct after failed daemon
+probes and immediately refuses stopped or unprovable engines; it does not
+wait the download budget after an observed exit. Each probe uses the smaller
+of the remaining total allowance and the control-operation budget. The typed
+state refusal test passed. Full source gates and cumulative review are still
+pending for this candidate.
+
+This moves the production bootstrap boundary needed for native generation
+admission. It does **not** acquire a generation reader yet: the production
+planner still selects the legacy cache route, and `prepare_run` still copies
+the legacy tool tree. Frozen generation selection/native exec handoff, trusted
+metadata-only overlay mounting, recovery/lifetime proof, quiescent completed
+install publication, large-cache optimization, and whole-machine convergence
+remain unfinished. The warm-archive runtime proof does not measure cold
+network download latency.
+
+
+### Startup review correction: installer failure propagation (2026-10-04)
+
+Cumulative review rejected the first startup candidate: its shared installer
+ended with `tar && binary-check && version`, followed by FD close and INIT.
+A nonfinal failure in that AND-list does not trigger shell `set -e`, so the
+appended INIT could mask failed extraction or binary verification. The earlier
+corrupt-archive experiment exercised the explicit download refusal only and
+did not prove these two paths. The earlier source gate, even if it passes,
+cannot authorize publishing that candidate.
+
+Two focused shell regressions using the compiled command generator reproduced
+the defect independently: failed extraction and failed binary checksum both
+entered an INIT sentinel and returned success (RED). The shared installer now
+explicitly exits with the failed chain's status before any later command. Both
+regressions passed (GREEN), along with all 23 engine-boundary tests. Full Rust
+command regeneration and a fresh private runtime proof also passed: verified
+released archive → actual INIT/dockerd in 1.56 seconds, correct binary/version
+and released archive writer; corrupt archive without network → exit 1 in
+5.52 seconds. Exact command identity and label-checked cleanup were confirmed.
+Evidence: `retention-bootstrap-install-failure-{red,green}.log` and
+`retention-bootstrap-fixed-runtime-proof.{py,json,log}`.
+
+This correction remains an unpublished startup candidate. Cumulative follow-up
+review and a new exact-source full gate are required. It does not add production
+generation admission or replace the legacy seed; the outstanding cache and
+machine-wide retention requirements above still apply.

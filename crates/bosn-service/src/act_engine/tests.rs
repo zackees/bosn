@@ -3,7 +3,7 @@
 use super::*;
 use serde_json::json;
 
-fn intent() -> ActEngineIntent {
+pub(super) fn intent() -> ActEngineIntent {
     ActEngineIntent {
         run_id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".into(),
         workspace: "/private/source".into(),
@@ -20,7 +20,7 @@ fn intent() -> ActEngineIntent {
     }
 }
 pub(super) const OWNER: &str = "11111111-2222-4333-8444-555555555555";
-fn limits() -> ActEngineLimits {
+pub(super) fn limits() -> ActEngineLimits {
     ActEngineLimits {
         memory_bytes: 8 << 30,
         storage_bytes: 4 << 30,

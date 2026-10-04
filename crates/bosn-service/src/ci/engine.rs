@@ -43,6 +43,10 @@ pub use maintenance::MaintenanceAttempt;
 pub use maintenance_helper::MaintenanceHelperAttempt;
 pub use maintenance_loop::MaintenanceTick;
 pub use migration::ImportAttempt;
+mod act_install;
+mod readiness;
+use act_install::act_archive;
+pub(crate) use act_install::install_act_script;
 mod lines;
 mod runner_tools;
 mod toolcache;
@@ -361,20 +365,6 @@ impl DockerActBackend {
             .run(owned(&["volume", "inspect", volume]), CONTROL_DEADLINE)
             .await?;
         cache_usage::volume_present(result.ok(), &result.stderr)
-    }
-
-    async fn wait_ready(&self, engine: &str) -> Result<(), String> {
-        let deadline = async_engine::Deadline::after(Duration::from_secs(60));
-        loop {
-            let probe = Self::exec(engine, "docker info >/dev/null 2>&1");
-            if self.run(probe, CONTROL_DEADLINE).await?.ok() {
-                return Ok(());
-            }
-            if deadline.is_elapsed() {
-                return Err("nested engine did not become ready within 60s".into());
-            }
-            async_engine::sleep(Duration::from_millis(250)).await;
-        }
     }
 
     /// Install the pinned act release, verified by sha256, from the cache
@@ -888,31 +878,6 @@ fn work_dirs_script() -> String {
         "mkdir -p {ENGINE_WORK}/bin {ENGINE_WORK}/src {ENGINE_WORK}/overlay {ENGINE_WORK}/artifacts \
          {ENGINE_WORK}/home/.cache {ENGINE_WORK}/home/.config {ENGINE_WORK}/tmp"
     )
-}
-
-/// Shell (busybox) that installs act from the cache volume, refreshing a
-/// missing or corrupt tarball from the pinned URL; prints `act --version`.
-fn install_act_script(act: ActArtifact) -> String {
-    format!(
-        "tgz={archive}; mkdir -p {ENGINE_CACHE}/tools; \
-         exec 9>>\"$tgz.lock\"; flock -x 9; \
-         if ! echo \"{sum}  $tgz\" | sha256sum -c - >/dev/null 2>&1; then \
-           stage=$(mktemp \"$tgz.XXXXXXXX\"); trap 'rm -f \"$stage\"' EXIT; \
-           wget -q -O \"$stage\" '{url}' && \
-           echo \"{sum}  $stage\" | sha256sum -c - >/dev/null && mv \"$stage\" \"$tgz\" || exit 1; \
-         fi; \
-         tar -xzf \"$tgz\" -C {ENGINE_WORK}/bin act && \
-         echo \"{binary}  {ENGINE_WORK}/bin/act\" | sha256sum -c - >/dev/null && \
-         {ENGINE_WORK}/bin/act --version",
-        url = act.url,
-        sum = act.sha256,
-        binary = act.binary_sha256,
-        archive = act_archive(act),
-    )
-}
-
-fn act_archive(act: ActArtifact) -> String {
-    format!("{ENGINE_CACHE}/tools/act-{ACT_VERSION}-{}.tgz", act.sha256)
 }
 
 /// The runner image tar in the cache volume.
