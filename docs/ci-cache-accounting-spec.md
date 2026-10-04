@@ -3735,3 +3735,22 @@ Before this addition the complete artifact-cache race suite passed in 22.114
 seconds (`.git/retention-native-recovery-pin-full-package.log`); that result does
 not validate the later release code. Candidate-wide review, lint/platform/full
 package validation, CLI exposure and production activation remain pending.
+
+### Recovery CLI and release package validation (candidate, 2026-10-04)
+
+Act2 candidate `208504c` exposes `cache tool-recovery reserve --record FILE
+--max-bytes N --apply` and `cache tool-recovery release --record FILE --apply`,
+with the existing `--cache-server-path` store selection. Both read a bounded
+regular schema-1 intent file into `ToolRecoveryPin`, reject unknown fields and
+trailing data, and emit typed JSON receipts even for partial runtime outcomes.
+The reservation validates the complete lower; release requires caller lifecycle
+exclusion described above. Missing `--apply` refuses before mutation.
+
+The CLI round-trip test publishes and releases a real fixture generation and
+checks missing approval, trailing data and unknown-field refusal:
+`.git/retention-native-recovery-pin-cli-tests.log` (passed, 0.021 seconds).
+The full artifact-cache race suite with explicit release passed in 21.793
+seconds: `.git/retention-native-recovery-pin-release-full-package.log`.
+Candidate lint is now being checked. Review, cross-platform/full CI, release
+artifact verification and Bosn normal lifecycle enrollment remain pending;
+these commands are not shipped or called by normal Bosn planning yet.
