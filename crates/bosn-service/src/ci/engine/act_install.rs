@@ -15,7 +15,7 @@ pub(crate) fn install_act_script(act: ActArtifact) -> String {
          fi; \
          tar -xzf \"$tgz\" -C {ENGINE_WORK}/bin act && \
          echo \"{binary}  {ENGINE_WORK}/bin/act\" | sha256sum -c - >/dev/null && \
-         {ENGINE_WORK}/bin/act --version",
+         {ENGINE_WORK}/bin/act --version || exit $?",
         url = act.url,
         sum = act.sha256,
         binary = act.binary_sha256,

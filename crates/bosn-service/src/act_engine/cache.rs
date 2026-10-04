@@ -300,6 +300,83 @@ mod ownership_tests {
         assert!(create_arguments(&wrong, ANY_REGISTRY, limits).is_err());
     }
 
+    #[cfg(unix)]
+    fn rejected_install_never_enters_init(fail_checksum: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let root = temporary.path();
+        let tools = root.join("commands");
+        std::fs::create_dir(&tools).unwrap();
+        let executable = |name: &str, script: &str| {
+            let file = tools.join(name);
+            std::fs::write(&file, script).unwrap();
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        executable("wget", "#!/bin/sh\nexit 55\n");
+        if fail_checksum {
+            executable(
+                "tar",
+                "#!/bin/sh\nprintf '#!/bin/sh\\nexit 0\\n' > \"$4/act\"; chmod 700 \"$4/act\"\n",
+            );
+            executable(
+                "sha256sum",
+                "#!/bin/sh\nIFS= read -r row; case \"$row\" in */bin/act) exit 53 ;; *) exit 0 ;; esac\n",
+            );
+        } else {
+            executable("tar", "#!/bin/sh\nexit 37\n");
+            executable("sha256sum", "#!/bin/sh\nexit 0\n");
+        }
+        let mut command = engine_command_with_cache(Some(&ActEngineCacheVolume {
+            name: "bosn-ci-cache-v1".into(),
+            target: crate::ci::engine::ENGINE_CACHE.into(),
+        }))
+        .unwrap();
+        command.truncate(4);
+        command[2] = command[2]
+            .replace(
+                crate::ci::engine::ENGINE_CACHE,
+                root.join("cache").to_str().unwrap(),
+            )
+            .replace(
+                crate::ci::engine::ENGINE_WORK,
+                root.join("work").to_str().unwrap(),
+            );
+        let admitted = root.join("init-started");
+        command.extend(
+            [
+                "sh",
+                "-ec",
+                "printf started > \"$1\"",
+                "test-init",
+                admitted.to_str().unwrap(),
+            ]
+            .map(str::to_owned),
+        );
+        let result = std::process::Command::new(&command[0])
+            .args(&command[1..])
+            .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))
+            .output()
+            .unwrap();
+        assert!(
+            !admitted.exists(),
+            "unverified install entered INIT: checksum_failure={fail_checksum}, exit={:?}",
+            result.status.code()
+        );
+        assert!(!result.status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_refuses_failed_extraction() {
+        rejected_install_never_enters_init(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_refuses_failed_binary_checksum() {
+        rejected_install_never_enters_init(true);
+    }
+
     #[test]
     fn typed_machine_cache_inspection_protects_the_volume_boundary() {
         let cache = ActEngineCacheVolume {

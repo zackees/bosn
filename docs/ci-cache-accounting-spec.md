@@ -3119,3 +3119,31 @@ metadata-only overlay mounting, recovery/lifetime proof, quiescent completed
 install publication, large-cache optimization, and whole-machine convergence
 remain unfinished. The warm-archive runtime proof does not measure cold
 network download latency.
+
+
+### Startup review correction: installer failure propagation (2026-10-04)
+
+Cumulative review rejected the first startup candidate: its shared installer
+ended with `tar && binary-check && version`, followed by FD close and INIT.
+A nonfinal failure in that AND-list does not trigger shell `set -e`, so the
+appended INIT could mask failed extraction or binary verification. The earlier
+corrupt-archive experiment exercised the explicit download refusal only and
+did not prove these two paths. The earlier source gate, even if it passes,
+cannot authorize publishing that candidate.
+
+Two focused shell regressions using the compiled command generator reproduced
+the defect independently: failed extraction and failed binary checksum both
+entered an INIT sentinel and returned success (RED). The shared installer now
+explicitly exits with the failed chain's status before any later command. Both
+regressions passed (GREEN), along with all 23 engine-boundary tests. Full Rust
+command regeneration and a fresh private runtime proof also passed: verified
+released archive → actual INIT/dockerd in 1.56 seconds, correct binary/version
+and released archive writer; corrupt archive without network → exit 1 in
+5.52 seconds. Exact command identity and label-checked cleanup were confirmed.
+Evidence: `retention-bootstrap-install-failure-{red,green}.log` and
+`retention-bootstrap-fixed-runtime-proof.{py,json,log}`.
+
+This correction remains an unpublished startup candidate. Cumulative follow-up
+review and a new exact-source full gate are required. It does not add production
+generation admission or replace the legacy seed; the outstanding cache and
+machine-wide retention requirements above still apply.
