@@ -21,6 +21,20 @@ fn input() -> (std::fs::File, u64, PathBuf) {
     drop(file);
     (std::fs::File::open(&path).unwrap(), 2 << 20, path)
 }
+async fn blocked_session(engine: &DockerEngine) -> kernal_api::ProcessSession {
+    engine
+        .spec()
+        .stdin(StreamMode::Piped)
+        .spawn_session(ProcessSessionOptions {
+            max_queued_chunks: 8,
+            max_chunk_bytes: 64 * 1024,
+            post_exit_drain: ProcessPostExitDrain::AbandonAfter(Duration::from_millis(250)),
+            kill_on_drop: true,
+        })
+        .await
+        .unwrap()
+}
+
 #[test]
 fn stdin_file_streams_large_input_and_preserves_transport_environment() {
     async_engine::RuntimeBuilder::multi_thread()
@@ -79,14 +93,16 @@ fn stdin_file_refuses_oversize_and_reaps_blocked_child_on_deadline_or_cancel() {
                     .await,
                 Err(CommandError::Io(_))
             ));
-            let result = engine
-                .capture_with_stdin_file_async(
-                    std::fs::File::open(&path).unwrap(),
-                    size,
-                    RunOptions::bounded(Duration::from_millis(100), 1024),
-                    None,
-                )
-                .await;
+            let session = blocked_session(&engine).await;
+            let result = stdin_file::capture_session(
+                std::fs::File::open(&path).unwrap(),
+                size,
+                RunOptions::bounded(Duration::from_millis(100), 1024),
+                None,
+                Instant::now(),
+                session,
+            )
+            .await;
             let Err(CommandError::Deadline {
                 reaped_pid: Some(pid),
                 ..
@@ -95,20 +111,22 @@ fn stdin_file_refuses_oversize_and_reaps_blocked_child_on_deadline_or_cancel() {
                 panic!("{result:?}")
             };
             assert!(!PathBuf::from(format!("/proc/{pid}")).exists());
+            let session = blocked_session(&engine).await;
             let source = async_engine::CancellationSource::new();
             let trigger = source.clone();
             let task = async_engine::launch(async move {
                 async_engine::sleep(Duration::from_millis(50)).await;
                 trigger.cancel();
             });
-            let result = engine
-                .capture_with_stdin_file_async(
-                    std::fs::File::open(&path).unwrap(),
-                    size,
-                    RunOptions::bounded(Duration::from_secs(5), 1024),
-                    Some(&source.token()),
-                )
-                .await;
+            let result = stdin_file::capture_session(
+                std::fs::File::open(&path).unwrap(),
+                size,
+                RunOptions::bounded(Duration::from_secs(5), 1024),
+                Some(&source.token()),
+                Instant::now(),
+                session,
+            )
+            .await;
             task.await.unwrap();
             let Err(CommandError::Cancelled {
                 reaped_pid: Some(pid),
