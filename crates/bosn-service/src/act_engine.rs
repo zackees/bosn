@@ -41,6 +41,8 @@ pub(crate) fn bundled_engine_manifests()
     Ok(BTreeMap::from([(ENGINE_MANIFEST.into(), proof)]))
 }
 
+mod budgets;
+pub(crate) use budgets::{CLEANUP_BUDGET, CLEANUP_PASS_BUDGET, removal_reserve};
 mod cache;
 pub(crate) use cache::*;
 mod manifest;

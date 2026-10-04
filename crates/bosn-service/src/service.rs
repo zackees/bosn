@@ -214,7 +214,7 @@ impl Service {
             act_runtime::ActStartupRecoveryOptions {
                 page_size: 64,
                 max_runs: 10000,
-                deadline: Duration::from_secs(180),
+                deadline: crate::act_engine::CLEANUP_BUDGET,
             },
             &self.stop.token(),
         )
@@ -338,7 +338,7 @@ impl Service {
                         break;
                     }
                     let retry = async_engine::timeout(
-                        Duration::from_secs(200),
+                        crate::act_engine::CLEANUP_PASS_BUDGET,
                         ci.retry_cleanup(&owner, cursor.clone()),
                     );
                     let pass = async_engine::cancellable(&stop, retry).await;

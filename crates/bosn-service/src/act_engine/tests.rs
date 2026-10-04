@@ -489,7 +489,7 @@ fn actor_commits_before_create_and_start_and_refuses_uncertain_removal() {
     // A synthetic CLI reads the actor's real SQLite snapshots before each
     // mutation. This proves ordering, not real Docker or Act execution.
     const SCRIPT: &str = r#"
-import json, pathlib, sqlite3, sys
+import json, pathlib, sqlite3, sys, time
 db, observation, mode, log = sys.argv[1:5]
 args = sys.argv[5:]
 with pathlib.Path(log).open('a') as out: out.write(json.dumps(args)+'\n')
@@ -510,6 +510,7 @@ elif args[:2]==['container','start']:
 elif args[:2]==['container','rm']:
  assert record['state']=='cleanup_required' and record['engine_id']=='1'*64
  assert args[-1]=='1'*64
+ if mode=='slow-remove': time.sleep(31)
  print('1'*64)
 elif args[:2]==['container','ls']:
  if mode=='probe-failed': sys.exit(8)
@@ -518,6 +519,7 @@ else: sys.exit(9)
 "#;
     for mode in [
         "success",
+        "slow-remove",
         "foreign",
         "start-failed",
         "probe-failed",
@@ -595,7 +597,7 @@ else: sys.exit(9)
                     remove_owned_engine(&actor, &engine, &intent().run_id, observed, 2.0)
                         .await
                         .is_ok(),
-                    mode == "success"
+                    matches!(mode, "success" | "slow-remove")
                 );
             }
             actor.stop().await;
@@ -606,7 +608,7 @@ else: sys.exit(9)
         assert_eq!(
             record.state,
             match mode {
-                "success" => ActEngineState::Terminal,
+                "success" | "slow-remove" => ActEngineState::Terminal,
                 "foreign" => ActEngineState::Pending,
                 _ => ActEngineState::CleanupRequired,
             }
@@ -619,7 +621,7 @@ else: sys.exit(9)
                 assert!(!args.starts_with(&["container".into(), "rm".into()]));
             }
         }
-        if mode == "success" {
+        if matches!(mode, "success" | "slow-remove") {
             assert_eq!(commands.lines().count(), 7);
         }
     }

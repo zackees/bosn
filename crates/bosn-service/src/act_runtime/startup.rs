@@ -293,16 +293,9 @@ pub(crate) async fn retire_engine(
             .await
             .map_err(|e| error(e.to_string()))?;
     }
-    // Reserve three 30-second container commands, optional four 10-second
-    // storage commands, and persistence.
-    // Refuse rather than start a removal that cannot fit the lifecycle budget.
-    let reserved = if intent.storage_volume_name().is_some() {
-        135
-    } else {
-        95
-    };
-    if cancellation.is_cancelled()
-        || deadline.saturating_duration_since(Instant::now()) < Duration::from_secs(reserved)
+    // Refuse deletion unless all commands and persistence fit the remaining budget.
+    let reserved = crate::act_engine::removal_reserve(intent.storage_volume_name().is_some());
+    if cancellation.is_cancelled() || deadline.saturating_duration_since(Instant::now()) < reserved
     {
         return Err(error(
             "startup removal deferred: insufficient reserved cleanup budget",

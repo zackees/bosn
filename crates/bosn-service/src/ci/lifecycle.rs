@@ -376,7 +376,7 @@ async fn acquire<'a>(
 }
 
 /// How long the in-run cleanup may take to prove an engine gone.
-const CLEANUP_BUDGET: Duration = Duration::from_secs(180);
+const CLEANUP_BUDGET: Duration = crate::act_engine::CLEANUP_BUDGET;
 
 /// Run one workflow on a fresh isolated engine. Never panics on engine
 /// faults; every path ends in a cleanup attempt whose result is reported.

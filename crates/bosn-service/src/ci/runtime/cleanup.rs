@@ -62,7 +62,7 @@ impl CiRuntime {
                 if record.registry_id != owner {
                     return Err("cleanup retry registry owner mismatch".into());
                 }
-                let budget = Duration::from_secs(180);
+                let budget = crate::act_engine::CLEANUP_BUDGET;
                 let result = async_engine::timeout(
                     budget,
                     self.backend.retire(&self.registry, owner, &record, budget),

@@ -947,3 +947,23 @@ commands in startup and online budgets, and test a delayed removal that exceeds
 the old bound. Timeout still leaves durable pending state; only exact container
 and storage absence may finalize retirement. The existing named-storage/online
 retry changes do not by themselves prove this deadline failure resolved.
+
+### Coordinated deletion budgets (candidate; verification in progress)
+
+The isolated process/registry regression now includes a 31-second authorized
+container deletion. Against the old helper it failed (0 passed / 1 failed),
+confirming the per-command bound independently of the outer lifecycle timeout.
+The candidate separates exact deletion (90 seconds) from container observation
+(30 seconds) and storage observation (10 seconds). Startup reserves 155 seconds
+for legacy retirement or 275 seconds for named-storage retirement, including
+independent absence probes and persistence. Lifecycle/startup/online retirement
+allow 360 seconds; the online pass wrapper allows 380 seconds. Accounting helper
+budgets remain independent. All values share one budget module.
+
+Timeout continues to leave pending cleanup; exact absence remains mandatory.
+These bounds do not guarantee disk-pressure convergence or resolve an arbitrarily
+slow Docker removal. The container regression turned GREEN (1 passed); the private-volume regression
+passed with an 11-second removal, exceeding its previous 10-second bound. Strict
+service all-target Clippy passed. The existing reviewer found no blocking issues.
+The full isolated service suite passed: 429 tests, 6 ignored, 0 failed.
+A new exact-source workflow gate remains required before shipping this correction.

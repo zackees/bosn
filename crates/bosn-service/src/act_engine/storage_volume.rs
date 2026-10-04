@@ -3,7 +3,6 @@ use super::*;
 use bosn_core::{ResourceKind, ResourceLabels, Retention, Scope};
 use bosn_engine::DockerEngine;
 use serde::Deserialize;
-use std::time::Duration;
 
 fn labels(
     intent: &ActEngineIntent,
@@ -132,7 +131,12 @@ pub(crate) async fn remove_storage_volume(
     )
     .await?;
     verify(&document, intent, owner)?;
-    storage_control(engine, vec!["volume".into(), "rm".into(), name.clone()]).await?;
+    super::create::docker_control_budget(
+        engine,
+        vec!["volume".into(), "rm".into(), name.clone()],
+        super::budgets::DELETE,
+    )
+    .await?;
     if present(engine, &name).await? {
         return Err(ActEngineError(
             "private storage absence is not established".into(),
@@ -173,7 +177,7 @@ mod transport_tests {
     use super::*;
     use crate::act_engine::tests::{OWNER, disk_intent};
     use kernal_api::{async_engine::RuntimeBuilder, platform::fs::TemporaryDirectory};
-    const SCRIPT: &str = r#"import pathlib, sys
+    const SCRIPT: &str = r#"import pathlib, sys, time
 artifact, state, log, name, mode = sys.argv[1:6]
 state, log = pathlib.Path(state), pathlib.Path(log)
 args = sys.argv[6:]
@@ -184,6 +188,7 @@ elif args[:2] == ['volume', 'inspect']:
     print(pathlib.Path(artifact).read_text())
 elif args[:2] == ['volume', 'rm']:
     log.write_text(args[2])
+    if mode == 'slow-remove': time.sleep(11)
     if mode == 'attached': sys.exit(1)
     if mode != 'persists': state.rename(state.with_name('removed'))
     if mode == 'lost_ack': sys.exit(1)
@@ -192,7 +197,14 @@ else: sys.exit(2)
 "#;
     #[test]
     fn removal_errors_and_uncertain_absence_remain_retryable() {
-        for mode in ["success", "attached", "unreadable", "lost_ack", "persists"] {
+        for mode in [
+            "success",
+            "slow-remove",
+            "attached",
+            "unreadable",
+            "lost_ack",
+            "persists",
+        ] {
             let dir = TemporaryDirectory::new().unwrap();
             let intent = disk_intent();
             let name = intent.storage_volume_name().unwrap();
@@ -221,7 +233,11 @@ else: sys.exit(2)
                 .unwrap()
                 .run(async {
                     let result = remove_storage_volume(&engine, &intent, OWNER).await;
-                    assert_eq!(result.is_ok(), mode == "success", "{mode}");
+                    assert_eq!(
+                        result.is_ok(),
+                        matches!(mode, "success" | "slow-remove"),
+                        "{mode}"
+                    );
                     if mode == "lost_ack" {
                         assert!(!state.exists());
                         assert!(
@@ -250,5 +266,5 @@ async fn storage_control(
     engine: &DockerEngine,
     args: Vec<String>,
 ) -> Result<Vec<u8>, ActEngineError> {
-    super::create::docker_control_budget(engine, args, Duration::from_secs(10)).await
+    super::create::docker_control_budget(engine, args, super::budgets::STORAGE_CONTROL).await
 }

@@ -303,7 +303,7 @@ pub(super) async fn docker_control(
     engine: &DockerEngine,
     args: Vec<String>,
 ) -> Result<Vec<u8>, ActEngineError> {
-    docker_control_budget(engine, args, std::time::Duration::from_secs(30)).await
+    docker_control_budget(engine, args, super::budgets::CONTROL).await
 }
 
 pub(super) async fn docker_control_budget(
@@ -499,7 +499,7 @@ pub async fn remove_owned_engine(
     {
         return Err(ActEngineError("registry removal identity changed".into()));
     }
-    docker_control(
+    docker_control_budget(
         engine,
         vec![
             "container".into(),
@@ -510,6 +510,7 @@ pub async fn remove_owned_engine(
             "--volumes".into(),
             observed.engine_id.clone(),
         ],
+        super::budgets::DELETE,
     )
     .await?;
     for filter in [
