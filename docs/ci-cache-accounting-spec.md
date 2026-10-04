@@ -2785,3 +2785,49 @@ preserved until separate ownership evidence exists. Root-level selection JSON
 stages are still a separate lifecycle requirement. Large-store efficiency,
 production overlay/reader admission, whole-machine accounting and old engine,
 image and scoped builder-cache expiry remain required.
+
+
+### Combined sweep and native retention command
+
+Act2 PR #41 runs owned stage expiry before generation/object retirement under the
+same original catalog writer. Selection, complete initial accounting and bounded
+candidate inventories validate before mutations. A partial stage result stops
+later deletion; fresh stage allocation becomes the next sweep's observation.
+Regression was RED with a registered one-MiB stage remaining, then GREEN for
+stage removal, physical reclamation and selected-generation preservation. Full
+package tests, vet/lint, review and exact-source gate passed in 22.40 seconds on
+`edd6acc1e331c53883424229493153caa1e8628b`, tree
+`4d980f78cf235b7d826bd2926dd1c4faf39e4124` (2,586 exported files).
+
+Local CLI candidate `e6eaabc` exposes the sweep:
+
+```sh
+act cache tool-retain --cache-server-path /absolute/tool-store \
+  --max-allocated-bytes 8589934592 --max-payload-bytes 17179869184 \
+  --expire-before 2026-10-01T00:00:00Z \
+  --max-entries 1000000 --max-candidates 10000 --apply
+```
+
+These are example policy values, not default production settings. All bounds and
+an explicit RFC3339 cutoff are required. Missing `--apply` refuses before mutation;
+`tool-usage` remains the read-only inventory command. The retention command emits
+a typed JSON report before returning an error for partial results or protected
+overflow. A complete pass that remains over cap therefore does not masquerade as
+successful quota convergence. The cap is scoped tool-store inode allocation,
+not machine-wide or Docker backing allocation.
+
+Command regression was RED with the command/flags absent, then GREEN: omitted
+`--apply` preserves an old generation, explicit mutation retires it, cap-one emits
+complete protected-overflow JSON and nonzero status, and the selected successor
+remains valid. Command vet/lint and cumulative review pass; final exact-source
+CLI gate is running. Evidence: `act2-tool-stage-policy-source-bound-gate` JSON/log,
+`act2-tool-retention-cli-red.log`, `-green.log` and CLI source-bound gate JSON/log.
+
+The dependent PR chain has been reconstructed on current act2 master to resolve
+conflicts from earlier squash merges; rebuilt trees exactly match reviewed trees.
+PR #37's updated exact-source gate passed on `6684ba9`. Rebuilt later commits
+still require their own source verification before branch updates. All changes
+remain unreleased and unused by production Bosn. Automatic scheduling, frozen
+engine profile and reader handoff, real workflow overlay/publication, selection
+JSON stage lifecycle, large-store efficiency, whole-machine accounting and old
+engine/image/scoped-builder expiry remain required.
