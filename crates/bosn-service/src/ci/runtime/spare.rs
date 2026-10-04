@@ -21,8 +21,8 @@ impl CiRuntime {
         if !idle {
             return;
         }
-        let enabled = super::super::config::load(&self.state_dir)
-            .is_ok_and(|config| config.engine.spares == Spares::One);
+        let enabled = super::super::config::load_engine(&self.state_dir)
+            .is_ok_and(|config| config.spares == Spares::One);
         if !enabled {
             self.spares.discard();
             return;
@@ -47,7 +47,7 @@ impl CiRuntime {
         if self.backend.host_resources().await?.available_memory < ROOM {
             return Ok(None);
         }
-        let config = super::super::config::load(&self.state_dir)?.engine;
+        let config = super::super::config::load_engine(&self.state_dir)?;
         let spec = self.engine_spec(config).await?;
         let id = new_uuid().await.map_err(|e| e.message)?;
         let workspace = self.state_dir.to_string_lossy().into_owned();

@@ -967,3 +967,39 @@ passed with an 11-second removal, exceeding its previous 10-second bound. Strict
 service all-target Clippy passed. The existing reviewer found no blocking issues.
 The full isolated service suite passed: 429 tests, 6 ignored, 0 failed.
 A new exact-source workflow gate remains required before shipping this correction.
+
+### Retention integration boundary (in progress)
+
+Act2 PR #22 merged as `7e6f010fa7cc7171083329b2cf3d18f1566e3468`.
+Full checks on that exact merge SHA are running in run 37186796787; no new
+tag/release or Bosn pin update has been made. Typed `[cache]` configuration now
+requires explicit positive repository/aggregate archive byte ceilings and
+positive maximum-age, unused-age, and maintenance intervals in seconds. It
+rejects unknown fields, inconsistent ceilings and act2 duration overflow.
+These settings govern completed archive lengths, not a physical machine cap.
+
+Production planning currently refuses configured retention with an explicit
+rollout error. Activation remains dependent on a verified release pin, safe
+warm import into the coordinated root, and maintenance supervision. Existing
+legacy shared-cache execution remains the default. This preparatory boundary
+does not claim that configured quotas are yet enforced.
+
+### Live lifecycle verification at b0860ff
+
+The candidate CLI built in the genuine isolated Rust harness. Against the
+private Docker engine, `the_host_engine_is_unchanged_after_every_way_a_run_can_end`
+passed (1 test, 282.13 seconds). After the warm-up baseline, exact owned-container,
+network, volume and engine-image inventories returned to baseline after success,
+failure, timeout, client SIGKILL and daemon SIGKILL/restart. The timeout scenario
+verified intent-derived named storage, volume-only mounts and a nested Docker
+engine distinct from its parent. Shared cache inputs persisted across the fresh
+engines. This validates candidate lifecycle cleanup under these workloads, not
+archive retention, sustained physical convergence or cleanup under full-disk
+conditions. The separate exact-source gate still uses released Bosn 0.1.12.
+
+The policy boundary test passed; both config tests passed, and strict service
+library Clippy passed in the isolated container. Review caught a spare-planning
+bypass; run planning, spare kickoff and spare planning now use the same
+`load_engine` guard. The config test proves parsed policy is refused at that
+boundary; it does not directly instrument backend creation counts. The existing
+reviewer passed the corrected slice. Retention activation remains incomplete.

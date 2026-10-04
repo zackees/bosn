@@ -71,7 +71,7 @@ impl CiRuntime {
         deadline: async_engine::Deadline,
         cancellation: &async_engine::CancellationToken,
     ) -> Result<EnginePlan, String> {
-        let config = super::super::config::load(&self.state_dir)?.engine;
+        let config = super::super::config::load_engine(&self.state_dir)?;
         let spec = self.engine_spec(config).await?;
         let intent = spec.intent(
             ActEngineBinding {

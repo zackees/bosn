@@ -52,6 +52,7 @@ mod vocabulary {
 }
 }
 
+pub mod cache_policy;
 pub mod checkout;
 pub mod client;
 pub mod config;
