@@ -244,7 +244,7 @@ def head_sha() -> str:
 
 
 def command(selection: Selection) -> list[str]:
-    return [
+    argv = [
         "bosn",
         "ci",
         "run",
@@ -269,6 +269,10 @@ def command(selection: Selection) -> list[str]:
         "3600000",
         "--json",
     ]
+    state = os.environ.get("BOSN_GATE_STATE_DIR")
+    if state:
+        argv.extend(["--state-dir", state])
+    return argv
 
 
 def forward_report(output: str, destination: Path) -> None:

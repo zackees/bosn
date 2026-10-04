@@ -73,6 +73,13 @@ class BosnGateProofTests(unittest.TestCase):
             head_sha="a" * 40,
         )
 
+    def test_private_runner_state_is_explicit(self) -> None:
+        with patch.dict(bosn_gate.os.environ, {"BOSN_GATE_STATE_DIR": "/private/state"}):
+            argv = bosn_gate.command(bosn_gate.RUST)
+        self.assertEqual(argv[-2:], ["--state-dir", "/private/state"])
+        self.assertIn("workflow_dispatch", argv)
+        self.assertIn("tier=minimal", argv)
+
     def test_shared_report_preserves_original_terminal_evidence(self) -> None:
         terminal = json.dumps(self.receipt(), separators=(",", ":"))
         with tempfile.TemporaryDirectory() as scratch:
