@@ -802,3 +802,34 @@ protection; lint also passed. Full Linux and snapshot jobs were still running
 when sampled. This supersedes the pending native correction result above.
 Bosn still pins the older released act2: no automatic migration, new-root
 server routing, retention flags or maintenance supervisor is enabled yet.
+
+## Command-level warm-cutover verification (candidate)
+
+The integration test `TestCacheCutoverCommandsPreserveFreshServerHitsAndRepositoryIsolation`
+uses actual loopback HTTP reservation, upload, commit, lookup and download. Two
+stopped source servers have the same cache key/version but different 80-byte
+payloads, under separate 16-digit repository identities. Cobra import commands
+copy each store into `actcache/cohort-v1/<repository hash>` with an 80-byte import
+bound; source metadata remains byte-identical. Three successive fresh servers
+per repository download the correct distinct payloads after import.
+
+A command-level aggregate pass with an 80-byte ceiling correctly reports
+160 remaining bytes, 160 protected bytes and BudgetMet=false: both archives
+were recently transferred. This verifies truthful protected overflow, not age
+expiry or sustained convergence. Linux Docker race testing and pinned command
+lint pass. Servers have immediate failure-path cleanup plus explicit close
+before import. The existing native host CI selection includes this test; no
+workflow/job/runner was added.
+
+Production integration still requires a verified released binary pin, typed
+machine policy, durable routing/cutover state, source quiescence across daemons,
+and supervised maintenance independent of run teardown. Proposed command sequence:
+`act cache import --apply --source-quiescent --from SOURCE --namespace HASH
+--max-bytes IMPORT_BOUND --cache-server-path COHORT`; start servers with
+`--cache-server-path COHORT/HASH --cache-server-cohort-root COHORT`, explicit
+namespace byte/age policy and optional close-time aggregate policy; supervise
+`act cache prune-cohort --apply --watch 1m --max-bytes AGGREGATE_BOUND
+--cache-server-path COHORT` with the same namespace byte/age policy.
+The source-quiescent flag is caller responsibility, not a detector of old
+peers. This test does not authorize automatic source deletion or prove those
+Bosn daemon paths are implemented.
