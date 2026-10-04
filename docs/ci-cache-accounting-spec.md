@@ -2172,6 +2172,21 @@ reader protection, safe retirement, policy convergence or Bosn enrollment.
 Those remain necessary before production activation. The candidate is local
 and unpublished.
 
+A further isolated-Docker experiment built the actual candidate CLI, published
+a completed 16 MiB install, assembled its generation, and transferred only the
+closed tree into a task-owned lower volume. Two nested job containers in one
+fresh Dind engine shared a private settings mutation; a job in a second fresh
+engine read the original settings. All read the same payload digest and the
+materialized completion marker. Each private upper grew from **0 KiB to 4
+KiB**, without copying the payload. The exact two engines and lower volume
+were removed with ownership verified. Fixture source/store artifacts remain
+in the task's private Go container tmpfs. The first transport attempt failed
+because its outer Docker exec did not attach stdin; its lower volume was
+removed, stdin attachment was corrected, and the subsequent experiment passed.
+This uses standard Dind initialization, not Bosn's production profile or a real
+act workflow. Artifacts: `retention-tool-generation-nested-experiment.py` and
+its JSON result.
+
 #### Next implementation contract: immutable generations and private writes
 
 - Publish typed, content-identified closed generations from completed installs.
