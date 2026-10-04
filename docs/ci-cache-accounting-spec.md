@@ -2187,6 +2187,68 @@ This uses standard Dind initialization, not Bosn's production profile or a real
 act workflow. Artifacts: `retention-tool-generation-nested-experiment.py` and
 its JSON result.
 
+#### In-progress generation reader coordination (2026-10-04)
+
+The living spec through generation assembly is on main via PR #487, merge
+`c8ab6697`. Its exact-source local gate passed in 627 seconds (Rust 341s,
+Linux 286s), stamped `6d1b8a77fd0cb2036c811548830cc8de41dee65c` for tree
+`ff728e2a68bc4b2fc5339989c9dc487b6a8f4f85`; pinned verification and required
+remote PR checks passed. No Bosn release was made.
+
+The act2 candidate `01a69fa`, published in
+[act2 PR #31](https://github.com/zackees/act2/pull/31), creates a per-generation
+`.readers-v1.bolt` coordination file in the private stage before directory sync
+and atomic publication. Reuse refuses missing reader coordination. The typed
+`AcquireToolGenerationLease` API validates a canonical established store,
+generation identity/schema and payload under the catalog writer lock, then
+acquires that generation's shared reader lock before releasing the catalog.
+Multiple readers coexist; publication of other generations remains possible.
+Future retirement must take the catalog lock and that generation's exclusive
+lock in the same order, and preserve their inode identity throughout deletion.
+
+Reader admission never initializes a store or recreates missing coordination.
+Review exposed an established-store bug that could replace a renamed catalog
+lock while another process still held its original inode. The regression
+reproduced that failure, then passed after both admission and publication were
+made to refuse a missing established-store catalog lock. An empty-store
+admission also leaves the directory empty.
+
+The caller must retain the reader descriptor for the entire engine lifetime,
+including preparation and uncertain cleanup, and close it only after all
+mounts/readers are gone. Admission's context bounds validation; it does not
+automatically close a successfully acquired lifetime lease. Holding this lease
+only in the Bosn daemon is insufficient: daemon death could release it while
+the Docker engine still reads its lower. Actual engine-owned holder integration
+is still required. There is no generation retirement command or activation yet.
+
+Focused tests verify published coordination, concurrent readers, exclusive
+retirement-lock refusal, successor publication while an old reader is held,
+missing coordination refusal, and OS lock release after killing the exact
+task-owned helper process. Full artifact-cache package tests passed after the
+fix (14.39 seconds), `go vet` passed, golangci-lint reported zero issues, and
+Darwin/Windows compilation of unsupported-platform stubs passed. The same
+reviewer returned PASS for the corrected slice. Artifacts:
+`act2-tool-generation-reader-red.log`, `act2-tool-generation-reader-tests.log`,
+`act2-tool-generation-catalog-reader-red.log`,
+`act2-tool-generation-reader-catalog-fixes.log`,
+`act2-tool-generation-reader-final-checks.log`.
+
+Source-bound checks then passed on the clean committed candidate: all 2,547
+exported Git files matched the private Docker build source before and after
+execution. Complete cache tests, focused tool command tests, vet, lint and
+Darwin/Windows compilation passed in 18 seconds. Source SHA:
+`01a69faac05e88cf0e2b5b84b23c2adeb47995a1`; tree:
+`f6fe365745366bd8e698997c903511c352947f6e`. This scoped local gate does not
+replace full act2 CI on the exact release candidate. Artifacts:
+`act2-immutable-source-bound-gate.json` and its execution log. No act2 release
+or Bosn activation is claimed.
+
+Admission currently audits the full payload while holding the catalog lock.
+Its cost on the surveyed 7.7 GiB cache has not been measured; this is a
+correctness baseline, not verified efficient production admission. Engine-owned
+lifetime protection, efficient admission, coordinated accounting/retirement,
+current-generation selection and physical budget convergence remain open.
+
 #### Next implementation contract: immutable generations and private writes
 
 - Publish typed, content-identified closed generations from completed installs.
