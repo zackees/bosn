@@ -2540,3 +2540,115 @@ retirement must protect the selected generation and live readers, account before
 and after deletion, and preserve unknown/corrupt state. Generation/object/stage
 expiry, whole-machine accounting, old engine/image expiry and scoped builder
 pressure remain required. No shared object was deleted for this accounting slice.
+
+
+### Coordinated generation retirement (act2 PR #35)
+
+Implementation: https://github.com/zackees/act2/pull/35, candidate
+`f8709458548f5510264babb96f58baee6a0b9c15` (unreleased). Linux API
+`RetireToolGeneration(ctx, root, id, maxBytes)` removes one explicitly eligible
+unselected generation. The caller must establish age/pressure eligibility; this
+API does not choose candidates or implement an automated retention policy.
+
+The original catalog writer stays held while validating the current selection
+and its complete payload/reader coordination, validating the candidate manifest
+and complete tree, collecting bounded store metadata, and acquiring the original
+candidate reader mutex exclusively. Selection, admission and participating
+publication cannot race this decision. Selected generations and live reader
+holders are refused. Missing/corrupt selection or coordination is preserved and
+refused. Candidate control layout must contain exactly the canonical tree,
+manifest and reader mutex; unknown entries are preserved. Immutable shared
+objects are never removed by this primitive.
+
+Mount safety requires more than device identity. A same-filesystem bind mount
+can preserve expected metadata/hashes while exposing a shared object to recursive
+deletion. Independent review found this hazard in the initial implementation.
+The correction compares Linux statx mount IDs for the store root, generation
+namespace, candidate and every bounded descendant, without following symlinks.
+Unavailable mount identity or any boundary causes refusal before deletion.
+Production must exclude nonparticipating mount changes and writers during this
+operation; this is not a defense against a privileged actor changing mounts after
+validation. Both original coordination locks remain held through removal and
+parent-directory sync. An error can follow partial deletion or lost durability
+acknowledgement: reclaimed bytes must come from a fresh accounting observation,
+never the logical generation size or a boolean return value.
+
+Verified evidence:
+
+- Focused regression was RED because retirement did not exist, then GREEN:
+  selected generation stays intact, live reader prevents retirement, closing that
+  reader permits old-generation removal, current selection remains valid, and
+  the shared immutable object remains present.
+- Lost selection, unknown control entries and missing reader coordination refuse
+  deletion. Mount-ID refusal also has a deterministic injected-boundary test.
+- A real same-device bind mount in an owned isolated container was refused;
+  source/target device IDs agreed and the mounted shared object remained fully
+  valid afterward. The container had no host binds or network and was removed.
+- Exact-source gate passed in 21.68 seconds against all 2,569 exported files before
+  and after complete artifactcache tests, focused command tests, vet/lint with zero
+  findings, and Darwin/Windows compilation. Tree:
+  `c3539145d22d2bed423b87622dfc9faa7611e1f4`. The first final gate caught an
+  unchecked test unmount error; teardown now checks it. Cumulative independent
+  review changed from CHANGES REQUESTED to PASS after mount protection.
+- Private artifacts: `act2-generation-retirement-red.log`,
+  `act2-generation-retirement-actual-bind-mount.log`, and
+  `act2-generation-retirement-source-bound-gate.json`/`.log`.
+
+**Remaining required work:** Automated age/pressure selection, object expiry,
+owned-stage expiry, measured physical before/after reclamation and convergence,
+protected-overflow reporting and bounded retry after partial retirement. This
+API has no production Bosn caller yet. Selected-generation intent/reader handoff,
+engine lifetime/recovery integration, large-store admission cost, cross-class
+machine accounting, old image/container expiry and scoped builder pressure all
+remain open. PR #35 needs remote CI/merge and an exact-default-branch full-CI
+release before Bosn can pin and activate it.
+
+
+#### Physical reclamation evidence for the pressure loop
+
+A private Docker regression published a one-MiB object, selected a generation
+with one reference, then selected a successor with two references to that same
+inode. Retiring the unselected predecessor reduced observed allocated store
+bytes from 1,118,208 to 1,097,728: only 20,480 bytes were reclaimed, while the
+1,048,576-byte shared payload stayed allocated and valid. The selected successor
+and object retain three payload paths sharing one inode. The test checks positive
+metadata reclamation smaller than the payload, retained unique payload bytes,
+and reference-minus-unique bytes of two MiB; it does not require these exact
+filesystem-dependent allocation totals. Evidence:
+`act2-generation-reclamation-evidence.log`.
+
+The retention pressure loop must therefore use a fresh complete physical scan
+after each mutation, including partial deletion, and continue toward its target
+only while eligible candidates remain. Logical generation size is not a predicted
+reclamation credit. Reaching a protected/unknown-only remainder above the cap must
+report protected overflow rather than deleting selected/live/unknown state or
+claiming convergence. This loop and object retirement are not implemented yet.
+
+
+#### Generation policy implementation in progress
+
+The local act2 `feat/tool-retention-policy` branch now has typed
+`ToolRetentionPolicy` and `RetainToolStore` APIs. The positive allocated-byte cap,
+explicit publication-age cutoff, maximum scanned entries (one million), maximum
+namespace candidates (ten thousand), and payload-validation ceiling are validated
+before mutation. The original catalog writer remains held throughout selection
+verification, complete initial accounting, bounded candidate enumeration and the
+sweep. Candidates are sorted by publication-directory modification time with an
+ID tie-break; the current selected generation is always preserved. Older eligible
+generations expire even below the cap; under pressure, younger unselected
+candidates can also retire. Reader-lock timeout protects a candidate. Other
+retirement failures mark the report partial. Every attempted mutation is followed
+by a fresh physical observation, including failures that may have partially
+removed data. Unknown namespace entries and all immutable objects stay intact.
+
+Focused regression was RED with missing APIs, then GREEN for expiry, live-reader
+protection followed by retry, unknown-state preservation and protected overflow.
+Further tests pass for young-generation preservation below the cap, pressure
+retirement and pre-mutation entry/candidate-bound refusal. Full artifactcache
+tests passed; initial lint found excessive function complexity and a deprecated
+bbolt error alias. The sweep is now a separate helper and uses the dependency's
+current errors package; focused boundary tests and lint pass. Independent review
+and final exact-source gate remain pending. No policy change is released or
+activated in Bosn. Object/stage expiry, last-use evidence beyond publication age,
+CLI integration, measured convergence across classes and production scheduling
+remain required.
