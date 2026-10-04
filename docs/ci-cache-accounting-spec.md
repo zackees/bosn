@@ -2069,13 +2069,51 @@ upper. Container wall times were 0.790 and 0.519 seconds. Both containers were
 auto-removed; the exact task-owned source volume was removed and cleanup was
 confirmed. Artifacts: `retention-toolcache-cow-experiment.py` and its JSON result.
 
-This proves the Linux filesystem primitive on this private Docker host, rather
-than production engine initialization, a nested workflow mount, real tool
-installers, snapshot publication, lifetime protection or expiry. The current
+An additional private Docker experiment mounted that overlay at a nested
+Docker named volume's data path. Two actual job containers in the first fresh
+engine shared their private settings change; a job in the second fresh engine
+read the original settings. All three read the same 16 MiB payload digest.
+Each engine's upper grew from **0 KiB to 4 KiB**, without copying the payload.
+Engine readiness took 16.37 and 16.60 seconds. Exact task-owned engines and
+the fixture volume were removed and their cleanup confirmed. Artifacts:
+`retention-toolcache-cow-nested-experiment.py` and its JSON result.
+This used the Docker image's normal Dind entrypoint, not Bosn's production
+engine profile or an act workflow. It verifies nested volume visibility and
+within-engine sharing; production initialization, real installers, lifetime
+protection and expiry remain unverified. The current
 mutable tool cache cannot serve as a live overlay lower: the kernel documents
 undefined behavior when underlying trees change while mounted. Immutable
 generations are therefore required before applying the primitive to Bosn.
 See [the kernel OverlayFS contract](https://docs.kernel.org/filesystems/overlayfs.html#changes-to-underlying-filesystems).
+
+#### In-progress act2 immutable install publisher
+
+The unpublished `feat/immutable-tool-cache` act2 worktree adds
+`cache tool-publish --from ... --cache-server-path ... --max-bytes ...
+--apply --source-quiescent`. It copies one completed install into a private
+stage, validates typed metadata and file hashes, and atomically publishes a
+manifest-identified object without replacing an existing destination.
+Mutable source inodes are never hard-linked into the object. Identity includes
+permissions, ownership and timestamps as well as file data. Source quiescence
+is an explicit caller assertion; a completion marker alone cannot prove it.
+
+The focused CLI test failed before implementation and then passed in an
+isolated Go Docker container: unchanged installs reuse an object, changed
+installs produce a new object, and the old payload remains intact. Additional
+focused tests passed for executable modes, relative symlinks, sibling completion
+markers, incomplete/over-budget/cancelled sources, corrupt existing objects and
+unknown stores. Corrupt objects are preserved and reported as partial failures.
+Initial execution found and fixed missing coordination-file initialization.
+The complete artifact-cache package test run passed (14.27 seconds), `go vet`
+passed for the cache and command packages, and their golangci-lint run reported
+zero issues after scanner decomposition and explicit returns.
+Artifacts: `act2-toolcache-publish-red.log`,
+`act2-toolcache-publish-green.log`, `act2-toolcache-boundaries.log`.
+
+This is local work, not released or enrolled by Bosn. Review,
+durability fault evidence, generation assembly, reader protection, accounting
+and coordinated expiry remain open. The publisher alone does not solve
+per-engine tool copying or authorize deletion of existing caches.
 
 #### Next implementation contract: immutable generations and private writes
 
