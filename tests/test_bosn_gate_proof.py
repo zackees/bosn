@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from ci import bosn_gate
 
@@ -60,6 +61,20 @@ class BosnGateProofTests(unittest.TestCase):
             workspace=Path("/work/repo"),
             head_sha="a" * 40,
         )
+
+    def test_old_runner_is_rejected_before_engine_submission(self) -> None:
+        self.assertIsNone(bosn_gate.version_error("bosn 0.1.12", 0))
+        for version in ("bosn 0.1.10", "bosn 0.1.11", "unknown"):
+            self.assertIsNotNone(bosn_gate.version_error(version, 0))
+        self.assertIsNotNone(bosn_gate.version_error("bosn 0.1.12", 1))
+        with (
+            patch.object(bosn_gate, "head_sha", return_value="a" * 40),
+            patch.object(
+                bosn_gate, "run_captured", return_value=bosn_gate.Captured(0, "bosn 0.1.10")
+            ) as run,
+        ):
+            self.assertEqual(1, bosn_gate.run_selection(bosn_gate.RUST))
+        run.assert_called_once_with(["bosn", "--version"])
 
     def test_complete_test_tier_receipt_passes(self) -> None:
         self.assertIsNone(self.error(self.receipt()))

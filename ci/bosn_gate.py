@@ -204,6 +204,20 @@ def proof_error(output: str, *, selection: Selection, workspace: Path, head_sha:
         return f"invalid Bosn proof: {error}"
 
 
+@dataclass(frozen=True, order=True)
+class Version:
+    major: int
+    minor: int
+    patch: int
+
+
+def version_error(output: str, returncode: int) -> str | None:
+    match = re.fullmatch(r"bosn (\d+)\.(\d+)\.(\d+)", output.strip())
+    if returncode or not match or Version(*(int(n) for n in match.groups())) < Version(0, 1, 12):
+        return "local gate requires Bosn >= 0.1.12 (act2.3); check the active environment PATH"
+    return None
+
+
 def fidelity_error(host_arch: str, daemon: str, returncode: int) -> str | None:
     if host_arch.lower() not in {"x86_64", "amd64"}:
         return "Linux tests require a native x64 host CPU"
@@ -259,6 +273,10 @@ def command(selection: Selection) -> list[str]:
 def run_selection(selection: Selection) -> int:
     try:
         head = head_sha()
+        version = run_captured(["bosn", "--version"])
+        error = version_error(version.output, version.returncode)
+        if error:
+            raise ValueError(error)
         daemon = run_captured(["docker", "info", "--format", "{{.OSType}} {{.Architecture}}"])
         error = fidelity_error(platform.machine(), daemon.output, daemon.returncode)
         if error:
