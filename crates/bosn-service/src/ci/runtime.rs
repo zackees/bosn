@@ -598,7 +598,11 @@ impl CiRuntime {
         let outcome = self.drive(&record, &cancel, &mut observer).await;
         observer.publish();
         let mut tree = std::mem::take(&mut observer.parser.tree);
-        let declared = workflow::declared(&self.store.source(&record.id), &record.workflow);
+        let declared = workflow::declared(
+            &self.store.source(&record.id),
+            &record.workflow,
+            &record.repository,
+        );
         let (conclusion, mut reason) = report::conclude(&outcome, &mut tree, &declared);
         let lost = observer.log.as_ref().map_or(observer.seq, LogWriter::lost);
         if lost > 0 {
