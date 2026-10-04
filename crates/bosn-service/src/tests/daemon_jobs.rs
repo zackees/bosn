@@ -133,6 +133,20 @@ fn setup_prepare_job_is_prompt_coalesced_logged_and_cancellable_without_docker()
             client.cancel_job(second).await.unwrap();
             wait_for_job_state(&client, second, "Cancelled").await;
             assert_eq!(fake.cancelled.load(Ordering::SeqCst), 2);
+            let runs = crate::raw_run_log::list_runs(&state).unwrap();
+            for job_id in [first, second] {
+                let run = runs.iter().find(|run| run.job_id == job_id).unwrap();
+                assert_eq!(run.task.as_deref(), Some("setup-prepare"));
+                assert_eq!(run.state.as_deref(), Some("cancelled"));
+                assert!(run.ended_unix_ms.is_some());
+                assert!(
+                    crate::raw_run_log::read_end(&state, &run.run_id)
+                        .unwrap()
+                        .unwrap()
+                        .exit_code
+                        .is_none()
+                );
+            }
             client.shutdown().await.unwrap();
             stopped(server).await;
         });

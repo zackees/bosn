@@ -5,7 +5,10 @@ use kernal_api::async_engine::RuntimeBuilder;
 /// reports its own ps-visible argv and environment, then echoes the token
 /// whole and split across two writes). Returns (daemon log lines, stdout).
 #[cfg(unix)]
-fn run_fake_docker_with_secrets(state: &Path, declared: &[String]) -> (Vec<String>, String) {
+fn run_fake_docker_with_secrets(
+    state: &Path,
+    declared: &[String],
+) -> (Vec<String>, String, Vec<u8>, Vec<u8>) {
     const SCRIPT: &str = r#"printf 'argv:'; tr '\0' ' ' < /proc/$$/cmdline; echo
 printf 'env=%s\n' "${GITHUB_TOKEN-unset}"
 if [ -n "${GITHUB_TOKEN-}" ]; then
@@ -25,7 +28,11 @@ fi
         let (engine, passthrough_env) = secrets.docker_engine(&base);
         let mut masker = SecretMasker::new(secrets.values.iter().map(|(_, value)| value));
         let (text_logs, mut log_receiver) = async_engine::channel::<String>(1024);
-        let logs = crate::raw_run_log::JobLogSink::transient(text_logs);
+        let run_id = "00000000-0000-0000-0000-000000000047";
+        let raw = crate::raw_run_log::RawRunLog::create(state, run_id).unwrap();
+        raw.write_metadata(run_id, 1, None).unwrap();
+        let root = raw.root().to_path_buf();
+        let logs = crate::raw_run_log::JobLogSink::durable(text_logs, raw);
         let (events, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
         let forwarder = async_engine::launch(async move {
             while let Some(event) = receiver.recv().await {
@@ -61,7 +68,12 @@ fi
         while let Some(line) = log_receiver.recv().await {
             lines.push(line);
         }
-        (lines, String::from_utf8_lossy(&result.stdout).into_owned())
+        (
+            lines,
+            String::from_utf8_lossy(&result.stdout).into_owned(),
+            std::fs::read(root.join("stdout.log")).unwrap(),
+            std::fs::read(root.join("stderr.log")).unwrap(),
+        )
     })
 }
 
@@ -71,7 +83,7 @@ fn declared_github_token_reaches_the_task_env_but_never_argv_or_logs() {
     const CANARY: &str = "ghp_CANARY308abcdefghijklmnop0123456789";
     let state = tempfile::tempdir().unwrap();
     secrets::write_secret(state.path(), "github_token", CANARY.as_bytes()).unwrap();
-    let (lines, raw_stdout) =
+    let (lines, raw_stdout, persisted_stdout, persisted_stderr) =
         run_fake_docker_with_secrets(state.path(), &["github_token".to_owned()]);
     let joined = lines.join("\n");
     // The docker client's ps-visible argv forwards the name only.
@@ -95,6 +107,14 @@ fn declared_github_token_reaches_the_task_env_but_never_argv_or_logs() {
     assert!(joined.contains("env=***"), "{joined}");
     assert!(joined.contains("whole *** end"), "{joined}");
     assert!(joined.contains("*** tail"), "{joined}");
+    for channel in [&persisted_stdout, &persisted_stderr] {
+        assert!(
+            !channel
+                .windows(CANARY.len())
+                .any(|part| part == CANARY.as_bytes())
+        );
+        assert!(String::from_utf8_lossy(channel).contains("***"));
+    }
 }
 
 #[cfg(unix)]
@@ -104,7 +124,7 @@ fn undeclared_task_gets_no_github_token_even_when_the_secret_exists() {
     let state = tempfile::tempdir().unwrap();
     secrets::write_secret(state.path(), "github_token", CANARY.as_bytes()).unwrap();
     // Ambient daemon env must not leak into the task either.
-    let (lines, raw_stdout) = run_fake_docker_with_secrets(state.path(), &[]);
+    let (lines, raw_stdout, _, _) = run_fake_docker_with_secrets(state.path(), &[]);
     assert!(raw_stdout.contains("env=unset"), "{raw_stdout}");
     // The only forwarded variable is the per-exec stop marker (#357).
     assert_eq!(raw_stdout.matches("--env").count(), 1, "{raw_stdout}");

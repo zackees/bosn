@@ -107,6 +107,7 @@ dependencies = [
  "bosn-registry",
  "bosn-service",
  "bosn-setup",
+ "futures-util",
  "kernal-api",
  "libc",
  "native-tls",
@@ -189,6 +190,7 @@ dependencies = [
  "bosn-generation",
  "bosn-registry",
  "bosn-setup",
+ "futures-util",
  "kernal-api",
  "native-tls",
  "prost",
@@ -626,6 +628,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
 
 [[package]]
+name = "futures-macro"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9fb9654ba8355388abeb8dcb4fc62f511300867002afc858860463bdd9fe0c44"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.5",
+]
+
+[[package]]
 name = "futures-sink"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -644,6 +657,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
 dependencies = [
  "futures-core",
+ "futures-macro",
  "futures-task",
  "pin-project-lite",
  "slab",
@@ -1035,9 +1049,9 @@ dependencies = [
 
 [[package]]
 name = "kernal-api"
-version = "0.1.27"
+version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "907f4fe1fa5b9494de965ce67c770256d327189e6be55e9649499cc088ab1930"
+checksum = "0af4f0671f881b8e03b505cae8394b09c47d79128cd60b4dbec0bcae709e4304"
 dependencies = [
  "blake3",
  "bytes",

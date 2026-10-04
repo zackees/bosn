@@ -23,11 +23,13 @@ pub struct RunHttpServer {
 const MAX_PAGE_BYTES: u64 = 4 * 1024 * 1024;
 
 pub async fn start(state_dir: &Path) -> io::Result<RunHttpServer> {
+    raw_run_log::mark_interrupted_runs(state_dir)?;
     let token = random_token().await?;
     let limits = http_server::Limits {
         max_connections: 8,
         max_request_body_bytes: 0,
         max_response_body_bytes: 96 * 1024 * 1024,
+        max_event_bytes: 1024 * 1024,
         handler_timeout: Duration::from_secs(30),
         ..http_server::Limits::default()
     };
@@ -183,7 +185,13 @@ fn respond(
         return text(404, "not found");
     }
     if operation == "stream" {
-        return stream_page(state_dir, run_id, &query, header(&request, "accept"));
+        return stream_page(
+            state_dir,
+            run_id,
+            &query,
+            header(&request, "accept"),
+            header(&request, "last-event-id"),
+        );
     }
     if let Some(channel) = operation.strip_prefix("logs/") {
         return raw_page(
@@ -202,6 +210,7 @@ fn stream_page(
     run_id: &str,
     query: &[(String, String)],
     accept: Option<&str>,
+    last_event_id: Option<&str>,
 ) -> http_server::Response {
     let mut from_seq = 0;
     let mut streams = "stdout,stderr";
@@ -223,6 +232,23 @@ fn stream_page(
         }
         saw_seq |= key == "from_seq";
         saw_streams |= key == "streams";
+    }
+    if accept.is_some_and(|value| value.contains("text/event-stream")) {
+        if let Some(last) = last_event_id {
+            let Ok(last) = last.parse::<u64>() else {
+                return text(400, "invalid Last-Event-ID");
+            };
+            from_seq = from_seq.max(last);
+        }
+        if !state_dir
+            .join("runs")
+            .join(run_id)
+            .join("run.json")
+            .is_file()
+        {
+            return text(404, "run not found");
+        }
+        return crate::run_sse::response(state_dir, run_id, from_seq, streams);
     }
     let chunks = match raw_run_log::read_since(state_dir, run_id, from_seq, 256) {
         Ok(chunks) => chunks,
@@ -270,7 +296,7 @@ fn stream_page(
     .unwrap_or_default()
 }
 
-fn chunk_json(chunk: &RawChunk) -> serde_json::Value {
+pub(crate) fn chunk_json(chunk: &RawChunk) -> serde_json::Value {
     let mut value = chunk_metadata(chunk);
     value["data_b64"] = json!(STANDARD.encode(&chunk.bytes));
     value
@@ -473,7 +499,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let run_id = "00000000-0000-0000-0000-000000000042";
             let mut log = raw_run_log::RawRunLog::create(tmp.path(), run_id).unwrap();
-            log.write_metadata(run_id, 123).unwrap();
+            log.write_metadata(run_id, 123, None).unwrap();
             log.append(&EngineEvent::Stdout(vec![0xff, b'a'])).unwrap();
             log.append(&EngineEvent::Stderr(vec![0xfe, b'b'])).unwrap();
             drop(log);
@@ -515,6 +541,14 @@ mod tests {
             assert!(listed.starts_with(b"HTTP/1.1 200"));
             let runs: serde_json::Value = serde_json::from_slice(body(&listed)).unwrap();
             assert_eq!(runs[0]["job_id"], 123);
+            assert_eq!(runs[0]["state"], "interrupted");
+            assert_eq!(
+                raw_run_log::read_end(tmp.path(), run_id)
+                    .unwrap()
+                    .unwrap()
+                    .seq,
+                3
+            );
             let replay = request(
                 port,
                 &route,
@@ -564,7 +598,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let run_id = "00000000-0000-0000-0000-000000000044";
             let mut log = raw_run_log::RawRunLog::create(tmp.path(), run_id).unwrap();
-            log.write_metadata(run_id, 44).unwrap();
+            log.write_metadata(run_id, 44, None).unwrap();
             for _ in 0..256 {
                 log.append(&EngineEvent::Stdout(vec![b'x'])).unwrap();
             }
@@ -598,6 +632,125 @@ mod tests {
             let event: serde_json::Value = serde_json::from_slice(body(&second)).unwrap();
             assert_eq!(event["seq"], 257);
             assert_eq!(event["stream"], "stderr");
+        });
+    }
+
+    #[test]
+    fn sse_reconnect_delivers_remaining_channel_and_terminal_event() {
+        run(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let run_id = "00000000-0000-0000-0000-000000000044";
+            let mut log = raw_run_log::RawRunLog::create(tmp.path(), run_id).unwrap();
+            log.write_metadata(run_id, 45, None).unwrap();
+            log.append(&EngineEvent::Stdout(b"first".to_vec())).unwrap();
+            log.append(&EngineEvent::Stderr(vec![0xff, b'B'])).unwrap();
+            log.finish("success").unwrap();
+            let first = start(tmp.path()).await.unwrap();
+            drop(first);
+            let server = start(tmp.path()).await.unwrap();
+            let port = server.local_addr.port();
+            let host = format!("127.0.0.1:{port}");
+            let token = std::fs::read_to_string(tmp.path().join("run-http.token")).unwrap();
+            let invalid = request(
+                port,
+                &format!("/v1/runs/{run_id}/stream"),
+                &host,
+                &format!(
+                    "Authorization: Bearer {token}\r\nAccept: text/event-stream\r\nLast-Event-ID: nope\r\n"
+                ),
+                "",
+            )
+            .await;
+            assert!(invalid.starts_with(b"HTTP/1.1 400"));
+            let reply = request(
+                port,
+                &format!("/v1/runs/{run_id}/stream"),
+                &host,
+                &format!(
+                    "Authorization: Bearer {token}\r\nAccept: text/event-stream\r\nLast-Event-ID: 1\r\n"
+                ),
+                "",
+            )
+            .await;
+            let wire = String::from_utf8_lossy(&reply);
+            assert!(wire.contains("id: 2\nevent: stderr\ndata: "), "{wire}");
+            assert!(wire.contains("\"data_b64\":\"/0I=\""), "{wire}");
+            assert!(wire.contains("id: 3\nevent: end\ndata: "), "{wire}");
+            assert!(wire.contains("\"state\":\"success\""), "{wire}");
+            assert!(wire.contains("\"exit_code\":0"), "{wire}");
+            assert!(!wire.contains("id: 1\nevent: stdout"), "{wire}");
+            assert_eq!(wire.matches("id: 2\n").count(), 1);
+            assert_eq!(wire.matches("id: 3\n").count(), 1);
+            let browser = request(
+                port,
+                &format!("/v1/runs/{run_id}/stream?token={token}&from_seq=2"),
+                &host,
+                "Accept: text/event-stream\r\n",
+                "",
+            )
+            .await;
+            let browser = String::from_utf8_lossy(&browser);
+            assert!(browser.contains("id: 3\nevent: end"), "{browser}");
+            drop(server);
+        });
+    }
+
+    #[test]
+    fn sse_waits_for_live_output_and_advances_filtered_cursor() {
+        run(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let run_id = "00000000-0000-0000-0000-000000000045";
+            let server = start(tmp.path()).await.unwrap();
+            let mut log = raw_run_log::RawRunLog::create(tmp.path(), run_id).unwrap();
+            log.write_metadata(run_id, 46, None).unwrap();
+            let port = server.local_addr.port();
+            let host = format!("127.0.0.1:{port}");
+            let token = std::fs::read_to_string(tmp.path().join("run-http.token")).unwrap();
+            let route = format!("/v1/runs/{run_id}/stream?streams=stderr");
+            let auth = format!("Authorization: Bearer {token}\r\nAccept: text/event-stream\r\n");
+            let reader =
+                async_engine::launch(async move { request(port, &route, &host, &auth, "").await });
+            async_engine::sleep(Duration::from_millis(100)).await;
+            log.append(&EngineEvent::Stdout(b"skip".to_vec())).unwrap();
+            log.append(&EngineEvent::Stderr(b"keep".to_vec())).unwrap();
+            log.finish("success").unwrap();
+            let reply = async_engine::timeout(Duration::from_secs(3), reader)
+                .await
+                .unwrap()
+                .unwrap();
+            let wire = String::from_utf8_lossy(&reply);
+            assert!(wire.contains("id: 2\nevent: stderr\ndata: "), "{wire}");
+            assert!(wire.contains("id: 3\nevent: end\ndata: "), "{wire}");
+            assert!(wire.contains("\"state\":\"success\""), "{wire}");
+            assert!(!wire.contains("id: 1\nevent: stdout"), "{wire}");
+            drop(server);
+        });
+    }
+
+    #[test]
+    fn sse_preserves_chunks_larger_than_eight_kib() {
+        run(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let run_id = "00000000-0000-0000-0000-000000000046";
+            let mut log = raw_run_log::RawRunLog::create(tmp.path(), run_id).unwrap();
+            log.write_metadata(run_id, 47, None).unwrap();
+            let chunk = vec![0xff; 16 * 1024];
+            log.append(&EngineEvent::Stdout(chunk.clone())).unwrap();
+            log.finish("success").unwrap();
+            let server = start(tmp.path()).await.unwrap();
+            let port = server.local_addr.port();
+            let token = std::fs::read_to_string(tmp.path().join("run-http.token")).unwrap();
+            let wire = request(
+                port,
+                &format!("/v1/runs/{run_id}/stream"),
+                &format!("127.0.0.1:{port}"),
+                &format!("Authorization: Bearer {token}\r\nAccept: text/event-stream\r\n"),
+                "",
+            )
+            .await;
+            let wire = String::from_utf8_lossy(&wire);
+            assert!(wire.contains(&STANDARD.encode(chunk)));
+            assert!(wire.contains("id: 2\nevent: end"));
         });
     }
 }

@@ -36,14 +36,14 @@ def test_every_repo_manifest_uses_the_published_kernel() -> None:
 
 def test_exact_published_kernel_is_accepted(tmp_path: Path) -> None:
     manifest = tmp_path / "Cargo.toml"
-    manifest.write_text('[dependencies]\nkernal-api = "=0.1.27"\n', encoding="utf-8")
+    manifest.write_text('[dependencies]\nkernal-api = "=0.1.28"\n', encoding="utf-8")
     assert verify(manifest) == []
 
 
 def test_valid_inline_table_dependency_is_accepted(tmp_path: Path) -> None:
     manifest = tmp_path / "Cargo.toml"
     manifest.write_text(
-        '[dependencies]\nkernal-api = { version = "=0.1.27", default-features = false }\n',
+        '[dependencies]\nkernal-api = { version = "=0.1.28", default-features = false }\n',
         encoding="utf-8",
     )
     assert verify(manifest) == []
@@ -52,8 +52,8 @@ def test_valid_inline_table_dependency_is_accepted(tmp_path: Path) -> None:
 def test_toml_forms_and_source_bypasses_are_not_spoofed_by_comments(tmp_path: Path) -> None:
     manifest = tmp_path / "Cargo.toml"
     manifest.write_text(
-        '# kernal-api = "=0.1.27"\n'
-        '[dependencies.kernal-api]\nversion = "=0.1.27"\n'
+        '# kernal-api = "=0.1.28"\n'
+        '[dependencies.kernal-api]\nversion = "=0.1.28"\n'
         'git = "https://example.invalid/k"\n[patch.crates-io]\n'
         'kernal-api = { path = "../k" }\n',
         encoding="utf-8",
@@ -66,15 +66,15 @@ def test_toml_forms_and_source_bypasses_are_not_spoofed_by_comments(tmp_path: Pa
 def test_replace_rename_target_and_workspace_bypasses_are_rejected(tmp_path: Path) -> None:
     root = tmp_path / "Cargo.toml"
     root.write_text(
-        '[workspace]\n[replace]\n"kernal-api:0.1.27" = { path = "kernel" }\n', encoding="utf-8"
+        '[workspace]\n[replace]\n"kernal-api:0.1.28" = { path = "kernel" }\n', encoding="utf-8"
     )
     member = tmp_path / "member" / "Cargo.toml"
     member.parent.mkdir()
     member.write_text(
         "[dependencies]\n"
-        'k = { package = "kernal-api", version = "=0.1.27", workspace = true }\n'
+        'k = { package = "kernal-api", version = "=0.1.28", workspace = true }\n'
         "[target.'cfg(unix)'.dependencies]\n"
-        'kernal-api = { version = "=0.1.27", git = "https://example.invalid" }\n',
+        'kernal-api = { version = "=0.1.28", git = "https://example.invalid" }\n',
         encoding="utf-8",
     )
     errors = verify(member)
@@ -84,13 +84,13 @@ def test_replace_rename_target_and_workspace_bypasses_are_rejected(tmp_path: Pat
 
 def test_each_kernel_source_selector_is_rejected_individually(tmp_path: Path) -> None:
     variants = {
-        "git": 'kernal-api = { version = "=0.1.27", git = "https://example.invalid" }',
-        "path": 'kernal-api = { version = "=0.1.27", path = "kernel" }',
-        "registry": 'kernal-api = { version = "=0.1.27", registry = "private-mirror" }',
+        "git": 'kernal-api = { version = "=0.1.28", git = "https://example.invalid" }',
+        "path": 'kernal-api = { version = "=0.1.28", path = "kernel" }',
+        "registry": 'kernal-api = { version = "=0.1.28", registry = "private-mirror" }',
         "rename": (
-            'k = { package = "kernal-api", version = "=0.1.27", git = "https://example.invalid" }'
+            'k = { package = "kernal-api", version = "=0.1.28", git = "https://example.invalid" }'
         ),
-        "workspace": 'kernal-api = { version = "=0.1.27", workspace = true }',
+        "workspace": 'kernal-api = { version = "=0.1.28", workspace = true }',
     }
     for name, dependency in variants.items():
         manifest = tmp_path / f"{name}.toml"
@@ -101,9 +101,9 @@ def test_each_kernel_source_selector_is_rejected_individually(tmp_path: Path) ->
 def test_target_source_selector_is_rejected_individually(tmp_path: Path) -> None:
     manifest = tmp_path / "Cargo.toml"
     manifest.write_text(
-        '[dependencies]\nkernal-api = "=0.1.27"\n'
+        '[dependencies]\nkernal-api = "=0.1.28"\n'
         "[target.'cfg(unix)'.dependencies]\n"
-        'kernal-api = { version = "=0.1.27", registry = "private-mirror" }\n',
+        'kernal-api = { version = "=0.1.28", registry = "private-mirror" }\n',
         encoding="utf-8",
     )
     assert any("bypass" in error for error in verify(manifest))

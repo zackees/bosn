@@ -81,6 +81,7 @@ mod registry_actor;
 mod registry_api;
 mod registry_records;
 mod run_http;
+mod run_sse;
 pub mod runners;
 pub mod secrets;
 mod service;
