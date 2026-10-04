@@ -62,29 +62,30 @@ pub(crate) fn verify_cache_volume(
     cache: &ActEngineCacheVolume,
 ) -> Result<(), ActEngineError> {
     let refused = || ActEngineError("cache volume ownership does not match".into());
-    let value: Value =
+    let volumes: Vec<storage_volume::DockerVolume> =
         serde_json::from_slice(document).map_err(|e| ActEngineError(e.to_string()))?;
-    let volume = value
-        .as_array()
-        .filter(|v| v.len() == 1)
-        .and_then(|v| v.first())
-        .ok_or_else(refused)?;
+    let [volume] = volumes.as_slice() else {
+        return Err(refused());
+    };
     // Every identity label but the two that legitimately vary.
     let expected = cache_volume_labels(ANY_REGISTRY, 0.0)?;
-    let labels = &volume["Labels"];
-    if volume["Name"].as_str() != Some(cache.name.as_str())
-        || volume["Driver"] != "local"
-        || volume["Scope"] != "local"
-        || !empty(&volume["Options"])
+    let labels = volume.labels.as_ref().ok_or_else(refused)?;
+    if volume.name != cache.name
+        || volume.driver != "local"
+        || volume.scope != "local"
+        || volume
+            .options
+            .as_ref()
+            .is_some_and(|options| !options.is_empty())
         || expected
             .iter()
             .filter(|(key, _)| ![LABEL_CREATED, LABEL_REGISTRY].contains(&key.as_str()))
-            .any(|(key, value)| labels[key.as_str()].as_str() != Some(value.as_str()))
-        || labels[LABEL_REGISTRY]
-            .as_str()
+            .any(|(key, value)| labels.get(key) != Some(value))
+        || labels
+            .get(LABEL_REGISTRY)
             .is_none_or(|registry| cache_volume_labels(registry, 0.0).is_err())
-        || labels[LABEL_CREATED]
-            .as_str()
+        || labels
+            .get(LABEL_CREATED)
             .is_none_or(|created| created.parse::<f64>().is_err())
     {
         return Err(refused());
@@ -186,4 +187,34 @@ pub(super) fn volume_mounts_match(
                 .count()
                 == 1
         })
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    #[test]
+    fn typed_machine_cache_inspection_protects_the_volume_boundary() {
+        let cache = ActEngineCacheVolume {
+            name: "bosn-ci-cache-v1".into(),
+            target: "/bosn/cache".into(),
+        };
+        let valid = serde_json::json!([{
+            "Name": cache.name,
+            "Driver": "local",
+            "Scope": "local",
+            "Options": null,
+            "Labels": cache_volume_labels(ANY_REGISTRY, 1.0).unwrap(),
+        }]);
+        assert!(verify_cache_volume(&serde_json::to_vec(&valid).unwrap(), &cache).is_ok());
+        for (field, value) in [
+            ("Options", serde_json::json!({"device": "/host"})),
+            ("Labels", serde_json::json!({LABEL_REGISTRY: 123})),
+            ("Driver", serde_json::json!("foreign")),
+        ] {
+            let mut document = valid.clone();
+            document[0][field] = value;
+            assert!(verify_cache_volume(&serde_json::to_vec(&document).unwrap(), &cache).is_err());
+        }
+    }
 }

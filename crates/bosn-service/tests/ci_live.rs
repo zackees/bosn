@@ -304,6 +304,17 @@ fn assert_isolated(run: &str) {
         &engine,
     ]))
     .unwrap();
+    let storage = mounts
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|mount| mount["Destination"] == "/var/lib/docker")
+        .expect("private Docker storage mount");
+    assert_eq!(
+        storage["Name"],
+        format!("bosn-act-storage-{run}"),
+        "the durable intent identifies the private image/build-cache volume"
+    );
     for mount in mounts.as_array().unwrap() {
         assert_eq!(mount["Type"], "volume", "no bind mounts: {mount}");
         let text = mount.to_string();

@@ -347,8 +347,10 @@ already be done. Active claims are neither interrupted nor cleared. The existing
 backend still verifies registry ownership and exact immutable container identity,
 authorizes removal, requests `container rm --force --volumes`, and proves container
 name/ID absence before recording a terminal receipt. Retrying retirement expires
-that engine's private nested image/build-cache store along with its anonymous
-storage; the named warm cache remains protected. Successful retry updates the
+that engine's private nested image/build-cache store. New v2 profiles require
+independent named-storage absence proof, as described below; legacy anonymous
+profiles retain their earlier removal contract. The named warm cache remains
+protected. Successful retry updates the
 run's cleanup field but preserves its original execution verdict and history.
 
 All three isolated synthetic-host tests pass: recovery without daemon restart,
@@ -404,3 +406,24 @@ host base images/shared cache artifacts need separate policy. Live Docker
 fault/restart/partial-create replay is still required: these checks do not prove
 late Docker-create side effects resolved or claim #445/#452 closed. No existing
 host data was converted or removed; cache cohort integration remains open.
+
+Live v2 verification passed all six scenarios in a fresh, isolated Docker
+29.7.2 engine (457.26 seconds): a later job restored `actions/cache` from an earlier
+job, a second fresh engine restored prior-run cache contents, repository
+namespaces remained isolated, and spare reuse/daemon-stop cleanup succeeded,
+all with v2 private storage enabled. Success, failure, timeout, client kill,
+daemon kill/restart and the recorded matrix/failure report also passed. A final
+volume listing contained only the retained `bosn-ci-cache-v1`, with no private
+storage volumes. This proves those tested lifecycle paths, not partial-create
+or lost-acknowledgement recovery against real Docker. The live isolation check now
+also asserts that `/var/lib/docker` uses the intent-derived named volume; that
+additional assertion passed in a focused lifecycle rerun (215.86 seconds).
+Host snapshots already compare all owned
+volume identities before and after retirement.
+
+Shared-cache and private-storage inspection now deserialize the same typed
+Docker volume response before ownership checks. The shared cache still accepts
+a valid different registry's machine cache; local driver/scope, empty options
+and identity labels remain mandatory. Ten focused accounting tests and the
+new malformed-label/foreign-driver/bind-option boundary test pass in isolation.
+Strict Clippy for all service targets and source-length/include checks also pass.

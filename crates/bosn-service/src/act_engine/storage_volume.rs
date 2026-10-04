@@ -28,16 +28,16 @@ fn labels(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
-struct StorageVolume {
-    name: String,
-    driver: String,
-    scope: String,
-    options: Option<BTreeMap<String, String>>,
-    labels: Option<BTreeMap<String, String>>,
+pub(super) struct DockerVolume {
+    pub(super) name: String,
+    pub(super) driver: String,
+    pub(super) scope: String,
+    pub(super) options: Option<BTreeMap<String, String>>,
+    pub(super) labels: Option<BTreeMap<String, String>>,
 }
 
 fn verify(document: &[u8], intent: &ActEngineIntent, owner: &str) -> Result<(), ActEngineError> {
-    let volumes: Vec<StorageVolume> =
+    let volumes: Vec<DockerVolume> =
         serde_json::from_slice(document).map_err(|e| ActEngineError(e.to_string()))?;
     let [volume] = volumes.as_slice() else {
         return Err(ActEngineError("ambiguous private storage volume".into()));
