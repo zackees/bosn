@@ -3687,3 +3687,27 @@ The API initially failed to compile because it was absent, then passed. Full
 package/lint/platform/release gates and review remain pending. Verified release,
 expired-record cleanup, CLI integration and Bosn's publication/source-volume
 lifecycle still require implementation; normal planning remains unactivated.
+
+### Bounded expired recovery reference cleanup (candidate, 2026-10-04)
+
+Act2 candidate `077e2f7` now removes expired canonical recovery records under
+original catalog exclusion after complete usage and candidate inventories pass.
+Each removal rechecks the exact typed intent and original record inode. The
+sweep removes at most `MaxCandidates` records, syncs the reference directory,
+reports remaining expired records, and bounds owner receipts to 32 with an
+explicit omitted count. Partial removal/sync outcomes stop further destructive
+work and trigger a fresh allocation audit. Active references remain protective.
+
+The focused retention/recovery race suite passed in 1.514 seconds:
+`.git/retention-native-recovery-pin-expiry-boundaries.log`. A 41-expired-record
+fixture removes eight in the first sweep, then 33 in the second, while retaining
+its active reference and protected generation. The second report contains 32
+owners and one omitted owner. The existing candidate inventory guard counts root
+control entries as well as payload entries; an initial two-entry test budget
+refused before mutation. The fixture budget was corrected to eight without
+changing production limits or bypassing inventory validation.
+
+Expired-record cleanup is implemented in this candidate; verified explicit
+release, CLI integration, review, full package/platform/release validation and
+Bosn source-volume lifetime activation remain incomplete. This evidence proves
+bounded metadata expiry, not automatic machine-wide cache maintenance.
