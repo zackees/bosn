@@ -2728,8 +2728,8 @@ with `MkdirTemp`, report their paths and attempt deferred cleanup. They do not
 persist ownership evidence for a later crash-recovery sweep. A stage-looking
 prefix is therefore insufficient proof for deleting a discovered old directory.
 The planned fix records typed relative path, creation time and original
-filesystem/inode identity in the existing catalog database while its original
-writer is held. Publication and cleanup must retire this record after successful
+filesystem/inode identity in synced ownership files while the original catalog
+writer is held. The catalog descriptor remains a read-only mutex. Publication and cleanup must retire this record after successful
 rename/removal. Crash windows before registration leave unknown preserved state;
 a record after rename must never authorize deleting a replacement at its old path.
 
@@ -2740,3 +2740,48 @@ inode identities refuse deletion. Stage cleanup must also apply bounded metadata
 and mount-ID checks and report physical accounting after mutation. No stage was
 deleted from a production/shared cache during this investigation. Evidence:
 `act2-tool-stage-retention-red.log`. This work remains unimplemented.
+
+
+### Durable stage ownership and bounded expiry (local implementation)
+
+Candidate `32ce983` wires registered stage creation into both object and generation
+publishers. Ownership records live in `.tool-publication-ownership-v1`, coordinated
+by the original catalog writer. An attempted bbolt transaction failed in the
+focused tests because coordination descriptors intentionally stay read-only; that
+mutex contract was preserved and the design moved to separately synced files.
+Each exclusive record leaf is the SHA-256 of a typed relative stage path, with
+canonical schema-1 JSON (at most 1,024 bytes), original device/inode/mount identity
+and UTC creation time. Stage parent, record file and ownership directory are
+synced before payload fill. Records are bounded at ten thousand; creation refuses
+at capacity before creating another stage. Unknown or malformed ledger state
+refuses recovery rather than inferring ownership from names.
+
+`RetireToolStages(ctx, root, expireBefore, maxEntries)` holds catalog exclusion,
+requires an explicit age cutoff and bounded complete store inventory, and deletes
+only registered expired stages with matching original inode and mount identity.
+Descendant mount-ID validation rejects bind mounts; unregistered stage-looking
+directories and replacement identities stay intact. Cleanup reports physical
+allocation after each attempt. Publication/removal sync precedes record deletion.
+A stale record whose original path is absent is cleared after parent sync without
+touching any published destination. Failed registration retains `pending_stage`
+for the private footprint. Deferred publisher cleanup uses bounded time derived
+from the caller context with cancellation detached for recovery.
+
+Verified regressions: original catalog prevents expiry while a publisher lives;
+registered old stage expires; unknown prefix is preserved; replacement directory
+identity refuses; a lost post-rename sync acknowledgement leaves an ownership
+record that recovery clears while the published object remains fully valid.
+Independent review caught creation of record 10,001 at capacity. Fixed regression
+uses ten thousand actual records, proves refusal before stage creation, then
+confirms an existing expired stage remains recoverable. Full package tests,
+vet/lint and cumulative review pass. Final exact-source gate is running.
+Evidence: `act2-tool-stage-capacity-check.log`,
+`act2-tool-stage-publication-checks2.log`, `act2-tool-stage-split-lint.log` and
+`act2-tool-stage-source-bound-gate` JSON/log.
+
+Not released or activated in Bosn. Stage expiry is not yet part of the combined
+retention scheduler or CLI. Earlier unregistered leftovers are deliberately
+preserved until separate ownership evidence exists. Root-level selection JSON
+stages are still a separate lifecycle requirement. Large-store efficiency,
+production overlay/reader admission, whole-machine accounting and old engine,
+image and scoped builder-cache expiry remain required.
