@@ -689,3 +689,16 @@ pass in the isolated Rust container. Strict Clippy for all service targets,
 source-length/include gates and slice review pass. This is a visibility
 improvement, not a free-space pressure controller or automatic owned GC. No
 new live host measurement was required for this warning change.
+
+### CI coverage scope for act2 PR #22
+
+The existing PR workflow's Windows and macOS lanes select only
+`TestRunEventHostEnvironment`; their success is host-environment coverage,
+not execution evidence for the newly added retention, transfer-lock or import
+tests on those operating systems. The snapshot lane builds the release target
+matrix without publishing. Linux runs `./...` with coverage and a 20-minute
+per-package timeout, then CLI smoke steps. Its test step was confirmed live
+on job `111376046334` in run `37181922413`; no replacement run was started.
+Lint, spelling, snapshot and both host-environment lanes had completed
+successfully at that observation. Linux completion and end-to-end Bosn quota
+integration remain unproven until their corresponding evidence exists.
