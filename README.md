@@ -155,3 +155,10 @@ PR verification refuses missing or stale proof. A trusted, attested PR can
 skip the mapped policy and Rust jobs, with audit sampling retained. Explicit
 `ci-test`/`ci-full` requests keep their Linux test-tier coverage; main pushes
 and release validation retain their remote checks.
+
+If the gate rejects an old Bosn before submitting a run, check `bosn --version`
+and the executable selected by `command -v bosn`. The gate requires at least
+0.1.12. Its `uv run --no-project --isolated` launchers avoid selecting a virtual
+environment in an ancestor directory: `--no-project` alone does not isolate
+the tooling environment. Make the supported executable available on PATH and
+rerun the gate; the rejected preflight produces no attestation.
