@@ -284,6 +284,14 @@ def command(selection: Selection) -> list[str]:
     return argv
 
 
+def forward_report(output: str, destination: Path) -> None:
+    """Forward the original terminal line after private proof validation."""
+    terminal = [line for line in output.splitlines() if line.startswith("{")]
+    if len(terminal) != 1:
+        raise ValueError("shared replay requires one original terminal report")
+    destination.write_text(terminal[0], encoding="utf-8")
+
+
 def run_selection(selection: Selection) -> int:
     try:
         head = head_sha()
@@ -306,6 +314,9 @@ def run_selection(selection: Selection) -> int:
         if result.returncode or error:
             print(result.output[-12000:])
             raise ValueError(error or f"Bosn exited {result.returncode}")
+        report_path = os.environ.get("CI_LINT_GATE_REPLAY_REPORT")
+        if report_path:
+            forward_report(result.output, Path(report_path))
         print(f"local gate: {selection.job_id} passed with clean source and executed-step proof")
         return 0
     except (OSError, ValueError) as error:

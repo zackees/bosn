@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from typing import TypeAlias
@@ -71,6 +72,30 @@ class BosnGateProofTests(unittest.TestCase):
             workspace=Path("/work/repo"),
             head_sha="a" * 40,
         )
+
+    def test_private_runner_state_is_explicit(self) -> None:
+        with patch.dict(bosn_gate.os.environ, {"BOSN_GATE_STATE_DIR": "/private/state"}):
+            argv = bosn_gate.command(bosn_gate.RUST)
+        self.assertEqual(argv[-2:], ["--state-dir", "/private/state"])
+        self.assertIn("workflow_dispatch", argv)
+        self.assertIn("tier=minimal", argv)
+
+    def test_shared_report_preserves_original_terminal_evidence(self) -> None:
+        terminal = json.dumps(self.receipt(), separators=(",", ":"))
+        with tempfile.TemporaryDirectory() as scratch:
+            destination = Path(scratch) / "report.json"
+            bosn_gate.forward_report("runner log\n" + terminal + "\n", destination)
+            self.assertEqual(destination.read_text(), terminal)
+            self.assertNotIn("git_tree", json.loads(destination.read_text()))
+
+    def test_shared_report_rejects_missing_or_ambiguous_terminal(self) -> None:
+        terminal = json.dumps(self.receipt())
+        for output in ("runner succeeded", terminal + "\n" + terminal):
+            with self.subTest(output=output), tempfile.TemporaryDirectory() as scratch:
+                destination = Path(scratch) / "report.json"
+                with self.assertRaises(ValueError):
+                    bosn_gate.forward_report(output, destination)
+                self.assertFalse(destination.exists())
 
     def test_old_runner_is_rejected_before_engine_submission(self) -> None:
         self.assertIsNone(bosn_gate.version_error("bosn 0.1.12", 0))

@@ -49,15 +49,17 @@ jobs:
       skip_rust: ${{ steps.verify.outputs.skip_rust }}
       skip_lint-no-macos-runners: ${{ steps.verify.outputs.skip_lint-no-macos-runners }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
         with:
           ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/checkout@v4
+      - name: Checkout CI policy
+        uses: actions/checkout@v4
         with:
           repository: zackees/ci.yml
-          ref: 86b63937960d00655f7ef3752ef6f15b6b06f35b
+          ref: 527cc179200496bdc41445a2c5b91e6025b495d7
           path: .ci-lint
           persist-credentials: false
           sparse-checkout: ci_lint
@@ -81,10 +83,12 @@ jobs:
       test: ${{ steps.select.outputs.test }}
       full: ${{ steps.select.outputs.full }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
         with:
           ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
-      - id: select
+      - name: Select CI tier
+        id: select
         env:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_PATH: ${{ github.event_path }}
@@ -124,7 +128,8 @@ jobs:
     if: needs.verify.outputs.skip_rust != 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
         with:
           ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
 
@@ -211,7 +216,8 @@ jobs:
         if: needs.select-tier.outputs.test != 'true'
         run: echo "Linux integration runs in test and full CI"
 
-      - uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
         if: needs.select-tier.outputs.test == 'true'
         with:
           ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}

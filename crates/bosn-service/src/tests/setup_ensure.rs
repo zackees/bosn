@@ -28,14 +28,23 @@ fn setup_ensure_job_is_prompt_coalesced_bounded_and_cancellable_without_docker()
                 deadline: Duration::from_secs(2),
                 output_limit: 4 * 1024,
             };
-            let submitted = std::time::Instant::now();
-            let first = client.submit_setup_ensure(request.clone()).await.unwrap();
-            assert!(submitted.elapsed() < Duration::from_millis(250));
+            // The executor cannot finish until cancelled. A synchronous
+            // submission fails this watchdog; host scheduling speed cannot
+            // masquerade as the asynchronous contract we are testing.
+            let first = async_engine::timeout(
+                Duration::from_secs(5),
+                client.submit_setup_ensure(request.clone()),
+            )
+            .await
+            .expect("submission returns while execution remains blocked")
+            .unwrap();
             assert_eq!(
                 first,
                 client.submit_setup_ensure(request.clone()).await.unwrap()
             );
             wait_for(|| fake.started.load(Ordering::SeqCst) == 1).await;
+            wait_for(|| fake.stages() == vec!["plan", "prepare", "ensure"]).await;
+            assert_eq!(fake.stages(), vec!["plan", "prepare", "ensure"]);
             client.ping().await.unwrap();
             let logs = wait_for_logs(&client, first).await;
             assert!(
