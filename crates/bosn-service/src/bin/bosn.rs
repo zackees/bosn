@@ -209,6 +209,8 @@ fn usage() -> ! {
         "   or: bosn daemon serve --state-dir STATE_DIR [--runner-slots N] [--runner-cpus CPUS] [--runner-memory SIZE] [--control-slots N] [--stall-seconds S] [--docker-proxy true|false]"
     );
     eprintln!("   or: bosn daemon status --state-dir STATE_DIR [--json]");
+    eprintln!("   or: bosn daemon url --state-dir STATE_DIR [--json]");
+    eprintln!("   or: bosn daemon token --state-dir STATE_DIR [--json]");
     eprintln!("   or: bosn daemon stop --state-dir STATE_DIR [--json]");
     eprintln!(
         "   or: bosn daemon autostart (enable|disable|status) [--state-dir STATE_DIR] [--json]"

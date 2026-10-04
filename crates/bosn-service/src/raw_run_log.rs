@@ -40,6 +40,13 @@ pub struct RawRunLog {
     stderr_len: u64,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RunMetadata {
+    pub run_id: String,
+    pub job_id: u64,
+    pub created_unix_ms: u64,
+}
+
 #[derive(Clone)]
 pub struct JobLogSink {
     sender: async_engine::Sender<String>,
@@ -108,6 +115,25 @@ impl RawRunLog {
         })
     }
 
+    /// Associate a durable output directory with its daemon job. This is
+    /// written once, before any task output, so discovery survives restart.
+    pub fn write_metadata(&self, run_id: &str, job_id: u64) -> io::Result<()> {
+        let metadata = RunMetadata {
+            run_id: run_id.to_owned(),
+            job_id,
+            created_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        };
+        let mut file = private_create(&self.root.join("run.json"))?;
+        serde_json::to_writer(&mut file, &metadata)?;
+        file.write_all(b"\n")?;
+        file.flush()
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -145,6 +171,36 @@ impl RawRunLog {
         self.next_seq = self.next_seq.saturating_add(1);
         Ok(Some(record))
     }
+}
+
+pub fn list_runs(state_dir: &Path) -> io::Result<Vec<RunMetadata>> {
+    let root = state_dir.join("runs");
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut runs = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !crate::ci::wire::valid_uuid(name) || !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path().join("run.json");
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let metadata: RunMetadata = serde_json::from_reader(file)?;
+        if metadata.run_id == name {
+            runs.push(metadata);
+        }
+    }
+    runs.sort_by_key(|run| (run.created_unix_ms, run.run_id.clone()));
+    Ok(runs)
 }
 
 /// Read at most `limit` committed chunks after `from_seq`, including after
@@ -292,6 +348,32 @@ mod tests {
         let resumed = read_since(tmp.path(), "00000000-0000-0000-0000-000000000042", 2, 1).unwrap();
         assert_eq!(resumed.len(), 1);
         assert_eq!(resumed[0].bytes, [b'c'; 16 * 1024]);
+    }
+
+    #[test]
+    fn run_metadata_survives_restart_and_is_owner_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_id = "00000000-0000-0000-0000-000000000042";
+        let log = RawRunLog::create(tmp.path(), run_id).unwrap();
+        log.write_metadata(run_id, 123).unwrap();
+        drop(log);
+        let runs = list_runs(tmp.path()).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].run_id, run_id);
+        assert_eq!(runs[0].job_id, 123);
+        assert!(runs[0].created_unix_ms > 0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(tmp.path().join("runs").join(run_id).join("run.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]
