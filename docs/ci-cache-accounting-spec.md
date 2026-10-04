@@ -2114,13 +2114,15 @@ are rejected), traversal reads 256 entries per page with a depth limit of 64,
 and initial-store recognition reads at most two entries. Absolute, parent and
 transitive symlink escape regressions failed before their fixes and passed
 afterward; excessive-depth refusal and all existing focused tests also passed.
-The corrected package/command lint run reported zero issues. Re-review is
-pending. Artifacts: `act2-toolcache-link-red.log`,
+The corrected package/command lint run reported zero issues. The same reviewer
+returned PASS for the corrected slice. Artifact-cache package tests passed
+again (14.25 seconds), and `go vet` passed. The act2 candidate is committed at
+`1941705`; it has not been pushed or released. Artifacts: `act2-toolcache-link-red.log`,
 `act2-toolcache-transitive-link-red.log`, `act2-toolcache-review-fixes.log`.
 Artifacts: `act2-toolcache-publish-red.log`,
 `act2-toolcache-publish-green.log`, `act2-toolcache-boundaries.log`.
 
-This is local work, not released or enrolled by Bosn. Review,
+This is local work, not released or enrolled by Bosn. Publication gates,
 durability fault evidence, generation assembly, reader protection, accounting
 and coordinated expiry remain open. The publisher alone does not solve
 per-engine tool copying or authorize deletion of existing caches.
