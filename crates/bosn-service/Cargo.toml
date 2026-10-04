@@ -21,7 +21,7 @@ bosn-setup = { path = "../bosn-setup" }
 bosn-engine = { path = "../bosn-engine" }
 bosn-generation = { path = "../bosn-generation" }
 prost = "=0.14.4"
-kernal-api = { version = "=0.1.26", default-features = false, features = ["sqlite", "fs", "ipc", "ipc-async", "secure-random", "daemon-frame-v1", "hash-sha256", "http-client", "http-server", "event-stream", "archive"] }
+kernal-api = { version = "=0.1.27", default-features = false, features = ["sqlite", "fs", "ipc", "ipc-async", "secure-random", "daemon-frame-v1", "hash-sha256", "http-client", "http-server", "event-stream", "archive"] }
 toml = "=0.8.23"
 toml_edit = "=0.22.27"
 serde_yaml = "=0.9.34"
