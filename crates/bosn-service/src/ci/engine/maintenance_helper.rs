@@ -99,6 +99,7 @@ impl DockerActBackend {
             if !version.ends_with(super::ACT_VERSION) {
                 return Err(format!("maintenance act version mismatch: {version}"));
             }
+            self.agree_cache_policy(&id, policy).await?;
             self.maintain_cache_cohort(&id, policy).await
         }
         .await;
@@ -186,7 +187,7 @@ mod tests {
         with_registry(|registry, directory| async move {
             let backend = DockerActBackend::default();
             let policy: CachePolicy = toml::from_str(
-                "repository_max_bytes=1073741824\naggregate_max_bytes=2147483648\nmax_age_secs=2592000\nunused_age_secs=604800\nmaintenance_interval_secs=300\n"
+                "repository_max_bytes=104857600\naggregate_max_bytes=209715200\nmax_age_secs=2592000\nunused_age_secs=604800\nmaintenance_interval_secs=60\n"
             ).unwrap();
             let result = backend
                 .maintain_cache_with_helper(&registry, OWNER, policy)
@@ -211,6 +212,19 @@ mod tests {
             backend.verify_measured_volume(CACHE_VOLUME).await.unwrap();
             let outcome = result.outcome.unwrap();
             outcome.require_complete().unwrap();
+            let mut conflict = policy;
+            conflict.aggregate_max_bytes += 1;
+            let refused = backend
+                .maintain_cache_with_helper(&registry, OWNER, conflict)
+                .await
+                .unwrap();
+            assert!(refused.cleanup.is_ok(), "{:?}", refused.cleanup);
+            assert!(refused.outcome.unwrap_err().contains("policy conflict"));
+            backend
+                .confirm_measurement_absent(&refused.container_id)
+                .await
+                .unwrap();
+            backend.verify_measured_volume(CACHE_VOLUME).await.unwrap();
             assert!(
                 outcome
                     .report

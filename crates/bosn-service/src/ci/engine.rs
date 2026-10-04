@@ -27,6 +27,7 @@ pub use cache_usage::HelperCleanupRetry;
 #[cfg(all(test, unix))]
 mod cache_usage_transport_tests;
 mod legacy_lease;
+mod machine_policy;
 mod maintenance;
 mod maintenance_helper;
 mod migration;
@@ -792,6 +793,9 @@ impl ActEngineBackend for DockerActBackend {
         lines: &'a async_engine::Sender<EngineLine>,
     ) -> BoxFuture<'a, Result<ExecEnd, String>> {
         Box::pin(async move {
+            if let super::cache_cohort::CacheRoute::Cohort { policy, .. } = invocation.cache_route {
+                self.agree_cache_policy(engine, policy).await?;
+            }
             let mut args = Self::act_exec(engine, &invocation.secrets);
             args.extend(invocation.args());
             let (events, mut receiver) = async_engine::channel(256);

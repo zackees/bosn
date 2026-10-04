@@ -45,8 +45,10 @@ cannot authorize enrollment. The exclusive import executor preserves partial
 publication on nonzero exits but is not yet invoked by production planning.
 A local registry journal now persists import intent and recovers historical
 publication after restart. It is not machine-wide routing or enrollment state.
-The candidate also executes bounded independent maintenance passes and consumes
-typed retention outcomes. Periodic helper supervision is still unfinished.
+The candidate also executes bounded independent maintenance passes in durable
+finite-lived helpers and consumes typed retention outcomes. Participating cohort
+workflow engines and maintenance helpers now require the same shared policy
+record. Periodic scheduling and production enrollment are still unfinished.
 
 The tool-cache candidate uses unique save stages and skips hidden unfinished
 stages when rehydrating fresh engines. Its actual pinned-engine shell proof
@@ -1486,3 +1488,38 @@ physical machine footprint convergence.
 
 Strict service all-target Clippy passed (18.52 seconds), after extracting the
 Docker creation profile to satisfy the existing function-length gate.
+
+### Participating machine policy agreement (2026-10-04 candidate)
+
+Cohort workflow execution and independent maintenance now agree on a fixed
+schema-1 record at `actcache/.bosn-cohort-policy-v1` in the shared machine volume.
+All validated policy fields are compared in a fixed numeric representation.
+A nonblocking exclusive lock serializes publication; a unique staging file and
+hard-link publication prevent overwriting an existing agreement. Conflicts
+return exit 78 and preserve the old record; contention returns 75. No policy
+change API or automatic replacement exists. Legacy routes do not claim this
+record. The agreement happens before cohort act execution or pruning.
+
+The isolated shell proof passed: initial publication, agreement from a new
+process, conflicting aggregate ceiling refused and original bytes unchanged,
+with no staging-file leak. Actual private-Docker helper verification also passed
+with a compatible policy and refused a conflicting policy while still retiring
+both helpers and preserving the shared volume. Review passed.
+
+This coordinates participating callers only. It does not enroll namespaces,
+recover a deleted agreement, exclude old/nonparticipating writers, prove record
+provenance against arbitrary cache-volume writes, or establish power-loss
+persistence. Losing/replacing this record while existing servers run is not a
+supported policy transition. Production activation remains guarded. A trusted
+scheduler still needs policy discovery/bootstrap, duplicate-pass coordination,
+restart/cancellation supervision and durable reporting before rollout.
+
+Strict service all-target Clippy passed (24.65 seconds). The actual cohort
+workflow proof then passed through the new agreement path (97.45 seconds):
+a later job restored saved bytes, a distinct fresh engine restored them again,
+and a third repository namespace using the same cache key stayed isolated.
+All three owned engines retired and the private Docker daemon had no remaining
+fixture containers. These participating workflow and maintenance tests use the
+same machine policy (100 MiB repository, 200 MiB aggregate, 30-day maximum age,
+seven-day unused age, 60-second maintenance interval). This is not a production
+machine-policy migration or contention/retry throughput proof.
