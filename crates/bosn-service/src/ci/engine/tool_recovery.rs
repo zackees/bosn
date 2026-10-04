@@ -21,6 +21,12 @@ struct ReservationReport {
     root: String,
     pin: RecoveryPin,
     published: bool,
+    /// Parsed because the receipt schema is closed, but deliberately not part
+    /// of the accept predicate: an identical retry is safe because `pin`
+    /// matches the complete frozen intent, not because act2 reported the work
+    /// as already done. If a future change gives this field authority, delete
+    /// this expectation so the compiler forces the reasoning to be redone.
+    #[expect(dead_code, reason = "closed receipt schema; carries no authority")]
     reused: bool,
     partial: bool,
     #[serde(default)]
