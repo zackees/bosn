@@ -8,58 +8,50 @@ not a claim that it is already implemented. Related issue: #456.
 
 ## Current implementation status (2026-10-04)
 
-Accounting/lifecycle foundation PR #473 merged as `b23398ae`. It adds
-bounded owned-footprint diagnostics, private-storage identity/reconciliation,
-and coordinated cleanup deadlines. Actual private-Docker tests prove shared
-archive hits across jobs and successive fresh engines; they do not prove
-sustained physical-footprint convergence. No new Bosn release is claimed.
+This status is reconciled against main at
+`d24c25d676b94910ece3141788fa340ea33a8b10`. Historical evidence below records
+intermediate states; descriptions of an unmerged candidate there are not
+current rollout status. No new Bosn release is claimed.
 
-The retention candidate is in `../bosn-extern/bosn-retention`. It includes typed
-policy/arguments/import evidence and participating legacy-session leases.
-The execution path now carries a typed legacy/cohort route; production planning
-still explicitly selects legacy, and rejects configured retention.
-Production planning still refuses configured retention: warm migration, old-peer
-exclusion and durable routing are unfinished. A follow-up now wires independent
-maintenance for an already agreed cohort into normal daemon startup; default
-legacy stores are still outside that retention policy.
-Tools/images/actions/tool-install expiry and host owned-image/build-cache
-pressure control remain open; successful private-engine retirement removes
-that engine's nested containers, images and build cache. Historical entries
-below record intermediate states and must not be read as current rollout status.
+| Requirement | Implemented on main | Verification and remaining gap |
+|---|---|---|
+| Warm caches across jobs and fresh engines | Shared machine volume for act archives, runner-image tar, actions, tool installs and repository cache archives; unique tool publication stages and hidden-stage exclusion | Real private-Docker proofs establish later-job and fresh-engine hits. Shared class expiry and sustained physical ceilings remain open. |
+| Machine cache accounting | Allocated and apparent bytes for five classes, bounded per-repository detail, partial/unknown results and independent volume total | Sparse files, malformed samples, failed reader cleanup and actual cache measurement are covered. Samples are non-atomic; nested engine bytes are separate. |
+| Private containers/images/build cache | Exact owned engine/storage journal and retirement, with bounded recovery after failures/restarts | Removing a verified private engine retires its nested Docker storage. This is not host owned-image or shared builder expiry. |
+| Archive retention | Verified act2.7, typed age/byte policy, bounded maintenance reports and journaled finite-lived helpers | Actual private cohort maintenance and warm-cohort reuse pass. Default legacy planning remains outside configured retention. |
+| Idle maintenance | Normal daemon discovers an existing immutable shared policy and runs periodic maintenance without jobs; bounded latest outcome persists for diagnostics | Actual idle daemon and restart proofs pass. Absence never bootstraps defaults; policy bootstrap and production repository enrollment remain open. |
+| Warm migration | Typed legacy/cohort routes, participating lifetime leases, exclusive import, historical publication journal and sampled current inventory | Callable imports preserve warmth and recover historical publication. They do not authorize production enrollment or physical-footprint claims. |
+| Routing admission | Participating legacy wrapper rechecks routing after acquiring its shared migration lease | Real lock race proves published routing refuses a stale legacy plan. Routing publication/selection and exclusion of older nonparticipating writers remain open. |
+| Other shared classes and host pressure | Accounting and warm restore exist; unmanaged census reports host build-cache bytes | Tools, actions, shared image tar and tool-install expiry are unfinished. Host build cache is report-only in unmanaged GC; owned image and scoped builder pressure control are unfinished. |
 
-Act2 v0.2.89-act2.7 is released from
-`1a6782d5bbabb715f425cad5601b1f706fc23fa8` (merged PR #28). Exact-commit
-full CI 37190653388 and release run 37191477610 passed. The Linux x86_64
-archive SHA-256 is
-`61d640112af87278075c70cd67412ec9c44ceffd1e269e88632d50d4a83ebd27`;
+Merged implementation evidence:
+
+- Foundation [PR #473](https://github.com/zackees/bosn/pull/473):
+  `b23398ae`, owned footprint and private-storage reconciliation.
+- Retention/startup [PR #483](https://github.com/zackees/bosn/pull/483):
+  `0f9c2302bd172e5492015c18b196bac6775f6cde`, including the act2.7 pin, tool
+  publication corrections, policy discovery, current inventory and startup
+  maintenance. These changes are on main, rather than only a candidate.
+- Routing admission [PR #485](https://github.com/zackees/bosn/pull/485):
+  `d24c25d676b94910ece3141788fa340ea33a8b10`; required remote checks passed.
+
+Act2 v0.2.89-act2.7 was released from
+`1a6782d5bbabb715f425cad5601b1f706fc23fa8` (merged PR #28). Exact-commit full
+CI 37190653388 and release run 37191477610 passed. The Linux x86_64 archive
+SHA-256 is `61d640112af87278075c70cd67412ec9c44ceffd1e269e88632d50d4a83ebd27`;
 the extracted binary SHA-256 is
-`328147f59cc101aa86cc826ecb5e7b2493f74765d520d4809997b2a9c6ba56bd`.
-Published checksums match, and the isolated binary reports
-`act version 0.2.89-act2.7`. The candidate pin selects these verified bytes.
-Four pin consistency tests and the actual published audit/watch command contract
-passed; strict service all-target Clippy passed (28.59 seconds).
+`328147f59cc101aa86cc826ecb5e7b2493f74765d520d4809997b2a9c6ba56bd`. Published
+checksums and the reported version match the main pin. This release includes
+empty-cutover correction and historical publication receipts; historical receipt
+parsing alone cannot authorize enrollment.
 
-This release includes the act2.6 empty-cutover fix and historical publication
-receipts. Bosn's typed parser checks exact namespace identity, historical and
-current byte ceilings, retained-source warmth, fingerprints and bounded archive
-receipts. Four isolated boundary tests passed; parsing historical evidence
-cannot authorize enrollment. The exclusive import executor preserves partial
-publication on nonzero exits but is not yet invoked by production planning.
-A local registry journal now persists import intent and recovers historical
-publication after restart. It is not machine-wide routing or enrollment state.
-The candidate also executes bounded independent maintenance passes in durable
-finite-lived helpers and consumes typed retention outcomes. Participating cohort
-workflow engines and maintenance helpers now require the same shared policy
-record. The periodic supervisor is callable in the promotion candidate. The
-next follow-up discovers existing shared policy at normal daemon startup and
-starts that supervisor without workflow jobs. Automatic policy bootstrap and
-repository enrollment remain unfinished.
-
-The tool-cache candidate uses unique save stages and skips hidden unfinished
-stages when rehydrating fresh engines. Its actual pinned-engine shell proof
-passed, alongside deterministic concurrency and completed-install tests. These
-changes are not yet shipped on Bosn main; policy activation and storage ceilings
-remain open.
+The pending integrated follow-up combines helper registration idempotence,
+normal daemon discovery cancellation, and cancellation-safe bounded maintenance,
+inventory and migration controls. Verified slice evidence appears below; the
+combined tree requires its own exact-source gate before publication. No local
+client cancellation result establishes remote Docker rollback. Production warm
+enrollment, older-writer exclusion, shared class expiry and host image/build-cache
+retention remain open.
 
 ## Survey and evidence (2026-10-03)
 
@@ -1926,3 +1918,108 @@ the lanes themselves used the current source-bound checker and passed. Verificat
 GATE-003 accepts the attestation for the exact tree. PR #483 now carries the
 verified rebased startup head and is mergeable; remote CI is running. No merge
 or Bosn release is claimed. This stale-route follow-up requires its own gate.
+### Cleanup retries preserve the ledger without duplicate snapshots
+
+A new survey of helper accounting found that every successful re-registration
+of an already known immutable ID appended another full snapshot. Uncertain
+removal retries can repeat indefinitely. The private-Docker regression test
+reproduced 102 journal entries for a single helper after intent, first
+registration and 100 identical retries (RED, 16.76 seconds).
+
+Registration now validates identity, state and time first, then treats the
+same ID in Created state as a no-op. The original transition timestamp and
+full intent remain unchanged. A first registration and terminal removal still
+append durable events; Removed nonces remain reserved forever and conflicting
+IDs, invalid times and registration after removal still fail. This preserves
+the append-only ledger and nonce protection instead of deleting audit history.
+
+The change bounds repeated registration of one unresolved helper to its real
+transitions. It does not bound the number of distinct helper nonces or the
+whole registry, compact SQLite pages, reclaim historical audit data, or
+establish current liveness from a transition timestamp. Periodic policy
+discovery without a record still creates fresh read-only helper intents;
+that cadence and the overall accounting-history footprint remain open.
+GREEN: five registry helper tests passed (2.39 seconds), including reopen and
+terminal nonce protection; 20 service accounting/helper recovery tests passed
+(0.59 seconds, four explicit live prerequisites ignored). Registry/service
+all-target Clippy passed (29.70 seconds) and independent review passed. The
+follow-up still requires its exact-source gate before promotion.
+
+
+The helper idempotence candidate passed its exact-source gate13 before
+integration: Rust 494 seconds, Linux 567 seconds, total 1062 seconds, stamped
+`1edf29024f8b389627522fa7086663b3fd47293c` and tree
+`742947b21eebd930f8b3af174c3147a84b2bc474`. It is now integrated with merged
+routing guard main `d24c25d6`; the doc append conflict preserved both evidence
+sections. The current status table has been reconciled with merged behavior.
+This combined tree requires fresh exact-source proof before publication.
+
+
+### Verified locally: normal daemon shutdown during stalled Docker discovery
+
+A normal `Service::serve` daemon with no workflow jobs was tested against a
+synthetic Docker transport that enters the real shared-volume discovery call
+and stalls for 12 seconds. An explicit marker proves the command started before
+the client requests daemon shutdown. The assertion includes kernel runtime
+teardown, rather than only completion of the service future.
+
+The baseline failed: shutdown took **12.001524079 seconds**. CI control commands
+used `capture_async`, whose kernel implementation dispatches bounded capture to
+the runtime blocking lane. Dropping the maintenance future left that blocking
+command alive, delaying runtime teardown. Evidence:
+`retention-maintenance-shutdown-red.log` (isolated Docker).
+
+The correction uses the existing process-session streaming runner with a bounded
+event channel drained concurrently. The session owns and kills the local Docker
+client when its future is dropped, while retaining the existing deadline and
+total output ceiling. The first regression passed with shutdown in
+**113.567175 milliseconds**. The final regression passed in **113.687191 ms**,
+including a check that the captured client PID no longer exists after runtime
+teardown. The complete service suite passed **470 tests** (18 explicit live
+prerequisites ignored), and all-target Clippy passed. An initial broad run found
+a stack overflow from the larger nested session future; boxing that future fixed
+it, with both the discovery regression and the complete suite rerun successfully.
+
+This does not prove that killing a Docker client rolls back a remote create or
+stops a remote exec. Durable helper intents, exact ownership checks and recovery
+still handle uncertain remote effects. The real lost-create-ack recovery test was rerun against the private Docker
+daemon: cancellation returned in **140.777 microseconds**, the exact helper was
+recovered and removed, and the shared cache remained measurable. The whole test
+completed in **1.08 seconds**, compared with the previous 63.29-second test whose
+blocking wrapper slept for 60 seconds. This proves direct helper cancellation
+and recovery plus normal daemon discovery shutdown; normal daemon shutdown
+during a real uncertain create/exec and every other shutdown phase remain
+separate checks. Evidence: `retention-maintenance-shutdown-boxed-checks.log`,
+`retention-maintenance-shutdown-final-checks.log`, and
+`retention-maintenance-shutdown-real-recovery.log`. Publication still requires
+the exact-source local gate.
+
+
+### Cache report commands share cancellation-safe bounded controls
+
+A follow-up survey found four report-producing cache operations still bypassed
+the normal CI control runner: cohort maintenance, current inventory, import and
+publication-receipt recovery. Each used kernel blocking capture directly. Thus
+the discovery cancellation correction alone did not establish cancellation of
+a maintenance report command.
+
+A regression waits for the actual `prune-cohort` Docker client invocation to
+enter a 12-second stall, cancels its future, and includes runtime teardown in
+the latency assertion. Baseline RED was **11.999834665 seconds**. The correction
+uses one common bounded process-session control runner for all four calls,
+retaining each original deadline (30 seconds, or 90 seconds for import), its
+**64 KiB** total output ceiling, and typed nonzero/partial stdout handling.
+Ordinary controls retain their separate 1 MiB ceiling. The runner is extracted
+by responsibility from the nearly 1,000-line engine module.
+
+Focused GREEN was **593.295 microseconds**, including runtime teardown and a
+check that the exact local client PID was absent. The complete service suite passed **471 tests** (18 explicit live prerequisites
+ignored; 87.42 seconds) against the isolated private Docker daemon. The actual
+import/current-inventory/historical-receipt proof passed (11.11 seconds), and
+maintenance contention/death-release proof passed (9.01 seconds). All-target Clippy passed (47.76 seconds). The slice is independently reviewed;
+its final integrated tree still requires an exact-source gate before publication. Local client cancellation
+does not establish remote command termination or undo a published import;
+durable journals and ownership-verified recovery remain required. Production
+enrollment and shared class/image/build-cache expiry remain unfinished.
+Evidence: `retention-cache-command-cancellation-red.log` and
+`retention-cache-command-cancellation-green.log`.

@@ -188,6 +188,12 @@ impl Immediate<'_> {
         {
             return Err(Error::BadRow("cache helper registration"));
         }
+        // Recovery can observe the same immutable ID repeatedly while removal
+        // is deferred. Only an actual state transition belongs in the audit;
+        // keep its original timestamp and full nonce/identity evidence.
+        if record.state == CacheHelperState::Created {
+            return Ok(());
+        }
         record.container_id = Some(id.into());
         record.state = CacheHelperState::Created;
         record.updated_at = at;

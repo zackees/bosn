@@ -3,6 +3,9 @@ use super::{DockerActBackend, RunOptions, owned};
 use crate::ci::{cache_maintenance::CohortReport, cache_policy::CachePolicy};
 use std::time::Duration;
 
+#[cfg(all(test, unix))]
+mod cancellation_tests;
+
 #[derive(Debug)]
 pub struct MaintenanceAttempt {
     pub exit_code: i32,
@@ -37,9 +40,10 @@ impl DockerActBackend {
         args.extend(super::maintenance_lease::command());
         args.extend(policy.maintenance_pass_args());
         let output = self
-            .docker
-            .with_args(args)
-            .capture_async(RunOptions::bounded(Duration::from_secs(30), 64 * 1024))
+            .run_bounded(
+                args,
+                RunOptions::bounded(Duration::from_secs(30), 64 * 1024),
+            )
             .await
             .map_err(|e| format!("cohort maintenance outcome is unknown: {e}"))?;
         let diagnostic = String::from_utf8_lossy(&output.stderr)
