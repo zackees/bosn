@@ -1185,3 +1185,31 @@ and a successive run restored saved bytes through a distinct fresh private
 engine. These exercise artifact verification and the legacy lease wrapper in
 real runs. They establish continued warm reuse, not policy activation or
 sustained image/container/build-cache footprint convergence.
+
+### Exclusive import lifetime and truthful command transport (candidate)
+
+Bosn's import executor now uses a nonblocking exclusive FD 8 legacy-session
+lease across the actual act process. Participating live sessions refuse import
+immediately; an importer excludes participating readers until process death.
+The OS releases the lease on termination. Older peers still need independent
+exclusion, and the caller must persist intent before invoking this method.
+Production planning remains guarded.
+
+Import execution has a 90-second command deadline and a 64 KiB output bound.
+It parses stdout even on nonzero exit, preserving published-but-partial evidence
+instead of discarding it through a generic checked-command helper. Command exit
+and publication report are separate typed facts: warm acceptance requires exit
+zero plus complete valid warm publication. Transport/parsing failure leaves
+publication unresolved; it is never converted into destination absence or
+permission to blindly repeat import.
+
+Two isolated synthetic transport tests passed (0.09 seconds), including a
+nonzero exit with published/partial output and contradictory success evidence.
+The actual process lease test passed (0.55 seconds): readers coexist, import
+refuses contention, importer excludes readers, and termination releases both
+lease modes. Strict service all-target Clippy passed. Independent review found
+no blockers. These tests do not prove actual automatic migration or supervision.
+
+Act2 receipt PR #28 merged as `1a6782d5bbabb715f425cad5601b1f706fc23fa8`
+after full PR CI passed. Exact-merge full CI run 37190653388 is in progress;
+the receipt feature remains unreleased and absent from the act2.6 candidate pin.
