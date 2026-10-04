@@ -16,6 +16,7 @@ fn intent() -> CacheHelperIntent {
         image: engine_image(),
         volume: super::super::CACHE_VOLUME.into(),
         created_at: 1.0,
+        role: None,
     }
 }
 

@@ -1422,3 +1422,25 @@ a missing cohort returned a nonzero partial report with unknown byte totals,
 and Bosn retained that typed outcome. The expanded proof passed (0.96 seconds);
 strict all-target Clippy passed again (6.48 seconds). This closes command-exit
 handling for the tested missing-root case; it is not crash-supervisor coverage.
+
+### Durable maintenance helper identity (2026-10-04 candidate)
+
+The existing helper journal now accepts an explicit `maintenance_v1` role.
+Historical measurement records omit the role and keep their previous names and
+serialization. Maintenance records use a distinct name, nonce label and ownership
+scope. Recovery requires their exact pinned image, immutable container ID, isolated
+profile and single writable named-volume mount at `/bosn/cache`; accounting
+helpers still require a read-only mount at `/cache`. Unknown roles are rejected.
+The shared cache volume is not authorized for deletion by either role.
+
+Isolated Docker verification passed all four registry helper tests and the new
+service profile test. These cover historical JSON, durable role recovery after
+registry reopen, unknown role rejection, cross-role mismatch, wrong destination,
+read-only maintenance mounts and extra mounts. Independent review passed.
+
+This establishes recovery identity only. Maintenance create/start orchestration,
+offline verified act installation, finite helper lifetime and periodic/restart
+scheduling remain unfinished. Production enrollment remains guarded.
+
+Strict registry/service all-target Clippy passed (20.89 seconds), after moving
+the new test module to the end of its file to satisfy the existing lint gate.

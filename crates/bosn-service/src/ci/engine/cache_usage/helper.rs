@@ -6,12 +6,14 @@ use std::collections::BTreeMap;
 use super::{CONTROL_DEADLINE, DockerActBackend, engine_image, owned};
 
 const LABEL: &str = "io.bosn.cache.measurement";
+const MAINTENANCE_LABEL: &str = "io.bosn.cache.maintenance";
 
-pub(super) struct Identity {
+pub(in crate::ci::engine) struct Identity {
     pub name: String,
-    pub(super) nonce: String,
+    pub(in crate::ci::engine) nonce: String,
     image: String,
     ownership: BTreeMap<String, String>,
+    maintenance: bool,
 }
 
 impl Identity {
@@ -24,21 +26,34 @@ impl Identity {
             nonce,
             image: engine_image(),
             ownership: BTreeMap::new(),
+            maintenance: false,
         })
     }
 
-    pub fn label(&self) -> String {
-        format!("{LABEL}={}", self.nonce)
+    fn label_key(&self) -> &str {
+        if self.maintenance {
+            MAINTENANCE_LABEL
+        } else {
+            LABEL
+        }
     }
 
-    pub(super) fn from_intent(
+    pub fn label(&self) -> String {
+        format!("{}={}", self.label_key(), self.nonce)
+    }
+
+    pub(in crate::ci::engine) fn from_intent(
         intent: &bosn_registry::cache_helper::CacheHelperIntent,
     ) -> Result<Self, String> {
         intent.validate().map_err(|error| error.to_string())?;
         let labels = bosn_core::ResourceLabels::new(
             &intent.registry_id,
             bosn_core::ResourceKind::Container,
-            "ci-cache-measurement",
+            if intent.role.is_some() {
+                "ci-cache-maintenance"
+            } else {
+                "ci-cache-measurement"
+            },
             &intent.nonce,
             bosn_core::Scope::Spec,
             "machine",
@@ -49,6 +64,7 @@ impl Identity {
         Ok(Self {
             name: intent.name(),
             nonce: intent.nonce.clone(),
+            maintenance: intent.role.is_some(),
             image: intent.image.clone(),
             ownership: labels
                 .to_map()
@@ -57,7 +73,7 @@ impl Identity {
                 .collect(),
         })
     }
-    pub(super) fn track(
+    pub(in crate::ci::engine) fn track(
         &mut self,
         owner: &str,
         volume: &str,
@@ -68,17 +84,22 @@ impl Identity {
             image: self.image.clone(),
             volume: volume.into(),
             created_at: crate::ci::lifecycle::now_seconds(),
+            role: None,
         };
         *self = Self::from_intent(&intent)?;
         Ok(intent)
     }
-    pub(super) fn ownership_args(&self) -> Vec<String> {
+    pub(in crate::ci::engine) fn ownership_args(&self) -> Vec<String> {
         self.ownership
             .iter()
             .flat_map(|(key, value)| ["--label".into(), format!("{key}={value}")])
             .collect()
     }
-    pub(super) fn verify(&self, document: &str, volume: &str) -> Result<String, String> {
+    pub(in crate::ci::engine) fn verify(
+        &self,
+        document: &str,
+        volume: &str,
+    ) -> Result<String, String> {
         let rows: Vec<Helper> = serde_json::from_str(document)
             .map_err(|error| format!("helper inspection invalid: {error}"))?;
         let [row] = rows.as_slice() else {
@@ -89,7 +110,7 @@ impl Identity {
         };
         if !valid_id(&row.id)
             || row.name != format!("/{}", self.name)
-            || row.config.labels.get(LABEL) != Some(&self.nonce)
+            || row.config.labels.get(self.label_key()) != Some(&self.nonce)
             || row.config.image != self.image
             || self
                 .ownership
@@ -100,8 +121,13 @@ impl Identity {
             || row.host_config.network_mode != "none"
             || mount.kind != "volume"
             || mount.name != volume
-            || mount.destination != "/cache"
-            || mount.rw
+            || mount.destination
+                != if self.maintenance {
+                    "/bosn/cache"
+                } else {
+                    "/cache"
+                }
+            || mount.rw != self.maintenance
         {
             return Err("helper identity or isolation does not match its create request".into());
         }
@@ -109,7 +135,7 @@ impl Identity {
     }
 }
 
-pub(super) fn valid_id(value: &str) -> bool {
+pub(in crate::ci::engine) fn valid_id(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
@@ -149,8 +175,9 @@ struct Mount {
     rw: bool,
 }
 
+
 impl DockerActBackend {
-    pub(super) async fn recover_measurement(
+    pub(in crate::ci::engine) async fn recover_measurement(
         &self,
         identity: &Identity,
         volume: &str,
@@ -186,7 +213,10 @@ impl DockerActBackend {
         Ok(())
     }
 
-    pub(super) async fn confirm_measurement_absent(&self, id: &str) -> Result<(), String> {
+    pub(in crate::ci::engine) async fn confirm_measurement_absent(
+        &self,
+        id: &str,
+    ) -> Result<(), String> {
         let result = self
             .run(owned(&["container", "inspect", id]), CONTROL_DEADLINE)
             .await
@@ -200,5 +230,70 @@ impl DockerActBackend {
         Err(format!(
             "measurement container {id} needs cleanup; absence is unproven"
         ))
+    }
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::*;
+    use bosn_registry::cache_helper::{CacheHelperIntent, CacheHelperRole};
+
+    #[test]
+    fn maintenance_recovery_requires_its_own_nonce_scope_and_writable_mount() {
+        let mut intent = CacheHelperIntent {
+            registry_id: "11111111-2222-4333-8444-555555555555".into(),
+            nonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".into(),
+            volume: "bosn-ci-cache-v1".into(),
+            image: engine_image(),
+            created_at: 1.0,
+            role: Some(CacheHelperRole::MaintenanceV1),
+        };
+        let maintenance = Identity::from_intent(&intent).unwrap();
+        let mut labels = maintenance.ownership.clone();
+        labels.insert(maintenance.label_key().into(), maintenance.nonce.clone());
+        let mut document = serde_json::json!({
+            "Id": "1".repeat(64), "Name": format!("/{}", maintenance.name),
+            "Config": {"Image": intent.image, "Labels": labels},
+            "HostConfig": {"ReadonlyRootfs": true, "Privileged": false, "NetworkMode": "none"},
+            "Mounts": [{"Type": "volume", "Name": intent.volume, "Destination": "/bosn/cache", "RW": true}]
+        });
+        let inspect = |value: &serde_json::Value| serde_json::to_string(&vec![value]).unwrap();
+        assert!(
+            maintenance
+                .verify(&inspect(&document), &intent.volume)
+                .is_ok()
+        );
+        intent.role = None;
+        let measurement = Identity::from_intent(&intent).unwrap();
+        assert!(
+            measurement
+                .verify(&inspect(&document), &intent.volume)
+                .is_err()
+        );
+        document["Mounts"][0]["RW"] = false.into();
+        assert!(
+            maintenance
+                .verify(&inspect(&document), &intent.volume)
+                .is_err()
+        );
+        document["Mounts"][0]["RW"] = true.into();
+        document["Mounts"][0]["Destination"] = "/cache".into();
+        assert!(
+            maintenance
+                .verify(&inspect(&document), &intent.volume)
+                .is_err()
+        );
+        document["Mounts"][0]["Destination"] = "/bosn/cache".into();
+        document["Mounts"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "Type": "bind", "Name": "", "Destination": "/foreign", "RW": true
+            }));
+        assert!(
+            maintenance
+                .verify(&inspect(&document), &intent.volume)
+                .is_err()
+        );
     }
 }

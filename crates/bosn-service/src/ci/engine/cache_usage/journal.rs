@@ -5,7 +5,7 @@ use crate::{
     act_registry::{ActRegistryCommand, ActRegistryReply},
 };
 
-pub(super) struct ActiveHelper<'a> {
+pub(in crate::ci::engine) struct ActiveHelper<'a> {
     backend: &'a DockerActBackend,
     nonce: String,
 }
@@ -32,7 +32,7 @@ impl Drop for ActiveHelper<'_> {
     }
 }
 
-pub(super) struct Tracker<'a> {
+pub(in crate::ci::engine) struct Tracker<'a> {
     registry: &'a RegistryActor,
     nonce: &'a str,
 }

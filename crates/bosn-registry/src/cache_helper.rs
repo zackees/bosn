@@ -9,6 +9,12 @@ const PREFIX: &str = "ci.cache-helper.v1:";
 const RECORD_BYTES: usize = 4096;
 pub const MAX_HELPER_PAGE: usize = 64;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheHelperRole {
+    MaintenanceV1,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CacheHelperIntent {
@@ -17,11 +23,18 @@ pub struct CacheHelperIntent {
     pub volume: String,
     pub image: String,
     pub created_at: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<CacheHelperRole>,
 }
 
 impl CacheHelperIntent {
     pub fn name(&self) -> String {
-        format!("bosn-cache-measure-{}", self.nonce)
+        let role = if self.role.is_some() {
+            "maintain"
+        } else {
+            "measure"
+        };
+        format!("bosn-cache-{role}-{}", self.nonce)
     }
 
     pub fn validate(&self) -> Result<(), Error> {

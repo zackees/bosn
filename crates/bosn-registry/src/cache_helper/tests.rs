@@ -11,7 +11,46 @@ fn intent(index: usize) -> CacheHelperIntent {
         volume: "bosn-ci-cache-v1".into(),
         image: format!("docker.io/library/docker@sha256:{ID}"),
         created_at: 1.0,
+        role: None,
     }
+}
+
+#[test]
+fn helper_role_preserves_legacy_json_and_survives_restart() {
+    let legacy = intent(140);
+    let encoded = serde_json::to_string(&legacy).unwrap();
+    assert!(!encoded.contains("role"));
+    assert_eq!(
+        serde_json::from_str::<CacheHelperIntent>(&encoded).unwrap(),
+        legacy
+    );
+    let mut maintenance = legacy.clone();
+    maintenance.role = Some(CacheHelperRole::MaintenanceV1);
+    assert_ne!(maintenance.name(), legacy.name());
+    let encoded = serde_json::to_string(&maintenance).unwrap();
+    assert!(encoded.contains("maintenance_v1"));
+    assert!(
+        serde_json::from_str::<CacheHelperIntent>(
+            &encoded.replace("maintenance_v1", "unrecognized")
+        )
+        .is_err()
+    );
+    let dir = fs::TemporaryDirectory::new().unwrap();
+    let path = dir.path().join("registry.sqlite3");
+    let mut registry = Registry::create_writer(&path, OWNER).unwrap();
+    let mut tx = registry.begin_immediate().unwrap();
+    tx.begin_cache_helper(&maintenance).unwrap();
+    tx.commit().unwrap();
+    drop(registry);
+    let registry = Registry::open_read_only(&path).unwrap();
+    assert_eq!(
+        registry
+            .cache_helper(&maintenance.nonce)
+            .unwrap()
+            .unwrap()
+            .intent,
+        maintenance
+    );
 }
 
 #[test]
