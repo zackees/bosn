@@ -2,7 +2,7 @@
 #
 # Before every push, from a clean, committed tree:
 #
-#   uvx --from git+https://github.com/zackees/ci.yml@86b63937960d00655f7ef3752ef6f15b6b06f35b ci-lint local-gate run
+#   uvx --from git+https://github.com/zackees/ci.yml@527cc179200496bdc41445a2c5b91e6025b495d7 ci-lint local-gate run
 #
 # runs `run` below and, on success, stamps HEAD with a tree-bound
 # `Local-Gate:` trailer (and, with ci-attestations.yml, one `Ci-Attestation:`
@@ -76,3 +76,45 @@ mode = "enforce"
 skip = ["ci.yml:lint-no-macos-runners", "ci.yml:rust"]
 covered-by = { "ci.yml:lint-no-macos-runners" = ["guards"], "ci.yml:rust" = ["rust"] }
 surfaces = []
+
+# Exact Bosn selections and executed checks, validated by the shared checker.
+[gate.replay]
+repository = "zackees/bosn"
+workflow = "ci.yml"
+mode = "minimal"
+
+[[gate.replay.jobs]]
+source-job = "ci.yml:verify"
+key = "CI/Verify local gate"
+steps = ["Checkout source", "Checkout CI policy", "Verify the local-gate attestation and decide attested skips"]
+lanes = ["rust", "tests"]
+
+[[gate.replay.jobs]]
+source-job = "ci.yml:rust"
+key = "CI/Rust workspace (locked tests)"
+steps = ["Checkout source", "Set up Python for PyO3 tests", "Install uv for isolated compiler fixtures", "Set up Soldr", "Install native build dependencies", "Rust format and Clippy", "Verify kernal-api boundary and locked resolution", "Test Rust workspace"]
+lanes = ["rust"]
+
+[[gate.replay.jobs]]
+source-job = "ci.yml:select-tier"
+key = "CI/Select CI tier"
+steps = ["Checkout source", "Select CI tier"]
+lanes = ["tests"]
+
+[[gate.replay.jobs]]
+source-job = "ci.yml:linux"
+key = "CI/Linux (lint + unit + docker)"
+steps = ["Verify selected CI tier", "Checkout source", "Install uv", "Docker engine version", "Set up Soldr for Linux checks", "Install", "Lint", "Test (unit + docker)"]
+lanes = ["tests"]
+
+[[gate.replay.selections]]
+lane = "rust"
+job = "rust"
+event = "workflow_dispatch"
+inputs = { tier = "minimal" }
+
+[[gate.replay.selections]]
+lane = "tests"
+job = "linux"
+event = "workflow_dispatch"
+inputs = { tier = "test" }
