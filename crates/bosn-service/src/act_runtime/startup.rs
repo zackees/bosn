@@ -190,7 +190,9 @@ pub(crate) async fn retire_engine(
     let deadline = Instant::now()
         .checked_add(remaining)
         .ok_or_else(|| error("invalid recovery deadline"))?;
-    // Successful exact-name/ID lists establish absence. Inspect errors never do.
+    // A successful list cannot settle an unobserved create request: Docker
+    // may finish that request after its CLI client was killed or timed out.
+    // Keep that intent quarantined until an immutable ID can be reconciled.
     let name = intent.engine_name();
     let mut named = Vec::new();
     for filter in std::iter::once(format!("name=^/{name}$"))
@@ -230,6 +232,7 @@ pub(crate) async fn retire_engine(
         named.push(ids);
     }
     if named.iter().all(Vec::is_empty) {
+        confirm_absence(record.engine_id.as_deref())?;
         registry
             .act_registry(ActRegistryCommand::Finalize {
                 run: intent.run_id.clone(),
@@ -304,4 +307,15 @@ pub(crate) async fn retire_engine(
     )
     .await
     .map_err(|e| error(e.to_string()))
+}
+
+/// An empty lookup proves removal only after this creation was observed.
+/// No waiting period establishes that an unresolved Docker request is done.
+pub(crate) fn confirm_absence(engine_id: Option<&str>) -> std::io::Result<()> {
+    if engine_id.is_none() {
+        return Err(error(
+            "engine creation remains unresolved; retaining cleanup_required for reconciliation",
+        ));
+    }
+    Ok(())
 }
