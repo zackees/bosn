@@ -3310,8 +3310,10 @@ generation publication proceed, the current generation's exclusive reader-lock
 writer remains blocked, and failed validation releases the reader. Existing
 generation tests passed, including the race detector, in isolated Docker.
 Evidence: `.git/retention-native-admission-lock-{red,green,race}.log`.
-Primary source review passed; act2 PR #47 is open with full platform CI
-running. Release is pending: this candidate is not in act2.8 or Bosn's pin. It does not remove full payload hashing or prove concurrent wall-time
+Primary source review and full PR platform CI passed. Act2 PR #47 is merged
+as `3016b36fbb439b557b76675945b0ab33e02cc14d`; exact-default-commit checks run
+`37234469601` is running before any release. The candidate is not in act2.8 or
+Bosn's pin. It does not remove full payload hashing or prove concurrent wall-time
 improvement for 7.7 GiB trees. Production frozen selection, reader handoff,
 shared overlay, source quiescence, and automatic retention remain required.
 
@@ -3375,3 +3377,30 @@ prove arbitrary workflow process/cgroup exclusion, or authorize removal of activ
 engines. It does not apply to memory-backed private storage, which disappears
 with its engine; that mode requires a separately verified handoff while data
 still exists. Bosn still uses legacy best-effort tool saving on ordinary exits.
+
+
+### Compiler-cache survey during accounting gate32 (2026-10-04)
+
+Rust run `f8909fcd-e93a-43a4-90ec-2e656d228d59` passed in the 863-second
+pre-rebase gate. Its setup-soldr post-step explicitly reported setup-cache miss,
+target cache disabled, compiler build-cache exact hit, and Cargo-registry cache
+disabled. The exact-hit compiler archive was not saved again (`layers_saved=0/1`,
+`uploaded=0B`), despite compilation producing new cache objects in the run's
+private cache. This merits investigating how useful new objects reach the next
+fresh engine; an exact-hit immutable archive alone does not demonstrate that.
+
+The final compiler summary reported 57 hits, 7 misses, 65 compilations and one
+non-cacheable invocation. Its own provenance said `global-fallback`, originating
+workspace unknown, and missing per-session journal. Do not attribute those
+counts, the 89.1% hit rate, or estimated 63.6 seconds saved to the entire Rust
+lane: the report is last-writer-wins fallback evidence, not a complete sum of
+all compiler commands. Separate log entries include foundation misses. The
+workflow test step took 3m45.7s even with cache restoration; successful archive
+restore is not proof of efficient end-to-end execution or persistent new-cache
+publication.
+
+Evidence: `.git/retention-gate32-compiler-cache-survey.json` and the run's retained
+`log.jsonl`. No compiler-cache policy was changed by this survey. Native shared
+tool generations, compiler object sharing/coordination, and artifact archive
+cohort retention are distinct contracts and need separate accounting and
+publication evidence.
