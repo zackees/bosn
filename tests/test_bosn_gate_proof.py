@@ -2,16 +2,26 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import sys
 import unittest
 from pathlib import Path
+from typing import TypeAlias
 from unittest.mock import patch
 
-from ci import bosn_gate
+JsonValue: TypeAlias = str | int | float | bool | list["JsonValue"] | dict[str, "JsonValue"] | None
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location("bosn_gate", ROOT / "ci" / "bosn_gate.py")
+assert SPEC is not None and SPEC.loader is not None
+bosn_gate = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = bosn_gate
+SPEC.loader.exec_module(bosn_gate)
 
 
 class BosnGateProofTests(unittest.TestCase):
-    def receipt(self) -> dict[str, bosn_gate.JsonValue]:
+    def receipt(self) -> dict[str, JsonValue]:
         # Deliberately synthetic; this fixture never establishes a real gate pass.
         return {
             "schema_version": 1,
@@ -54,7 +64,7 @@ class BosnGateProofTests(unittest.TestCase):
             },
         }
 
-    def error(self, receipt: dict[str, bosn_gate.JsonValue]) -> str | None:
+    def error(self, receipt: dict[str, JsonValue]) -> str | None:
         return bosn_gate.proof_error(
             json.dumps(receipt),
             selection=bosn_gate.LINUX,
