@@ -2,7 +2,7 @@
 
 `bosn-generation` collects a stack's selected Docker context and computes a
 generation only after the caller supplies immutable image resolver receipts.
-The crate uses `kernal-api` from crates.io, pinned exactly to `=0.1.25`.
+The crate uses `kernal-api` from crates.io, pinned exactly to `=0.1.27`.
 
 ```rust
 let stack = manifest.stack("web")?;
