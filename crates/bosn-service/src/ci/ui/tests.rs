@@ -269,6 +269,61 @@ fn disabled_means_no_listener_and_grants_are_refused() {
     });
 }
 
+#[test]
+fn run_status_sse_replays_after_reconnect() {
+    with_registry(|registry, dir| async move {
+        let mut record = fake_record();
+        let store = crate::ci::store::Store::new(&dir);
+        std::fs::create_dir_all(store.run_dir(&record.id)).unwrap();
+        crate::ci::status::append(&store, &record, 1).unwrap();
+        record.state = crate::ci::RunState::Running;
+        crate::ci::status::append(&store, &record, 2).unwrap();
+        record.finish(crate::ci::Conclusion::Success, None);
+        crate::ci::status::append(&store, &record, 3).unwrap();
+        store.save_run(&record);
+        let (ci, _server, port) = listener(&dir, registry).await;
+        let cookie = sign_in(&ci, port).await;
+        let host = format!("127.0.0.1:{port}");
+        let path = format!("/v1/runs/{}/events", record.id);
+        let first = raw(port, get(port, &path, &host, Some(&cookie))).await;
+        assert_eq!(first.status, 200, "{}", first.body);
+        assert!(first.body.contains("id: 1"), "{}", first.body);
+        assert!(first.body.contains("id: 2"), "{}", first.body);
+        assert!(first.body.contains("id: 3"), "{}", first.body);
+        assert!(first.body.contains("event: status"), "{}", first.body);
+        assert!(first.body.contains("\"state\":\"done\""), "{}", first.body);
+        let reconnect = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\nCookie: {cookie}\r\nLast-Event-ID: 2\r\nConnection: close\r\n\r\n"
+        );
+        let resumed = raw(port, reconnect).await;
+        assert_eq!(resumed.status, 200);
+        assert!(resumed.body.contains("id: 3"), "{}", resumed.body);
+        assert!(!resumed.body.contains("id: 1"), "{}", resumed.body);
+        assert!(!resumed.body.contains("id: 2"), "{}", resumed.body);
+    });
+}
+
+#[test]
+fn run_status_sse_requires_a_session_and_valid_cursor() {
+    with_registry(|registry, dir| async move {
+        let (ci, _server, port) = listener(&dir, registry).await;
+        let cookie = sign_in(&ci, port).await;
+        let host = format!("127.0.0.1:{port}");
+        let events = format!("/v1/runs/{}/events", fake_record().id);
+        assert_eq!(raw(port, get(port, &events, &host, None)).await.status, 401);
+        assert_eq!(
+            raw(port, get(port, &events, &host, Some(&cookie)))
+                .await
+                .status,
+            404
+        );
+        let invalid_cursor = format!(
+            "GET {events} HTTP/1.1\r\nHost: {host}\r\nCookie: {cookie}\r\nLast-Event-ID: bad\r\nConnection: close\r\n\r\n"
+        );
+        assert_eq!(raw(port, invalid_cursor).await.status, 400);
+    });
+}
+
 /// How long a step that must happen may take before the test calls it hung.
 /// A liveness guard for a loaded machine, never a speed assertion (#412).
 const HUNG: Duration = Duration::from_secs(60);

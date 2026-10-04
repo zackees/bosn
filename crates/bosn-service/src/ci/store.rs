@@ -5,6 +5,7 @@
 //! ci/staging/<uuid>/source/   client-written snapshot awaiting submission
 //! ci/runs/<run>/run.json      durable run record (rewritten atomically)
 //! ci/runs/<run>/log.jsonl     seq-ordered log records
+//! ci/runs/<run>/status.jsonl  replayable status snapshots
 //! ci/runs/<run>/event.json    provider event payload
 //! ci/runs/<run>/source/       frozen source snapshot (kept for retry)
 //! ci/settings.json            runner settings (limit, drain)

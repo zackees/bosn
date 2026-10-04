@@ -140,20 +140,34 @@ impl CiRuntime {
             order: Vec::new(),
             clearing_cache: false,
         };
+        let writer = RecordWriter::new(store.clone());
         for mut record in store.load_runs() {
+            let interrupted = record.state != RunState::Done;
             if record.state != RunState::Done {
                 record.finish(
                     Conclusion::Error,
                     Some("interrupted: the daemon stopped during this run".into()),
                 );
-                store.save_run(&record);
             }
-            state.insert(record, 0);
+            let latest = super::status::repair_and_last(&store, &record.id)
+                .ok()
+                .flatten();
+            let bootstrap = interrupted
+                || latest.as_ref().is_none_or(|last| {
+                    !last.same_status(&super::status::StatusSnapshot::of(&record, last.seq))
+                });
+            if bootstrap {
+                writer.write(&Save {
+                    record: record.clone(),
+                    version: 1,
+                });
+            }
+            state.insert(record, u64::from(bootstrap));
         }
         let (kick, mut kicked) = async_engine::channel(64);
         let runtime = Self {
             state_dir: state_dir.to_path_buf(),
-            writer: RecordWriter::new(store.clone()),
+            writer,
             store,
             state: Arc::new(Mutex::new(state)),
             kick,
@@ -277,6 +291,17 @@ impl CiRuntime {
     /// The live run feed (lossy; see [`super::events`]).
     pub fn feed(&self) -> &Feed {
         &self.feed
+    }
+
+    pub(crate) fn status_store(&self) -> Store {
+        self.store.clone()
+    }
+
+    pub(crate) async fn reconcile_status(&self, run: String) -> std::io::Result<(bool, RunState)> {
+        let writer = self.writer.clone();
+        async_engine::launch_blocking(move || writer.ensure_status(&run))
+            .await
+            .map_err(std::io::Error::other)?
     }
 
     pub(crate) fn record(&self, run: &str) -> Result<RunRecord, CiError> {
