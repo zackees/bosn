@@ -2282,3 +2282,115 @@ Activation is not implemented. Required acceptance remains actual later-job and
 fresh-engine warmth, private mutation isolation, generation durability/replay,
 concurrent publisher/reader/GC safety, exact retirement and sustained logical
 and physical ceilings. The original broad shared-cache/expiry goal remains open.
+
+
+### Engine-owned reader descriptor: actual init-chain experiment (2026-10-04)
+
+The reader-contract follow-up is merged in [Bosn PR #488](https://github.com/zackees/bosn/pull/488)
+at `5fb7adbd74ccf964ba966156636f72773df4956a`. Its exact-source local gate
+passed in 605 seconds (Rust 304 seconds; Linux Docker tests 301 seconds),
+and required remote checks passed. [Act2 PR #31](https://github.com/zackees/act2/pull/31)
+is merged at `adefc9f75bfbb789ac54aa18bd1546bcf6cc04d1`; the exact-merge
+[full CI run](https://github.com/zackees/act2/actions/runs/37215686314) passed. No release or Bosn pin update is claimed for that merge.
+
+A new private-Docker experiment tests the engine-owned descriptor approach
+through the actual current `ENGINE_INIT` body, then `docker-init`, then
+`dockerd`. It uses the already cached pinned Docker image, a read-only root,
+private cgroup namespace, Unix-only daemon socket, bounded private tmpfs storage,
+and a read-only volume containing a generation produced by the current act2 CLI.
+A private launching client is killed after readiness; the engine remains alive.
+
+- Negative control: without a held descriptor, an exclusive writer obtains the
+  generation reader lock while the engine runs, before and after client death.
+- With `exec 5</lower/.readers-v1.bolt` and `flock -s -n 5` before the unchanged
+  init body, exclusive writers are refused while the engine runs, including
+  after client death. `/proc/1/fd/5` still names the generation reader file.
+- After stopping that exact engine and verifying it is no longer running,
+  an exclusive writer obtains the lock. Both experiment engines and their
+  labelled volume are removed after exact ownership checks.
+- Engine readiness was 0.529 seconds for the control and 0.409 seconds for the
+  protected engine. These tiny-fixture timings do not measure admission costs
+  for the 7.7 GiB production tool cache.
+
+Evidence artifacts in the task's private git directory:
+`retention-engine-owned-reader-experiment.py`, `.log`, and `.json`. Run key:
+`157021de141146fb9399ff225d5141dc`; generation:
+`5b50ccf627083156cc21a7c740d94d3a0e8b177991c0c1c78dcf878721e3a07e`;
+unchanged base-init SHA-256:
+`e269505630ad33e94fcf314157a7f6376c32f73a538275f0b4b76616b1ac54b3`.
+The small source/object fixture remains inside the private Go container's
+`/tmp` filesystem; no shared cache or host daemon was pruned or stopped.
+
+**Scope:** this proves descriptor inheritance through the real init chain and
+release on engine stop. It does not exercise an actual Bosn daemon crash,
+catalog-coordinated admission, production generation selection, or retirement.
+The generation and its reader file were transferred into a private experiment
+volume; this is not proof of mutex identity between that volume and the original
+publisher store. Production must retain the same published reader inode,
+acquire catalog protection before generation protection, and validate the closed
+generation before any mount. A raw shell lock alone is insufficient admission.
+The shell prototype would require FD 5 to be reserved in the frozen engine
+command/profile and verified during recovery. The native handoff below instead
+preserves its dynamically allocated original descriptor; production must freeze
+that policy and observe the actual descriptor and inode during recovery. The existing daemon-only reader API is still insufficient for a
+surviving engine. Engine admission, mounting, coordinated expiry, and efficient
+large-cache admission remain implementation work.
+
+
+### Native admission and exec handoff (implemented candidate, 2026-10-04)
+
+[Act2 PR #32](https://github.com/zackees/act2/pull/32), candidate
+`7fd5beef176674b7f71f5bcfc062c5ad1b118897`, adds:
+
+```sh
+act cache tool-exec --cache-server-path STORE --generation ID \
+  --max-bytes POSITIVE --apply -- COMMAND ARGS...
+```
+
+`ExecWithToolGeneration` is Linux-only and intended for a dedicated engine-init
+process. It validates the closed generation under the catalog writer lock,
+then opens the original bounded regular reader file with bbolt's shared lock
+before releasing catalog protection. It clears close-on-exec on that exact
+original descriptor and replaces its process, reporting the dynamic descriptor
+number in `BOSN_TOOL_GENERATION_LEASE_FD`. It does not force a fixed FD number or
+close/reopen the mutex. Failed exec restores descriptor flags and releases the
+reader. The command must keep the descriptor open throughout engine lifetime;
+the generation is still only a read-only overlay lower, never a writable mount.
+
+The focused regression was RED because the API was missing, then GREEN: the
+same original-store bbolt writer remains blocked across exec and succeeds after
+the replaced process exits. Malformed argv, canceled admission and failed exec
+also release the reader. Final exact-source scoped gate passed in 18.73 seconds:
+2,552 exported files matched private Docker source bytes/modes before and after
+full artifactcache tests (14.542 seconds), focused tool commands, vet/lint with
+zero findings, and Darwin/Windows unsupported-stub compilation. Cumulative
+independent review passed. These checks do not replace full act2 release CI.
+
+A second actual-init experiment runs the native CLI as engine PID 1 before it
+execs the unchanged init chain. Publication and admission use **the same labelled
+volume**, with read-only admission attachment; no published mutex is reconstructed
+for admission. Control allows writers while alive. Native admission blocks writers
+before and after killing the launching client, then releases the lock after the
+exact engine stops. PID 1 retains original reader descriptor 7 in this run.
+Readiness was 0.428 seconds for the control and 0.381 seconds for the native
+protected engine, with an eight-byte fixture. Both owned engines and the volume
+were removed after label checks. Run `80d4509034074495abc87218ad2f56c5`;
+generation `241e5b4bbdcc223b5f5cb38e55bb533eed89b592034a8ce78390ca6faa16f5c4`.
+Artifacts: `retention-engine-native-reader-experiment.py`, `.json`, `.log`;
+`act2-tool-generation-exec-red.log`, `-green.log`, and
+`act2-generation-exec-source-bound-gate.json`/`.log`, in the task's private git
+directory. This verifies init handoff, not an actual Bosn daemon-crash path.
+
+Two prior archive-transfer fixtures were refused by canonical payload validation
+and their exact engines/volumes cleaned up. Ordinary tar transfer cannot be assumed
+to preserve a generation manifest's metadata. Validation was not weakened; the
+passing experiment publishes and admits on the same volume. A later diagnostic
+accidentally auto-created an empty replacement private volume after cleanup; that
+exact replacement was inspected and removed. No shared cache was pruned.
+
+**Still open:** PR #32 is not released or activated in Bosn. The production frozen
+profile must reference a selected generation and the native handoff policy;
+recovery must verify its mount and live original-inode holder. Coordinated current
+selection, actual overlay mounting, completed-install publication with writer
+exclusion, efficient admission of the 7.7 GiB cache, generation/object expiry,
+physical accounting and image/container/scoped build-cache expiry remain required.
