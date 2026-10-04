@@ -1178,3 +1178,10 @@ This parser is prepared for act2 PR #28 and is not invoked against act2.6,
 which does not include the receipt command. Independent review found no blockers.
 Issue #456 now records merged accounting work and exact dependency release
 evidence while leaving the full acceptance criteria open.
+
+The actual private-Docker workflow tests also passed with the verified act2.6
+pin (2 tests, 140.91 seconds): a later job restored an earlier job's archive,
+and a successive run restored saved bytes through a distinct fresh private
+engine. These exercise artifact verification and the legacy lease wrapper in
+real runs. They establish continued warm reuse, not policy activation or
+sustained image/container/build-cache footprint convergence.
