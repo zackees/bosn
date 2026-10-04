@@ -58,23 +58,38 @@ workspace.virtualScreenGeometryChanged.connect(placeAll);
 // it is an empty, compositor-owned script object used only for readiness.
 const marker = "bosn-widget-corner-ready-v1";
 let pulsePending = false;
+let pendingTicks = 0;
 const health = new QTimer();
 health.interval = 500;
+function reportReadiness(reason) {
+    console.warn("bosn-widget-corner readiness: " + reason + "; run bosn widget install to reload the owned placement script");
+}
+function stopReadiness(reason) {
+    reportReadiness(reason);
+    health.stop();
+}
 health.timeout.connect(function () {
-    if (pulsePending) return;
+    if (pulsePending) {
+        // KWin omits the callback on D-Bus errors. Report once per pending
+        // request, without overlapping it or changing click-time deadlines.
+        pendingTicks++;
+        if (pendingTicks === 4) reportReadiness("D-Bus callback pending");
+        return;
+    }
     try { placeAll(); } catch (error) {
-        health.stop();
+        stopReadiness("geometry readback rejected");
         callDBus("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "unloadScript", marker);
         return;
     }
     pulsePending = true;
+    pendingTicks = 0;
     // Script restarts can leave the empty marker loaded. Query compositor state
     // each time; a local toggle also races KWin's deferred script destruction.
     callDBus("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "isScriptLoaded", marker, function (present) {
-        if (typeof present !== "boolean") { health.stop(); return; }
+        if (typeof present !== "boolean") { stopReadiness("invalid marker query reply"); return; }
         function complete(result) {
             const accepted = present ? result === true : typeof result === "number" && result >= 0;
-            if (!accepted) { health.stop(); return; }
+            if (!accepted) { stopReadiness(present ? "marker removal rejected" : "marker creation rejected"); return; }
             pulsePending = false;
         }
         if (present) {

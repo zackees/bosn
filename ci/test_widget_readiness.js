@@ -13,6 +13,7 @@ function verify(initialMarker, mode = 'ordinary') {
     const transitions = [];
     let pendingDelete = false;
     let mutations = 0;
+    const warnings = [];
     function QTimer() {
         timer = this;
         this.timeout = signal();
@@ -48,8 +49,9 @@ function verify(initialMarker, mode = 'ordinary') {
         windowList: () => [], windowAdded: signal(), windowRemoved: signal(),
         screensChanged: signal(), virtualScreenGeometryChanged: signal()
     };
-    vm.runInNewContext(script, {QTimer, callDBus, workspace, KWin: {MaximizeArea: 1}});
-    for (let tick = 0; tick < 3 && !timer.stopped; tick++) {
+    vm.runInNewContext(script, {QTimer, callDBus, workspace, console: {warn: message => warnings.push(message)}, KWin: {MaximizeArea: 1}});
+    const ticks = mode === 'missing-callback' ? 12 : 3;
+    for (let tick = 0; tick < ticks && !timer.stopped; tick++) {
         // KWin unloadScript schedules deleteLater; completion is not removal.
         if (tick === 2 && pendingDelete) { present = false; transitions.push(present); }
         timer.timeout.emit();
@@ -58,14 +60,19 @@ function verify(initialMarker, mode = 'ordinary') {
         assert.equal(timer.stopped, true, 'invalid compositor replies must fail closed');
         assert.deepEqual(transitions, []);
         assert.equal(mutations, mode === 'invalid-query' ? 0 : 1);
+        assert.equal(warnings.length, 1, 'failure must emit one actionable diagnostic');
+        assert.match(warnings[0], /bosn widget install/);
         return;
     }
     if (mode === 'missing-callback') {
         assert.equal(mutations, 0, 'pending requests must not manufacture readiness transitions');
         assert.deepEqual(transitions, []);
+        assert.equal(warnings.length, 1, 'a missing callback must produce a bounded diagnostic');
+        assert.match(warnings[0], /pending.*bosn widget install/);
         return;
     }
     assert.equal(timer.stopped, undefined, 'existing readiness marker must not permanently stop the placement script');
+    assert.deepEqual(warnings, [], 'healthy readiness stays quiet');
     assert.deepEqual(transitions, mode === 'deferred-delete' ? [false, true] : initialMarker ? [false, true, false] : [true, false, true]);
 }
 verify(false);
