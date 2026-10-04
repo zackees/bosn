@@ -37,5 +37,8 @@ ul { list-style: none; margin: 0; padding: 0; }
 .tree .steps { margin-left: 22px; }
 pre#log { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px;
           max-height: 55vh; overflow: auto; white-space: pre-wrap; font: 12px/1.4 ui-monospace, monospace; }
+.log-line.stderr { color: var(--fail); }
+.log-line.bosn { color: var(--muted); }
+.log-channel { font-weight: 700; }
 .failure-box { border-left: 3px solid var(--fail); padding: 4px 10px; margin: 8px 0; }
 button.confirming { border-color: var(--fail); color: var(--fail); }
