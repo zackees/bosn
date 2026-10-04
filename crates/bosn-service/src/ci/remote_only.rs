@@ -162,13 +162,14 @@ pub fn reason(job: &Job) -> Option<String> {
             text
         });
     }
-    let registered =
-        job.steps
-            .iter()
-            .find_map(|step| match classify(step.uses.as_deref()?, &step.with) {
-                StepClass::Confined(why) => Some(why),
-                StepClass::Local | StepClass::Stubbed => None,
-            });
+    let registered = job
+        .steps
+        .iter()
+        .filter(|step| !inactive(step.condition.as_ref(), None))
+        .find_map(|step| match classify(step.uses.as_deref()?, &step.with) {
+            StepClass::Confined(why) => Some(why),
+            StepClass::Local | StepClass::Stubbed => None,
+        });
     if registered.is_some() {
         return registered;
     }
@@ -180,6 +181,96 @@ pub fn reason(job: &Job) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Only literal false and exact repository comparisons are decidable here.
+/// Unknown expressions remain remote-only; this is not an expression evaluator.
+fn inactive(condition: Option<&Value>, repository: Option<&str>) -> bool {
+    let Some(condition) = condition else {
+        return false;
+    };
+    if condition == &Value::Bool(false) {
+        return true;
+    }
+    let Some(text) = condition.as_str() else {
+        return false;
+    };
+    let text = text.trim();
+    let expression = text
+        .strip_prefix("${{")
+        .and_then(|s| s.strip_suffix("}}"))
+        .unwrap_or(text)
+        .trim();
+    if expression == "false" {
+        return true;
+    }
+    let Some(repository) = repository else {
+        return false;
+    };
+    let Some(comparison) = expression.strip_prefix("github.repository") else {
+        return false;
+    };
+    let comparison = comparison.trim_start();
+    let (literal, equal) = if let Some(value) = comparison.strip_prefix("==") {
+        (value, true)
+    } else if let Some(value) = comparison.strip_prefix("!=") {
+        (value, false)
+    } else {
+        return false;
+    };
+    let Some(literal) = literal
+        .trim()
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+    else {
+        return false;
+    };
+    let Some((owner, name)) = literal.split_once('/') else {
+        return false;
+    };
+    let valid = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    };
+    if !valid(owner) || !valid(name) {
+        return false;
+    }
+    repository.eq_ignore_ascii_case(literal) != equal
+}
+
+/// Materialize proven-false remote step guards in the overlay so the runner
+/// and context-free coverage classifier agree. The original workflow is intact.
+pub fn freeze_inactive_steps(document: &mut Value, repository: &str) -> usize {
+    let Some(jobs) = document.get_mut("jobs").and_then(Value::as_mapping_mut) else {
+        return 0;
+    };
+    let mut count = 0;
+    for job in jobs.values_mut() {
+        let Some(steps) = job.get_mut("steps").and_then(Value::as_sequence_mut) else {
+            continue;
+        };
+        for value in steps {
+            let Ok(step) = serde_yaml::from_value::<super::workflow::Step>(value.clone()) else {
+                continue;
+            };
+            let Some(uses) = step.uses.as_deref() else {
+                continue;
+            };
+            if matches!(classify(uses, &step.with), StepClass::Confined(_))
+                && inactive(step.condition.as_ref(), Some(repository))
+                && step.condition != Some(Value::Bool(false))
+            {
+                value
+                    .as_mapping_mut()
+                    .unwrap()
+                    .insert("if".into(), Value::Bool(false));
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 /// In a workflow document, replace every remote-only job (one with
@@ -238,6 +329,72 @@ mod tests {
 
     fn job(yaml: &str) -> Job {
         serde_yaml::from_str(yaml).unwrap()
+    }
+
+    #[test]
+    fn inactive_registered_steps_leave_the_test_job_runnable() {
+        assert_eq!(reason(&job("steps:\n  - run: go test ./...\n  - uses: codecov/codecov-action@v5\n    if: false\n")), None);
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("checks.yml");
+        let output = root.path().join("localized.yml");
+        std::fs::write(&source, "jobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: go test ./...\n      - uses: codecov/codecov-action@v5\n        if: github.repository == 'nektos/act'\n").unwrap();
+        let mut changes = super::super::checkout::Localized::default();
+        super::super::checkout::localize(&source, &output, "zackees/act2", &mut changes).unwrap();
+        assert!(changes.remote_only.is_empty());
+        let document: Value =
+            serde_yaml::from_str(&std::fs::read_to_string(output).unwrap()).unwrap();
+        let test: Job = serde_yaml::from_value(document["jobs"]["test"].clone()).unwrap();
+        assert_eq!(reason(&test), None);
+        assert_eq!(
+            super::super::flush::untrap(test.steps[0].run.as_deref().unwrap()),
+            "go test ./..."
+        );
+        assert_eq!(changes.inactive_remote_steps, 1);
+        assert_eq!(test.steps[1].condition, Some(Value::Bool(false)));
+    }
+
+    #[test]
+    fn repository_guards_are_narrow_and_unknown_guards_fail_closed() {
+        for condition in [
+            "false",
+            "${{ false }}",
+            "github.repository == 'nektos/act'",
+            "${{ github.repository != 'ZACKEES/ACT2' }}",
+        ] {
+            assert!(
+                inactive(Some(&Value::String(condition.into())), Some("zackees/act2")),
+                "{condition}"
+            );
+        }
+        for condition in [
+            "true",
+            "github.repository == 'ZACKEES/ACT2'",
+            "github.repository != 'nektos/act'",
+            "github.repository == 'nektos/act' || true",
+            "github.repository == inputs.repository",
+            "github.repository == 'a/b/c'",
+            "github.repository == ''",
+            "!false",
+            "${{ false }} || true",
+            "github.repository == 'nektos/act''",
+            "contains(github.repository, 'act')",
+        ] {
+            assert!(
+                !inactive(Some(&Value::String(condition.into())), Some("zackees/act2")),
+                "{condition}"
+            );
+        }
+        assert!(!inactive(
+            Some(&Value::String("github.repository == 'nektos/act'".into())),
+            None
+        ));
+        for yaml in [
+            "env: {CI_REMOTE_ONLY: declared}\nsteps: [{uses: codecov/codecov-action@v5, if: false}]",
+            "permissions: {id-token: write}\nsteps: [{uses: codecov/codecov-action@v5, if: false}]",
+            "steps: [{uses: codecov/codecov-action@v5, if: 'inputs.enabled'}]",
+        ] {
+            assert!(reason(&job(yaml)).is_some(), "{yaml}");
+        }
     }
 
     #[test]

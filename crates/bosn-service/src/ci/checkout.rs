@@ -43,6 +43,8 @@ use serde_yaml::{Mapping, Value};
 /// What the rewrite did to a run's workflows.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Localized {
+    /// Registered remote steps proven inactive for the frozen repository.
+    pub inactive_remote_steps: usize,
     /// Own-repository checkout steps now served from the frozen snapshot.
     pub own: usize,
     /// `owner/name@commit` of each pinned checkout of another repository,
@@ -115,6 +117,8 @@ pub fn localize(
     localize_document(&mut document, repository, &mut changes);
     // Stub first: a job left with nothing GitHub-only is not confined.
     changes.pages_stubbed = super::pages::stub_configure_pages(&mut document, repository);
+    changes.inactive_remote_steps =
+        super::remote_only::freeze_inactive_steps(&mut document, repository);
     changes.remote_only = super::remote_only::confine(&mut document);
     changes.runner_gated = super::matrix_runner::gate(&mut document);
     changes.trapped = super::flush::add_traps(&mut document);
@@ -127,6 +131,7 @@ pub fn localize(
         std::fs::write(out, rewritten)?;
     }
     localized.own += changes.own;
+    localized.inactive_remote_steps += changes.inactive_remote_steps;
     localized.pinned.extend(changes.pinned);
     localized.trapped += changes.trapped;
     localized.remote_only.extend(changes.remote_only);
@@ -380,12 +385,10 @@ mod tests {
             format!("actions/checkout zackees/ci.yml@{PIN}"),
             "an unnamed step is named after what it fetches"
         );
-        assert!(
-            steps[1]["run"]
-                .as_str()
-                .unwrap()
-                .contains("dest=\"$GITHUB_WORKSPACE\"\n")
-        );
+        assert!(steps[1]["run"]
+            .as_str()
+            .unwrap()
+            .contains("dest=\"$GITHUB_WORKSPACE\"\n"));
     }
 
     #[test]

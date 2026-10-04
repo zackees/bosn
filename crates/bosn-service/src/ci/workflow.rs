@@ -57,6 +57,8 @@ pub enum Permissions {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct Step {
+    #[serde(rename = "if")]
+    pub condition: Option<serde_yaml::Value>,
     pub id: Option<String>,
     pub name: Option<String>,
     pub uses: Option<String>,
