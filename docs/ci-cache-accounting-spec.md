@@ -3259,7 +3259,7 @@ include `docker exec` client overhead; they are wall time, not CPU time.
 | Publish closed object | 6.985 | Published, complete |
 | Assemble and initialize selected generation | 2.217 | Selected, complete |
 | Validate current selection, three warm runs | 0.926 / 0.881 / 1.082 | Same generation ID |
-| Acquire reader and exec, three warm runs | 0.876 / 0.832 / 1.237 | Inherited reader descriptor reported |
+| Acquire reader and exec, three warm runs | 0.876 / 0.832 / 1.237 | Reader descriptor environment value verified |
 
 The explicit bounded metadata audit visited 19 paths and 18 unique inodes,
 reported 1,073,790,976 allocated bytes and 2,147,517,791 referenced file bytes,
