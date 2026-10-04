@@ -7,7 +7,7 @@ use serde_json::{Map, Value, json};
 
 use super::{
     CancelReply, CiRequest, ErrorReply, ListReply, LogsReply, Plan, RunReport, RunView,
-    RunnersReply, SubmitReply, UiGrantReply, WidgetReply, events::RunEvent,
+    RunnersReply, SubmitReply, UiGrantReply, WidgetReply, events::RunEvent, status::StatusSnapshot,
 };
 
 fn sub<T: JsonSchema>(generator: &mut SchemaGenerator) -> Value {
@@ -33,18 +33,20 @@ pub fn document() -> Value {
     });
     let request = sub::<CiRequest>(&mut generator);
     let event = sub::<RunEvent>(&mut generator);
+    let status_event = sub::<StatusSnapshot>(&mut generator);
     let error = sub::<ErrorReply>(&mut generator);
     let definitions: Map<String, Value> = generator.take_definitions(true).into_iter().collect();
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "bosn ci",
-        "description": "Requests (`bosn ci`, MCP `bosn_ci_*`, the dashboard API), their typed replies, the live event and the error document. `--json` CLI output is the reply of the matching operation.",
+        "description": "Requests (`bosn ci`, MCP `bosn_ci_*`, the dashboard API), their typed replies, live events, and the error document. `--json` CLI output is the reply of the matching operation.",
         "x-schema-version": super::SCHEMA_VERSION,
         "type": "object",
         "properties": {
             "request": request,
             "replies": {"type": "object", "properties": replies},
             "event": event,
+            "status_event": status_event,
             "error": error,
         },
         "$defs": definitions,
@@ -92,6 +94,7 @@ mod tests {
             "Section",
             "Conclusion",
             "LogRecord",
+            "StatusSnapshot",
         ] {
             assert!(definitions.contains_key(name), "{name}");
         }

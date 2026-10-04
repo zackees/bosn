@@ -1884,6 +1884,47 @@
       ],
       "type": "object"
     },
+    "StatusSnapshot": {
+      "properties": {
+        "conclusion": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Conclusion"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "log_records": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "run": {
+          "type": "string"
+        },
+        "seq": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "state": {
+          "$ref": "#/$defs/RunState"
+        },
+        "tree": {
+          "$ref": "#/$defs/RunTree"
+        }
+      },
+      "required": [
+        "seq",
+        "run",
+        "state",
+        "log_records",
+        "tree"
+      ],
+      "type": "object"
+    },
     "SubmitReply": {
       "properties": {
         "coalesced": {
@@ -2179,7 +2220,7 @@
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "Requests (`bosn ci`, MCP `bosn_ci_*`, the dashboard API), their typed replies, the live event and the error document. `--json` CLI output is the reply of the matching operation.",
+  "description": "Requests (`bosn ci`, MCP `bosn_ci_*`, the dashboard API), their typed replies, live events, and the error document. `--json` CLI output is the reply of the matching operation.",
   "properties": {
     "error": {
       "$ref": "#/$defs/ErrorReply"
@@ -2227,6 +2268,9 @@
     },
     "request": {
       "$ref": "#/$defs/CiRequest"
+    },
+    "status_event": {
+      "$ref": "#/$defs/StatusSnapshot"
     }
   },
   "title": "bosn ci",

@@ -48,6 +48,7 @@ async function refreshList() {
 
 function select(run) {
   selected = run;
+  connectRun(run);
   history.replaceState(null, "", `/ci/runs/${run}`);
   refreshList().catch(() => {});
   showRun().catch((e) => $("detail").replaceChildren(el("p", { class: "hint" }, e.message)));
@@ -56,6 +57,12 @@ function select(run) {
 async function showRun() {
   if (!selected) return;
   const run = await api(`/v1/runs/${selected}`);
+  if (run.id === selected && run.state === "done") {
+    runFinished = true;
+    if (runSource) runSource.close();
+    if (runRetry) clearTimeout(runRetry);
+    runRetry = null;
+  }
   const report = run.state === "done" ? await api(`/v1/runs/${selected}/report?tail=40`) : null;
   const parts = [
     el("h2", {}, `Run ${run.id}`),
@@ -136,6 +143,51 @@ function connect() {
   source.onerror = () => { source.close(); setTimeout(connect, 2000); };
 }
 
+// A selected run replays saved status changes after a dropped connection.
+let runSource = null;
+let runCursor = 0;
+let runRetry = null;
+let runFinished = false;
+function connectRun(run) {
+  if (runSource) runSource.close();
+  if (runRetry) clearTimeout(runRetry);
+  runRetry = null;
+  runCursor = 0;
+  runFinished = false;
+  openRunSource(run);
+}
+function openRunSource(run) {
+  if (selected !== run || runFinished) return;
+  const source = new EventSource(`/v1/runs/${run}/events?from_seq=${runCursor}`);
+  runSource = source;
+  source.addEventListener("status", (message) => {
+    if (selected !== run) { source.close(); return; }
+    const event = JSON.parse(message.data);
+    runCursor = event.seq;
+    schedule();
+    if (event.state === "done") {
+      runFinished = true;
+      source.close();
+    }
+  });
+  source.onerror = async () => {
+    if (runSource !== source) return;
+    source.close();
+    if (selected !== run || runFinished) return;
+    try {
+      const snapshot = await api(`/v1/runs/${run}`);
+      if (snapshot.state === "done") {
+        runFinished = true;
+        schedule();
+        return;
+      }
+    } catch (_) { /* Retry after transient network errors. */ }
+    if (runSource === source && selected === run && !runFinished) {
+      runRetry = setTimeout(() => { runRetry = null; openRunSource(run); }, 2000);
+    }
+  };
+}
+
 $("drain").addEventListener("click", () => post("/v1/runners", { action: "drain" }).then(refreshList));
 $("resume").addEventListener("click", () => post("/v1/runners", { action: "resume" }).then(refreshList));
 $("set-limit").addEventListener("click", () => {
@@ -151,4 +203,5 @@ $("clear-cache-slot").replaceChildren(confirmButton("Clear cache",
   () => post("/v1/runners", { action: "clear_cache" }), showCache));
 
 refreshList().then(() => selected && showRun()).catch(() => {});
+if (selected) connectRun(selected);
 connect();

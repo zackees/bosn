@@ -76,8 +76,8 @@ within 4 seconds to confirm.
   rebinding.
 - Every write must carry the listener's `Origin`, which defends against CSRF.
   A write with no `Origin` is refused.
-- Every `/v1` route is one of the typed CI operations above; the listener can
-  do nothing the daemon socket cannot.
+- Snapshot and control `/v1` routes use the typed CI operations above. The
+  SSE routes expose those run states with the same session and Host checks.
 - The page, script and stylesheet are compiled into the binary. They load no
   CDN, fonts or analytics, so the dashboard works with no network beyond
   loopback.
@@ -85,6 +85,13 @@ within 4 seconds to confirm.
 The live feed (`/v1/events`, server-sent events) is lossy: a reader that falls
 behind is sent `resync` and refetches. A slow browser never delays the daemon
 or other readers.
+
+`GET /v1/runs/{id}/events` replays saved status snapshots for one run and
+then follows new ones. Its SSE `id`, `Last-Event-ID`, and optional `from_seq`
+query use a per-run status cursor. Each event's `log_records` field points to
+the corresponding position in the separate log cursor. Status changes that
+are superseded before persistence may be coalesced; the terminal state is
+reconciled from the saved run record.
 
 ## Schema
 
@@ -94,6 +101,7 @@ contract:
 - every request;
 - each operation's reply (`--json` output and MCP structured content);
 - the live event;
+- the per-run status event;
 - the error document.
 
 It is derived from the typed Rust definitions, and a unit test fails when the

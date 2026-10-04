@@ -1,6 +1,6 @@
 //! The UI listener's routes, parsed eagerly into a closed `Route`. Every API
-//! route *is* a typed [`CiRequest`]: there is no other dispatch path, so the
-//! listener can do nothing the daemon socket cannot.
+//! snapshot and control routes are typed [`CiRequest`]s. The two SSE routes
+//! expose the same run state, under the same session and Host checks.
 
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
@@ -15,6 +15,8 @@ pub enum Route {
     Redeem { token: String, next: String },
     /// The live feed (`GET /v1/events`, server-sent events).
     Events,
+    /// One run's durable status feed (`GET /v1/runs/{id}/events`).
+    RunEvents { run: String, from_seq: Option<u64> },
     /// One typed CI operation.
     Api(Box<CiRequest>),
 }
@@ -100,6 +102,13 @@ impl Route {
                 }
             }
             (["v1", "events"], true, _) => Route::Events,
+            (["v1", "runs", run, "events"], true, _) => {
+                let q: EventsQuery = typed_query(query)?;
+                Route::RunEvents {
+                    run: run_id(run)?,
+                    from_seq: q.from_seq,
+                }
+            }
             (["v1", "runs"], true, _) => {
                 let q: ListQuery = typed_query(query)?;
                 Route::api(CiRequest::List {
@@ -161,7 +170,12 @@ impl Route {
                 | ["v1", "events"]
                 | ["v1", "runs"]
                 | ["v1", "runs", _]
-                | ["v1", "runs", _, "logs" | "report" | "cancel" | "retry"]
+                | [
+                    "v1",
+                    "runs",
+                    _,
+                    "logs" | "events" | "report" | "cancel" | "retry",
+                ]
                 | ["v1", "runners"],
                 _,
                 _,
@@ -240,6 +254,12 @@ struct LogsQuery {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct EventsQuery {
+    from_seq: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReportQuery {
     tail: Option<usize>,
 }
@@ -286,17 +306,27 @@ mod tests {
         Route::parse(method, path, &query, body.as_bytes())
     }
 
-    /// Table-driven: every route maps to exactly one typed operation; a new
-    /// path cannot appear without changing this table.
+    /// Table-driven: every route maps to one closed variant; a new path
+    /// cannot appear without changing this table.
     #[test]
     #[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
-    fn every_route_is_a_typed_operation() {
+    fn every_route_is_closed_and_typed() {
         let runs = format!("/v1/runs/{RUN}");
         type Case<'a> = (&'a str, String, Vec<(&'a str, &'a str)>, &'a str, Route);
         let table: Vec<Case> = vec![
             ("GET", "/".into(), vec![], "", Route::Page),
             ("GET", format!("/ci/runs/{RUN}"), vec![], "", Route::Page),
             ("GET", "/v1/events".into(), vec![], "", Route::Events),
+            (
+                "GET",
+                format!("{runs}/events"),
+                vec![("from_seq", "2")],
+                "",
+                Route::RunEvents {
+                    run: RUN.into(),
+                    from_seq: Some(2),
+                },
+            ),
             (
                 "GET",
                 "/v1/runs".into(),

@@ -1,11 +1,12 @@
 //! The daemon's opt-in UI listener (`[ui] enabled = true`): the run dashboard,
 //! the typed `/v1` API and a live server-sent-event feed, on `127.0.0.1`
 //! only. See [`auth`] for the grant/cookie/Host/Origin rules and [`routes`]
-//! for the closed route set (every API route is a typed CI request).
+//! for the closed route set (snapshot and control routes are typed requests).
 
 pub mod auth;
 mod page;
 pub mod routes;
+mod status_sse;
 
 use std::{
     io,
@@ -152,6 +153,14 @@ async fn respond(
                 .unwrap_or_else(|_| text(500, "redirect failed")),
         },
         Route::Events => events(ci),
+        Route::RunEvents { run, from_seq } => {
+            let last = header(&request, "last-event-id");
+            let last = match last.map(str::parse::<u64>).transpose() {
+                Ok(last) => last,
+                Err(_) => return text(400, "invalid Last-Event-ID"),
+            };
+            status_sse::response(ci, &run, from_seq.unwrap_or(0).max(last.unwrap_or(0)))
+        }
         Route::Api(request) => match ci.handle(*request).await {
             Ok(value) => json(200, value.to_string()),
             Err(error) => api_error(&error),
