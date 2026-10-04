@@ -56,6 +56,7 @@ pub mod cache_cohort;
 #[cfg(all(test, unix))]
 mod cache_cohort_cli_tests;
 pub mod cache_import;
+pub mod cache_inventory;
 pub mod cache_maintenance;
 pub mod cache_policy;
 pub mod checkout;

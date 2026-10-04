@@ -1794,3 +1794,36 @@ tests passed in 0.71 seconds. Accounting and helper recovery tests passed
 (20 tests, four explicit live prerequisites ignored, 0.34 seconds), format
 passed and final all-target service Clippy passed in 7.03 seconds. Independent
 review passed. The integrated candidate still requires its exact-source gate.
+
+### Current destination inventory before warm admission (follow-up candidate)
+
+Bosn now reads act2 `cache audit` through a supplied verified engine, using a
+30-second deadline and 64 KiB output bound. The initial page has at most 12
+entries; act2's count, logical archive byte total and fingerprint describe its
+whole-store scan. Continuation entries are not represented as a full exported
+catalog. Typed validation rejects identity/schema mismatches, contradictory
+page/count/byte evidence, invalid entries and unbounded diagnostics. Missing,
+busy, partial, failed-command and unknown inventory cannot satisfy the current
+inventory requirement. Nonzero commands retain valid partial evidence.
+
+The published act2.7 private-Docker import/expiry proof passed in 1.66 seconds.
+Current inventory first observed the imported archive (one entry, 80 bytes);
+after independent idle maintenance it observed zero entries/bytes and a changed
+fingerprint while the historical import receipt still described the original
+publication. Source hashes remained unchanged and the exact helper was removed.
+A focused parser test passed and service all-target Clippy passed (18.09 seconds)
+before the live fixture extension. The initial final lint attempt exposed the
+fixture's 106-line function; extracting its current-inventory assertion kept
+the gate intact. The expanded live proof passed again, and final all-target
+Clippy passed in 18.91 seconds. Independent review passed.
+
+This supplies current sampled evidence, not an enrollment transaction, snapshot
+lease across routing publication, proof of old-peer exclusion or physical block
+accounting. Production admission and maintenance startup remain open.
+
+Promotion gate c602bb62-eaf2-4906-9027-5aa290ad1d9c completed after 378
+seconds with all Rust workspace tests and lint steps successful, but its Bosn
+0.1.14 driver marked the overall run Incomplete: reusable-workflow execution
+identity was not qualified. Cleanup was Removed. This is not a passing gate
+receipt; the Linux lane was not run. Bosn 0.1.15 is now available as a released
+driver and the next gate will use an isolated state directory with that version.

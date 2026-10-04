@@ -26,6 +26,7 @@ mod cache_usage;
 pub use cache_usage::HelperCleanupRetry;
 #[cfg(all(test, unix))]
 mod cache_usage_transport_tests;
+mod inventory;
 mod legacy_lease;
 mod machine_policy;
 mod maintenance;
@@ -36,6 +37,7 @@ mod maintenance_lease;
 mod maintenance_loop;
 mod maintenance_reporting;
 mod migration;
+pub use inventory::InventoryAttempt;
 pub use maintenance::MaintenanceAttempt;
 pub use maintenance_helper::MaintenanceHelperAttempt;
 pub use maintenance_loop::MaintenanceTick;

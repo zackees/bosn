@@ -73,6 +73,7 @@ fn published_binary_import_preserves_source_and_has_typed_historical_receipt() {
             if parsed.imported_bytes != 80 {
                 return Err("unexpected historical receipt bytes".into());
             }
+            let fingerprint = inventory(&backend, id, &namespace, 1, 80).await?;
             // No workflow or cache HTTP server is alive. Expire old imported
             // content through an independent bounded maintenance command.
             let expiry: CachePolicy = toml::from_str("repository_max_bytes=100\naggregate_max_bytes=200\nmax_age_secs=1\nunused_age_secs=1\nmaintenance_interval_secs=1\n").map_err(|e| e.to_string())?;
@@ -86,6 +87,9 @@ fn published_binary_import_preserves_source_and_has_typed_historical_receipt() {
             let eviction = store.retention.as_ref().ok_or("eviction evidence missing")?;
             if eviction.reclaimed_archive_bytes != 80 || eviction.deleted_count != 1 || store.archive_bytes != Some(0) {
                 return Err("idle removal did not have exact archive evidence".into());
+            }
+            if inventory(&backend, id, &namespace, 0, 0).await? == fingerprint {
+                return Err("current inventory did not observe removal independently of history".into());
             }
             let repeated = backend.maintain_cache_cohort(id, expiry).await?;
             repeated.require_budget_met()?;
@@ -105,4 +109,19 @@ fn published_binary_import_preserves_source_and_has_typed_historical_receipt() {
         assert!(!absence.ok() && String::from_utf8_lossy(&absence.stderr).to_ascii_lowercase().contains("no such container"), "helper absence unproven: {id}");
         result.unwrap();
     });
+}
+
+async fn inventory(
+    backend: &DockerActBackend,
+    engine: &str,
+    namespace: &Namespace,
+    count: u64,
+    bytes: u64,
+) -> Result<String, String> {
+    let current = backend.audit_cache_destination(engine, namespace).await?;
+    current.require_current_inventory()?;
+    if current.report.entry_count != Some(count) || current.report.archive_bytes != Some(bytes) {
+        return Err("unexpected current destination inventory".into());
+    }
+    Ok(current.report.fingerprint)
 }
