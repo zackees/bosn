@@ -1636,3 +1636,22 @@ snapshot invariant even for another future trusted caller.
 
 Final registry/service all-target Clippy passed (31.42 seconds), including the
 partial-reclamation guard and latest snapshot integration.
+
+### Current-main integration and promotion gate (2026-10-04 candidate)
+
+The retention branch was rebased onto main `219ee2b1` (Bosn 0.1.14 preparation,
+verified desktop widget and raw task-stream persistence). The configuration
+conflict was resolved by preserving both desktop opt-in UI installation and
+retention admission checks. The existing desktop test now includes a cache
+policy, checks that installation preserves it and verifies that installing the
+UI cannot bypass the enrollment guard.
+
+The accumulated candidate is being prepared for a PR through the repository's
+clean exact-source local gate. The gate must replay both the Rust and Linux
+workflow lanes through released Bosn, validate executed-step/source receipts,
+and stamp tree-bound attestations before push. Focused private-Docker proofs
+above establish their stated behavior; they do not substitute for this promotion
+gate. No push, merge or release is asserted by this entry. A promoted candidate
+still needs production policy discovery/bootstrap, repository enrollment and
+old-peer exclusion; broader cache-class and host image/build-cache expiry remain
+open. The existing production guard will stay until those requirements are met.

@@ -107,6 +107,8 @@ pub fn enable_desktop_ui(state_dir: &Path) -> Result<bool, String> {
     }
     std::fs::rename(&staged, &path).map_err(|e| e.to_string())?;
     Ok(true)
+}
+
 /// Configuration usable by both run and spare engine planning.
 pub(crate) fn load_engine(state_dir: &Path) -> Result<super::limits::EngineConfig, String> {
     let settings = load(state_dir)?;
@@ -126,11 +128,19 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "# my limits\n[engine]\ncpus = 3\n[widget]\nauto_launch = \"never\"\n",
+            "# my limits\n[engine]\ncpus = 3\n[widget]\nauto_launch = \"never\"\n[cache]\nrepository_max_bytes=100\naggregate_max_bytes=200\nmax_age_secs=3600\nunused_age_secs=1800\nmaintenance_interval_secs=60\n",
         )
         .unwrap();
+        let original_policy = load(dir.path()).unwrap().cache;
+        assert!(original_policy.is_some());
         assert!(enable_desktop_ui(dir.path()).unwrap());
         let enabled = load(dir.path()).unwrap();
+        assert_eq!(enabled.cache, original_policy);
+        assert!(
+            load_engine(dir.path())
+                .unwrap_err()
+                .contains("not enrolled")
+        );
         assert!(enabled.ui.enabled);
         assert_eq!(enabled.engine.cpus, Some(3));
         assert_eq!(
