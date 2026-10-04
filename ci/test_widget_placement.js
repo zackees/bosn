@@ -6,8 +6,18 @@ const script = fs.readFileSync('crates/bosn-service/src/bin/bosn/widget/placemen
 let added;
 let timer;
 const calls=[];
+const warnings=[];
 function QTimer() { timer=this; this.timeout=signal(); this.start=()=>{}; this.stop=()=>{this.stopped=true;}; }
-function callDBus(...args) { calls.push(args); const callback=args.at(-1); if(typeof callback === "function") callback(args[3] === "unloadScript" ? true : 3); }
+let markerPresent = false;
+function callDBus(...args) {
+    calls.push(args);
+    const callback = args.at(-1);
+    let result;
+    if (args[3] === 'isScriptLoaded') result = markerPresent;
+    else if (args[3] === 'unloadScript') { result = markerPresent; markerPresent = false; }
+    else { result = markerPresent ? -1 : 3; markerPresent = true; }
+    if (typeof callback === 'function') callback(result);
+}
 function signal() { const callbacks=[]; return { connect:f=>callbacks.push(f), emit:()=>callbacks.forEach(f=>f()) }; }
 const screensChanged=signal(), virtualScreenGeometryChanged=signal(), removed=signal();
 const dockChanged=signal();
@@ -17,7 +27,7 @@ const bubble = { caption: 'bosn bubble', resourceClass: 'dev.bosn.widget', frame
 const panel = { caption:'bosn panel', resourceClass:'dev.bosn.widget', frameGeometry:{x:20,y:30,width:420,height:640}, active:false, outputChanged:signal(), windowShown:signal() };
 const other = { caption:'bosn bubble', resourceClass:'other', frameGeometry:{x:7,y:8,width:72,height:72} };
 let area = {x:1423,y:99,width:2560,height:1396};
-vm.runInNewContext(script, { QTimer,callDBus,KWin:{MaximizeArea:1}, workspace:{windowList:()=>[bubble,panel,other,dock], clientArea:()=>area, windowAdded:{connect:f=>added=f},screensChanged,virtualScreenGeometryChanged,windowRemoved:removed} });
+vm.runInNewContext(script, { QTimer,callDBus,console:{warn:message=>warnings.push(message)},KWin:{MaximizeArea:1}, workspace:{windowList:()=>[bubble,panel,other,dock], clientArea:()=>area, windowAdded:{connect:f=>added=f},screensChanged,virtualScreenGeometryChanged,windowRemoved:removed} });
 assert.equal(JSON.stringify(bubble.frameGeometry), JSON.stringify({x:3887,y:1399,width:72,height:72}));
 assert.equal(bubble.active,false);
 assert.equal(bubble.keepAbove,true);
@@ -52,6 +62,7 @@ timer.timeout.emit();
 assert.equal(calls.at(-1)[3], 'loadScript');
 timer.timeout.emit();
 assert.equal(calls.at(-1)[3], 'unloadScript');
+assert.deepEqual(warnings, []);
 // A compositor that rejects geometry must stop readiness transitions.
 let rejected = bubble.frameGeometry;
 Object.defineProperty(bubble, 'frameGeometry', {get:()=>rejected, set:()=>{}});
@@ -59,3 +70,5 @@ area={x:0,y:0,width:800,height:600};
 timer.timeout.emit();
 assert.equal(timer.stopped,true);
 assert.equal(calls.at(-1)[3],'unloadScript');
+assert.equal(warnings.length,1);
+assert.match(warnings[0], /geometry readback rejected.*bosn widget install/);
