@@ -94,6 +94,7 @@ pub(super) async fn cleanup(
                 .act_registry(ActRegistryCommand::Finalize {
                     run: intent.run_id.clone(),
                     proof: ActEngineRemovalProof {
+                        storage_volume: None,
                         name: intent.engine_name(),
                         engine_id: None,
                     },

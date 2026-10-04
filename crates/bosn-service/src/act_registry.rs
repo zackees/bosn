@@ -660,6 +660,7 @@ mod tests {
                 tx.finalize_act_cleanup(
                     &intent.run_id,
                     &ActEngineRemovalProof {
+                        storage_volume: None,
                         name: intent.engine_name(),
                         engine_id: Some(observed.engine_id),
                     },

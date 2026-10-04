@@ -210,7 +210,7 @@ verification resources; none is a new production runner or cache contract.
    layers and volume sizes into a false physical total. Continue reporting
    unowned artifacts through the existing `scan` path.
 4. **Lifecycle and expiry.** Completed, failed, cancelled and interrupted runs
-   eventually remove their exact nested engine and anonymous storage. Cleanup
+   eventually remove their exact nested engine and private storage. Cleanup
    failure remains visible and retryable. Old Bosn-owned images and
    containers are expired only after exact ownership, reachability and use
    checks. Build cache needs a separate policy: Docker's build-cache records
@@ -355,7 +355,52 @@ All three isolated synthetic-host tests pass: recovery without daemon restart,
 preservation of an active claim, and cursor fairness across failed retirement.
 Strict Clippy for all bosn-service targets passes, as do source-length/include
 checks. The timed daemon worker and disk-backed fault paths still need live proof. No disk-backed timeout or partial-create replay
-has yet proved #445/#452 resolved on current main. Anonymous-volume absence is not
-independently recorded by the current container-only receipt, so an error after
-container removal still needs a stronger volume reconciliation proof. Host base
+has yet proved #445/#452 resolved on current main. Legacy anonymous-volume absence
+is not independently recorded; the v2 named-storage slice below adds the required
+volume reconciliation proof for new engines. Host base
 images and shared cached image/tool artifacts also need separate expiry policy.
+
+### Independent private-storage retirement (local candidate)
+
+Evidence: anonymous disk storage names were observed only inside container
+inspect responses. They were neither committed to the intent nor required in
+terminal receipts. If `container rm --volumes` removed the container but left its
+volume, a later container-absence probe could finalize cleanup without identifying
+that storage. This loses the nested image/build-cache retirement evidence.
+
+New disk profiles use `named_disk_storage_run_tmp_noexec_v2`: a local, labelled
+`bosn-act-storage-<immutable intent UUID>` volume is created after the durable
+intent commits and before container creation. Its scope is spec, retention warm,
+with exact registry/run identity. The pinned shared cache remains separate.
+Container declarations and observed mounts must bind the exact storage name.
+Existing anonymous v1 profiles remain observable for recovery; new creation uses
+v2 only. Older executables do not understand v2 profiles, so downgrade into a
+registry containing them is unsupported.
+
+Cleanup proves the container absent, verifies any remaining private volume's
+exact labels/local driver/empty options, removes only that named volume without
+force, and then proves its absence by a successful list. The registry requires
+the exact storage identity in v2 terminal receipts, even when partial creation
+never produced a container ID. An attached, foreign or pinned volume is refused.
+A failed/unavailable probe is not absence; failed or uncertain removal stays
+pending. Storage control commands each have a ten-second budget; retirement
+reserves an additional forty seconds for them. Startup's pass budget is now
+180 seconds so the required 135-second named-storage removal reservation can
+fit; the former 120-second startup bound would always defer a present v2 engine.
+The online retry retains its 180-second retirement and 200-second whole-pass bounds.
+
+Transport tests cover unreadable inspect, attached volumes, lost acknowledgement,
+reported success with surviving volume and later successful absence reconciliation.
+The durable registry test rejects container-only/wrong-storage receipts and
+verifies the correct identity survives reopen. The full isolated service library
+suite passed 397 tests (four ignored), and all 18 registry lifecycle tests passed.
+The focused bound-spare test passes, and strict Clippy passes for all service
+and registry targets. Online retry now follows a spare's run binding for its active-run guard
+and cleanup update, rather than looking up the original spare UUID as a CI run.
+
+This provides a stronger expiry contract for new private nested image/build-cache
+storage. Legacy anonymous storage still lacks independent survivor identity, and
+host base images/shared cache artifacts need separate policy. Live Docker
+fault/restart/partial-create replay is still required: these checks do not prove
+late Docker-create side effects resolved or claim #445/#452 closed. No existing
+host data was converted or removed; cache cohort integration remains open.

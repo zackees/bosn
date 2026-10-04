@@ -155,6 +155,7 @@ fn success_requires_execution_and_exact_cleanup_proof() {
         tx.commit().unwrap();
     }
     let bad = ActEngineRemovalProof {
+        storage_volume: None,
         name: intent().engine_name(),
         engine_id: Some("2".repeat(64)),
     };
@@ -170,6 +171,7 @@ fn success_requires_execution_and_exact_cleanup_proof() {
         tx.finalize_act_cleanup(
             RUN,
             &ActEngineRemovalProof {
+                storage_volume: None,
                 name: intent().engine_name(),
                 engine_id: Some("1".repeat(64)),
             },
@@ -203,6 +205,7 @@ fn pending_create_failure_is_recoverable_and_history_does_not_cap_recovery() {
         tx.finalize_act_cleanup(
             &i.run_id,
             &ActEngineRemovalProof {
+                storage_volume: None,
                 name: i.engine_name(),
                 engine_id: None,
             },
@@ -256,6 +259,7 @@ fn registration_and_terminal_retirement_rollback_together() {
         tx.finalize_act_cleanup(
             RUN,
             &ActEngineRemovalProof {
+                storage_volume: None,
                 name: intent().engine_name(),
                 engine_id: Some("1".repeat(64)),
             },
@@ -370,6 +374,7 @@ fn liveness_and_conflicting_execution_protect_cleanup() {
             .finalize_act_cleanup(
                 RUN,
                 &ActEngineRemovalProof {
+                    storage_volume: None,
                     name: intent().engine_name(),
                     engine_id: Some("1".repeat(64))
                 },
@@ -488,6 +493,7 @@ fn crash_before_registration_recovers_exact_id_for_cleanup_only() {
             .finalize_act_cleanup(
                 RUN,
                 &ActEngineRemovalProof {
+                    storage_volume: None,
                     name: intent().engine_name(),
                     engine_id: None
                 },
@@ -500,6 +506,7 @@ fn crash_before_registration_recovers_exact_id_for_cleanup_only() {
         tx.finalize_act_cleanup(
             RUN,
             &ActEngineRemovalProof {
+                storage_volume: None,
                 name: intent().engine_name(),
                 engine_id: Some("1".repeat(64)),
             },
@@ -533,6 +540,7 @@ fn retirement_between_recovery_pages_does_not_skip_remaining_engines() {
         tx.finalize_act_cleanup(
             &record.intent.run_id,
             &ActEngineRemovalProof {
+                storage_volume: None,
                 name: record.intent.engine_name(),
                 engine_id: None,
             },
@@ -980,3 +988,6 @@ fn record_versions_refuse_profile_presence_mismatches() {
         );
     }
 }
+
+#[path = "act_lifecycle/storage.rs"]
+mod storage;

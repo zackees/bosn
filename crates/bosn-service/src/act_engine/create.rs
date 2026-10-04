@@ -60,8 +60,8 @@ pub enum EngineStorage {
     /// A private exec tmpfs: RAM, inside the engine's memory limit, capped at
     /// `storage_bytes`.
     Memory,
-    /// An anonymous volume on the host engine's disk, removed with the
-    /// engine. `storage_bytes` is the free-disk budget it was sized against,
+    /// A labelled per-run volume on the host engine's disk, independently
+    /// removed after the engine. `storage_bytes` is the free-disk budget it was sized against,
     /// not a quota, and none of it counts against memory.
     Disk,
 }
@@ -70,14 +70,15 @@ impl EngineStorage {
     pub(crate) fn policy(self) -> ActEngineTmpfsPolicy {
         match self {
             Self::Memory => ActEngineTmpfsPolicy::StorageExecRunTmpNoexecV1,
-            Self::Disk => ActEngineTmpfsPolicy::DiskStorageRunTmpNoexecV1,
+            Self::Disk => ActEngineTmpfsPolicy::NamedDiskStorageRunTmpNoexecV2,
         }
     }
 
     pub(crate) fn of(policy: ActEngineTmpfsPolicy) -> Self {
         match policy {
             ActEngineTmpfsPolicy::StorageExecRunTmpNoexecV1 => Self::Memory,
-            ActEngineTmpfsPolicy::DiskStorageRunTmpNoexecV1 => Self::Disk,
+            ActEngineTmpfsPolicy::DiskStorageRunTmpNoexecV1
+            | ActEngineTmpfsPolicy::NamedDiskStorageRunTmpNoexecV2 => Self::Disk,
         }
     }
 }
@@ -210,9 +211,8 @@ pub fn create_arguments(
         .creation_profile
         .as_ref()
         .and_then(|profile| profile.cache_volume.clone());
-    if intent.creation_profile.as_ref()
-        != Some(&creation_profile_with_cache(limits, cache.clone())?)
-    {
+    let expected_profile = creation_profile_with_cache(limits, cache.clone())?;
+    if intent.creation_profile.as_ref() != Some(&expected_profile) {
         return Err(ActEngineError(
             "creation differs from frozen engine profile".into(),
         ));
@@ -264,10 +264,13 @@ pub fn create_arguments(
         args.extend(["--tmpfs".into(), format!("{path}:{options}")]);
     }
     if limits.storage == EngineStorage::Disk {
-        // Anonymous, so `container rm --volumes` removes it with the engine.
+        // New profiles bind exact intent-derived storage; legacy profiles are observed only.
         args.extend([
             "--mount".into(),
-            format!("type=volume,target={STORAGE_TARGET}"),
+            intent.storage_volume_name().map_or_else(
+                || format!("type=volume,target={STORAGE_TARGET}"),
+                |name| format!("type=volume,source={name},target={STORAGE_TARGET}"),
+            ),
         ]);
     }
     if let Some(cache) = &cache {
@@ -300,12 +303,17 @@ pub(super) async fn docker_control(
     engine: &DockerEngine,
     args: Vec<String>,
 ) -> Result<Vec<u8>, ActEngineError> {
+    docker_control_budget(engine, args, std::time::Duration::from_secs(30)).await
+}
+
+pub(super) async fn docker_control_budget(
+    engine: &DockerEngine,
+    args: Vec<String>,
+    budget: std::time::Duration,
+) -> Result<Vec<u8>, ActEngineError> {
     let result = engine
         .with_args(args)
-        .capture_async(RunOptions::bounded(
-            std::time::Duration::from_secs(30),
-            2 << 20,
-        ))
+        .capture_async(RunOptions::bounded(budget, 2 << 20))
         .await
         .map_err(|e| ActEngineError(e.to_string()))?;
     if result.exit_code != 0 {
@@ -421,6 +429,7 @@ pub(super) async fn create_owned_engine_inner(
         .await?;
         verify_cache_volume(&volume, cache)?;
     }
+    ensure_storage_volume(engine, &intent, owner).await?;
     let created = docker_control(engine, args).await?;
     let id = std::str::from_utf8(&created)
         .map_err(|_| ActEngineError("Docker create returned non-UTF8 ID".into()))?
@@ -496,8 +505,8 @@ pub async fn remove_owned_engine(
             "container".into(),
             "rm".into(),
             "--force".into(),
-            // A disk-backed engine's anonymous storage volume goes with it;
-            // named volumes (the machine cache) are never removed.
+            // Legacy anonymous storage goes with the container. Named private
+            // storage is reconciled below; the shared cache is preserved.
             "--volumes".into(),
             observed.engine_id.clone(),
         ],
@@ -527,10 +536,12 @@ pub async fn remove_owned_engine(
             ));
         }
     }
+    remove_storage_volume(engine, &record.intent, &record.registry_id).await?;
     registry
         .act_registry(ActRegistryCommand::Finalize {
             run: run.into(),
             proof: bosn_registry::act::ActEngineRemovalProof {
+                storage_volume: record.intent.storage_volume_name(),
                 name: observed.name,
                 engine_id: Some(observed.engine_id),
             },

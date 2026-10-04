@@ -51,3 +51,6 @@ mod observe;
 pub use observe::*;
 #[cfg(test)]
 mod tests;
+
+mod storage_volume;
+pub(crate) use storage_volume::{ensure_storage_volume, remove_storage_volume};

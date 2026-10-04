@@ -176,3 +176,33 @@ fn clearing_the_cache_retires_the_spare_first() {
         assert_eq!(backend.live(), 0);
     });
 }
+
+#[test]
+fn online_retry_updates_the_run_bound_to_a_claimed_spare() {
+    with_registry(|registry, dir| async move {
+        let backend = Arc::new(FakeBackend::roomy());
+        let runtime = CiRuntime::start(&dir, registry, backend.clone(), 2);
+        first_run(&runtime, '0').await;
+        let held = ready(&runtime, None).await;
+        let held_id = engine_id(&backend, &held.engine);
+        backend.faults.lock().unwrap().remove = true;
+        let run = submit(&runtime, 'a').await.run;
+        let done = wait_done(&runtime, &run).await;
+        assert_eq!(done.engine_id.as_deref(), Some(held_id.as_str()));
+        assert!(done.cleanup.as_deref().unwrap().starts_with("failed:"));
+        backend.faults.lock().unwrap().remove = false;
+        let retry = runtime
+            .retry_cleanup(crate::ci::lifecycle::tests::OWNER, None)
+            .await
+            .unwrap();
+        assert!(retry.retired.is_some());
+        let updated = runtime.record(&run).unwrap();
+        assert_eq!(
+            updated.cleanup.as_deref(),
+            Some("removed"),
+            "the bound run, not the spare UUID, needs the updated receipt"
+        );
+        assert_eq!(updated.conclusion, done.conclusion);
+        runtime.close_spares().await;
+    });
+}

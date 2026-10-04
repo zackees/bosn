@@ -263,7 +263,11 @@ impl ActEngineBackend for FakeBackend {
                 registry,
                 ActRegistryCommand::Finalize {
                     run,
-                    proof: ActEngineRemovalProof { name, engine_id },
+                    proof: ActEngineRemovalProof {
+                        storage_volume: record.intent.storage_volume_name(),
+                        name,
+                        engine_id,
+                    },
                     at: later(record),
                 },
             )

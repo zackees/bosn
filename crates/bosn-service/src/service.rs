@@ -214,7 +214,7 @@ impl Service {
             act_runtime::ActStartupRecoveryOptions {
                 page_size: 64,
                 max_runs: 10000,
-                deadline: Duration::from_secs(120),
+                deadline: Duration::from_secs(180),
             },
             &self.stop.token(),
         )

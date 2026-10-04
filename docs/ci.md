@@ -337,8 +337,10 @@ stubbed job.
     min(cores, 8); 4096 processes. Memory reserves no RAM until it is
     written; it only bounds a runaway job.
   - **Storage is disk by default (#425).** The engine's `/var/lib/docker` is
-    an anonymous Docker volume on the host's disk, removed with the engine
-    (`docker container rm --volumes`), so concurrent builds' `target/` dirs
+    a labelled per-run Docker volume (`bosn-act-storage-<intent UUID>`) on the
+    host's disk. Cleanup removes the container, removes only that exact private
+    volume and independently proves both absent; the shared warm cache is kept.
+    Legacy anonymous profiles retain their recovery handling. Builds' `target/` dirs
     never compete with the host for RAM. Its budget is the free disk under
     Docker's root less a 16 GiB margin, rounded down to 8 GiB and capped at
     128 GiB (72 GiB with 89 GiB free); it is checked before the run, not a

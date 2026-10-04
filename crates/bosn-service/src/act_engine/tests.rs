@@ -19,7 +19,7 @@ fn intent() -> ActEngineIntent {
         spare: false,
     }
 }
-const OWNER: &str = "11111111-2222-4333-8444-555555555555";
+pub(super) const OWNER: &str = "11111111-2222-4333-8444-555555555555";
 fn limits() -> ActEngineLimits {
     ActEngineLimits {
         memory_bytes: 8 << 30,
@@ -633,7 +633,7 @@ fn disk_limits() -> ActEngineLimits {
         ..limits()
     }
 }
-fn disk_intent() -> ActEngineIntent {
+pub(super) fn disk_intent() -> ActEngineIntent {
     ActEngineIntent {
         creation_profile: Some(creation_profile(disk_limits()).unwrap()),
         ..intent()
@@ -644,9 +644,9 @@ fn disk_document() -> serde_json::Value {
     let i = disk_intent();
     d[0]["Config"]["Labels"] = json!(i.required_labels(OWNER).unwrap());
     d[0]["HostConfig"]["Tmpfs"] = json!(disk_limits().tmpfs());
-    d[0]["HostConfig"]["Mounts"] = json!([{"Type":"volume","Target":"/var/lib/docker"}]);
+    d[0]["HostConfig"]["Mounts"] = json!([{"Type":"volume","Source":i.storage_volume_name().unwrap(),"Target":"/var/lib/docker"}]);
     d[0]["Mounts"] = json!([
-        {"Type":"volume","Name":"9".repeat(64),"Source":format!("/var/lib/docker/volumes/{}/_data","9".repeat(64)),"Destination":"/var/lib/docker","Driver":"local","Mode":"z","RW":true,"Propagation":""},
+        {"Type":"volume","Name":i.storage_volume_name().unwrap(),"Source":format!("/var/lib/docker/volumes/{}/_data",i.storage_volume_name().unwrap()),"Destination":"/var/lib/docker","Driver":"local","Mode":"z","RW":true,"Propagation":""},
         {"Type":"tmpfs","Destination":"/run"},
         {"Type":"tmpfs","Destination":"/tmp"}
     ]);
@@ -664,11 +664,11 @@ fn observe_disk(d: &Value, i: &ActEngineIntent, l: ActEngineLimits) -> bool {
 }
 
 #[test]
-fn disk_storage_is_an_anonymous_volume_outside_the_memory_limit() {
+fn disk_storage_has_an_intent_derived_volume_outside_the_memory_limit() {
     let profile = creation_profile(disk_limits()).unwrap();
     assert_eq!(
         profile.tmpfs_policy,
-        ActEngineTmpfsPolicy::DiskStorageRunTmpNoexecV1
+        ActEngineTmpfsPolicy::NamedDiskStorageRunTmpNoexecV2
     );
     assert!(profile.storage_bytes > profile.memory_bytes);
     assert_eq!(frozen_limits(&disk_intent()).unwrap(), disk_limits());
@@ -681,15 +681,13 @@ fn disk_storage_is_an_anonymous_volume_outside_the_memory_limit() {
         .is_err()
     );
     let args = create_arguments(&disk_intent(), OWNER, disk_limits()).unwrap();
-    assert!(
-        args.windows(2)
-            .any(|p| p[0] == "--mount" && p[1] == "type=volume,target=/var/lib/docker")
-    );
-    assert!(
-        !args
-            .iter()
-            .any(|v| v.starts_with("/var/lib/docker:") || v.contains("source="))
-    );
+    assert!(args.windows(2).any(|p| p[0] == "--mount"
+        && p[1]
+            == format!(
+                "type=volume,source={},target=/var/lib/docker",
+                disk_intent().storage_volume_name().unwrap()
+            )));
+    assert!(!args.iter().any(|v| v.starts_with("/var/lib/docker:")));
     for path in ["/run:", "/tmp:"] {
         assert!(
             args.windows(2)
@@ -702,7 +700,7 @@ fn disk_storage_is_an_anonymous_volume_outside_the_memory_limit() {
 }
 
 #[test]
-fn disk_storage_observation_accepts_only_its_own_anonymous_volume() {
+fn disk_storage_observation_accepts_only_its_own_named_volume() {
     let (i, l) = (disk_intent(), disk_limits());
     assert!(observe_disk(&disk_document(), &i, l));
     // Docker may omit the tmpfs entries, as for a memory-backed engine.
@@ -731,4 +729,20 @@ fn disk_storage_observation_accepts_only_its_own_anonymous_volume() {
         }
         assert!(!observe_disk(&d, &i, l), "{change}");
     }
+}
+
+#[test]
+fn legacy_anonymous_disk_profiles_can_be_observed_but_not_newly_created() {
+    let mut i = disk_intent();
+    i.creation_profile.as_mut().unwrap().tmpfs_policy =
+        ActEngineTmpfsPolicy::DiskStorageRunTmpNoexecV1;
+    let mut d = disk_document();
+    d[0]["Config"]["Labels"] = json!(i.required_labels(OWNER).unwrap());
+    d[0]["HostConfig"]["Mounts"] = json!([{"Type":"volume","Target":"/var/lib/docker"}]);
+    d[0]["Mounts"][0]["Name"] = json!("9".repeat(64));
+    d[0]["Mounts"][0]["Source"] =
+        json!(format!("/var/lib/docker/volumes/{}/_data", "9".repeat(64)));
+    assert!(observe_disk(&d, &i, disk_limits()));
+    assert!(i.storage_volume_name().is_none());
+    assert!(create_arguments(&i, OWNER, disk_limits()).is_err());
 }

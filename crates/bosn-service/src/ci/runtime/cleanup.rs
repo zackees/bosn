@@ -34,11 +34,17 @@ impl CiRuntime {
             };
             for record in page.items {
                 cursor = Some(record.intent.run_id.clone());
+                let tracked_run = record
+                    .binding
+                    .as_ref()
+                    .map_or(record.intent.run_id.as_str(), |binding| {
+                        binding.run_id.as_str()
+                    });
                 if record.state != ActEngineState::CleanupRequired
                     || self
                         .lock()
                         .runs
-                        .get(&record.intent.run_id)
+                        .get(tracked_run)
                         .is_some_and(|slot| slot.record.state != RunState::Done)
                 {
                     continue;
@@ -56,7 +62,7 @@ impl CiRuntime {
                 .and_then(|r| r);
                 let retired = result.is_ok().then(|| record.intent.run_id.clone());
                 if retired.is_some() {
-                    self.update(&record.intent.run_id, |slot| {
+                    self.update(tracked_run, |slot| {
                         slot.record.cleanup = Some("removed".into());
                     });
                 }

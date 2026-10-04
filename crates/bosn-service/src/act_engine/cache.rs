@@ -1,4 +1,4 @@
-//! The one named volume an engine may mount: `bosn ci`'s machine-wide cache.
+//! The named shared cache and exact engine volume-mount boundary.
 //!
 //! The volume is frozen into the creation profile, so recovery verifies the
 //! same attachment the run created. Like a setup volume, its ownership is
@@ -97,13 +97,14 @@ pub(crate) fn verify_cache_volume(
 const ANY_REGISTRY: &str = "00000000-0000-4000-8000-000000000000";
 
 /// The volume mounts an engine is created with: the frozen cache volume
-/// (named) and, for disk-backed storage, the anonymous storage volume.
-fn expected_volumes(
-    cache: Option<&ActEngineCacheVolume>,
+/// (named) and the exact private storage identity (legacy anonymous or v2 named).
+fn expected_volumes<'a>(
+    cache: Option<&'a ActEngineCacheVolume>,
     storage: EngineStorage,
-) -> Vec<(Option<&str>, &str)> {
+    storage_name: Option<&'a str>,
+) -> Vec<(Option<&'a str>, &'a str)> {
     let cache = cache.map(|cache| (Some(cache.name.as_str()), cache.target.as_str()));
-    let disk = (storage == EngineStorage::Disk).then_some((None, STORAGE_TARGET));
+    let disk = (storage == EngineStorage::Disk).then_some((storage_name, STORAGE_TARGET));
     cache.into_iter().chain(disk).collect()
 }
 
@@ -112,8 +113,9 @@ pub(super) fn host_mounts_match(
     host: &Value,
     cache: Option<&ActEngineCacheVolume>,
     storage: EngineStorage,
+    storage_name: Option<&str>,
 ) -> bool {
-    let expected = expected_volumes(cache, storage);
+    let expected = expected_volumes(cache, storage, storage_name);
     if expected.is_empty() {
         return empty(host);
     }
@@ -165,9 +167,10 @@ pub(super) fn volume_mounts_match(
     mounts: &[Value],
     cache: Option<&ActEngineCacheVolume>,
     storage: EngineStorage,
+    storage_name: Option<&str>,
 ) -> bool {
     let volumes: Vec<&Value> = mounts.iter().filter(|m| m["Type"] == "volume").collect();
-    let expected = expected_volumes(cache, storage);
+    let expected = expected_volumes(cache, storage, storage_name);
     volumes.len() == expected.len()
         && expected.iter().all(|(name, target)| {
             volumes
