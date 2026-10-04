@@ -20,6 +20,12 @@ use kernal_api::async_engine::{self, CancellationToken};
 
 use crate::{RegistryActor, act_engine};
 
+#[cfg(all(test, unix))]
+mod cache_staging_tests;
+mod cache_usage;
+pub use cache_usage::HelperCleanupRetry;
+#[cfg(all(test, unix))]
+mod cache_usage_transport_tests;
 mod lines;
 mod runner_tools;
 mod toolcache;
@@ -253,7 +259,30 @@ pub trait ActEngineBackend: Send + Sync {
     /// best-effort, before the engine is removed.
     fn save_toolcache<'a>(&'a self, engine: &'a str) -> BoxFuture<'a, Result<(), String>>;
     /// The cache volume's size in bytes; `None` when it does not exist.
-    fn cache_bytes<'a>(&'a self, volume: &'a str) -> BoxFuture<'a, Result<Option<u64>, String>>;
+    fn cache_usage<'a>(
+        &'a self,
+        volume: &'a str,
+    ) -> BoxFuture<'a, Result<super::CacheUsage, String>>;
+    /// Service accounting commits a durable intent before creating its helper.
+    fn tracked_cache_usage<'a>(
+        &'a self,
+        volume: &'a str,
+        registry: &'a RegistryActor,
+        owner: &'a str,
+    ) -> BoxFuture<'a, Result<super::CacheUsage, String>> {
+        let _ = (registry, owner);
+        self.cache_usage(volume)
+    }
+    /// Retry one inactive durable helper; implementations without Docker helpers are no-ops.
+    fn retry_cache_helpers<'a>(
+        &'a self,
+        registry: &'a RegistryActor,
+        owner: &'a str,
+        cursor: Option<String>,
+    ) -> BoxFuture<'a, Result<HelperCleanupRetry, String>> {
+        let _ = (registry, owner, cursor);
+        Box::pin(async { Ok(HelperCleanupRetry::default()) })
+    }
     /// Remove the cache volume. The host engine refuses while any container
     /// (another daemon's run included) still uses it.
     fn remove_cache<'a>(&'a self, volume: &'a str) -> BoxFuture<'a, Result<(), String>>;
@@ -268,6 +297,7 @@ const RUN_OUTPUT: usize = 1024 * 1024 * 1024;
 
 pub struct DockerActBackend {
     docker: DockerEngine,
+    active_helpers: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl Default for DockerActBackend {
@@ -278,7 +308,10 @@ impl Default for DockerActBackend {
 
 impl DockerActBackend {
     pub fn new(docker: DockerEngine) -> Self {
-        Self { docker }
+        Self {
+            docker,
+            active_helpers: Default::default(),
+        }
     }
 
     async fn run(
@@ -310,10 +343,10 @@ impl DockerActBackend {
     }
 
     async fn volume_exists(&self, volume: &str) -> Result<bool, String> {
-        Ok(self
+        let result = self
             .run(owned(&["volume", "inspect", volume]), CONTROL_DEADLINE)
-            .await?
-            .ok())
+            .await?;
+        cache_usage::volume_present(result.ok(), &result.stderr)
     }
 
     async fn wait_ready(&self, engine: &str) -> Result<(), String> {
@@ -636,39 +669,29 @@ impl ActEngineBackend for DockerActBackend {
         })
     }
 
-    fn cache_bytes<'a>(&'a self, volume: &'a str) -> BoxFuture<'a, Result<Option<u64>, String>> {
-        Box::pin(async move {
-            if !self.volume_exists(volume).await? {
-                return Ok(None);
-            }
-            // Measured read-only with the pinned engine image (present once
-            // any run created the volume): no extra image is pulled.
-            let mount = format!("type=volume,source={volume},target=/cache,readonly");
-            let image = engine_image();
-            let du = owned(&[
-                "run",
-                "--rm",
-                "--pull",
-                "never",
-                "--network",
-                "none",
-                "--mount",
-                &mount,
-                "--entrypoint",
-                "du",
-                &image,
-                "-sb",
-                "/cache",
-            ]);
-            let out = self.checked("cache size", du, PULL_DEADLINE).await?;
-            out.split_whitespace()
-                .next()
-                .and_then(|bytes| bytes.parse().ok())
-                .map(Some)
-                .ok_or_else(|| format!("cache size: unexpected output {out:?}"))
-        })
+    fn cache_usage<'a>(
+        &'a self,
+        volume: &'a str,
+    ) -> BoxFuture<'a, Result<super::CacheUsage, String>> {
+        Box::pin(self.measure_cache(volume))
     }
 
+    fn tracked_cache_usage<'a>(
+        &'a self,
+        volume: &'a str,
+        registry: &'a RegistryActor,
+        owner: &'a str,
+    ) -> BoxFuture<'a, Result<super::CacheUsage, String>> {
+        Box::pin(self.measure_cache_tracked(volume, Some((registry, owner))))
+    }
+    fn retry_cache_helpers<'a>(
+        &'a self,
+        registry: &'a RegistryActor,
+        owner: &'a str,
+        cursor: Option<String>,
+    ) -> BoxFuture<'a, Result<HelperCleanupRetry, String>> {
+        Box::pin(self.retry_measurements(registry, owner, cursor))
+    }
     fn remove_cache<'a>(&'a self, volume: &'a str) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             if !self.volume_exists(volume).await? {
@@ -838,9 +861,11 @@ fn work_dirs_script() -> String {
 fn install_act_script(act: ActArtifact) -> String {
     format!(
         "tgz={ENGINE_CACHE}/tools/act-{ACT_VERSION}-{sum}.tgz; mkdir -p {ENGINE_CACHE}/tools; \
+         exec 9>>\"$tgz.lock\"; flock -x 9; \
          if ! echo \"{sum}  $tgz\" | sha256sum -c - >/dev/null 2>&1; then \
-           wget -q -O \"$tgz.$$\" '{url}' && \
-           echo \"{sum}  $tgz.$$\" | sha256sum -c - >/dev/null && mv \"$tgz.$$\" \"$tgz\"; \
+           stage=$(mktemp \"$tgz.XXXXXXXX\"); trap 'rm -f \"$stage\"' EXIT; \
+           wget -q -O \"$stage\" '{url}' && \
+           echo \"{sum}  $stage\" | sha256sum -c - >/dev/null && mv \"$stage\" \"$tgz\" || exit 1; \
          fi; \
          tar -xzf \"$tgz\" -C {ENGINE_WORK}/bin act && \
          echo \"{binary}  {ENGINE_WORK}/bin/act\" | sha256sum -c - >/dev/null && \
@@ -862,14 +887,32 @@ fn runner_tar() -> String {
 /// Shell that loads the runner image tar from the cache volume, or pulls
 /// the pinned image, tags it [`runner_tag`] and saves the tar atomically.
 fn load_runner_script() -> String {
+    format!("{} {}", runner_input_lock(true), load_runner_body())
+}
+
+fn runner_input_lock(shared: bool) -> String {
+    format!(
+        "mkdir -p {ENGINE_CACHE}/images; exec 9>>{}.lock; flock -{} 9;",
+        runner_tar(),
+        if shared { "s" } else { "x" }
+    )
+}
+
+fn load_runner_body() -> String {
     let tag = runner_tag();
     let tar = runner_tar();
+    let restore = "[ -f \"$tar\" ] && docker load -q -i \"$tar\" >/dev/null";
     format!(
         "tar={tar}; mkdir -p {ENGINE_CACHE}/images; \
-         if ! {{ [ -f \"$tar\" ] && docker load -q -i \"$tar\" >/dev/null; }}; then \
+         if ! {{ {restore}; }}; then \
+           flock -x 9; \
+           if ! {{ {restore}; }}; then \
            docker pull -q --platform linux/amd64 {RUNNER_IMAGE} >/dev/null && \
            docker tag {RUNNER_IMAGE} {tag} && \
-           docker save --platform linux/amd64 -o \"$tar.$$\" {tag} && mv \"$tar.$$\" \"$tar\"; \
+           stage=$(mktemp \"$tar.XXXXXXXX\") && \
+           trap 'rm -f \"$stage\"' EXIT && \
+           docker save --platform linux/amd64 -o \"$stage\" {tag} && mv \"$stage\" \"$tar\" || exit 1; \
+           fi; \
          fi; \
          docker image inspect {tag} >/dev/null"
     )
@@ -879,113 +922,13 @@ fn load_runner_script() -> String {
 /// loaded, then pull and save again.
 fn reload_runner_script() -> String {
     format!(
-        "rm -f {tar}; docker image rm -f {tag} >/dev/null 2>&1 || :; {load}",
+        "{lock} rm -f {tar}; docker image rm -f {tag} >/dev/null 2>&1 || :; {load}",
+        lock = runner_input_lock(false),
         tar = runner_tar(),
         tag = runner_tag(),
-        load = load_runner_script(),
+        load = load_runner_body(),
     )
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn invocation_never_names_a_host_socket_and_pins_runners() {
-        let args = ActInvocation {
-            event: "push".into(),
-            workflow: ".github/workflows/ci.yml".into(),
-            workflow_overlaid: false,
-            job: Some("lint".into()),
-            cache_namespace: "0123456789abcdef".into(),
-            secrets: SecretEnv(vec![("GITHUB_TOKEN".into(), "ghp_secretvalue".into())]),
-            params: Default::default(),
-        }
-        .args();
-        assert!(args.iter().all(|a| !a.contains("docker.sock")));
-        assert!(args.contains(&format!("ubuntu-latest={}", runner_tag())));
-        assert!(args.contains(&format!("{ENGINE_CACHE}/actcache/0123456789abcdef")));
-        let cache = format!("{ENGINE_CACHE}/actions");
-        let flags = ["--action-cache-path", &cache, "--use-new-action-cache"];
-        assert!(args.windows(3).any(|w| w == flags), "zackees/clud#1724");
-        assert!(args.windows(2).any(|w| w == ["-s", "GITHUB_TOKEN"]));
-        assert!(
-            args.iter().all(|a| !a.contains("ghp_secretvalue")),
-            "no value in argv"
-        );
-        assert!(args.ends_with(&["-j".to_string(), "lint".to_string()]));
-        assert!(RUNNER_IMAGE.contains("@sha256:") && engine_image().contains("@sha256:"));
-        assert!(act_artifact("x86_64").is_some() && act_artifact("aarch64").is_none());
-        let secrets = SecretEnv(vec![("GITHUB_TOKEN".into(), "ghp_secretvalue".into())]);
-        assert!(
-            !format!("{secrets:?}").contains("ghp_"),
-            "Debug shows names only"
-        );
-    }
-
-    /// #424: act plans bosn's rewrite of the workflow and reads rewritten
-    /// reusable workflows and actions from the overlay; jobs never see it.
-    #[test]
-    fn act_reads_rewrites_from_the_overlay() {
-        let mut invocation = ActInvocation {
-            event: "push".into(),
-            workflow: ".github/workflows/ci.yml".into(),
-            workflow_overlaid: false,
-            job: None,
-            cache_namespace: "0123456789abcdef".into(),
-            secrets: SecretEnv::default(),
-            params: Default::default(),
-        };
-        let overlay = format!("{ENGINE_WORK}/overlay");
-        let args = invocation.args();
-        assert!(
-            args.windows(2)
-                .any(|w| w == ["-W", ".github/workflows/ci.yml"])
-        );
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "--workflow-overlay" && w[1] == overlay)
-        );
-        invocation.workflow_overlaid = true;
-        let args = invocation.args();
-        let planned = format!("{overlay}/.github/workflows/ci.yml");
-        assert!(args.windows(2).any(|w| w[0] == "-W" && w[1] == planned));
-        assert!(work_dirs_script().contains(&overlay));
-    }
-
-    #[test]
-    fn cache_scripts_verify_the_pinned_act_and_save_atomically() {
-        let act = act_artifact("x86_64").unwrap();
-        let install = install_act_script(act);
-        assert!(install.contains(act.sha256) && install.contains(act.url));
-        assert!(install.contains("sha256sum -c"));
-        let load = load_runner_script();
-        assert!(load.contains("docker load") && load.contains(RUNNER_IMAGE));
-        assert!(load.contains("mv \"$tar.$$\" \"$tar\""), "atomic rename");
-        let reload = reload_runner_script();
-        assert!(reload.starts_with(&format!("rm -f {}", runner_tar())) && reload.ends_with(&load));
-        assert!(
-            install.contains(act.binary_sha256),
-            "the extracted binary is checked too"
-        );
-        let cache = CacheVolume::machine("11111111-2222-4333-8444-555555555555", 1.0).unwrap();
-        assert_eq!(cache.name, CACHE_VOLUME);
-        assert!(
-            bosn_core::REQUIRED_LABELS
-                .iter()
-                .all(|k| cache.labels.contains_key(*k))
-        );
-    }
-
-    #[test]
-    fn line_buffer_splits_and_bounds_lines() {
-        let mut b = LineBuffer::default();
-        b.push(b"one\ntw");
-        assert_eq!(b.drain_lines(), ["one"]);
-        b.push(b"o\n");
-        assert_eq!(b.drain_lines(), ["two"]);
-        b.push(&vec![b'x'; MAX_LINE + 5]);
-        assert_eq!(b.drain_lines()[0].len(), MAX_LINE);
-        assert_eq!(b.finish(), ["xxxxx"]);
-    }
-}
+mod tests;

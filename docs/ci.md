@@ -341,8 +341,10 @@ stubbed job.
     min(cores, 8); 4096 processes. Memory reserves no RAM until it is
     written; it only bounds a runaway job.
   - **Storage is disk by default (#425).** The engine's `/var/lib/docker` is
-    an anonymous Docker volume on the host's disk, removed with the engine
-    (`docker container rm --volumes`), so concurrent builds' `target/` dirs
+    a labelled per-run Docker volume (`bosn-act-storage-<intent UUID>`) on the
+    host's disk. Cleanup removes the container, removes only that exact private
+    volume and independently proves both absent; the shared warm cache is kept.
+    Legacy anonymous profiles retain their recovery handling. Builds' `target/` dirs
     never compete with the host for RAM. Its budget is the free disk under
     Docker's root less a 16 GiB margin, rounded down to 8 GiB and capped at
     128 GiB (72 GiB with 89 GiB free); it is checked before the run, not a
@@ -453,6 +455,9 @@ stubbed job.
 
 ## Caches (machine-wide)
 
+The [CI cache and Docker footprint living spec](ci-cache-accounting-spec.md)
+tracks shared-cache behavior, measured gaps, and implementation/test status.
+
 Every engine mounts one bosn-labelled named volume, `bosn-ci-cache-v1`, at
 `/bosn/cache`. It is a volume rather than a host directory because the
 privileged engine writes as root, and Docker Desktop shares no host paths
@@ -504,9 +509,16 @@ All runtime state is under the daemon state directory (`ci/`):
   `pull_request.base.ref` and `.sha` name the same commit (#403). It is kept
   for the newest 10 runs so they can be retried.
 
-`runners cache` reports the size of the machine-wide cache volume, and
-`runners clear-cache` removes it. Removal is refused while a run executes,
-and the next run recreates the volume cold.
+`runners cache` reports apparent file bytes and allocated filesystem blocks
+for the shared volume, its cache classes and repository namespaces. JSON
+includes `partial` and `errors`; an unreadable cache is unknown, never empty.
+Namespace details are capped at the largest or unknown 256 stores; omitted
+details make the report partial while volume totals stay independent.
+The CLI shows the largest contributors. Samples can change during active
+writes, and class totals include their namespace entries, so do not add them
+again to the volume total. `runners clear-cache` removes the whole volume;
+removal is refused while a run executes, and the next run recreates it cold.
+The living spec records verification and the remaining retention work.
 
 The newest 200 finished runs are kept; `runners prune-cache --older-than-secs N
 --max-bytes N` prunes further.

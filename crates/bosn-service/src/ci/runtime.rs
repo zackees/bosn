@@ -30,6 +30,7 @@ use super::{
     workflow,
 };
 use crate::{RegistryActor, secrets::SecretMasker};
+mod cleanup;
 mod observer;
 mod persist;
 mod plan;

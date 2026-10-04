@@ -17,6 +17,8 @@ pub struct Faults {
     pub slow_image: bool,
     /// Saving the tool cache fails.
     pub save: bool,
+    /// The shared cache cannot be measured.
+    pub cache_measure: bool,
 }
 
 /// In-memory engine host: name -> observation. Creation and retirement
@@ -126,12 +128,23 @@ impl ActEngineBackend for FakeBackend {
         *self.cache.lock().unwrap() = true;
         Box::pin(async { Ok(()) })
     }
-    fn cache_bytes<'a>(
+    fn cache_usage<'a>(
         &'a self,
-        _volume: &'a str,
-    ) -> crate::ci::engine::BoxFuture<'a, Result<Option<u64>, String>> {
+        volume: &'a str,
+    ) -> crate::ci::engine::BoxFuture<'a, Result<crate::ci::CacheUsage, String>> {
         let exists = *self.cache.lock().unwrap();
-        Box::pin(async move { Ok(exists.then_some(4096)) })
+        let failed = self.faults().cache_measure;
+        Box::pin(async move {
+            if failed {
+                return Err("cache size: Docker unavailable".into());
+            }
+            Ok(crate::ci::CacheUsage {
+                volume: volume.into(),
+                bytes: exists.then_some(4096),
+                allocated_bytes: exists.then_some(4096),
+                ..Default::default()
+            })
+        })
     }
     fn storage_usage<'a>(
         &'a self,
@@ -254,7 +267,11 @@ impl ActEngineBackend for FakeBackend {
                 registry,
                 ActRegistryCommand::Finalize {
                     run,
-                    proof: ActEngineRemovalProof { name, engine_id },
+                    proof: ActEngineRemovalProof {
+                        storage_volume: record.intent.storage_volume_name(),
+                        name,
+                        engine_id,
+                    },
                     at: later(record),
                 },
             )

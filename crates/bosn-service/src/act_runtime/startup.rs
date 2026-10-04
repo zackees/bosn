@@ -233,10 +233,14 @@ pub(crate) async fn retire_engine(
     }
     if named.iter().all(Vec::is_empty) {
         confirm_absence(record.engine_id.as_deref())?;
+        crate::act_engine::remove_storage_volume(engine, intent, owner)
+            .await
+            .map_err(|e| error(e.to_string()))?;
         registry
             .act_registry(ActRegistryCommand::Finalize {
                 run: intent.run_id.clone(),
                 proof: bosn_registry::act::ActEngineRemovalProof {
+                    storage_volume: intent.storage_volume_name(),
                     name,
                     engine_id: record.engine_id.clone(),
                 },
@@ -289,10 +293,9 @@ pub(crate) async fn retire_engine(
             .await
             .map_err(|e| error(e.to_string()))?;
     }
-    // The existing remover has three 30-second commands plus persistence.
-    // Refuse rather than start a removal that cannot fit the lifecycle budget.
-    if cancellation.is_cancelled()
-        || deadline.saturating_duration_since(Instant::now()) < Duration::from_secs(95)
+    // Refuse deletion unless all commands and persistence fit the remaining budget.
+    let reserved = crate::act_engine::removal_reserve(intent.storage_volume_name().is_some());
+    if cancellation.is_cancelled() || deadline.saturating_duration_since(Instant::now()) < reserved
     {
         return Err(error(
             "startup removal deferred: insufficient reserved cleanup budget",

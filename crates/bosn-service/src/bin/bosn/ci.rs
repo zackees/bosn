@@ -698,13 +698,43 @@ fn runners(arguments: impl Iterator<Item = OsString>) -> Result<i32, Failure> {
             println!("pruned runs: {}", pruned.len());
         }
         if let Some(cache) = &r.cache {
-            match cache.bytes {
-                Some(bytes) => println!("cache: {} {}", cache.volume, human_bytes(bytes)),
-                None => println!("cache: {} (none)", cache.volume),
-            }
+            print_cache(cache);
         }
     });
     Ok(0)
+}
+
+fn print_cache(cache: &bosn_service::ci::CacheUsage) {
+    let measured = cache.allocated_bytes.or(cache.bytes);
+    match measured {
+        Some(bytes) => println!(
+            "cache: {} {}{}",
+            cache.volume,
+            human_bytes(bytes),
+            if cache.partial { " (partial)" } else { "" }
+        ),
+        None if cache.partial => println!("cache: {} (unknown; partial)", cache.volume),
+        None => println!("cache: {} (none)", cache.volume),
+    }
+    let mut components: Vec<_> = cache.components.iter().collect();
+    components
+        .sort_by_key(|component| std::cmp::Reverse(component.allocated_bytes.or(component.bytes)));
+    for component in components.into_iter().take(20) {
+        let identity = component.store_path.clone().unwrap_or_else(|| {
+            component.namespace.as_ref().map_or_else(
+                || component.class.as_str().into(),
+                |namespace| format!("{}/{}", component.class.as_str(), namespace),
+            )
+        });
+        let size = component
+            .allocated_bytes
+            .or(component.bytes)
+            .map_or_else(|| "unknown".into(), human_bytes);
+        println!("  {identity}: {size}");
+    }
+    for error in &cache.errors {
+        println!("  measurement: {error}");
+    }
 }
 
 fn human_bytes(bytes: u64) -> String {

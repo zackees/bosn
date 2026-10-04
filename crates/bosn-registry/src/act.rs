@@ -21,6 +21,8 @@ pub enum ActEngineTmpfsPolicy {
     /// Docker storage on an anonymous disk volume that is removed with the
     /// engine (#425); only `/run` and `/tmp` are tmpfs, both noexec.
     DiskStorageRunTmpNoexecV1,
+    /// Labelled, intent-derived private disk volume with independent absence proof.
+    NamedDiskStorageRunTmpNoexecV2,
 }
 impl ActEngineTmpfsPolicy {
     /// Whether the engine's storage is RAM that counts against its memory.
@@ -39,8 +41,8 @@ pub struct ActEngineCreationProfile {
     pub tmp_tmpfs_bytes: u64,
     pub tmpfs_policy: ActEngineTmpfsPolicy,
     pub init_command_sha256: String,
-    /// The one named host volume an engine may mount (`bosn ci`'s
-    /// machine-wide cache). Absent for engines without it; omitted from the
+    /// The optional named shared host cache. V2 private storage is separately
+    /// derived from the immutable run identity. Absent for engines without it; omitted from the
     /// serialized profile then, so earlier profiles and their digests are
     /// unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -211,6 +213,9 @@ pub struct ActEngineObservation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActEngineRemovalProof {
+    /// Present only for v2 named storage after an exact volume-absence probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_volume: Option<String>,
     pub name: String,
     pub engine_id: Option<String>,
 }
@@ -317,12 +322,26 @@ impl ActEngineIntent {
         Ok(labels)
     }
 }
+impl ActEngineIntent {
+    /// Exact per-run storage identity survives container disappearance.
+    pub fn storage_volume_name(&self) -> Option<String> {
+        self.creation_profile
+            .as_ref()
+            .filter(|profile| {
+                profile.tmpfs_policy == ActEngineTmpfsPolicy::NamedDiskStorageRunTmpNoexecV2
+            })
+            .map(|_| format!("bosn-act-storage-{}", self.run_id))
+    }
+}
+
 impl ActEngineRecord {
     fn validate(&self) -> Result<(), Error> {
         self.intent.validate()?;
         if (self.state == ActEngineState::Terminal) != self.removal.is_some()
             || self.removal.as_ref().is_some_and(|p| {
-                p.name != self.intent.engine_name() || p.engine_id != self.engine_id
+                p.name != self.intent.engine_name()
+                    || p.engine_id != self.engine_id
+                    || p.storage_volume != self.intent.storage_volume_name()
             })
         {
             return Err(Error::BadRow("act removal snapshot"));
@@ -728,6 +747,7 @@ impl Immediate<'_> {
         if record.state != ActEngineState::CleanupRequired
             || proof.name != record.intent.engine_name()
             || proof.engine_id != record.engine_id
+            || proof.storage_volume != record.intent.storage_volume_name()
         {
             return Err(Error::BadRow("act removal proof"));
         }
@@ -751,23 +771,7 @@ impl Immediate<'_> {
 }
 impl Registry {
     pub fn act_engine(&self, run: &str) -> Result<Option<ActEngineRecord>, Error> {
-        let rows = self.connection.query(
-            "SELECT detail FROM events WHERE kind=? ORDER BY id DESC LIMIT 1",
-            &[Value::Text(kind(run)?)],
-            QueryLimits {
-                max_rows: 1,
-                max_bytes: 32768,
-            },
-        )?;
-        let record = rows
-            .first()
-            .map(|r| decode(&text(r, 0)?, run))
-            .transpose()?;
-        let owner = self.registry_id()?;
-        if record.as_ref().is_some_and(|r| owner != r.registry_id) {
-            return Err(Error::ResourceIdentityConflict);
-        }
-        Ok(record)
+        read_act_engine(&self.connection, &self.registry_id()?, run)
     }
     /// Bounded active recovery page using immutable run-ID keyset ordering.
     /// Follow next_run_id until absent; retiring earlier pages cannot skip work.
@@ -811,5 +815,34 @@ impl Registry {
                 .clone()
         });
         Ok(ActEngineRecoveryPage { items, next_run_id })
+    }
+}
+
+fn read_act_engine(
+    connection: &Connection,
+    owner: &str,
+    run: &str,
+) -> Result<Option<ActEngineRecord>, Error> {
+    let rows = connection.query(
+        "SELECT detail FROM events WHERE kind=? ORDER BY id DESC LIMIT 1",
+        &[Value::Text(kind(run)?)],
+        QueryLimits {
+            max_rows: 1,
+            max_bytes: 32768,
+        },
+    )?;
+    let record = rows
+        .first()
+        .map(|r| decode(&text(r, 0)?, run))
+        .transpose()?;
+    if record.as_ref().is_some_and(|r| owner != r.registry_id) {
+        return Err(Error::ResourceIdentityConflict);
+    }
+    Ok(record)
+}
+
+impl ReadOnlyRegistry {
+    pub fn act_engine(&self, run: &str) -> Result<Option<ActEngineRecord>, Error> {
+        read_act_engine(&self.connection, &self.registry_id()?, run)
     }
 }

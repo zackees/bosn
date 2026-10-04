@@ -852,4 +852,6 @@ fn the_cache_volume_is_measured_and_cleared_only_while_nothing_runs() {
 mod params;
 mod spare;
 
+mod cache_usage;
+mod cleanup;
 mod source_identity;

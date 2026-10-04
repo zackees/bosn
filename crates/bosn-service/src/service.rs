@@ -214,7 +214,7 @@ impl Service {
             act_runtime::ActStartupRecoveryOptions {
                 page_size: 64,
                 max_runs: 10000,
-                deadline: Duration::from_secs(120),
+                deadline: crate::act_engine::CLEANUP_BUDGET,
             },
             &self.stop.token(),
         )
@@ -315,6 +315,74 @@ impl Service {
                     if async_engine::cancellable(
                         &stop,
                         async_engine::sleep(unmanaged::MAINTENANCE_INTERVAL),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+        };
+        // Retry durable cleanup online; failed retirement must not wait for restart.
+        // This worker never uses startup interruption authority or shared prune.
+        let _ci_cleanup = {
+            let ci = ci.clone();
+            let owner = act_owner.clone();
+            let stop = self.stop.token();
+            async_engine::launch(async move {
+                let mut cursor = None;
+                let mut helper_cursor = None;
+                loop {
+                    if stop.is_cancelled() {
+                        break;
+                    }
+                    let retry = async_engine::timeout(
+                        crate::act_engine::CLEANUP_PASS_BUDGET,
+                        ci.retry_cleanup(&owner, cursor.clone()),
+                    );
+                    let pass = async_engine::cancellable(&stop, retry).await;
+                    match pass {
+                        Ok(Ok(Ok(report))) => {
+                            cursor = report.next_cursor;
+                            if let Some(run) = report.retired {
+                                eprintln!("bosn CI cleanup retry removed {run}");
+                            }
+                            if let Some(reason) = report.deferred {
+                                eprintln!(
+                                    "bosn CI cleanup retry deferred for {}: {reason}",
+                                    cursor.as_deref().unwrap_or("unknown")
+                                );
+                            }
+                        }
+                        Ok(Ok(Err(error))) => eprintln!("bosn CI cleanup retry failed: {error}"),
+                        Ok(Err(_)) => eprintln!("bosn CI cleanup retry pass deadline exceeded"),
+                        Err(_) => break,
+                    }
+                    // Helper intents survive uncertain create/cleanup and daemon death.
+                    // Use an independent cursor and budget; helper failures do not
+                    // prevent the next engine cleanup pass from advancing.
+                    let retry = async_engine::timeout(
+                        Duration::from_secs(200),
+                        ci.retry_cache_helper_cleanup(&owner, helper_cursor.clone()),
+                    );
+                    match async_engine::cancellable(&stop, retry).await {
+                        Ok(Ok(Ok(report))) => {
+                            helper_cursor = report.next_nonce;
+                            if let Some(name) = report.removed {
+                                eprintln!("bosn CI helper cleanup removed {name}");
+                            }
+                            if let Some(reason) = report.deferred {
+                                eprintln!("bosn CI helper cleanup deferred: {reason}");
+                            }
+                        }
+                        Ok(Ok(Err(error))) => eprintln!("bosn CI helper cleanup failed: {error}"),
+                        Ok(Err(_)) => eprintln!("bosn CI helper cleanup deadline exceeded"),
+                        Err(_) => break,
+                    }
+                    if async_engine::cancellable(
+                        &stop,
+                        async_engine::sleep(Duration::from_secs(60)),
                     )
                     .await
                     .is_err()

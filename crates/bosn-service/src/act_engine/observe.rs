@@ -58,6 +58,7 @@ pub fn observe_engine(
         .as_array()
         .ok_or_else(|| ActEngineError("missing environment observation".into()))?;
     let storage = EngineStorage::of(profile.tmpfs_policy);
+    let storage_name = intent.storage_volume_name();
     let storage_tmpfs = (storage == EngineStorage::Memory).then(|| {
         (
             STORAGE_TARGET.to_owned(),
@@ -108,8 +109,8 @@ pub fn observe_engine(
             .is_none_or(|v| !v.is_null() && !v.as_array().is_some_and(|v| v.is_empty()))
         || !empty(&host["Binds"])
         || !empty(&host["VolumesFrom"])
-        || !host_mounts_match(&host["Mounts"], profile.cache_volume.as_ref(), storage)
-        || !volume_mounts_match(mounts, profile.cache_volume.as_ref(), storage)
+        || !host_mounts_match(&host["Mounts"], profile.cache_volume.as_ref(), storage, storage_name.as_deref())
+        || !volume_mounts_match(mounts, profile.cache_volume.as_ref(), storage, storage_name.as_deref())
         || !empty(&host["PortBindings"])
         || tmpfs != expected_tmpfs
         // Docker may omit tmpfs entries from Mounts; declarations remain exact.

@@ -25,6 +25,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bosn_service::ci::reply::RunView;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 const SUCCESS: &str =
@@ -182,7 +184,18 @@ impl Live {
 
     /// Wait for a run to end; returns the CLI's exit code and the record.
     fn wait(&self, run: &str) -> (Option<i32>, Value) {
-        self.json(&["ci", "wait", run, "--deadline-ms", "900000", "--json"])
+        self.wait_as(run)
+    }
+
+    fn wait_as<T: DeserializeOwned>(&self, run: &str) -> (Option<i32>, T) {
+        let out = self.cli(&["ci", "wait", run, "--deadline-ms", "900000", "--json"]);
+        let reply = serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
+            panic!(
+                "wait {run}: {error}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        (out.status.code(), reply)
     }
 
     /// Until the run's job is executing (its first step printed).
@@ -291,6 +304,17 @@ fn assert_isolated(run: &str) {
         &engine,
     ]))
     .unwrap();
+    let storage = mounts
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|mount| mount["Destination"] == "/var/lib/docker")
+        .expect("private Docker storage mount");
+    assert_eq!(
+        storage["Name"],
+        format!("bosn-act-storage-{run}"),
+        "the durable intent identifies the private image/build-cache volume"
+    );
     for mount in mounts.as_array().unwrap() {
         assert_eq!(mount["Type"], "volume", "no bind mounts: {mount}");
         let text = mount.to_string();
@@ -456,24 +480,109 @@ fn the_recorded_fixture_yields_its_tree_exit_1_and_only_the_failing_tail() {
 #[ignore = "needs Docker and network access; see the module docs"]
 fn a_second_run_restores_actions_cache_from_the_local_server() {
     let live = Live::new();
-    // A key no earlier test run used, so the first run must miss.
     let key = format!("bosn-live-{}", std::process::id());
     live.workflow(&format!(
-        "on: [push]\njobs:\n  c:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/cache@v4\n        with:\n          path: cached\n          key: {key}\n      - run: mkdir -p cached && echo kept > cached/x\n"
+        "on: [push]\njobs:\n{}",
+        cache_job("c", &key, "mkdir -p cached && echo kept > cached/x", None)
     ));
     let first = live.submit(&[]);
-    assert_eq!(live.wait(&first).0, Some(0));
+    let (code, first_view) = live.wait_as::<RunView>(&first);
+    assert_eq!(code, Some(0), "{first_view:?}\n{}", live.logs(&first));
     assert!(
         !live.logs(&first).contains("Cache restored"),
         "a fresh key cannot hit"
     );
+    // Verify actual bytes in a different engine, rather than a cache-hit log alone.
+    live.workflow(&format!(
+        "on: [push]\njobs:\n{}",
+        cache_job(
+            "c",
+            &key,
+            "test \"$(cat cached/x)\" = kept && echo RESTORED_BYTES",
+            None
+        )
+    ));
     let second = live.submit(&[]);
-    assert_eq!(live.wait(&second).0, Some(0));
-    assert!(
-        live.logs(&second).contains("Cache restored"),
-        "{}",
-        live.logs(&second)
+    let (code, second_view) = live.wait_as::<RunView>(&second);
+    assert_eq!(code, Some(0), "{second_view:?}\n{}", live.logs(&second));
+    assert!(first_view.record.engine_id.is_some(), "{first_view:?}");
+    assert_ne!(first_view.record.engine_id, second_view.record.engine_id);
+    let logs = live.logs(&second);
+    assert!(logs.contains("Cache restored"), "{logs}");
+    assert!(logs.contains("RESTORED_BYTES"), "{logs}");
+}
+
+#[test]
+#[ignore = "needs Docker and network access; see the module docs"]
+fn a_later_job_restores_actions_cache_from_an_earlier_job() {
+    let live = Live::new();
+    let key = format!("bosn-jobs-{}", std::process::id());
+    live.workflow(&format!(
+        "on: [push]\njobs:\n{}{}",
+        cache_job(
+            "save",
+            &key,
+            "mkdir -p cached && echo kept > cached/x",
+            None
+        ),
+        cache_job(
+            "restore",
+            &key,
+            "test \"$(cat cached/x)\" = kept && echo JOB_RESTORED_BYTES",
+            Some("save")
+        )
+    ));
+    let run = live.submit(&[]);
+    let (code, view) = live.wait_as::<RunView>(&run);
+    let logs = live.logs(&run);
+    assert_eq!(code, Some(0), "{view:?}\n{logs}");
+    assert_eq!(view.jobs.total, 2, "{view:?}");
+    assert_eq!(view.jobs.completed, 2, "{view:?}");
+    assert!(logs.contains("Cache restored"), "{logs}");
+    assert!(logs.contains("JOB_RESTORED_BYTES"), "{logs}");
+}
+
+#[test]
+#[ignore = "needs Docker and network access; see the module docs"]
+fn repository_namespaces_do_not_restore_each_others_archives() {
+    let writer = Live::new();
+    let reader = Live::new();
+    let key = format!("bosn-namespaces-{}", std::process::id());
+    writer.workflow(&format!(
+        "on: [push]\njobs:\n{}",
+        cache_job("c", &key, "mkdir -p cached && echo kept > cached/x", None)
+    ));
+    let run = writer.submit(&[]);
+    let (code, source) = writer.wait_as::<RunView>(&run);
+    assert_eq!(code, Some(0), "{source:?}\n{}", writer.logs(&run));
+    reader.workflow(&format!(
+        "on: [push]\njobs:\n{}",
+        cache_job(
+            "c",
+            &key,
+            "test ! -e cached/x && echo REPOSITORY_CACHE_MISS",
+            None
+        )
+    ));
+    let run = reader.submit(&[]);
+    let (code, target) = reader.wait_as::<RunView>(&run);
+    let logs = reader.logs(&run);
+    assert_eq!(code, Some(0), "{target:?}\n{logs}");
+    assert_ne!(
+        source.record.cache_namespace(),
+        target.record.cache_namespace()
     );
+    assert!(!logs.contains("Cache restored"), "{logs}");
+    assert!(logs.contains("REPOSITORY_CACHE_MISS"), "{logs}");
+}
+
+fn cache_job(name: &str, key: &str, command: &str, needs: Option<&str>) -> String {
+    let needs = needs
+        .map(|job| format!("    needs: {job}\n"))
+        .unwrap_or_default();
+    format!(
+        "  {name}:\n{needs}    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/cache@v4\n        with:\n          path: cached\n          key: {key}\n      - run: {command}\n"
+    )
 }
 
 /// A container's or volume's labels and immutable ID.

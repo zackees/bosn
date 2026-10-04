@@ -182,11 +182,58 @@ pub struct RunnersReply {
 
 /// The machine-wide cache volume (act tools, runner image, action
 /// checkouts and the per-repository `actions/cache` store).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CacheUsage {
     pub volume: String,
-    /// `None` when the volume does not exist.
+    /// Apparent bytes (file lengths), retained for older clients. `None`
+    /// when the volume is absent or measurement failed; inspect `partial`.
     pub bytes: Option<u64>,
+    /// Allocated filesystem blocks, as measured by `du -k`. Components
+    /// are separate samples and must not be summed with this total.
+    #[serde(default)]
+    pub allocated_bytes: Option<u64>,
+    #[serde(default)]
+    pub components: Vec<CacheComponent>,
+    /// Unknown/incomplete measurements never mean an empty cache.
+    #[serde(default)]
+    pub partial: bool,
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheClass {
+    Tools,
+    Images,
+    Actions,
+    Toolcache,
+    Actcache,
+}
+
+impl CacheClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tools => "tools",
+            Self::Images => "images",
+            Self::Actions => "actions",
+            Self::Toolcache => "toolcache",
+            Self::Actcache => "actcache",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CacheComponent {
+    pub class: CacheClass,
+    /// Repository hash for an act cache store; absent for class totals.
+    pub namespace: Option<String>,
+    /// Store path relative to the shared volume. Distinguishes retained legacy
+    /// and imported stores for the same repository; never deletion authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_path: Option<String>,
+    pub bytes: Option<u64>,
+    pub allocated_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
