@@ -862,3 +862,22 @@ automatically superseded by the later test commit, not proven passing. Its
 Windows/macOS/lint/snapshot jobs passed. At current `7902785`, run 37184103814
 passed native Windows/macOS (including command cutover tests) and lint; Linux
 and snapshot were still running at the latest sample.
+
+## Full candidate review and schema correction
+
+The single reviewer covered the full 45-file Bosn range through `224990a3`
+against `146515cf`; no blocking ownership/replay/concurrency defects were found.
+Full unit verification then caught a stale published schema for optional
+`CacheComponent.store_path`: 417 service cases passed, one schema case failed,
+and six cases were ignored. The earlier review assertion of schema parity was
+incorrect. An actual generated schema fixes that mismatch; its comparison test
+now passes. Registry library tests (five), workspace formatting and strict
+all-target service Clippy pass.
+
+A tiny stdout exporter, `soldr cargo run -q -p bosn-service --example
+export_ci_schema`, generates the contract inside an isolated container without
+writing its read-only source mount. The host can validate/copy its JSON output
+into `docs/ci.schema.json`. No weakening of the schema parity gate was made.
+These results precede reconciliation with newer main changes and do not prove
+the merged candidate; current main is `5a5040fa`. Full verification after that
+reconciliation remains required before pushing a candidate.

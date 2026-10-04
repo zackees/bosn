@@ -56,6 +56,13 @@
             "string",
             "null"
           ]
+        },
+        "store_path": {
+          "description": "Store path relative to the shared volume. Distinguishes retained legacy\nand imported stores for the same repository; never deletion authority.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
