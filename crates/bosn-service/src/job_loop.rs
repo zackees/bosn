@@ -712,11 +712,21 @@ pub(crate) fn launch_started_setup_jobs(
         tasks.spawn(async move {
             let (text_logs, mut log_receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
             let logs = if let Some(state_dir) = state_dir {
+                let task = match &request {
+                    SetupJobRequest::Prepare(_) => "setup-prepare",
+                    SetupJobRequest::Task(request) => &request.task_name,
+                    SetupJobRequest::AppTask(request) => &request.task_name,
+                    SetupJobRequest::Ensure(_) => "setup-ensure",
+                    SetupJobRequest::ManifestEnsure(_) => "manifest-ensure",
+                    SetupJobRequest::ManifestConverge(_) => "manifest-converge",
+                    SetupJobRequest::ManifestAppTask(request) => &request.task_name,
+                };
                 let raw = async {
                     let run_id = ci::wire::new_uuid().await.map_err(|e| e.message)?;
                     let raw = crate::raw_run_log::RawRunLog::create(&state_dir, &run_id)
                         .map_err(|e| e.to_string())?;
-                    raw.write_metadata(&run_id, id).map_err(|e| e.to_string())?;
+                    raw.write_metadata(&run_id, id, Some(task))
+                        .map_err(|e| e.to_string())?;
                     Ok::<_, String>(raw)
                 }
                 .await;
@@ -872,6 +882,19 @@ pub(crate) fn launch_started_setup_jobs(
                         .await,
                 )),
             };
+            let state = if token.is_cancelled() {
+                "cancelled"
+            } else if completion
+                .as_ref()
+                .is_some_and(|(_, result)| result.is_err())
+            {
+                "failure"
+            } else {
+                "success"
+            };
+            if let Err(error) = logs.finish(state) {
+                eprintln!("bosn: job {id} could not persist raw run completion: {error}");
+            }
             drop(logs);
             let _ = forwarder.await;
             if let Some((kind, result)) = completion {
