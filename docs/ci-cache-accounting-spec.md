@@ -2678,3 +2678,44 @@ gate remains pending. No production cancellation code changed. This evidence
 does not prove that stopping a Docker client stops a remote command, nor does it
 close the daemon-crash, uncertain creation/start, or engine-lifetime recovery
 requirements.
+
+
+### Verified object retirement and pressure-sweep integration
+
+Act2 PR #38 adds `RetireToolObject(ctx, root, id, maxBytes, maxGenerations)`.
+The original catalog writer spans complete current-selection validation, bounded
+retained-generation manifest inventory, verified object payload/layout and mount
+identity checks, removal and root-directory sync. Every retained generation
+reference protects its object, including idle old generations and live readers.
+Unknown namespace entries, missing/corrupt manifests, and exhausted reference
+bounds refuse deletion. Candidate objects must have exactly the closed tree and
+manifest control layout. Unknown state and unverified payloads stay intact.
+
+Missing API regression was RED then GREEN: an object stays while selected,
+while an old reader lives, and while its idle old generation remains; after that
+last generation is retired, object deletion reclaims at least its one-MiB payload
+allocation and the selected replacement remains valid. Strengthened tests use an
+otherwise unreferenced orphan to prove unknown/missing/bounded reference refusal.
+Complete package tests, vet/lint and cumulative review passed. Exact-source gate
+passed in 20.65 seconds on `f63c19243cf128b35923e2d626bad303922b9344`, tree
+`958851bf886d9e565ec5b4fad70490c6365c7d3e`, covering 2,578 exported files and
+Darwin/Windows compilation. Evidence: `act2-tool-object-retirement-source-bound-gate`
+JSON/log and `act2-tool-object-retirement-reference-checks.log`.
+
+The following local `feat/tool-object-retention-policy` slice integrates object
+retirement into the age/pressure sweep. A real failing regression showed that
+retiring generation metadata alone left an unreferenced one-MiB object allocated.
+It now passes: bounded object candidates are inventoried before mutation,
+generation retirement runs first, then verified unreferenced objects expire by
+age or pressure, oldest first. Each attempted mutation gets fresh accounting.
+Typed reports distinguish retired/protected objects and generations. Referenced
+objects are protected without claiming a failure; unknown/corrupt reference state
+is partial and preserved. The catalog writer remains held throughout both sweeps.
+Full package tests, vet/lint and review pass; exact-source gate on
+`e9281ab` is pending. Production activation remains absent.
+
+Stage expiry, automatic production scheduling, CLI entry point, last-use evidence,
+7.7-GiB scan efficiency, whole-machine cross-class allocation and sustained caps
+remain open. These slices have not been released or pinned into Bosn. Old
+containers/images and scoped builder-cache pressure remain separate required
+parts of the original objective.
