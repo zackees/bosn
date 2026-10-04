@@ -27,6 +27,9 @@ fn setup_ensure_job_is_prompt_coalesced_bounded_and_cancellable_without_docker()
         .run(async {
             let server = async_engine::launch(
                 Service::new(state.clone())
+                    .with_act_backend(Arc::new(crate::ci::lifecycle::tests::FakeBackend::with(
+                        Default::default(),
+                    )))
                     .with_setup_ensure_executor(fake.clone())
                     .serve(),
             );
@@ -124,6 +127,9 @@ fn setup_ensure_stops_after_prepare_failure_or_ownership_mismatch_without_mutati
             .run(async {
                 let server = async_engine::launch(
                     Service::new(state.clone())
+                        .with_act_backend(Arc::new(crate::ci::lifecycle::tests::FakeBackend::with(
+                            Default::default(),
+                        )))
                         .with_setup_ensure_executor(fake.clone())
                         .serve(),
                 );
@@ -208,6 +214,9 @@ fn setup_ensure_persists_container_and_content_addressed_image_across_daemon_res
             .run(async {
                 let server = async_engine::launch(
                     Service::new(state.clone())
+                        .with_act_backend(Arc::new(crate::ci::lifecycle::tests::FakeBackend::with(
+                            Default::default(),
+                        )))
                         .with_setup_ensure_executor(fake.clone())
                         .serve(),
                 );

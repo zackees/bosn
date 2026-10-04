@@ -4,6 +4,26 @@ use super::{CACHE_VOLUME, CONTROL_DEADLINE, DockerActBackend, ENGINE_CACHE};
 use crate::ci::cache_policy::CachePolicy;
 
 impl DockerActBackend {
+    /// A maintenance helper must observe an existing agreement on its mounted
+    /// volume. A replaced cache must not inherit a stale in-memory policy.
+    pub(super) async fn require_cache_policy(
+        &self,
+        engine: &str,
+        policy: CachePolicy,
+    ) -> Result<(), String> {
+        let output = self
+            .checked(
+                "existing maintenance policy",
+                Self::exec(engine, &READ_POLICY.replace("/cache", ENGINE_CACHE)),
+                CONTROL_DEADLINE,
+            )
+            .await?;
+        if decode_record(&output)? != Some(policy) {
+            return Err("existing machine cache policy is absent or differs".into());
+        }
+        Ok(())
+    }
+
     /// Read participating policy without bootstrapping, enrolling or changing it.
     /// Absence is a sample; errors never authorize a default policy.
     pub async fn discover_cache_policy(

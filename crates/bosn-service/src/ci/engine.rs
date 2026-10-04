@@ -297,6 +297,17 @@ pub trait ActEngineBackend: Send + Sync {
         let _ = (registry, owner, cursor);
         Box::pin(async { Ok(HelperCleanupRetry::default()) })
     }
+    /// Maintain only an existing cohort with an agreed shared machine policy.
+    /// Backends without shared stores have no background maintenance work.
+    fn maintain_existing_cohort<'a>(
+        &'a self,
+        registry: &'a RegistryActor,
+        owner: &'a str,
+        stop: &'a CancellationToken,
+    ) -> BoxFuture<'a, ()> {
+        let _ = (registry, owner, stop);
+        Box::pin(async {})
+    }
     /// Remove the cache volume. The host engine refuses while any container
     /// (another daemon's run included) still uses it.
     fn remove_cache<'a>(&'a self, volume: &'a str) -> BoxFuture<'a, Result<(), String>>;
@@ -705,6 +716,14 @@ impl ActEngineBackend for DockerActBackend {
         cursor: Option<String>,
     ) -> BoxFuture<'a, Result<HelperCleanupRetry, String>> {
         Box::pin(self.retry_measurements(registry, owner, cursor))
+    }
+    fn maintain_existing_cohort<'a>(
+        &'a self,
+        registry: &'a RegistryActor,
+        owner: &'a str,
+        stop: &'a CancellationToken,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(self.supervise_existing_cohort(registry, owner, stop))
     }
     fn remove_cache<'a>(&'a self, volume: &'a str) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {

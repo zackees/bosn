@@ -19,7 +19,9 @@ policy/arguments/import evidence and participating legacy-session leases.
 The execution path now carries a typed legacy/cohort route; production planning
 still explicitly selects legacy, and rejects configured retention.
 Production planning still refuses configured retention: warm migration, old-peer
-exclusion, durable routing and independent watcher supervision are unfinished.
+exclusion and durable routing are unfinished. A follow-up now wires independent
+maintenance for an already agreed cohort into normal daemon startup; default
+legacy stores are still outside that retention policy.
 Tools/images/actions/tool-install expiry and host owned-image/build-cache
 pressure control remain open; successful private-engine retirement removes
 that engine's nested containers, images and build cache. Historical entries
@@ -48,8 +50,10 @@ publication after restart. It is not machine-wide routing or enrollment state.
 The candidate also executes bounded independent maintenance passes in durable
 finite-lived helpers and consumes typed retention outcomes. Participating cohort
 workflow engines and maintenance helpers now require the same shared policy
-record. A callable cancellable periodic supervisor is now implemented; production
-startup policy discovery and enrollment remain unfinished.
+record. The periodic supervisor is callable in the promotion candidate. The
+next follow-up discovers existing shared policy at normal daemon startup and
+starts that supervisor without workflow jobs. Automatic policy bootstrap and
+repository enrollment remain unfinished.
 
 The tool-cache candidate uses unique save stages and skips hidden unfinished
 stages when rehydrating fresh engines. Its actual pinned-engine shell proof
@@ -1827,3 +1831,57 @@ seconds with all Rust workspace tests and lint steps successful, but its Bosn
 identity was not qualified. Cleanup was Removed. This is not a passing gate
 receipt; the Linux lane was not run. Bosn 0.1.15 is now available as a released
 driver and the next gate will use an isolated state directory with that version.
+
+### Normal daemon startup maintains existing agreed cohorts (follow-up)
+
+Normal `Service::serve` now starts the independent cache maintenance worker and
+keeps the registry writer alive until worker cancellation finishes. It polls
+for an existing canonical shared policy; no volume/record means no defaults,
+bootstrap, migration or deletion. Discovery errors persist an Unknown latest
+result without a helper reference and retry after 60 seconds. Once discovered,
+the bounded periodic supervisor runs independently of job admission and saves
+its latest outcome before the service consumer receives it. The existing FD6
+nonblocking cross-daemon lock continues to exclude concurrent maintenance
+commands, though duplicate helper creation is still possible.
+
+Each maintenance helper additionally requires the existing canonical policy on
+its actual mounted volume, rather than publishing policy itself. A replaced
+volume or removed/conflicting record cannot inherit cached in-memory agreement.
+Explicit participating cohort workflow execution still publishes agreement;
+maintenance never opts legacy repositories into the cohort or deletes source
+stores. Production route selection remains Legacy and configured cohort
+retention stays refused pending warm enrollment and old-peer coordination.
+
+The genuine private-Docker normal-daemon fixture passed in 1.45 seconds: startup
+without submitted jobs discovered the existing policy, recorded a successful
+complete budget outcome, stopped normally and left the exact helper journal
+Removed. The no-volume/Docker-outage test issued only volume inspection, never
+helper creation or maintenance; absence left no snapshot and outage persisted
+Unknown. Focused safety tests and all-target Clippy passed (14.12 seconds).
+The tightened per-helper existing-policy check and full service suite are being
+verified; no shipped startup behavior or prompt uncertain-command shutdown
+guarantee is claimed yet. Other shared cache classes and host image/build-cache
+expiry remain open.
+
+The tightened policy check passed the real idle-daemon proof again (2.66
+seconds). Full-suite runs exposed setup-only fixtures using the real CI backend:
+background discovery legitimately added helper intent events to their exact
+setup event expectations. Setup and rollover fixtures now explicitly supply
+the existing fake CI backend; their setup executors and exact event assertions
+are retained. The corrected full suite and final lint are running.
+
+The promotion candidate before this startup follow-up passed its Rust lane
+under the released Bosn 0.1.15 driver (375 seconds), with exact-source executed
+step evidence. Its Linux lane is running as
+41f19684-93f1-4b0d-bb80-de4603894b89. This supersedes the earlier driver
+0.1.14 Incomplete result but does not yet establish a complete promotion gate.
+
+After both setup fixture groups used explicit fake CI backends, the full private
+Docker service suite passed: 463 passed, zero failed, 18 explicit live/large
+prerequisites ignored. Final service all-target Clippy passed in 19.67 seconds.
+The normal-startup slice and fixture isolation received independent review.
+The preceding promotion candidate now has a complete passing exact-source gate:
+Rust 375 seconds, Linux 332 seconds, total 707 seconds, stamped commit
+85bc9afcba5760b4c3c418479c240a6620bc5a01 and tree
+d27b7f0616d9e4dfccc9118d35d759896af1dd53. The startup follow-up still
+requires its own integrated exact-source gate before promotion.

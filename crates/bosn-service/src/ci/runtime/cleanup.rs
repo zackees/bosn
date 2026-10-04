@@ -10,6 +10,16 @@ pub(crate) struct CleanupRetry {
 }
 
 impl CiRuntime {
+    pub(crate) async fn maintain_existing_cohort(
+        &self,
+        owner: &str,
+        stop: &async_engine::CancellationToken,
+    ) {
+        self.backend
+            .maintain_existing_cohort(&self.registry, owner, stop)
+            .await;
+    }
+
     pub(crate) async fn retry_cache_helper_cleanup(
         &self,
         owner: &str,

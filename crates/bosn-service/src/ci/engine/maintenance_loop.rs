@@ -13,6 +13,75 @@ pub struct MaintenanceTick {
 }
 
 impl DockerActBackend {
+    /// Normal daemon startup discovers immutable participating policy. Absence
+    /// never bootstraps or migrates legacy stores; failures remain unknown.
+    pub(crate) async fn supervise_existing_cohort(
+        &self,
+        registry: &RegistryActor,
+        owner: &str,
+        stop: &CancellationToken,
+    ) {
+        loop {
+            let discovered = match async_engine::cancellable(
+                stop,
+                async_engine::timeout(
+                    Duration::from_secs(200),
+                    self.discover_cache_policy(registry, owner),
+                ),
+            )
+            .await
+            {
+                Err(_) => return,
+                Ok(Err(_)) => Err("shared policy discovery deadline exceeded".into()),
+                Ok(Ok(result)) => result,
+            };
+            match discovered {
+                Ok(Some(policy)) => {
+                    let (reports, mut receiver) = async_engine::channel(1);
+                    let worker =
+                        self.supervise_cache_maintenance(registry, owner, policy, stop, &reports);
+                    let consumer = async {
+                        while let Ok(Some(tick)) =
+                            async_engine::cancellable(stop, receiver.recv()).await
+                        {
+                            if let Err(error) = tick.persistence {
+                                eprintln!("bosn cache maintenance persistence failed: {error}");
+                            }
+                        }
+                    };
+                    async_engine::join(worker, consumer).await;
+                    return;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let tick = MaintenanceTick {
+                        recovery: Ok(HelperCleanupRetry::default()),
+                        attempt: Err(error),
+                        persistence: Ok(()),
+                    };
+                    match async_engine::cancellable(
+                        stop,
+                        super::maintenance_reporting::persist(registry, &tick),
+                    )
+                    .await
+                    {
+                        Err(_) => return,
+                        Ok(Err(error)) => {
+                            eprintln!("bosn cache discovery evidence persistence failed: {error}")
+                        }
+                        Ok(Ok(())) => {}
+                    }
+                }
+            }
+            if async_engine::cancellable(stop, async_engine::sleep(Duration::from_secs(60)))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+
     /// The caller supplies an enrolled machine policy and consumes every tick.
     /// No repository configuration or legacy record authorizes this loop.
     /// Restart runs immediately; subsequent ticks wait after the previous pass.
@@ -98,6 +167,70 @@ mod tests {
     use super::*;
     use crate::ci::lifecycle::tests::{OWNER, with_registry};
     use kernal_api::async_engine::CancellationSource;
+
+    #[test]
+    fn discovery_absence_and_outage_never_start_default_maintenance() {
+        for detail in ["no such volume", "Docker permission denied"] {
+            with_registry(|registry, directory| async move {
+                let script = directory.join("docker.py");
+                let log = directory.join("commands");
+                std::fs::write(&script, "import sys\nwith open(sys.argv[2], 'a') as f: f.write(' '.join(sys.argv[3:]) + '\\n')\nprint(sys.argv[1], file=sys.stderr)\nsys.exit(1)\n").unwrap();
+                let backend = DockerActBackend::new(bosn_engine::DockerEngine::synthetic_for_test(
+                    "python3",
+                    [
+                        script.into_os_string(),
+                        detail.into(),
+                        log.clone().into_os_string(),
+                    ],
+                ));
+                let stop = CancellationSource::new();
+                let token = stop.token();
+                let worker = backend.supervise_existing_cohort(&registry, OWNER, &token);
+                let observer = async {
+                    let ready = async_engine::timeout(Duration::from_secs(5), async {
+                        loop {
+                            let snapshot = bosn_registry::Registry::open_read_only(
+                                directory.join("registry.sqlite3"),
+                            )
+                            .unwrap()
+                            .latest_cache_maintenance()
+                            .unwrap();
+                            if detail == "no such volume" && log.exists()
+                                || detail != "no such volume" && snapshot.is_some()
+                            {
+                                return;
+                            }
+                            async_engine::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await;
+                    stop.cancel();
+                    ready
+                };
+                let (_, ready) = async_engine::join(worker, observer).await;
+                ready.unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(log).unwrap(),
+                    "volume inspect bosn-ci-cache-v1\n"
+                );
+                let snapshot =
+                    bosn_registry::Registry::open_read_only(directory.join("registry.sqlite3"))
+                        .unwrap()
+                        .latest_cache_maintenance()
+                        .unwrap();
+                if detail == "no such volume" {
+                    assert!(snapshot.is_none());
+                } else {
+                    let snapshot = snapshot.unwrap();
+                    assert!(snapshot.helper.is_none());
+                    assert!(matches!(
+                        snapshot.outcome,
+                        bosn_registry::cache_maintenance::MaintenanceOutcome::Unknown { .. }
+                    ));
+                }
+            });
+        }
+    }
 
     #[test]
     #[ignore = "requires isolated private Docker with shared verified act2.7 cache"]

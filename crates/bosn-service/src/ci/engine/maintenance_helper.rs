@@ -99,7 +99,7 @@ impl DockerActBackend {
             if !version.ends_with(super::ACT_VERSION) {
                 return Err(format!("maintenance act version mismatch: {version}"));
             }
-            self.agree_cache_policy(&id, policy).await?;
+            self.require_cache_policy(&id, policy).await?;
             self.maintain_cache_cohort(&id, policy).await
         }
         .await;
