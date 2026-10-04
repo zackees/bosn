@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from ci import widget_artifact as artifact
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ci"))
+import widget_artifact as artifact
 
 
 class WidgetArtifactTests(unittest.TestCase):
