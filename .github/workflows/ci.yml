@@ -128,11 +128,6 @@ jobs:
         with:
           ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.95.0
-
       - name: Set up Python for PyO3 tests
         uses: actions/setup-python@v5
         with:
@@ -142,10 +137,15 @@ jobs:
         uses: astral-sh/setup-uv@v5
 
       - name: Set up Soldr
-        uses: zackees/setup-soldr@fe965fc7e2c5203570072e1d0fd19d0935d98e39
+        uses: zackees/setup-soldr@v0
         with:
           version: "0.9.27"
-          toolchain: "1.95.0"
+          cache: true
+          job-status: ${{ job.status }}
+          save-cache: auto
+          save-cache-remote: ${{ github.ref == 'refs/heads/main' && 'auto' || 'false' }}
+          target-cache: false
+          cargo-registry-cache: false
           prebuild-deps: none
 
       # No hand-keyed target cache (#361 phase 3): the former
@@ -223,6 +223,19 @@ jobs:
       - name: Docker engine version
         if: needs.select-tier.outputs.test == 'true'
         run: docker version
+
+      - name: Set up Soldr for Linux checks
+        if: needs.select-tier.outputs.test == 'true'
+        uses: zackees/setup-soldr@v0
+        with:
+          version: "0.9.27"
+          cache: true
+          job-status: ${{ job.status }}
+          save-cache: auto
+          save-cache-remote: ${{ github.ref == 'refs/heads/main' && 'auto' || 'false' }}
+          target-cache: false
+          cargo-registry-cache: false
+          prebuild-deps: none
 
       - name: Install
         if: needs.select-tier.outputs.test == 'true'
