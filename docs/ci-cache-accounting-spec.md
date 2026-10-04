@@ -1661,3 +1661,17 @@ The first promotion gate correctly refused the candidate at Rust formatting
 an extra blank line left when the helper test module was moved. Python static
 and repository guards passed; Rust tests and Linux tests were not claimed.
 The changed Rust files were formatted again before replaying the clean gate.
+
+The second gate (`33f51278-d38e-4018-a2e4-24f590db7a37`, cleanup Removed)
+passed format, Clippy and kernel boundary checks but failed the 50-submission,
+10-key concurrency test: its roughly five-second observation window expired
+with a run still Running before an engine ID was recorded. The private Docker
+service suite reproduced the failure (457 passed, one failed, 15 ignored),
+while that test alone passed in 2.14 seconds. Its burst-specific observation
+budget is now bounded at 30 seconds, and it additionally requires every run's
+conclusion to be Success; timeout/error completion cannot satisfy the test.
+With this change the full private Docker service suite passed: 458 passed,
+zero failed, 15 ignored, 35.70 seconds. Production run deadlines are unchanged.
+This is evidence of load-dependent test observation, not a proof of production
+latency. The exact-source promotion gate still needs a successful replay; its
+Linux lane did not run in either failed attempt.

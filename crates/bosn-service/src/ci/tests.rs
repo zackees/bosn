@@ -73,7 +73,12 @@ async fn submit(runtime: &CiRuntime, sha_byte: char) -> SubmitReply {
 async fn wait_done(runtime: &CiRuntime, run: &str) -> RunRecord {
     // The default run deadline is five seconds. Leave the test watchdog
     // room for terminal-state persistence and engine cleanup afterwards.
-    for _ in 0..1000 {
+    wait_done_with_budget(runtime, run, Duration::from_secs(10)).await
+}
+
+async fn wait_done_with_budget(runtime: &CiRuntime, run: &str, budget: Duration) -> RunRecord {
+    let deadline = std::time::Instant::now() + budget;
+    while std::time::Instant::now() < deadline {
         let record = runtime.record(run).unwrap();
         if record.state == RunState::Done {
             return record;
@@ -707,7 +712,10 @@ fn fifty_concurrent_submissions_with_ten_keys_make_ten_executions() {
         .await;
         for runs in by_key.values() {
             let run = runs.iter().next().unwrap();
-            let record = wait_done(&runtime, run).await;
+            // Ten runs share the registry actor and blocking record writer;
+            // the full parallel suite also loads the container's CPU and disk.
+            let record = wait_done_with_budget(&runtime, run, Duration::from_secs(30)).await;
+            assert_eq!(record.conclusion, Some(Conclusion::Success), "{record:?}");
             assert_eq!(record.submitters, 5, "five submitters joined {run}");
             assert_eq!(record.conclusion, Some(Conclusion::Success));
         }
