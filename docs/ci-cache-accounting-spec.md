@@ -2623,3 +2623,32 @@ only while eligible candidates remain. Logical generation size is not a predicte
 reclamation credit. Reaching a protected/unknown-only remainder above the cap must
 report protected overflow rather than deleting selected/live/unknown state or
 claiming convergence. This loop and object retirement are not implemented yet.
+
+
+#### Generation policy implementation in progress
+
+The local act2 `feat/tool-retention-policy` branch now has typed
+`ToolRetentionPolicy` and `RetainToolStore` APIs. The positive allocated-byte cap,
+explicit publication-age cutoff, maximum scanned entries (one million), maximum
+namespace candidates (ten thousand), and payload-validation ceiling are validated
+before mutation. The original catalog writer remains held throughout selection
+verification, complete initial accounting, bounded candidate enumeration and the
+sweep. Candidates are sorted by publication-directory modification time with an
+ID tie-break; the current selected generation is always preserved. Older eligible
+generations expire even below the cap; under pressure, younger unselected
+candidates can also retire. Reader-lock timeout protects a candidate. Other
+retirement failures mark the report partial. Every attempted mutation is followed
+by a fresh physical observation, including failures that may have partially
+removed data. Unknown namespace entries and all immutable objects stay intact.
+
+Focused regression was RED with missing APIs, then GREEN for expiry, live-reader
+protection followed by retry, unknown-state preservation and protected overflow.
+Further tests pass for young-generation preservation below the cap, pressure
+retirement and pre-mutation entry/candidate-bound refusal. Full artifactcache
+tests passed; initial lint found excessive function complexity and a deprecated
+bbolt error alias. The sweep is now a separate helper and uses the dependency's
+current errors package; focused boundary tests and lint pass. Independent review
+and final exact-source gate remain pending. No policy change is released or
+activated in Bosn. Object/stage expiry, last-use evidence beyond publication age,
+CLI integration, measured convergence across classes and production scheduling
+remain required.
