@@ -3194,3 +3194,26 @@ publication and proves recovery/lifetime behavior. Generation admission,
 trusted shared overlays, large-cache efficiency and whole-machine automatic
 expiry remain unfinished. Cumulative review and full publication gates remain
 required for this child candidate.
+
+
+### Startup merge and next publication boundary (2026-10-04)
+
+Startup PR #502 is merged as `797447baac73ff86e011eeeb214fdea37dfc72c0`.
+The corrected source passed all required local lanes in 937 seconds, exact
+stamped-head verification, and remote required checks before merge. Production
+cache-backed engine creation now uses verified act bootstrap before INIT; it
+still has no tool-generation reader and still copies the legacy tool tree.
+The uncertain-save child was rebased onto this main commit with an identical
+source tree, preserving its reviewed behavior and focused evidence. Its full
+publication gate remains required. Performance issue #503 tracks reducing the
+complete ordinary changed-source gate below 60 seconds without dropping checks.
+
+A possible engine-scoped snapshot mechanism is the cgroup v2 freezer. The
+[kernel documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+requires waiting for the frozen acknowledgement in `cgroup.events`; requesting
+a freeze is asynchronous. Process migration remains possible while a group is
+frozen. Therefore a production mechanism must also exclude new writers and
+uncontrolled migration, identify every relevant writer group, preserve the
+engine-owned generation reader, and bind the control operation to the verified
+private engine. A frozen flag alone is not a source-quiescence receipt. This
+is an investigation direction, not an implemented freezer or publication proof.
