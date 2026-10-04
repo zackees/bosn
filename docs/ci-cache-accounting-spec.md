@@ -3754,3 +3754,13 @@ seconds: `.git/retention-native-recovery-pin-release-full-package.log`.
 Candidate lint is now being checked. Review, cross-platform/full CI, release
 artifact verification and Bosn normal lifecycle enrollment remain pending;
 these commands are not shipped or called by normal Bosn planning yet.
+
+Candidate lint failed with three complexity-limit violations (reference
+inventory, reservation publication, combined retention), one import-format issue
+and one trailing whitespace issue. Evidence:
+`.git/retention-native-recovery-pin-candidate-lint.log`.
+Reference record decoding has since been separated from complete inventory
+validation; focused retention/recovery race tests still pass (1.519 seconds,
+`.git/retention-native-recovery-pin-refactor-tests.log`). Lint is not yet green;
+publication/retention refactoring and final formatting remain required before
+review or shipping. No correctness gate was relaxed.
