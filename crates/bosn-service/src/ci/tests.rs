@@ -71,7 +71,9 @@ async fn submit(runtime: &CiRuntime, sha_byte: char) -> SubmitReply {
 }
 
 async fn wait_done(runtime: &CiRuntime, run: &str) -> RunRecord {
-    for _ in 0..500 {
+    // The default run deadline is five seconds. Leave the test watchdog
+    // room for terminal-state persistence and engine cleanup afterwards.
+    for _ in 0..1000 {
         let record = runtime.record(run).unwrap();
         if record.state == RunState::Done {
             return record;
@@ -707,6 +709,7 @@ fn fifty_concurrent_submissions_with_ten_keys_make_ten_executions() {
             let run = runs.iter().next().unwrap();
             let record = wait_done(&runtime, run).await;
             assert_eq!(record.submitters, 5, "five submitters joined {run}");
+            assert_eq!(record.conclusion, Some(Conclusion::Success));
         }
         assert_eq!(*backend.executions.lock().unwrap(), 10);
         assert_eq!(backend.live(), 0, "no engine left");
