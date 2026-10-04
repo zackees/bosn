@@ -722,3 +722,31 @@ local integration experiments while Linux CI continues. The artifact is a
 CI snapshot, not an approved release or permanent download pin; Bosn's
 released artifact/version checks remain unchanged. Warm workflow execution
 with this binary and automatic Bosn policy/supervision are still unverified.
+
+### Warm migration headroom admission and native publication
+
+Act2 PR #22 now includes commit `0ae797d`. Import measures destination
+caller-available free bytes before archive copying and refuses unknown or
+insufficient space. The additional-space estimate is selected apparent
+archive lengths plus 64 KiB per archive and 64 MiB metadata headroom. Reports
+expose retained source archive bytes separately: when both stores use one
+filesystem, its current available space already accounts for retained data.
+This estimate is not a reservation against concurrent writes or an exact
+allocated-block budget, and does not implement Bosn's machine pressure floor.
+
+Focused RED refusal/accounting cases now pass. Failure-path tests leave source
+metadata and archives unchanged, remove the generated stage, and publish
+nothing. Native probes use Linux/macOS filesystem available blocks and Windows
+GetDiskFreeSpaceEx; other platforms explicitly refuse unknown space. Linux
+import race tests pass, the artifactcache race suite passed in 16.874 seconds,
+pinned lint reports zero issues, and Windows amd64/macOS arm64 cross-builds
+pass. Local review passed after fixing an exposed Windows publication bug.
+
+Windows now uses same-volume MoveFileEx with WRITE_THROUGH without replacement,
+after file/metadata close. Unix retains rename plus parent-directory sync and
+truthfully preserves Published after rename even on a later sync failure.
+Power-loss durability on arbitrary Windows filesystems is not established.
+Existing host CI jobs now include TestImport* to execute these native paths;
+no workflow files or runners were added. All CI checks passed for the previous
+8a2e84f candidate; the new head's native and full CI remain pending. Bosn warm
+cutover, old-peer exclusion and maintenance supervision remain open.
