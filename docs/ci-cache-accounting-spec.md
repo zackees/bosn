@@ -3312,7 +3312,7 @@ generation tests passed, including the race detector, in isolated Docker.
 Evidence: `.git/retention-native-admission-lock-{red,green,race}.log`.
 Primary source review and full PR platform CI passed. Act2 PR #47 is merged
 as `3016b36fbb439b557b76675945b0ab33e02cc14d`; exact-default-commit checks run
-`37234469601` is running before any release. The candidate is not in act2.8 or
+`37234469601` passed all five required jobs before tagging. The candidate is not in act2.8 or
 Bosn's pin. It does not remove full payload hashing or prove concurrent wall-time
 improvement for 7.7 GiB trees. Production frozen selection, reader handoff,
 shared overlay, source quiescence, and automatic retention remain required.
@@ -3412,5 +3412,22 @@ independent GitHub asset digests and sizes, executable architecture headers, and
 embedded version strings. Control evidence:
 `.git/act2-native-admission-release-v9-verifier-control.json`. This validates the
 verification procedure on the existing release; it is not act2.9 release evidence.
-The exact-commit act2 checks run remains pending and no new tag is authorized by
-this control alone.
+This control alone supplies no tag authorization; the separate exact-commit
+full CI gate is the release prerequisite.
+
+
+### Act2.9 tag and release workflow checkpoint (2026-10-04)
+
+Exact default-branch commit `3016b36fbb439b557b76675945b0ab33e02cc14d`
+passed dispatched checks run `37234469601`: lint, snapshot, Linux, macOS and
+Windows all completed successfully. A clean checkout, unchanged default-branch
+head and absence of both the tag and release were verified before tagging.
+Annotated `v0.2.89-act2.9` tag object
+`60b924efb73d76ff3368fc28cded65190c9597b1` peels to that exact commit.
+Existing release workflow run `37235462650` is running on the tag.
+
+Pre-tag evidence: `.git/act2-native-admission-release-v9-pretag-gate.json`.
+Release archives, independent asset digests, binary headers/versions and Linux
+runtime smoke still require verification. Bosn's pin remains act2.8 until those
+checks pass. This release step alone does not activate production shared tools,
+archive cohort migration, per-class automatic expiry or machine-wide allocation.
