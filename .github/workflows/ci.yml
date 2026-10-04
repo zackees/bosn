@@ -130,7 +130,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: zackees/ci.yml
-          ref: b93b8c4a20ce3cd476c75a278ad01a31bde2438b
+          # A ref that has `ci_lint local-gate verify`. The pin the shadow
+          # reuse step uses predates the whole local-gate command, so it cannot
+          # decide trust; this job needs its own, current pin.
+          ref: 7335ab6bc6d6bff7aea797336b503b50bb20e4f2
           path: .ci-lint
           persist-credentials: false
           sparse-checkout: ci_lint
