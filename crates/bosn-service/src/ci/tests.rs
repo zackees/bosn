@@ -157,10 +157,13 @@ fn identical_submissions_coalesce_and_distinct_ones_queue_behind_the_limit() {
         while *backend.executions.lock().unwrap() < 2 {
             async_engine::sleep(Duration::from_millis(5)).await;
         }
+        // Request both cancellations before waiting on either one's cleanup.
         for run in [&a, &b] {
             let cancelled: CancelReply =
                 call(&runtime, CiRequest::Cancel { run: run.clone() }).await;
             assert!(cancelled.cancelled);
+        }
+        for run in [&a, &b] {
             let done = wait_done(&runtime, run).await;
             assert_eq!(done.conclusion, Some(Conclusion::Cancelled));
             assert_eq!(done.cleanup.as_deref(), Some("removed"));
