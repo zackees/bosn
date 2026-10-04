@@ -750,3 +750,27 @@ Existing host CI jobs now include TestImport* to execute these native paths;
 no workflow files or runners were added. All CI checks passed for the previous
 8a2e84f candidate; the new head's native and full CI remain pending. Bosn warm
 cutover, old-peer exclusion and maintenance supervision remain open.
+
+## Native Windows coordination correction (candidate)
+
+CI run 37182945345 at act2 `0ae797d` passed full Linux tests, macOS
+import tests, lint and snapshot builds. Windows import tests failed before
+publication: bbolt attempted to truncate an intentionally read-only
+coordination descriptor while acquiring an exclusive lease.
+
+Windows now validates the existing bounded coordination database read-only,
+then takes a native exclusive LockFileEx lease over exactly bbolt's lock byte.
+Shared leases retain bbolt's read-only locking protocol. No writable descriptor
+or creation is permitted by inspection. Close releases the lock and handle
+idempotently; acquisition failure returns a nil lease. Unix retains its
+existing bbolt protocol.
+
+Read-only file preservation, shared/exclusive exclusion, separate-process
+transfer protection and import tests pass with the race detector in isolated
+Linux Docker (2.124 seconds); pinned lint reports zero issues. The previous
+full artifactcache race suite passed in 16.844 seconds after correcting a
+typed-nil lease regression. Windows package cross-build passed. Existing host
+CI now selects the lease and separate-process transfer tests as well as import
+tests. Review found no concrete protocol defect; native Windows execution of
+this correction remains pending. This does not complete Bosn policy wiring,
+maintenance supervision, warm cutover or machine-wide physical budgeting.
