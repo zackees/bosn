@@ -1,0 +1,75 @@
+# bosn's local gate (zackees/ci.yml#166, #168, #177, #190, #196, #198;
+# GATE-001..010).
+#
+# Before every push, from a clean, committed tree:
+#
+#   uvx --from git+https://github.com/zackees/ci.yml@<sha> ci-lint local-gate run
+#
+# runs `run` below and, on success, stamps HEAD with a tree-bound
+# `Local-Gate:` trailer plus one `Ci-Attestation:` trailer per gate of each
+# passed lane. CI's `ci-mode` job reads them: an attested, in-policy PR head
+# skips the remote jobs the gate already ran.
+[gate]
+run = ["uv", "run", "--no-project", "python", "ci/local_gate.py"]
+
+# No `mirrors` entry: the lane does not re-list ci.yml's commands, it replays
+# the real job with `bosn ci run --job`, so GATE-001's "a mirror must run the
+# same commands" check does not apply. ci-attestations.yml is what says which
+# job the lane may let a PR skip.
+setup-steps = []
+verify = "ci.yml:ci-mode"
+# These jobs are policy/observability checks, not work the gate mirrors: they
+# cost ~0.1m each and run on every PR by design. Listing them keeps GATE-002
+# from asking select-tier to gate them.
+# Only `rust` is skippable. select-tier picks the tier every other job reads,
+# and the remaining jobs are cheap policy/observability checks, so none of them
+# should be made to wait on ci-mode.
+verify-exempt = [
+  "select-tier",
+  "lint-no-macos-runners",
+  "ci-queue-timing",
+  "linux",
+  "native-wheel",
+  "darwin-cross-wheel",
+  "darwin-hosted-smoke",
+  "widget",
+  "full-coverage",
+]
+
+# Shadow: an unattested PR head is reported rather than failed, so a
+# contributor who has not adopted the gate still gets the full remote run.
+# Promote to "enforce" once `ci-lint local-gate first-pass` shows attested heads
+# are the norm (GATE-004).
+mode = "shadow"
+
+# zackees/ci.yml#168 (GATE-005): the Rust suite starts daemons and touches
+# state roots, so it must not run against a developer host. The guard refuses
+# any run that is not CI or the isolated gate image.
+#
+# There is deliberately no `proves-tree` here: that describes a `bosn run
+# --task` gate, whereas this lane replays a real CI job with `bosn ci run
+# --job`. ci/local_gate.py's receipt check proves the replay ran this
+# workspace, this commit, this engine and this event -- checked against the
+# immutable receipt rather than trusted from a container.
+[gate.isolation]
+marker = "BOSN_TEST_ISOLATED"
+runner = ["bosn", "ci", "run"]
+guard = "ci/gate_isolation_guard.sh"
+
+[gate.lanes.rust]
+run = ["uv", "run", "--no-project", "python", "ci/local_gate.py", "--lane", "rust"]
+tools = ["bosn"]
+
+[gate.trust]
+mode = "enforce"
+skip = ["ci.yml:rust"]
+covered-by = { "ci.yml:rust" = ["rust"] }
+# What only the skipped job runs, plus the surfaces a local lane cannot prove.
+surfaces = [
+  "bosn.toml",
+  ".github/workflows/ci.yml",
+  "ci/local_gate.py",
+  "ci/gate_isolation_guard.sh",
+  "ci/verify_kernel_boundary.py",
+  "ci-attestations.yml",
+]

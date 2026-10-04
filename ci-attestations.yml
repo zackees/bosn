@@ -1,0 +1,14 @@
+# bosn's gate definition (zackees/ci.yml#198, GATE-010).
+#
+# Which local gate lane proves which check, and which remote job that lane may
+# let an attested PR head skip. A remote job is skippable only when every gate
+# it runs is attested, so listing a job here claims the local lane really runs
+# it.
+#
+# The lane replays the real job with `bosn ci run --job rust`, so this mapping
+# cannot drift from .github/workflows/ci.yml.
+version: 1
+gates:
+  rust/all/test: {lane: rust}    # Rust workspace job, replayed in bosn
+jobs:
+  ci.yml:rust: [rust/all/test]

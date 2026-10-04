@@ -105,8 +105,52 @@ jobs:
         # spent on any wheel lane.
         run: uv run --no-project --with pyyaml==6.0.2 python ci/lint_no_macos_runners.py
 
+  # GATE-008/010: decide whether an attested PR head may skip the jobs the
+  # local gate already ran. A standalone job so a decision error can never turn
+  # a real check red, and so `rust` can read its output without depending on
+  # select-tier.
+  ci-mode:
+    name: CI mode
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      skip_rust: ${{ steps.gate.outputs.skip_rust }}
+    steps:
+      # Full history: the decision diffs the PR against its merge base and
+      # reads local-gate.toml as committed on the base.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: zackees/ci.yml
+          ref: b93b8c4a20ce3cd476c75a278ad01a31bde2438b
+          path: .ci-lint
+          persist-credentials: false
+          sparse-checkout: ci_lint
+      - name: Local gate attestation
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        working-directory: .ci-lint
+        run: >-
+          python3 -m ci_lint local-gate verify --repo .. --trust
+          --sha "${{ github.event.pull_request.head.sha || github.sha }}"
+          --github-output
+
   rust:
     name: Rust workspace (locked tests)
+    needs: ci-mode
+    # GATE-008/010: skipped only for an attested PR head whose `rust` lane
+    # passed (see ci-mode). This is the only job here with real runner cost --
+    # the rest are gated by the CI tier.
+    if: ${{ needs.ci-mode.outputs.skip_rust != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
