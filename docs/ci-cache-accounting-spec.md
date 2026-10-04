@@ -228,9 +228,9 @@ verification resources; none is a new production runner or cache contract.
 | Step | Work | Evidence required | State |
 |---|---|---|---|
 | 1 | Inventory current caches, accounting and cleanup; record a host sample | Code paths, current tests, read-only audit | Complete (survey above) |
-| 2 | Expose a typed breakdown for the shared cache and owned engine volumes | Focused RED to GREEN tests with accurate partial/unknown behavior | Shared cache implemented and tested in this branch; engine/retained-volume attribution open |
+| 2 | Expose a typed breakdown for the shared cache and owned engine volumes | Focused RED to GREEN tests with accurate partial/unknown behavior | Shared-cache apparent/allocated breakdown and machine-wide labelled volume attribution implemented/tested locally; bounded private-volume lifecycle correlation verified; per-private-volume allocated-block samples and legacy anonymous attribution open |
 | 3 | Add age/size policy for disposable act cache data and active-use coordination | Concurrent live runs retain hits; over-limit idle data shrinks; no cross-repo reads | act2 byte limit and cross-process transfer RED to GREEN; policy settings and idle-server maintenance tested; offline and aggregate completed-archive maintenance implemented locally; Bosn integration and automatic warm cutover open |
-| 4 | Account for and expire eligible old CI engines, host images and build cache | Fault/restart live Docker tests, exact ownership checks, repeated-run footprint trend | Existing lifecycle passes live end-state/restart tests; online retry implemented/tested; image/build-cache attribution/expiry and live failure replay open |
+| 4 | Account for and expire eligible old CI engines, host images and build cache | Fault/restart live Docker tests, exact ownership checks, repeated-run footprint trend | Named private storage requires independent absence proof; six live lifecycle scenarios and focused mount identity pass, expiring nested image/build-cache storage; online retry verified locally; host base/shared artifacts, legacy anonymous survivors, real partial-create/lost-ack replay and sustained growth checks open |
 | 5 | Wire pressure diagnostics and verify sustained warm workloads | Repeated cold/warm benchmark plus disk growth under the configured ceiling | Open |
 
 ### Decisions to preserve
@@ -507,4 +507,7 @@ explicitly exit on failure, before consuming or reporting the cached input.
 The failure test also checks stage cleanup and subsequent lock reuse; it went
 from RED to GREEN and passed in 1.32 seconds after the explicit failure exits.
 Final strict Clippy for all service targets and source-length/include/diff checks
-pass. A real fresh-engine cache-restore rerun is the next verification gate.
+pass. The real fresh-engine cache-restore rerun passed in 47.25 seconds with
+the new lock/publication shell against the pinned Docker image. It verifies
+cache contents restored across distinct engines; concurrent cold live hydration
+and interrupted-stage expiry remain open.
