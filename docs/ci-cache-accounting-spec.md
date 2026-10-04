@@ -3711,3 +3711,27 @@ Expired-record cleanup is implemented in this candidate; verified explicit
 release, CLI integration, review, full package/platform/release validation and
 Bosn source-volume lifetime activation remain incomplete. This evidence proves
 bounded metadata expiry, not automatic machine-wide cache maintenance.
+
+### Explicit recovery reference release (candidate, 2026-10-04)
+
+Act2 candidate `4cc45cb` adds `ReleaseToolRecoveryPin`. Under original catalog
+exclusion it validates the complete reference inventory and matches the exact
+frozen owner/generation/creation/expiry intent before unlinking a reference.
+Changed intent is refused without removal. A successful acknowledgement requires
+syncing the reference namespace; an absent retry repeats that sync to reconcile
+an earlier unlink whose acknowledgement was lost. Removed-but-partial does not
+prove durable absence. Cancellation before mutation leaves the reference intact.
+Non-Linux platforms explicitly refuse this operation without filesystem access.
+
+The caller must durably record completion and exclude further publication by
+that owner before release. The API does not establish source quiescence or
+source-volume ownership, and it does not retain an unbounded owner tombstone.
+These caller lifecycle obligations remain part of Bosn integration work.
+
+Focused release/retention race tests passed, including altered-intent refusal,
+injected directory-sync failure, idempotent reconciliation and cancellation:
+`.git/retention-native-recovery-pin-release-{red,green,boundaries}.log`.
+Before this addition the complete artifact-cache race suite passed in 22.114
+seconds (`.git/retention-native-recovery-pin-full-package.log`); that result does
+not validate the later release code. Candidate-wide review, lint/platform/full
+package validation, CLI exposure and production activation remain pending.
