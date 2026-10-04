@@ -2719,3 +2719,24 @@ Stage expiry, automatic production scheduling, CLI entry point, last-use evidenc
 remain open. These slices have not been released or pinned into Bosn. Old
 containers/images and scoped builder-cache pressure remain separate required
 parts of the original objective.
+
+
+#### Crash-leftover stage ownership gap
+
+Source inspection confirms object and generation publishers create private stages
+with `MkdirTemp`, report their paths and attempt deferred cleanup. They do not
+persist ownership evidence for a later crash-recovery sweep. A stage-looking
+prefix is therefore insufficient proof for deleting a discovered old directory.
+The planned fix records typed relative path, creation time and original
+filesystem/inode identity in the existing catalog database while its original
+writer is held. Publication and cleanup must retire this record after successful
+rename/removal. Crash windows before registration leave unknown preserved state;
+a record after rename must never authorize deleting a replacement at its old path.
+
+Focused new regressions are RED with missing stage-ownership and expiry APIs:
+original catalog exclusion blocks expiry during a living publisher, registered
+old stages expire, same-prefix unregistered directories remain, and replacement
+inode identities refuse deletion. Stage cleanup must also apply bounded metadata
+and mount-ID checks and report physical accounting after mutation. No stage was
+deleted from a production/shared cache during this investigation. Evidence:
+`act2-tool-stage-retention-red.log`. This work remains unimplemented.
