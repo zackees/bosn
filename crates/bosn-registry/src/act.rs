@@ -8,6 +8,8 @@ use super::*;
 use bosn_core::ResourceLabels;
 use serde::{Deserialize, Serialize};
 
+mod recovery;
+pub use recovery::ActToolRecoveryIntent;
 mod spare;
 pub use spare::ActEngineBinding;
 
@@ -236,6 +238,9 @@ pub struct ActEngineRecord {
     /// the spare over ([`Immediate::claim_act_spare`]), never otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<ActEngineBinding>,
+    /// Frozen before reserving a native lower; absent in historical records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_recovery: Option<ActToolRecoveryIntent>,
 }
 /// Keyset page ordered by immutable canonical run UUID, independent of state.
 #[derive(Clone, Debug, PartialEq)]
@@ -386,6 +391,9 @@ impl ActEngineIntent {
 impl ActEngineRecord {
     fn validate(&self) -> Result<(), Error> {
         self.intent.validate()?;
+        if let Some(recovery) = &self.tool_recovery {
+            recovery.validate_record(self)?;
+        }
         if (self.state == ActEngineState::Terminal) != self.removal.is_some()
             || self.removal.as_ref().is_some_and(|p| {
                 p.name != self.intent.engine_name()
@@ -514,6 +522,7 @@ impl Immediate<'_> {
             removal: None,
             updated_at: intent.created_at,
             binding: None,
+            tool_recovery: None,
         })
     }
     /// Exact ownership predicate for both registration and pending-intent

@@ -993,3 +993,6 @@ fn record_versions_refuse_profile_presence_mismatches() {
 
 #[path = "act_lifecycle/storage.rs"]
 mod storage;
+
+#[path = "act_lifecycle/recovery.rs"]
+mod recovery;
