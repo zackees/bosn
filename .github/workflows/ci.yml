@@ -230,6 +230,8 @@ jobs:
         with:
           version: "0.9.27"
           cache: true
+          # Fork the restored Rust foundation so wheel units can be saved too.
+          cache-key-suffix: linux-gate
           job-status: ${{ job.status }}
           save-cache: auto
           save-cache-remote: ${{ github.ref == 'refs/heads/main' && 'auto' || 'false' }}
