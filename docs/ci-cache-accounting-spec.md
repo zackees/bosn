@@ -522,3 +522,23 @@ The race-enabled workload/import tests pass (1.176 seconds), and pinned Go lint
 reports zero issues. This verifies act2 handler/file behavior, not Bosn's automatic
 maintenance loop or a physical machine ceiling. Namespace metadata and retained
 legacy-source bytes remain outside this archive cap; automatic cutover remains open.
+
+### act2 review: bounded inventory and interrupted deletion (local candidate)
+
+Review found that `filepath.WalkDir` materialized whole directories before the
+advertised entry/time checks. Inventory now reads 256 entries per page, with one
+shared 100,000-entry ceiling and a 64-directory depth ceiling. Focused tests cover
+oversized directories, cancellation and excessive depth.
+
+Review also found that interruption between archive removal and metadata deletion
+could permanently block offline maintenance. A typed deletion intent is now
+committed before file removal; cache metadata and intent are deleted in one final
+transaction. Offline preflight accepts missing archives only with a matching intent.
+Ordinary audit remains partial until recovery; unknown missing files still refuse
+maintenance. Cohort recovery starts only after every namespace passes preflight.
+Recovery receipts count zero newly reclaimed archive bytes when the file is already
+absent, and a second pass emits no duplicate deletion. Lookup preserves missing-file metadata so it cannot orphan the intent before
+recovery. Interruption, intervening lookup and cohort deferral tests pass; the full
+cache package passes race testing (17.315 seconds),
+and Go lint reports zero issues. These changes remain unshipped and do not change
+Bosn's released act2 pin or close the automatic maintenance/cutover gaps above.
