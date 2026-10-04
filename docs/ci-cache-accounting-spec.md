@@ -1885,3 +1885,44 @@ Rust 375 seconds, Linux 332 seconds, total 707 seconds, stamped commit
 85bc9afcba5760b4c3c418479c240a6620bc5a01 and tree
 d27b7f0616d9e4dfccc9118d35d759896af1dd53. The startup follow-up still
 requires its own integrated exact-source gate before promotion.
+
+### Stale Legacy planning cannot cross participating route publication
+
+The fixed shared route-record location is now
+`/bosn/cache/actcache/.bosn-cohort-routes-v1/<16-hex-namespace>`. This follow-up
+defines its admission fence only; it does not publish or parse routing records.
+Actual Legacy workflow invocation acquires the shared lifetime FD8 lease, then
+checks the namespace's record. Any record, including malformed content or a
+dangling symlink, refuses the stale invocation before act starts and requests
+replanning. Invalid/unreadable routing directories also refuse. Listing and
+explicit cohort invocations retain their existing lease behavior.
+
+The check belongs after lease acquisition: migration can publish while a
+previously planned Legacy job is waiting. The real shell/OS-lock proof marks
+the attempted acquisition before publication, confirms the job stays blocked,
+publishes while holding the exclusive migration lease, releases it, and requires
+exit 78 with no binary execution. The original unfenced wrapper is run against
+the same publication and reproduces the unsafe admission. Malformed/dangling
+records and an invalid routing directory refuse; genuine absence runs normally.
+Two focused lease tests passed in private Docker (0.14 seconds), preserving
+process-death lease release. Final all-target service Clippy passed (17.89
+seconds) and independent review passed. Integration still requires its own
+exact-source promotion gate.
+
+Inspection of the actual released act2.4 source confirms it has no cohort
+marker/admission protocol (`pkg/artifactcache/cohort.go` does not exist at that
+tag; its legacy handler directly opens the selected directory). Consequently
+a new marker or this participating Bosn wrapper cannot fence older binaries.
+Old-peer exclusion remains an enrollment prerequisite, alongside durable shared
+routing publication, current inventory and snapshot coordination. Neither an
+empty census nor this guard authorizes production migration. Default planning
+still selects warm Legacy; configured retention remains guarded.
+
+The preceding startup candidate passed its rebased exact-source gate: Rust
+325 seconds and Linux 330 seconds, total 654 seconds, stamped commit
+06deb89d233e with tree13207a267328092bda66ffaa54c55fad16b43ee7.
+The outer gate tool used the older pin and warned that `gate.replay` was unknown;
+the lanes themselves used the current source-bound checker and passed. Verification with the current repository's gate-tool pin passed:
+GATE-003 accepts the attestation for the exact tree. PR #483 now carries the
+verified rebased startup head and is mergeable; remote CI is running. No merge
+or Bosn release is claimed. This stale-route follow-up requires its own gate.

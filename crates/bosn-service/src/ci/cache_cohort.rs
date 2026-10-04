@@ -43,6 +43,10 @@ impl Namespace {
         }
         Ok(Self(value.into()))
     }
+    /// Shared routing publication, checked under the legacy admission lease.
+    pub fn routing_record_path(&self) -> String {
+        format!("{ENGINE_CACHE}/actcache/.bosn-cohort-routes-v1/{}", self.0)
+    }
     pub fn legacy_path(&self) -> String {
         format!("{ENGINE_CACHE}/actcache/{}", self.0)
     }
