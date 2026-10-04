@@ -229,7 +229,7 @@ verification resources; none is a new production runner or cache contract.
 |---|---|---|---|
 | 1 | Inventory current caches, accounting and cleanup; record a host sample | Code paths, current tests, read-only audit | Complete (survey above) |
 | 2 | Expose a typed breakdown for the shared cache and owned engine volumes | Focused RED to GREEN tests with accurate partial/unknown behavior | Shared cache implemented and tested in this branch; engine/retained-volume attribution open |
-| 3 | Add age/size policy for disposable act cache data and active-use coordination | Concurrent live runs retain hits; over-limit idle data shrinks; no cross-repo reads | act2 byte limit and cross-process transfer RED to GREEN; policy settings and idle-server maintenance tested; offline/global maintenance and Bosn integration open |
+| 3 | Add age/size policy for disposable act cache data and active-use coordination | Concurrent live runs retain hits; over-limit idle data shrinks; no cross-repo reads | act2 byte limit and cross-process transfer RED to GREEN; policy settings and idle-server maintenance tested; offline namespace audit/maintenance implemented locally; global maintenance and Bosn integration open |
 | 4 | Account for and expire eligible old CI engines, host images and build cache | Fault/restart live Docker tests, exact ownership checks, repeated-run footprint trend | Existing lifecycle passes live end-state/restart tests; image/build-cache attribution, expiry and online failure recovery open |
 | 5 | Wire pressure diagnostics and verify sustained warm workloads | Repeated cold/warm benchmark plus disk growth under the configured ceiling | Open |
 
@@ -258,3 +258,24 @@ verification resources; none is a new production runner or cache contract.
   is not a leak verdict.
 - Which detached stack/machine volumes remain useful and which registry owns
   them; do not infer from names or attachment alone.
+
+### Offline act2 maintenance progress (local candidate)
+
+The act2 checkout now offers typed paginated `cache audit` and explicit
+`cache prune --apply` for a namespace with no running server. A RED repro left
+160 bytes above a 100-byte ceiling; GREEN leaves the newest 80-byte archive.
+The audit creates nothing for absent stores and reports missing, busy and partial
+states separately. It refuses unknown/untracked inventories before deletion.
+Pages are capped at 12 entries and expose metadata/file-size fingerprints;
+these are consistency checks, not archive-content hashes. Metadata, temporary
+files and allocated-block accounting remain separate from completed-archive quota.
+
+Artifactcache race tests and focused offline CLI tests pass. Updated artifactcache/CLI packages also pass pinned golangci-lint v2.11.4
+with zero issues; the full CLI Docker result predates this extension. The candidate also reports bounded successful eviction receipts with typed
+reasons, reclaimed completed-archive lengths, remaining/protected budget bytes
+and an explicit budget-met flag. A protected over-budget namespace is not
+reported as meeting its ceiling. Read-only mount proof passes on a disposable Docker volume: EROFS write probe,
+accurate 160-byte inventory and byte-identical metadata. Sustained aggregate-budget
+tests remain open. Legacy
+servers do not honor the new transfer lock: Bosn still pins the released act2,
+and this candidate must not evict mixed-version shared stores.
