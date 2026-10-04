@@ -2652,3 +2652,29 @@ and final exact-source gate remain pending. No policy change is released or
 activated in Bosn. Object/stage expiry, last-use evidence beyond publication age,
 CLI integration, measured convergence across classes and production scheduling
 remain required.
+
+
+### Maintenance shutdown observation correction (2026-10-04)
+
+The object/stage spec's required Bosn gate failed in the existing stalled-client
+shutdown test: runtime teardown completed in 16.48 ms, but an immediate PID
+probe still observed the owned process. The process-session drop contract sends
+an asynchronous owner-drop notification; it does not synchronously prove reaping.
+The original isolated fixture also failed once in 32 concurrent attempts.
+
+A bounded reaping observation alone remained RED (2/64 attempts). Capturing the
+probe output in another 64-attempt series identified four failures caused by
+`ValueError: invalid literal for int() with base 10: ''`: cancellation observed
+the marker after creation but before its PID contents were written. The fixture
+now writes a private sibling and atomically renames it to publish a complete PID.
+The probe waits for actual PID absence, and the final elapsed-time assertion
+includes runtime teardown and observation within the original five-second
+cancellation budget. A live 12-second negative-control process was rejected.
+
+The corrected isolated focused test and all 64 attempts with four concurrent
+workers pass. Independent review passes. These are diagnostic checks in the
+private Rust harness, not the required gate on this exact source commit; that
+gate remains pending. No production cancellation code changed. This evidence
+does not prove that stopping a Docker client stops a remote command, nor does it
+close the daemon-crash, uncertain creation/start, or engine-lifetime recovery
+requirements.
