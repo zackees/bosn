@@ -1,4 +1,4 @@
-//! How full an engine's private storage got during a run, and what a run
+//! Pressure on the filesystem backing an engine, and what a run
 //! that failed with it nearly full says about it (#392).
 //!
 //! The storage is the engine's `/var/lib/docker`: an anonymous volume on the
@@ -20,7 +20,11 @@ pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(3);
 /// Where the storage is mounted in the engine.
 pub const STORAGE_PATH: &str = "/var/lib/docker";
 
-/// One sample of the storage, in bytes.
+/// One sample of the entire backing filesystem, in bytes.
+///
+/// Disk-backed anonymous volumes share this filesystem with other engines
+/// and host data. These counters are pressure signals, never owned allocation
+/// or inputs to additive machine-wide cache accounting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StorageUsage {
     pub size: u64,
@@ -105,21 +109,24 @@ impl StoragePeak {
 /// The log line for a sample that found the storage low.
 pub fn low_warning(usage: StorageUsage) -> String {
     format!(
-        "warning: the engine's storage is low ({}); a step that needs free space may fail",
+        "warning: the engine storage backing filesystem is low ({}); a step that needs free space may fail",
         usage.describe()
     )
 }
 
 /// The log line closing a run's sampling.
 pub fn peak_note(peak: StorageUsage) -> String {
-    format!("engine storage peaked at {}", peak.describe())
+    format!(
+        "engine storage backing filesystem peaked at {} (filesystem-wide; not engine-owned bytes)",
+        peak.describe()
+    )
 }
 
 /// Why a failed run may have failed, when its storage ran low.
 pub fn failure_reason(peak: StorageUsage) -> Option<String> {
     peak.is_low().then(|| {
         format!(
-            "the engine's storage ran low ({} at its peak): a step that needs free space \
+            "the engine storage backing filesystem ran low ({} at its peak): a step that needs free space \
              (soldr refuses to build under 5 GiB) or hit \"no space left on device\" may have \
              failed for it; free disk on the Docker host (disk-backed storage) or raise \
              storage_gib under [engine] in <state>/config.toml",
@@ -195,7 +202,10 @@ mod tests {
     #[test]
     fn a_failed_run_on_low_storage_says_so_and_names_the_setting() {
         let reason = failure_reason(usage(20.0, 16.0)).unwrap();
-        assert!(reason.contains("storage ran low"), "{reason}");
+        assert!(
+            reason.contains("storage backing filesystem ran low"),
+            "{reason}"
+        );
         assert!(reason.contains("16.0 of 20.0 GiB used, 4.0 GiB free"));
         assert!(reason.contains("storage_gib"));
         assert_eq!(failure_reason(usage(36.0, 16.0)), None);

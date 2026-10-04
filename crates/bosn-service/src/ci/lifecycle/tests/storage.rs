@@ -41,13 +41,13 @@ fn a_run_on_nearly_full_storage_records_the_peak_and_warns_in_the_log() {
     assert!(
         notes
             .iter()
-            .any(|n| n.starts_with("warning: the engine's storage is low")),
+            .any(|n| n.starts_with("warning: the engine storage backing filesystem is low")),
         "{notes:?}"
     );
     assert!(
         notes
             .iter()
-            .any(|n| n == "engine storage peaked at 16.0 of 20.0 GiB used, 4.0 GiB free"),
+            .any(|n| n == "engine storage backing filesystem peaked at 16.0 of 20.0 GiB used, 4.0 GiB free (filesystem-wide; not engine-owned bytes)"),
         "{notes:?}"
     );
 }

@@ -462,7 +462,10 @@ fn a_failed_run_on_nearly_full_storage_says_why_in_its_reason() {
     );
     assert_eq!(conclusion, Conclusion::Failure);
     let reason = reason.expect("a storage-starved failure explains itself");
-    assert!(reason.contains("storage ran low"), "{reason}");
+    assert!(
+        reason.contains("storage backing filesystem ran low"),
+        "{reason}"
+    );
     assert!(reason.contains("storage_gib"), "{reason}");
     // An engine failure keeps its own error first.
     let (_, reason) = report::conclude(
@@ -472,7 +475,10 @@ fn a_failed_run_on_nearly_full_storage_says_why_in_its_reason() {
     );
     let reason = reason.unwrap();
     assert!(reason.starts_with("runner load; "), "{reason}");
-    assert!(reason.contains("storage ran low"), "{reason}");
+    assert!(
+        reason.contains("storage backing filesystem ran low"),
+        "{reason}"
+    );
     // Roomy storage, or a run that did not fail, adds nothing.
     let roomy = super::storage::StorageUsage {
         size: 36 * GIB,
