@@ -3900,3 +3900,22 @@ on that exact default-branch commit as run `37241691702`:
 https://github.com/zackees/act2/actions/runs/37241691702
 The run is in progress. The candidate is not released or pinned by Bosn yet;
 exact default-branch CI and release artifact verification remain mandatory.
+
+### Durable reservation acknowledgement (candidate, 2026-10-04)
+
+Bosn candidate `b82550b` persists a separate reservation acknowledgement timestamp
+against the complete frozen intent and exact unexecuted engine claim. The trusted
+runtime may supply this only after the strict non-partial act2 receipt check.
+Expired acknowledgements, wrong intent/claim and invalid transition times refuse;
+identical acknowledged retries avoid another event. Snapshot decoding validates
+acknowledgement presence, finite time and its relation to intent and transition.
+Focused registry recovery tests pass, including persistence and expiry refusal:
+`.git/retention-bosn-tool-recovery-ack-tests.log` (0.12-second test execution).
+
+The prior transport review found no blocking issue, but noted command
+substitution strips trailing newlines. Existing request validation now also
+requires the exact encoded byte count, so added trailing newlines cannot pass.
+That transport adjustment still needs its final focused validation. Neither the
+persistence nor transport is called by normal lifecycle planning yet. Source
+stop, source-volume retention and completed publication/release transitions
+remain implementation work. Full act2 exact-merge CI remains in progress.
