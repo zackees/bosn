@@ -9,7 +9,16 @@ use super::{ActLine, ItemConclusion, ItemStatus, Job, RunTree};
 pub struct JobIdentity {
     #[serde(rename = "jobID")]
     pub job_id: String,
-    pub matrix: Option<Value>,
+    pub matrix: Value,
+}
+
+/// Retain invalid field shapes as a typed boundary error, rather than losing
+/// the entire log record and silently counting a different job as success.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub(super) enum QualifiedIdentity {
+    Valid(Vec<JobIdentity>),
+    Invalid(Value),
 }
 
 fn matrix(value: Option<&Value>) -> Option<&Value> {
@@ -21,25 +30,28 @@ impl ActLine {
         let Some(identity) = &self.job_identity else {
             return Ok(None);
         };
+        let QualifiedIdentity::Valid(identity) = identity else {
+            if let QualifiedIdentity::Invalid(value) = identity {
+                let _ = value;
+            }
+            return Err("invalid qualified execution identity shape".into());
+        };
         if identity.is_empty()
             || identity.len() > 32
             || identity.iter().any(|i| {
                 !super::super::workflow::valid_job_id(&i.job_id)
-                    || i.matrix
-                        .as_ref()
-                        .is_some_and(|m| !m.is_null() && !m.is_object())
+                    || (!i.matrix.is_null() && !i.matrix.is_object())
             })
             || identity.last().map(|i| i.job_id.as_str()) != self.job_id.as_deref()
-            || matrix(identity.last().and_then(|i| i.matrix.as_ref()))
-                != matrix(self.matrix.as_ref())
+            || matrix(identity.last().map(|i| &i.matrix)) != matrix(self.matrix.as_ref())
             || serde_json::to_vec(identity).map_or(true, |bytes| bytes.len() > 65536)
         {
             return Err("invalid qualified execution identity".into());
         }
         let mut canonical = identity.clone();
         for i in &mut canonical {
-            if matrix(i.matrix.as_ref()).is_none() {
-                i.matrix = None;
+            if matrix(Some(&i.matrix)).is_none() {
+                i.matrix = Value::Null;
             }
         }
         Ok(Some(canonical))

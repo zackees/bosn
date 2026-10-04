@@ -608,7 +608,8 @@
         "matrix": true
       },
       "required": [
-        "jobID"
+        "jobID",
+        "matrix"
       ],
       "type": "object"
     },

@@ -62,6 +62,7 @@ fn qualified_remote_jobs_and_unresolved_execution_paths_are_reported_correctly()
         1
     );
     for unresolved in [
+        r#"{"job":"missing-parent-matrix","jobID":"test","jobIdentity":[{"jobID":"validation"},{"jobID":"test","matrix":null}],"jobResult":"success"}"#,
         r#"{"job":"legacy","jobID":"test","jobResult":"success"}"#,
         r#"{"job":"unknown","jobID":"test","jobIdentity":[{"jobID":"unknown","matrix":null},{"jobID":"test","matrix":null}],"jobResult":"success"}"#,
         r#"{"job":"wrong-leaf","jobID":"test","jobIdentity":[{"jobID":"validation","matrix":null},{"jobID":"other","matrix":null}],"jobResult":"success"}"#,

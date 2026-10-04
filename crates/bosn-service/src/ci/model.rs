@@ -495,7 +495,7 @@ struct ActLine {
     #[serde(rename = "jobID")]
     job_id: Option<String>,
     #[serde(rename = "jobIdentity")]
-    job_identity: Option<Vec<JobIdentity>>,
+    job_identity: Option<identity::QualifiedIdentity>,
     matrix: Option<Value>,
     stage: Option<String>,
     step: Option<String>,
