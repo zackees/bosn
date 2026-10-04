@@ -511,3 +511,14 @@ pass. The real fresh-engine cache-restore rerun passed in 47.25 seconds with
 the new lock/publication shell against the pinned Docker image. It verifies
 cache contents restored across distinct engines; concurrent cold live hydration
 and interrupted-stage expiry remain open.
+
+### Repeated act2 warm/retention workload (local candidate)
+
+Eight cycles now exercise imported warm data, fresh HTTP servers, cold namespace
+growth and aggregate maintenance. Each adds 160 cold bytes; active servers defer
+GC, then idle maintenance stays within a 160-byte completed-archive ceiling while
+preserving the imported 80-byte warm archive. A final fresh server restores it.
+The race-enabled workload/import tests pass (1.176 seconds), and pinned Go lint
+reports zero issues. This verifies act2 handler/file behavior, not Bosn's automatic
+maintenance loop or a physical machine ceiling. Namespace metadata and retained
+legacy-source bytes remain outside this archive cap; automatic cutover remains open.
