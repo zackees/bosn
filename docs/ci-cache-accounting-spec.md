@@ -230,7 +230,7 @@ verification resources; none is a new production runner or cache contract.
 | 1 | Inventory current caches, accounting and cleanup; record a host sample | Code paths, current tests, read-only audit | Complete (survey above) |
 | 2 | Expose a typed breakdown for the shared cache and owned engine volumes | Focused RED to GREEN tests with accurate partial/unknown behavior | Shared cache implemented and tested in this branch; engine/retained-volume attribution open |
 | 3 | Add age/size policy for disposable act cache data and active-use coordination | Concurrent live runs retain hits; over-limit idle data shrinks; no cross-repo reads | act2 byte limit and cross-process transfer RED to GREEN; policy settings and idle-server maintenance tested; offline and aggregate completed-archive maintenance implemented locally; Bosn integration and automatic warm cutover open |
-| 4 | Account for and expire eligible old CI engines, host images and build cache | Fault/restart live Docker tests, exact ownership checks, repeated-run footprint trend | Existing lifecycle passes live end-state/restart tests; image/build-cache attribution, expiry and online failure recovery open |
+| 4 | Account for and expire eligible old CI engines, host images and build cache | Fault/restart live Docker tests, exact ownership checks, repeated-run footprint trend | Existing lifecycle passes live end-state/restart tests; online retry implemented/tested; image/build-cache attribution/expiry and live failure replay open |
 | 5 | Wire pressure diagnostics and verify sustained warm workloads | Repeated cold/warm benchmark plus disk growth under the configured ceiling | Open |
 
 ### Decisions to preserve
@@ -331,3 +331,31 @@ Bosn must verify quiescence rather than treating that flag as evidence. Import
 copies rather than removes legacy archives, so retained legacy bytes and temporary
 duplication must be included in headroom. Bosn integration, automatic safe cutover,
 retry, sustained workload and host image/build-cache expiry remain open.
+
+### Online engine cleanup progress (local candidate)
+
+Survey of current main found `CLEANUP_BUDGET = 180s`, so the older 60-second
+failure in #445 is not the current literal budget. However, durable failed
+retirements were retried only at startup; a running daemon could retain an engine
+until restart. The candidate daemon now runs a separate cancellable retry worker.
+Every pass scans at most 512 pending records and attempts at most one eligible
+retirement, with a 200-second whole-pass deadline, then waits 60 seconds. A cursor carries across passes and wraps at
+the end so early failures/active records cannot starve later cleanup.
+
+Only registry `cleanup_required` records are eligible, and a tracked CI run must
+already be done. Active claims are neither interrupted nor cleared. The existing
+backend still verifies registry ownership and exact immutable container identity,
+authorizes removal, requests `container rm --force --volumes`, and proves container
+name/ID absence before recording a terminal receipt. Retrying retirement expires
+that engine's private nested image/build-cache store along with its anonymous
+storage; the named warm cache remains protected. Successful retry updates the
+run's cleanup field but preserves its original execution verdict and history.
+
+All three isolated synthetic-host tests pass: recovery without daemon restart,
+preservation of an active claim, and cursor fairness across failed retirement.
+Strict Clippy for all bosn-service targets passes, as do source-length/include
+checks. The timed daemon worker and disk-backed fault paths still need live proof. No disk-backed timeout or partial-create replay
+has yet proved #445/#452 resolved on current main. Anonymous-volume absence is not
+independently recorded by the current container-only receipt, so an error after
+container removal still needs a stronger volume reconciliation proof. Host base
+images and shared cached image/tool artifacts also need separate expiry policy.

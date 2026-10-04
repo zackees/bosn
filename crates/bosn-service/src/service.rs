@@ -324,6 +324,52 @@ impl Service {
                 }
             })
         };
+        // Retry durable cleanup online; failed retirement must not wait for restart.
+        // This worker never uses startup interruption authority or shared prune.
+        let _ci_cleanup = {
+            let ci = ci.clone();
+            let owner = act_owner.clone();
+            let stop = self.stop.token();
+            async_engine::launch(async move {
+                let mut cursor = None;
+                loop {
+                    if stop.is_cancelled() {
+                        break;
+                    }
+                    let retry = async_engine::timeout(
+                        Duration::from_secs(200),
+                        ci.retry_cleanup(&owner, cursor.clone()),
+                    );
+                    let pass = async_engine::cancellable(&stop, retry).await;
+                    match pass {
+                        Ok(Ok(Ok(report))) => {
+                            cursor = report.next_cursor;
+                            if let Some(run) = report.retired {
+                                eprintln!("bosn CI cleanup retry removed {run}");
+                            }
+                            if let Some(reason) = report.deferred {
+                                eprintln!(
+                                    "bosn CI cleanup retry deferred for {}: {reason}",
+                                    cursor.as_deref().unwrap_or("unknown")
+                                );
+                            }
+                        }
+                        Ok(Ok(Err(error))) => eprintln!("bosn CI cleanup retry failed: {error}"),
+                        Ok(Err(_)) => eprintln!("bosn CI cleanup retry pass deadline exceeded"),
+                        Err(_) => break,
+                    }
+                    if async_engine::cancellable(
+                        &stop,
+                        async_engine::sleep(Duration::from_secs(60)),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+        };
         let mut clients = async_engine::TaskGroup::new();
         while !self.stop.is_cancelled() {
             // TaskGroup retains completed tasks until collected.  Reap only
