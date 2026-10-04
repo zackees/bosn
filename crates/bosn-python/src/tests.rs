@@ -16,6 +16,33 @@ use std::{
     },
 };
 
+// A promptness fixture must own its interpreter: other parallel libtest
+// cases can hold the process-wide GIL while its Python thread starts.
+#[cfg(feature = "embedded-python-tests")]
+fn isolated_python_fixture(test: &str) -> bool {
+    const CHILD: &str = "BOSN_PYTHON_SUBMIT_TEST_PARENT";
+    if let Some(parent) = std::env::var_os(CHILD) {
+        assert_ne!(
+            parent,
+            std::ffi::OsString::from(std::process::id().to_string())
+        );
+        return false;
+    }
+    let output = kernal_api::run_bounded_command(
+        kernal_api::SpawnSpec::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", test])
+            .env(CHILD, std::process::id().to_string()),
+        Duration::from_secs(10),
+        65536,
+    )
+    .expect("isolated Python submission fixture must finish");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.exit.is_success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("1 passed; 0 failed"), "{stdout}");
+    true
+}
+
 #[cfg(feature = "embedded-python-tests")]
 struct FakeSetupExecutor {
     started: AtomicUsize,
@@ -200,6 +227,11 @@ fn python_module_exposes_compose_plan_without_a_client_or_daemon() {
 #[cfg(feature = "embedded-python-tests")]
 #[test]
 fn python_client_submits_and_observes_fake_setup_job_without_docker() {
+    if isolated_python_fixture(
+        "tests::python_client_submits_and_observes_fake_setup_job_without_docker",
+    ) {
+        return;
+    }
     Python::initialize();
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let state = temporary.path().join("state");
@@ -299,6 +331,11 @@ fn python_client_submits_and_observes_fake_setup_job_without_docker() {
 #[cfg(feature = "embedded-python-tests")]
 #[test]
 fn python_client_submits_and_cancels_coalesced_fake_setup_task_without_docker() {
+    if isolated_python_fixture(
+        "tests::python_client_submits_and_cancels_coalesced_fake_setup_task_without_docker",
+    ) {
+        return;
+    }
     Python::initialize();
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let state = temporary.path().join("state");
@@ -394,6 +431,11 @@ fn python_client_submits_and_cancels_coalesced_fake_setup_task_without_docker() 
 #[cfg(feature = "embedded-python-tests")]
 #[test]
 fn python_client_submits_and_cancels_coalesced_fake_setup_ensure_without_docker() {
+    if isolated_python_fixture(
+        "tests::python_client_submits_and_cancels_coalesced_fake_setup_ensure_without_docker",
+    ) {
+        return;
+    }
     Python::initialize();
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let state = temporary.path().join("state");
