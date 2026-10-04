@@ -1057,3 +1057,19 @@ Strict service-library Clippy passed. The published-binary contract test passed 
 and supervision. Accounting/lifecycle PR #473 merged as
 `b23398aef9f9c12eb314e0835ca7a508391a07fd` after required checks passed;
 full hosted macOS/release checks were not requested or claimed.
+
+### Warm migration refuses a budget-induced cold cutover (act2 follow-up)
+
+Inspection and a focused RED test exposed an act2.5 import gap: two completed
+80-byte source archives with a 79-byte import ceiling published an empty
+cohort destination. The retained source survived, but destination existence
+then prevented a warmer retry. This conflicts with warm migration.
+
+The act2 candidate now refuses before staging/publication if completed
+archives were skipped for budget and none fit. Tests prove destination absence,
+unchanged source metadata, a successful 80-byte retry and actual HTTP restore
+of the retained archive. Genuinely empty-source initialization remains allowed.
+Import race tests passed (1.177 seconds), and pinned lint reported 0 issues.
+This follow-up is not yet released: Bosn's act2.5 pin still has the old edge
+case, and production enrollment remains guarded. A corrected dependency release
+and verified pin are needed before automatic migration can be enabled.
