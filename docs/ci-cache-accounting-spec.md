@@ -3234,3 +3234,13 @@ backing/VHD observations remain required. Do not add these filesystem counters
 to shared-cache totals or derive deletion eligibility from them. The four storage unit tests and two affected failure/lifecycle tests passed
 in isolated Docker via `soldr cargo`; `git diff --check` passed. Review and the
 required publication gate remain pending; production remains unchanged.
+
+
+An isolated Docker filesystem fixture confirms the attribution and deduplication
+risk: a 16 MiB allocated file plus its hard-link alias and a 256 MiB sparse file
+had 16 MiB unique file allocation (plus a 4 KiB directory), while summing file
+rows gave 32 MiB. The sparse file allocated zero blocks. `df` reported roughly
+1.46 TiB used for the backing filesystem. Evidence is retained locally in
+`.git/retention-accounting-scope-proof.json`. This fixture verifies Linux inode
+and block semantics only; it does not prove production machine-wide inventory,
+VHD reclamation, atomic concurrent accounting or automated expiry.
