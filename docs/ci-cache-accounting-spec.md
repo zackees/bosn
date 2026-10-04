@@ -6,6 +6,41 @@ Update the survey, implementation table and verification evidence in the same
 change as each implementation step. The desired behavior below is a contract,
 not a claim that it is already implemented. Related issue: #456.
 
+## Current implementation status (2026-10-04)
+
+Accounting/lifecycle foundation PR #473 merged as `b23398ae`. It adds
+bounded owned-footprint diagnostics, private-storage identity/reconciliation,
+and coordinated cleanup deadlines. Actual private-Docker tests prove shared
+archive hits across jobs and successive fresh engines; they do not prove
+sustained physical-footprint convergence. No new Bosn release is claimed.
+
+The retention candidate is in `../bosn-extern/bosn-retention`. It includes typed
+policy/arguments/import evidence and participating legacy-session leases.
+Production planning still refuses configured retention: warm migration, old-peer
+exclusion, durable routing and independent watcher supervision are unfinished.
+Tools/images/actions/tool-install expiry and host owned-image/build-cache
+pressure control remain open; successful private-engine retirement removes
+that engine's nested containers, images and build cache. Historical entries
+below record intermediate states and must not be read as current rollout status.
+
+Act2 v0.2.89-act2.6 is released from `d874c3b6`: exact-commit full CI
+37188971746 and release run 37189703504 passed. The Linux x86_64 archive
+SHA-256 is `75b703169f0feddec6724a98f7c88a5f115116036eeddeb443721675633879e2`;
+the extracted binary SHA-256 is
+`319dc105a22da9fb29cb08ee98457f0ebd9d50ea7b89ac7b311ccf26b6f623e8`.
+Published checksums match, and the isolated binary reports
+`act version 0.2.89-act2.6`. The candidate pin now selects these verified bytes.
+This fixes budget-induced empty warm cutover; it does not activate Bosn policy.
+
+Act2 PR #28 adds bounded historical import receipts published with the namespace
+for lost-acknowledgement recovery. The full artifactcache race suite passed
+(17.031 seconds), actual Cobra receipt/cutover tests passed, and native Windows
+and macOS PR checks passed. Full PR CI is still running; this receipt feature
+is not in act2.6. Bosn's typed parser checks exact namespace identity, historical
+and current byte ceilings, retained-source warmth, fingerprints and bounded
+archive receipts. Four isolated boundary tests and strict service-library
+Clippy passed; parsing historical evidence cannot authorize enrollment.
+
 ## Survey and evidence (2026-10-03)
 
 The read-only host audit in #456 measured ~859 GiB under `/var/lib/docker`.
@@ -1125,3 +1160,21 @@ new lifetime wrapper and frozen profiles (2 tests, 61.07 seconds): a later job
 restored an earlier job's archive, and a successive run restored it through a
 distinct fresh private engine. This verifies continued warm legacy sharing;
 it does not verify cohort migration or retention-policy activation.
+
+### Verified act2.6 pin and historical receipt boundary
+
+The published act2.6 CLI contract test passed (1 test, 0.16 seconds), as did
+four pin/proof consistency tests. The dependency is verified; production cache
+policy remains guarded. Four typed import/receipt boundary tests passed and
+strict library Clippy passed. Historical receipt validation shares the same
+checked archive count/digest/byte logic as import reports, binds both source
+and destination to the repository namespace, and requires a valid source
+fingerprint, original import ceiling, current repository ceiling and known
+retained-source warmth. It refuses populated-source empty evidence.
+
+The record is creation-time evidence only: current inventory, durable routing,
+publication reconciliation and old-writer exclusion remain caller obligations.
+This parser is prepared for act2 PR #28 and is not invoked against act2.6,
+which does not include the receipt command. Independent review found no blockers.
+Issue #456 now records merged accounting work and exact dependency release
+evidence while leaving the full acceptance criteria open.

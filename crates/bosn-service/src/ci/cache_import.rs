@@ -48,38 +48,12 @@ impl ImportReport {
         {
             return Err("import report identity, schema or byte ceiling mismatch".into());
         }
-        let receipts = report.receipts.as_deref().unwrap_or_default();
-        let count = u64::try_from(receipts.len()).map_err(|error| error.to_string())?;
-        if receipts.len() > 12
-            || count.checked_add(report.receipts_omitted) != Some(report.imported_count)
-        {
-            return Err("import receipt count mismatch".into());
-        }
-        let mut sources = BTreeSet::new();
-        let mut destinations = BTreeSet::new();
-        let mut receipt_bytes = 0_u64;
-        for receipt in receipts {
-            if receipt.source_id == 0
-                || receipt.destination_id == 0
-                || !sources.insert(receipt.source_id)
-                || !destinations.insert(receipt.destination_id)
-                || receipt.sha256.len() != 64
-                || !receipt
-                    .sha256
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
-                return Err("invalid import archive receipt".into());
-            }
-            receipt_bytes = receipt_bytes
-                .checked_add(receipt.bytes)
-                .ok_or("import receipt byte overflow")?;
-        }
-        if receipt_bytes > report.imported_bytes
-            || (report.receipts_omitted == 0 && receipt_bytes != report.imported_bytes)
-        {
-            return Err("import receipt byte total mismatch".into());
-        }
+        validate_receipts(
+            report.receipts.as_deref().unwrap_or_default(),
+            report.receipts_omitted,
+            report.imported_count,
+            report.imported_bytes,
+        )?;
         Ok(report)
     }
 
@@ -109,6 +83,96 @@ impl ImportReport {
         }
         Ok(())
     }
+}
+
+/// Historical creation-time evidence published inside an imported namespace.
+/// Parsing cannot authorize enrollment: current inventory, publication sync and
+/// writer exclusion still need independent reconciliation.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicationReceipt {
+    pub schema_version: u32,
+    pub source: String,
+    pub destination: String,
+    pub source_fingerprint: String,
+    pub max_bytes: i64,
+    pub retained_source_archive_bytes: Option<u64>,
+    pub imported_count: u64,
+    pub imported_bytes: u64,
+    pub receipts: Option<Vec<ImportReceipt>>,
+    pub receipts_omitted: u64,
+}
+impl PublicationReceipt {
+    pub fn parse(bytes: &[u8], namespace: &Namespace, policy: CachePolicy) -> Result<Self, String> {
+        if bytes.len() > 64 * 1024 {
+            return Err("publication receipt exceeds bounded output".into());
+        }
+        let receipt: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        if receipt.schema_version != 1
+            || receipt.source != namespace.legacy_path()
+            || receipt.destination != namespace.path()
+            || !valid_digest(&receipt.source_fingerprint)
+            || receipt.max_bytes <= 0
+            || !i64::try_from(receipt.imported_bytes).is_ok_and(|bytes| {
+                bytes <= receipt.max_bytes && bytes <= policy.repository_max_bytes
+            })
+            || receipt.retained_source_archive_bytes.is_none_or(|bytes| {
+                bytes > i64::MAX as u64
+                    || bytes < receipt.imported_bytes
+                    || (bytes > 0 && receipt.imported_count == 0)
+            })
+        {
+            return Err(
+                "publication receipt identity, schema or warm byte evidence mismatch".into(),
+            );
+        }
+        validate_receipts(
+            receipt.receipts.as_deref().unwrap_or_default(),
+            receipt.receipts_omitted,
+            receipt.imported_count,
+            receipt.imported_bytes,
+        )?;
+        Ok(receipt)
+    }
+}
+
+fn validate_receipts(
+    receipts: &[ImportReceipt],
+    omitted: u64,
+    imported_count: u64,
+    imported_bytes: u64,
+) -> Result<(), String> {
+    let count = u64::try_from(receipts.len()).map_err(|error| error.to_string())?;
+    if receipts.len() > 12 || count.checked_add(omitted) != Some(imported_count) {
+        return Err("import receipt count mismatch".into());
+    }
+    let mut sources = BTreeSet::new();
+    let mut destinations = BTreeSet::new();
+    let mut receipt_bytes = 0_u64;
+    for receipt in receipts {
+        if receipt.source_id == 0
+            || receipt.destination_id == 0
+            || !sources.insert(receipt.source_id)
+            || !destinations.insert(receipt.destination_id)
+            || !valid_digest(&receipt.sha256)
+        {
+            return Err("invalid import archive receipt".into());
+        }
+        receipt_bytes = receipt_bytes
+            .checked_add(receipt.bytes)
+            .ok_or("import receipt byte overflow")?;
+    }
+    if receipt_bytes > imported_bytes || (omitted == 0 && receipt_bytes != imported_bytes) {
+        return Err("import receipt byte total mismatch".into());
+    }
+    Ok(())
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(test)]
@@ -176,5 +240,41 @@ mod tests {
         assert!(parse(&value).unwrap().require_warm_publication().is_err());
         value["retained_source_archive_bytes"] = serde_json::json!(0);
         parse(&value).unwrap().require_warm_publication().unwrap();
+    }
+    #[test]
+    fn historical_receipt_refuses_foreign_incomplete_or_overflowed_evidence() {
+        let receipt = serde_json::json!({
+            "schema_version":1,"source":namespace().legacy_path(),"destination":namespace().path(),
+            "source_fingerprint":"b".repeat(64),"max_bytes":80,"retained_source_archive_bytes":160,
+            "imported_count":1,"imported_bytes":80,
+            "receipts":[{"source_id":1,"destination_id":1,"bytes":80,"sha256":"a".repeat(64)}],
+            "receipts_omitted":0
+        });
+        let parse_receipt = |value: &serde_json::Value| {
+            PublicationReceipt::parse(&serde_json::to_vec(value).unwrap(), &namespace(), policy())
+        };
+        parse_receipt(&receipt).unwrap();
+        for (field, invalid) in [
+            ("source", serde_json::json!("/foreign")),
+            ("destination", serde_json::json!("/foreign")),
+            ("schema_version", serde_json::json!(2)),
+            ("source_fingerprint", serde_json::json!("B".repeat(64))),
+            ("max_bytes", serde_json::json!(79)),
+            ("retained_source_archive_bytes", serde_json::Value::Null),
+            ("retained_source_archive_bytes", serde_json::json!(u64::MAX)),
+            ("receipts_omitted", serde_json::json!(u64::MAX)),
+            ("imported_count", serde_json::json!(2)),
+        ] {
+            let mut invalid_receipt = receipt.clone();
+            invalid_receipt[field] = invalid;
+            assert!(parse_receipt(&invalid_receipt).is_err(), "{field}");
+        }
+        let mut cold = receipt;
+        cold["imported_bytes"] = serde_json::json!(0);
+        cold["imported_count"] = serde_json::json!(0);
+        cold["receipts"] = serde_json::Value::Null;
+        assert!(parse_receipt(&cold).is_err());
+        cold["retained_source_archive_bytes"] = serde_json::json!(0);
+        parse_receipt(&cold).unwrap();
     }
 }
