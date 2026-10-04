@@ -3147,3 +3147,73 @@ This correction remains an unpublished startup candidate. Cumulative follow-up
 review and a new exact-source full gate are required. It does not add production
 generation admission or replace the legacy seed; the outstanding cache and
 machine-wide retention requirements above still apply.
+
+
+### Writer-quiescence survey and uncertain-save correction (2026-10-04)
+
+A further source survey found that `ci/lifecycle.rs` calls `save_toolcache`
+after cancellation, timeout, and execution transport failure if the engine
+claim still verifies. The shared legacy lease covers act execution; it does
+not cover the post-execution tool-cache save. Ownership of a live engine does
+not prove that its workflow writers have stopped. This is relevant to the
+planned native publisher's explicit source-quiescence requirement.
+
+There is actual runtime evidence: the rejected gate28 run
+`c2d22a89-ece4-4bf1-b888-a94dd8ffd258`, using released Bosn 0.1.15, ended
+`cancelled` but logged `tool cache saved in 0.5s` before its confirmed removal.
+The current source had the same unconditional save path. A controlled writer
+in the private Docker daemon independently continued changing an install
+payload after its launching client was terminated: progress advanced from
+2 to 6 over two seconds while the labelled engine remained live. The client
+reported exit code **0**. The engine was then ownership-checked and removed.
+Evidence: `retention-bootstrap-rejected-gate-cancellation.json`, that run's
+`log.jsonl` sequences 2834–2836, and
+`retention-toolcache-cancelled-writer-proof.{py,json,log}`. This controlled
+writer is not a complete production workflow or publication proof.
+
+The new lifecycle candidate skips tool publication for known cancellation,
+timeout, and execution-failure outcomes, preserves the existing machine-wide
+warm cache, and records why saving was skipped. Normal reported act exits
+still use the existing best-effort save, including completed installs from
+failed jobs. The timeout regression was RED. The cancellation fixture's old
+fixed delay could cancel before execution, so it now waits for an explicit
+execution acknowledgement; that acknowledged cancellation was also RED.
+Both are GREEN with the correction. All 14 lifecycle tests passed; the actual
+cohort Docker fixture remained ignored and is not claimed as coverage.
+Evidence: `retention-toolcache-uncertain-writers-red.log`,
+`retention-toolcache-cancellation-acknowledged-red.log`, and
+`retention-toolcache-uncertain-writers-acknowledged-green.log`.
+
+This correction is an unpublished child of the startup candidate. It prevents
+saving from **known uncertain** executions, but ordinary client exit is not
+sufficient proof of writer quiescence, as the zero-exit Docker experiment
+demonstrates. Do not set native publication's source-quiescent flag from an
+exit code or engine ownership check. The production transition still needs
+an engine-scoped mechanism that excludes all relevant writers during snapshot
+publication and proves recovery/lifetime behavior. Generation admission,
+trusted shared overlays, large-cache efficiency and whole-machine automatic
+expiry remain unfinished. Cumulative review and full publication gates remain
+required for this child candidate.
+
+
+### Startup merge and next publication boundary (2026-10-04)
+
+Startup PR #502 is merged as `797447baac73ff86e011eeeb214fdea37dfc72c0`.
+The corrected source passed all required local lanes in 937 seconds, exact
+stamped-head verification, and remote required checks before merge. Production
+cache-backed engine creation now uses verified act bootstrap before INIT; it
+still has no tool-generation reader and still copies the legacy tool tree.
+The uncertain-save child was rebased onto this main commit with an identical
+source tree, preserving its reviewed behavior and focused evidence. Its full
+publication gate remains required. Performance issue #503 tracks reducing the
+complete ordinary changed-source gate below 60 seconds without dropping checks.
+
+A possible engine-scoped snapshot mechanism is the cgroup v2 freezer. The
+[kernel documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+requires waiting for the frozen acknowledgement in `cgroup.events`; requesting
+a freeze is asynchronous. Process migration remains possible while a group is
+frozen. Therefore a production mechanism must also exclude new writers and
+uncontrolled migration, identify every relevant writer group, preserve the
+engine-owned generation reader, and bind the control operation to the verified
+private engine. A frozen flag alone is not a source-quiescence receipt. This
+is an investigation direction, not an implemented freezer or publication proof.
