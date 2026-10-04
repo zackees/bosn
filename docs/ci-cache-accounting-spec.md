@@ -3244,3 +3244,240 @@ rows gave 32 MiB. The sparse file allocated zero blocks. `df` reported roughly
 `.git/retention-accounting-scope-proof.json`. This fixture verifies Linux inode
 and block semantics only; it does not prove production machine-wide inventory,
 VHD reclamation, atomic concurrent accounting or automated expiry.
+
+
+### Released act2.8: 1 GiB warm-cache measurements (2026-10-04)
+
+A controlled fixture used the verified released Linux x64 binary, an isolated
+Go container's private `/tmp` tmpfs, one quiescent completed install with a
+1 GiB allocated zero-filled payload, and a 2 GiB logical-byte bound. All timings
+include `docker exec` client overhead; they are wall time, not CPU time.
+
+| Phase | Seconds | Result |
+|---|---:|---|
+| Create source payload | 1.526 | Completed before publication; no source writer remained |
+| Publish closed object | 6.985 | Published, complete |
+| Assemble and initialize selected generation | 2.217 | Selected, complete |
+| Validate current selection, three warm runs | 0.926 / 0.881 / 1.082 | Same generation ID |
+| Acquire reader and exec, three warm runs | 0.876 / 0.832 / 1.237 | Reader descriptor environment value verified |
+
+The explicit bounded metadata audit visited 19 paths and 18 unique inodes,
+reported 1,073,790,976 allocated bytes and 2,147,517,791 referenced file bytes,
+and was complete. This confirms object/generation payload hardlinks do not
+double the unique allocation. The first audit command omitted `--max-entries`:
+it correctly returned nonzero with partial status and unknown totals. That
+failed invocation is retained as evidence, not reported as successful.
+
+A negative control changed one payload byte while preserving size and mtime.
+`tool-current` refused it in 1.384 seconds with `tool generation payload differs;
+existing data preserved`. Restoring the original byte and mtime restored
+admission in 1.341 seconds. An optimization based only on size and mtime would
+miss this corruption; do not replace content validation with those fields.
+
+Evidence: local `.git/retention-large-tool-benchmark.{py,json,log}`. Generation
+`97b8606089402a23068d7bf32bb14cd9e23dbd25eb4dd7878a2506dd8ef08370`
+and object `5d66737eddb513d4679de12b8f0f5298c67f21e3401871eb3652b4ca51f5cf72`
+remain in the private fixture store for inspection. This does not measure cold
+disk, many-file tool trees, 7.7 GiB payloads, production startup, actual PID1
+lease lifetime, concurrent admission/publication, or complete gate latency.
+The source still validates content on selection and again on reader admission;
+production integration should avoid redundant planning validation where the
+native admission already supplies the required proof, while preserving exact
+frozen generation identity and refusal on missing or changed data.
+
+
+### Writer uncertainty and concurrent native admission checkpoint (2026-10-04)
+
+Bosn PR #504 is merged as `753d8a1575c6a8bc6a5a5085c353a387acf1afa9`.
+Its full local gate passed in 998 seconds (Rust 448, Linux 550), exact stamped
+commit `49ba670ab6a28e07cdfa42b1e7165ff3da4ac8eb` verified, and remote checks
+passed before merge. Known cancellation, timeout and execution failure now skip
+legacy tool saving. Ordinary reported exits still retain best-effort saving:
+client exit alone still does not establish native publisher source quiescence.
+
+The act2 admission survey found that generation payload hashing holds the
+store-wide catalog mutex for the entire validation. That serializes independent
+engines' large-cache admission and unrelated publication. Candidate act2
+`071d429` acquires the original generation reader under catalog exclusion,
+then releases the catalog before hashing. The reader excludes generation
+retirement while content validation still runs unchanged. Failed validation
+closes the reader and returns no admitted lease; native exec retains the exact
+original descriptor as before.
+
+The focused regression was RED with the old lock scope. GREEN coverage proves
+the catalog is available during validation, another admission and unrelated
+generation publication proceed, the current generation's exclusive reader-lock
+writer remains blocked, and failed validation releases the reader. Existing
+generation tests passed, including the race detector, in isolated Docker.
+Evidence: `.git/retention-native-admission-lock-{red,green,race}.log`.
+Primary source review and full PR platform CI passed. Act2 PR #47 is merged
+as `3016b36fbb439b557b76675945b0ab33e02cc14d`; exact-default-commit checks run
+`37234469601` passed all five required jobs before tagging. The candidate is not in act2.8 or
+Bosn's pin. It does not remove full payload hashing or prove concurrent wall-time
+improvement for 7.7 GiB trees. Production frozen selection, reader handoff,
+shared overlay, source quiescence, and automatic retention remain required.
+
+
+The native admission candidate also passed a real CLI concurrency comparison
+against the verified released act2.8 Linux binary on the same warm 1 GiB
+private tmpfs generation. Three simultaneous admissions per trial, three trials:
+act2.8 admitted 3/9 and refused the other 6 with catalog `timeout`; candidate
+`071d4299993b862aed724fd5da69bf166f792172` admitted 9/9. Candidate batch
+wall times were 0.967, 1.027 and 1.060 seconds, including Docker client overhead.
+All successful commands verified a nonempty inherited reader FD environment
+value. Candidate binary SHA-256:
+`61de1050ac88da869fd1dba0b49b30e6ce97b9a8dbaa70c413d3f96fdfcce1de`.
+
+Evidence: `.git/retention-native-admission-concurrent-runtime.{py,json,log}`.
+This is an actual simultaneous CLI admission test, not a production Bosn
+workflow or PID1 lifetime test. It confirms catalog contention can fail warm
+admission even on a 1 GiB tree, and that shortening exclusion resolves those
+observed failures without dropping payload validation. It does not establish
+cold-disk scaling, general starvation bounds, many-engine pressure limits,
+7.7 GiB performance, or complete gates under 60 seconds. The whole artifact-cache
+package passed with the race detector (22.734 seconds), including retention
+coverage, after the focused generation tests.
+
+
+### Post-stop read-only publication survey (2026-10-04, fixture only)
+
+A controlled private-Docker fixture retained a task-owned named source volume
+while removing its writer container. The writer advanced from 10 to 21 after
+its launching client reported exit code 0. After label-checked source-container
+removal, inspection confirmed its absence and no volume attachments. A separate
+controlled finalizer wrote the completion marker and exited; it was removed
+before the publisher started. A fresh helper mounted the exact original source
+volume read-only and a distinct task-owned destination volume read-write.
+
+The verified released act2.8 CLI published a complete `sibling-v1` object from
+that read-only source. Payload remained `23` over the stability check and the
+published payload matched it. Native report: published=true, partial=false,
+2 payload bytes and 2 entries. All source/finalizer/helper containers and both
+volumes were label-checked and removed; cleanup completed.
+
+Evidence: `.git/retention-post-stop-publication-proof.{py,json,log}`. Earlier
+streaming and noexec-tmpfs harness failures are preserved separately as
+`retention-post-stop-publication-proof-{stream,exec}-failure.{json,log}`; their
+resources were cleaned up and they are not successful publication evidence.
+
+For disk-backed production runs this supports investigating publication from
+retained private storage *after* proven source-engine shutdown, instead of
+claiming quiescence from client exit or a completion marker. Required integration:
+freeze the exact named storage identity; protect it against cleanup/GC throughout
+the handoff; prove original engine/process absence and refuse unknown or foreign
+attachments; mount that original source read-only in an owned publisher; retain
+old-generation protection while reconstructing any merged overlay; publish only
+completed entries into the latest selected generation; then reconcile helper
+and source-volume removal. Partial publication must preserve the prior shared
+selection and expose pending storage/byte-budget evidence for bounded retry or
+safe expiry.
+
+This fixture does not implement that lifecycle, recover overlays/metacopy data,
+prove arbitrary workflow process/cgroup exclusion, or authorize removal of active
+engines. It does not apply to memory-backed private storage, which disappears
+with its engine; that mode requires a separately verified handoff while data
+still exists. Bosn still uses legacy best-effort tool saving on ordinary exits.
+
+
+### Compiler-cache survey during accounting gate32 (2026-10-04)
+
+Rust run `f8909fcd-e93a-43a4-90ec-2e656d228d59` passed in the 863-second
+pre-rebase gate. Its setup-soldr post-step explicitly reported setup-cache miss,
+target cache disabled, compiler build-cache exact hit, and Cargo-registry cache
+disabled. The exact-hit compiler archive was not saved again (`layers_saved=0/1`,
+`uploaded=0B`), despite compilation producing new cache objects in the run's
+private cache. This merits investigating how useful new objects reach the next
+fresh engine; an exact-hit immutable archive alone does not demonstrate that.
+
+The final compiler summary reported 57 hits, 7 misses, 65 compilations and one
+non-cacheable invocation. Its own provenance said `global-fallback`, originating
+workspace unknown, and missing per-session journal. Do not attribute those
+counts, the 89.1% hit rate, or estimated 63.6 seconds saved to the entire Rust
+lane: the report is last-writer-wins fallback evidence, not a complete sum of
+all compiler commands. Separate log entries include foundation misses. The
+workflow test step took 3m45.7s even with cache restoration; successful archive
+restore is not proof of efficient end-to-end execution or persistent new-cache
+publication.
+
+Evidence: `.git/retention-gate32-compiler-cache-survey.json` and the run's retained
+`log.jsonl`. No compiler-cache policy was changed by this survey. Native shared
+tool generations, compiler object sharing/coordination, and artifact archive
+cohort retention are distinct contracts and need separate accounting and
+publication evidence.
+
+
+The prepared act2.9 release-asset verifier was exercised against all 11 existing
+act2.8 archives as a control. Checks passed for archive/checksum-file hashes,
+independent GitHub asset digests and sizes, executable architecture headers, and
+embedded version strings. Control evidence:
+`.git/act2-native-admission-release-v9-verifier-control.json`. This validates the
+verification procedure on the existing release; it is not act2.9 release evidence.
+This control alone supplies no tag authorization; the separate exact-commit
+full CI gate is the release prerequisite.
+
+
+### Act2.9 tag and release workflow checkpoint (2026-10-04)
+
+Exact default-branch commit `3016b36fbb439b557b76675945b0ab33e02cc14d`
+passed dispatched checks run `37234469601`: lint, snapshot, Linux, macOS and
+Windows all completed successfully. A clean checkout, unchanged default-branch
+head and absence of both the tag and release were verified before tagging.
+Annotated `v0.2.89-act2.9` tag object
+`60b924efb73d76ff3368fc28cded65190c9597b1` peels to that exact commit.
+Existing release workflow run `37235462650` passed on the tag.
+
+Pre-tag evidence: `.git/act2-native-admission-release-v9-pretag-gate.json`.
+Release archives, independent asset digests, binary headers/versions and Linux
+runtime smoke still require verification. Bosn's pin remains act2.8 until those
+checks pass. This release step alone does not activate production shared tools,
+archive cohort migration, per-class automatic expiry or machine-wide allocation.
+
+
+### Released act2.9 artifact verification and overlay recovery evidence (2026-10-04)
+
+All 11 act2.9 release archives passed checks against the checksum manifest and
+independent GitHub asset digests/sizes, executable architecture headers, and
+embedded version strings. Linux x86_64 executed in the private Go container and
+reported `0.2.89-act2.9`. Other platforms have static artifact verification and
+exact-commit CI evidence, not local native execution. Evidence:
+`.git/act2-native-admission-release-v9-verification.json`.
+
+Accounting PR #505 merged as `eb8cac903cf0df2df605567bc73721e4f585ad58`.
+Its exact combined candidate passed gate33 in 999 seconds. Storage pressure is
+now explicitly backing-filesystem usage, not engine-owned cache allocation;
+this wording correction does not implement cross-class physical accounting.
+
+The post-stop overlay fixture now passes. A task-owned source container used an
+immutable lower and retained disk upper/work; chmod created a metadata-only
+16 MiB payload copy-up with zero allocated upper blocks. After label-checked
+source removal, a fresh helper reconstructed the metacopy overlay and explicitly
+remounted the merged view read-only. Released act2.8 published completed
+`Python/3.13/x64` and `New/2/x64` objects. Payload hash and mode 600 matched,
+changed private settings were published, lower settings stayed unchanged, and
+upper payload allocation remained zero blocks. All fixture containers and three
+volumes were removed after label checks. Evidence:
+`.git/retention-post-stop-overlay-recovery-proof.json`.
+
+The helper mounted retained upper/work storage writable to construct the overlay;
+only the merged publication source was read-only. This controlled kernel/native
+publication fixture does not prove production Bosn lifecycle fencing, original
+reader handoff, migration, arbitrary writer exclusion, whiteout/opaque/redirect
+handling, or memory-storage recovery. Production post-stop recovery remains
+unimplemented. Earlier capability/remount setup failures are retained separately;
+they were corrected before this success was recorded.
+
+
+Released act2.9 repeated the warm 1 GiB concurrent admission fixture: three
+simultaneous readers across three trials succeeded 9/9, versus act2.8's 3/9
+(the other six hit catalog-lock timeouts). Released act2.9 batch wall times were
+1.339, 1.312 and 1.369 seconds including Docker client overhead. Commands asserted
+a nonempty lease-FD environment value; this does not independently prove full
+production descriptor lifetime or PID1 handoff. Evidence:
+`.git/retention-native-admission-released-v9-runtime.json`.
+
+This branch now updates Bosn's act version, Linux archive URL, archive digest and
+executable digest to verified act2.9. Source review and the complete local gate
+remain required before publication. The released native admission optimization
+permits concurrent content validation while the original generation reader
+protects the payload; it does not weaken corruption checks or activate Bosn's
+pending shared-cache lifecycle.
