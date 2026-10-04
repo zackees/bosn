@@ -212,6 +212,17 @@ pub fn create_arguments(
         .creation_profile
         .as_ref()
         .and_then(|profile| profile.cache_volume.clone());
+    if cache.is_some() {
+        let act = crate::ci::pins::act_artifact("amd64")
+            .ok_or_else(|| ActEngineError("no pinned startup act artifact".into()))?;
+        if intent.act_version != crate::ci::pins::ACT_VERSION
+            || intent.act_image_digest != format!("sha256:{}", act.sha256)
+        {
+            return Err(ActEngineError(
+                "startup act differs from frozen intent".into(),
+            ));
+        }
+    }
     let expected_profile = creation_profile_with_cache(limits, cache.clone())?;
     if intent.creation_profile.as_ref() != Some(&expected_profile) {
         return Err(ActEngineError(
@@ -284,7 +295,7 @@ pub fn create_arguments(
         "docker.io/library/docker@{}",
         intent.engine_image_digest
     ));
-    args.extend(engine_command());
+    args.extend(engine_command_with_cache(cache.as_ref())?);
     Ok(args)
 }
 

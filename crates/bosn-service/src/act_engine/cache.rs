@@ -42,11 +42,47 @@ pub(crate) fn creation_profile_with_cache(
     profile.cache_coordination = cache
         .as_ref()
         .map(|_| bosn_registry::act::ActCacheCoordination::SharedLegacyLeaseV1);
+    profile.init_command_sha256 = command_digest(&engine_command_with_cache(cache.as_ref())?)?;
     profile.cache_volume = cache;
     profile
         .validate()
         .map_err(|error| ActEngineError(error.to_string()))?;
     Ok(profile)
+}
+
+/// A cache-backed engine verifies and installs act while it is still the
+/// dedicated startup process. The command digest freezes both artifact hashes
+/// and the exact install/INIT chain before durable registration and creation.
+/// Engines without a shared cache retain their historical command identity.
+pub(super) fn engine_command_with_cache(
+    cache: Option<&ActEngineCacheVolume>,
+) -> Result<Vec<String>, ActEngineError> {
+    let Some(cache) = cache else {
+        return Ok(engine_command());
+    };
+    cache
+        .validate()
+        .map_err(|error| ActEngineError(error.to_string()))?;
+    use crate::ci::engine::{ENGINE_CACHE, ENGINE_WORK, act_artifact, install_act_script};
+    if cache.target != ENGINE_CACHE {
+        return Err(ActEngineError(
+            "startup requires the canonical shared cache mount".into(),
+        ));
+    }
+    let act = act_artifact("amd64")
+        .ok_or_else(|| ActEngineError("no pinned startup act artifact".into()))?;
+    let script = format!(
+        "set -eu; mkdir -p {ENGINE_WORK}/bin; {}; exec 9>&-; exec \"$@\"",
+        install_act_script(act),
+    );
+    let mut command = vec![
+        "sh".into(),
+        "-ec".into(),
+        script,
+        "bosn-act-bootstrap".into(),
+    ];
+    command.extend(engine_command());
+    Ok(command)
 }
 
 /// `--mount` for the frozen cache volume.
@@ -195,6 +231,74 @@ pub(super) fn volume_mounts_match(
 #[cfg(test)]
 mod ownership_tests {
     use super::*;
+
+    #[test]
+    fn cache_backed_engine_freezes_verified_act_install_before_init() {
+        let limits = super::super::tests::limits();
+        let mut intent = super::super::tests::intent();
+        let act = crate::ci::pins::act_artifact("amd64").unwrap();
+        intent.act_version = crate::ci::pins::ACT_VERSION.into();
+        intent.act_image_digest = format!("sha256:{}", act.sha256);
+        let cache = ActEngineCacheVolume {
+            name: "bosn-ci-cache-v1".into(),
+            target: crate::ci::engine::ENGINE_CACHE.into(),
+        };
+        intent.creation_profile = Some(creation_profile_with_cache(limits, Some(cache)).unwrap());
+        let args = create_arguments(&intent, ANY_REGISTRY, limits).unwrap();
+        let image = format!("docker.io/library/docker@{}", intent.engine_image_digest);
+        let index = args.iter().position(|argument| argument == &image).unwrap();
+        let command = &args[index + 1..];
+        assert!(
+            command[2].contains("sha256sum -c -"),
+            "act must be verified before engine INIT"
+        );
+        assert!(
+            command[2].contains(
+                crate::ci::pins::act_artifact("amd64")
+                    .unwrap()
+                    .binary_sha256
+            )
+        );
+        assert!(
+            command[2].contains("exec 9>&-"),
+            "archive writer must close before engine lifetime"
+        );
+        // The isolated runtime fixture consumes the compiled command generator.
+        println!(
+            "BOOTSTRAP_COMMAND_JSON={}",
+            serde_json::to_string(command).unwrap()
+        );
+        assert_eq!(
+            command_digest(command).unwrap(),
+            intent.creation_profile.unwrap().init_command_sha256
+        );
+    }
+
+    #[test]
+    fn startup_refuses_an_artifact_different_from_the_frozen_intent() {
+        let limits = super::super::tests::limits();
+        let mut intent = super::super::tests::intent();
+        let act = crate::ci::pins::act_artifact("amd64").unwrap();
+        intent.act_version = crate::ci::pins::ACT_VERSION.into();
+        intent.act_image_digest = format!("sha256:{}", act.sha256);
+        intent.creation_profile = Some(
+            creation_profile_with_cache(
+                limits,
+                Some(ActEngineCacheVolume {
+                    name: "bosn-ci-cache-v1".into(),
+                    target: crate::ci::engine::ENGINE_CACHE.into(),
+                }),
+            )
+            .unwrap(),
+        );
+        assert!(create_arguments(&intent, ANY_REGISTRY, limits).is_ok());
+        let mut wrong = intent.clone();
+        wrong.act_version = "old-release".into();
+        assert!(create_arguments(&wrong, ANY_REGISTRY, limits).is_err());
+        wrong = intent;
+        wrong.act_image_digest = format!("sha256:{}", "0".repeat(64));
+        assert!(create_arguments(&wrong, ANY_REGISTRY, limits).is_err());
+    }
 
     #[test]
     fn typed_machine_cache_inspection_protects_the_volume_boundary() {

@@ -3072,3 +3072,50 @@ cost, or establish machine-wide accounting and automatic expiry. Production
 still installs act after engine startup and uses the whole-tree tool seed.
 The next implementation must change that startup and recovery contract before
 replacing the production seed with the verified shared-generation overlay.
+
+
+### Production startup candidate: verified act before engine INIT (2026-10-04)
+
+After pin PR #501 merged as `139953f509075ff59a60c19d49414e5abe1e3f9f`,
+the next source candidate changes the actual cache-backed engine command.
+`creation_profile_with_cache` now freezes a bootstrap command that installs
+the pinned archive, checks both archive and extracted binary SHA-256, closes
+the archive writer descriptor, and replaces itself with the existing PID-1
+INIT → docker-init → dockerd chain. The shared install script is extracted
+into `ci/engine/act_install.rs`; startup and post-readiness verification use
+the same implementation. Creation refuses an act version/archive identity
+that differs from this startup artifact and refuses a noncanonical cache
+mount. Engines without the cache retain their original command identity.
+Historical engine recovery still checks its recorded command digest; it does
+not substitute the new producer's command. This source is not yet published.
+
+The focused regression was RED on the old command and GREEN after the change.
+A second RED showed that creation accepted a mismatched recorded artifact;
+it is now refused. All 21 engine-boundary tests passed. The compiled Rust
+command generator was also exercised in the private Docker daemon: a valid
+released archive started dockerd 29.7.2 in 1.66 seconds, exposed the verified
+act2.8 binary, and allowed exclusive acquisition of the archive writer lock
+while the engine remained live. A corrupt cached archive with no network
+exited with code 1 after 5.46 seconds. The exact observed Docker command
+matched the compiled generator. Both engines and the cache fixture volume
+were ownership-checked and removed. Audit evidence is
+`retention-bootstrap-{focused-red,focused-green,identity-red,identity-green,generated-command,runtime-proof}`
+(local logs and the runtime proof's Python/JSON artifacts).
+
+Because installation now precedes readiness, readiness has the previous
+30-minute install allowance plus the previous 60-second daemon allowance.
+It parses Docker's startup state into a typed struct after failed daemon
+probes and immediately refuses stopped or unprovable engines; it does not
+wait the download budget after an observed exit. Each probe uses the smaller
+of the remaining total allowance and the control-operation budget. The typed
+state refusal test passed. Full source gates and cumulative review are still
+pending for this candidate.
+
+This moves the production bootstrap boundary needed for native generation
+admission. It does **not** acquire a generation reader yet: the production
+planner still selects the legacy cache route, and `prepare_run` still copies
+the legacy tool tree. Frozen generation selection/native exec handoff, trusted
+metadata-only overlay mounting, recovery/lifetime proof, quiescent completed
+install publication, large-cache optimization, and whole-machine convergence
+remain unfinished. The warm-archive runtime proof does not measure cold
+network download latency.
