@@ -10,14 +10,14 @@
 //! | `release` | `workflow_dispatch` with the exact `commit_sha`     |
 //! | `workflow_dispatch`, `workflow_call` | that event with the run's `--input`s (#430) |
 
-use std::{
-    collections::BTreeMap,
-    path::{Component, Path},
-};
+use std::path::{Component, Path};
 
 use serde_json::{Value, json};
 
-use super::snapshot::{BaseRef, DEFAULT_BASE_BRANCH};
+use super::{
+    params::RunParams,
+    snapshot::{BaseRef, DEFAULT_BASE_BRANCH},
+};
 
 vocabulary!(
     /// The CI syntax: GitHub workflows now, `.gitlab-ci.yml` later.
@@ -188,8 +188,9 @@ pub fn github_event(
     base: Option<&BaseRef>,
     repository: &str,
     pr_number: u64,
-    inputs: &BTreeMap<String, String>,
+    params: &RunParams,
 ) -> (&'static str, Value) {
+    let inputs = &params.inputs;
     let branch = branch.unwrap_or("main");
     let repo = json!({"full_name": repository, "name": repository.rsplit('/').next()});
     match trigger {
@@ -211,6 +212,7 @@ pub fn github_event(
                     "repository": repo,
                     "pull_request": {
                         "number": pr_number,
+                        "title": params.pr_title.as_deref().unwrap_or(""),
                         "head": {"sha": sha, "ref": branch, "repo": repo},
                         "base": base,
                         "labels": labels,
@@ -317,7 +319,7 @@ mod tests {
     #[test]
     fn trigger_mapping_golden() {
         let sha = "a".repeat(40);
-        let none = BTreeMap::new();
+        let none = RunParams::default();
         let (event, payload) = github_event(
             Trigger::Pr,
             Mode::Test,
@@ -393,7 +395,10 @@ mod tests {
         assert_eq!(event, "workflow_dispatch");
         assert_eq!(release["inputs"]["commit_sha"], sha.as_str());
         // #430: the --event triggers carry the run's inputs.
-        let inputs = BTreeMap::from([("mode".to_owned(), "candidate".to_owned())]);
+        let inputs = RunParams {
+            inputs: std::collections::BTreeMap::from([("mode".to_owned(), "candidate".to_owned())]),
+            ..RunParams::default()
+        };
         for trigger in Trigger::EVENTS {
             let (event, payload) = github_event(
                 trigger,

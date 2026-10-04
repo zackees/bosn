@@ -535,3 +535,41 @@ fn ci_plan_adapter_refusals_match_act_and_exit_3() {
         );
     }
 }
+
+#[test]
+fn pr_title_reaches_plan_and_other_events_refuse_it() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = repo(root.path());
+    let state = root.path().join("state");
+    let out = bosn(
+        &[
+            "ci",
+            "plan",
+            "--trigger",
+            "pr",
+            "--pr-title",
+            "[ci-windows] proof",
+            "--json",
+        ],
+        &repo,
+        &state,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        plan["payload"]["pull_request"]["title"],
+        "[ci-windows] proof"
+    );
+    assert_eq!(plan["params"]["pr_title"], "[ci-windows] proof");
+    let refused = bosn(
+        &["ci", "plan", "--trigger", "push", "--pr-title", "title"],
+        &repo,
+        &state,
+    );
+    assert_eq!(refused.status.code(), Some(3));
+    assert!(!state.exists());
+}

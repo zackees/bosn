@@ -118,7 +118,7 @@ pub fn plan(options: &SubmitOptions) -> Result<Plan, Error> {
         resolved.base.as_ref(),
         &repository,
         options.pr_number.unwrap_or(1),
-        &options.params.inputs,
+        &options.params,
     );
     Ok(Plan {
         schema_version: super::SCHEMA_VERSION,

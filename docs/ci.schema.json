@@ -939,6 +939,13 @@
           },
           "description": "Run only the matrix legs whose `K` is `V` (act `--matrix K:V`).",
           "type": "object"
+        },
+        "pr_title": {
+          "description": "Explicit synthetic PR title; participates in run identity (#454).",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"

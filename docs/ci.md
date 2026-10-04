@@ -291,6 +291,10 @@ stubbed job.
     the run's `--input`s in the payload's `inputs`. It replaces `--trigger`
     (giving both is refused), and is recorded as the run's trigger. MCP and
     `bosn.Client` take these as `trigger` values.
+- **PR title (#454).** `--pr-title "[ci-windows] check"` supplies the synthetic
+  `pull_request.title` with `--trigger pr`. MCP uses `pr_title`. The bounded
+  title is recorded and distinguishes run identity, so different titles on
+  the same tree never coalesce. Other events refuse it.
 - **Inputs, a matrix filter and env (#430).** `--input K=V`, `--matrix K:V`
   and `--env K=V` repeat, and reach act as `--input`, `--matrix` and
   `--env`. MCP and `bosn.Client` take `inputs`, `matrix` and `env` objects.

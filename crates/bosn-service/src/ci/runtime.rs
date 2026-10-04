@@ -313,7 +313,7 @@ impl CiRuntime {
                 request.base.as_ref(),
                 &provider::repository(request.origin.as_deref()),
                 request.pr_number.unwrap_or(1),
-                &request.params.inputs,
+                &request.params,
             );
             let payload = serde_json::to_vec_pretty(&payload).unwrap_or_default();
             let record = RunRecord::queued(new_uuid().await?, &request, event, &payload);
