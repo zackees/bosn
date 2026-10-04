@@ -3404,3 +3404,13 @@ Evidence: `.git/retention-gate32-compiler-cache-survey.json` and the run's retai
 tool generations, compiler object sharing/coordination, and artifact archive
 cohort retention are distinct contracts and need separate accounting and
 publication evidence.
+
+
+The prepared act2.9 release-asset verifier was exercised against all 11 existing
+act2.8 archives as a control. Checks passed for archive/checksum-file hashes,
+independent GitHub asset digests and sizes, executable architecture headers, and
+embedded version strings. Control evidence:
+`.git/act2-native-admission-release-v9-verifier-control.json`. This validates the
+verification procedure on the existing release; it is not act2.9 release evidence.
+The exact-commit act2 checks run remains pending and no new tag is authorized by
+this control alone.
