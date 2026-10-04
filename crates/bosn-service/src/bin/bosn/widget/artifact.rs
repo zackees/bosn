@@ -232,7 +232,8 @@ async fn install_release(destination: PathBuf) -> io::Result<PathBuf> {
 }
 
 pub fn install() -> io::Result<PathBuf> {
-    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+    let target = kernal_api::platform::host::process_target();
+    if target.os != "linux" || target.architecture != "x86_64" {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "published desktop installer supports Linux x86_64",

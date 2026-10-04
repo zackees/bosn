@@ -90,14 +90,21 @@ impl Layout {
         *self.slot(window) = Presence::Absent;
     }
 
-    /// Reconcile status presence without taking focus during host loss/recovery.
+    /// Only explicit commands create compact windows; activity never does.
+    pub fn has_compact_window(&self) -> bool {
+        self.bubble != Presence::Absent || self.panel != Presence::Absent
+    }
+
+    /// Hide compact surfaces if live placement disappears, without taking focus.
     pub fn status_steps(&self, hosted: bool, positioned: bool) -> Vec<Step> {
-        match (hosted || !positioned, self.bubble) {
-            (true, Presence::Shown) => vec![Step::Hide(Window::Bubble)],
-            (false, Presence::Absent) => vec![open_page(Window::Bubble)],
-            (false, Presence::Hidden) => vec![Step::Show(Window::Bubble)],
-            _ => vec![],
+        let mut steps = Vec::new();
+        if self.bubble == Presence::Shown && (hosted || !positioned) {
+            steps.push(Step::Hide(Window::Bubble));
         }
+        if self.panel == Presence::Shown && !positioned {
+            steps.push(Step::Hide(Window::Panel));
+        }
+        steps
     }
 
     /// An explicit Show reveals details without toggling an already open panel.
@@ -182,17 +189,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_placement_never_opens_an_automatic_center_fallback() {
-        let mut layout = Layout::default();
-        assert!(layout.status_steps(false, false).is_empty());
-        let dock = layout.status_steps(false, true);
-        for step in &dock {
-            layout.record(step);
+    fn activity_never_opens_compact_windows_even_with_healthy_placement() {
+        let layout = Layout::default();
+        for hosted in [false, true] {
+            for positioned in [false, true] {
+                assert!(layout.status_steps(hosted, positioned).is_empty());
+            }
         }
-        assert_eq!(
-            layout.status_steps(false, false),
-            vec![Step::Hide(Window::Bubble)]
-        );
     }
 
     #[test]
@@ -207,24 +210,19 @@ mod tests {
     }
 
     #[test]
-    fn host_loss_and_recovery_swap_status_presence_without_stealing_focus() {
+    fn placement_loss_hides_explicit_details_without_stealing_focus() {
         let mut layout = Layout::default();
-        assert!(layout.status_steps(true, true).is_empty());
-        let fallback = layout.status_steps(false, true);
-        assert_eq!(opens(&fallback), 1);
-        for step in fallback {
+        for step in layout.plan(WidgetCommand::Toggle) {
             layout.record(&step);
         }
-        let hosted = layout.status_steps(true, true);
-        assert_eq!(hosted, vec![Step::Hide(Window::Bubble)]);
-        for step in hosted {
+        assert!(layout.has_compact_window());
+        assert!(layout.status_steps(false, true).is_empty());
+        let hidden = layout.status_steps(true, false);
+        assert_eq!(hidden, vec![Step::Hide(Window::Panel)]);
+        for step in hidden {
             layout.record(&step);
         }
-        assert!(layout.status_steps(true, true).is_empty());
-        assert_eq!(
-            layout.status_steps(false, true),
-            vec![Step::Show(Window::Bubble)]
-        );
+        assert!(layout.status_steps(false, true).is_empty());
     }
 
     #[test]

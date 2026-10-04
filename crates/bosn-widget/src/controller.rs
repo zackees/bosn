@@ -168,10 +168,8 @@ impl Windows {
         views: &ExternalWebviewClient,
         client: &Client,
     ) {
-        for step in self
-            .layout
-            .status_steps(hosted, crate::placement::configured())
-        {
+        let positioned = self.layout.has_compact_window() && crate::placement::configured().await;
+        for step in self.layout.status_steps(hosted, positioned) {
             if self.execute(&step, views, client).await {
                 self.layout.record(&step);
             } else if let Some(window) = step.window() {
@@ -208,10 +206,18 @@ impl Windows {
                 *self.slot(*window) = opened;
                 ok
             }
-            Step::Show(window) => match self.slot(*window) {
-                Some(handle) => handle.show().await.is_ok(),
-                None => false,
-            },
+            Step::Show(window) => {
+                if *window != Window::Full && !crate::placement::configured().await {
+                    if let Some(handle) = self.slot(*window) {
+                        let _ = handle.hide().await;
+                    }
+                    return false;
+                }
+                match self.slot(*window) {
+                    Some(handle) => handle.show().await.is_ok(),
+                    None => false,
+                }
+            }
             Step::Hide(window) => match self.slot(*window) {
                 Some(handle) => handle.hide().await.is_ok(),
                 None => false,
@@ -255,7 +261,7 @@ async fn open(
     window: Window,
     path: &str,
 ) -> Option<WebviewHandle> {
-    if window != Window::Full && !crate::placement::configured() {
+    if window != Window::Full && !crate::placement::configured().await {
         return None;
     }
     let url = page_url(client, path).await?;
