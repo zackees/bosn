@@ -139,3 +139,19 @@ that keeps the token out of containers is in
 [docs/github-api-proxy.md](docs/github-api-proxy.md).
 Local CI on an isolated, daemon-owned engine (`bosn ci run --wait`, with
 reports and stable exit codes for agents) is in [docs/ci.md](docs/ci.md).
+
+Before pushing this repository, run its gate from a clean, committed checkout:
+
+```bash
+uvx --from git+https://github.com/zackees/ci.yml@86b63937960d00655f7ef3752ef6f15b6b06f35b ci-lint local-gate run
+```
+
+The heavy lanes require Bosn 0.1.12 or later and replay the Rust checks and
+Linux test tier through act2 on isolated engines. The gate checks the executed
+source and required successful steps before stamping the commit. Unchanged
+lane inputs can reuse a recorded pass; compiler units are cached across runs.
+
+PR verification refuses missing or stale proof. A trusted, attested PR can
+skip the mapped policy and Rust jobs, with audit sampling retained. Explicit
+`ci-test`/`ci-full` requests keep their Linux test-tier coverage; main pushes
+and release validation retain their remote checks.
