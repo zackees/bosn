@@ -1,4 +1,4 @@
-//! The widget's control loop: register with the daemon, open the bubble,
+//! The widget's control loop: register with the daemon and desktop tray,
 //! then poll for commands (toggle the panel, open the full view, open an
 //! allowlisted external link, quit) and watch for finished runs to notify
 //! about.
@@ -35,7 +35,7 @@ pub fn single_instance(state_dir: &Path) -> Option<OwnedFileLock> {
     kernal_api::platform::fs::try_lock_exclusive_owned(file).ok()
 }
 
-/// A second `bosn widget`: ask the running one to show its bubble.
+/// A second `bosn widget`: ask the running one to reveal details.
 pub fn ask_running_widget_to_show(state_dir: &Path) {
     let Ok(client) = Client::for_state(state_dir) else {
         return;
@@ -168,7 +168,10 @@ impl Windows {
         views: &ExternalWebviewClient,
         client: &Client,
     ) {
-        for step in self.layout.status_steps(hosted) {
+        for step in self
+            .layout
+            .status_steps(hosted, crate::placement::configured())
+        {
             if self.execute(&step, views, client).await {
                 self.layout.record(&step);
             } else if let Some(window) = step.window() {
@@ -252,6 +255,9 @@ async fn open(
     window: Window,
     path: &str,
 ) -> Option<WebviewHandle> {
+    if window != Window::Full && !crate::placement::configured() {
+        return None;
+    }
     let url = page_url(client, path).await?;
     let options = window.options(views.window_support()).ok()?;
     views

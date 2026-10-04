@@ -24,6 +24,10 @@ class WidgetArtifactTests(unittest.TestCase):
             with patch.object(artifact, "build_info", return_value=info):
                 archive = artifact.stage(binary, root / "dist", info)
             self.assertEqual(artifact.verify(archive, info), info)
+            original = archive.read_bytes()
+            with patch.object(artifact, "build_info", return_value=info):
+                artifact.stage(binary, root / "dist", info)
+            self.assertEqual(archive.read_bytes(), original)
             wrong = artifact.BuildInfo("0.1.12", "b" * 40, artifact.TARGET)
             with self.assertRaisesRegex(ValueError, "source"):
                 artifact.verify(archive, wrong)

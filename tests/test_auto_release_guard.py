@@ -293,3 +293,41 @@ def test_the_tag_is_created_only_by_the_release_job_at_the_guarded_sha() -> None
     assert create["env"]["RELEASE_SHA"] == "${{ needs.guard.outputs.sha }}"
     assert '--target "$RELEASE_SHA"' in create["run"]
     assert "needs.guard.outputs.dry_run == 'false'" in job["if"]
+
+
+def test_desktop_artifact_stays_source_bound_and_separate_from_four_wheels() -> None:
+    ci_jobs = yaml.safe_load(CI.read_text())["jobs"]
+    widget = ci_jobs["widget"]
+    checkout = next(
+        step for step in widget["steps"] if step.get("uses", "").startswith("actions/checkout@")
+    )
+    build = next(
+        step for step in widget["steps"] if "ci/widget_artifact.py stage" in step.get("run", "")
+    )
+    upload = next(
+        step
+        for step in widget["steps"]
+        if step.get("uses", "").startswith("actions/upload-artifact@")
+    )
+    source = checkout["with"]["ref"]
+    assert build["env"]["BOSN_WIDGET_SOURCE_SHA"] == source
+    assert upload["with"]["name"] == "bosn-widget-linux-" + source
+    assert upload["with"]["if-no-files-found"] == "error"
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    collect = jobs["collect"]["steps"]
+    desktop = next(
+        step
+        for step in collect
+        if step.get("with", {}).get("path") == "widget-dist" and "run-id" in step.get("with", {})
+    )
+    assert desktop["with"]["run-id"] == "${{ inputs.full_ci_run_id }}"
+    assert desktop["with"]["name"] == "bosn-widget-linux-${{ needs.guard.outputs.sha }}"
+    commands = "\n".join(step.get("run", "") for step in collect)
+    assert 'ci/verify_release.py wheels --tag "$RELEASE_TAG" dist' in commands
+    assert "ci/widget_artifact.py verify" in commands
+    assert '--source-sha "$RELEASE_SHA"' in commands
+    assert "twine check --strict dist/*" in commands
+    release = "\n".join(step.get("run", "") for step in jobs["github-release"]["steps"])
+    assert "for asset in dist/*.whl widget-dist/*" in release
+    assert 'cmp "$asset"' in release
+    assert 'gh release create "$RELEASE_TAG" dist/*.whl widget-dist/*' in release

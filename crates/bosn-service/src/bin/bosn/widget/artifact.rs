@@ -188,6 +188,16 @@ fn unpack(
     Ok(stage)
 }
 
+fn validate_download(bytes: &[u8], expected: &Asset) -> io::Result<()> {
+    if bytes.len() as u64 != expected.size
+        || expected.digest.as_deref()
+            != Some(&format!("sha256:{}", Sha256Hasher::digest(bytes).to_hex()))
+    {
+        return Err(invalid("desktop release archive digest/size mismatch"));
+    }
+    Ok(())
+}
+
 async fn install_release(destination: PathBuf) -> io::Result<PathBuf> {
     let version = env!("CARGO_PKG_VERSION");
     let tag = format!("v{version}");
@@ -210,15 +220,12 @@ async fn install_release(destination: PathBuf) -> io::Result<PathBuf> {
         MAX_BINARY,
     )
     .await?;
-    if bytes.len() as u64 != expected.size
-        || expected.digest.as_deref() != Some(&format!("sha256:{}", Sha256Hasher::digest(&bytes)))
-    {
-        return Err(invalid("desktop release archive digest/size mismatch"));
-    }
+    validate_download(&bytes, expected)?;
     let parent = destination
         .parent()
         .ok_or_else(|| invalid("widget installation path has no parent"))?;
     fs::create_dir_all_private(parent)?;
+    fs::ensure_dir_private(parent)?;
     let stage = unpack(&bytes, parent, version, &commit.sha)?;
     fs::replacement::atomic_replace(&stage.path().join("payload/bosn-widget"), &destination)?;
     Ok(destination)
@@ -236,4 +243,71 @@ pub fn install() -> io::Result<PathBuf> {
         .enable_all()
         .build()?
         .run(install_release(destination))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ARCHIVE: &[u8] = include_bytes!("fixtures/widget.tar.gz");
+
+    #[test]
+    fn installer_refuses_missing_digest_duplicate_and_oversized_assets() {
+        let make = |digest: Option<String>, size| Asset {
+            name: "widget.tar.gz".into(),
+            size,
+            digest,
+        };
+        let mut release = Release {
+            tag_name: "v0.1.12".into(),
+            draft: false,
+            prerelease: false,
+            assets: vec![make(None, 1)],
+        };
+        assert!(asset(&release, "widget.tar.gz").is_err());
+        release.assets = vec![make(Some(format!("sha256:{}", "a".repeat(64))), 1)];
+        assert!(asset(&release, "widget.tar.gz").is_ok());
+        release
+            .assets
+            .push(make(Some(format!("sha256:{}", "a".repeat(64))), 1));
+        assert!(asset(&release, "widget.tar.gz").is_err());
+        release.assets = vec![make(
+            Some(format!("sha256:{}", "a".repeat(64))),
+            MAX_BINARY + 1,
+        )];
+        assert!(asset(&release, "widget.tar.gz").is_err());
+        assert!(asset(&release, "other.tar.gz").is_err());
+    }
+
+    #[test]
+    fn installer_rejects_download_tampering_and_truncation() {
+        let expected = Asset {
+            name: "widget.tar.gz".into(),
+            size: ARCHIVE.len() as u64,
+            digest: Some(format!("sha256:{}", Sha256Hasher::digest(ARCHIVE).to_hex())),
+        };
+        validate_download(ARCHIVE, &expected).unwrap();
+        assert!(validate_download(&ARCHIVE[..ARCHIVE.len() - 1], &expected).is_err());
+        let mut tampered = ARCHIVE.to_vec();
+        tampered[0] ^= 1;
+        assert!(validate_download(&tampered, &expected).is_err());
+    }
+
+    #[test]
+    fn installer_verifies_version_source_architecture_and_binary_before_publication() {
+        let root = fs::TemporaryDirectory::new().unwrap();
+        let stage = unpack(ARCHIVE, root.path(), "0.1.12", &"a".repeat(40)).unwrap();
+        assert!(stage.path().join("payload/bosn-widget").is_file());
+        assert!(unpack(ARCHIVE, root.path(), "0.1.13", &"a".repeat(40)).is_err());
+        assert!(unpack(ARCHIVE, root.path(), "0.1.12", &"b".repeat(40)).is_err());
+        let manifest: Manifest = serde_json::from_slice(
+            &std::fs::read(stage.path().join("payload/manifest.json")).unwrap(),
+        )
+        .unwrap();
+        let mut binary = std::fs::read(stage.path().join("payload/bosn-widget")).unwrap();
+        binary[63] ^= 1;
+        assert!(validate_payload(&manifest, &binary, "0.1.12", &"a".repeat(40)).is_err());
+        binary[18] = 183;
+        assert!(validate_payload(&manifest, &binary, "0.1.12", &"a".repeat(40)).is_err());
+    }
 }

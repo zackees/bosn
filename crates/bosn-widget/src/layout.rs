@@ -91,8 +91,8 @@ impl Layout {
     }
 
     /// Reconcile status presence without taking focus during host loss/recovery.
-    pub fn status_steps(&self, hosted: bool) -> Vec<Step> {
-        match (hosted, self.bubble) {
+    pub fn status_steps(&self, hosted: bool, positioned: bool) -> Vec<Step> {
+        match (hosted || !positioned, self.bubble) {
             (true, Presence::Shown) => vec![Step::Hide(Window::Bubble)],
             (false, Presence::Absent) => vec![open_page(Window::Bubble)],
             (false, Presence::Hidden) => vec![Step::Show(Window::Bubble)],
@@ -182,6 +182,20 @@ mod tests {
     }
 
     #[test]
+    fn missing_placement_never_opens_an_automatic_center_fallback() {
+        let mut layout = Layout::default();
+        assert!(layout.status_steps(false, false).is_empty());
+        let dock = layout.status_steps(false, true);
+        for step in &dock {
+            layout.record(step);
+        }
+        assert_eq!(
+            layout.status_steps(false, false),
+            vec![Step::Hide(Window::Bubble)]
+        );
+    }
+
+    #[test]
     fn repeated_explicit_show_keeps_existing_details_visible() {
         let mut layout = Layout::default();
         for _ in 0..3 {
@@ -195,19 +209,22 @@ mod tests {
     #[test]
     fn host_loss_and_recovery_swap_status_presence_without_stealing_focus() {
         let mut layout = Layout::default();
-        assert!(layout.status_steps(true).is_empty());
-        let fallback = layout.status_steps(false);
+        assert!(layout.status_steps(true, true).is_empty());
+        let fallback = layout.status_steps(false, true);
         assert_eq!(opens(&fallback), 1);
         for step in fallback {
             layout.record(&step);
         }
-        let hosted = layout.status_steps(true);
+        let hosted = layout.status_steps(true, true);
         assert_eq!(hosted, vec![Step::Hide(Window::Bubble)]);
         for step in hosted {
             layout.record(&step);
         }
-        assert!(layout.status_steps(true).is_empty());
-        assert_eq!(layout.status_steps(false), vec![Step::Show(Window::Bubble)]);
+        assert!(layout.status_steps(true, true).is_empty());
+        assert_eq!(
+            layout.status_steps(false, true),
+            vec![Step::Show(Window::Bubble)]
+        );
     }
 
     #[test]

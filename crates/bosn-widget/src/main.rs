@@ -1,7 +1,7 @@
-//! `bosn-widget`: bosn's floating desktop widget (#323 step 10).
+//! `bosn-widget`: desktop tray status with explicitly opened CI details.
 //!
-//! One user-session process owns every native window: a small bubble, a
-//! panel toggled from it, and one full-view dashboard window. Each is an
+//! One user-session process owns the tray icon, a dock-adjacent fallback,
+//! an explicitly toggled panel, and one full-view dashboard. Each window is an
 //! isolated kernal-api webview (no IPC bridge) on a page the daemon serves;
 //! clicks go page -> daemon -> this process (`WidgetPoll`). The daemon stays
 //! headless and decides when the widget should exist.
@@ -14,6 +14,7 @@
 mod controller;
 mod layout;
 mod notify;
+mod placement;
 mod tray;
 mod windows;
 
@@ -68,7 +69,7 @@ fn main() {
         }
     };
     // One widget per user: a second start asks the running one to show its
-    // bubble, then exits successfully.
+    // details, then exits successfully.
     let Some(lock) = controller::single_instance(&args.state_dir) else {
         controller::ask_running_widget_to_show(&args.state_dir);
         return;

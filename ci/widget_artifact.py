@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import io
 import json
@@ -111,7 +112,11 @@ def stage(binary: Path, destination: Path, expected: BuildInfo) -> Path:
     metadata = json.dumps(asdict(manifest), sort_keys=True).encode("utf-8")
     destination.mkdir(parents=True, exist_ok=True)
     archive = destination / f"bosn-widget-v{expected.version}-{expected.target}.tar.gz"
-    with tarfile.open(archive, "w:gz") as output:
+    with (
+        archive.open("wb") as raw,
+        gzip.GzipFile(fileobj=raw, mode="wb", filename="", mtime=0) as compressed,
+        tarfile.open(fileobj=compressed, mode="w") as output,
+    ):
         for entry in (
             ArchiveFile("bosn-widget", data, 0o755),
             ArchiveFile("manifest.json", metadata, 0o644),
