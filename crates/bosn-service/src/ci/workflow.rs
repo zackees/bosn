@@ -57,6 +57,8 @@ pub enum Permissions {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct Step {
+    #[serde(rename = "if")]
+    pub condition: Option<serde_yaml::Value>,
     pub id: Option<String>,
     pub name: Option<String>,
     pub uses: Option<String>,
@@ -85,18 +87,27 @@ impl Step {
 
 /// Parse the workflow file's jobs. A workflow that cannot be read or parsed
 /// yields no declarations (act reports what it can on its own).
-pub fn declared(source: &Path, workflow: &str) -> Declared {
+pub fn declared(source: &Path, workflow: &str, repository: &str) -> Declared {
     std::fs::read_to_string(source.join(workflow))
         .ok()
-        .and_then(|text| parse(&text))
+        .and_then(|text| parse_for_repository(&text, Some(repository)))
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn parse(text: &str) -> Option<Declared> {
+    parse_for_repository(text, None)
+}
+
+fn parse_for_repository(text: &str, repository: Option<&str>) -> Option<Declared> {
     let workflow: Workflow = serde_yaml::from_str(text).ok()?;
     let mut declared = Declared::default();
     for (id, job) in workflow.jobs {
-        if let Some(reason) = super::remote_only::reason(&job) {
+        let reason = repository.map_or_else(
+            || super::remote_only::reason(&job),
+            |repository| super::remote_only::reason_in_repository(&job, repository),
+        );
+        if let Some(reason) = reason {
             declared.remote_only.insert(id.clone(), reason);
         }
         let steps = job

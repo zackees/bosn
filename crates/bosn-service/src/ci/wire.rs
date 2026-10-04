@@ -71,6 +71,10 @@ pub struct SubmitRequest {
     pub sha: String,
     pub branch: Option<String>,
     pub tree_digest: String,
+    /// Git tree of the effective frozen checkout, absent in legacy receipts.
+    /// Source identity does not authorize cache writers or compatible outputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_tree: Option<String>,
     pub dirty: bool,
     /// The synthetic commit holding the uncommitted work (dirty runs only):
     /// the job checks it out, and the event payload names it.
@@ -101,6 +105,13 @@ impl SubmitRequest {
         }
         if !valid_sha(&self.sha) || !valid_hex(&self.tree_digest, 64) {
             return refuse("invalid SHA or tree digest");
+        }
+        if self
+            .git_tree
+            .as_deref()
+            .is_some_and(|tree| !valid_sha(tree))
+        {
+            return refuse("invalid Git tree identity");
         }
         if self
             .commit
@@ -274,6 +285,10 @@ pub struct RunRecord {
     #[serde(default)]
     pub commit: Option<String>,
     pub tree_digest: String,
+    /// Git tree of the effective frozen checkout, absent in legacy receipts.
+    /// Source identity does not authorize cache writers or compatible outputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_tree: Option<String>,
     pub workflow: String,
     pub job: Option<String>,
     pub trigger: Trigger,
@@ -321,6 +336,7 @@ impl RunRecord {
             dirty: request.dirty.then(|| request.tree_digest.clone()),
             commit: request.commit.clone(),
             tree_digest: request.tree_digest.clone(),
+            git_tree: request.git_tree.clone(),
             workflow: request.workflow.clone(),
             job: request.job.clone(),
             trigger: request.trigger,

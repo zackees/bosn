@@ -20,7 +20,6 @@ pass whose inputs did not change:
 from __future__ import annotations
 
 import argparse
-import os
 import subprocess
 import sys
 import time
@@ -29,7 +28,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 # The zackees/ci.yml commit whose ci-lint this repository's gate is checked by.
-CI_LINT = "git+https://github.com/zackees/ci.yml@acde655080acb24bcdb70b153b3790474b958379"
+CI_LINT = "git+https://github.com/zackees/ci.yml@86b63937960d00655f7ef3752ef6f15b6b06f35b"
 
 # The locked environment without bosn itself (installing bosn is a full Rust
 # extension build the linters do not need), then the tools from it.
@@ -78,10 +77,8 @@ LANES: dict[str, list[list[str]]] = {
 
 def run_lane(name: str) -> int:
     commands = LANES[name]
-    if name == "rust" and os.environ.get("BOSN_TEST_ISOLATED") != "1":
-        # Build scripts link host executables even during Clippy. The managed
-        # Linux image supplies their C runtime and keeps Cargo state writable.
-        commands = [["bosn", "run", "--task", "rust-lint"]]
+    if name in {"rust", "tests"}:
+        commands = [[sys.executable, "ci/bosn_gate.py", "--lane", name]]
     for command in commands:
         print(f"\n>>> [{name}] {' '.join(command)}", flush=True)
         started = time.monotonic()

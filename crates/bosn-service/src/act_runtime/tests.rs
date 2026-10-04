@@ -270,12 +270,16 @@ if mode=='foreign':print('f'*64)
                     let report = result.unwrap();
                     assert_eq!(report.runs.len(), 3);
                     assert_eq!(
-                        report.runs.iter().all(|r| r.engine_removed),
-                        mode == "absent"
+                        report.runs.iter().filter(|run| run.engine_removed).count(),
+                        usize::from(mode == "absent")
                     );
                     assert_eq!(
-                        report.runs.iter().all(|r| r.deferred_reason.is_some()),
-                        mode != "absent"
+                        report
+                            .runs
+                            .iter()
+                            .filter(|run| run.deferred_reason.is_some())
+                            .count(),
+                        if mode == "absent" { 2 } else { 3 }
                     );
                 }
                 assert!(
@@ -291,9 +295,9 @@ if mode=='foreign':print('f'*64)
                 task.await.unwrap();
             });
             let reopened = Registry::open_writer(&db).unwrap();
-            for intent in &intents {
+            for (index, intent) in intents.iter().enumerate() {
                 let record = reopened.act_engine(&intent.run_id).unwrap().unwrap();
-                if mode == "absent" {
+                if mode == "absent" && index == 1 {
                     assert_eq!(record.state, ActEngineState::Terminal);
                     assert_eq!(record.outcome, Some(ActRunOutcome::Interrupted));
                     assert_ne!(record.execution, Some(ActRunOutcome::Passed));

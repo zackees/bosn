@@ -222,7 +222,11 @@ impl ActEngineBackend for FakeBackend {
             let name = record.intent.engine_name();
             let found = self.engines.lock().unwrap().get(&name).cloned();
             let engine_id = match found {
-                None => record.engine_id.clone(),
+                None => {
+                    crate::act_runtime::confirm_absence(record.engine_id.as_deref())
+                        .map_err(|error| error.to_string())?;
+                    record.engine_id.clone()
+                }
                 Some(observed) => {
                     let required = record
                         .intent

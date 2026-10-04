@@ -304,6 +304,19 @@ impl CiRuntime {
             if !staging.join("source").is_dir() {
                 return Err(CiError::refused("staged snapshot is missing"));
             }
+            if let Some(expected_tree) = request.git_tree.as_ref() {
+                let source = staging.join("source");
+                let commit = request.commit.as_ref().unwrap_or(&request.sha).clone();
+                let actual =
+                    blocking(move || super::snapshot::effective_git_tree(&source, &commit))
+                        .await?
+                        .map_err(|error| {
+                            CiError::refused(format!("invalid frozen Git tree: {error}"))
+                        })?;
+                if &actual != expected_tree {
+                    return Err(CiError::refused("staged Git tree identity mismatch"));
+                }
+            }
             // The job checks out the synthetic commit of a dirty tree, so
             // the payload names it (`pull_request.head.sha`, `after`).
             let (event, payload) = provider::github_event(
@@ -314,7 +327,7 @@ impl CiRuntime {
                 request.base.as_ref(),
                 &provider::repository(request.origin.as_deref()),
                 request.pr_number.unwrap_or(1),
-                &request.params.inputs,
+                &request.params,
             );
             let payload = serde_json::to_vec_pretty(&payload).unwrap_or_default();
             let record = RunRecord::queued(new_uuid().await?, &request, event, &payload);
@@ -599,7 +612,11 @@ impl CiRuntime {
         let outcome = self.drive(&record, &cancel, &mut observer).await;
         observer.publish();
         let mut tree = std::mem::take(&mut observer.parser.tree);
-        let declared = workflow::declared(&self.store.source(&record.id), &record.workflow);
+        let declared = workflow::declared(
+            &self.store.source(&record.id),
+            &record.workflow,
+            &record.repository,
+        );
         let (conclusion, mut reason) = report::conclude(&outcome, &mut tree, &declared);
         let lost = observer.log.as_ref().map_or(observer.seq, LogWriter::lost);
         if lost > 0 {

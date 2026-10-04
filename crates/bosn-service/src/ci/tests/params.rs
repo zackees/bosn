@@ -93,3 +93,43 @@ fn the_daemon_refuses_a_secret_in_env_and_inputs_without_an_event() {
             .is_none()
     );
 }
+
+#[test]
+fn pr_titles_reach_events_and_distinguish_same_tree_runs() {
+    with_registry(|registry, dir| async move {
+        let backend = Arc::new(FakeBackend::with(Faults {
+            hang: true,
+            ..Faults::default()
+        }));
+        let runtime = CiRuntime::start(&dir, registry, backend, 1);
+        let staging = new_uuid().await.unwrap();
+        staged(&runtime, &staging);
+        let mut original = request(&staging, 'a');
+        original.trigger = Trigger::Pr;
+        original.params.pr_title = Some("[ci-windows] original".into());
+        let first = submit_request(&runtime, original.clone()).await;
+        let payload: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(store::Store::new(&dir).event(&first.run)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["pull_request"]["title"], "[ci-windows] original");
+        let staging = new_uuid().await.unwrap();
+        staged(&runtime, &staging);
+        let mut different = original.clone();
+        different.staging = staging;
+        different.params.pr_title = Some("[ci-linux] other".into());
+        let second = submit_request(&runtime, different).await;
+        assert!(!second.coalesced);
+        assert_ne!(first.run, second.run);
+        let staging = new_uuid().await.unwrap();
+        staged(&runtime, &staging);
+        original.staging = staging;
+        let repeated = submit_request(&runtime, original).await;
+        assert!(repeated.coalesced);
+        assert_eq!(repeated.run, first.run);
+        for run in [&first.run, &second.run] {
+            let _: CancelReply = call(&runtime, CiRequest::Cancel { run: run.clone() }).await;
+            wait_done(&runtime, run).await;
+        }
+    });
+}

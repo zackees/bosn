@@ -57,7 +57,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: zackees/ci.yml
-          ref: acde655080acb24bcdb70b153b3790474b958379
+          ref: 86b63937960d00655f7ef3752ef6f15b6b06f35b
           path: .ci-lint
           persist-credentials: false
           sparse-checkout: ci_lint
@@ -128,11 +128,6 @@ jobs:
         with:
           ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.95.0
-
       - name: Set up Python for PyO3 tests
         uses: actions/setup-python@v5
         with:
@@ -142,11 +137,18 @@ jobs:
         uses: astral-sh/setup-uv@v5
 
       - name: Set up Soldr
-        uses: zackees/setup-soldr@fe965fc7e2c5203570072e1d0fd19d0935d98e39
+        uses: zackees/setup-soldr@v0
         with:
           version: "0.9.27"
-          toolchain: "1.95.0"
+          cache: true
+          job-status: ${{ job.status }}
+          save-cache: auto
+          save-cache-remote: ${{ github.ref == 'refs/heads/main' && 'auto' || 'false' }}
+          target-cache: false
+          cargo-registry-cache: false
           prebuild-deps: none
+          # A restored solo snapshot can lack the on-demand Clippy binary.
+          solo-toolchain-cache: "false"
 
       # No hand-keyed target cache (#361 phase 3): the former
       # Swatinem/rust-cache `rust-workspace-v1` key was invalidated by hand.
@@ -158,6 +160,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes pkg-config libssl-dev
+
+      - name: Rust format and Clippy
+        run: |
+          soldr cargo fmt --all --check
+          soldr cargo fmt --check --manifest-path crates/bosn-widget/Cargo.toml
+          soldr cargo clippy --workspace --exclude bosn-python --all-targets --locked -- -D warnings
 
       - name: Verify kernal-api boundary and locked resolution
         run: |
@@ -218,9 +226,27 @@ jobs:
         if: needs.select-tier.outputs.test == 'true'
         run: docker version
 
+      - name: Set up Soldr for Linux checks
+        if: needs.select-tier.outputs.test == 'true'
+        uses: zackees/setup-soldr@v0
+        with:
+          version: "0.9.27"
+          cache: true
+          # Fork the restored Rust foundation so wheel units can be saved too.
+          cache-key-suffix: linux-gate
+          job-status: ${{ job.status }}
+          save-cache: auto
+          save-cache-remote: ${{ github.ref == 'refs/heads/main' && 'auto' || 'false' }}
+          target-cache: false
+          cargo-registry-cache: false
+          prebuild-deps: none
+
       - name: Install
         if: needs.select-tier.outputs.test == 'true'
-        run: ./install
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes pkg-config libssl-dev patchelf
+          ./install
 
       - name: Lint
         if: needs.select-tier.outputs.test == 'true'

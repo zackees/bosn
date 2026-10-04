@@ -2,7 +2,7 @@
 #
 # Before every push, from a clean, committed tree:
 #
-#   uvx --from git+https://github.com/zackees/ci.yml@acde655080acb24bcdb70b153b3790474b958379 ci-lint local-gate run
+#   uvx --from git+https://github.com/zackees/ci.yml@86b63937960d00655f7ef3752ef6f15b6b06f35b ci-lint local-gate run
 #
 # runs `run` below and, on success, stamps HEAD with a tree-bound
 # `Local-Gate:` trailer (and, with ci-attestations.yml, one `Ci-Attestation:`
@@ -10,15 +10,17 @@
 # `verify`. Install the matching pre-push hook once per clone with
 # `... ci-lint local-gate install-hook`.
 #
-# Rollout: `shadow` reports a missing or stale attestation without failing
-# the run. Promote to `enforce` once `ci-lint local-gate first-pass` shows
-# attested heads are the norm.
+# Exact-source Rust and Linux workflow replays passed before promotion
+# (bosn#464). Missing or stale proof now refuses a PR; non-PR events retain
+# their remote coverage. The heavy lanes require released bosn >= 0.1.12.
+# Isolate the tooling interpreter: --no-project alone can discover an
+# ancestor .venv and replace the intended Bosn executable on PATH.
 [gate]
-run = ["uv", "run", "--no-project", "--python", "3.13", "python", "ci/local_gate.py"]
+run = ["uv", "run", "--no-project", "--isolated", "--python", "3.13", "python", "ci/bosn_gate.py"]
 verify = "ci.yml:verify"
 # ci-pre only publishes attestation side entries; nothing waits on it.
 verify-exempt = ["ci-pre"]
-mode = "shadow"
+mode = "enforce"
 
 # GATE-005: bosn is live infrastructure on the developer's host (its tests
 # start bosn daemons and touch bosn state roots), so its suites run only in
@@ -27,7 +29,8 @@ mode = "shadow"
 # .cargo/config.toml). docker/test.Dockerfile sets the marker.
 [gate.isolation]
 marker = "BOSN_TEST_ISOLATED"
-runner = ["bosn", "run", "--task", "test"]
+runner = ["bosn", "ci", "run"]
+proves-tree = true
 guard = "tests/conftest.py"
 
 # GATE-007: lanes, split along input boundaries. A lane is skipped when its
@@ -37,23 +40,23 @@ guard = "tests/conftest.py"
 # `include_str!` JSON schemas, fixtures and docs, so only Python-only lanes
 # exclude anything.
 [gate.lanes.py-static]
-run = ["uv", "run", "--no-project", "--python", "3.13", "python", "ci/local_gate.py", "--lane", "py-static"]
+run = ["uv", "run", "--no-project", "--isolated", "--python", "3.13", "python", "ci/bosn_gate.py", "--lane", "py-static"]
 tools = ["uv"]
 weight = "light"
 exclude = ["crates/**", "Cargo.toml", "Cargo.lock", "docs/**", "*.md", "docker/**", ".github/workflows/**", "**/*.rs", "**/*.json"]
 
 [gate.lanes.guards]
-run = ["uv", "run", "--no-project", "--python", "3.13", "python", "ci/local_gate.py", "--lane", "guards"]
+run = ["uv", "run", "--no-project", "--isolated", "--python", "3.13", "python", "ci/bosn_gate.py", "--lane", "guards"]
 tools = ["uv"]
 weight = "light"
 
 [gate.lanes.rust]
-run = ["uv", "run", "--no-project", "--python", "3.13", "python", "ci/local_gate.py", "--lane", "rust"]
-tools = ["soldr"]
+run = ["uv", "run", "--no-project", "--isolated", "--python", "3.13", "python", "ci/bosn_gate.py", "--lane", "rust"]
+tools = ["bosn", "docker"]
 
 [gate.lanes.tests]
-run = ["uv", "run", "--no-project", "--python", "3.13", "python", "ci/local_gate.py", "--lane", "tests"]
-tools = ["bosn"]
+run = ["uv", "run", "--no-project", "--isolated", "--python", "3.13", "python", "ci/bosn_gate.py", "--lane", "tests"]
+tools = ["bosn", "docker"]
 
 # GATE-008/010 (zackees/ci.yml#190, #198): an attested PR head skips the
 # remote jobs whose every gate (ci-attestations.yml) it attests. CI's verify
@@ -65,10 +68,11 @@ tools = ["bosn"]
 # Pushes to main always run them (the post-merge catch); a release always
 # runs everything. `shadow`: report what would be skipped, skip nothing.
 #
-# Only jobs the local lanes fully cover are listed. `linux` also runs the
-# docker-marked tests, which no local lane runs, so it always runs remotely.
+# Only jobs mapped to attested gates are listed. The local Linux test tier
+# now runs Docker tests too, but `linux` remains outside the skip mapping:
+# an explicit ci-test/full request still runs its remote tier checks.
 [gate.trust]
-mode = "shadow"
+mode = "enforce"
 skip = ["ci.yml:lint-no-macos-runners", "ci.yml:rust"]
-covered-by = { "ci.yml:lint-no-macos-runners" = ["guards"], "ci.yml:rust" = ["rust", "tests"] }
+covered-by = { "ci.yml:lint-no-macos-runners" = ["guards"], "ci.yml:rust" = ["rust"] }
 surfaces = []

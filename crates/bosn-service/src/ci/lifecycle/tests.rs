@@ -349,10 +349,21 @@ fn every_fault_point_ends_terminal_or_cleanup_required() {
                 &mut Collect::default(),
             )
             .await;
-            assert_eq!(report.cleanup, CleanupEnd::Removed, "case {i}: {report:?}");
+            if faults.create {
+                assert!(
+                    matches!(report.cleanup, CleanupEnd::Failed(_)),
+                    "{report:?}"
+                );
+                assert_eq!(
+                    record(&registry, &dir, &run).await.state,
+                    ActEngineState::CleanupRequired
+                );
+            } else {
+                assert_eq!(report.cleanup, CleanupEnd::Removed, "case {i}: {report:?}");
+                terminal(&record(&registry, &dir, &run).await, outcome);
+            }
             assert_ne!(report.execution, ExecutionEnd::Exited(0));
             assert_eq!(backend.live(), 0, "case {i}");
-            terminal(&record(&registry, &dir, &run).await, outcome);
         }
     });
 }
@@ -496,18 +507,24 @@ fn daemon_restart_mid_run_is_recovered_as_interrupted() {
         daemon.stop().await;
         backend.faults.lock().unwrap().hang = false;
         let (daemon, retired, failed) = restarted(&path, &backend).await;
-        assert!(failed.is_empty(), "{failed:?}");
-        assert_eq!(retired.len(), 51);
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0].0, run_id(200));
+        assert_eq!(retired.len(), 50);
+        assert_eq!(
+            record_of(&daemon.registry, &run_id(200)).await.state,
+            ActEngineState::CleanupRequired
+        );
         assert_eq!(backend.live(), 0, "no orphaned engine");
-        for n in (0..50).map(|n| run_id(100 + n)).chain([run_id(200)]) {
+        for n in (0..50).map(|n| run_id(100 + n)) {
             terminal(
                 &record_of(&daemon.registry, &n).await,
                 ActRunOutcome::Interrupted,
             );
         }
         daemon.stop().await;
-        let (daemon, retired, _) = restarted(&path, &backend).await;
-        assert!(retired.is_empty(), "nothing is left to recover");
+        let (daemon, retired, failed) = restarted(&path, &backend).await;
+        assert!(retired.is_empty(), "observed engines stay terminal");
+        assert_eq!(failed.len(), 1, "uncertain creation remains quarantined");
         daemon.stop().await;
     });
 }
@@ -633,3 +650,52 @@ fn every_engine_step_holds_the_execution_claim() {
 }
 
 mod storage;
+
+#[test]
+fn delayed_create_after_empty_lookup_stays_recoverable() {
+    with_registry(|registry, dir| async move {
+        let backend = FakeBackend::with(Faults {
+            create: true,
+            ..Faults::default()
+        });
+        let run = run_id(95);
+        let engine_plan = plan(&run, Duration::from_secs(30));
+        let report = run_on_engine(
+            &registry,
+            &backend,
+            &engine_plan,
+            &CancellationSource::new().token(),
+            &mut Collect::default(),
+        )
+        .await;
+        assert!(
+            matches!(report.cleanup, CleanupEnd::Failed(_)),
+            "{report:?}"
+        );
+        let pending = record(&registry, &dir, &run).await;
+        assert_eq!(pending.state, ActEngineState::CleanupRequired);
+        assert!(pending.removal.is_none());
+        // Docker's server finishes the request after the client timed out and
+        // the first cleanup lookup returned no container. No sleeps or races.
+        let owner = registry_owner(&registry).await.unwrap();
+        backend.insert(
+            &engine_plan.intent.engine_name(),
+            &engine_plan.intent.engine_image_digest,
+            engine_plan.intent.required_labels(&owner).unwrap(),
+        );
+        assert_eq!(backend.live(), 1);
+        cleanup(
+            &registry,
+            &backend,
+            &owner,
+            &run,
+            None,
+            ActRunOutcome::Failed,
+            &mut Clock(engine_plan.intent.created_at),
+        )
+        .await
+        .unwrap();
+        assert_eq!(backend.live(), 0);
+        terminal(&record(&registry, &dir, &run).await, ActRunOutcome::Failed);
+    });
+}

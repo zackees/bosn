@@ -31,6 +31,7 @@ fn request(staging: &str, sha_byte: char) -> SubmitRequest {
         sha: sha_byte.to_string().repeat(40),
         branch: Some("main".into()),
         tree_digest: "d".repeat(64),
+        git_tree: None,
         dirty: false,
         commit: None,
         base: None,
@@ -816,5 +817,5 @@ mod params;
 mod spare;
 
 mod cache_usage;
-
 mod cleanup;
+mod source_identity;

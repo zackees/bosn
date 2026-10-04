@@ -41,6 +41,8 @@ pub struct SnapshotReceipt {
     pub branch: Option<String>,
     /// sha256 over the copied tree (always present).
     pub tree_digest: String,
+    /// Git tree object of the effective frozen checkout commit.
+    pub git_tree: String,
     /// True when the tree differs from `HEAD` (tracked edits, deletions or
     /// untracked files). Receipts then record `sha + dirty: tree_digest`.
     pub dirty: bool,
@@ -259,16 +261,34 @@ pub fn snapshot(
     } else {
         None
     };
+    let git_tree = effective_git_tree(dest, commit.as_deref().unwrap_or(&sha))?;
     Ok(SnapshotReceipt {
         sha,
         branch,
         tree_digest: hasher.finalize().to_hex(),
+        git_tree,
         dirty,
         commit,
         files,
         bytes,
         origin,
     })
+}
+
+/// Read the tree of an explicit effective commit, never infer it from HEAD.
+/// This is source identity only, not an approved cache-writer grant.
+pub(crate) fn effective_git_tree(root: &Path, commit: &str) -> io::Result<String> {
+    if !super::wire::valid_sha(commit) {
+        return Err(io::Error::other("invalid effective checkout commit"));
+    }
+    let tree = text(git(
+        root,
+        &["rev-parse", "--verify", &format!("{commit}^{{tree}}")],
+    )?)?;
+    if !super::wire::valid_sha(&tree) {
+        return Err(io::Error::other("unsupported Git tree identity"));
+    }
+    Ok(tree)
 }
 
 /// The `.git` refs, `HEAD` and remote act's revision/ref/remote probes read;
@@ -758,5 +778,34 @@ pub(crate) mod tests {
             first.tree_digest, edited.tree_digest,
             "the last byte counts"
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_receipt_binds_clean_git_tree() {
+        let tmp = TemporaryDirectory::new().unwrap();
+        let ws = repo(tmp.path());
+        let clean_root = tmp.path().join("clean");
+        let clean = snapshot(&ws, &clean_root, None).unwrap();
+        let original_tree = text(git(&clean_root, &["rev-parse", "HEAD^{tree}"]).unwrap()).unwrap();
+        assert_eq!(clean.git_tree, original_tree);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_receipt_binds_dirty_git_tree() {
+        let tmp = TemporaryDirectory::new().unwrap();
+        let ws = repo(tmp.path());
+        let clean_root = tmp.path().join("clean");
+        let clean = snapshot(&ws, &clean_root, None).unwrap();
+        let original_tree = text(git(&clean_root, &["rev-parse", "HEAD^{tree}"]).unwrap()).unwrap();
+        std::fs::write(ws.join("tracked.txt"), "dirty bytes").unwrap();
+        let dirty_root = tmp.path().join("dirty");
+        let dirty = snapshot(&ws, &dirty_root, None).unwrap();
+        assert_eq!(dirty.sha, clean.sha);
+        assert!(dirty.dirty);
+        assert!(dirty.commit.is_some());
+        let effective_tree =
+            text(git(&dirty_root, &["rev-parse", "HEAD^{tree}"]).unwrap()).unwrap();
+        assert_eq!(dirty.git_tree, effective_tree);
+        assert_ne!(dirty.git_tree, original_tree);
     }
 }
