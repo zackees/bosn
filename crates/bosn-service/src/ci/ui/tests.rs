@@ -103,6 +103,7 @@ fn fake_record() -> crate::ci::RunRecord {
         sha: "a".repeat(40),
         branch: None,
         tree_digest: "d".repeat(64),
+        git_tree: None,
         dirty: false,
         commit: None,
         base: None,

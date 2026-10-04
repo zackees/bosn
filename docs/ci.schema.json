@@ -1169,6 +1169,13 @@
             "null"
           ]
         },
+        "git_tree": {
+          "description": "Git tree of the effective frozen checkout, absent in legacy receipts.\nSource identity does not authorize cache writers or compatible outputs.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "id": {
           "type": "string"
         },
@@ -1669,6 +1676,13 @@
         },
         "engine": {
           "type": "string"
+        },
+        "git_tree": {
+          "description": "Git tree of the effective frozen checkout, absent in legacy receipts.\nSource identity does not authorize cache writers or compatible outputs.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "job": {
           "type": [

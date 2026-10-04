@@ -303,6 +303,19 @@ impl CiRuntime {
             if !staging.join("source").is_dir() {
                 return Err(CiError::refused("staged snapshot is missing"));
             }
+            if let Some(expected_tree) = request.git_tree.as_ref() {
+                let source = staging.join("source");
+                let commit = request.commit.as_ref().unwrap_or(&request.sha).clone();
+                let actual =
+                    blocking(move || super::snapshot::effective_git_tree(&source, &commit))
+                        .await?
+                        .map_err(|error| {
+                            CiError::refused(format!("invalid frozen Git tree: {error}"))
+                        })?;
+                if &actual != expected_tree {
+                    return Err(CiError::refused("staged Git tree identity mismatch"));
+                }
+            }
             // The job checks out the synthetic commit of a dirty tree, so
             // the payload names it (`pull_request.head.sha`, `after`).
             let (event, payload) = provider::github_event(
