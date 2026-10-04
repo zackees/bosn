@@ -9,7 +9,7 @@ not a claim that it is already implemented. Related issue: #456.
 ## Current implementation status (2026-10-04)
 
 This status is reconciled against main at
-`d24c25d676b94910ece3141788fa340ea33a8b10`. Historical evidence below records
+`d0b313fdf80c121d3fe213720779702fcde1ca92`. Historical evidence below records
 intermediate states; descriptions of an unmerged candidate there are not
 current rollout status. No new Bosn release is claimed.
 
@@ -45,11 +45,20 @@ checksums and the reported version match the main pin. This release includes
 empty-cutover correction and historical publication receipts; historical receipt
 parsing alone cannot authorize enrollment.
 
-The pending integrated follow-up combines helper registration idempotence,
-normal daemon discovery cancellation, and cancellation-safe bounded maintenance,
-inventory and migration controls. Verified slice evidence appears below; the
-combined tree requires its own exact-source gate before publication. No local
-client cancellation result establishes remote Docker rollback. Production warm
+The cache lifecycle follow-up [PR #486](https://github.com/zackees/bosn/pull/486)
+is merged at `d0b313fdf80c121d3fe213720779702fcde1ca92`. Its exact-source gate
+passed (Rust397s, Linux305s, total702s; tree
+`3580afa77edd7db51100ed9623265fa14a11d562`) and required remote checks passed.
+Main now avoids duplicate snapshots for identical helper registration and uses
+cancellation-safe bounded process controls for normal CI commands and cache
+maintenance/inventory/import/receipt reports. These preserve journals and
+nonzero/partial outcomes; local client cancellation does not establish remote
+Docker rollback. Distinct-nonce history and physical registry convergence remain
+open. No Bosn release is claimed.
+
+The new survey and isolated copy-on-write seed primitive are documented below.
+They are evidence for the next toolcache implementation, rather than activated
+immutable generation publication or production mounts. Production warm
 enrollment, older-writer exclusion, shared class expiry and host image/build-cache
 retention remain open.
 
@@ -2023,3 +2032,81 @@ durable journals and ownership-verified recovery remain required. Production
 enrollment and shared class/image/build-cache expiry remain unfinished.
 Evidence: `retention-cache-command-cancellation-red.log` and
 `retention-cache-command-cancellation-green.log`.
+
+
+### Shared class survey and immutable tool seed experiment (2026-10-04)
+
+A bounded read-only survey used this task's live gate engine
+`bosn-act-4326b744-5536-4fe8-94ea-fd34b639d670` to inspect the existing machine
+cache without creating a reader or changing its data:
+
+- Five act archive variants occupy the shared `tools/` class, including .2, .3,
+  .4 and diagnostic builds. Several historical archive paths have no existing
+  lock file; this does not prove either an active reader or safe exclusion.
+- The shared runner-image tar has apparent length **566,650,368 bytes**. Engine
+  retirement removes a private loaded copy, rather than this shared tar.
+- Shared `toolcache/` measured **8,088,304 KiB** allocated (about 7.71 GiB), and
+  this fresh engine's `act-toolcache` measured **8,088,652 KiB**. These are
+  separate, non-atomic samples; their small difference is not a leak verdict.
+  The seed script explicitly uses BusyBox `cp -a` on every visible tool family,
+  so cache hits still require copying the broad tool set into each fresh
+  engine. The actual BusyBox cp has no reflink option.
+
+The classes contain Python, Node, Go, uv, Soldr toolchains/syslibs/bundles,
+runner tools and binfmt data. This is evidence that warm reuse alone does not
+solve per-engine tool-storage amplification. No old shared artifact was deleted
+and no current archive was declared unused. Survey artifact:
+`retention-shared-class-age-survey.txt`.
+
+A genuine private-Docker experiment then tested a closed read-only lower volume
+with a completed-install marker, a 16 MiB payload and a small settings file.
+Two successive fresh privileged containers each mounted an OverlayFS view with
+the same immutable lower and a distinct private tmpfs upper/work directory.
+Both read the identical payload SHA-256 and marker with **0 KiB** allocated
+upper data initially. Mutating settings allocated **4 KiB** privately, preserved
+the original lower settings, and did not copy the 16 MiB payload into either
+upper. Container wall times were 0.790 and 0.519 seconds. Both containers were
+auto-removed; the exact task-owned source volume was removed and cleanup was
+confirmed. Artifacts: `retention-toolcache-cow-experiment.py` and its JSON result.
+
+This proves the Linux filesystem primitive on this private Docker host, rather
+than production engine initialization, a nested workflow mount, real tool
+installers, snapshot publication, lifetime protection or expiry. The current
+mutable tool cache cannot serve as a live overlay lower: the kernel documents
+undefined behavior when underlying trees change while mounted. Immutable
+generations are therefore required before applying the primitive to Bosn.
+See [the kernel OverlayFS contract](https://docs.kernel.org/filesystems/overlayfs.html#changes-to-underlying-filesystems).
+
+#### Next implementation contract: immutable generations and private writes
+
+- Publish typed, content-identified closed generations from completed installs.
+  Stage and validate their manifest/data before durable publication; readers
+  must never mount a stage or treat an incomplete record as an empty cache.
+- Reuse closed generation objects when building a successor, so new generations
+  do not copy the complete tool set. Hard links may join immutable generation
+  objects; they must not expose mutable source objects or job-written upper
+  data as shared lower data. No installed lower object changes in place.
+- Pin a generation in the engine's frozen ownership/storage profile. Acquire
+  its reader protection before mounting and preserve protection for the actual
+  engine lifetime, including preparation. Lost create/start acknowledgements
+  need the existing exact-ID journal and cleanup rules. A missing generation
+  requires replanning or known warm-copy fallback, rather than silently starting
+  with an empty tool cache.
+- Mount a private writable overlay at the nested tool-cache volume's data path.
+  Verify that nested job containers see it, that normal installers can create
+  new tools, and that edits/deletes/chmod/copy-up remain private. Save only
+  completed new installs back through coordinated publication.
+- Account shared closed data once in the toolcache class, include stages and
+  unknown objects, and report private upper storage with the owned engine.
+  Independent shared/private samples must not imply a single atomic total.
+- Expire old generations, unreferenced objects and stages only after verified
+  writer/admission and reader exclusion. Deletion must preserve a current warm
+  seed and in-use generations, expose protected overflow, and converge under
+  sustained publication; stage cleanup and old generations cannot be left
+  outside the byte/age policy. This also requires resolving distinct-nonce
+  ledger growth and host owned-image/scoped builder retention.
+
+Activation is not implemented. Required acceptance remains actual later-job and
+fresh-engine warmth, private mutation isolation, generation durability/replay,
+concurrent publisher/reader/GC safety, exact retirement and sustained logical
+and physical ceilings. The original broad shared-cache/expiry goal remains open.
