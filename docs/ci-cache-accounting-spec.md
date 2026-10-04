@@ -3244,3 +3244,43 @@ rows gave 32 MiB. The sparse file allocated zero blocks. `df` reported roughly
 `.git/retention-accounting-scope-proof.json`. This fixture verifies Linux inode
 and block semantics only; it does not prove production machine-wide inventory,
 VHD reclamation, atomic concurrent accounting or automated expiry.
+
+
+### Released act2.8: 1 GiB warm-cache measurements (2026-10-04)
+
+A controlled fixture used the verified released Linux x64 binary, an isolated
+Go container's private `/tmp` tmpfs, one quiescent completed install with a
+1 GiB allocated zero-filled payload, and a 2 GiB logical-byte bound. All timings
+include `docker exec` client overhead; they are wall time, not CPU time.
+
+| Phase | Seconds | Result |
+|---|---:|---|
+| Create source payload | 1.526 | Completed before publication; no source writer remained |
+| Publish closed object | 6.985 | Published, complete |
+| Assemble and initialize selected generation | 2.217 | Selected, complete |
+| Validate current selection, three warm runs | 0.926 / 0.881 / 1.082 | Same generation ID |
+| Acquire reader and exec, three warm runs | 0.876 / 0.832 / 1.237 | Inherited reader descriptor reported |
+
+The explicit bounded metadata audit visited 19 paths and 18 unique inodes,
+reported 1,073,790,976 allocated bytes and 2,147,517,791 referenced file bytes,
+and was complete. This confirms object/generation payload hardlinks do not
+double the unique allocation. The first audit command omitted `--max-entries`:
+it correctly returned nonzero with partial status and unknown totals. That
+failed invocation is retained as evidence, not reported as successful.
+
+A negative control changed one payload byte while preserving size and mtime.
+`tool-current` refused it in 1.384 seconds with `tool generation payload differs;
+existing data preserved`. Restoring the original byte and mtime restored
+admission in 1.341 seconds. An optimization based only on size and mtime would
+miss this corruption; do not replace content validation with those fields.
+
+Evidence: local `.git/retention-large-tool-benchmark.{py,json,log}`. Generation
+`97b8606089402a23068d7bf32bb14cd9e23dbd25eb4dd7878a2506dd8ef08370`
+and object `5d66737eddb513d4679de12b8f0f5298c67f21e3401871eb3652b4ca51f5cf72`
+remain in the private fixture store for inspection. This does not measure cold
+disk, many-file tool trees, 7.7 GiB payloads, production startup, actual PID1
+lease lifetime, concurrent admission/publication, or complete gate latency.
+The source still validates content on selection and again on reader admission;
+production integration should avoid redundant planning validation where the
+native admission already supplies the required proof, while preserving exact
+frozen generation identity and refusal on missing or changed data.
