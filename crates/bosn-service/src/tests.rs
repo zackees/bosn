@@ -625,7 +625,9 @@ impl SetupEnsureExecutor for FakeSetupEnsureExecutor {
                 return Err("fake ownership mismatch".into());
             }
             if request.config.contains("wait") {
-                for _ in 0..100 {
+                // Stay blocked until cancellation: callers prove submission is
+                // asynchronous without racing a wall-clock fake completion.
+                loop {
                     if cancellation.is_cancelled() {
                         self.cancelled.fetch_add(1, Ordering::SeqCst);
                         return Err("fake ensure observed cancellation".into());
