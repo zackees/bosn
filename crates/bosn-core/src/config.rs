@@ -3,14 +3,13 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-pub const POLICY_KEYS: [&str; 9] = [
+pub const POLICY_KEYS: [&str; 8] = [
     "container_idle_stop",
     "container_remove",
     "warm_volume_ttl",
     "superseded_cap",
     "shared_cache_ceiling",
     "run_max_duration",
-    "idle_retire_seconds",
     "build_ttl_seconds",
     "max_builds",
 ];
@@ -50,6 +49,11 @@ impl fmt::Display for PolicyError {
 }
 impl std::error::Error for PolicyError {}
 impl PolicyDefaults {
+    /// The default for every accepted key. Every entry here is also in `POLICY_KEYS`; a key in
+    /// one and not the other is a knob an operator can set with no value behind it.
+    pub fn values(&self) -> &BTreeMap<String, f64> {
+        &self.values
+    }
     pub fn for_cpu_count(cpu_count: Option<usize>) -> Self {
         Self {
             values: BTreeMap::from([
@@ -62,7 +66,6 @@ impl PolicyDefaults {
                     (100_u64 * 1024_u64.pow(3)) as f64,
                 ),
                 ("run_max_duration".into(), 28800.),
-                ("idle_retire_seconds".into(), 900.),
                 ("build_ttl_seconds".into(), 3600.),
                 (
                     "max_builds".into(),
