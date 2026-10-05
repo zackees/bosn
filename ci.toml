@@ -1,0 +1,166 @@
+# ci.toml — this repository's CI contract. Checked and planned by ci-lint
+# (zackees/ci.yml). Nothing here generates YAML: it bounds what the YAML may
+# do and decides what each run selects.
+#
+# First declaration for this repository (zackees/ci.yml#335). Every platform,
+# runner and cache family below was read off the existing workflows and the
+# live cache listing. Where the YAML and this file disagree, the YAML is right
+# and this file is the bug.
+#
+# `[local.gate]` is deliberately ABSENT: this repository declares its gate in
+# `local-gate.toml`, and declaring both is a GATE-001 violation.
+schema  = 3
+profile = "rust-pypi-app"
+linter  = "zackees/ci.yml@fe965fc7e2c5203570072e1d0fd19d0935d98e39"
+
+# ── Platforms ────────────────────────────────────────────────────────────────
+# Linux is the only native CI host here: every ci.yml job runs `ubuntu-latest`.
+# macOS is exercised through a guest (`macos-x64-execute.yml` drives a VM from a
+# Linux host, ci.yml:464-466 names `macos-15` / `macos-15-intel` as the GUEST's
+# runner). No Windows lane exists in CI, so no Windows platform is declared --
+# declaring one would claim coverage this repository does not have.
+[platforms]
+linux-x64   = { target = "x86_64-unknown-linux-gnu", runs-on = "ubuntu-latest",   group = "linux", wheel = "manylinux_2_17" }
+linux-arm64 = { target = "aarch64-unknown-linux-gnu", runs-on = "ubuntu-latest", group = "linux", wheel = "manylinux_2_17" }
+macos-arm64 = { target = "aarch64-apple-darwin",      runs-on = "macos-15",       group = "macos" }
+macos-x64   = { target = "x86_64-apple-darwin",       runs-on = "macos-15-intel", group = "macos" }
+
+# ── Python packaging ─────────────────────────────────────────────────────────
+# pyproject.toml:19 -- "No [project.scripts]: the `bosn` command is the native
+# binary itself, staged into the wheel's .data/scripts by bosn_build_backend".
+# So the CLI is native and its entry point is not a Python callable.
+[python]
+backend = "soldr"
+cli     = { name = "bosn", crate = "bosn-python", native = true }
+abi3    = "cp310"
+pythons = ["3.11"]
+
+# ── Rust workspace discipline ─────────────────────────────────────────────────
+# Cargo.toml:2 -- eight members. `bosn` (crates.io) and `bosn-python` (PyPI)
+# publish; the other six are internal. `bosn-widget` is excluded (Cargo.toml:6)
+# because it links a webview toolkit the CLI/daemon/CI never link.
+[rust]
+public  = "crates/bosn-python"
+private = "crates/bosn-core"
+
+[rust.tests]
+max-binary = "60MB"
+max-total  = "400MB"
+binaries   = ["bosn-core:lib", "bosn-engine:lib", "bosn-python:lib"]
+
+# ── Suites ───────────────────────────────────────────────────────────────────
+[suites]
+unit        = { run = "ci/test.py unit",   required = true }
+smoke       = { run = "ci/build.py smoke", required = true }
+integration = { run = "ci/test.py integration", required = true }
+
+# ── Flows ────────────────────────────────────────────────────────────────────
+[flow.pr]
+platforms = ["linux-x64"]
+suites    = ["unit", "smoke"]
+budget    = { critical-path = "8m" }
+
+[flow.main]
+extends   = "pr"
+cache     = "write"
+pre-prune = true
+
+[flow.release]
+platforms = "all"
+suites    = "all"
+wheels    = "all"
+publish   = "pypi"
+
+[flow.nightly]
+extends   = "release"
+schedule  = "daily"
+cache     = "write"
+janitor   = true
+publish   = "none"
+pre-prune = true
+
+# ── Tags ─────────────────────────────────────────────────────────────────────
+[tags]
+ci-full        = { add = { platforms = "all", suites = ["integration"] } }
+ci-cache-save  = { cache = "pr-base" }
+no-test        = { remove = { suites = "tests" } }
+release        = { flow = "release", publish = "rehearsal" }
+
+# ── Default-branch reuse ─────────────────────────────────────────────────────
+# `off` is the honest value, not a default: measured, bosn saves 0.4 min/day
+# from verified reuse, so enabling it here would be ceremony without payoff.
+[reuse.default-branch]
+mode          = "off"
+max-age-hours = 24
+
+# ── Cache ────────────────────────────────────────────────────────────────────
+# Families and sizes measured from the live listing
+# (`gh api repos/zackees/bosn/actions/caches`, 2026-10-05).
+[cache]
+budget   = "9GB"
+write-on = ["main"]
+never    = []
+retired  = []
+pr       = { mode = "none", families = [], max-per-pr = "0MB", budget = "0MB", trim = "on-close" }
+
+[cache.family]
+# buildcache-v2 is the large one: 3.28 GiB across 5 entries on linux-x64 alone,
+# plus 0.39 GiB on windows-x64. `compile` is sized for it and opts into ancestor
+# promotion (CACHE-031: >= 256MB).
+compile    = { via = "setup-soldr:build-cache",     max = "800MB", lockfile = true, per = "platform", min = "1MB", evict = "lru", promote = "ancestor" }
+# The four solo-toolchain entries measured 0.15-0.20 GiB each; 210MB covers the
+# largest with headroom, and it sits below CACHE-031's floor so it stays unopted.
+toolchain  = { via = "setup-soldr:solo-toolchain", max = "210MB", per = "none",                            evict = "lru" }
+registry   = { via = "setup-soldr:cargo-registry",  max = "200MB", lockfile = true, per = "none",          evict = "lru" }
+soldr-mini = { via = "setup-soldr:soldr-mini",     max = "30MB",  per = "none", min = "1MB",                evict = "lru" }
+uv         = { via = "setup-uv",                   max = "100MB", per = "platform",                        evict = "lru" }
+
+# Ancestor promotion (CACHE-024, zackees/ci.yml#335). Standardizing on
+# setup-soldr's ancestor encoding -- shortest parent-edge distance from a live
+# git DAG walk -- rather than a first-parent ordinal, which INVERTS on wide
+# merges: a 50-commit branch tip reports ordinal 53 while the merge commit
+# containing it reports 4, so a cache saved at the merge looks older than one
+# saved 50 commits before it. #335 keeps the `m<n>` label for offline audit only.
+#
+# Only `compile` is at or above CACHE-031's 256MB floor; `toolchain` (210MB),
+# `registry` (200MB), `soldr-mini` (30MB) and `uv` (100MB) stay below it, where
+# unbounded entry count is noise rather than a budget threat.
+#
+# DECLARATION ONLY: setup-soldr#566 is merged but unreleased, so CACHE-030 and
+# CACHE-032 report `needs_review` and the opt-in is inert until a tag lands.
+[cache.promote]
+mode          = "ancestor"
+max-age-hours = 168
+
+# ── Local runs ───────────────────────────────────────────────────────────────
+# Only the runner: the gate itself lives in `local-gate.toml`, and declaring
+# `[local.gate]` here as well would be GATE-001.
+[local]
+runner = "bosn-act"
+lanes  = ["precheck"]
+cache  = "machine"
+
+# ── Allowlist ────────────────────────────────────────────────────────────────
+# Which workflows a repository HAS is repo-specific (ci.yml#341 made this
+# explicit so a large repository is not told to shrink to the example's shape).
+[allow]
+workflows         = { "ci.yml" = ["pull_request", "merge_group", "push:main", "schedule", "workflow_dispatch"], "ci-pre.yml" = ["pull_request", "push:main", "merge_group"], "macos-x64-execute.yml" = ["workflow_call"], "auto-release.yml" = ["push:tag", "workflow_dispatch"] }
+actions           = ["actions/checkout", "actions/upload-artifact", "actions/download-artifact", "zackees/setup-soldr", "astral-sh/setup-uv"]
+tools             = ["soldr", "uv", "python3", "yq", "git"]
+secrets           = []
+platform-selector = "crates/bosn-core/src/lib.rs"
+platform-code     = ["crates/bosn-core/src/**"]
+
+# Read off the workflows: the release job publishes `bosn-python` to PyPI over
+# OIDC, and cache maintenance retires entries with `actions: write`.
+permissions = { "id-token: write" = ["publish"], "actions: write" = ["cache-maint"] }
+
+# This repository calls `zackees/setup-soldr` directly and has no composite
+# wrapper under `.github/actions/`, so `only-in` is the empty string: it asserts
+# "no wrapper anywhere" rather than naming a directory that does not exist.
+setup-soldr       = { only-in = "", require = { save-cache = "plan" } }
+setup-uv          = { require = { save-cache = "plan" } }
+
+# ── Publish ──────────────────────────────────────────────────────────────────
+[publish]
+pypi = { auth = "oidc", environment = "pypi", mode = "mock" }
