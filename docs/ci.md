@@ -238,6 +238,10 @@ job succeeded, or when its engine could not be proven removed.
 
 ## Caches (machine-wide)
 
+The [CI cache and Docker footprint living spec](ci-cache-accounting-spec.md)
+tracks what is shared today, measured gaps, and the implementation and test
+status of bounded retention.
+
 Every engine mounts one bosn-labelled named volume, `bosn-ci-cache-v1`, at
 `/bosn/cache`. It is a volume rather than a host directory because the
 privileged engine writes as root, and Docker Desktop shares no host paths

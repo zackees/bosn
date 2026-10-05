@@ -34,9 +34,7 @@ from typing import TypeAlias
 
 ROOT = Path(__file__).resolve().parent.parent
 
-JsonValue: TypeAlias = (
-    str | int | float | bool | list["JsonValue"] | dict[str, "JsonValue"] | None
-)
+JsonValue: TypeAlias = str | int | float | bool | list["JsonValue"] | dict[str, "JsonValue"] | None
 
 LANES = ("rust",)
 CI_WORKFLOW = ".github/workflows/ci.yml"
@@ -158,7 +156,9 @@ def _job(value: JsonValue) -> Job:
 
 
 def parse_receipt(output: str) -> Receipt:
-    documents = [_document(json.loads(line)) for line in output.splitlines() if line.startswith("{")]
+    documents = [
+        _document(json.loads(line)) for line in output.splitlines() if line.startswith("{")
+    ]
     if len(documents) != 1:
         raise ValueError("expected exactly one Bosn run receipt")
     document = documents[0]
@@ -205,7 +205,9 @@ def _job_proves_steps(job: Job, required_steps: tuple[str, ...]) -> bool:
     completed = {
         section.name
         for section in job.sections
-        if section.stage == "Main" and section.status == "completed" and section.conclusion == "success"
+        if section.stage == "Main"
+        and section.status == "completed"
+        and section.conclusion == "success"
     }
     return set(required_steps).issubset(completed)
 
@@ -228,7 +230,10 @@ def receipt_error(
         receipt = parse_receipt(output)
     except (KeyError, ValueError, TypeError) as error:
         return f"invalid Bosn source proof: {error}"
-    if not Path(receipt.workspace).is_absolute() or Path(receipt.workspace).resolve() != workspace.resolve():
+    if (
+        not Path(receipt.workspace).is_absolute()
+        or Path(receipt.workspace).resolve() != workspace.resolve()
+    ):
         return "Bosn executed another workspace"
     if receipt.sha != head_sha:
         return "Bosn executed another commit"
@@ -280,8 +285,19 @@ def checks() -> list[Check]:
         Check(
             "Rust workspace (isolated Bosn Actions)",
             (
-                "bosn", "ci", "run", "--workspace", ".", "--workflow", CI_WORKFLOW,
-                "--job", "rust", "--trigger", "pr", "--wait", "--json",
+                "bosn",
+                "ci",
+                "run",
+                "--workspace",
+                ".",
+                "--workflow",
+                CI_WORKFLOW,
+                "--job",
+                "rust",
+                "--trigger",
+                "pr",
+                "--wait",
+                "--json",
             ),
             "rust",
             isolated=True,
@@ -324,7 +340,9 @@ def run_check(check: Check) -> Result:
     if not check.isolated:
         return result
     if head is None or head.returncode != 0:
-        return Result(check, 1, result.seconds, result.output + "\nlocal gate: cannot determine HEAD\n")
+        return Result(
+            check, 1, result.seconds, result.output + "\nlocal gate: cannot determine HEAD\n"
+        )
     error = receipt_error(
         result.output,
         workspace=ROOT,
@@ -345,14 +363,18 @@ def run_check(check: Check) -> Result:
 def save_log(result: Result) -> Path:
     logs = ROOT / "target" / "local-gate-logs"
     logs.mkdir(parents=True, exist_ok=True)
-    safe = "".join(char if char.isalnum() or char in "._-" else "-" for char in result.check.name).strip("-")
+    safe = "".join(
+        char if char.isalnum() or char in "._-" else "-" for char in result.check.name
+    ).strip("-")
     path = logs / f"{safe}.log"
     path.write_text(result.output, encoding="utf-8")
     return path
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--lane", choices=("all", *LANES), default="all", help="one GATE-007 lane")
     parser.add_argument("--list", action="store_true", help="print the checks and exit")
     parser.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 2))

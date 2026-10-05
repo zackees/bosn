@@ -10,3 +10,6 @@ build/
 target/
 _vender/
 src/bosn/_native.*
+
+# Local host-audit scratch output (docker-audit-YYYYMMDD/), uploaded to a gist
+docker-audit-*/
