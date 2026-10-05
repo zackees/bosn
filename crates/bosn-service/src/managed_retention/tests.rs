@@ -11,7 +11,10 @@ use std::io::Write;
 use bosn_core::retention::RetentionPolicy;
 use bosn_engine::DockerEngine;
 
-use crate::managed_retention::{auto_retention_enabled, managed_retention_pass};
+use crate::managed_retention::{
+    SetupContainerReport, StoppedSetupContainer, auto_retention_enabled, managed_retention_pass,
+    setup_container_report_line,
+};
 use crate::wire::Request;
 use crate::wire_validate::{OWNED_MAX_TTL_SECS, validate_managed_retention_request_wire};
 
@@ -192,12 +195,35 @@ const FAKE_ID: &str = "fake-container-id";
 ///
 /// `size` is omitted entirely when `None`, which is how Docker says "I did not measure this".
 fn owned_container_inspect(size: Option<i128>) -> String {
+    owned_container_inspect_with(false, &[], size)
+}
+
+/// As [`owned_container_inspect`], with liveness and a mount table.
+///
+/// `mounts` is rendered as Docker renders it: a list of `{Type, Name}`. A stopped
+/// `bosn-setup-v2-*` container's cost is exactly this list, which is why the fake has to be able
+/// to produce one.
+fn owned_container_inspect_with(
+    running: bool,
+    mounts: &[(&str, &str)],
+    size: Option<i128>,
+) -> String {
     let size_field = size.map_or_else(String::new, |bytes| format!(r#","SizeRw":{bytes}"#));
+    let mounts = mounts
+        .iter()
+        .map(|(mount_type, name)| format!(r#"{{"Type":"{mount_type}","Name":"{name}"}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mounts = if mounts.is_empty() {
+        String::new()
+    } else {
+        format!(r#","Mounts":[{mounts}]"#)
+    };
     format!(
-        r#"[{{"Id":"{FAKE_ID}","Created":"2020-01-01T00:00:00Z","State":{{"Running":false}},
+        r#"[{{"Id":"{FAKE_ID}","Created":"2020-01-01T00:00:00Z","State":{{"Running":{running}}},
 "Config":{{"Labels":{{"{registry}":"{REGISTRY_ID}","{kind}":"container","{stack}":"stack",
 "{generation}":"1","{scope}":"scope","{workspace}":"/w","{created}":"2020-01-01T00:00:00Z"}}}}
-{size_field}}}]"#,
+{mounts}{size_field}}}]"#,
         registry = bosn_core::LABEL_REGISTRY,
         kind = bosn_core::LABEL_KIND,
         stack = bosn_core::LABEL_STACK,
@@ -215,6 +241,18 @@ fn owned_container_inspect(size: Option<i128>) -> String {
 /// exists, and a `rm` that Docker would refuse is refused here too — including a `rm -f`, which
 /// is the whole point: this fake models Docker, and Docker really does kill.
 fn fake_docker(sizes: &[Option<i128>]) -> (DockerEngine, std::path::PathBuf) {
+    fake_docker_reporting(owned_container_inspect, sizes)
+}
+
+/// As [`fake_docker`], with the inspect document built by `render` instead of by
+/// [`owned_container_inspect`].
+///
+/// One builder rather than a second fake: the #518 report and the #522/#523 removal races are the
+/// same pass reading the same objects, and a separate fake would let them drift apart.
+fn fake_docker_reporting(
+    render: impl Fn(Option<i128>) -> String,
+    sizes: &[Option<i128>],
+) -> (DockerEngine, std::path::PathBuf) {
     const SCRIPT: &str = r#"
 if [ "$1" = "ps" ]; then
   case "$*" in *label=*) echo fake-container-id ;; esac
@@ -254,12 +292,9 @@ exit 0
     let mut engine = DockerEngine::synthetic_for_test("/bin/sh", ["-c", SCRIPT, "fake-docker"])
         .env("FD_STATE", dir.as_os_str());
     for (index, size) in sizes.iter().enumerate() {
-        engine = engine.env(
-            format!("FD_INSPECT_{}", index + 1),
-            owned_container_inspect(*size),
-        );
+        engine = engine.env(format!("FD_INSPECT_{}", index + 1), render(*size));
     }
-    engine = engine.env("FD_INSPECT_LAST", owned_container_inspect(None));
+    engine = engine.env("FD_INSPECT_LAST", render(None));
     (engine, dir)
 }
 
@@ -365,5 +400,218 @@ fn an_already_stopped_container_is_removed_without_force() {
     assert!(
         fake_state.join("removed").exists(),
         "the fake removed it, so `rm` reached Docker and Docker agreed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #518: stopped setup containers are reported by default, deleted only on opt-in.
+// ---------------------------------------------------------------------------
+
+/// A stopped, fully-labelled setup container holding `volume_count` stack volumes.
+///
+/// The volumes are named `bosn-v-stack-*`, which is what `bosn-setup` actually mounts; the report
+/// counts volumes, so the names matter only in that they are distinct.
+fn setup_container_pinning(volume_count: usize) -> String {
+    let mounts: Vec<(String, String)> = (0..volume_count)
+        .map(|index| ("volume".to_owned(), format!("bosn-v-stack-{index}")))
+        .collect();
+    let borrowed: Vec<(&str, &str)> = mounts
+        .iter()
+        .map(|(mount_type, name)| (mount_type.as_str(), name.as_str()))
+        .collect();
+    owned_container_inspect_with(false, &borrowed, Some(1_000))
+}
+
+#[test]
+fn a_stopped_setup_container_is_reported_with_the_volumes_it_pins() {
+    let (engine, _) =
+        fake_docker_reporting(|_| setup_container_pinning(4), &[Some(1_000), Some(1_000)]);
+    let dir = state_dir_with_registry("setup-pins-volumes");
+
+    let outcome = managed_retention_pass(&engine, &dir, RetentionPolicy::default(), false);
+
+    let report = &outcome.setup_containers;
+    assert_eq!(
+        report.container_count(),
+        1,
+        "the stopped container must be reported"
+    );
+    assert_eq!(
+        report.pinned_volume_count(),
+        4,
+        "the whole point of the report is how many volumes each container pins"
+    );
+    assert_eq!(
+        report.stopped[0].pinned_volumes,
+        vec![
+            "bosn-v-stack-0".to_owned(),
+            "bosn-v-stack-1".to_owned(),
+            "bosn-v-stack-2".to_owned(),
+            "bosn-v-stack-3".to_owned(),
+        ],
+        "the pinned volumes come from Docker's own mount table"
+    );
+    assert!(
+        report.oldest_age_seconds().is_some_and(|age| age > 0.0),
+        "a container created in 2020 is not new"
+    );
+}
+
+#[test]
+fn a_running_container_is_not_reported_as_stopped() {
+    let (engine, _) = fake_docker_reporting(
+        |size| owned_container_inspect_with(true, &[("volume", "bosn-v-stack-0")], size),
+        &[Some(1_000), Some(1_000)],
+    );
+    let dir = state_dir_with_registry("running-not-stopped");
+
+    let outcome = managed_retention_pass(&engine, &dir, RetentionPolicy::default(), false);
+
+    assert!(
+        outcome.setup_containers.is_empty(),
+        "a running container is not a leaked one: {:?}",
+        outcome.setup_containers
+    );
+    assert!(
+        setup_container_report_line(&outcome.setup_containers, false).is_none(),
+        "a healthy machine gets no warning line"
+    );
+}
+
+/// A bind mount is not a volume, and an anonymous volume's name is not something the operator can
+/// act on. Counting either would inflate the number the report exists to make honest.
+#[test]
+fn only_named_volume_mounts_count_as_pinned() {
+    let (engine, _) = fake_docker_reporting(
+        |size| {
+            owned_container_inspect_with(
+                false,
+                &[
+                    ("bind", "/home/user/src"),
+                    ("volume", "bosn-v-stack-0"),
+                    ("volume", "bosn-v-stack-1"),
+                ],
+                size,
+            )
+        },
+        &[Some(1_000), Some(1_000)],
+    );
+    let dir = state_dir_with_registry("bind-mounts");
+
+    let outcome = managed_retention_pass(&engine, &dir, RetentionPolicy::default(), false);
+
+    assert_eq!(
+        outcome.setup_containers.pinned_volume_count(),
+        2,
+        "a bind mount is a path on a filesystem Bosn does not own"
+    );
+}
+
+/// #518: the report must appear on a default install, where nothing is opt-in yet.
+#[test]
+fn the_report_appears_with_the_default_opt_out_config() {
+    let (engine, _) =
+        fake_docker_reporting(|_| setup_container_pinning(3), &[Some(1_000), Some(1_000)]);
+    // No `retention.toml` at all: this is what a default install looks like.
+    let dir = state_dir_with_registry("default-config-report");
+
+    let outcome = managed_retention_pass(&engine, &dir, RetentionPolicy::default(), false);
+
+    let line = setup_container_report_line(&outcome.setup_containers, outcome.summary.applied)
+        .expect("a default install must still be told it is leaking");
+    assert!(
+        line.contains("1 stopped owned setup container(s)"),
+        "{line}"
+    );
+    assert!(line.contains("pinning 3 volume(s)"), "{line}");
+    assert!(
+        line.contains("oldest "),
+        "the age is part of the report: {line}"
+    );
+    assert!(line.contains("past the 6h container gate"), "{line}");
+    assert!(line.contains("auto_retention = true"), "{line}");
+}
+
+/// #518: without the opt-in, a pass that could reclaim removes nothing.
+#[test]
+fn nothing_is_removed_without_the_opt_in() {
+    let (engine, fake_state) =
+        fake_docker_reporting(|_| setup_container_pinning(2), &[Some(1_000), Some(1_000)]);
+    let dir = state_dir_with_registry("no-opt-in-no-removal");
+    assert!(
+        !auto_retention_enabled(&dir),
+        "a machine with no opt-in file is not opted in"
+    );
+
+    // Exactly what `maintenance_pass` computes on the default path.
+    let apply = auto_retention_enabled(&dir);
+    let outcome = managed_retention_pass(&engine, &dir, RetentionPolicy::default(), apply);
+
+    assert!(!outcome.summary.applied, "nothing was applied");
+    assert_eq!(
+        outcome.summary.removed, 0,
+        "the pile is reported, never reclaimed without the opt-in"
+    );
+    assert!(
+        !fake_state.join("removed").exists(),
+        "no removal command reached Docker at all"
+    );
+    assert!(!fake_state.join("rm-argv").exists());
+    assert_eq!(
+        outcome.setup_containers.pinned_volume_count(),
+        2,
+        "reporting does not depend on the opt-in"
+    );
+    let line = setup_container_report_line(&outcome.setup_containers, false).expect("a line");
+    assert!(line.contains("enable with"), "{line}");
+}
+
+/// The opt-in changes only the advice, never the facts.
+#[test]
+fn an_applied_pass_reports_the_same_pile_and_advises_the_gc_command() {
+    let (engine, _) =
+        fake_docker_reporting(|_| setup_container_pinning(1), &[Some(1_000), Some(1_000)]);
+    let dir = state_dir_with_registry("applied-advice");
+    write_config(&dir, "auto_retention = true\n");
+
+    let apply = auto_retention_enabled(&dir);
+    let outcome = managed_retention_pass(&engine, &dir, RetentionPolicy::default(), apply);
+
+    assert_eq!(outcome.setup_containers.pinned_volume_count(), 1);
+    let line = setup_container_report_line(&outcome.setup_containers, outcome.summary.applied)
+        .expect("a line");
+    assert!(line.contains("bosn gc owned --apply --yes"), "{line}");
+}
+
+/// A shared volume is one blob on one filesystem; counting it once per container would overstate
+/// the disk problem.
+#[test]
+fn a_volume_shared_by_two_stopped_containers_is_counted_once() {
+    let report = SetupContainerReport {
+        stopped: vec![
+            StoppedSetupContainer {
+                id: "a".to_owned(),
+                age_seconds: 900.0,
+                pinned_volumes: vec!["bosn-v-stack-0".to_owned()],
+            },
+            StoppedSetupContainer {
+                id: "b".to_owned(),
+                age_seconds: 100.0,
+                pinned_volumes: vec!["bosn-v-stack-0".to_owned()],
+            },
+        ],
+    };
+
+    assert_eq!(report.container_count(), 2);
+    assert_eq!(report.pinned_volume_count(), 1);
+    assert_eq!(report.oldest_age_seconds(), Some(900.0));
+}
+
+#[test]
+fn an_empty_pile_produces_no_line() {
+    assert!(SetupContainerReport::default().is_empty());
+    assert!(
+        setup_container_report_line(&SetupContainerReport::default(), false).is_none(),
+        "a machine with nothing leaked must stay quiet"
     );
 }
