@@ -14,6 +14,19 @@
 //! on an apply pass, re-checks each object immediately before removing it. The policy is pure and
 //! unit-tested in `bosn-core`; everything here is I/O.
 //!
+//! #518: stopped setup containers are reported by default, deleted only on opt-in
+//!
+//! `bosn-setup-v2-*` containers cannot be created with `--rm`: `validate_observed` actively
+//! enforces `AutoRemove == false`, so the container is designed to persist and reclamation must
+//! come from here. A persisted container pins every volume it ever mounted, which is why this is
+//! a disk problem and not a container-count problem — and why the report counts *pinned volumes*,
+//! not containers.
+//!
+//! Reclamation stays opt-in through `retention.toml` (never delete what Bosn does not own, never
+//! delete what cannot be recreated). But **reporting** is not reclamation, so
+//! [`maintenance_pass`] emits the pile on every maintenance interval even with the default
+//! opt-out config. Before this, a default install had no bound at all and no signal.
+//!
 //! Three invariants hold for every removal this module performs:
 //!
 //! 1. **The object is re-verified after the plan is built.** A pass that takes minutes can see a
@@ -53,6 +66,65 @@ pub struct ManagedRetentionOutcome {
     pub summary: ManagedRetentionSummary,
     /// The plan the pass ran, kept for the daemon log and for tests.
     pub plan: bosn_core::retention::RetentionPlan,
+    /// Stopped Bosn-owned setup containers and the volumes each one pins (#518).
+    pub setup_containers: SetupContainerReport,
+}
+
+/// One stopped, Bosn-owned container and the volumes it is holding alive.
+///
+/// A persisted container's cost is not its own writable layer but the mounts it keeps referenced:
+/// a stopped container keeps every volume it ever mounted eligible for neither GC nor release.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoppedSetupContainer {
+    /// The container id, as Docker reported it.
+    pub id: String,
+    /// Seconds since the container was created.
+    pub age_seconds: f64,
+    /// The named volumes this container still mounts.
+    pub pinned_volumes: Vec<String>,
+}
+
+/// Every stopped Bosn-owned container the pass observed, oldest first.
+///
+/// Reporting is unconditional; deletion is not. Nothing here is ever removed by this struct — it
+/// exists so a default install, which has no `retention.toml`, still learns that it is leaking.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SetupContainerReport {
+    pub stopped: Vec<StoppedSetupContainer>,
+}
+
+impl SetupContainerReport {
+    /// Number of stopped Bosn-owned containers.
+    pub fn container_count(&self) -> usize {
+        self.stopped.len()
+    }
+
+    /// Distinct volumes pinned across every stopped container.
+    ///
+    /// Counted once per volume, not once per container, because a volume shared by two stopped
+    /// containers is one blob on one filesystem.
+    pub fn pinned_volume_count(&self) -> usize {
+        let mut names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for container in &self.stopped {
+            names.extend(container.pinned_volumes.iter().map(String::as_str));
+        }
+        names.len()
+    }
+
+    /// The age of the oldest stopped container, when there is one.
+    pub fn oldest_age_seconds(&self) -> Option<f64> {
+        self.stopped
+            .iter()
+            .map(|container| container.age_seconds)
+            .fold(None, |oldest, age| {
+                Some(oldest.map_or(age, |prior: f64| prior.max(age)))
+            })
+    }
+
+    /// Whether there is anything to say.
+    pub fn is_empty(&self) -> bool {
+        self.stopped.is_empty()
+    }
 }
 
 /// Run one managed-retention pass.
@@ -70,7 +142,12 @@ pub fn managed_retention_pass(
         .ok()
         .and_then(|registry| registry.registry_id().ok());
 
-    let (artifacts, refusal) = observe_owned(engine);
+    let (artifacts, stopped_containers, refusal) = observe_owned(engine);
+    // #518: this report is unconditional. A default install has no `retention.toml`, so nothing
+    // would ever delete these — but the operator still has to be told the pile is growing.
+    let setup_containers = SetupContainerReport {
+        stopped: stopped_containers,
+    };
 
     // An incomplete read must not authorize a removal. This is the rule the unmanaged census
     // follows too, and for the same reason: "we could not see it" is not "it is safe".
@@ -87,6 +164,7 @@ pub fn managed_retention_pass(
                 refused: Some(detail),
             },
             plan: bosn_core::retention::RetentionPlan::default(),
+            setup_containers,
         };
     }
 
@@ -127,6 +205,7 @@ pub fn managed_retention_pass(
             refused: None,
         },
         plan,
+        setup_containers,
     }
 }
 
@@ -135,9 +214,16 @@ pub fn managed_retention_pass(
 /// Returns the observations and, separately, a refusal reason when any read was incomplete.
 /// A partial read yields no observations at all rather than a partial set, because an
 /// incomplete candidate list is indistinguishable from an empty one.
-fn observe_owned(engine: &DockerEngine) -> (Vec<bosn_core::ObservedArtifact>, Option<String>) {
+fn observe_owned(
+    engine: &DockerEngine,
+) -> (
+    Vec<bosn_core::ObservedArtifact>,
+    Vec<StoppedSetupContainer>,
+    Option<String>,
+) {
     let options = RunOptions::bounded(RETENTION_READ_DEADLINE, RETENTION_OUTPUT_LIMIT);
     let mut artifacts = Vec::new();
+    let mut stopped_containers = Vec::new();
     let mut unreadable: Vec<String> = Vec::new();
 
     // The label key used as the entry filter. Any object carrying it is a candidate for
@@ -145,14 +231,29 @@ fn observe_owned(engine: &DockerEngine) -> (Vec<bosn_core::ObservedArtifact>, Op
     // filter here costs a read but can never widen what is removed.
     let probe = bosn_core::LABEL_KIND;
 
-    observe_containers(engine, options, probe, &mut artifacts, &mut unreadable);
+    observe_containers(
+        engine,
+        options,
+        probe,
+        &mut artifacts,
+        &mut stopped_containers,
+        &mut unreadable,
+    );
     observe_volumes(engine, options, probe, &mut artifacts, &mut unreadable);
     observe_images(engine, options, probe, &mut artifacts, &mut unreadable);
 
     if unreadable.is_empty() {
-        (artifacts, None)
+        // Oldest first, so the report's head is the worst offender.
+        stopped_containers.sort_by(|left, right| {
+            right
+                .age_seconds
+                .total_cmp(&left.age_seconds)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        (artifacts, stopped_containers, None)
     } else {
         (
+            Vec::new(),
             Vec::new(),
             Some(format!(
                 "{} engine read(s) failed, so this pass cannot prove what is safe to remove: {}",
@@ -166,12 +267,15 @@ fn observe_owned(engine: &DockerEngine) -> (Vec<bosn_core::ObservedArtifact>, Op
 /// Observe every Bosn-labeled container, running or stopped.
 ///
 /// `State.Running` comes from Docker rather than being inferred, so a container that started
-/// between two reads is still seen as live.
+/// between two reads is still seen as live. The same read feeds the #518 report, so a stopped
+/// container's pinned volumes come from the mount table Docker gives us here rather than from a
+/// second, raceable query.
 fn observe_containers(
     engine: &DockerEngine,
     options: RunOptions,
     probe: &str,
     artifacts: &mut Vec<bosn_core::ObservedArtifact>,
+    stopped_containers: &mut Vec<StoppedSetupContainer>,
     unreadable: &mut Vec<String>,
 ) {
     let Some(ids) = labeled_ids(
@@ -197,6 +301,13 @@ fn observe_containers(
                 ));
                 continue;
             };
+            if !entry.running() {
+                stopped_containers.push(StoppedSetupContainer {
+                    id: entry.id().to_owned(),
+                    age_seconds: age,
+                    pinned_volumes: entry.pinned_volume_names(),
+                });
+            }
             artifacts.push(bosn_core::ObservedArtifact {
                 id: entry.id().to_owned(),
                 kind: ResourceKind::Container,
@@ -549,6 +660,8 @@ struct ContainerDetail {
     created: String,
     #[serde(rename = "State", default)]
     state: Option<ContainerState>,
+    #[serde(rename = "Mounts", default)]
+    mounts: Vec<ContainerMount>,
     #[serde(rename = "Config", default)]
     config: Option<LabelledConfig>,
     /// `docker inspect` reports `SizeRw` only when asked; absent means unmeasured, which the
@@ -562,6 +675,21 @@ struct ContainerState {
     #[serde(rename = "Running", default)]
     running: bool,
 }
+
+/// One entry of a container's mount table.
+///
+/// Only named volume mounts count toward "pinned volumes": a bind mount is a path on a filesystem
+/// Bosn does not own, and an anonymous volume's name is an opaque id that would only inflate the
+/// count with something the operator cannot act on.
+#[derive(Debug, serde::Deserialize)]
+struct ContainerMount {
+    #[serde(rename = "Type", default)]
+    mount_type: String,
+    #[serde(rename = "Name", default)]
+    name: Option<String>,
+}
+
+const VOLUME_MOUNT_TYPE: &str = "volume";
 
 #[derive(Debug, serde::Deserialize)]
 struct LabelledConfig {
@@ -587,6 +715,23 @@ impl ContainerDetail {
     }
     fn size_bytes(&self) -> Option<i128> {
         self.size_rw
+    }
+    /// The named volumes this container mounts, sorted and deduplicated.
+    ///
+    /// The report counts what is *pinned*, so a container that mounts the same volume twice must
+    /// not report it twice. A nameless volume mount is skipped rather than reported as an empty
+    /// name: an unnameable volume is not something the report could describe.
+    fn pinned_volume_names(&self) -> Vec<String> {
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for mount in &self.mounts {
+            if mount.mount_type != VOLUME_MOUNT_TYPE {
+                continue;
+            }
+            if let Some(name) = mount.name.as_deref().filter(|name| !name.is_empty()) {
+                names.insert(name.to_owned());
+            }
+        }
+        names.into_iter().collect()
     }
 }
 
@@ -667,6 +812,9 @@ pub fn report_pass(outcome: &ManagedRetentionOutcome) {
         eprintln!("bosn retention: {refused}");
         return;
     }
+    // #518: the stopped-container pile is reported whether or not anything is reclaimable, and
+    // whether or not the operator opted in. It is the only signal a default install gets.
+    report_setup_containers(&outcome.setup_containers, summary.applied);
     if summary.planned == 0 {
         return;
     }
@@ -683,6 +831,67 @@ pub fn report_pass(outcome: &ManagedRetentionOutcome) {
     for failure in &summary.failures {
         eprintln!("bosn retention: {failure}");
     }
+}
+
+/// Print the stopped setup-container pile, if there is one.
+///
+/// The message leads with the volume count, because that is the actual cost: a stopped
+/// `bosn-setup-v2-*` container is kilobytes of writable layer holding megabytes of volumes
+/// unreclaimable. `applied` only changes the advice, never the facts.
+fn report_setup_containers(report: &SetupContainerReport, applied: bool) {
+    if let Some(line) = setup_container_report_line(report, applied) {
+        eprintln!("bosn retention: {line}");
+    }
+}
+
+/// The one-line report for a stopped-container pile, or `None` when there is nothing to report.
+///
+/// Split from the printing so the message is testable without capturing stderr.
+fn setup_container_report_line(report: &SetupContainerReport, applied: bool) -> Option<String> {
+    if report.is_empty() {
+        return None;
+    }
+    let past_gate = past_container_gate(report);
+    let oldest = report.oldest_age_seconds().map_or_else(
+        || "unknown age".to_owned(),
+        |age| format!("{:.1}h old", age / 3600.0),
+    );
+    let action = if applied {
+        "reclaim with: bosn gc owned --apply --yes"
+    } else {
+        "enable with: auto_retention = true in retention.toml"
+    };
+    Some(format!(
+        "{} stopped owned setup container(s), oldest {oldest}, pinning {} volume(s), {} past the \
+         {} container gate; {action}",
+        report.container_count(),
+        report.pinned_volume_count(),
+        past_gate,
+        describe_container_gate(),
+    ))
+}
+
+/// How many stopped containers are already past the container age gate.
+///
+/// The gate comes from `bosn-core`'s policy rather than a constant invented here, so the number
+/// the report calls stale is the same one an apply pass would act on.
+fn past_container_gate(report: &SetupContainerReport) -> usize {
+    let gate = RetentionPolicy::default()
+        .ttl_for(ResourceKind::Container)
+        .map_or(0.0, |ttl| ttl.as_secs_f64());
+    report
+        .stopped
+        .iter()
+        .filter(|container| container.age_seconds >= gate)
+        .count()
+}
+
+/// The container gate, phrased for a human reading a log line.
+fn describe_container_gate() -> String {
+    let gate = RetentionPolicy::default()
+        .ttl_for(ResourceKind::Container)
+        .map_or(0, |ttl| ttl.as_secs() / 3600);
+    format!("{gate}h")
 }
 
 /// The file that opts a machine into unattended reclamation.

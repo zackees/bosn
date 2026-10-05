@@ -91,6 +91,36 @@ and still reports what it *would* remove — a machine is never silently growing
 which is the failure mode that produced this issue. An absent file is not a reason to delete; it
 is a reason to say so.
 
+## Stopped setup containers are reported by default (#518)
+
+`bosn-setup-v2-*` containers are created with `docker container create` and **no `--rm`**, and
+cannot gain one: `bosn-setup`'s `validate_observed` actively enforces `AutoRemove == false`, so
+the container is designed to persist and reclamation has to come from this side. A persisted
+container keeps every volume it ever mounted alive, so it is a disk problem rather than a
+container-count problem.
+
+`maintenance_pass` now reports the pile on every maintenance interval, **regardless of the
+opt-in**:
+
+```
+bosn retention: 12 stopped owned setup container(s), oldest 59263.4h old, pinning 34 volume(s),
+8 past the 6h container gate; enable with: auto_retention = true in retention.toml
+```
+
+The line leads with the volume count because that is the actual cost, and it names how many are
+already past the 6 h container gate — the same `bosn-core` gate an apply pass acts on, not a
+constant invented here. Pinned volumes are read from the container's own mount table; a shared
+volume is counted once, and a bind mount or an anonymous volume is not counted at all, since
+neither is a named blob the operator can act on.
+
+Two properties are deliberate:
+
+- **Reporting is unconditional; deletion is not.** The two must not be confused. With the default
+  opt-out config the pass removes nothing and still prints the line; that line is the only bound a
+  default install has.
+- **The advice changes, the facts do not.** Opting in swaps the trailing hint for
+  `bosn gc owned --apply --yes`; the counts are the same either way.
+
 ## Relation to the existing paths
 
 This does **not** widen any existing destructive path:
