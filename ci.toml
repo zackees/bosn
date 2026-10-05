@@ -1,0 +1,140 @@
+# ci.toml — bosn's CI contract. Checked and planned by ci-lint (zackees/ci.yml).
+#
+# SCOPE OF THIS FILE: the cache policy only. It exists because bosn's GitHub
+# Actions cache sat at 221 entries / 9.92 GiB on 2026-10-05 -- 99% of GitHub's
+# 10 GiB per-repository cap -- and `ci-lint cache janitor` had no declared
+# families to evict against. Measured live with
+# `ci-lint cache audit --repo .` (GITHUB_REPOSITORY=zackees/bosn); see the PR
+# body for the per-family byte evidence.
+#
+# The tables bosn's schema-3 contract requires but does not yet declare
+# ([suites], [flow], [local], [allow], [publish]) are present but deliberately
+# EMPTY: declaring them would assert a CI contract bosn has not adopted, and an
+# empty table is the honest "nothing declared" the schema accepts. Fill them in
+# when bosn actually adopts the corresponding ci.yml conventions.
+#
+# Nothing here generates YAML: it bounds what the YAML may do.
+schema  = 3
+# bosn ships a Rust-backed PyPI wheel, but has NOT adopted the rust-pypi-app
+# suite/publish contract, so it does not claim that profile: that profile's
+# enforced requirements ([python], [rust], required unit+smoke suites, OIDC
+# publish) would be assertions bosn has not made. Only "rust-pypi-app" has
+# enforced requirements; this value loads and is not yet cross-checked.
+profile = "cache-policy-only"
+linter  = "zackees/ci.yml@527cc179200496bdc41445a2c5b91e6025b495d7"
+
+# ── Platforms ────────────────────────────────────────────────────────────────
+# The four runner/target pairs bosn's workflows actually build. Read from
+# .github/workflows/ci.yml (matrix.os = ubuntu-latest + windows-latest; the
+# Darwin targets cross-compile on ubuntu-latest and smoke on macos-15-intel /
+# macos-15) and macos-x64-execute.yml. Each id generates a [ci-<id>] tag.
+[platforms]
+linux-x64   = { target = "x86_64-unknown-linux-gnu", runs-on = "ubuntu-latest",   group = "linux" }
+windows-x64 = { target = "x86_64-pc-windows-msvc",  runs-on = "windows-latest", group = "windows" }
+macos-x64   = { target = "x86_64-apple-darwin",     runs-on = "macos-15-intel", group = "macos" }
+macos-arm64 = { target = "aarch64-apple-darwin",    runs-on = "macos-15",       group = "macos" }
+
+# bosn has not adopted the ci.yml suite/tag/local/allow/publish conventions.
+# Declared with their schema-required keys and nothing more, so the schema-3
+# load is clean without asserting a contract bosn has not adopted. Fill them
+# in when bosn actually adopts the corresponding ci.yml conventions.
+[suites]
+[flow]
+[tags]
+
+# GATE-001: the local gate is declared in local-gate.toml, NOT here. ci-lint
+# reads ci.toml's [local.gate] only when present, so leaving [local.gate] out
+# keeps local-gate.toml authoritative and avoids the both-declared violation.
+[local]
+runner = "bosn"
+lanes  = ["py-static", "guards", "rust", "tests"]
+cache  = "none"
+
+[allow]
+workflows         = {}
+actions           = []
+setup-soldr       = { only-in = ".github/workflows", require = {} }
+tools             = []
+platform-selector = ""
+platform-code     = []
+
+# bosn has no .github/actions/ wrapper: it calls setup-soldr and actions/cache
+# directly from its workflows. These two keys record that as the sanctioned
+# shape rather than leaving it implicit, so CACHE-001/009 classify bosn's real
+# layout instead of inventing a wrapper directory bosn does not have. This is
+# a repo-specific deviation from the fleet's wrapper convention -- flagged in
+# the PR body for review, not a policy waiver.
+cache-actions     = { only-in = ".github/workflows" }
+
+[publish]
+
+# ── Cache policy ─────────────────────────────────────────────────────────────
+# budget: 9.5GB, under GitHub's 10GB cap, so a save is refused by the API only
+# after ci-lint has already flagged the overage as CACHE-004.
+#
+# write-on = ["main"]: bosn's measured cache footprint is dominated by the
+# setup-soldr build cache, whose key encodes the toolchain digest and the
+# per-job suffix but NOT the commit SHA (setup-soldr#237). Every push appends
+# a new entry and nothing retires the old one -- exactly the CACHE-029
+# "per-run hash, nothing ever retires" shape. Restricting writes to the
+# default branch is what makes the LRU below meaningful.
+[cache]
+budget   = "9.5GB"
+write-on = ["main"]
+never    = []
+retired  = []
+
+# PRs write no cache at all. bosn's local gate (local-gate.toml, GATE-001..010)
+# already proves most lanes before they reach CI, so PR-attributable caches are
+# the cheapest thing to drop and the most expensive to keep.
+[cache.pr]
+mode       = "none"
+families   = []
+max-per-pr = "0MB"
+budget     = "0MB"
+trim       = "on-close"
+
+# ── Cache families ───────────────────────────────────────────────────────────
+# Every `max` below is at or above the largest entry actually observed live on
+# 2026-10-05. That direction is the safe one: `ci-lint cache janitor` LRU-evicts
+# an `evict = "lru"` family down to `max x cardinality`, so an under-stated
+# `max` would delete caches the next run genuinely restores. Over-stating `max`
+# only costs budget headroom.
+#
+# Every family declares `per = "platform"` because none of them can be counted
+# more tightly: the build-cache key ends in a per-toolchain/per-lockfile hash,
+# so its live cardinality already exceeds the writer-shape count (the same
+# over-count CACHE-029 documents for setup-uv).
+
+# Measured: 16 entries, 8.75 GiB, largest 1003.6 MB.
+# Key shape: setup-soldr-buildcache-v2-<os>-<arch>-<digest>-<job-suffix>-<lockhash>
+# -- a per-toolchain/per-lockfile content hash, NOT a per-commit one.
+[cache.family.build-cache]
+via   = "setup-soldr:build-cache"
+max   = "1050MB"
+per   = "platform"
+evict = "lru"
+
+# Measured: 4 entries, 738 MB, largest 207.7 MB.
+# Key shape: solo-toolchain-v3-<os>-<arch>-glibc|msvc-rustc<ver>-<digest>-t<target>-soldrv<ver>
+[cache.family.solo-toolchain]
+via   = "setup-soldr:solo-toolchain"
+max   = "210MB"
+per   = "platform"
+evict = "lru"
+
+# Measured: 2 entries, 21 MB, largest 10.5 MB.
+[cache.family.soldr-mini]
+via   = "setup-soldr:soldr-mini"
+max   = "12MB"
+per   = "platform"
+evict = "lru"
+
+# Measured: 3 entries, 617 KB, largest 277 KB. Under CACHE-029's 256MB
+# threshold either way; declared so the live audit classifies them instead of
+# reporting them as undeclared families.
+[cache.family.uv]
+via   = "setup-uv"
+max   = "1MB"
+per   = "platform"
+evict = "lru"
