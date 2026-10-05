@@ -2,6 +2,9 @@
 
 use super::*;
 
+pub(crate) mod registry_identity;
+pub(crate) use registry_identity::*;
+
 impl Service {
     pub fn new(state_dir: impl Into<PathBuf>) -> Self {
         let state_dir = state_dir.into();
@@ -22,6 +25,7 @@ impl Service {
             manifest_recovery_executor: Arc::new(DockerManifestRecoveryExecutor::new()),
             release_version: Arc::from(""),
             act_backend: Arc::new(ci::engine::DockerActBackend::default()),
+            identity_probe: default_identity_probe(),
             state_dir,
             stop: CancellationSource::new(),
             capacity: None,
@@ -111,6 +115,12 @@ impl Service {
         self.act_backend = backend;
         self
     }
+    /// Substitute the read-only prior-identity probe (#515). It can only
+    /// report Docker objects it read; it cannot inject engine commands.
+    pub fn with_identity_probe(mut self, probe: Arc<dyn RegistryIdentityProbe>) -> Self {
+        self.identity_probe = probe;
+        self
+    }
     /// Foreground lifecycle: acquires the sole registry writer before binding.
     #[expect(
         clippy::cognitive_complexity,
@@ -126,6 +136,38 @@ impl Service {
                 .map_err(|_| Error::ActorClosed)??,
             Ok(None) => return Err(Error::Protocol("registry identity unavailable")),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A missing database is either a genuine first run or the loss
+                // of the record of what this machine owns. Only the engine can
+                // tell those apart, so ask it before minting an identity that
+                // would strand every object the previous one created (#515).
+                let probe = Arc::clone(&self.identity_probe);
+                let prior = async_engine::launch_blocking(move || probe.as_ref().probe())
+                    .await
+                    .map_err(|_| Error::ActorClosed)?;
+                if prior.has_prior_objects() {
+                    // Refuse loudly rather than adopt silently: an empty
+                    // database minted here would make every one of these
+                    // objects `ForeignRegistry`, unreachable by every GC path
+                    // and unreported. Adopting them is an explicit act with an
+                    // explicit record, and this daemon does not perform it.
+                    let message = prior_registry_refusal(&prior, &db);
+                    eprintln!("{message}");
+                    return Err(Error::Protocol(
+                        "registry missing but this machine already has Bosn-labelled objects",
+                    ));
+                }
+                if !prior.is_clean() {
+                    // The read was incomplete, so "clean" is unproven. That is
+                    // not enough to refuse — a machine with a stopped Docker
+                    // daemon must still be able to start — but it is far too
+                    // much to mint an identity silently.
+                    for detail in &prior.unreadable {
+                        eprintln!(
+                            "bosn: prior-registry probe could not be completed ({detail}); \
+                             this machine is not known to be a clean first run"
+                        );
+                    }
+                }
                 let bytes = kernal_api::random::SecureRandom::new(1, IO_DEADLINE)
                     .map_err(|_| Error::Random)?
                     .bytes(16)
@@ -504,6 +546,9 @@ pub struct Service {
     /// Runner capacity from `bosn daemon serve` flags; `None` loads
     /// `runners.toml` and the environment at serve time.
     pub(crate) capacity: Option<capacity::RunnerCapacity>,
+    /// Read-only evidence about a previous registry, consulted when the
+    /// database is absent (#515).
+    pub(crate) identity_probe: Arc<dyn RegistryIdentityProbe>,
 }
 
 /// Stop every process in a setup container except its idle PID 1, the idle

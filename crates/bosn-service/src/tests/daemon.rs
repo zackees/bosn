@@ -564,6 +564,198 @@ fn doctor_executor_deadline_is_typed_without_waiting_for_a_slow_engine() {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Prior-registry identity (#515)
+// ---------------------------------------------------------------------------
+
+/// A probe that reports a fixed prior-identity read.
+#[derive(Debug)]
+struct FixedIdentityProbe(PriorIdentity);
+
+impl RegistryIdentityProbe for FixedIdentityProbe {
+    fn probe(&self) -> PriorIdentity {
+        self.0.clone()
+    }
+}
+
+fn prior_volume(name: &str, registry_id: &str, bytes: i128) -> PriorObject {
+    PriorObject {
+        kind: PriorObjectKind::Volume,
+        name: name.to_owned(),
+        registry_id: registry_id.to_owned(),
+        bytes: Some(bytes),
+    }
+}
+
+/// The 2026-10-05 incident: a clean state directory whose objects already carry
+/// a registry label. This must NOT become a silent first run — the failure mode
+/// made 182 volumes permanently unreachable by every GC path.
+#[test]
+fn missing_registry_with_foreign_labeled_objects_refuses_instead_of_rekeying() {
+    let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+    let state = temporary.path().join("state");
+    let db = state.join("registry.sqlite3");
+    let prior = PriorIdentity {
+        objects: vec![
+            prior_volume("bosn-cache", "11111111-1111-4111-8111-111111111111", 4_096),
+            prior_volume("bosn-model", "11111111-1111-4111-8111-111111111111", 8_192),
+        ],
+        unreadable: Vec::new(),
+    };
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let result = runtime.run(async {
+        Service::new(state.clone())
+            .with_identity_probe(Arc::new(FixedIdentityProbe(prior.clone())))
+            .serve()
+            .await
+    });
+    assert!(
+        matches!(result, Err(Error::Protocol(_))),
+        "a missing registry with foreign objects must refuse, got {result:?}"
+    );
+    // The decisive assertion: no database was minted, so nothing was re-keyed.
+    assert!(
+        !db.exists(),
+        "a new registry identity was minted for a machine that already had one"
+    );
+}
+
+/// The refusal must be actionable, not merely a failure: an operator has to be
+/// able to see what would be orphaned, by name and size, and what to do.
+#[test]
+fn the_prior_registry_refusal_names_every_orphaned_object_and_the_recovery() {
+    let prior = PriorIdentity {
+        objects: vec![
+            prior_volume("bosn-cache", "11111111-1111-4111-8111-111111111111", 4_096),
+            PriorObject {
+                kind: PriorObjectKind::Container,
+                name: "bosn-task-7".to_owned(),
+                registry_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+                bytes: None,
+            },
+        ],
+        unreadable: Vec::new(),
+    };
+    let message = prior_registry_refusal(&prior, Path::new("/state/registry.sqlite3"));
+    assert!(message.contains("/state/registry.sqlite3"));
+    assert!(message.contains("not a clean first run"));
+    assert!(message.contains("bosn-cache"));
+    assert!(message.contains("bosn-task-7"));
+    assert!(message.contains("11111111-1111-4111-8111-111111111111"));
+    assert!(message.contains("22222222-2222-4222-8222-222222222222"));
+    // Size is reported when known and named as unknown when not, so an
+    // operator is never left guessing which figure is missing.
+    assert!(message.contains("4.0KiB"));
+    assert!(message.contains("size unknown"));
+    assert!(message.contains("Restore the registry database from backup"));
+}
+
+/// The other half of the contract: a genuinely clean machine must still get a
+/// registry on the first try, with no ceremony and no configuration.
+#[test]
+fn a_genuine_first_run_on_a_clean_machine_still_mints_without_ceremony() {
+    let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+    let state = temporary.path().join("state");
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.run(async {
+        let server = async_engine::launch(
+            Service::new(state.clone())
+                .with_identity_probe(Arc::new(FixedIdentityProbe(PriorIdentity::default())))
+                .serve(),
+        );
+        let client = wait_for_client(&state).await;
+        let status = client.status().await.unwrap();
+        assert!(
+            !status.registry_id.is_empty(),
+            "a clean first run must still receive a registry identity"
+        );
+        assert!(state.join("registry.sqlite3").exists());
+        client.shutdown().await.unwrap();
+        stopped(server).await;
+    });
+}
+
+/// An unreadable probe is not an empty probe. It must not be mistaken for a
+/// clean machine, but it also must not block startup: a daemon on a host with
+/// a stopped Docker engine has to be able to come up.
+#[test]
+fn an_unreadable_probe_is_reported_but_does_not_block_a_first_run() {
+    let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+    let state = temporary.path().join("state");
+    let prior = PriorIdentity {
+        objects: Vec::new(),
+        unreadable: vec!["docker ps --filter label failed: no such daemon".to_owned()],
+    };
+    // The distinction under test: not clean, but also not a refusal.
+    assert!(!prior.is_clean());
+    assert!(!prior.has_prior_objects());
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.run(async {
+        let server = async_engine::launch(
+            Service::new(state.clone())
+                .with_identity_probe(Arc::new(FixedIdentityProbe(prior)))
+                .serve(),
+        );
+        let client = wait_for_client(&state).await;
+        assert!(!client.status().await.unwrap().registry_id.is_empty());
+        client.shutdown().await.unwrap();
+        stopped(server).await;
+    });
+}
+
+/// The typed inspect documents must deserialize into the probe's own structs,
+/// with Docker's `null` `Labels` handled rather than treated as absent.
+#[test]
+fn prior_identity_parses_typed_inspect_documents() {
+    let key = bosn_core::LABEL_REGISTRY;
+    let containers = r#"[{"Id":"abc123","Name":"/bosn-task-7","SizeRw":2048,
+        "Config":{"Labels":{"com.zackees.bosn.registry":"aaaa"}}}]"#;
+    let mut prior = PriorIdentity::default();
+    parse_kind(&mut prior, PriorObjectKind::Container, containers, key);
+    parse_kind(&mut prior, PriorObjectKind::Container, "not json", key);
+    assert_eq!(prior.objects.len(), 1);
+    assert_eq!(prior.objects[0].name, "bosn-task-7");
+    assert_eq!(prior.objects[0].registry_id, "aaaa");
+    assert_eq!(prior.objects[0].bytes, Some(2048));
+    // A document this build cannot read is recorded as unreadable, never as
+    // "nothing there".
+    assert_eq!(prior.unreadable.len(), 1);
+    assert!(!prior.is_clean());
+
+    // Docker renders `Labels` as `null` on an unlabelled object, not `{}`.
+    let volumes = r#"[{"Name":"bosn-cache","Labels":null,"UsageData":{"Size":1024}}]"#;
+    let mut prior = PriorIdentity::default();
+    parse_kind(&mut prior, PriorObjectKind::Volume, volumes, key);
+    assert_eq!(prior.objects[0].name, "bosn-cache");
+    assert_eq!(prior.objects[0].bytes, Some(1024));
+    assert!(
+        prior.objects[0]
+            .registry_id
+            .contains("no readable registry label"),
+        "a null Labels map must be reported, not silently dropped"
+    );
+
+    // An untagged image falls back to its id, never to a blank name.
+    let images = r#"[{"Id":"sha256:deadbeef","RepoTags":["<none>:<none>"],"Size":9,
+        "Config":{"Labels":{}}}]"#;
+    let mut prior = PriorIdentity::default();
+    parse_kind(&mut prior, PriorObjectKind::Image, images, key);
+    assert_eq!(prior.objects[0].name, "sha256:deadbeef");
+    assert_eq!(prior.objects[0].bytes, Some(9));
+}
+
 #[test]
 fn independent_state_directories_serve_concurrently() {
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
