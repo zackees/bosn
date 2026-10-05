@@ -124,6 +124,23 @@ pub(crate) struct ReplyWire {
     /// Code 220, `bosn jobs` (#358): the accounting view as a JSON document.
     #[prost(string, tag = "58")]
     pub(crate) jobs_json: String,
+    /// Code 230, `bosn gc owned` (#456): what the managed-retention pass did or would do.
+    #[prost(bool, tag = "59")]
+    pub(crate) owned_applied: bool,
+    #[prost(uint64, tag = "60")]
+    pub(crate) owned_planned: u64,
+    #[prost(uint64, tag = "61")]
+    pub(crate) owned_removed: u64,
+    #[prost(int64, tag = "62")]
+    pub(crate) owned_removed_bytes: i64,
+    #[prost(uint64, tag = "63")]
+    pub(crate) owned_deferred: u64,
+    #[prost(uint64, tag = "64")]
+    pub(crate) owned_failed: u64,
+    #[prost(string, repeated, tag = "65")]
+    pub(crate) owned_failures: Vec<String>,
+    #[prost(string, tag = "66")]
+    pub(crate) owned_refused: String,
 }
 #[derive(Message)]
 pub(crate) struct LogRecordWire {
@@ -340,6 +357,7 @@ pub(crate) enum Reply {
     ManifestVolumeGcPreview(ManifestVolumeGcPreviewPage),
     ManifestVolumeGcApply(ManifestVolumeGcApplyResult),
     UnmanagedApply(UnmanagedApplySummary),
+    ManagedRetention(ManagedRetentionSummary),
     Ci(String),
     CiError(String),
     Jobs(String),
@@ -468,6 +486,16 @@ pub(crate) fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
             refused: (!v.unmanaged_refused.is_empty()).then_some(v.unmanaged_refused),
         })),
         220 => Ok(Reply::Jobs(v.jobs_json)),
+        230 => Ok(Reply::ManagedRetention(ManagedRetentionSummary {
+            applied: v.owned_applied,
+            planned: v.owned_planned,
+            removed: v.owned_removed,
+            removed_bytes: i128::from(v.owned_removed_bytes),
+            deferred: v.owned_deferred,
+            failed: v.owned_failed,
+            failures: v.owned_failures,
+            refused: (!v.owned_refused.is_empty()).then_some(v.owned_refused),
+        })),
         1 => Err(Error::Protocol("unsupported protocol")),
         2 => Err(Error::Protocol("unknown operation")),
         _ => Err(Error::Protocol("daemon error")),
@@ -525,6 +553,19 @@ pub(crate) struct Request {
     /// polled for this many milliseconds (#357). Zero means no lease.
     #[prost(uint64, tag = "23")]
     pub(crate) follow_lease_ms: u64,
+    /// Operation 38, `bosn gc owned` (#456): the per-kind age gates in seconds.
+    #[prost(uint64, tag = "24")]
+    pub(crate) owned_container_ttl_secs: u64,
+    #[prost(uint64, tag = "25")]
+    pub(crate) owned_volume_ttl_secs: u64,
+    #[prost(uint64, tag = "26")]
+    pub(crate) owned_image_ttl_secs: u64,
+    /// Zero means no byte ceiling for this pass.
+    #[prost(int64, tag = "27")]
+    pub(crate) owned_max_bytes: i64,
+    /// Set only together with `gc_confirm`: this is a destructive pass, not a preview.
+    #[prost(bool, tag = "28")]
+    pub(crate) owned_confirm: bool,
 }
 impl Request {
     pub(crate) fn operation(operation: u32) -> Self {
@@ -552,6 +593,11 @@ impl Request {
             unmanaged_ttl_seconds: 0,
             ci_request: String::new(),
             follow_lease_ms: 0,
+            owned_container_ttl_secs: 0,
+            owned_volume_ttl_secs: 0,
+            owned_image_ttl_secs: 0,
+            owned_max_bytes: 0,
+            owned_confirm: false,
         }
     }
 }

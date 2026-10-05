@@ -10,6 +10,7 @@ pub mod act_coverage;
 pub mod compose;
 pub mod config;
 pub mod manifest;
+pub mod retention;
 pub mod setup;
 pub mod unmanaged;
 
@@ -25,6 +26,10 @@ pub use config::{
 };
 pub use manifest::{
     MANIFEST_TASK_SECRETS, Manifest, ManifestError, ManifestRoots, parse_manifest_toml,
+};
+pub use retention::{
+    DEFAULT_CONTAINER_TTL, DEFAULT_IMAGE_TTL, DEFAULT_VOLUME_TTL, HoldReason, MAX_MANAGED_REMOVALS,
+    RetentionPlan, RetentionPolicy, RetentionVerdict, age_seconds, classify_managed, plan_managed,
 };
 pub use setup::{
     CompanionFile, MAX_COMPANION_FILE_BYTES, MAX_COMPANION_FILES, MAX_ENVIRONMENT_ENTRIES,

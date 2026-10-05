@@ -70,6 +70,7 @@ mod job_api;
 mod job_loop;
 mod job_support;
 pub mod jobs;
+pub mod managed_retention;
 mod manifest_executors;
 mod manifest_plan;
 mod manifest_recovery;

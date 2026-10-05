@@ -73,6 +73,29 @@ pub struct SetupGcApplyResult {
     pub removed: bool,
     pub reconciled_missing: bool,
 }
+/// Outcome of one `gc owned` pass, preview or applied.
+///
+/// Every count here is measured by the daemon from its own re-derived plan. The caller's
+/// preview is never trusted: the daemon rebuilds the plan immediately before removing anything.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedRetentionSummary {
+    /// False for a preview. A preview never mutates the engine.
+    pub applied: bool,
+    /// Reclaimable objects the re-derived plan selected, before any removal.
+    pub planned: u64,
+    /// Objects actually removed. Zero for a preview.
+    pub removed: u64,
+    /// Measured after the pass completed, not predicted before it.
+    pub removed_bytes: i128,
+    /// Reclaimable objects left for a later pass because a cap was reached.
+    pub deferred: u64,
+    /// Removals the engine refused or failed. Each names the exact object.
+    pub failed: u64,
+    pub failures: Vec<String>,
+    /// Set when the pass refused to remove anything.
+    pub refused: Option<String>,
+}
+
 /// Outcome of one `gc --unmanaged --apply`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnmanagedApplySummary {
