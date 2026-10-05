@@ -101,11 +101,11 @@ pub fn managed_retention_pass(
             // Re-verify this exact object immediately before removing it. A container that
             // started while the pass was running must never be removed by a stale plan.
             let outcome = revalidate(engine, candidate, our_registry.as_deref(), policy)
-                .and_then(|()| remove_owned(engine, candidate));
+                .and_then(|measured| remove_owned(engine, candidate).map(|()| measured));
             match outcome {
-                Ok(()) => {
+                Ok(measured) => {
                     removed += 1;
-                    removed_bytes = removed_bytes.saturating_add(candidate.bytes.unwrap_or(0));
+                    removed_bytes = removed_bytes.saturating_add(measured.unwrap_or(0));
                 }
                 Err(detail) => {
                     failed += 1;
@@ -310,14 +310,19 @@ fn signals(in_use: bool) -> bosn_core::Signals {
 }
 
 /// Re-check one candidate immediately before its removal.
+///
+/// Returns the size measured by that same fresh inspection, or `None` when the engine did not
+/// report one. Every field of the decision comes from this read: the plan's `bytes` is a
+/// snapshot from the start of the pass and must never stand in for a value the engine did not
+/// give us now, because the summary's `removed_bytes` is an account of what actually went away.
 fn revalidate(
     engine: &DockerEngine,
     candidate: &RetentionVerdict,
     our_registry: Option<&str>,
     policy: RetentionPolicy,
-) -> Result<(), String> {
+) -> Result<Option<i128>, String> {
     let options = RunOptions::bounded(RETENTION_READ_DEADLINE, RETENTION_OUTPUT_LIMIT);
-    let (labels, age, in_use) = match candidate.kind {
+    let (labels, age, in_use, bytes) = match candidate.kind {
         ResourceKind::Container => {
             let probe = vec![candidate.id.clone()];
             let Some(entries) =
@@ -326,13 +331,15 @@ fn revalidate(
                 return Err(format!("container {} could not be re-read", candidate.id));
             };
             let Some(entry) = entries.into_iter().next() else {
-                // Already gone: the desired state is reached, not a failure.
-                return Ok(());
+                // Already gone: the desired state is reached, not a failure. Nothing was
+                // reclaimed, so nothing is accounted for either.
+                return Ok(None);
             };
             (
                 entry.labels(),
                 entry.created_age(now_seconds()),
                 entry.running(),
+                entry.size_bytes(),
             )
         }
         ResourceKind::Volume => {
@@ -342,13 +349,14 @@ fn revalidate(
                 return Err(format!("volume {} could not be re-read", candidate.id));
             };
             let Some(entry) = entries.into_iter().next() else {
-                return Ok(());
+                return Ok(None);
             };
             let in_use = !volume_is_unused(engine, &entry.name, options);
             (
                 entry.labels.clone(),
                 entry.created_age(now_seconds()),
                 in_use,
+                entry.size_bytes(),
             )
         }
         ResourceKind::Image => {
@@ -358,10 +366,15 @@ fn revalidate(
                 return Err(format!("image {} could not be re-read", candidate.id));
             };
             let Some(entry) = entries.into_iter().next() else {
-                return Ok(());
+                return Ok(None);
             };
             let in_use = !image_is_unused(engine, &entry.id, options);
-            (entry.labels(), entry.created_age(now_seconds()), in_use)
+            (
+                entry.labels(),
+                entry.created_age(now_seconds()),
+                in_use,
+                entry.size_bytes(),
+            )
         }
         _ => return Err("unsupported kind for removal".to_owned()),
     };
@@ -381,11 +394,11 @@ fn revalidate(
             dangling: false,
             anonymous: false,
         },
-        bytes: candidate.bytes,
+        bytes,
         age_seconds: Some(age),
     };
     match classify_managed(&fresh, our_registry, policy).hold {
-        None => Ok(()),
+        None => Ok(bytes),
         Some(reason) => Err(format!(
             "{} {} is no longer reclaimable: {}",
             candidate.kind.as_str(),
@@ -402,9 +415,11 @@ fn revalidate(
 fn remove_owned(engine: &DockerEngine, candidate: &RetentionVerdict) -> Result<(), String> {
     let options = RunOptions::bounded(RETENTION_REMOVAL_DEADLINE, RETENTION_REMOVAL_OUTPUT_LIMIT);
     let argv: Vec<&str> = match candidate.kind {
-        // `-f` because a container can be re-created between the re-check and this call, and a
-        // container that already stopped still needs removing.
-        ResourceKind::Container => vec!["rm", "-f", &candidate.id],
+        // No `-f`: a container can start between the re-check and this call, and forcing it
+        // would kill live work this pass never looked at. A plain `rm` already removes an
+        // already-stopped container, and refuses a running one, which the caller reports as a
+        // failure and moves on from.
+        ResourceKind::Container => vec!["rm", &candidate.id],
         ResourceKind::Volume => vec!["volume", "rm", &candidate.id],
         ResourceKind::Image => vec!["rmi", &candidate.id],
         _ => return Err("unsupported kind for removal".to_owned()),
