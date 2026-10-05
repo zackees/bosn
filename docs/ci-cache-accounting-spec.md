@@ -4060,3 +4060,28 @@ refused by `ci/test_guard.sh` by design, so the new unit tests compile here and
 execute in the local gate's isolated lane. Normal runtime enrollment remains
 legacy and unactivated; publication, merge-into-generation, reference release,
 source-volume removal and bounded recovery enumeration remain open.
+
+### Gate failure triage: source-text ordering test vs. native overlay (2026-10-04)
+
+The local gate's `tests` lane failed with exactly one failure,
+`tests/test_runner_tools.py::RunnerToolsTests::test_tools_are_prepared_after_the_tool_cache_is_seeded`,
+at `ValueError: substring not found` (262 passed, 10 skipped). The retained act
+log for the failing run is under the gate state directory's `ci/runs/`.
+
+The test asserts on **source text**, and the native overlay slice replaced the
+seed call site: `engine.rs` now runs
+`Self::exec(engine, &prepare_toolcache_script(generation)?)`, which returns the
+legacy seed with no frozen generation and the native overlay with one. The
+invariant the test guards — the tool cache is seeded before runner stock tools
+install into it — is unchanged, and the ordering assertion now names the new
+call site. The test was updated, not weakened: it still pins both call sites
+and their relative order.
+
+Two other tests fail when the workspace suite is run directly on the developer
+host (`concurrent_engines_with_equal_pids_publish_through_distinct_stages` and
+`daemon_shutdown_does_not_wait_for_stalled_cache_discovery_client`, the latter
+measuring ~30s against a 5s budget). Both fail identically on unmodified
+`origin/main` (`420c1ddb`), and main's GitHub CI at that same SHA is green, so
+they are host-environment timing artifacts rather than branch defects. They are
+retained here rather than dismissed, because the local gate is the stricter
+environment and a host run is not the gate.

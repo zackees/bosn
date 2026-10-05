@@ -91,8 +91,13 @@ class RunnerToolsTests(unittest.TestCase):
         engine = (ROOT / "crates/bosn-service/src/ci/engine.rs").read_text()
         self.assertIn("runner_tools::prepare_script()", engine)
         self.assertIn("runner_tools::path_env()", engine)
+        # The tool cache is seeded through `prepare_toolcache_script`, which
+        # yields the legacy seed with no frozen generation and the native
+        # overlay with one. Both must land before runner stock tools, because
+        # those tools install into the tool cache the seed just populated.
+        self.assertIn("prepare_toolcache_script(generation)?", engine)
         self.assertLess(
-            engine.index("Self::exec(engine, &seed_toolcache_script())"),
+            engine.index("Self::exec(engine, &prepare_toolcache_script(generation)?)"),
             engine.index("runner_tools::prepare_script()"),
         )
 
