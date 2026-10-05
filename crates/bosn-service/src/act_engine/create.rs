@@ -175,6 +175,7 @@ pub(crate) fn creation_profile(
         init_command_sha256: command_digest(&engine_command())?,
         cache_volume: None,
         cache_coordination: None,
+        tool_generation: None,
     };
     profile
         .validate()
@@ -223,7 +224,11 @@ pub fn create_arguments(
             ));
         }
     }
-    let expected_profile = creation_profile_with_cache(limits, cache.clone())?;
+    let generation = intent
+        .creation_profile
+        .as_ref()
+        .and_then(|profile| profile.tool_generation.clone());
+    let expected_profile = creation_profile_with_tools(limits, cache.clone(), generation.clone())?;
     if intent.creation_profile.as_ref() != Some(&expected_profile) {
         return Err(ActEngineError(
             "creation differs from frozen engine profile".into(),
@@ -295,7 +300,10 @@ pub fn create_arguments(
         "docker.io/library/docker@{}",
         intent.engine_image_digest
     ));
-    args.extend(engine_command_with_cache(cache.as_ref())?);
+    args.extend(engine_command_with_tools(
+        cache.as_ref(),
+        generation.as_ref(),
+    )?);
     Ok(args)
 }
 
@@ -549,7 +557,8 @@ pub async fn remove_owned_engine(
             ));
         }
     }
-    remove_storage_volume(engine, &record.intent, &record.registry_id).await?;
+    crate::act_engine::stop_source_writers(registry, engine, &record, &record.registry_id).await?;
+    remove_storage_volume(engine, &record, &record.registry_id).await?;
     registry
         .act_registry(ActRegistryCommand::Finalize {
             run: run.into(),

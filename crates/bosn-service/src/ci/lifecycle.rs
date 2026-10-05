@@ -445,7 +445,15 @@ pub async fn run_on_engine(
             }
             observer.note("preparing run: tool cache, frozen source");
             backend
-                .prepare_run(held.engine(), &plan.source, &plan.event)
+                .prepare_run(
+                    held.engine(),
+                    &plan.source,
+                    &plan.event,
+                    plan.intent
+                        .creation_profile
+                        .as_ref()
+                        .and_then(|profile| profile.tool_generation.as_ref()),
+                )
                 .await
         };
         let prepared =

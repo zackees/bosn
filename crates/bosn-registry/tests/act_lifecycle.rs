@@ -16,6 +16,7 @@ fn profile() -> ActEngineCreationProfile {
         init_command_sha256: "a".repeat(64),
         cache_volume: None,
         cache_coordination: None,
+        tool_generation: None,
     }
 }
 fn intent() -> ActEngineIntent {
@@ -992,3 +993,6 @@ fn record_versions_refuse_profile_presence_mismatches() {
 
 #[path = "act_lifecycle/storage.rs"]
 mod storage;
+
+#[path = "act_lifecycle/recovery.rs"]
+mod recovery;

@@ -2,9 +2,10 @@
 use super::*;
 use bosn_core::{ResourceKind, ResourceLabels, Retention, Scope};
 use bosn_engine::DockerEngine;
+use bosn_registry::act::ActEngineRecord;
 use serde::Deserialize;
 
-fn labels(
+pub(super) fn labels(
     intent: &ActEngineIntent,
     owner: &str,
 ) -> Result<BTreeMap<String, String>, ActEngineError> {
@@ -35,26 +36,41 @@ pub(super) struct DockerVolume {
     pub(super) labels: Option<BTreeMap<String, String>>,
 }
 
-fn verify(document: &[u8], intent: &ActEngineIntent, owner: &str) -> Result<(), ActEngineError> {
+/// The one predicate that decides whether an observed volume is the private
+/// local volume a bosn intent owns. Ambiguous, absent or unparsable output is
+/// always a refusal; the expected name comes from the caller, never from
+/// Docker, so a rename can never substitute a different volume.
+pub(super) fn verify_owned_local_volume(
+    document: &[u8],
+    expected_name: &str,
+    expected_labels: &BTreeMap<String, String>,
+) -> Result<(), ActEngineError> {
     let volumes: Vec<DockerVolume> =
         serde_json::from_slice(document).map_err(|e| ActEngineError(e.to_string()))?;
     let [volume] = volumes.as_slice() else {
         return Err(ActEngineError("ambiguous private storage volume".into()));
     };
-    if Some(&volume.name) != intent.storage_volume_name().as_ref()
+    if volume.name != expected_name
         || volume.driver != "local"
         || volume.scope != "local"
         || volume
             .options
             .as_ref()
             .is_some_and(|options| !options.is_empty())
-        || volume.labels.as_ref() != Some(&labels(intent, owner)?)
+        || volume.labels.as_ref() != Some(expected_labels)
     {
         return Err(ActEngineError(
             "private storage volume ownership does not match".into(),
         ));
     }
     Ok(())
+}
+
+fn verify(document: &[u8], intent: &ActEngineIntent, owner: &str) -> Result<(), ActEngineError> {
+    let expected = intent
+        .storage_volume_name()
+        .ok_or_else(|| ActEngineError("private storage volume ownership does not match".into()))?;
+    verify_owned_local_volume(document, &expected, &labels(intent, owner)?)
 }
 
 async fn present(engine: &DockerEngine, name: &str) -> Result<bool, ActEngineError> {
@@ -112,9 +128,30 @@ pub(crate) async fn ensure_storage_volume(
     verify(&document, intent, owner)
 }
 
+/// Remove a retiring engine's private storage, unless native tool recovery
+/// still needs it.
+///
+/// A record carrying an unreleased recovery intent keeps its source volume:
+/// the recovering reader still holds the overlay it contains. Publication and
+/// reference release must be integrated before this guard is relaxed, so that
+/// path never falls back to deleting private disk.
+pub(crate) async fn remove_storage_volume(
+    engine: &DockerEngine,
+    record: &ActEngineRecord,
+    owner: &str,
+) -> Result<(), ActEngineError> {
+    if super::source_retained_by_recovery(record) {
+        return Err(ActEngineError(
+            "native tool recovery retains the private source volume".into(),
+        ));
+    }
+    remove_private_storage(engine, &record.intent, owner).await
+}
+
 /// Exact named storage only. Attached volumes are refused by Docker; removal
 /// is never forced. A successful exact listing is required before receipt.
-pub(crate) async fn remove_storage_volume(
+/// Module-private so [`remove_storage_volume`] stays the only reachable path.
+async fn remove_private_storage(
     engine: &DockerEngine,
     intent: &ActEngineIntent,
     owner: &str,
@@ -232,7 +269,7 @@ else: sys.exit(2)
                 .build()
                 .unwrap()
                 .run(async {
-                    let result = remove_storage_volume(&engine, &intent, OWNER).await;
+                    let result = remove_private_storage(&engine, &intent, OWNER).await;
                     assert_eq!(
                         result.is_ok(),
                         matches!(mode, "success" | "slow-remove"),
@@ -241,7 +278,9 @@ else: sys.exit(2)
                     if mode == "lost_ack" {
                         assert!(!state.exists());
                         assert!(
-                            remove_storage_volume(&engine, &intent, OWNER).await.is_ok(),
+                            remove_private_storage(&engine, &intent, OWNER)
+                                .await
+                                .is_ok(),
                             "a successful later list may establish absence"
                         );
                     }

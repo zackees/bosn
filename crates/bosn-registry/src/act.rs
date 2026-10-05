@@ -8,6 +8,8 @@ use super::*;
 use bosn_core::ResourceLabels;
 use serde::{Deserialize, Serialize};
 
+mod recovery;
+pub use recovery::{ActToolRecoveryIntent, ActToolSourceStopProof};
 mod spare;
 pub use spare::ActEngineBinding;
 
@@ -56,6 +58,9 @@ pub struct ActEngineCreationProfile {
     /// Absent in historical profiles; their serialized identity stays unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_coordination: Option<ActCacheCoordination>,
+    /// Exact immutable tool generation admitted by the engine startup process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_generation: Option<ActToolGenerationBinding>,
 }
 /// A frozen named-volume mount: Docker's `local` driver, read-write, at
 /// `target`. The volume's ownership is verified before creation and the
@@ -104,8 +109,36 @@ impl ActEngineCacheVolume {
         Ok(())
     }
 }
+/// Frozen native reader policy. Store location is producer-defined, not a path
+/// supplied by the client. Omitted bindings preserve historical profile bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActToolGenerationBinding {
+    pub id: String,
+    pub max_payload_bytes: u64,
+    /// Exact producer preparation recipe, including native reader checks.
+    pub overlay_recipe_sha256: String,
+}
+impl ActToolGenerationBinding {
+    pub fn validate(&self) -> Result<(), Error> {
+        if !hex(&self.id, 64)
+            || !hex(&self.overlay_recipe_sha256, 64)
+            || self.max_payload_bytes == 0
+            || self.max_payload_bytes > i64::MAX as u64
+        {
+            return Err(Error::BadRow("act tool generation binding"));
+        }
+        Ok(())
+    }
+}
 impl ActEngineCreationProfile {
     pub fn validate(&self) -> Result<(), Error> {
+        if let Some(generation) = &self.tool_generation {
+            generation.validate()?;
+            if self.cache_volume.is_none() || self.cache_coordination.is_none() {
+                return Err(Error::BadRow("tool generation without coordinated cache"));
+            }
+        }
         if self.cache_coordination.is_some() && self.cache_volume.is_none() {
             return Err(Error::BadRow("cache coordination without shared cache"));
         }
@@ -205,6 +238,13 @@ pub struct ActEngineRecord {
     /// the spare over ([`Immediate::claim_act_spare`]), never otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<ActEngineBinding>,
+    /// Frozen before reserving a native lower; absent in historical records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_recovery: Option<ActToolRecoveryIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_recovery_reserved_at: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_recovery_source_stopped_at: Option<f64>,
 }
 /// Keyset page ordered by immutable canonical run UUID, independent of state.
 #[derive(Clone, Debug, PartialEq)]
@@ -355,6 +395,31 @@ impl ActEngineIntent {
 impl ActEngineRecord {
     fn validate(&self) -> Result<(), Error> {
         self.intent.validate()?;
+        if self.tool_recovery_reserved_at.is_some_and(|at| {
+            !at.is_finite()
+                || at > self.updated_at
+                || self.tool_recovery.as_ref().is_none_or(|intent| {
+                    at < intent.created_at_seconds as f64 || at >= intent.expires_at_seconds as f64
+                })
+        }) {
+            return Err(Error::BadRow("tool recovery reservation acknowledgement"));
+        }
+        if self.tool_recovery_source_stopped_at.is_some_and(|at| {
+            !at.is_finite()
+                || at > self.updated_at
+                || self
+                    .tool_recovery_reserved_at
+                    .is_none_or(|reserved| at < reserved)
+                || !matches!(
+                    self.state,
+                    ActEngineState::CleanupRequired | ActEngineState::Terminal
+                )
+        }) {
+            return Err(Error::BadRow("tool recovery source stop snapshot"));
+        }
+        if let Some(recovery) = &self.tool_recovery {
+            recovery.validate_record(self)?;
+        }
         if (self.state == ActEngineState::Terminal) != self.removal.is_some()
             || self.removal.as_ref().is_some_and(|p| {
                 p.name != self.intent.engine_name()
@@ -483,6 +548,9 @@ impl Immediate<'_> {
             removal: None,
             updated_at: intent.created_at,
             binding: None,
+            tool_recovery: None,
+            tool_recovery_reserved_at: None,
+            tool_recovery_source_stopped_at: None,
         })
     }
     /// Exact ownership predicate for both registration and pending-intent

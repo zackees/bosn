@@ -22,6 +22,25 @@ pub enum ActRegistryCommand {
     /// Irreversibly withdraw startup recovery authority for this actor.
     SealStartup,
     Begin(ActEngineIntent),
+    ToolRecoveryBegin {
+        run: String,
+        token: String,
+        created: i64,
+        expires: i64,
+    },
+    ToolRecoveryReserved {
+        run: String,
+        token: String,
+        intent: bosn_registry::act::ActToolRecoveryIntent,
+        at: f64,
+    },
+    /// Trusted runtime receipt that the engine holding the last source reader
+    /// is absent and its private source volume is still retained and ours.
+    ToolRecoverySourceStopped {
+        run: String,
+        proof: bosn_registry::act::ActToolSourceStopProof,
+        at: f64,
+    },
     Register {
         run: String,
         observed: ActEngineObservation,
@@ -152,6 +171,8 @@ pub(crate) fn apply(
     if matches!(
         &command,
         ActRegistryCommand::Begin(_)
+            | ActRegistryCommand::ToolRecoveryBegin { .. }
+            | ActRegistryCommand::ToolRecoveryReserved { .. }
             | ActRegistryCommand::HelperBegin(_)
             | ActRegistryCommand::Claim { .. }
             | ActRegistryCommand::ClaimSpare { .. }
@@ -226,6 +247,28 @@ pub(crate) fn apply(
         }
         ActRegistryCommand::Begin(intent) => {
             transaction.begin_act_engine(&intent)?;
+            ActRegistryReply::Committed
+        }
+        ActRegistryCommand::ToolRecoveryBegin {
+            run,
+            token,
+            created,
+            expires,
+        } => {
+            transaction.begin_act_tool_recovery(&run, &token, created, expires)?;
+            ActRegistryReply::Committed
+        }
+        ActRegistryCommand::ToolRecoveryReserved {
+            run,
+            token,
+            intent,
+            at,
+        } => {
+            transaction.acknowledge_act_tool_recovery(&run, &token, &intent, at)?;
+            ActRegistryReply::Committed
+        }
+        ActRegistryCommand::ToolRecoverySourceStopped { run, proof, at } => {
+            transaction.record_act_tool_source_stopped(&run, &proof, at)?;
             ActRegistryReply::Committed
         }
         ActRegistryCommand::Register { run, observed, at } => {
@@ -362,6 +405,7 @@ mod tests {
                 init_command_sha256: "a".repeat(64),
                 cache_volume: None,
                 cache_coordination: None,
+                tool_generation: None,
             }),
         };
         let runtime = kernal_api::async_engine::RuntimeBuilder::multi_thread()
@@ -496,6 +540,7 @@ mod tests {
                 init_command_sha256: "a".repeat(64),
                 cache_volume: None,
                 cache_coordination: None,
+                tool_generation: None,
             }),
         }
     }
@@ -616,7 +661,7 @@ mod tests {
     }
     #[test]
     fn admission_or_seal_irreversibly_closes_startup_and_preserves_live_claim() {
-        for close in ["seal", "begin", "claim"] {
+        for close in ["seal", "begin", "claim", "recovery"] {
             let dir = TemporaryDirectory::new().unwrap();
             let path = dir.path().join("fenced.sqlite3");
             let intent = startup_fixture();
@@ -646,6 +691,19 @@ mod tests {
                                 .act_registry(ActRegistryCommand::Begin(next))
                                 .await
                                 .unwrap();
+                        }
+                        "recovery" => {
+                            assert!(
+                                actor
+                                    .act_registry(ActRegistryCommand::ToolRecoveryBegin {
+                                        run: intent.run_id.clone(),
+                                        token: STALE_CLAIM.into(),
+                                        created: 4,
+                                        expires: 3604,
+                                    })
+                                    .await
+                                    .is_err()
+                            );
                         }
                         _ => {
                             assert!(

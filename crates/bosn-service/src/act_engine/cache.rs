@@ -38,12 +38,31 @@ pub(crate) fn creation_profile_with_cache(
     limits: ActEngineLimits,
     cache: Option<ActEngineCacheVolume>,
 ) -> Result<ActEngineCreationProfile, ActEngineError> {
+    creation_profile_with_tools(limits, cache, None)
+}
+
+pub(crate) fn creation_profile_with_tools(
+    limits: ActEngineLimits,
+    cache: Option<ActEngineCacheVolume>,
+    generation: Option<bosn_registry::act::ActToolGenerationBinding>,
+) -> Result<ActEngineCreationProfile, ActEngineError> {
+    if generation.as_ref().is_some_and(|generation| {
+        generation.overlay_recipe_sha256 != crate::ci::engine::tool_overlay_recipe_sha256()
+    }) {
+        return Err(ActEngineError(
+            "tool overlay recipe differs from frozen producer".into(),
+        ));
+    }
     let mut profile = creation_profile(limits)?;
     profile.cache_coordination = cache
         .as_ref()
         .map(|_| bosn_registry::act::ActCacheCoordination::SharedLegacyLeaseV1);
-    profile.init_command_sha256 = command_digest(&engine_command_with_cache(cache.as_ref())?)?;
+    profile.init_command_sha256 = command_digest(&engine_command_with_tools(
+        cache.as_ref(),
+        generation.as_ref(),
+    )?)?;
     profile.cache_volume = cache;
+    profile.tool_generation = generation;
     profile
         .validate()
         .map_err(|error| ActEngineError(error.to_string()))?;
@@ -54,9 +73,22 @@ pub(crate) fn creation_profile_with_cache(
 /// dedicated startup process. The command digest freezes both artifact hashes
 /// and the exact install/INIT chain before durable registration and creation.
 /// Engines without a shared cache retain their historical command identity.
+#[cfg(test)]
 pub(super) fn engine_command_with_cache(
     cache: Option<&ActEngineCacheVolume>,
 ) -> Result<Vec<String>, ActEngineError> {
+    engine_command_with_tools(cache, None)
+}
+
+pub(super) fn engine_command_with_tools(
+    cache: Option<&ActEngineCacheVolume>,
+    generation: Option<&bosn_registry::act::ActToolGenerationBinding>,
+) -> Result<Vec<String>, ActEngineError> {
+    if generation.is_some() && cache.is_none() {
+        return Err(ActEngineError(
+            "tool generation requires shared cache".into(),
+        ));
+    }
     let Some(cache) = cache else {
         return Ok(engine_command());
     };
@@ -81,6 +113,24 @@ pub(super) fn engine_command_with_cache(
         script,
         "bosn-act-bootstrap".into(),
     ];
+    if let Some(generation) = generation {
+        generation
+            .validate()
+            .map_err(|error| ActEngineError(error.to_string()))?;
+        command.extend([
+            format!("{ENGINE_WORK}/bin/act"),
+            "--cache-server-path".into(),
+            format!("{ENGINE_CACHE}/toolstore-v1"),
+            "cache".into(),
+            "tool-exec".into(),
+            "--generation".into(),
+            generation.id.clone(),
+            "--max-bytes".into(),
+            generation.max_payload_bytes.to_string(),
+            "--apply".into(),
+            "--".into(),
+        ]);
+    }
     command.extend(engine_command());
     Ok(command)
 }
@@ -231,6 +281,60 @@ pub(super) fn volume_mounts_match(
 #[cfg(test)]
 mod ownership_tests {
     use super::*;
+
+    #[test]
+    fn selected_tool_generation_is_frozen_into_native_engine_startup() {
+        let limits = super::super::tests::limits();
+        let mut intent = super::super::tests::intent();
+        let act = crate::ci::pins::act_artifact("amd64").unwrap();
+        intent.act_version = crate::ci::pins::ACT_VERSION.into();
+        intent.act_image_digest = format!("sha256:{}", act.sha256);
+        let cache = ActEngineCacheVolume {
+            name: "bosn-ci-cache-v1".into(),
+            target: crate::ci::engine::ENGINE_CACHE.into(),
+        };
+        let mut document =
+            serde_json::to_value(creation_profile_with_cache(limits, Some(cache)).unwrap())
+                .unwrap();
+        document["tool_generation"] = serde_json::json!({
+            "id": "a".repeat(64), "max_payload_bytes": 33554432,
+            "overlay_recipe_sha256": crate::ci::engine::tool_overlay_recipe_sha256()
+        });
+        let profile: ActEngineCreationProfile = serde_json::from_value(document).unwrap();
+        profile.validate().unwrap();
+        // The producer must recompute the frozen command for its typed binding.
+        // An old command hash with a new binding must never authorize creation.
+        intent.creation_profile = Some(profile);
+        assert!(create_arguments(&intent, ANY_REGISTRY, limits).is_err());
+        let profile = intent.creation_profile.as_ref().unwrap();
+        intent.creation_profile = Some(
+            creation_profile_with_tools(
+                limits,
+                profile.cache_volume.clone(),
+                profile.tool_generation.clone(),
+            )
+            .unwrap(),
+        );
+        let args = create_arguments(&intent, ANY_REGISTRY, limits).unwrap();
+        assert!(args.windows(2).any(|pair| pair == ["cache", "tool-exec"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--generation", &"a".repeat(64)])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--max-bytes", "33554432"])
+        );
+        assert!(args.contains(&format!("{}/toolstore-v1", crate::ci::engine::ENGINE_CACHE)));
+        let mut altered = intent.creation_profile.clone().unwrap();
+        altered
+            .tool_generation
+            .as_mut()
+            .unwrap()
+            .overlay_recipe_sha256 = "f".repeat(64);
+        intent.creation_profile = Some(altered);
+        assert!(create_arguments(&intent, ANY_REGISTRY, limits).is_err());
+    }
 
     #[test]
     fn cache_backed_engine_freezes_verified_act_install_before_init() {

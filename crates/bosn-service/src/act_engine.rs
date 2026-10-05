@@ -54,5 +54,8 @@ pub use observe::*;
 #[cfg(test)]
 mod tests;
 
+mod source_stop;
+pub(crate) use source_stop::{source_retained_by_recovery, stop_source_writers};
+
 mod storage_volume;
 pub(crate) use storage_volume::{ensure_storage_volume, remove_storage_volume};

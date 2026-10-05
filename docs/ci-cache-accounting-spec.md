@@ -3481,3 +3481,607 @@ remain required before publication. The released native admission optimization
 permits concurrent content validation while the original generation reader
 protects the payload; it does not weaken corruption checks or activate Bosn's
 pending shared-cache lifecycle.
+
+### Original native reader through real engine PID1 (2026-10-04)
+
+A released act2.9 fixture published and selected a quiescent 16 MiB tool
+install in a task-owned volume, then created a fresh privileged engine in the
+private test daemon. `tool-exec` replaced itself with Bosn's actual `ENGINE_INIT`
+command and the same pinned dockerd arguments. The engine reached Docker
+readiness. `/proc/1/environ` recorded lease FD 7 and `/proc/1/fd/7` referenced the
+original selected generation's `.readers-v1.bolt`. An independent helper sharing
+the same store failed a nonblocking exclusive flock while the engine was alive
+(exit 1, no diagnostic); after label-checked engine removal the same command
+succeeded (exit 0). Both fixture containers and both volumes were removed after
+ownership/attachment checks. Evidence:
+`.git/retention-native-pid1-handoff-proof.json` and its executable fixture.
+
+The fixture used the production init command and dockerd flags, but directly
+created its engine: no production planner, frozen generation binding, automatic
+migration, tool overlay preparation, job execution or post-stop publication is
+claimed. It establishes that native original-reader handoff survives the shell
+and `docker-init` chain and excludes an independent writer for the live engine.
+The initial fixture attempt misread the typed update report shape; it failed
+before engine creation and cleaned up all resources. Its retained failure is
+separate from the corrected successful lifetime experiment.
+
+### Frozen generation startup integration (working implementation, 2026-10-04)
+
+The integration branch adds an optional typed `ActToolGenerationBinding` to the
+persisted creation profile: a canonical SHA-256 generation ID and positive,
+signed-64-bit-bounded payload validation ceiling. It requires a coordinated
+shared cache. Absent bindings are omitted from serialization, preserving the
+historical profile identity. New engine creation recomputes the complete frozen
+command, refusing a changed binding paired with an old command digest.
+
+The generated cache bootstrap installs the verified pinned act, closes its
+archive descriptor, then invokes native `cache tool-exec` against the fixed
+`/bosn/cache/toolstore-v1` store before replacing itself with the existing engine
+init chain. The generation ID and payload bound are individual argv values.
+This command path is implemented, but runtime planning does not yet select or
+freeze bindings. Generation admission precedes any eventual tool overlay; no
+production overlay or lifecycle activation is claimed.
+
+The focused test failed because the persisted profile rejected the generation
+field, then passed with typed persistence and command binding. Evidence:
+`.git/retention-native-reader-profile-red.log` and `-green.log`. All 24 scoped engine boundary tests passed, and the stalled-discovery shutdown
+regression passed alone (one test, 0.27 seconds for the test run). This does not
+establish the cause of the earlier full-suite latency failure. Evidence:
+`.git/retention-native-reader-profile-scoped.log`. This branch is not reviewed,
+gated or published.
+Separately, the act2.9 pin's gate34 failed at the stalled-discovery shutdown
+latency assertion (6.998 seconds against a five-second ceiling), after format
+and Clippy passed. That failure is retained and under investigation; no gate34
+attestation authorizes publication.
+
+### Native overlay preparation and real jobs (working implementation, 2026-10-04)
+
+`prepare_run` now receives the frozen typed generation binding from its engine
+intent. Legacy plans retain their seed path; a bound generation uses the new
+`toolcache_overlay.sh`. Before mounting, the script checks PID1's original reader
+FD, exact expected reader path and device/inode identity. It refuses missing or
+invalid descriptors, a nonempty target, and preexisting upper/work paths. The
+selected immutable generation is the overlay lower; upper/work live in the
+engine's private `/var/lib/docker`. The mount explicitly requests metacopy.
+
+The actual generated overlay script passed in a released act2.9 engine using
+Bosn's init command and dockerd flags. Two real nested job containers mounted
+`act-toolcache`: job one changed the payload mode and wrote private settings;
+job two observed both changes and the identical payload hash. The 16 MiB payload
+copy-up occupied zero upper blocks. The shared generation acquired no settings
+file. Independent exclusive-reader probing remained blocked until engine removal.
+All owned fixture containers/volumes were cleaned up. Evidence:
+`.git/retention-native-overlay-jobs-proof.json` and its executable fixture.
+All 14 existing scoped lifecycle tests passed (one physical cohort test ignored);
+evidence `.git/retention-native-overlay-lifecycle-tests.log`.
+
+This connects preparation to a bound plan, but the normal runtime planner still
+creates unbound plans. Before activation, completed private upper installs must
+be published after writer exclusion, disk storage must survive until verified
+publication/recovery, and recovery must revalidate live reader/mount identity.
+The existing ordinary-exit legacy saver is not native generation publication;
+it must not be used as proof that new overlay installs persist to a fresh engine.
+Automatic generation selection and maintenance are still absent.
+
+### Effective overlay and frozen preparation recipe (2026-10-04)
+
+The binding now also requires `overlay_recipe_sha256`. The producer hashes the
+exact preparation script with canonical store/target paths and the generation
+placeholder; the separately frozen generation ID completes its inputs. Creation
+and preparation refuse a recipe mismatch, so a new daemon cannot silently use a
+changed overlay recipe with a previously frozen generation profile. Profiles
+without a generation still omit the entire binding.
+
+After mount, the actual script reads `/proc/self/mountinfo` and requires exactly
+one matching writable overlay with the exact lower/upper/work paths and effective
+`metacopy=on`. Success of the mount command alone is insufficient. The updated
+real two-job fixture passed these checks with zero allocated blocks for the
+16 MiB metadata-only upper payload. A helper without a live PID1 native reader
+was refused before overlay setup (`native tool reader descriptor missing`). The
+original reader continued excluding a writer until engine removal. Fixture
+cleanup completed. Evidence: `.git/retention-native-overlay-jobs-proof.json`;
+the earlier successful pre-verification report is retained separately.
+
+The focused frozen-profile test also passed with rejection of a changed recipe
+digest: `.git/retention-native-overlay-recipe-binding-test.log`. No automatic
+runtime selection, native publication, recovery fencing or expiry activation is
+claimed. The act2.9 pin retry gate35 passed its Rust lane in 415 seconds; its
+Linux lane is still running, so publication remains unauthorized by that gate.
+
+### Pending lower protection survey and RED retention contract (2026-10-04)
+
+Act2's retirement paths protect the current selection and original live reader
+locks. They have no durable reference for a stopped engine's pending overlay.
+If every holder dies and another generation becomes current, the old lower is
+eligible for age/pressure retirement even while pending private upper data needs
+it. The successful live-helper experiment does not cover this holder-free gap.
+
+A new focused contract test on act2 default commit
+`3016b36fbb439b557b76675945b0ab33e02cc14d` initializes a generation, selects a
+successor, and writes a proposed canonical unexpired recovery reference under
+`.tool-recovery-pins-v1`. No reader process remains. Aggressive native retention
+removes the old generation; the test fails because that lower is absent.
+Evidence: `.git/retention-native-recovery-pin-red.log`; working test
+`pkg/artifactcache/tool_recovery_pin_linux_test.go` in the sibling act2 worktree.
+This demonstrates a missing desired recovery contract, not support for an
+existing pin protocol. No shared machine store was used or pruned.
+
+Required implementation: publish a bounded typed reservation under the original
+catalog lock before stopping source writers; bind canonical owner/generation and
+an explicit finite expiry; retain its referenced lower and objects without a
+living process; reject malformed/ambiguous inventory before destructive work;
+report protected allocation/overflow; permit convergence after verified release
+or expiry. The native record is a protection request, not proof of Docker source
+ownership or writer exclusion. Bosn must separately persist publication intent,
+verify source/volume identity and absence, keep recovery state until publication
+or authorized bounded expiry, and then reconcile both reference and source-volume
+cleanup. Automatic planning remains disabled until these lifetimes are connected.
+
+The act2.9 pin's exact gate35 completed successfully in 791 seconds (Rust 415,
+Linux 376); the clean stamped head `30c76a974291e65d613ef32249fe1a08fc90aa32`
+passed pull-request attestation verification. No full-objective completion is
+implied by that pin gate.
+
+### Durable lower retention checks (working candidate, 2026-10-04)
+
+Act2's recovery-reference contract is now GREEN in the working sibling branch.
+The original catalog writer guards a bounded inventory of canonical typed pin
+records: owner and generation SHA-256 IDs, schema 1, creation and explicit expiry,
+with at most a 24-hour lifetime, 10,000 records and 1,024 bytes per record. Active
+references must name a valid existing canonical generation manifest. Future
+creation times, malformed/oversized records, owner mismatches, symlinks and
+missing active lowers refuse retention before mutation. Context cancellation is
+checked during the bounded scan.
+
+The automatic generation sweep preserves unexpired referenced generations and
+includes them in protected-generation/overflow reporting. Direct generation
+retirement enforces the same check. Object retention retains the surviving
+generations' references through its existing generation inventory. Expired
+references cease protecting generations. The sweep reads the reference inventory
+once under the catalog lock rather than rescanning it for every candidate.
+
+Focused retention/recovery boundary tests passed:
+`.git/retention-native-recovery-pin-green.log` and
+`.git/retention-native-recovery-pin-boundaries.log`. Test fixtures currently write
+records directly. Safe reservation publication, acknowledgement recovery,
+verified release, expired-record cleanup, CLI integration, review and release
+remain implementation work; no production pin enrollment is claimed. This does
+not yet preserve a source volume or implement writer exclusion in Bosn.
+
+Bosn PR #507 is merged as `420c1ddbc889cacfc7f3f524129158f138cee871`.
+The verified act2.9 version/archive/executable pin and accumulated measurement
+spec are now on main. The native engine integration branch was rebased onto that
+exact main commit; its production lifetime activation is still incomplete.
+
+### Recovery reservation publication and older-peer fence (candidate, 2026-10-04)
+
+`PublishToolRecoveryPin` now publishes a typed reservation after full generation
+validation under its original reader. Payload validation releases the catalog;
+publication reacquires it and re-reads reference state. The owner record is
+immutable: identical retry reuses it, differing generation/time intent is refused.
+Publication stages are tracked by the existing original-inode ownership ledger.
+A synced file is linked atomically without replacement, then the reference
+namespace is synced. Partial outcomes never prove absence. An injected final
+parent-sync failure reports published-but-partial; retry reconciles and syncs it.
+
+Before acknowledging a reservation, the same catalog writer changes the store
+marker to `bosn-tool-snapshots-v2`. The new runtime accepts both epochs; released
+act2.9 validates only v1 under that original lock and refuses the fenced store.
+Only marker metadata changes: warm selection, objects, generations and original
+catalog/reader inodes remain intact. Fence stages also use the owned stage ledger.
+A failed fence or reference acknowledgement requires reconciliation; it does not
+authorize stopping source writers. Existing legacy stores are not silently
+upgraded by ordinary access or initialized as empty during refusal.
+
+An actual released act2.9 binary admitted a private store before reservation and
+refused it afterward (`invalid tool store marker`). The candidate retained the
+same warm generation and both original coordination inodes. Evidence:
+`.git/retention-native-recovery-pin-fence-probe.json`. Its small fixture remains
+only in the private Go container. No shared machine store was changed.
+
+Focused retention/publication/snapshot race tests passed in 1.486 seconds.
+Tests cover immutable retry, uncertain parent sync and validation that releases
+the catalog while retaining the original generation reader. Evidence:
+`.git/retention-native-recovery-pin-publication-{red,green,race,fence-tests}.log`.
+The API initially failed to compile because it was absent, then passed. Full
+package/lint/platform/release gates and review remain pending. Verified release,
+expired-record cleanup, CLI integration and Bosn's publication/source-volume
+lifecycle still require implementation; normal planning remains unactivated.
+
+### Bounded expired recovery reference cleanup (candidate, 2026-10-04)
+
+Act2 candidate `077e2f7` now removes expired canonical recovery records under
+original catalog exclusion after complete usage and candidate inventories pass.
+Each removal rechecks the exact typed intent and original record inode. The
+sweep removes at most `MaxCandidates` records, syncs the reference directory,
+reports remaining expired records, and bounds owner receipts to 32 with an
+explicit omitted count. Partial removal/sync outcomes stop further destructive
+work and trigger a fresh allocation audit. Active references remain protective.
+
+The focused retention/recovery race suite passed in 1.514 seconds:
+`.git/retention-native-recovery-pin-expiry-boundaries.log`. A 41-expired-record
+fixture removes eight in the first sweep, then 33 in the second, while retaining
+its active reference and protected generation. The second report contains 32
+owners and one omitted owner. The existing candidate inventory guard counts root
+control entries as well as payload entries; an initial two-entry test budget
+refused before mutation. The fixture budget was corrected to eight without
+changing production limits or bypassing inventory validation.
+
+Expired-record cleanup is implemented in this candidate; verified explicit
+release, CLI integration, review, full package/platform/release validation and
+Bosn source-volume lifetime activation remain incomplete. This evidence proves
+bounded metadata expiry, not automatic machine-wide cache maintenance.
+
+### Explicit recovery reference release (candidate, 2026-10-04)
+
+Act2 candidate `4cc45cb` adds `ReleaseToolRecoveryPin`. Under original catalog
+exclusion it validates the complete reference inventory and matches the exact
+frozen owner/generation/creation/expiry intent before unlinking a reference.
+Changed intent is refused without removal. A successful acknowledgement requires
+syncing the reference namespace; an absent retry repeats that sync to reconcile
+an earlier unlink whose acknowledgement was lost. Removed-but-partial does not
+prove durable absence. Cancellation before mutation leaves the reference intact.
+Non-Linux platforms explicitly refuse this operation without filesystem access.
+
+The caller must durably record completion and exclude further publication by
+that owner before release. The API does not establish source quiescence or
+source-volume ownership, and it does not retain an unbounded owner tombstone.
+These caller lifecycle obligations remain part of Bosn integration work.
+
+Focused release/retention race tests passed, including altered-intent refusal,
+injected directory-sync failure, idempotent reconciliation and cancellation:
+`.git/retention-native-recovery-pin-release-{red,green,boundaries}.log`.
+Before this addition the complete artifact-cache race suite passed in 22.114
+seconds (`.git/retention-native-recovery-pin-full-package.log`); that result does
+not validate the later release code. Candidate-wide review, lint/platform/full
+package validation, CLI exposure and production activation remain pending.
+
+### Recovery CLI and release package validation (candidate, 2026-10-04)
+
+Act2 candidate `208504c` exposes `cache tool-recovery reserve --record FILE
+--max-bytes N --apply` and `cache tool-recovery release --record FILE --apply`,
+with the existing `--cache-server-path` store selection. Both read a bounded
+regular schema-1 intent file into `ToolRecoveryPin`, reject unknown fields and
+trailing data, and emit typed JSON receipts even for partial runtime outcomes.
+The reservation validates the complete lower; release requires caller lifecycle
+exclusion described above. Missing `--apply` refuses before mutation.
+
+The CLI round-trip test publishes and releases a real fixture generation and
+checks missing approval, trailing data and unknown-field refusal:
+`.git/retention-native-recovery-pin-cli-tests.log` (passed, 0.021 seconds).
+The full artifact-cache race suite with explicit release passed in 21.793
+seconds: `.git/retention-native-recovery-pin-release-full-package.log`.
+Candidate lint is now being checked. Review, cross-platform/full CI, release
+artifact verification and Bosn normal lifecycle enrollment remain pending;
+these commands are not shipped or called by normal Bosn planning yet.
+
+Candidate lint failed with three complexity-limit violations (reference
+inventory, reservation publication, combined retention), one import-format issue
+and one trailing whitespace issue. Evidence:
+`.git/retention-native-recovery-pin-candidate-lint.log`.
+Reference record decoding has since been separated from complete inventory
+validation; focused retention/recovery race tests still pass (1.519 seconds,
+`.git/retention-native-recovery-pin-refactor-tests.log`). Lint is not yet green;
+publication/retention refactoring and final formatting remain required before
+review or shipping. No correctness gate was relaxed.
+
+### Recovery candidate lint refactor (2026-10-04)
+
+Act2 candidate `802f5ab` separates verified reservation publication, reference
+namespace preparation, atomic linking/stage cleanup and post-expiry allocation
+audit. The original lock/reader scopes and partial acknowledgement behavior are
+preserved. Lint now reports zero issues:
+`.git/retention-native-recovery-pin-refactored-lint.log`.
+The complete artifact-cache race suite passed in 21.477 seconds after this
+refactor. The combined CLI package run stopped at a default cache directory
+creation on the private container's read-only root; this is retained in
+`.git/retention-native-recovery-pin-refactored-full-tests.log`. A separate CLI
+race run uses an explicit private writable XDG cache directory, without changing
+production code or tests. Its result and the existing primary review are pending.
+
+The existing sole primary reviewer completed all 18 changed Go files at
+`802f5ab` with no blocking findings. Publication retains the original reader
+across validation outside catalog exclusion; fencing and immutable publication
+follow catalog reacquisition. Release continues to require durable caller
+completion and exclusion of republishing. Review does not prove Bosn enrollment.
+
+Windows amd64 and Darwin amd64/arm64 builds of the changed CLI/artifact-cache
+packages passed with CGO disabled:
+`.git/retention-native-recovery-pin-platform-builds.log` (terminal exit zero).
+These are compile checks, not native platform execution or full release CI.
+The complete CLI suite still fails in this private environment: default archive
+server setup uses the read-only home cache even with a writable XDG action cache.
+An isolated daemon resolved the earlier missing-socket error, without using the
+host Docker socket. Failure evidence remains in
+`.git/retention-native-recovery-pin-refactored-cmd-isolated-tests.log`.
+Focused recovery CLI tests passed; the full CLI package is not claimed green.
+Full remote CI must establish the release candidate gate in its normal test
+fixture before any release. No tests or assertions were weakened.
+
+The clean reviewed recovery candidate was pushed as act2 PR #50:
+https://github.com/zackees/act2/pull/50
+at exact head `802f5ab09ba44c26e6088b14c7598750a8acec23`.
+The PR body discloses the private-environment full CLI failure and incomplete
+Bosn enrollment. Existing remote full checks are the next verification gate;
+no release or Bosn pin change has been made for this candidate.
+
+### Physical post-stop recovery and a fresh engine (candidate, 2026-10-04)
+
+A task-owned isolated-Docker experiment now exercises recovery through the act2
+candidate CLI (`802f5ab`), the native PID1 reader and the current Bosn overlay
+preparation recipe. Two inner jobs share changed settings and a metadata-only
+payload mode change; the 16 MiB upper payload still allocates zero blocks. The
+shared immutable lower remains unchanged. A durable recovery reservation is
+acknowledged before the engine is removed; its source disk volume is retained.
+
+After engine removal the original reader admits an exclusive probe. Selection
+is advanced with an additional completed Node install. A pressure/age sweep
+preserves the stopped engine's now-unselected lower through its recovery
+reference. A helper takes that original native reader, mounts the saved overlay,
+reads the identical payload hash and changed settings, and publishes the closed
+Python install. Updating the latest generation preserves the newer Node install.
+A fresh engine with a new empty private disk then mounts that selected lower;
+an actual inner job sees both the recovered settings and newer Node payload,
+with the original Python payload hash. The helper and fresh engine are removed,
+reference release is durably acknowledged, and a subsequent sweep retires the
+old lower. All task-labelled containers and volumes are verified and removed.
+
+Evidence: `.git/retention-native-poststop-recovery-proof.{py,json,log}`.
+The first candidate build used dynamic linking unavailable in the Alpine
+fixture; a CGO-disabled build corrected the harness. A second attempt reached
+reference protection but the harness treated a JSON null retired list as an
+array. Both failed attempts and complete cleanup evidence are retained in
+`retention-native-poststop-recovery-{dynamic-build,null-receipt}-failure` files.
+No production assertion or retention limit was changed to obtain this result.
+
+This is a controlled physical proof of warm recovery across fresh engines.
+It manually supplies trusted source-volume ownership and stopped-writer evidence
+and directly drives the CLI, bypassing the normal Bosn planner/registry cleanup.
+Normal durable intent, bounded recovery scheduling, source volume lifetime,
+publication completion and reference release still require Bosn integration.
+It is not proof of automatic enrollment, compiler/archive persistence, machine
+ceilings, cross-class inode accounting or old image/build/container expiry.
+
+### Bosn durable recovery intent persistence (candidate, 2026-10-04)
+
+Bosn candidate `6313f42` adds optional typed `ActToolRecoveryIntent` to the
+self-contained engine registry snapshot. Historical records omit it. Under the
+exact unexecuted registered engine claim, `begin_act_tool_recovery` binds the
+original engine ID, deterministic named private source volume, shared cache
+volume and frozen native lower. Its owner digest includes registry identity,
+engine/run identity and the complete frozen creation profile. Recovery requires
+persistent named disk storage; anonymous disk and memory-only profiles refuse.
+Creation/expiry timestamps are frozen once, with a positive lifetime at most
+24 hours. Whole-second reference timestamps preserve the registry's more precise
+monotonic transition clock. An identical retry reuses intent; changed intent
+refuses. Decoding rechecks the binding against the containing engine record.
+
+The intent transaction rolls back without commit and survives writer close and
+reopen after commit. Tests verify changed claim/lifetime refusal and the finite
+lifetime bound. All 19 engine-registry lifecycle tests passed in 11.24 seconds;
+registry all-target Clippy with warnings denied passed. Evidence:
+`.git/retention-bosn-tool-recovery-intent-{red,green,boundaries}.log`.
+The initial missing-API compilation evidence also contained a fixture typo in
+the preexisting claim method name; it was corrected before the passing runs.
+
+This persistence API does not acknowledge act2 reservation, establish source
+quiescence, permit storage removal or schedule a recovery helper. It is not
+called by the normal runtime yet. Reservation acknowledgement, source-stop
+proof, completed publication/release/expiry transitions, retention of the source
+volume during cleanup and bounded recovery enumeration remain implementation
+work. The ordinary engine terminal state still requires source-volume absence;
+recovery must integrate with that lifecycle before normal enrollment is enabled.
+
+### Recovery reservation transport and act2 merge (candidate, 2026-10-04)
+
+Bosn candidate `542d7a5` adds `DockerActBackend::reserve_tool_recovery`.
+It revalidates frozen recovery intent against the containing engine record,
+requires the producer cache mount, formats whole-second RFC3339 pin timestamps,
+and writes a bounded immutable request into private engine work storage.
+Existing request files must be regular non-symlinks with the exact frozen bytes;
+new files use no-clobber creation. The command calls the verified installed act
+binary with the frozen lower payload bound and explicit mutation approval.
+
+A bounded strict typed receipt must match schema, store and every pin field,
+report publication, and have no partial/error/pending-stage state. Command
+failure or rejected receipt requires reconciliation and never establishes pin
+absence or permission to stop source writers. Tests reject uncertain publication
+and changed-generation receipts. Focused receipt validation and service
+all-target Clippy with warnings denied passed against the final source:
+`.git/retention-bosn-tool-recovery-transport-final-tests.log`.
+The prior durable intent slice received the sole primary review with no findings.
+The transport slice is awaiting review and is not called by normal planning;
+reservation acknowledgement persistence and later source lifetime phases remain
+required before activation. No source-stop or removal authority is added here.
+
+All act2 PR #50 checks passed on reviewed head `802f5ab` and the PR merged as
+`6c7ae11a0917c24e88035764c4de3f097dcd6c8f`. Existing full checks were dispatched
+on that exact default-branch commit as run `37241691702`:
+https://github.com/zackees/act2/actions/runs/37241691702
+The run is in progress. The candidate is not released or pinned by Bosn yet;
+exact default-branch CI and release artifact verification remain mandatory.
+
+### Durable reservation acknowledgement (candidate, 2026-10-04)
+
+Bosn candidate `b82550b` persists a separate reservation acknowledgement timestamp
+against the complete frozen intent and exact unexecuted engine claim. The trusted
+runtime may supply this only after the strict non-partial act2 receipt check.
+Expired acknowledgements, wrong intent/claim and invalid transition times refuse;
+identical acknowledged retries avoid another event. Snapshot decoding validates
+acknowledgement presence, finite time and its relation to intent and transition.
+Focused registry recovery tests pass, including persistence and expiry refusal:
+`.git/retention-bosn-tool-recovery-ack-tests.log` (0.12-second test execution).
+
+The prior transport review found no blocking issue, but noted command
+substitution strips trailing newlines. Existing request validation now also
+requires the exact encoded byte count, so added trailing newlines cannot pass.
+That transport adjustment still needs its final focused validation. Neither the
+persistence nor transport is called by normal lifecycle planning yet. Source
+stop, source-volume retention and completed publication/release transitions
+remain implementation work. Full act2 exact-merge CI remains in progress.
+
+### Trusted actor reservation orchestration (candidate, 2026-10-04)
+
+The backend now exposes an ordered `reserve_claimed_tool_recovery` seam:
+commit exact frozen intent through the trusted registry actor, read its committed
+snapshot, confirm claim continuity, execute the strict act2 reservation transport,
+then commit acknowledgement through that same actor. Lost command/commit replies
+require reconciliation with the original intent and timestamps. This is a
+trusted daemon operation, with no new client/protobuf authority. Recovery
+admission closes the actor's startup-interruption window even if refused; a
+focused actor test verifies that the live claim cannot subsequently be withdrawn
+through startup recovery.
+
+All four actor tests passed (0.38-second test execution) and service all-target
+Clippy with warnings denied passed after moving the implementation before its
+test module. Evidence: `.git/retention-bosn-tool-recovery-actor-final.log` and
+`.git/retention-bosn-tool-recovery-actor-clippy-green.log`. The earlier lint failure
+is retained in the actor wiring/final logs. The final request-length adjustment
+also passed focused receipt validation and service Clippy in
+`.git/retention-bosn-tool-recovery-ack-transport-final.log`.
+
+These tests cover actor authority and compilation, not an end-to-end call through
+this new orchestration against a live engine. Normal runtime enrollment remains
+unactivated. Source-stop proof, source-volume preservation, publication/release
+phases and bounded recovery enumeration are still required. Act2 exact default
+branch full CI run `37241691702` remains live; it has not been restarted.
+
+### Durable source-stop phase (candidate, 2026-10-04)
+
+The engine snapshot now records source stop separately from terminal volume
+removal. The trusted source-stop receipt binds exact engine name/ID and retained
+source-volume identity, requires cleanup_requested state and an acknowledged,
+unexpired lower reservation, and persists a monotonic timestamp. Decoder checks
+refuse absent acknowledgement and inconsistent state/time. Wrong engine identity
+and a receipt before cleanup refuse without advancing recovery state. A client
+exit or failed runtime probe cannot establish this receipt.
+
+Two focused recovery tests and registry all-target Clippy with warnings denied
+passed: `.git/retention-bosn-tool-source-stop-green.log`. The initial combined
+test exceeded the 100-line function lint; it was split by intent and source-stop
+responsibility with a shared fixture. No assertion or limit was relaxed.
+Runtime Docker probes and source-volume preservation are not wired yet; the
+ordinary terminal path still requires volume absence. This persistence phase
+alone gives no helper publication or storage-removal authority.
+
+The sole primary reviewer found no blocking issues in the acknowledgement and
+actor reservation slices. Exact default-branch act2 CI run `37241691702` now
+completed successfully on `6c7ae11a0917c24e88035764c4de3f097dcd6c8f`.
+Release preparation can proceed; no candidate release or Bosn pin is claimed yet.
+
+After clean exact-commit CI and duplicate tag/release absence checks, annotated
+tag `v0.2.89-act2.10` was pushed. Tag object
+`fa12b182110e83ce8f01d9ae2b63d8948e6fd7a6` peels to tested default-branch commit
+`6c7ae11a0917c24e88035764c4de3f097dcd6c8f`. The existing Go tag release workflow
+is in progress as run `37242493394`:
+https://github.com/zackees/act2/actions/runs/37242493394
+Release completion, independent archive/executable digests, architecture and
+embedded-version verification remain pending. Bosn's shipped pin is unchanged.
+
+### act2.10 release verification and Bosn pin rollout (2026-10-04)
+
+Act2 release run `37242493394` completed **successfully** on exact default-branch
+commit `6c7ae11a0917c24e88035764c4de3f097dcd6c8f`; the release is no longer a
+draft. All 11 archives plus `checksums.txt` were downloaded and verified
+independently:
+
+- every archive matches its release `checksums.txt` entry **and** the GitHub
+  asset digest (the manifest and the API digests are byte-identical);
+- every archive's GitHub-reported size matches the downloaded size;
+- executable architecture confirmed per archive via `llvm-readobj`: Mach-O
+  `arm64`/`x86-64`; ELF `EM_AARCH64`, `EM_ARM` (armv6 and armv7), `EM_386`,
+  `EM_RISCV`, `EM_X86_64`; COFF `IMAGE_FILE_MACHINE_ARM64`, `_I386`, `_AMD64`;
+  all of file type executable;
+- every binary embeds the literal `0.2.89-act2.10`;
+- the Linux x86_64 binary **executed**: `act --version` reports
+  `0.2.89-act2.10`, and `cache tool-recovery reserve|release` expose the typed
+  `--record` / `--apply` / `--max-bytes` surface this recovery work depends on.
+
+Bosn's pin moved to `v0.2.89-act2.10`
+(`crates/bosn-core/src/act.rs`, `crates/bosn-service/src/ci/pins.rs`) with the
+Linux x86_64 archive digest `2e6ed85cd71f17d8f27aa9b66a7c5d338c9927b14b884cf8eeed489c7e707df8`
+and extracted executable digest
+`4ac7dd7f5660daae13b53f06f12dc3c27e6cff77ede042925078d9c4a69f6e65`, both
+measured from the verified release rather than transcribed.
+
+### Runtime source-stop probe and source-volume retention (2026-10-04)
+
+The source-stop phase is no longer a durable field only — the trusted runtime
+now constructs the proof from real Docker observations
+(`crates/bosn-service/src/act_engine/source_stop.rs`):
+
+- `stop_source_writers` runs the retained-volume half of the phase. It
+  `docker volume inspect`s the **frozen** source volume name (never a name
+  Docker volunteers) and requires exactly one volume whose driver/scope are
+  `local`, whose options are empty, and whose ownership labels are exactly this
+  daemon's for this intent. Anything ambiguous, unparsable, renamed, relabelled,
+  networked or mounted is a refusal.
+- The typed `ActToolSourceStopProof` is then built only from frozen identity —
+  engine name from the intent, engine ID from the record, and the frozen source
+  volume — and both must agree with the recovery intent. An unresolved or
+  different engine ID refuses.
+- Engine absence is the other half: startup recovery already proves it with
+  two independent exact listings before this probe runs, and the ordinary
+  `remove_owned_engine` path reaches the probe only after its own absence
+  checks.
+- A record with a frozen intent but no acknowledged reservation refuses. An
+  ordinary engine with no recovery intent skips the phase entirely.
+- The proof is idempotent: an already-recorded stop re-verifies ownership and
+  returns without rewriting the timestamp.
+
+**Preservation guard.** `remove_storage_volume` now refuses while a record
+holds a **live** recovery reference, so private disk and terminal metadata are
+not finalized ahead of publication. Retention is bounded by the reference's own
+finite lifetime rather than by a release transition that does not exist yet: an
+expired reference is an abandoned recovery, so the volume is reclaimable
+instead of wedging cleanup and leaking the disk forever. The guard is
+fail-closed for the whole (at most 24 hour) window in which a helper could
+still publish through that reference. The underlying destructive primitive was
+made module-private (`remove_private_storage`), so the guarded entry is the only
+crate-reachable path and the guard cannot be bypassed by adding a caller. This
+is a structural guarantee rather than a unit test, because an
+`ActEngineRecord` cannot be constructed outside the registry; the registry-side
+receipt boundaries are already covered by the existing focused recovery tests.
+The liveness/expiry predicate itself is a pure function and is unit-tested.
+
+Pre-push review of the branch raised a blocking defect that was fixed here: the
+first guard keyed only on the presence of a recovery intent, which is never
+cleared, so one recovery run would have wedged its record in `CleanupRequired`
+forever — leaking a volume and a registry row and re-failing the same
+retirement on every later cleanup pass. Keying on expiry gives that path a
+bounded escape. The review also flagged the retained-source predicate as a
+near-verbatim copy of the private-storage predicate; both now share one
+`verify_owned_local_volume` predicate that takes the expected name and labels
+from the caller, so a Docker-reported name can never substitute a volume.
+
+Workspace Clippy with warnings denied and `--all-targets` passed, and `./lint`
+(including file length and include-base) passed. Host test execution is
+refused by `ci/test_guard.sh` by design, so the new unit tests compile here and
+execute in the local gate's isolated lane. Normal runtime enrollment remains
+legacy and unactivated; publication, merge-into-generation, reference release,
+source-volume removal and bounded recovery enumeration remain open.
+
+### Gate failure triage: source-text ordering test vs. native overlay (2026-10-04)
+
+The local gate's `tests` lane failed with exactly one failure,
+`tests/test_runner_tools.py::RunnerToolsTests::test_tools_are_prepared_after_the_tool_cache_is_seeded`,
+at `ValueError: substring not found` (262 passed, 10 skipped). The retained act
+log for the failing run is under the gate state directory's `ci/runs/`.
+
+The test asserts on **source text**, and the native overlay slice replaced the
+seed call site: `engine.rs` now runs
+`Self::exec(engine, &prepare_toolcache_script(generation)?)`, which returns the
+legacy seed with no frozen generation and the native overlay with one. The
+invariant the test guards — the tool cache is seeded before runner stock tools
+install into it — is unchanged, and the ordering assertion now names the new
+call site. The test was updated, not weakened: it still pins both call sites
+and their relative order.
+
+Two other tests fail when the workspace suite is run directly on the developer
+host (`concurrent_engines_with_equal_pids_publish_through_distinct_stages` and
+`daemon_shutdown_does_not_wait_for_stalled_cache_discovery_client`, the latter
+measuring ~30s against a 5s budget). Both fail identically on unmodified
+`origin/main` (`420c1ddb`), and main's GitHub CI at that same SHA is green, so
+they are host-environment timing artifacts rather than branch defects. They are
+retained here rather than dismissed, because the local gate is the stricter
+environment and a host run is not the gate.
