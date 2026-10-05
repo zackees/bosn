@@ -15,3 +15,7 @@ src/bosn/_native.*
 # CARGO_HOME must never get its registry or caches committed.
 /.cargo/*
 !/.cargo/config.toml
+
+# clud agent scratch (logs, tmp, caches) lives inside the checkout and is not
+# source. Without this the local gate refuses a PR as a dirty worktree.
+.clud/
