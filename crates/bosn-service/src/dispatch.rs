@@ -1,6 +1,7 @@
 //! One authenticated connection: decode a request, dispatch the typed operation, reply.
 
 use super::*;
+use bosn_core::retention::RetentionPolicy;
 
 pub(crate) struct ConnectionContext {
     pub(crate) actor: RegistryActor,
@@ -98,6 +99,54 @@ pub(crate) async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Re
                     job_id,
                     ..Default::default()
                 },
+                Err(_) => ReplyWire {
+                    code: 3,
+                    ..Default::default()
+                },
+            },
+            38 => match validate_managed_retention_request_wire(&r) {
+                Ok(()) => {
+                    let policy = RetentionPolicy {
+                        container_ttl: Duration::from_secs(r.owned_container_ttl_secs),
+                        volume_ttl: Duration::from_secs(r.owned_volume_ttl_secs),
+                        image_ttl: Duration::from_secs(r.owned_image_ttl_secs),
+                        max_bytes: (r.owned_max_bytes > 0).then_some(i128::from(r.owned_max_bytes)),
+                    };
+                    let apply = r.owned_confirm;
+                    let state_dir = state_dir.clone();
+                    // The daemon re-derives the plan from its own fresh read here. A preview a
+                    // client built earlier is never trusted: it was taken against engine state
+                    // that may already have changed, and a preview is not an authorization.
+                    let outcome = async_engine::launch_blocking(move || {
+                        let engine = DockerEngine::docker();
+                        managed_retention::managed_retention_pass(
+                            &engine, &state_dir, policy, apply,
+                        )
+                    })
+                    .await;
+                    match outcome {
+                        Ok(outcome) => {
+                            let summary = outcome.summary;
+                            ReplyWire {
+                                code: 230,
+                                owned_applied: summary.applied,
+                                owned_planned: summary.planned,
+                                owned_removed: summary.removed,
+                                owned_removed_bytes: i64::try_from(summary.removed_bytes)
+                                    .unwrap_or(i64::MAX),
+                                owned_deferred: summary.deferred,
+                                owned_failed: summary.failed,
+                                owned_failures: summary.failures,
+                                owned_refused: summary.refused.unwrap_or_default(),
+                                ..Default::default()
+                            }
+                        }
+                        Err(_) => ReplyWire {
+                            code: 3,
+                            ..Default::default()
+                        },
+                    }
+                }
                 Err(_) => ReplyWire {
                     code: 3,
                     ..Default::default()

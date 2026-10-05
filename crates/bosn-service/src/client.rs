@@ -1,6 +1,7 @@
 //! The daemon client: one typed request per call over the owner-only endpoint.
 
 use super::*;
+use bosn_core::retention::RetentionPolicy;
 
 #[derive(Clone, Debug)]
 pub struct Client {
@@ -141,6 +142,40 @@ impl Client {
         {
             Reply::UnmanagedApply(v) => Ok(v),
             _ => Err(Error::Protocol("unexpected unmanaged apply response")),
+        }
+    }
+
+    /// Preview or reclaim the resources this registry owns, by age gate (#456).
+    ///
+    /// The daemon re-derives the plan itself and revalidates ownership, liveness and pins
+    /// immediately before each removal. A destructive pass requires `confirm`, and the daemon
+    /// refuses one whose re-derived observation was incomplete rather than deleting on a
+    /// partial read.
+    pub async fn managed_retention(
+        &self,
+        policy: RetentionPolicy,
+        apply: bool,
+    ) -> Result<ManagedRetentionSummary, Error> {
+        let max_bytes = policy.max_bytes.unwrap_or(0);
+        if max_bytes < 0 || max_bytes > i64::MAX as i128 {
+            return Err(Error::Protocol(
+                "managed retention byte ceiling out of range",
+            ));
+        }
+        match self
+            .call(Request {
+                gc_confirm: apply,
+                owned_confirm: apply,
+                owned_container_ttl_secs: policy.container_ttl.as_secs(),
+                owned_volume_ttl_secs: policy.volume_ttl.as_secs(),
+                owned_image_ttl_secs: policy.image_ttl.as_secs(),
+                owned_max_bytes: max_bytes as i64,
+                ..Request::operation(38)
+            })
+            .await?
+        {
+            Reply::ManagedRetention(v) => Ok(v),
+            _ => Err(Error::Protocol("unexpected managed retention response")),
         }
     }
 

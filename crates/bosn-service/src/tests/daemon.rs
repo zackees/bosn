@@ -198,6 +198,9 @@ fn unsupported_request_protocol_returns_typed_error_response() {
             unmanaged_ttl_seconds: 0,
             ci_request: String::new(),
             follow_lease_ms: 0,
+            // The managed-retention fields default to zero/false, which is exactly what a
+            // protocol-mismatch probe wants: it is testing the version handshake, not the gate.
+            ..Request::operation(0)
         }
         .encode(&mut payload)
         .unwrap();

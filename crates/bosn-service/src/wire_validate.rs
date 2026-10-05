@@ -26,6 +26,57 @@ pub(crate) fn validate_unmanaged_apply_request_wire(r: &Request) -> Result<(), E
     Ok(())
 }
 
+/// A managed-retention pass carries only the three age gates, an optional byte ceiling, and
+/// whether the caller confirmed a destructive pass.
+///
+/// A gate is capped so a client cannot ask the daemon to hold every object forever or reclaim
+/// every object instantly by passing an absurd value; both are refused rather than clamped,
+/// because silently substituting a different policy than the one requested is worse than
+/// refusing. A zero gate is legitimate and means "reclaim as soon as idle".
+pub(crate) const OWNED_MAX_TTL_SECS: u64 = 365 * 86_400;
+
+pub(crate) fn validate_managed_retention_request_wire(r: &Request) -> Result<(), Error> {
+    if r.owned_container_ttl_secs > OWNED_MAX_TTL_SECS
+        || r.owned_volume_ttl_secs > OWNED_MAX_TTL_SECS
+        || r.owned_image_ttl_secs > OWNED_MAX_TTL_SECS
+    {
+        return Err(Error::Protocol("managed retention age gate out of range"));
+    }
+    if r.owned_max_bytes < 0 {
+        return Err(Error::Protocol(
+            "managed retention byte ceiling is negative",
+        ));
+    }
+    // A destructive pass must be confirmed on both fields. `gc_confirm` is the existing
+    // confirmation channel; `owned_confirm` is this operation's own, and requiring both stops a
+    // request meant for another destructive operation from being reinterpreted as this one.
+    if r.owned_confirm != r.gc_confirm {
+        return Err(Error::Protocol(
+            "managed retention apply requires confirmation on both flags",
+        ));
+    }
+    if !r.workspace.is_empty()
+        || r.workspace.len() > 8 * 1024
+        || !r.stack.is_empty()
+        || !r.digest.is_empty()
+        || !r.gc_candidate_token.is_empty()
+        || !r.setup_config.is_empty()
+        || !r.setup_task_name.is_empty()
+        || r.job_id != 0
+        || !r.unmanaged_include.is_empty()
+        || r.unmanaged_ttl_seconds != 0
+        || !r.ci_request.is_empty()
+        || r.follow_lease_ms != 0
+        || r.diagnostic_after != 0
+        || r.diagnostic_limit != 0
+        || r.setup_done_confirm
+        || r.setup_adopt_confirm
+    {
+        return Err(Error::Protocol("nonsemantic managed retention fields"));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_setup_prepare_wire(
     workspace: &str,
     config: &str,

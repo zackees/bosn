@@ -1,0 +1,111 @@
+# Managed retention (`bosn gc owned`)
+
+Issue #456. Companion to [`rust-unmanaged.md`](rust-unmanaged.md), which this does not replace.
+
+## Why this exists
+
+The unmanaged census protects everything this registry owns:
+
+```rust
+OwnershipClass::Ours => return protect(ProtectedReason::OwnedByThisRegistry),
+```
+
+That is correct — an owned resource has its own lifecycle. But three kinds of owned resource had
+**no lifecycle at all**:
+
+| Resource | How it was created | What removed it |
+|---|---|---|
+| `bosn-setup-v2-*` container | `docker container create`, no `--rm` | a token-bound `gc apply`, one at a time |
+| `bosn-v-stack-*`, `bosn-v-machine-*` | `docker volume create` | explicit release, one at a time |
+| `bosn-setup:<sha256>` image | `docker build` | nothing |
+
+None of the predicates in `gc_query.rs` reference age, TTL, or a timestamp; they are purely
+structural. The hourly daemon loop (`service.rs`) ran a census and **printed a warning** — it
+never deleted.
+
+The consequence compounds. A stopped setup container keeps every volume it ever mounted alive, so
+the container leak is upstream of the volume leak: on a long-lived machine 115 exited containers
+held 182 volumes, reported as 515 GB. Reclaiming the volumes alone would have freed nothing.
+
+## The policy
+
+`crates/bosn-core/src/retention.rs` is pure and decides one question per object: **may this exact
+object be removed right now?** Callers own the clock, the engine, and the registry.
+
+Gates, per kind, because the cost of rebuilding differs by orders of magnitude:
+
+| Kind | Default | Reasoning |
+|---|---|---|
+| Container | 6 h | recreated on demand; no state worth keeping once stopped |
+| Volume | 14 d | cached toolchain; a cold rebuild is expensive |
+| Image | 30 d | content-addressed; each rebuild is a full build |
+
+Removal order is **containers → volumes → images**, because a container pins its volumes. Within
+a kind, oldest first, so a capped pass spends its budget on the bytes idle longest.
+
+### The safety contract
+
+The order of the checks in `classify_managed` *is* the contract:
+
+1. **Ownership is proven, never assumed.** A `bosn-act-*` name is not evidence; only the complete
+   label set naming *this* registry is. Incomplete labels → `HoldReason::IncompleteLabels`.
+2. **Liveness before age.** A running container, or a volume any container mounts, is never
+   reclaimable at any age. This is the rule that would have prevented the original incident.
+3. **`Retention::Pinned` outranks every age gate.** It is an explicit human promise. A *missing*
+   retention label is not treated as a pin.
+4. **An unmeasured age fails closed.** `HoldReason::AgeUnknown` — "we could not measure it" is
+   not "it is safe".
+
+### Budgets
+
+`MAX_MANAGED_REMOVALS` (1024) bounds one pass; `--max-bytes` bounds the bytes. Exceeding either
+**defers** rather than fails, and the plan reports `deferred`. An object whose size the engine
+would not report is deferred under a byte ceiling, not counted as zero: an unmeasured size cannot
+be proven to fit a budget.
+
+## Running it
+
+```
+bosn gc owned --state-dir DIR --container-ttl-secs N --volume-ttl-secs N \
+              --image-ttl-secs N [--max-bytes N] [--apply --yes] [--json]
+```
+
+Preview is the default. `--apply` and `--yes` must both be present, matching `gc --unmanaged`, so
+a bare invocation from shell history cannot delete. All three gates are **required** — a defaulted
+gate would silently reclaim under a TTL the operator never chose.
+
+The daemon re-derives the plan from its own fresh read and re-verifies each object immediately
+before removing it. A pass that takes minutes can otherwise remove a volume a new run just
+mounted.
+
+## Unattended
+
+Opt-in via `retention.toml` in the state directory:
+
+```toml
+auto_retention = true
+```
+
+Absent, unreadable, or unparseable means **no**. Without the flag the pass still reads the engine
+and still reports what it *would* remove — a machine is never silently growing without a signal,
+which is the failure mode that produced this issue. An absent file is not a reason to delete; it
+is a reason to say so.
+
+## Relation to the existing paths
+
+This does **not** widen any existing destructive path:
+
+- `gc preview` / `gc apply` remain token-bound and one-candidate-at-a-time.
+- `manifest volume-release apply` remains the explicit release for durable data. This policy
+  reaches `stack`/`machine` volumes **only** through the label-and-age path, and only when they
+  are not pinned.
+- `gc --unmanaged` is untouched and still refuses to act on a partial census.
+
+## Known limits
+
+- **The registry reset.** Every GC path requires a registry row. A registry that is reset or
+  restored from a different `registry_id` orphans everything on disk, and *no* policy can reclaim
+  an object whose row is gone. Reclaiming those needs the label-based path above, which is why it
+  exists — but it is worth knowing that the registry is the authority for everything else.
+- Images report no size from `image ls`; `docker image inspect` is the read used instead.
+- Build cache is out of scope entirely, matching `is_removable_by_id`.

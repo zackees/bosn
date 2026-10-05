@@ -736,7 +736,6 @@ impl DockerEngine {
         Ok(census_read(result, "docker image ls --filter label"))
     }
 
-    /// Append trusted, product-selected Docker CLI arguments. This local
     /// transport is not a sandbox or authorization boundary and is not RPC.
     #[must_use]
     pub fn with_args(&self, args: impl IntoIterator<Item = impl Into<OsString>>) -> Self {
@@ -786,7 +785,7 @@ pub enum DockerDoctorState {
 
 /// Convert one bounded capture into a census read, so a refusal is never mistaken for an
 /// empty result.
-fn census_read(result: CommandResult, what: &str) -> CensusRead {
+pub(crate) fn census_read(result: CommandResult, what: &str) -> CensusRead {
     if !result.ok() {
         return CensusRead::Unavailable {
             detail: format!("{what} exited with {}", result.exit_code),
@@ -798,6 +797,24 @@ fn census_read(result: CommandResult, what: &str) -> CensusRead {
             detail: format!("{what} returned non-UTF-8 output"),
         },
     }
+}
+
+/// Split a successful read's stdout into trimmed, non-empty lines.
+///
+/// An unsuccessful read yields no lines. Callers that use this to decide "is anything still
+/// using this?" must treat the empty result as a refusal to answer, not as proof of no use;
+/// that distinction is enforced where the answer is consumed.
+pub(crate) fn split_lines(result: CommandResult) -> Vec<String> {
+    if !result.ok() {
+        return Vec::new();
+    }
+    String::from_utf8(result.stdout)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn doctor_report(result: Result<CommandResult, CommandError>) -> DockerDoctorReport {
@@ -941,6 +958,7 @@ fn map_bounded(error: BoundedProcessError) -> CommandError {
     }
 }
 
+mod managed_reads;
 mod stdin_file;
 
 #[cfg(test)]

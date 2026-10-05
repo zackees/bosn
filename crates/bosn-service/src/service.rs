@@ -313,6 +313,17 @@ impl Service {
                             ),
                             None => {}
                         }
+                        // Unattended reclamation of what this registry owns (#456). The
+                        // unmanaged census above can never do this: it protects everything we
+                        // own, which left setup containers, stack/machine volumes and setup
+                        // images with no reclamation path at all.
+                        //
+                        // This is destructive, so it is opt-in: `auto_retention` in the state
+                        // directory's `retention.toml`. Without it the pass still runs and still
+                        // reports what it would remove, so the machine is never silently growing
+                        // with no signal. A pass whose read is incomplete removes nothing and
+                        // says so (see `managed_retention`).
+                        managed_retention::maintenance_pass(&state_dir);
                     })
                     .await;
                     if async_engine::cancellable(
