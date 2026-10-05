@@ -11,7 +11,7 @@
 # `local-gate.toml`, and declaring both is a GATE-001 violation.
 schema  = 3
 profile = "rust-pypi-app"
-linter  = "zackees/ci.yml@fe965fc7e2c5203570072e1d0fd19d0935d98e39"
+linter  = "zackees/ci.yml@0fcff997fefecf152ba075875029582d1ec05ad1"
 
 # ── Platforms ────────────────────────────────────────────────────────────────
 # Linux is the only native CI host here: every ci.yml job runs `ubuntu-latest`.
@@ -60,10 +60,18 @@ platforms = ["linux-x64"]
 suites    = ["unit", "smoke"]
 budget    = { critical-path = "8m" }
 
+# `pre-prune` is deliberately ABSENT from both writer flows (`main`, `nightly`).
+# It was declared but never honoured: no workflow here ever runs
+# `ci-lint cache preprune`, and CACHE-004's arithmetic waives the lockfile-change
+# peak purely on that declaration (zackees/ci.yml#352, rule CACHE-034). Removing
+# it makes the number honest: worst case 4.24GB -> 7.80GB, still inside the 9GB
+# budget, so CACHE-004 keeps passing. Restoring `pre-prune = true` requires adding
+# a real pre-prune step ahead of the first `zackees/setup-soldr` save in `ci.yml`
+# with `actions: write`; `ci-pre.yml` cannot host it, because nothing in `ci.yml`
+# `needs:` it and the save would not be ordered behind it.
 [flow.main]
 extends   = "pr"
 cache     = "write"
-pre-prune = true
 
 [flow.release]
 platforms = "all"
@@ -77,7 +85,6 @@ schedule  = "daily"
 cache     = "write"
 janitor   = true
 publish   = "none"
-pre-prune = true
 
 # ── Tags ─────────────────────────────────────────────────────────────────────
 [tags]
