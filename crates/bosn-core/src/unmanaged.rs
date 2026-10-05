@@ -55,6 +55,18 @@ pub struct Warning {
     pub review_bytes: i128,
     /// Bytes the census can see but cannot remove by immutable ID.
     pub report_only_bytes: i128,
+    /// Bytes held back by an ownership or liveness proof, broken down by reason.
+    ///
+    /// These are measured and previously discarded (#516). They are the largest thing on a
+    /// machine in the failure that motivated the living spec: a registry reset leaves every
+    /// Bosn-labeled object classed `ForeignRegistry`, so it is protected rather than
+    /// reclaimable — and silence about it is indistinguishable from a clean machine.
+    pub protected: Vec<ProtectedSummary>,
+    /// Objects the engine did not report a size for, by class and by reason.
+    ///
+    /// An unmeasured object is not a zero-byte object (#520). Reporting `0 B` for N objects
+    /// hides the very footprint the census exists to measure.
+    pub unmeasured_objects: u64,
     /// The census could not be read completely. A partial census is never a clean machine.
     pub partial: bool,
 }
@@ -83,8 +95,18 @@ pub fn warning(census: &Census, threshold: WarningThreshold) -> Option<Warning> 
         .filter(|summary| !is_removable_by_id(summary.class))
         .map(|summary| summary.eligible_bytes)
         .sum();
+    let protected_bytes: i128 = census.protected.iter().map(|summary| summary.bytes).sum();
+    let protected_objects: u64 = census.protected.iter().map(|summary| summary.objects).sum();
+    // #516: protected bytes are measured, so they must be able to speak. A threshold that
+    // ignores them lets the largest footprint on a machine pass in silence — which is exactly
+    // what a lost registry looks like. The same threshold is used so one number governs both.
+    // #520: unmeasured objects speak too, because "we cannot tell you how big this is" is
+    // itself worth reporting; they have no byte total, so they are judged on object count.
     let over = census.reclaimable_bytes >= threshold.bytes
-        || census.reclaimable_objects >= threshold.objects;
+        || census.reclaimable_objects >= threshold.objects
+        || protected_bytes >= threshold.bytes
+        || protected_objects >= threshold.objects
+        || census.unmeasured_objects >= threshold.objects;
     if !over && !census.partial {
         return None;
     }
@@ -94,6 +116,8 @@ pub fn warning(census: &Census, threshold: WarningThreshold) -> Option<Warning> 
         review_objects,
         review_bytes,
         report_only_bytes,
+        protected: census.protected.clone(),
+        unmeasured_objects: census.unmeasured_objects,
         partial: census.partial,
     })
 }
@@ -487,7 +511,33 @@ pub fn classify(
         ..base
     };
     match ownership {
-        OwnershipClass::Ours => return protect(ProtectedReason::OwnedByThisRegistry),
+        OwnershipClass::Ours => {
+            // #519: an owned image used to be protected unconditionally, so `bosn-setup:*`
+            // images were never counted, never warned about and never reclaimable by any path.
+            //
+            // The usual objection to sweeping a tagged image is that it may be the only copy.
+            // That does not apply to an image *this registry* built and content-addressed: a
+            // `bosn-setup:<sha256>` tag is derived from the inputs that produced it, so
+            // removing the tag removes a cache entry, not data. Docker's own `dangling` verdict
+            // is still required — this narrows nothing about what Docker considers
+            // unreferenced, it only stops treating our own cache as untouchable.
+            //
+            // Everything else we own stays protected: owned containers and volumes have their
+            // own lifecycle (`bosn gc owned`), which is opt-in and re-verifies ownership
+            // immediately before removal. Widening those here would create a second,
+            // unattended path to destroying a volume, which the non-goals forbid.
+            if kind == ResourceKind::Image && signals.dangling && !signals.in_use {
+                let Some(age) = age_seconds else {
+                    return protect(ProtectedReason::Unmeasured);
+                };
+                return Classification {
+                    class: Some(UnmanagedClass::DanglingImage),
+                    age_eligible: age >= config.ttl_seconds,
+                    ..base
+                };
+            }
+            return protect(ProtectedReason::OwnedByThisRegistry);
+        }
         OwnershipClass::ForeignRegistry => return protect(ProtectedReason::ForeignRegistry),
         OwnershipClass::IncompleteLabels => return protect(ProtectedReason::IncompleteLabels),
         OwnershipClass::Unlabeled => {}
@@ -606,6 +656,11 @@ pub struct Census {
     /// Set when any input was unmeasurable or unparseable. A partial census is never a
     /// clean machine, and no plan may be built from it.
     pub partial: bool,
+    /// Objects the engine reported no size for.
+    ///
+    /// #520: these are counted, not folded into a byte total. Reporting them as `0 B` made an
+    /// unmeasurable class indistinguishable from an empty one.
+    pub unmeasured_objects: u64,
     /// Docker reports human-unit sizes with ~4 significant digits. Every byte figure in this
     /// census is derived from those and is therefore approximate.
     pub bytes_approximate: bool,
@@ -621,6 +676,9 @@ pub fn census(
     let mut classes: BTreeMap<UnmanagedClass, ClassSummary> = BTreeMap::new();
     let mut protected: BTreeMap<ProtectedReason, ProtectedSummary> = BTreeMap::new();
     let mut partial = false;
+    // #520: an object with no reported size is counted here rather than silently contributing
+    // zero bytes to a total it cannot honestly be part of.
+    let mut unmeasured_objects: u64 = 0;
     for artifact in artifacts {
         let verdict = classify(
             artifact.kind,
@@ -633,6 +691,7 @@ pub fn census(
         let bytes = artifact.bytes.unwrap_or(0);
         if artifact.bytes.is_none() {
             partial = true;
+            unmeasured_objects += 1;
         }
         if let Some(reason) = verdict.protected {
             let entry = protected.entry(reason).or_insert(ProtectedSummary {
@@ -695,6 +754,7 @@ pub fn census(
         reclaimable_objects,
         reclaimable_bytes,
         partial,
+        unmeasured_objects,
         bytes_approximate: true,
     }
 }

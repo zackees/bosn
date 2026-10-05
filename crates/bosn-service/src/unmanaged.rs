@@ -11,7 +11,7 @@ use std::path::Path;
 
 use bosn_core::{
     Acknowledgement, Census, CensusConfig, EngineObservation, InspectedVolume, Plan,
-    SystemDfReport, census, observe, plan, removal_rank,
+    ProtectedReason, SystemDfReport, census, observe, plan, pressure_decision, removal_rank,
 };
 use bosn_engine::{CensusRead, DockerEngine, RunOptions};
 use serde::{Deserialize, Serialize};
@@ -142,6 +142,73 @@ pub fn maintenance_pass(
     (scan, warning)
 }
 
+/// The free-space floor below which a machine is under pressure, and the pressure call itself.
+///
+/// #517: `pressure_decision` had no non-test caller, so the rule it encodes — that eviction is
+/// only suppressed when it provably cannot help — governed nothing. This is the caller. It
+/// *reports*; it does not delete. Turning a `may_evict_owned` verdict into an actual eviction
+/// stays a product decision, because the non-goals forbid autonomous deletion of anything not
+/// provably ours, and this is the place that decision has to be made deliberately.
+#[must_use]
+pub fn pressure_report(engine: &DockerEngine, census: &Census) -> Option<PressureReport> {
+    let owned_bytes: i128 = census
+        .protected
+        .iter()
+        .filter(|summary| summary.reason == ProtectedReason::OwnedByThisRegistry)
+        .map(|summary| summary.bytes)
+        .sum();
+    let root = docker_root_dir(engine)?;
+    let free_bytes = i128::from(kernal_api::resources_available_space(&root).ok()?);
+    let min_free_bytes = MIN_FREE_BYTES;
+    let under_pressure = free_bytes < min_free_bytes;
+    let decision = pressure_decision(
+        under_pressure,
+        true,
+        free_bytes,
+        min_free_bytes,
+        owned_bytes,
+        !census.partial,
+    );
+    Some(PressureReport {
+        free_bytes,
+        min_free_bytes,
+        owned_bytes,
+        decision,
+    })
+}
+
+/// The free-space floor a machine is held to.
+///
+/// Five percent of nothing is not a number, so this is a fixed floor rather than a fraction:
+/// large enough that a build does not fail for want of space, small enough that a machine
+/// reports pressure long before it is unusable.
+pub const MIN_FREE_BYTES: i128 = 20 * (1 << 30);
+
+/// What the pressure rule decided, for the maintenance log.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PressureReport {
+    pub free_bytes: i128,
+    pub min_free_bytes: i128,
+    /// Bytes owned by this registry, i.e. the only bytes pressure could reclaim.
+    pub owned_bytes: i128,
+    pub decision: bosn_core::PressureDecision,
+}
+
+/// The Docker root directory, or `None` when the engine will not say.
+///
+/// Pressure is only reported when the root is known. An unreadable root is not pressure.
+fn docker_root_dir(engine: &DockerEngine) -> Option<std::path::PathBuf> {
+    let options = RunOptions::bounded(CENSUS_READ_DEADLINE, CENSUS_READ_OUTPUT_LIMIT);
+    let text = match engine
+        .with_args(["info", "--format", "{{.DockerRootDir}}"])
+        .capture(options)
+    {
+        Ok(result) if result.ok() => String::from_utf8_lossy(&result.stdout).trim().to_owned(),
+        _ => return None,
+    };
+    (!text.is_empty()).then(|| std::path::PathBuf::from(text))
+}
+
 /// The warning's lines, without colour, so every surface says the same thing.
 ///
 /// The caller decides how to render them; JSON never calls this, because JSON carries neither
@@ -176,6 +243,41 @@ pub fn warning_lines(warning: &bosn_core::Warning) -> Vec<String> {
             "  review {} items ({}) needing judgment: listed by the preview, opt one in with --include <id>",
             warning.review_objects,
             human_bytes(warning.review_bytes),
+        ));
+    }
+    // #516: these were measured and discarded. Silence about a foreign-registry or in-use
+    // footprint is what let a lost registry look like a clean machine, so each reason is named
+    // with its own size and its own next step.
+    for summary in &warning.protected {
+        let detail = match summary.reason {
+            bosn_core::ProtectedReason::ForeignRegistry => {
+                "labelled for a Bosn registry this machine no longer recognises (a restored or \
+                 reset state directory re-keys ownership and strands these); \
+                 see them: bosn scan --json"
+            }
+            bosn_core::ProtectedReason::OwnedByThisRegistry => {
+                "owned by this registry, reclaimed by age: see them: bosn gc owned"
+            }
+            bosn_core::ProtectedReason::InUse => "still in use by a live container or engine",
+            bosn_core::ProtectedReason::IncompleteLabels => {
+                "bosn labels are incomplete, so ownership cannot be proven either way"
+            }
+            bosn_core::ProtectedReason::Unmeasured => "size could not be measured",
+            bosn_core::ProtectedReason::Unclassified => "no classification rule applies",
+        };
+        lines.push(format!(
+            "  {} ({}) {}",
+            summary.objects,
+            human_bytes(summary.bytes),
+            detail
+        ));
+    }
+    // #520: an unmeasured object is not a zero-byte object, and reporting it as `0 B` hid the
+    // footprint the census exists to measure.
+    if warning.unmeasured_objects > 0 {
+        lines.push(format!(
+            "  {} object(s) have no reported size and are NOT counted as 0 B",
+            warning.unmeasured_objects
         ));
     }
     lines.push("  silence:   bosn scan --ack".to_owned());
@@ -501,6 +603,8 @@ mod tests {
             review_objects: 1,
             review_bytes: 10,
             report_only_bytes: 2 * 1024 * 1024 * 1024,
+            protected: Vec::new(),
+            unmeasured_objects: 0,
             partial: false,
         };
         let lines = warning_lines(&warning);
@@ -529,6 +633,8 @@ mod tests {
             review_objects: 0,
             review_bytes: 0,
             report_only_bytes: 0,
+            protected: Vec::new(),
+            unmeasured_objects: 0,
             partial: false,
         };
         let lines = warning_lines(&warning);
@@ -552,6 +658,8 @@ mod tests {
             review_objects: 0,
             review_bytes: 0,
             report_only_bytes: 0,
+            protected: Vec::new(),
+            unmeasured_objects: 0,
             partial: true,
         };
         let lines = warning_lines(&warning);

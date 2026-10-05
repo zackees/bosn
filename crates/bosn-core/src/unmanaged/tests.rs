@@ -154,7 +154,12 @@ fn protection_wins_over_reclaimability() {
         old,
         config,
     );
-    assert_eq!(ours.protected, Some(ProtectedReason::OwnedByThisRegistry));
+    // #519 changed exactly this case: an owned image Docker itself calls dangling is now
+    // reclaimable, because `bosn-setup:<sha256>` is content-addressed and therefore rebuildable.
+    // Everything this test goes on to assert is unchanged. The narrowing that keeps that safe
+    // is pinned by `owned_footprint_is_only_opened_by_dockers_own_verdict`.
+    assert_eq!(ours.class, Some(UnmanagedClass::DanglingImage));
+    assert_eq!(ours.protected, None);
 
     let foreign = classify(
         ResourceKind::Image,
@@ -731,4 +736,207 @@ fn rfc3339_and_accounting_timestamps_agree() {
     // A UTC designator is accepted, and a date without a zone is not.
     assert_eq!(parse_rfc3339_timestamp("1970-01-01T00:00:00Z"), Some(0.0));
     assert_eq!(parse_rfc3339_timestamp("1970-01-01T00:00:00"), None);
+}
+
+#[test]
+fn owned_footprint_is_only_opened_by_dockers_own_verdict() {
+    // The narrowing that makes #519 safe. An owned image enters the reclaimable set only when
+    // Docker itself calls it dangling; owned containers and volumes stay protected whatever
+    // their age, because widening those would create a second, unattended path to removing a
+    // volume. Pins and incompleteness still resolve before any of this.
+    let config = CensusConfig::default();
+    let old = Some(DEFAULT_TTL_SECONDS * 10.0);
+    let open = |kind, signals| classify(kind, &complete("r1"), Some("r1"), signals, old, config);
+
+    // The narrowing that matters: an owned image Docker does *not* call dangling, and one that
+    // is still in use, both stay protected. Only Docker's own verdict opens the door.
+    let owned_tagged = open(ResourceKind::Image, Signals::default());
+    assert_eq!(
+        owned_tagged.protected,
+        Some(ProtectedReason::OwnedByThisRegistry)
+    );
+    let owned_in_use = open(
+        ResourceKind::Image,
+        Signals {
+            dangling: true,
+            in_use: true,
+            ..Signals::default()
+        },
+    );
+    assert_eq!(
+        owned_in_use.protected,
+        Some(ProtectedReason::OwnedByThisRegistry)
+    );
+
+    // An owned *container* stays protected whatever its age. Widening images must never create
+    // a second unattended path to removing an owned volume's owner.
+    let owned_container = open(
+        ResourceKind::Container,
+        Signals {
+            dangling: true,
+            ..Signals::default()
+        },
+    );
+    assert_eq!(
+        owned_container.protected,
+        Some(ProtectedReason::OwnedByThisRegistry)
+    );
+
+    // An owned dangling image with no measurable age cannot clear a gate it has no value for.
+    let owned_unmeasured = classify(
+        ResourceKind::Image,
+        &complete("r1"),
+        Some("r1"),
+        Signals {
+            dangling: true,
+            ..Signals::default()
+        },
+        None,
+        config,
+    );
+    assert_eq!(
+        owned_unmeasured.protected,
+        Some(ProtectedReason::Unmeasured)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #516: protected bytes are measured, so they must be reported.
+// ---------------------------------------------------------------------------
+
+fn owned_protected_artifact(bytes: i128) -> ObservedArtifact {
+    // A volume labelled for a registry this machine no longer recognises — the exact shape a
+    // reset state directory leaves behind. It is protected, and it is the largest thing on the
+    // disk, and until #516 nothing said so.
+    ObservedArtifact {
+        id: "v-stale".to_owned(),
+        kind: ResourceKind::Volume,
+        labels: complete("some-other-registry"),
+        signals: Signals::default(),
+        bytes: Some(bytes),
+        age_seconds: Some(DEFAULT_TTL_SECONDS * 100.0),
+    }
+}
+
+#[test]
+fn a_protected_footprint_alone_can_raise_a_warning() {
+    // RED case for #516: 200 GiB of foreign-registry volumes, nothing reclaimable. Before the
+    // fix `warning()` returned None and a machine in this state was silent.
+    let census = census(
+        &[owned_protected_artifact(200 << 30)],
+        Some("r1"),
+        CensusConfig::default(),
+    );
+    assert_eq!(census.reclaimable_bytes, 0, "nothing here is reclaimable");
+    let warned = warning(&census, WarningThreshold::default());
+    assert!(
+        warned.is_some(),
+        "a 200 GiB protected footprint must not be silent"
+    );
+    let warning = warned.expect("warning");
+    assert_eq!(warning.protected.len(), 1);
+    assert_eq!(warning.protected[0].objects, 1);
+    assert_eq!(warning.protected[0].bytes, 200 << 30);
+    assert_eq!(
+        warning.protected[0].reason,
+        ProtectedReason::ForeignRegistry
+    );
+}
+
+#[test]
+fn a_healthy_machine_stays_silent_with_the_protected_terms_added() {
+    // #516 must not make every machine noisy. One small unlabeled object is under both the
+    // byte and object thresholds, so there is still nothing to say.
+    let census = census(
+        &[artifact(
+            "u",
+            ResourceKind::Volume,
+            1024,
+            DEFAULT_TTL_SECONDS * 2.0,
+        )],
+        Some("r1"),
+        CensusConfig::default(),
+    );
+    assert!(
+        warning(&census, WarningThreshold::default()).is_none(),
+        "a small tidy machine must stay silent"
+    );
+}
+
+#[test]
+fn protected_objects_alone_can_trip_the_object_threshold() {
+    // The byte threshold is 5 GiB; 26 tiny protected objects clear the count threshold instead,
+    // which proves the object term is live and not just a restatement of the byte term.
+    let artifacts: Vec<ObservedArtifact> = (0..26)
+        .map(|index| {
+            let mut item = owned_protected_artifact(1024);
+            item.id = format!("v-{index}");
+            item
+        })
+        .collect();
+    let census = census(&artifacts, Some("r1"), CensusConfig::default());
+    assert!(warning(&census, WarningThreshold::default()).is_some());
+}
+
+// ---------------------------------------------------------------------------
+// #520: an unmeasured size is not a zero-byte size.
+// ---------------------------------------------------------------------------
+
+fn unmeasured_artifact(id: &str) -> ObservedArtifact {
+    ObservedArtifact {
+        id: id.to_owned(),
+        kind: ResourceKind::Volume,
+        labels: BTreeMap::new(),
+        signals: Signals::default(),
+        bytes: None,
+        age_seconds: Some(DEFAULT_TTL_SECONDS * 2.0),
+    }
+}
+
+#[test]
+fn unmeasured_objects_are_counted_rather_than_folded_into_zero_bytes() {
+    let artifacts: Vec<ObservedArtifact> = (0..30)
+        .map(|i| unmeasured_artifact(&format!("u-{i}")))
+        .collect();
+    let census = census(&artifacts, Some("r1"), CensusConfig::default());
+    assert_eq!(
+        census.unmeasured_objects, 30,
+        "30 objects with no reported size must not read as 0 bytes"
+    );
+    assert!(
+        census.partial,
+        "an unmeasured input is still a partial census"
+    );
+}
+
+#[test]
+fn unmeasured_objects_alone_can_raise_a_warning() {
+    // #520's user-visible half: 30 unmeasured objects and nothing else. Their byte total is
+    // genuinely unknown, so the object count is what speaks.
+    let artifacts: Vec<ObservedArtifact> = (0..30)
+        .map(|i| unmeasured_artifact(&format!("u-{i}")))
+        .collect();
+    let census = census(&artifacts, Some("r1"), CensusConfig::default());
+    assert_eq!(census.reclaimable_bytes, 0);
+    let warned = warning(&census, WarningThreshold::default());
+    assert!(warned.is_some(), "unmeasured objects must be able to speak");
+    assert_eq!(warned.expect("warning").unmeasured_objects, 30);
+}
+
+#[test]
+fn a_measured_zero_is_not_counted_as_unmeasured() {
+    // The distinction the fix exists to preserve: 0 B measured is a fact; 0 B because the
+    // engine said nothing is an admission of ignorance.
+    let census = census(
+        &[artifact(
+            "z",
+            ResourceKind::Volume,
+            0,
+            DEFAULT_TTL_SECONDS * 2.0,
+        )],
+        Some("r1"),
+        CensusConfig::default(),
+    );
+    assert_eq!(census.unmeasured_objects, 0);
+    assert!(!census.partial);
 }
