@@ -13,6 +13,62 @@ pub(crate) fn run_manifest(mut arguments: impl Iterator<Item = std::ffi::OsStrin
     }
 }
 
+/// A parsed destructive volume apply. Both flags are required: `apply` states
+/// the intent to remove durable data, `yes` confirms it. There is deliberately
+/// no bulk mode, no `--force`, and no other predicate-widening flag; the
+/// candidate token is the only thing that names what may be removed.
+struct VolumeApplyArguments {
+    state_dir: PathBuf,
+    workspace: PathBuf,
+    candidate: String,
+    json_output: bool,
+}
+
+/// Parse the apply form shared by `manifest volume-gc apply` and
+/// `manifest volume-release apply`. Eagerly typed at the boundary so a refused
+/// form never reaches the client.
+fn parse_volume_apply_arguments(
+    mut arguments: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<VolumeApplyArguments, ()> {
+    let mut state_dir = None;
+    let mut workspace = None;
+    let mut candidate = None;
+    let mut apply = false;
+    let mut yes = false;
+    let mut json_output = false;
+    while let Some(argument) = arguments.next() {
+        match argument.to_string_lossy().as_ref() {
+            "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
+            "--workspace" => set_once_parsed(&mut workspace, arguments.next(), parse_state_dir),
+            "--candidate" => set_once_parsed(&mut candidate, arguments.next(), |v| {
+                v.to_str().map(str::to_owned).ok_or(())
+            }),
+            "--apply" if !apply => {
+                apply = true;
+                Ok(())
+            }
+            "--yes" if !yes => {
+                yes = true;
+                Ok(())
+            }
+            "--json" if !json_output => {
+                json_output = true;
+                Ok(())
+            }
+            _ => Err(()),
+        }?;
+    }
+    if !apply || !yes {
+        return Err(());
+    }
+    Ok(VolumeApplyArguments {
+        state_dir: state_dir.ok_or(())?,
+        workspace: workspace.ok_or(())?,
+        candidate: candidate.ok_or(())?,
+        json_output,
+    })
+}
+
 pub(crate) fn run_manifest_volume_release(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
     let Some(verb) = arguments.next() else {
         usage();
@@ -39,49 +95,19 @@ pub(crate) fn run_manifest_volume_release(mut arguments: impl Iterator<Item = st
             None => gc_failure(json_output),
         }
     } else if verb.as_os_str() == std::ffi::OsStr::new("apply") {
-        let mut state_dir = None;
-        let mut workspace = None;
-        let mut token = None;
-        let mut apply = false;
-        let mut yes = false;
-        let mut json_output = false;
-        while let Some(argument) = arguments.next() {
-            match argument.to_string_lossy().as_ref() {
-                "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
-                "--workspace" => set_once_parsed(&mut workspace, arguments.next(), parse_state_dir),
-                "--candidate" => set_once_parsed(&mut token, arguments.next(), |v| {
-                    v.to_str().map(str::to_owned).ok_or(())
-                }),
-                "--apply" if !apply => {
-                    apply = true;
-                    Ok(())
-                }
-                "--yes" if !yes => {
-                    yes = true;
-                    Ok(())
-                }
-                "--json" if !json_output => {
-                    json_output = true;
-                    Ok(())
-                }
-                _ => Err(()),
-            }
-            .unwrap_or_else(|_| usage());
-        }
-        let (Some(state_dir), Some(workspace), Some(token)) = (state_dir, workspace, token) else {
-            usage();
-        };
-        if !apply || !yes {
-            usage();
-        }
-        let result = Client::for_state(state_dir).ok().and_then(|client| {
+        let parsed = parse_volume_apply_arguments(arguments).unwrap_or_else(|_| usage());
+        let result = Client::for_state(parsed.state_dir).ok().and_then(|client| {
             RuntimeBuilder::current_thread()
                 .enable_all()
                 .build()
                 .ok()
                 .and_then(|runtime| {
                     runtime
-                        .run(client.manifest_volume_release_apply(workspace, &token, true))
+                        .run(client.manifest_volume_release_apply(
+                            &parsed.workspace,
+                            &parsed.candidate,
+                            true,
+                        ))
                         .ok()
                 })
         });
@@ -90,7 +116,7 @@ pub(crate) fn run_manifest_volume_release(mut arguments: impl Iterator<Item = st
                 "{}",
                 json!({"action":"manifest_volume_release_apply","removed":value.removed,"reconciled_missing":value.reconciled_missing})
             ),
-            None => gc_failure(json_output),
+            None => gc_failure(parsed.json_output),
         }
     } else {
         usage();
@@ -123,49 +149,19 @@ pub(crate) fn run_manifest_volume_gc(mut arguments: impl Iterator<Item = std::ff
             None => gc_failure(json_output),
         }
     } else if verb.as_os_str() == std::ffi::OsStr::new("apply") {
-        let mut state_dir = None;
-        let mut workspace = None;
-        let mut token = None;
-        let mut apply = false;
-        let mut yes = false;
-        let mut json_output = false;
-        while let Some(argument) = arguments.next() {
-            match argument.to_string_lossy().as_ref() {
-                "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
-                "--workspace" => set_once_parsed(&mut workspace, arguments.next(), parse_state_dir),
-                "--candidate" => set_once_parsed(&mut token, arguments.next(), |v| {
-                    v.to_str().map(str::to_owned).ok_or(())
-                }),
-                "--apply" if !apply => {
-                    apply = true;
-                    Ok(())
-                }
-                "--yes" if !yes => {
-                    yes = true;
-                    Ok(())
-                }
-                "--json" if !json_output => {
-                    json_output = true;
-                    Ok(())
-                }
-                _ => Err(()),
-            }
-            .unwrap_or_else(|_| usage());
-        }
-        let (Some(state_dir), Some(workspace), Some(token)) = (state_dir, workspace, token) else {
-            usage();
-        };
-        if !apply || !yes {
-            usage();
-        }
-        let result = Client::for_state(state_dir).ok().and_then(|client| {
+        let parsed = parse_volume_apply_arguments(arguments).unwrap_or_else(|_| usage());
+        let result = Client::for_state(parsed.state_dir).ok().and_then(|client| {
             RuntimeBuilder::current_thread()
                 .enable_all()
                 .build()
                 .ok()
                 .and_then(|runtime| {
                     runtime
-                        .run(client.manifest_volume_gc_apply(workspace, &token, true))
+                        .run(client.manifest_volume_gc_apply(
+                            &parsed.workspace,
+                            &parsed.candidate,
+                            true,
+                        ))
                         .ok()
                 })
         });
@@ -174,7 +170,7 @@ pub(crate) fn run_manifest_volume_gc(mut arguments: impl Iterator<Item = std::ff
                 "{}",
                 json!({"action":"manifest_volume_gc_apply","removed":value.removed,"reconciled_missing":value.reconciled_missing})
             ),
-            None => gc_failure(json_output),
+            None => gc_failure(parsed.json_output),
         }
     } else {
         usage();
@@ -366,5 +362,106 @@ pub(crate) fn run_manifest_ensure(mut arguments: impl Iterator<Item = std::ffi::
         ),
         Ok(job_id) => println!("manifest ensure submitted: {job_id}"),
         Err(_) => usage(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn apply(values: &[&str]) -> Result<VolumeApplyArguments, ()> {
+        parse_volume_apply_arguments(values.iter().map(std::ffi::OsString::from))
+    }
+
+    /// The documented durable-volume release form (#524) parses. `docs/
+    /// rust-manifest-runtime.md` promises an opaque candidate token plus
+    /// `--apply --yes`; this holds the CLI to exactly that shape.
+    #[test]
+    fn volume_release_apply_parses_the_documented_form() {
+        let parsed = apply(&[
+            "--state-dir",
+            "/state",
+            "--workspace",
+            "/work",
+            "--candidate",
+            "VOLUME-RELEASE-TOKEN",
+            "--apply",
+            "--yes",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(parsed.state_dir, PathBuf::from("/state"));
+        assert_eq!(parsed.workspace, PathBuf::from("/work"));
+        assert_eq!(parsed.candidate, "VOLUME-RELEASE-TOKEN");
+        assert!(parsed.json_output);
+    }
+
+    /// Both confirmations are load-bearing. Dropping either one must refuse
+    /// before the client is reached, so apply cannot remove durable data.
+    #[test]
+    fn apply_refuses_without_both_apply_and_yes() {
+        let base = [
+            "--state-dir",
+            "/state",
+            "--workspace",
+            "/work",
+            "--candidate",
+            "T",
+        ];
+        let mut without_yes = base.to_vec();
+        without_yes.push("--apply");
+        assert!(apply(&without_yes).is_err());
+
+        let mut without_apply = base.to_vec();
+        without_apply.push("--yes");
+        assert!(apply(&without_apply).is_err());
+
+        assert!(apply(&base).is_err());
+    }
+
+    /// No bulk mode, no `--force`, no other widening flag. Anything unrecognized
+    /// is refused rather than ignored.
+    #[test]
+    fn apply_refuses_unknown_and_repeated_flags() {
+        for bad in [
+            &["--all"][..],
+            &["--force"][..],
+            &["--yes"][..],
+            &["--workspace"][..],
+        ] {
+            let mut values = vec![
+                "--state-dir",
+                "/state",
+                "--workspace",
+                "/work",
+                "--candidate",
+                "T",
+                "--apply",
+                "--yes",
+            ];
+            values.extend_from_slice(bad);
+            assert!(apply(&values).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    /// Missing required operands are refused, not defaulted.
+    #[test]
+    fn apply_requires_state_dir_workspace_and_candidate() {
+        let full = [
+            "--state-dir",
+            "/state",
+            "--workspace",
+            "/work",
+            "--candidate",
+            "T",
+            "--apply",
+            "--yes",
+        ];
+        for drop in ["--state-dir", "--workspace", "--candidate"] {
+            let index = full.iter().position(|value| *value == drop).unwrap();
+            let mut values = full.to_vec();
+            values.drain(index..index + 2);
+            assert!(apply(&values).is_err(), "accepted without {drop}");
+        }
     }
 }
