@@ -596,8 +596,8 @@ These are tracked in #323:
 
 Before workflow execution, bootstrap and offline readiness query the same
 digest-verified act binary with `--ci-capabilities`. Bosn requires schema 1,
-producer `act2`, the exact pinned version, `qualified-job-identity-v1`, and
-`step-stage-result-v1`. Malformed, duplicate-field, oversized or incompatible
+producer `act2`, the exact pinned version, `qualified-job-identity-v1`,
+`step-stage-result-v1`, and `cache-exact-delete-v1`. Malformed, duplicate-field, oversized or incompatible
 responses fail readiness. A capability response proves available event
 contracts, not passing tests or a source tree. ci-lint owns evidence validation
 and attestation policy.
@@ -612,9 +612,11 @@ source snapshot and event payload. Old records without this field remain
 readable; their absence supplies no provider identity for attestation reuse.
 The shared ci-lint consumer binds these pins into result-cache keys and
 terminal receipt validation when `provider-query` is enrolled. Exposing pins
-alone does not qualify a skip; real adopter qualification remains pending.
+alone does not qualify a skip; ci-lint must verify source-bound execution evidence.
 
-The Bosn source candidate pins published `v0.2.89-act2.13` from
+### Historical Bosn 0.1.16 provider
+
+Bosn 0.1.16 pins published `v0.2.89-act2.13` from
 [act2 PR #54](https://github.com/zackees/act2/pull/54), adding selected output
 evidence to the qualified identity and step-result contracts. Full CI passed
 on exact merged commit `0354c17e437066c43727be259450b5bbd1a9bb31`
@@ -628,20 +630,29 @@ Its extracted executable hashes to
 `48541dd9f8d579a6521dba02cbeec207c12359220c504ec3b2424dce8b79c5db`.
 The actual executable reports version `0.2.89-act2.13` and all three
 capabilities even with a nonexistent workflow path and Docker socket.
-This is a source pin update, not a deployed Bosn release. End-to-end adopter
-qualification remains pending in
+That provider was released with Bosn 0.1.16. Clud's recorded local run,
+unchanged-tree reuse, exact-head publication, five hosted job skips, and required
+`CI OK` success are documented in
 [ci.yml#362](https://github.com/zackees/ci.yml/issues/362).
 
-### Selected planner outputs (candidate transport)
+The current Bosn 0.1.17 candidate pins published `v0.2.89-act2.14`, which adds
+exact local cache deletion and protects action checkout readers. Public artifact
+hashes, release qualification, and remaining rollout checks live in the
+[cache accounting spec](ci-cache-accounting-spec.md#ci-attestation-pilot-published-exact-cleanup-provider-362).
+Bosn 0.1.17 publication and the second consumer's end-to-end qualification remain
+pending; the earlier Clud proof does not qualify this new provider automatically.
+
+### Selected planner outputs
 
 The implementation for [act2 PR #54](https://github.com/zackees/act2/pull/54)
 adds explicit `--ci-output <job/path>:<output>` requests to Bosn CI plans and
 MCP run arguments. Requests are typed, bounded, included in run identity, and
 forwarded to act2. Before executing a plan with requests, Bosn requires the
 `selected-job-outputs-v1` capability from its digest-verified producer. The
-older `.12` release lacks this capability and refuses such plans; the source
-candidate uses the qualified `.13` artifact above. Ordinary plans continue
-to require the two existing capabilities.
+older `.12` release lacks this capability and refuses such plans. The current
+candidate uses the verified public `.14` artifact. Ordinary plans require the
+three baseline capabilities listed above; output requests additionally require
+`selected-job-outputs-v1`.
 
 Output events remain attached to each concrete qualified job, including its
 caller and matrix identity. The receipt records schema, event sequence, string
@@ -653,7 +664,8 @@ Bosn transports execution data. Shared ci-lint must first prove the producing
 job and its source definition before using the selected outputs to resolve
 `needs` expressions or dynamic matrices. That verification and attestation
 policy belong to ci.yml, rather than another workflow planner in Bosn. The
-candidate transport does not yet demonstrate end-to-end hosted skips.
+transport supplies evidence for shared validation; second-consumer qualification
+with the current provider remains pending.
 
 ### Shared local gate adoption (source candidate)
 
