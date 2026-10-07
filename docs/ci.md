@@ -478,9 +478,11 @@ stubbed job.
   and its engine retired (`act_runtime::recover_startup_act_engines`); the
   window then seals. A container that holds an engine name without the exact
   ownership and isolation identity is never removed.
-- **Scheduling.** There is one machine-wide FIFO queue with a live concurrency
-  limit, which defaults to cores / 4 and is changed with
-  `bosn ci runners set-limit N`.
+- **Scheduling.** Each daemon owns one FIFO queue for its state root, with
+  a live concurrency limit that defaults to cores / 4 and is changed with
+  `bosn ci runners set-limit N`. Independent state roots have independent
+  limits; this is not an aggregate CPU budget across daemons. Each engine's
+  CPU ceiling is configured separately, and prepared spares may also do work.
   - Identical submissions share one run ID. "Identical" means the same SHA,
     dirty digest, workflow, job, trigger, mode, provider, engine, event payload
     (branch, PR number, repository, inputs), matrix filter, env and timeout.

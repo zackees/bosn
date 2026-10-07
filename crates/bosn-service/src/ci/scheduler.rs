@@ -1,6 +1,7 @@
-//! Machine-wide CI admission: one FIFO queue, one live concurrency limit, and
+//! Per-daemon CI admission: one FIFO queue, one live concurrency limit, and
 //! coalescing of identical submissions onto the run already queued/running.
-//! Pure state; the CI actor owns the only instance and performs effects.
+//! Pure state; each CI actor owns its instance and performs effects. Separate
+//! state roots do not share this limit or establish an aggregate CPU budget.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
