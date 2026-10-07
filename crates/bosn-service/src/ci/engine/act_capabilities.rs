@@ -27,9 +27,13 @@ pub(super) fn validate(
     {
         return Err("act capability schema, producer or pinned version mismatch".into());
     }
-    for required in ["qualified-job-identity-v1", "step-stage-result-v1"]
-        .into_iter()
-        .chain(selected_outputs.then_some("selected-job-outputs-v1"))
+    for required in [
+        "qualified-job-identity-v1",
+        "step-stage-result-v1",
+        "cache-exact-delete-v1",
+    ]
+    .into_iter()
+    .chain(selected_outputs.then_some("selected-job-outputs-v1"))
     {
         if !capabilities
             .capabilities
@@ -48,7 +52,14 @@ pub(super) fn validate(
 mod tests {
     use super::validate;
 
-    const DOCUMENT: &str = r#"{"schema_version":1,"producer":"act2","version":"candidate","capabilities":["qualified-job-identity-v1","step-stage-result-v1"]}"#;
+    const DOCUMENT: &str = r#"{"schema_version":1,"producer":"act2","version":"candidate","capabilities":["qualified-job-identity-v1","step-stage-result-v1","cache-exact-delete-v1"]}"#;
+
+    #[test]
+    fn requires_local_exact_key_cleanup_before_workflow_execution() {
+        let unsupported = DOCUMENT.replace("cache-exact-delete-v1", "unsupported");
+        let error = validate(&unsupported, "candidate", false).unwrap_err();
+        assert!(error.contains("cache-exact-delete-v1"));
+    }
 
     #[test]
     fn requested_outputs_require_the_output_evidence_capability() {
@@ -61,9 +72,13 @@ mod tests {
     }
 
     #[test]
-    fn requires_both_execution_evidence_features() {
+    fn requires_execution_and_cache_cleanup_features() {
         assert!(validate(DOCUMENT, "candidate", false).is_ok());
-        for feature in ["qualified-job-identity-v1", "step-stage-result-v1"] {
+        for feature in [
+            "qualified-job-identity-v1",
+            "step-stage-result-v1",
+            "cache-exact-delete-v1",
+        ] {
             assert!(
                 validate(
                     &DOCUMENT.replace(feature, "unknown-feature"),
