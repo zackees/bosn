@@ -652,3 +652,27 @@ job and its source definition before using the selected outputs to resolve
 `needs` expressions or dynamic matrices. That verification and attestation
 policy belong to ci.yml, rather than another workflow planner in Bosn. The
 candidate transport does not yet demonstrate end-to-end hosted skips.
+
+### Shared local gate adoption (source candidate)
+
+`local-gate.toml` now declares two direct Bosn workflow selections: `rust`
+and `tests` (`linux`, dispatched with `tier=test`). Both return original JSON
+receipts to the pinned shared checker and query the provider's actual execution
+pins. Source definitions determine required checks; the repository no longer
+has a private receipt parser or manually copied check lists. `ci/bosn_gate.py`
+is a compatibility command that delegates to `ci-lint local-gate run`.
+
+The Linux selection preserves the former Python static and guard checks via
+`./lint`, adds the shared policy lint, and retains unit and Docker tests via
+`./test`. Their gate records now use the `tests` lane. The Rust selection
+retains workspace and widget formatting, Clippy, boundary and locked metadata,
+workspace tests and embedded Python tests. No lane input exclusions are claimed.
+`ci/local_gate.py` remains a diagnostic helper for existing isolated tasks;
+it neither verifies receipts nor produces attestations and refuses Rust/test
+diagnostics on a developer host.
+
+Isolated wiring tests pass and the shared policy lint reports zero violations.
+Its existing no-mirror finding remains `needs_review`: this repository uses
+per-gate remote skip mappings rather than claiming a single mirrored job.
+Actual complete Bosn gate execution, result reuse, deployment and hosted skips
+remain pending; source configuration and wiring tests do not establish them.

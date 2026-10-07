@@ -1,120 +1,73 @@
-# bosn's local gate (zackees/ci.yml#166..#198: GATE-001..007; bosn#361).
-#
-# Before every push, from a clean, committed tree:
-#
-#   uvx --from git+https://github.com/zackees/ci.yml@527cc179200496bdc41445a2c5b91e6025b495d7 ci-lint local-gate run
-#
-# runs `run` below and, on success, stamps HEAD with a tree-bound
-# `Local-Gate:` trailer (and, with ci-attestations.yml, one `Ci-Attestation:`
-# per attested gate). CI's `verify` job checks it; every other job needs
-# `verify`. Install the matching pre-push hook once per clone with
-# `... ci-lint local-gate install-hook`.
-#
-# Exact-source Rust and Linux workflow replays passed before promotion
-# (bosn#464). Missing or stale proof now refuses a PR; non-PR events retain
-# their remote coverage. The heavy lanes require released bosn >= 0.1.12.
-# Isolate the tooling interpreter: --no-project alone can discover an
-# ancestor .venv and replace the intended Bosn executable on PATH.
+# Shared CI tool policy for Bosn (zackees/ci.yml#362).
+# Run from a clean committed tree before pushing:
+# uvx --from git+https://github.com/zackees/ci.yml@96ba9f2df5b6c16d4fc933ee9dc2dbab7c47b46e ci-lint local-gate run
+# The shared verifier proves source checks and provider identity, then writes
+# Local-Gate and per-gate Ci-Attestation trailers. Bosn supplies raw receipts.
 [gate]
-run = ["uv", "run", "--no-project", "--isolated", "--python", "3.13", "python", "ci/bosn_gate.py"]
+run = ["bosn", "ci", "run", "--workspace", ".", "--workflow", ".github/workflows/ci.yml", "--event", "workflow_dispatch", "--input", "tier=test", "--mode", "minimal", "--engine", "act", "--timeout-secs", "3600", "--wait", "--deadline-ms", "3600000", "--json", "--ci-output", "verify:skip_rust", "--ci-output", "select-tier:test"]
 verify = "ci.yml:verify"
-# ci-pre only publishes attestation side entries; nothing waits on it.
 verify-exempt = ["ci-pre"]
 mode = "enforce"
 
-# GATE-005: bosn is live infrastructure on the developer's host (its tests
-# start bosn daemons and touch bosn state roots), so its suites run only in
-# the isolated bosn container. The guards refuse a bare host run: Python's in
-# tests/conftest.py, Rust's in ci/test_guard.sh (cargo's test runner, see
-# .cargo/config.toml). docker/test.Dockerfile sets the marker.
 [gate.isolation]
 marker = "BOSN_TEST_ISOLATED"
 runner = ["bosn", "ci", "run"]
 proves-tree = true
 guard = "tests/conftest.py"
 
-# GATE-007: lanes, split along input boundaries. A lane is skipped when its
-# inputs (the commit tree minus `exclude`, plus the mandatory inputs) match a
-# recorded pass. Exclusions are deliberately few until
-# `ci-lint local-gate lanes --simulate` shows more are safe: the Rust crates
-# `include_str!` JSON schemas, fixtures and docs, so only Python-only lanes
-# exclude anything.
-[gate.lanes.py-static]
-run = ["uv", "run", "--no-project", "--isolated", "--python", "3.13", "python", "ci/bosn_gate.py", "--lane", "py-static"]
-tools = ["uv"]
-weight = "light"
-exclude = ["crates/**", "Cargo.toml", "Cargo.lock", "docs/**", "*.md", "docker/**", ".github/workflows/**", "**/*.rs", "**/*.json"]
-
-[gate.lanes.guards]
-run = ["uv", "run", "--no-project", "--isolated", "--python", "3.13", "python", "ci/bosn_gate.py", "--lane", "guards"]
-tools = ["uv"]
-weight = "light"
-
+# The two workflow selections preserve all former checks: Linux runs Python
+# static checks, repository guards, shared policy lint, unit and Docker tests;
+# Rust runs both rustfmt scopes, Clippy, boundary/metadata and workspace tests.
+# No exclusions until measured input evidence establishes narrower safe keys.
 [gate.lanes.rust]
-run = ["uv", "run", "--no-project", "--isolated", "--python", "3.13", "python", "ci/bosn_gate.py", "--lane", "rust"]
-tools = ["bosn", "docker"]
+run = ["bosn", "ci", "run", "--workspace", ".", "--workflow", ".github/workflows/ci.yml", "--event", "workflow_dispatch", "--input", "tier=test", "--mode", "minimal", "--engine", "act", "--timeout-secs", "3600", "--wait", "--deadline-ms", "3600000", "--json", "--ci-output", "verify:skip_rust", "--ci-output", "select-tier:test", "--job", "rust"]
+tools = ["bosn", "docker", "uv", "python"]
 
 [gate.lanes.tests]
-run = ["uv", "run", "--no-project", "--isolated", "--python", "3.13", "python", "ci/bosn_gate.py", "--lane", "tests"]
-tools = ["bosn", "docker"]
+run = ["bosn", "ci", "run", "--workspace", ".", "--workflow", ".github/workflows/ci.yml", "--event", "workflow_dispatch", "--input", "tier=test", "--mode", "minimal", "--engine", "act", "--timeout-secs", "3600", "--wait", "--deadline-ms", "3600000", "--json", "--ci-output", "verify:skip_rust", "--ci-output", "select-tier:test", "--job", "linux"]
+tools = ["bosn", "docker", "uv", "python"]
 
-# GATE-008/010 (zackees/ci.yml#190, #198): an attested PR head skips the
-# remote jobs whose every gate (ci-attestations.yml) it attests. CI's verify
-# job decides with `ci-lint local-gate verify --trust`, from THIS file and
-# ci-attestations.yml as committed on the PR's base. It fails closed: a fork
-# or non-writer author, a `ci-full` label, a head not attested for its exact
-# tree, a missing gate, a change to a surface below (or to either file,
-# ci/local_gate.py or ci.yml) or the audit sample all run the jobs as before.
-# Pushes to main always run them (the post-merge catch); a release always
-# runs everything. `shadow`: report what would be skipped, skip nothing.
-#
-# Only jobs mapped to attested gates are listed. The local Linux test tier
-# now runs Docker tests too, but `linux` remains outside the skip mapping:
-# an explicit ci-test/full request still runs its remote tier checks.
-[gate.trust]
-mode = "enforce"
-skip = ["ci.yml:lint-no-macos-runners", "ci.yml:rust"]
-covered-by = { "ci.yml:lint-no-macos-runners" = ["guards"], "ci.yml:rust" = ["rust"] }
-surfaces = []
-
-# Exact Bosn selections and executed checks, validated by the shared checker.
 [gate.replay]
 repository = "zackees/bosn"
 workflow = "ci.yml"
 mode = "minimal"
+report-source = "stdout"
+qualified = true
+provider-query = ["bosn", "ci", "runners", "list", "--json"]
 
 [[gate.replay.jobs]]
 source-job = "ci.yml:verify"
-key = "CI/Verify local gate"
-steps = ["Checkout source", "Checkout CI policy", "Verify the local-gate attestation and decide attested skips"]
 lanes = ["rust", "tests"]
 
 [[gate.replay.jobs]]
 source-job = "ci.yml:rust"
-key = "CI/Rust workspace (locked tests)"
-steps = ["Checkout source", "Set up Python for PyO3 tests", "Install uv for isolated compiler fixtures", "Set up Soldr", "Install native build dependencies", "Rust format and Clippy", "Verify kernal-api boundary and locked resolution", "Test Rust workspace"]
 lanes = ["rust"]
 
 [[gate.replay.jobs]]
 source-job = "ci.yml:select-tier"
-key = "CI/Select CI tier"
-steps = ["Checkout source", "Select CI tier"]
 lanes = ["tests"]
 
 [[gate.replay.jobs]]
 source-job = "ci.yml:linux"
-key = "CI/Linux (lint + unit + docker)"
-steps = ["Verify selected CI tier", "Checkout source", "Install uv", "Docker engine version", "Set up Soldr for Linux checks", "Install", "Lint", "Test (unit + docker)"]
 lanes = ["tests"]
 
 [[gate.replay.selections]]
 lane = "rust"
 job = "rust"
 event = "workflow_dispatch"
-inputs = { tier = "minimal" }
+inputs = { tier = "test" }
 
 [[gate.replay.selections]]
 lane = "tests"
 job = "linux"
 event = "workflow_dispatch"
 inputs = { tier = "test" }
+
+# Read from the PR base; changed policy/workflow surfaces, missing proof,
+# forks, full labels and audit samples fail closed to ordinary remote checks.
+# Default-branch and release coverage remain remote.
+[gate.trust]
+mode = "enforce"
+skip = ["ci.yml:lint-no-macos-runners", "ci.yml:rust"]
+covered-by = { "ci.yml:lint-no-macos-runners" = ["tests"], "ci.yml:rust" = ["rust"] }
+surfaces = []

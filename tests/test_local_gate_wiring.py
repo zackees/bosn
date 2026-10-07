@@ -1,12 +1,9 @@
-"""The local gate (zackees/ci.yml GATE-001..007, bosn#361) stays wired: every
-lane `local-gate.toml` declares exists in ci/local_gate.py, the isolation guards
+"""The local gate uses the shared CI tool and source workflow checks. Isolation guards
 refuse a bare host and the isolated image sets the marker, and every CI job
 waits for the verify job."""
 
 from __future__ import annotations
 
-import importlib.util
-import sys
 from pathlib import Path
 
 import tomllib
@@ -14,22 +11,47 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 
-SPEC = importlib.util.spec_from_file_location("local_gate", ROOT / "ci" / "local_gate.py")
-assert SPEC is not None and SPEC.loader is not None
-local_gate = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = local_gate
-SPEC.loader.exec_module(local_gate)
-
 GATE = tomllib.loads((ROOT / "local-gate.toml").read_text(encoding="utf-8"))["gate"]
 WORKFLOW = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
 
 
-def test_every_declared_lane_runs_its_own_local_gate_lane() -> None:
+def test_every_declared_lane_runs_a_source_bound_isolated_replay() -> None:
     lanes = GATE["lanes"]
-    assert set(lanes) == set(local_gate.LANES)
+    assert set(lanes) == {"rust", "tests"}
+    assert GATE["run"][:3] == ["bosn", "ci", "run"]
+    replay = GATE["replay"]
+    assert replay["qualified"] and replay["report-source"] == "stdout"
+    assert replay["provider-query"] == ["bosn", "ci", "runners", "list", "--json"]
     for name, lane in lanes.items():
-        assert lane["run"][-2:] == ["--lane", name], name
-        assert lane["run"][:-2] == GATE["run"], f"{name} is the gate command plus its lane"
+        command = lane["run"]
+        assert command[:3] == ["bosn", "ci", "run"]
+        selection = next(item for item in replay["selections"] if item["lane"] == name)
+        assert command[command.index("--job") + 1] == selection["job"]
+        assert command[command.index("--event") + 1] == selection["event"]
+        assert command[command.index("--input") + 1] == f"tier={selection['inputs']['tier']}"
+        assert "--ci-output" in command and "verify:skip_rust" in command
+    assert all("steps" not in job and "key" not in job for job in replay["jobs"])
+    requested = {
+        command[index + 1]
+        for lane in lanes.values()
+        for command in [lane["run"]]
+        for index, token in enumerate(command)
+        if token == "--ci-output"
+    }
+    full = GATE["run"]
+    assert requested <= {
+        full[index + 1] for index, token in enumerate(full) if token == "--ci-output"
+    }
+
+
+def test_python_guards_and_policy_validation_remain_in_the_test_lane() -> None:
+    linux = WORKFLOW["jobs"]["linux"]
+    commands = [step.get("run", "") for step in linux["steps"]]
+    assert "./lint" in commands and "./test" in commands
+    assert any("ci-lint local-gate lint" in command for command in commands)
+    definition = yaml.safe_load((ROOT / "ci-attestations.yml").read_text(encoding="utf-8"))
+    assert definition["gates"]["python/all/static"]["lane"] == "tests"
+    assert definition["gates"]["general/all/ci-policy"]["lane"] == "tests"
 
 
 def test_the_isolation_guards_refuse_a_bare_host_and_the_image_lifts_them() -> None:
@@ -78,7 +100,11 @@ def test_every_trusted_skip_maps_to_attested_gates_and_is_wired() -> None:
 
 
 def test_ci_verifies_with_the_ci_lint_the_gate_runs() -> None:
-    pin = local_gate.CI_LINT.rsplit("@", 1)[1]
+    pin = next(
+        step["with"]["ref"]
+        for step in WORKFLOW["jobs"]["verify"]["steps"]
+        if step.get("with", {}).get("repository") == "zackees/ci.yml"
+    )
     checkout = next(
         step
         for step in WORKFLOW["jobs"]["verify"]["steps"]
@@ -86,3 +112,7 @@ def test_ci_verifies_with_the_ci_lint_the_gate_runs() -> None:
     )
     assert checkout["with"]["ref"] == pin
     assert pin in (ROOT / "local-gate.toml").read_text(encoding="utf-8")
+    assert any(
+        pin in step.get("run", "") and "ci-lint local-gate lint" in step.get("run", "")
+        for step in WORKFLOW["jobs"]["linux"]["steps"]
+    )
