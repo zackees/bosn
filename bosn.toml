@@ -48,3 +48,8 @@ cmd = "soldr toolchain ensure --json && soldr cargo test -p bosn-service --lib c
 [task.ci-capabilities-test]
 stack = "test"
 cmd = "soldr toolchain ensure --json && soldr cargo fmt --all --check && soldr cargo clippy -p bosn-service --all-targets --locked -- -D warnings && soldr cargo test -p bosn-service --lib ci::engine::act_capabilities --locked"
+
+# Frozen source history is a protocol boundary; reuse the isolated test stack.
+[task.ci-snapshot-test]
+stack = "test"
+cmd = "soldr toolchain ensure --json && soldr cargo test -p bosn-service --lib ci::snapshot --locked"
