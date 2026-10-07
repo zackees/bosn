@@ -612,22 +612,22 @@ The shared ci-lint consumer binds these pins into result-cache keys and
 terminal receipt validation when `provider-query` is enrolled. Exposing pins
 alone does not qualify a skip; real adopter qualification remains pending.
 
-Bosn pins the published `v0.2.89-act2.12` release from
-[act2 PR #53](https://github.com/zackees/act2/pull/53). This fixes qualified
-skipped-job events being hidden at debug log level under normal JSON logging.
-Full CI passed on the exact merged commit
-`4849612c36b906208cf8e4b9826ec9b38f7d5c70`
-([run 37580056082](https://github.com/zackees/act2/actions/runs/37580056082));
+The Bosn source candidate pins published `v0.2.89-act2.13` from
+[act2 PR #54](https://github.com/zackees/act2/pull/54), adding selected output
+evidence to the qualified identity and step-result contracts. Full CI passed
+on exact merged commit `0354c17e437066c43727be259450b5bbd1a9bb31`
+([run 37593921290](https://github.com/zackees/act2/actions/runs/37593921290));
 the existing release workflow
-([run 37580974300](https://github.com/zackees/act2/actions/runs/37580974300))
+([run 37595328315](https://github.com/zackees/act2/actions/runs/37595328315))
 completed successfully. The downloaded Linux x86_64 archive matches the
 publisher's `checksums.txt`:
-`d4fcce22efe1f6d1ccfa1117fee1dba24690fee1e5c40ee020810226ed603990`.
+`a219d5539358d0df0088ca59f7e2aafde2f7d9701f92fda402c63b19116496c7`.
 Its extracted executable hashes to
-`0b8cd125773f4a0ea6f201b49942755053f09a3312db4333826d6d2e698d5420`.
-The actual executable reports version `0.2.89-act2.12` and both required
+`48541dd9f8d579a6521dba02cbeec207c12359220c504ec3b2424dce8b79c5db`.
+The actual executable reports version `0.2.89-act2.13` and all three
 capabilities even with a nonexistent workflow path and Docker socket.
-End-to-end adopter qualification remains pending in
+This is a source pin update, not a deployed Bosn release. End-to-end adopter
+qualification remains pending in
 [ci.yml#362](https://github.com/zackees/ci.yml/issues/362).
 
 ### Selected planner outputs (candidate transport)
@@ -637,8 +637,9 @@ adds explicit `--ci-output <job/path>:<output>` requests to Bosn CI plans and
 MCP run arguments. Requests are typed, bounded, included in run identity, and
 forwarded to act2. Before executing a plan with requests, Bosn requires the
 `selected-job-outputs-v1` capability from its digest-verified producer. The
-currently pinned `.12` release lacks this capability and refuses such plans;
-ordinary plans continue to require the two existing capabilities.
+older `.12` release lacks this capability and refuses such plans; the source
+candidate uses the qualified `.13` artifact above. Ordinary plans continue
+to require the two existing capabilities.
 
 Output events remain attached to each concrete qualified job, including its
 caller and matrix identity. The receipt records schema, event sequence, string

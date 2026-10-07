@@ -82,9 +82,9 @@ pub fn act_artifact(architecture: &str) -> Option<ActArtifact> {
             // immutable generation admission with bounded physical retention,
             // and typed durable tool-recovery references (reserve/release)
             // with a finite lifetime that fence the v2 recovery store.
-            url: "https://github.com/zackees/act2/releases/download/v0.2.89-act2.12/act_Linux_x86_64.tar.gz",
-            sha256: "d4fcce22efe1f6d1ccfa1117fee1dba24690fee1e5c40ee020810226ed603990",
-            binary_sha256: "0b8cd125773f4a0ea6f201b49942755053f09a3312db4333826d6d2e698d5420",
+            url: "https://github.com/zackees/act2/releases/download/v0.2.89-act2.13/act_Linux_x86_64.tar.gz",
+            sha256: "a219d5539358d0df0088ca59f7e2aafde2f7d9701f92fda402c63b19116496c7",
+            binary_sha256: "48541dd9f8d579a6521dba02cbeec207c12359220c504ec3b2424dce8b79c5db",
         }),
         _ => None,
     }
