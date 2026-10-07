@@ -1,6 +1,32 @@
 //! Shared digest-verified act installation for bootstrap and readiness.
 
-use super::{ACT_VERSION, ActArtifact, ENGINE_CACHE, ENGINE_WORK};
+use super::{
+    ACT_VERSION, ActArtifact, CONTROL_DEADLINE, DockerActBackend, ENGINE_CACHE, ENGINE_WORK,
+};
+
+impl DockerActBackend {
+    /// Query the same digest-verified executable used for workflow execution.
+    /// Bootstrap and offline readiness both require this evidence contract.
+    pub(super) async fn verify_installed_act(
+        &self,
+        engine: &str,
+        version: &str,
+    ) -> Result<(), String> {
+        if !version.ends_with(ACT_VERSION) {
+            return Err(format!(
+                "installed act reports {version:?}, expected {ACT_VERSION}"
+            ));
+        }
+        let document = self
+            .checked(
+                "act execution capabilities",
+                Self::exec(engine, &format!("{ENGINE_WORK}/bin/act --ci-capabilities")),
+                CONTROL_DEADLINE,
+            )
+            .await?;
+        super::act_capabilities::validate(&document, ACT_VERSION)
+    }
+}
 
 /// Shell (busybox) that installs act from the cache volume, refreshing a
 /// missing or corrupt tarball from the pinned URL; prints `act --version`.

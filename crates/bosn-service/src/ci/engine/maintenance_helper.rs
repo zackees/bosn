@@ -96,9 +96,7 @@ impl DockerActBackend {
                     CONTROL_DEADLINE,
                 )
                 .await?;
-            if !version.ends_with(super::ACT_VERSION) {
-                return Err(format!("maintenance act version mismatch: {version}"));
-            }
+            self.verify_installed_act(&id, &version).await?;
             self.require_cache_policy(&id, policy).await?;
             self.maintain_cache_cohort(&id, policy).await
         }

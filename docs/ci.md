@@ -589,3 +589,21 @@ These are tracked in #323:
   `actions/cache`.
 - Compositor-anchored widget placement without a KWin rule (zackees/kernal-api#389), and a bottom-right default placement elsewhere (zackees/kernal-api#393).
 - GitLab.
+
+## Execution capability qualification (ci.yml#362)
+
+Before workflow execution, bootstrap and offline readiness query the same
+digest-verified act binary with `--ci-capabilities`. Bosn requires schema 1,
+producer `act2`, the exact pinned version, `qualified-job-identity-v1`, and
+`step-stage-result-v1`. Malformed, duplicate-field, oversized or incompatible
+responses fail readiness. A capability response proves available event
+contracts, not passing tests or a source tree. ci-lint owns evidence validation
+and attestation policy.
+
+This branch requires the capability release from
+[act2 PR #52](https://github.com/zackees/act2/pull/52), which depends on PR #30.
+The current act2.10 artifact pin does not implement this query; update it only
+after full CI passes on the exact release candidate and the published archive
+and binary checksums are verified. Do not deploy this qualification change
+with the old artifact pin. End-to-end adopter qualification remains pending
+in [ci.yml#362](https://github.com/zackees/ci.yml/issues/362).
