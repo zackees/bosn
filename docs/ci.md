@@ -589,3 +589,90 @@ These are tracked in #323:
   `actions/cache`.
 - Compositor-anchored widget placement without a KWin rule (zackees/kernal-api#389), and a bottom-right default placement elsewhere (zackees/kernal-api#393).
 - GitLab.
+
+## Execution capability qualification (ci.yml#362)
+
+Before workflow execution, bootstrap and offline readiness query the same
+digest-verified act binary with `--ci-capabilities`. Bosn requires schema 1,
+producer `act2`, the exact pinned version, `qualified-job-identity-v1`, and
+`step-stage-result-v1`. Malformed, duplicate-field, oversized or incompatible
+responses fail readiness. A capability response proves available event
+contracts, not passing tests or a source tree. ci-lint owns evidence validation
+and attestation policy.
+
+The running daemon exposes its `execution_pins` through runner status, and
+new run records capture the same shared `ActPins` contract: adapter schema,
+act version and binary digest, engine manifest and config digests, and runner
+manifest and config digests. Planning refuses a queued record whose captured
+pins differ from the current daemon before resolving an engine image. An
+explicit retry captures the current provider while retaining the original
+source snapshot and event payload. Old records without this field remain
+readable; their absence supplies no provider identity for attestation reuse.
+The shared ci-lint consumer binds these pins into result-cache keys and
+terminal receipt validation when `provider-query` is enrolled. Exposing pins
+alone does not qualify a skip; real adopter qualification remains pending.
+
+The Bosn source candidate pins published `v0.2.89-act2.13` from
+[act2 PR #54](https://github.com/zackees/act2/pull/54), adding selected output
+evidence to the qualified identity and step-result contracts. Full CI passed
+on exact merged commit `0354c17e437066c43727be259450b5bbd1a9bb31`
+([run 37593921290](https://github.com/zackees/act2/actions/runs/37593921290));
+the existing release workflow
+([run 37595328315](https://github.com/zackees/act2/actions/runs/37595328315))
+completed successfully. The downloaded Linux x86_64 archive matches the
+publisher's `checksums.txt`:
+`a219d5539358d0df0088ca59f7e2aafde2f7d9701f92fda402c63b19116496c7`.
+Its extracted executable hashes to
+`48541dd9f8d579a6521dba02cbeec207c12359220c504ec3b2424dce8b79c5db`.
+The actual executable reports version `0.2.89-act2.13` and all three
+capabilities even with a nonexistent workflow path and Docker socket.
+This is a source pin update, not a deployed Bosn release. End-to-end adopter
+qualification remains pending in
+[ci.yml#362](https://github.com/zackees/ci.yml/issues/362).
+
+### Selected planner outputs (candidate transport)
+
+The implementation for [act2 PR #54](https://github.com/zackees/act2/pull/54)
+adds explicit `--ci-output <job/path>:<output>` requests to Bosn CI plans and
+MCP run arguments. Requests are typed, bounded, included in run identity, and
+forwarded to act2. Before executing a plan with requests, Bosn requires the
+`selected-job-outputs-v1` capability from its digest-verified producer. The
+older `.12` release lacks this capability and refuses such plans; the source
+candidate uses the qualified `.13` artifact above. Ordinary plans continue
+to require the two existing capabilities.
+
+Output events remain attached to each concrete qualified job, including its
+caller and matrix identity. The receipt records schema, event sequence, string
+values, and any refusal reason. Duplicate events invalidate earlier values;
+malformed, unqualified, masked, or oversized data cannot supply usable output
+evidence. An output event alone never changes the job's result to success.
+
+Bosn transports execution data. Shared ci-lint must first prove the producing
+job and its source definition before using the selected outputs to resolve
+`needs` expressions or dynamic matrices. That verification and attestation
+policy belong to ci.yml, rather than another workflow planner in Bosn. The
+candidate transport does not yet demonstrate end-to-end hosted skips.
+
+### Shared local gate adoption (source candidate)
+
+`local-gate.toml` now declares two direct Bosn workflow selections: `rust`
+and `tests` (`linux`, dispatched with `tier=test`). Both return original JSON
+receipts to the pinned shared checker and query the provider's actual execution
+pins. Source definitions determine required checks; the repository no longer
+has a private receipt parser or manually copied check lists. `ci/bosn_gate.py`
+is a compatibility command that delegates to `ci-lint local-gate run`.
+
+The Linux selection preserves the former Python static and guard checks via
+`./lint`, adds the shared policy lint, and retains unit and Docker tests via
+`./test`. Their gate records now use the `tests` lane. The Rust selection
+retains workspace and widget formatting, Clippy, boundary and locked metadata,
+workspace tests and embedded Python tests. No lane input exclusions are claimed.
+`ci/local_gate.py` remains a diagnostic helper for existing isolated tasks;
+it neither verifies receipts nor produces attestations and refuses Rust/test
+diagnostics on a developer host.
+
+Isolated wiring tests pass and the shared policy lint reports zero violations.
+Its existing no-mirror finding remains `needs_review`: this repository uses
+per-gate remote skip mappings rather than claiming a single mirrored job.
+Actual complete Bosn gate execution, result reuse, deployment and hosted skips
+remain pending; source configuration and wiring tests do not establish them.

@@ -104,6 +104,7 @@ impl RunTree {
             name: job_name_from_key(key),
             matrix: matrix.filter(|m| !m.is_null()).cloned(),
             identity: identity.map(<[JobIdentity]>::to_vec),
+            output_evidence: None,
             status: ItemStatus::Queued,
             conclusion: None,
             reason: None,

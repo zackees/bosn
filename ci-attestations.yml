@@ -14,8 +14,8 @@
 # release always ignores attestations.
 version: 1
 gates:
-  python/all/static: {lane: py-static}      # ruff format/check, pyright
-  general/all/ci-policy: {lane: guards}     # CI workflow policy, Ctrl-C, vcpkg, local-gate lint
+  python/all/static: {lane: tests}      # ruff format/check, pyright
+  general/all/ci-policy: {lane: tests}     # CI workflow policy, Ctrl-C, vcpkg, local-gate lint
   rust/all/fmt: {lane: rust}                # rustfmt --check
   rust/all/boundary: {lane: rust}           # kernal-api boundary, locked resolution
   rust/x86_64-unknown-linux-gnu/clippy: {lane: rust}

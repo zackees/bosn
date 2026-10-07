@@ -11,11 +11,15 @@
 //! `GITHUB_*`/`ACTIONS_*`/`RUNNER_*` namespace is refused. The daemon-owned
 //! `github_token` stays the only secret, passed as act `-s`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
 use super::provider::Trigger;
+
+mod outputs;
+pub use outputs::OutputSelector;
+pub(crate) use outputs::valid_name as valid_output_name;
 
 /// At most this many entries per kind.
 pub const MAX_ENTRIES: usize = 32;
@@ -63,6 +67,9 @@ pub struct RunParams {
     /// Extra environment for every job (act `--env K=V`); never a secret.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// Explicit non-secret planner outputs, bound to qualified job paths.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub ci_outputs: BTreeSet<OutputSelector>,
 }
 
 impl RunParams {
@@ -71,6 +78,7 @@ impl RunParams {
             && self.inputs.is_empty()
             && self.matrix.is_empty()
             && self.env.is_empty()
+            && self.ci_outputs.is_empty()
     }
 
     /// Add one `--input K=V`.
@@ -91,9 +99,18 @@ impl RunParams {
         insert(&mut self.env, "--env", key, value)
     }
 
+    pub fn add_ci_output(&mut self, spec: &str) -> Result<(), String> {
+        let selector = OutputSelector::parse(spec)?;
+        if !self.ci_outputs.insert(selector) {
+            return Err("--ci-output given twice".into());
+        }
+        outputs::validate(&self.ci_outputs)
+    }
+
     /// Bounded sizes, safe keys and values, no secret in the environment,
     /// and inputs only for an event that takes them.
     pub fn validate(&self, trigger: Trigger) -> Result<(), String> {
+        outputs::validate(&self.ci_outputs)?;
         if let Some(title) = &self.pr_title {
             if trigger != Trigger::Pr {
                 return Err("--pr-title requires --trigger pr".into());
@@ -163,6 +180,9 @@ impl RunParams {
         for (key, value) in &self.env {
             args.extend(["--env".into(), format!("{key}={value}")]);
         }
+        for selector in &self.ci_outputs {
+            args.extend(["--ci-output".into(), selector.spec()]);
+        }
         args
     }
 
@@ -182,6 +202,16 @@ impl RunParams {
             part("inputs", &self.inputs, '='),
             part("matrix", &self.matrix, ':'),
             part("env", &self.env, '='),
+            (!self.ci_outputs.is_empty()).then(|| {
+                format!(
+                    "ci outputs: {}",
+                    self.ci_outputs
+                        .iter()
+                        .map(OutputSelector::spec)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }),
         ]
         .into_iter()
         .flatten()
@@ -242,6 +272,34 @@ fn check_value(what: &str, key: &str, value: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_outputs_are_typed_bounded_and_part_of_run_identity() {
+        let mut params = RunParams::default();
+        params.add_ci_output("precheck/plan:matrix").unwrap();
+        assert!(params.validate(Trigger::Pr).is_ok());
+        assert!(!params.is_empty());
+        assert_eq!(params.act_args(), ["--ci-output", "precheck/plan:matrix"]);
+        assert!(params.add_ci_output("precheck/plan:matrix").is_err());
+        assert!(params.describe().unwrap().contains("precheck/plan:matrix"));
+        let bytes = serde_json::to_vec(&params).unwrap();
+        assert_eq!(serde_json::from_slice::<RunParams>(&bytes).unwrap(), params);
+        assert_ne!(params, RunParams::default());
+        for selector in [
+            "missing",
+            "job::matrix",
+            "/job:matrix",
+            "job/:matrix",
+            "job:matrix/other",
+            "1job:matrix",
+            "job:1matrix",
+        ] {
+            assert!(
+                RunParams::default().add_ci_output(selector).is_err(),
+                "{selector}"
+            );
+        }
+    }
 
     fn installer() -> RunParams {
         let mut params = RunParams::default();

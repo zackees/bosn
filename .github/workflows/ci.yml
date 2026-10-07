@@ -59,7 +59,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: zackees/ci.yml
-          ref: 527cc179200496bdc41445a2c5b91e6025b495d7
+          ref: 96ba9f2df5b6c16d4fc933ee9dc2dbab7c47b46e
           path: .ci-lint
           persist-credentials: false
           sparse-checkout: ci_lint
@@ -257,6 +257,10 @@ jobs:
       - name: Lint
         if: needs.select-tier.outputs.test == 'true'
         run: ./lint
+
+      - name: Validate shared local-gate policy
+        if: needs.select-tier.outputs.test == 'true'
+        run: uvx --from git+https://github.com/zackees/ci.yml@96ba9f2df5b6c16d4fc933ee9dc2dbab7c47b46e --with pyyaml==6.0.2 ci-lint local-gate lint
 
       - name: Test (unit + docker)
         if: needs.select-tier.outputs.test == 'true'

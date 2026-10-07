@@ -1,12 +1,8 @@
-"""bosn's local gate (zackees/ci.yml GATE-001..007; bosn#361).
+"""Legacy diagnostic commands, excluded from the attestation protocol.
 
-`ci-lint local-gate run` (see local-gate.toml) runs every lane below and, on
-success, stamps HEAD with a tree-bound `Local-Gate:` trailer and one
-`Ci-Attestation:` per attested gate (ci-attestations.yml). Each lane is also
-runnable alone: `python ci/local_gate.py --lane <name>`.
-
-Lanes split along input boundaries so the lane cache (GATE-007) can reuse a
-pass whose inputs did not change:
+Use the pinned shared `ci-lint local-gate run` in local-gate.toml to create
+attestations from source-bound Bosn workflow receipts. This helper only runs
+individual diagnostic commands and never proves or stamps a gate pass.
 
 - py-static: ruff and pyright over the Python sources.
 - guards: the repository lints (CI policy, Ctrl-C handlers, vcpkg) and the
@@ -20,6 +16,7 @@ pass whose inputs did not change:
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -28,7 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 # The zackees/ci.yml commit whose ci-lint this repository's gate is checked by.
-CI_LINT = "git+https://github.com/zackees/ci.yml@527cc179200496bdc41445a2c5b91e6025b495d7"
+CI_LINT = "git+https://github.com/zackees/ci.yml@96ba9f2df5b6c16d4fc933ee9dc2dbab7c47b46e"
 
 # The locked environment without bosn itself (installing bosn is a full Rust
 # extension build the linters do not need), then the tools from it.
@@ -77,8 +74,11 @@ LANES: dict[str, list[list[str]]] = {
 
 def run_lane(name: str) -> int:
     commands = LANES[name]
-    if name in {"rust", "tests"}:
-        commands = [[sys.executable, "ci/bosn_gate.py", "--lane", name]]
+    if name in {"rust", "tests"} and not (
+        os.environ.get("CI", "").lower() == "true" or os.environ.get("BOSN_TEST_ISOLATED") == "1"
+    ):
+        print("Rust/test diagnostics require an isolated Bosn runner", file=sys.stderr)
+        return 1
     for command in commands:
         print(f"\n>>> [{name}] {' '.join(command)}", flush=True)
         started = time.monotonic()
@@ -98,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
         if code != 0:
             print(f"\nLOCAL GATE FAILED: lane {name}", file=sys.stderr)
             return code
-    print("\nLOCAL GATE OK")
+    print("\nDIAGNOSTIC COMMANDS OK (no attestation)")
     return 0
 
 

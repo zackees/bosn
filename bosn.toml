@@ -43,3 +43,8 @@ cmd = "soldr toolchain ensure --json && soldr cargo check -p bosn-service --lock
 [task.ci-engine-test]
 stack = "test"
 cmd = "soldr toolchain ensure --json && soldr cargo test -p bosn-service --lib ci::engine --locked && soldr cargo test -p bosn-service --lib ci::pins --locked && uv run --no-project --with pytest pytest tests/test_runner_tools.py"
+
+# Focused isolated protocol-boundary tests; shares the existing Rust build state.
+[task.ci-capabilities-test]
+stack = "test"
+cmd = "soldr toolchain ensure --json && soldr cargo fmt --all --check && soldr cargo clippy -p bosn-service --all-targets --locked -- -D warnings && soldr cargo test -p bosn-service --lib ci::engine::act_capabilities --locked"

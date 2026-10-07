@@ -109,6 +109,11 @@ pub struct RunnerStatus {
     pub drained: bool,
     pub engine: String,
     pub act_version: String,
+    /// Stable provider identity for local result keys, independent of slots.
+    /// Reuse the core typed contract without adding schema dependencies there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<serde_json::Value>")]
+    pub execution_pins: Option<bosn_core::act::ActPins>,
     /// Whether the desktop widget is running.
     pub widget: super::widget::WidgetPresence,
     /// The prepared spare engine (#410), when one is kept or being prepared.

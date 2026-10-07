@@ -43,6 +43,7 @@ pub use maintenance::MaintenanceAttempt;
 pub use maintenance_helper::MaintenanceHelperAttempt;
 pub use maintenance_loop::MaintenanceTick;
 pub use migration::ImportAttempt;
+mod act_capabilities;
 mod act_install;
 mod readiness;
 mod tool_recovery;
@@ -395,12 +396,7 @@ impl DockerActBackend {
                 PULL_DEADLINE,
             )
             .await?;
-        if !version.ends_with(ACT_VERSION) {
-            return Err(format!(
-                "installed act reports {version:?}, expected {ACT_VERSION}"
-            ));
-        }
-        Ok(())
+        self.verify_installed_act(engine, &version).await
     }
 
     /// Stream `file` into the engine on `docker exec`'s stdin. The engine's
@@ -814,6 +810,9 @@ impl ActEngineBackend for DockerActBackend {
         lines: &'a async_engine::Sender<EngineLine>,
     ) -> BoxFuture<'a, Result<ExecEnd, String>> {
         Box::pin(async move {
+            if !invocation.params.ci_outputs.is_empty() {
+                self.verify_act_capabilities(engine, true).await?;
+            }
             if let super::cache_cohort::CacheRoute::Cohort { policy, .. } = invocation.cache_route {
                 self.agree_cache_policy(engine, policy).await?;
             }
