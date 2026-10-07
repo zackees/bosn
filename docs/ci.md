@@ -629,3 +629,25 @@ The actual executable reports version `0.2.89-act2.12` and both required
 capabilities even with a nonexistent workflow path and Docker socket.
 End-to-end adopter qualification remains pending in
 [ci.yml#362](https://github.com/zackees/ci.yml/issues/362).
+
+### Selected planner outputs (candidate transport)
+
+The implementation for [act2 PR #54](https://github.com/zackees/act2/pull/54)
+adds explicit `--ci-output <job/path>:<output>` requests to Bosn CI plans and
+MCP run arguments. Requests are typed, bounded, included in run identity, and
+forwarded to act2. Before executing a plan with requests, Bosn requires the
+`selected-job-outputs-v1` capability from its digest-verified producer. The
+currently pinned `.12` release lacks this capability and refuses such plans;
+ordinary plans continue to require the two existing capabilities.
+
+Output events remain attached to each concrete qualified job, including its
+caller and matrix identity. The receipt records schema, event sequence, string
+values, and any refusal reason. Duplicate events invalidate earlier values;
+malformed, unqualified, masked, or oversized data cannot supply usable output
+evidence. An output event alone never changes the job's result to success.
+
+Bosn transports execution data. Shared ci-lint must first prove the producing
+job and its source definition before using the selected outputs to resolve
+`needs` expressions or dynamic matrices. That verification and attestation
+policy belong to ci.yml, rather than another workflow planner in Bosn. The
+candidate transport does not yet demonstrate end-to-end hosted skips.

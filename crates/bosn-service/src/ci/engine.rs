@@ -810,6 +810,9 @@ impl ActEngineBackend for DockerActBackend {
         lines: &'a async_engine::Sender<EngineLine>,
     ) -> BoxFuture<'a, Result<ExecEnd, String>> {
         Box::pin(async move {
+            if !invocation.params.ci_outputs.is_empty() {
+                self.verify_act_capabilities(engine, true).await?;
+            }
             if let super::cache_cohort::CacheRoute::Cohort { policy, .. } = invocation.cache_route {
                 self.agree_cache_policy(engine, policy).await?;
             }

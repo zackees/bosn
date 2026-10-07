@@ -143,6 +143,8 @@ struct RunArgs {
     matrix: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     env: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    ci_outputs: std::collections::BTreeSet<super::params::OutputSelector>,
 }
 impl RunArgs {
     fn options(self) -> SubmitOptions {
@@ -152,6 +154,7 @@ impl RunArgs {
                 inputs: self.inputs,
                 matrix: self.matrix,
                 env: self.env,
+                ci_outputs: self.ci_outputs,
             },
             workspace: self.workspace,
             provider: self.provider,

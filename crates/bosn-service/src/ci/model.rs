@@ -62,6 +62,8 @@ pub struct Job {
     pub matrix: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<Vec<JobIdentity>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_evidence: Option<JobOutputEvidence>,
     pub status: ItemStatus,
     pub conclusion: Option<ItemConclusion>,
     /// Why the job did not run locally (a `remote_only` job's reason).
@@ -174,6 +176,7 @@ impl RunTree {
                 name: job.name.clone(),
                 matrix: None,
                 identity: None,
+                output_evidence: None,
                 status: ItemStatus::Queued,
                 conclusion: None,
                 reason: None,
@@ -414,6 +417,7 @@ impl ActParser {
             |i| identity::execution_key(i),
         );
         let valid_identity = identity.as_ref().ok().and_then(|i| i.as_deref());
+        let qualified = valid_identity.is_some();
         let job = self
             .tree
             .job_for(&key, &job_id, act.matrix.as_ref(), valid_identity);
@@ -436,6 +440,7 @@ impl ActParser {
         // An unsupported leg stays unsupported: bosn's gate step for it
         // ([`super::matrix_runner`]) ends in a successful job.
         job.observe_result(act.job_result, act.time.as_deref());
+        job.observe_outputs(&act, seq, qualified);
         let section = act.step().and_then(|step| {
             let index = match job
                 .sections
@@ -504,6 +509,8 @@ fn section_name(step: Option<&str>, id: &str) -> String {
 /// newer act cannot break an older daemon.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ActLine {
+    #[serde(flatten)]
+    output: outputs::OutputEvent,
     #[serde(default)]
     msg: String,
     time: Option<String>,
@@ -654,8 +661,13 @@ impl ActLine {
 #[cfg(test)]
 mod leg_tests;
 
+#[cfg(test)]
+mod output_tests;
+
 mod identity;
 pub use identity::JobIdentity;
+mod outputs;
+pub use outputs::{JobOutputEvidence, OutputEvidenceError};
 mod legs;
 #[cfg(test)]
 mod property_tests;

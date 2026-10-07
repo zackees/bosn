@@ -22,7 +22,7 @@ use bosn_service::{
 };
 use kernal_api::async_engine::{Runtime, RuntimeBuilder};
 
-pub const USAGE: &str = "usage: bosn ci plan [--workspace P] [--provider github] [--workflow F] [--job J] [--trigger pr|push|release | --event workflow_dispatch|workflow_call] [--input K=V]... [--matrix K:V]... [--env K=V]... [--mode minimal|test|full] [--sha S] [--json]
+pub const USAGE: &str = "usage: bosn ci plan [--workspace P] [--provider github] [--workflow F] [--job J] [--trigger pr|push|release | --event workflow_dispatch|workflow_call] [--input K=V]... [--matrix K:V]... [--env K=V]... [--ci-output JOB/PATH:OUTPUT]... [--mode minimal|test|full] [--sha S] [--json]
    or: bosn ci plan --adapter RELATIVE_JSON --workspace P --event pull_request|push|release --mode minimal|test|full --sha 40_HEX --repo-owner O --repo-name N [--base-sha S] [--pr-number N --head-owner O --head-name N --head-ref R --base-ref R --author-login L] [--json]  (fleet adapter V1 plan, JSON on stdout)
    or: bosn ci run <plan options> [--engine act] [--pr-number N] [--timeout-secs N] [--github-token] [--wait [--deadline-ms N]] [--json]
    or: bosn ci list [--workspace P] [--state queued|running|done] [--limit N] [--json]
@@ -45,7 +45,7 @@ const EXIT_NOT_FINISHED: i32 = 2;
 const POLL: Duration = Duration::from_millis(500);
 
 /// Flags that may repeat; every value is kept, in order (#430).
-const REPEATABLE: &[&str] = &["--input", "--matrix", "--env"];
+const REPEATABLE: &[&str] = &["--input", "--matrix", "--env", "--ci-output"];
 
 /// Parsed `--flag value` / `--switch` arguments plus positionals.
 struct Flags {
@@ -134,6 +134,7 @@ const PLAN_FLAGS: &[&str] = &[
     "--input",
     "--matrix",
     "--env",
+    "--ci-output",
     "--mode",
     "--sha",
     "--engine",
@@ -231,6 +232,9 @@ fn params(flags: &Flags) -> Result<RunParams, Failure> {
     }
     for value in flags.all("--env") {
         params.add_env(value)?;
+    }
+    for value in flags.all("--ci-output") {
+        params.add_ci_output(value)?;
     }
     Ok(params)
 }

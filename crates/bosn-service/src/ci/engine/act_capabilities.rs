@@ -11,7 +11,11 @@ struct Capabilities {
     capabilities: Vec<String>,
 }
 
-pub(super) fn validate(document: &str, expected_version: &str) -> Result<(), String> {
+pub(super) fn validate(
+    document: &str,
+    expected_version: &str,
+    selected_outputs: bool,
+) -> Result<(), String> {
     if document.len() > 16 * 1024 {
         return Err("act capability document exceeds 16 KiB".into());
     }
@@ -23,7 +27,10 @@ pub(super) fn validate(document: &str, expected_version: &str) -> Result<(), Str
     {
         return Err("act capability schema, producer or pinned version mismatch".into());
     }
-    for required in ["qualified-job-identity-v1", "step-stage-result-v1"] {
+    for required in ["qualified-job-identity-v1", "step-stage-result-v1"]
+        .into_iter()
+        .chain(selected_outputs.then_some("selected-job-outputs-v1"))
+    {
         if !capabilities
             .capabilities
             .iter()
@@ -44,10 +51,27 @@ mod tests {
     const DOCUMENT: &str = r#"{"schema_version":1,"producer":"act2","version":"candidate","capabilities":["qualified-job-identity-v1","step-stage-result-v1"]}"#;
 
     #[test]
+    fn requested_outputs_require_the_output_evidence_capability() {
+        assert!(validate(DOCUMENT, "candidate", true).is_err());
+        let capable = DOCUMENT.replace(
+            "step-stage-result-v1\"",
+            "step-stage-result-v1\",\"selected-job-outputs-v1\"",
+        );
+        assert!(validate(&capable, "candidate", true).is_ok());
+    }
+
+    #[test]
     fn requires_both_execution_evidence_features() {
-        assert!(validate(DOCUMENT, "candidate").is_ok());
+        assert!(validate(DOCUMENT, "candidate", false).is_ok());
         for feature in ["qualified-job-identity-v1", "step-stage-result-v1"] {
-            assert!(validate(&DOCUMENT.replace(feature, "unknown-feature"), "candidate").is_err());
+            assert!(
+                validate(
+                    &DOCUMENT.replace(feature, "unknown-feature"),
+                    "candidate",
+                    false
+                )
+                .is_err()
+            );
         }
     }
 
@@ -64,7 +88,10 @@ mod tests {
                 "\"version\":\"candidate\",\"version\":\"candidate\"",
             ),
         ] {
-            assert!(validate(&document, "candidate").is_err(), "{document}");
+            assert!(
+                validate(&document, "candidate", false).is_err(),
+                "{document}"
+            );
         }
     }
 }

@@ -17,6 +17,14 @@ impl DockerActBackend {
                 "installed act reports {version:?}, expected {ACT_VERSION}"
             ));
         }
+        self.verify_act_capabilities(engine, false).await
+    }
+
+    pub(super) async fn verify_act_capabilities(
+        &self,
+        engine: &str,
+        selected_outputs: bool,
+    ) -> Result<(), String> {
         let document = self
             .checked(
                 "act execution capabilities",
@@ -24,7 +32,7 @@ impl DockerActBackend {
                 CONTROL_DEADLINE,
             )
             .await?;
-        super::act_capabilities::validate(&document, ACT_VERSION)
+        super::act_capabilities::validate(&document, ACT_VERSION, selected_outputs)
     }
 }
 

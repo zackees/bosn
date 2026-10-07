@@ -643,6 +643,16 @@
         "name": {
           "type": "string"
         },
+        "output_evidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobOutputEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "reason": {
           "description": "Why the job did not run locally (a `remote_only` job's reason).",
           "type": [
@@ -757,6 +767,43 @@
         "cancelled",
         "skipped",
         "unsupported"
+      ],
+      "type": "object"
+    },
+    "JobOutputEvidence": {
+      "description": "This is execution data, never a pass or a ci-lint attestation.",
+      "properties": {
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OutputEvidenceError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "schema_version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "seq": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "values": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "schema_version",
+        "seq",
+        "values"
       ],
       "type": "object"
     },
@@ -992,6 +1039,37 @@
       ],
       "type": "string"
     },
+    "OutputEvidenceError": {
+      "enum": [
+        "missing-output",
+        "masked-output",
+        "output-limit",
+        "invalid-event",
+        "duplicate-event",
+        "unqualified-identity",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "OutputSelector": {
+      "additionalProperties": false,
+      "properties": {
+        "output": {
+          "type": "string"
+        },
+        "path": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "path",
+        "output"
+      ],
+      "type": "object"
+    },
     "Plan": {
       "description": "What `bosn ci run` would execute (`bosn ci plan`).",
       "properties": {
@@ -1170,6 +1248,14 @@
       "additionalProperties": false,
       "description": "One run's workflow inputs, matrix filter and extra environment.",
       "properties": {
+        "ci_outputs": {
+          "description": "Explicit non-secret planner outputs, bound to qualified job paths.",
+          "items": {
+            "$ref": "#/$defs/OutputSelector"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
         "env": {
           "additionalProperties": {
             "type": "string"
@@ -1405,6 +1491,9 @@
         },
         "event": {
           "type": "string"
+        },
+        "execution_pins": {
+          "description": "Pins captured by the daemon at submission; absent in legacy receipts."
         },
         "exit_code": {
           "format": "int32",
@@ -1686,6 +1775,9 @@
         },
         "engine": {
           "type": "string"
+        },
+        "execution_pins": {
+          "description": "Stable provider identity for local result keys, independent of slots.\nReuse the core typed contract without adding schema dependencies there."
         },
         "limit": {
           "format": "uint",
