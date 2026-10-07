@@ -4085,3 +4085,46 @@ measuring ~30s against a 5s budget). Both fail identically on unmodified
 they are host-environment timing artifacts rather than branch defects. They are
 retained here rather than dismissed, because the local gate is the stricter
 environment and a host run is not the gate.
+
+
+### CI attestation pilot: published exact cleanup provider (#362)
+
+Act2 `v0.2.89-act2.14` is published from exact default-branch candidate
+`6ec60ce6f3de3fa1fe827d2ccf5b00b1b20294db`. All five full qualification jobs
+passed in [run 37627801434](https://github.com/zackees/act2/actions/runs/37627801434);
+existing tag-triggered [publication 37629524141](https://github.com/zackees/act2/actions/runs/37629524141)
+also passed. The consumed Linux x86_64 archive matches published checksums:
+`8549dea52bccef8784754ab8f1ca3ef917ecae710b0adbe0b71d4aa5e58a27aa`.
+Its extracted executable SHA-256 is
+`ec6aeb07022ad055e852066e4591e8fd399750a6426f51a5ce8987831c43cfcf`.
+The public executable reports that version and all four required contracts:
+qualified jobs, step results, selected outputs and `cache-exact-delete-v1`.
+
+The server implements exact local deletion through its existing durable
+journal, preserving other keys and incomplete entries and refusing busy
+transfers. Shared ci-lint owns backend selection and receipt validation;
+[ci.yml PR #370](https://github.com/zackees/ci.yml/pull/370) uses that service
+under ACT without a GitHub credential fallback. Actual source conformance
+reserved/uploaded/committed two entries, deleted exactly one, preserved the
+other and repeated with zero deleted count/bytes. This is cleanup transport
+proof, not compiler warmth or test-execution proof.
+
+The first exact-main qualification caught a legacy action-cache read/write
+race, repaired in [act2 PR #56](https://github.com/zackees/act2/pull/56). Its
+process-local Git gate protects manifest reads, copies and deferred Docker
+build contexts and rejects a changed manifest revision. It does not establish
+cross-process action locking or aggregate host CPU admission.
+
+This Bosn 0.1.17 candidate pins the verified public artifact and requires the
+cleanup capability before workflow execution. The focused isolated capability
+regression demonstrated RED to GREEN. Candidate qualification, ordinary merge,
+exact-main full CI, pretag dry run and public Bosn release remain pending.
+The independent Template replay remains stopped before a costly run against
+Bosn 0.1.16/act2.13, which cannot support its local delta cleanup.
+
+The shared delta transport also now uses content identities
+([ci.yml PR #372](https://github.com/zackees/ci.yml/pull/372)), preserving
+same-size generation-pointer changes and invalidating different content bases.
+It is restored privately before compilation; this does not establish safe
+concurrent import into a shared writable compiler store. Actual fresh-engine
+compiler durability, residual misses and hashing cost remain pilot measurements.
