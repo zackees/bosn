@@ -306,6 +306,10 @@ pub struct RunRecord {
     pub cleanup: Option<String>,
     pub engine_id: Option<String>,
     pub act_version: String,
+    /// Pins captured by the daemon at submission; absent in legacy receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<serde_json::Value>")]
+    pub execution_pins: Option<bosn_core::act::ActPins>,
     pub runner_image: String,
     pub submitters: u32,
     pub retry_of: Option<String>,
@@ -354,6 +358,7 @@ impl RunRecord {
             cleanup: None,
             engine_id: None,
             act_version: super::engine::ACT_VERSION.into(),
+            execution_pins: super::pins::execution_pins(),
             runner_image: super::engine::RUNNER_IMAGE.into(),
             submitters: 1,
             retry_of: None,
@@ -383,6 +388,9 @@ impl RunRecord {
             retry_of: Some(self.id.clone()),
             log_records: 0,
             tree: RunTree::default(),
+            act_version: super::engine::ACT_VERSION.into(),
+            execution_pins: super::pins::execution_pins(),
+            runner_image: super::engine::RUNNER_IMAGE.into(),
             ..self.clone()
         }
     }

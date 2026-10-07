@@ -17,7 +17,7 @@ use std::{collections::BTreeMap, fmt};
 /// `docker:29.7.2` linux/amd64 manifest, with its config, both shipped below.
 pub(crate) const ENGINE_MANIFEST: &str =
     "sha256:6acc6aaf783ac1c1100822e542534c3dab3f1d38782760b0bdcb688280574d9e";
-const ENGINE_CONFIG: &str =
+pub(crate) const ENGINE_CONFIG: &str =
     "sha256:8cdb6d492106752d557cda50e628b88e7bb303a7eaea91a10bdf672b95ad4f52";
 
 /// The pinned publisher bytes, reached through one base directory.

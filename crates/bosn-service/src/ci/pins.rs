@@ -90,11 +90,93 @@ pub fn act_artifact(architecture: &str) -> Option<ActArtifact> {
     }
 }
 
+/// The daemon's effective execution pins, using the existing shared contract.
+/// Unsupported hosts advertise no profile rather than promising an engine.
+pub(crate) fn execution_pins() -> Option<bosn_core::act::ActPins> {
+    let act = act_artifact(std::env::consts::ARCH)?;
+    Some(bosn_core::act::ActPins {
+        interface_schema: bosn_core::act::ACT_ADAPTER_SCHEMA,
+        act_version: ACT_VERSION.into(),
+        act_binary_digest: format!("sha256:{}", act.binary_sha256),
+        engine_manifest_digest: crate::act_engine::ENGINE_MANIFEST.into(),
+        engine_config_digest: crate::act_engine::ENGINE_CONFIG.into(),
+        runner_manifest_digest: runner_manifest().into(),
+        runner_config_digest: RUNNER_CONFIG.into(),
+    })
+}
+
+/// Refuse an enrolled queued run before creating an engine when an upgrade
+/// changes its provider. Legacy records remain readable but carry no profile.
+pub(crate) fn require_execution_pins(pins: Option<&bosn_core::act::ActPins>) -> Result<(), String> {
+    if pins.is_some() && pins != execution_pins().as_ref() {
+        return Err("execution provider pins changed since submission; resubmit the run".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use kernal_api::hash::Sha256Hasher;
     use serde_json::{Value, json};
+
+    #[test]
+    fn execution_pins_bind_receipts_and_refuse_changed_queued_providers() {
+        let pins = execution_pins().expect("test host has a pinned act build");
+        let record = crate::ci::tests::sample_record("profile-test");
+        assert_eq!(record.execution_pins.as_ref(), Some(&pins));
+        let mut encoded = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            encoded["execution_pins"],
+            serde_json::to_value(&pins).unwrap()
+        );
+        encoded.as_object_mut().unwrap().remove("execution_pins");
+        let legacy: crate::ci::wire::RunRecord = serde_json::from_value(encoded).unwrap();
+        assert!(legacy.execution_pins.is_none());
+        assert!(require_execution_pins(None).is_ok());
+        assert!(require_execution_pins(Some(&pins)).is_ok());
+        for changed in 0..7 {
+            let mut stale = pins.clone();
+            match changed {
+                0 => stale.interface_schema += 1,
+                1 => stale.act_version.push_str("-changed"),
+                2 => stale.act_binary_digest.push('0'),
+                3 => stale.engine_manifest_digest.push('0'),
+                4 => stale.engine_config_digest.push('0'),
+                5 => stale.runner_manifest_digest.push('0'),
+                _ => stale.runner_config_digest.push('0'),
+            }
+            assert!(require_execution_pins(Some(&stale)).is_err());
+        }
+    }
+
+    #[test]
+    fn retries_bind_the_current_provider_without_changing_the_source() {
+        let current = crate::ci::tests::sample_record("current-provider");
+        for legacy in [false, true] {
+            let mut historical = current.clone();
+            historical.id = "historical-provider".into();
+            historical.act_version = "old-act".into();
+            historical.runner_image = "old-runner".into();
+            if legacy {
+                historical.execution_pins = None;
+            } else {
+                historical.execution_pins.as_mut().unwrap().act_version = "old-act".into();
+            }
+            let retry = historical.retry("fresh-retry".into(), None);
+            assert_eq!(retry.execution_pins, current.execution_pins);
+            assert_eq!(retry.act_version, current.act_version);
+            assert_eq!(retry.runner_image, current.runner_image);
+            assert_eq!(retry.sha, historical.sha);
+            assert_eq!(retry.git_tree, historical.git_tree);
+            assert_eq!(retry.tree_digest, historical.tree_digest);
+            assert_eq!(retry.payload_sha256, historical.payload_sha256);
+            assert_eq!(retry.params, historical.params);
+            assert_eq!(retry.retry_of.as_deref(), Some("historical-provider"));
+            assert_eq!(historical.act_version, "old-act");
+            assert_eq!(historical.runner_image, "old-runner");
+        }
+    }
 
     #[test]
     fn runner_path_matches_pinned_image_config() {

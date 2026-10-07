@@ -600,6 +600,17 @@ responses fail readiness. A capability response proves available event
 contracts, not passing tests or a source tree. ci-lint owns evidence validation
 and attestation policy.
 
+The running daemon exposes its `execution_pins` through runner status, and
+new run records capture the same shared `ActPins` contract: adapter schema,
+act version and binary digest, engine manifest and config digests, and runner
+manifest and config digests. Planning refuses a queued record whose captured
+pins differ from the current daemon before resolving an engine image. An
+explicit retry captures the current provider while retaining the original
+source snapshot and event payload. Old records without this field remain
+readable; their absence supplies no provider identity for attestation reuse.
+ci-lint's consumer binding of these pins into result-cache keys and receipt
+validation is still pending; exposing pins alone does not qualify a skip.
+
 Bosn pins the published `v0.2.89-act2.11` release from
 [act2 PR #52](https://github.com/zackees/act2/pull/52), merged after PR #30.
 Full CI passed on the exact merged commit

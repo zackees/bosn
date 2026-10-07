@@ -835,6 +835,7 @@ fn runner_status(
         drained: scheduler.drained(),
         engine: "act".into(),
         act_version: ACT_VERSION.into(),
+        execution_pins: super::pins::execution_pins(),
         widget,
         spare,
     }
