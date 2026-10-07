@@ -82,11 +82,11 @@ pub fn act_artifact(architecture: &str) -> Option<ActArtifact> {
             // immutable generation admission with bounded physical retention,
             // and typed durable tool-recovery references (reserve/release)
             // with a finite lifetime that fence the v2 recovery store.
-            // act2.14 adds exact-key local cache cleanup and protects legacy
-            // action checkout reads from concurrent clone/reset.
-            url: "https://github.com/zackees/act2/releases/download/v0.2.89-act2.14/act_Linux_x86_64.tar.gz",
-            sha256: "8549dea52bccef8784754ab8f1ca3ef917ecae710b0adbe0b71d4aa5e58a27aa",
-            binary_sha256: "ec6aeb07022ad055e852066e4591e8fd399750a6426f51a5ce8987831c43cfcf",
+            // act2.15 retains exact-key cleanup and protected action checkout
+            // reads, and escapes artifact signatures for stock Azure clients.
+            url: "https://github.com/zackees/act2/releases/download/v0.2.89-act2.15/act_Linux_x86_64.tar.gz",
+            sha256: "e21535decdac2c6ed8429b8662825b4c1fca606301e0da54e37b180ad2517e6d",
+            binary_sha256: "b4be8d7ef98729ad16a9a6ddba331f1d2b0feb8abd52eb9e5f3a93155fb4f1df",
         }),
         _ => None,
     }
