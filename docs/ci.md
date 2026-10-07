@@ -537,13 +537,15 @@ All runtime state is under the daemon state directory (`ci/`):
   `section`.
 - `event.json` is the event payload.
 - `source/` is the frozen snapshot: the working tree, uncommitted work
-  included, in a Git repository holding only the `HEAD` commit (depth 1, plus
+  included, in a Git repository holding `HEAD` and its available parent (depth 2, plus
   the synthetic commit of a dirty tree), so a workflow's `git rev-parse HEAD`,
-  `git diff` and `git status` behave as in a real checkout.
+  `git diff HEAD^ HEAD` and `git status` behave as in a real checkout.
+  An initial commit or shallow source retains only the history actually available;
+  Bosn does not invent missing parents or promise arbitrary checkout depths.
   `refs/bosn/base` names the commit the snapshot was taken from. A `--trigger
   pr` run also holds its base branch as `origin/<base>` (origin's default
   branch, else `main`, at `origin/<base>` or the local branch), with the
-  history of both tips down to their merge base, so `git merge-base
+  history of both tips down to their merge base (at least depth 2), so `git merge-base
   origin/main HEAD` works as in a `fetch-depth: 0` PR checkout; the payload's
   `pull_request.base.ref` and `.sha` name the same commit (#403). It is kept
   for the newest 10 runs so they can be retried.

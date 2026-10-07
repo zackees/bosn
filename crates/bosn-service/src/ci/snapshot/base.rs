@@ -2,7 +2,7 @@
 //!
 //! On GitHub, a pull request checkout with `fetch-depth: 0` has
 //! `origin/<base>`, so a workflow can run `git merge-base origin/main HEAD`.
-//! A snapshot otherwise holds only the `HEAD` commit; a PR run's snapshot
+//! A snapshot otherwise holds `HEAD` and its available parent; a PR run's snapshot
 //! also holds the base branch as `refs/remotes/origin/<base>` at the commit
 //! the event payload names (`pull_request.base.sha`), with the history of
 //! both tips down to their merge base and no deeper.
@@ -94,17 +94,19 @@ pub(super) struct Depths {
 }
 
 impl Depths {
-    /// One commit each when there is no base or no merge base (unrelated
+    /// Two commits each when there is no base or no merge base (unrelated
     /// histories have none on GitHub either); otherwise each tip down to and
-    /// including the merge base. Every commit between a tip and the merge
+    /// including the merge base, with at least two requested for parent diffs.
+    /// A root or shallow source cannot provide a missing parent.
+    /// Every commit between a tip and the merge
     /// base is at most that many parents away, so a shallow fetch of that
     /// depth reaches it along every path.
     pub(super) fn of(root: &Path, head: &str, base: Option<&BaseRef>) -> std::io::Result<Self> {
         let Some(base) = base else {
-            return Ok(Self { head: 1, base: 1 });
+            return Ok(Self { head: 2, base: 2 });
         };
         let Ok(merge_base) = git(root, &["merge-base", head, &base.sha]).and_then(text) else {
-            return Ok(Self { head: 1, base: 1 });
+            return Ok(Self { head: 2, base: 2 });
         };
         let depth = |tip: &str| -> std::io::Result<usize> {
             let count = text(git(
@@ -113,7 +115,7 @@ impl Depths {
             )?)?;
             count
                 .parse::<usize>()
-                .map(|n| n + 1)
+                .map(|n| (n + 1).max(2))
                 .map_err(std::io::Error::other)
         };
         Ok(Self {
@@ -234,13 +236,30 @@ mod tests {
     }
 
     #[test]
-    fn a_push_snapshot_holds_only_head() {
+    fn a_push_snapshot_holds_head_and_its_parent() {
         let tmp = TemporaryDirectory::new().unwrap();
         let (ws, _) = diverged(tmp.path());
         let dest = tmp.path().join("s");
         super::super::snapshot(&ws, &dest, None).unwrap();
-        assert_eq!(git_in(&dest, &["rev-list", "--count", "HEAD"]), "1");
+        assert_eq!(git_in(&dest, &["rev-list", "--count", "HEAD"]), "2");
         assert_eq!(git_in(&dest, &["for-each-ref", "refs/remotes"]), "");
+    }
+
+    #[test]
+    fn fetching_a_base_equal_to_head_preserves_the_parent() {
+        let tmp = TemporaryDirectory::new().unwrap();
+        let (ws, _) = diverged(tmp.path());
+        let head = git_in(&ws, &["rev-parse", "HEAD"]);
+        let parent = git_in(&ws, &["rev-parse", "HEAD^"]);
+        let base = BaseRef {
+            branch: "main".into(),
+            sha: head.clone(),
+        };
+        let dest = tmp.path().join("same-tip");
+        super::super::snapshot(&ws, &dest, Some(&base)).unwrap();
+        assert_eq!(git_in(&dest, &["rev-parse", "origin/main"]), head);
+        assert_eq!(git_in(&dest, &["rev-parse", "HEAD^"]), parent);
+        assert_eq!(git_in(&dest, &["rev-list", "--count", "HEAD"]), "2");
     }
 
     #[test]

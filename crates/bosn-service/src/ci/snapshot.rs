@@ -183,8 +183,8 @@ pub fn head(workspace: &Path) -> io::Result<Head> {
 }
 
 /// Copy the working tree of `workspace` (a Git checkout root) into `dest`,
-/// which must not exist yet, and make it a Git repository holding only the
-/// `HEAD` commit (refs, remote, a depth-1 pack and an index), so the runner
+/// which must not exist yet, and make it a Git repository holding `HEAD`
+/// and its available parent (refs, remote, a bounded pack and an index), so the runner
 /// and the workflow's own `git` commands see the right commit. With a
 /// `base` (a pull request run) it also holds that branch, and both tips'
 /// history down to their merge base. A dirty tree is then committed on top
@@ -336,7 +336,7 @@ fn write_git_metadata(
     std::fs::write(git.join("config"), config)
 }
 
-/// Fetch the `HEAD` commit's objects, `depth` commits deep (1 unless a pull
+/// Fetch the `HEAD` commit's objects, `depth` commits deep (2 unless a pull
 /// request run needs the merge base: no history the run was not given), and
 /// build an index matching it, so a workflow's
 /// `git rev-parse`, `git diff` and `git status` see a real checkout with the
@@ -635,10 +635,40 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_snapshot_is_a_real_repository_holding_only_the_head_commit() {
+    fn a_push_snapshot_preserves_the_parent_for_lockfile_change_detection() {
         let tmp = TemporaryDirectory::new().unwrap();
         let ws = repo(tmp.path());
-        sh(&ws, "printf 'b\\n' > tracked.txt && git commit -qam second");
+        sh(
+            &ws,
+            "printf 'lock\\n' > Cargo.lock && git add Cargo.lock && git commit -qm lock",
+        );
+        sh(
+            &ws,
+            "printf 'changed\\n' > tracked.txt && git commit -qam source",
+        );
+        let parent = git_in(&ws, &["rev-parse", "HEAD^"]);
+        let dest = tmp.path().join("push");
+        snapshot(&ws, &dest, None).unwrap();
+        assert_eq!(git_in(&dest, &["rev-parse", "HEAD^"]), parent);
+        assert_eq!(
+            git_in(
+                &dest,
+                &["diff", "--name-only", "HEAD^", "HEAD", "--", "Cargo.lock"]
+            ),
+            "",
+            "an ordinary source change must not look like a lockfile change"
+        );
+        assert_eq!(git_in(&dest, &["rev-list", "--count", "HEAD"]), "2");
+    }
+
+    #[test]
+    fn the_snapshot_is_a_real_repository_holding_bounded_parent_history() {
+        let tmp = TemporaryDirectory::new().unwrap();
+        let ws = repo(tmp.path());
+        sh(
+            &ws,
+            "printf 'b\\n' > tracked.txt && git commit -qam second && git commit -q --allow-empty -m third",
+        );
         let dest = tmp.path().join("s");
         let receipt = snapshot(&ws, &dest, None).unwrap();
         let git = |args: &[&str]| git_in(&dest, args);
@@ -652,8 +682,8 @@ pub(crate) mod tests {
         git(&["cat-file", "-e", "HEAD^{tree}"]);
         assert_eq!(
             git(&["rev-list", "--count", "HEAD"]),
-            "1",
-            "no history beyond HEAD"
+            "2",
+            "history stops after the parent"
         );
         assert_eq!(git(&["status", "--porcelain"]), "");
         assert_eq!(
