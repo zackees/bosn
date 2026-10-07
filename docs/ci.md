@@ -608,22 +608,24 @@ pins differ from the current daemon before resolving an engine image. An
 explicit retry captures the current provider while retaining the original
 source snapshot and event payload. Old records without this field remain
 readable; their absence supplies no provider identity for attestation reuse.
-ci-lint's consumer binding of these pins into result-cache keys and receipt
-validation is still pending; exposing pins alone does not qualify a skip.
+The shared ci-lint consumer binds these pins into result-cache keys and
+terminal receipt validation when `provider-query` is enrolled. Exposing pins
+alone does not qualify a skip; real adopter qualification remains pending.
 
-Bosn pins the published `v0.2.89-act2.11` release from
-[act2 PR #52](https://github.com/zackees/act2/pull/52), merged after PR #30.
+Bosn pins the published `v0.2.89-act2.12` release from
+[act2 PR #53](https://github.com/zackees/act2/pull/53). This fixes qualified
+skipped-job events being hidden at debug log level under normal JSON logging.
 Full CI passed on the exact merged commit
-`0c9947b7d75a61edb6bcde3087614c00321a23a1`
-([run 37571846804](https://github.com/zackees/act2/actions/runs/37571846804));
+`4849612c36b906208cf8e4b9826ec9b38f7d5c70`
+([run 37580056082](https://github.com/zackees/act2/actions/runs/37580056082));
 the existing release workflow
-([run 37572787591](https://github.com/zackees/act2/actions/runs/37572787591))
+([run 37580974300](https://github.com/zackees/act2/actions/runs/37580974300))
 completed successfully. The downloaded Linux x86_64 archive matches the
 publisher's `checksums.txt`:
-`753d2f1e9db1d31088ef0de372b5b124e932481d3b4987ad420de8ce278c9e64`.
+`d4fcce22efe1f6d1ccfa1117fee1dba24690fee1e5c40ee020810226ed603990`.
 Its extracted executable hashes to
-`bd9c112f9fb54eb159e6b45a1223f9ed6e84e8e5ee6f9a1cb27c1d6f913a1c4d`.
-The actual executable reports version `0.2.89-act2.11` and both required
+`0b8cd125773f4a0ea6f201b49942755053f09a3312db4333826d6d2e698d5420`.
+The actual executable reports version `0.2.89-act2.12` and both required
 capabilities even with a nonexistent workflow path and Docker socket.
 End-to-end adopter qualification remains pending in
 [ci.yml#362](https://github.com/zackees/ci.yml/issues/362).
