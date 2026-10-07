@@ -600,10 +600,19 @@ responses fail readiness. A capability response proves available event
 contracts, not passing tests or a source tree. ci-lint owns evidence validation
 and attestation policy.
 
-This branch requires the capability release from
-[act2 PR #52](https://github.com/zackees/act2/pull/52), which depends on PR #30.
-The current act2.10 artifact pin does not implement this query; update it only
-after full CI passes on the exact release candidate and the published archive
-and binary checksums are verified. Do not deploy this qualification change
-with the old artifact pin. End-to-end adopter qualification remains pending
-in [ci.yml#362](https://github.com/zackees/ci.yml/issues/362).
+Bosn pins the published `v0.2.89-act2.11` release from
+[act2 PR #52](https://github.com/zackees/act2/pull/52), merged after PR #30.
+Full CI passed on the exact merged commit
+`0c9947b7d75a61edb6bcde3087614c00321a23a1`
+([run 37571846804](https://github.com/zackees/act2/actions/runs/37571846804));
+the existing release workflow
+([run 37572787591](https://github.com/zackees/act2/actions/runs/37572787591))
+completed successfully. The downloaded Linux x86_64 archive matches the
+publisher's `checksums.txt`:
+`753d2f1e9db1d31088ef0de372b5b124e932481d3b4987ad420de8ce278c9e64`.
+Its extracted executable hashes to
+`bd9c112f9fb54eb159e6b45a1223f9ed6e84e8e5ee6f9a1cb27c1d6f913a1c4d`.
+The actual executable reports version `0.2.89-act2.11` and both required
+capabilities even with a nonexistent workflow path and Docker socket.
+End-to-end adopter qualification remains pending in
+[ci.yml#362](https://github.com/zackees/ci.yml/issues/362).
