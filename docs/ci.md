@@ -637,12 +637,14 @@ unchanged-tree reuse, exact-head publication, five hosted job skips, and require
 `CI OK` success are documented in
 [ci.yml#362](https://github.com/zackees/ci.yml/issues/362).
 
-The current Bosn 0.1.17 candidate pins published `v0.2.89-act2.14`, which adds
-exact local cache deletion and protects action checkout readers. Public artifact
-hashes, release qualification, and remaining rollout checks live in the
+Released Bosn 0.1.17 pins published `v0.2.89-act2.14`, which adds exact local
+cache deletion and protects action checkout readers. The 0.1.18 candidate pins
+verified `v0.2.89-act2.15`, preserving those contracts and fixing stock upload
+clients' artifact signatures. Public artifact hashes, release qualification,
+and remaining rollout checks live in the
 [cache accounting spec](ci-cache-accounting-spec.md#ci-attestation-pilot-published-exact-cleanup-provider-362).
-Bosn 0.1.17 publication and the second consumer's end-to-end qualification remain
-pending; the earlier Clud proof does not qualify this new provider automatically.
+Bosn 0.1.18 publication and the second consumer's hosted skips remain pending;
+the earlier Clud proof does not qualify a new provider automatically.
 
 ### Selected planner outputs
 
@@ -652,7 +654,7 @@ MCP run arguments. Requests are typed, bounded, included in run identity, and
 forwarded to act2. Before executing a plan with requests, Bosn requires the
 `selected-job-outputs-v1` capability from its digest-verified producer. The
 older `.12` release lacks this capability and refuses such plans. The current
-candidate uses the verified public `.14` artifact. Ordinary plans require the
+candidate uses the verified public `.15` artifact. Ordinary plans require the
 three baseline capabilities listed above; output requests additionally require
 `selected-job-outputs-v1`.
 

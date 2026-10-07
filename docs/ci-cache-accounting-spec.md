@@ -4115,12 +4115,13 @@ process-local Git gate protects manifest reads, copies and deferred Docker
 build contexts and rejects a changed manifest revision. It does not establish
 cross-process action locking or aggregate host CPU admission.
 
-This Bosn 0.1.17 candidate pins the verified public artifact and requires the
-cleanup capability before workflow execution. The focused isolated capability
-regression demonstrated RED to GREEN. Candidate qualification, ordinary merge,
-exact-main full CI, pretag dry run and public Bosn release remain pending.
-The independent Template replay remains stopped before a costly run against
-Bosn 0.1.16/act2.13, which cannot support its local delta cleanup.
+Released Bosn 0.1.17 pins the verified public artifact and requires the cleanup
+capability before workflow execution. The focused isolated capability regression
+demonstrated RED to GREEN. Its exact-main full qualification, pretag dry run and
+publication completed; [shared pilot evidence](https://github.com/zackees/ci.yml/issues/362)
+records all four verified public wheels. Template's complete local replay and
+unchanged-tree reuse passed through this provider; its source-only hosted skip
+proof remains queued.
 
 The shared delta transport also now uses content identities
 ([ci.yml PR #372](https://github.com/zackees/ci.yml/pull/372)), preserving
@@ -4128,3 +4129,29 @@ same-size generation-pointer changes and invalidating different content bases.
 It is restored privately before compilation; this does not establish safe
 concurrent import into a shared writable compiler store. Actual fresh-engine
 compiler durability, residual misses and hashing cost remain pilot measurements.
+
+
+### Published artifact-signature provider (act2.15; Bosn rollout pending)
+
+[Act2 PR #57](https://github.com/zackees/act2/pull/57) URL-encodes artifact
+signatures so the stock upload client's query handling preserves base64 padding.
+Strict signature verification is unchanged. Exact-main
+[qualification 37648485379](https://github.com/zackees/act2/actions/runs/37648485379)
+passed all five jobs on `73c1eea4d868bb38a84c3050db395f6f21f4c6e7`;
+[publication 37650187671](https://github.com/zackees/act2/actions/runs/37650187671)
+then published `v0.2.89-act2.15`. The downloaded Linux x86_64 archive matches
+its published checksum `e21535decdac2c6ed8429b8662825b4c1fca606301e0da54e37b180ad2517e6d`;
+the executable hashes to `b4be8d7ef98729ad16a9a6ddba331f1d2b0feb8abd52eb9e5f3a93155fb4f1df`.
+The public binary reports act2.15 and all four required capability contracts.
+
+The Bosn 0.1.18 candidate pins those verified bytes. It also contains merged
+[PR #542](https://github.com/zackees/bosn/pull/542), retaining available parent
+history so ordinary local push lockfile comparisons can read `HEAD^`. That
+change's full source gate passed in 608s; unchanged reuse took 0.999s and kept
+all seven trailers. Exact publication and hosted run 37650279564 passed with
+attested Rust and policy skips. This proves the snapshot change through the
+previous public provider, not the new provider's execution.
+
+New candidate qualification, exact-main full CI, pretag verification, publication
+and actual local writer replay through act2.15 remain pending. Compiler payload
+durability and residual misses remain separate unproven requirements.
