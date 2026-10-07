@@ -9,7 +9,7 @@ exclude = ["crates/bosn-widget"]
 # `bosn` (crates.io) and `bosn-python` (PyPI, via maturin's dynamic version)
 # inherit it. The internal crates are never published and keep their own.
 [workspace.package]
-version = "0.1.15"
+version = "0.1.16"
 
 [workspace.lints.clippy]
 cognitive_complexity = "warn"
