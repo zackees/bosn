@@ -12,6 +12,7 @@ const MAX_CATALOG_ENTRIES: usize = 1024;
 const MAX_ENTRY_BYTES: u64 = 16 * 1024;
 mod authority;
 mod bootstrap;
+mod location;
 
 pub(crate) fn promote_authority(
     registry: &mut Registry,
@@ -60,7 +61,7 @@ pub(super) fn machine_root() -> Option<PathBuf> {
     } else if std::env::var_os("BOSN_TEST_ISOLATED").is_some() {
         std::env::var_os("BOSN_TEST_RETENTION_ROOT").map(PathBuf::from)
     } else {
-        Some(crate::mcp::machine_state_dir())
+        Some(location::root(&crate::mcp::machine_state_dir()))
     }
 }
 

@@ -67,7 +67,7 @@ pub fn default_state_dir() -> PathBuf {
     machine_state_dir()
 }
 
-/// Machine catalog location, independent of a caller's per-workspace state override.
+/// Default state location, independent of a caller's per-workspace state override.
 pub fn machine_state_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {

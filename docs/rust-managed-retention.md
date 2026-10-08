@@ -36,6 +36,15 @@ login-service path. Registration failures are printed; the workspace daemon
 still starts. CI and isolated tests do not register host services. Windows
 persistent registration is not yet supported.
 
+Machine ownership authority and retention admission locks live beside the
+default state directory, in `bosn-retention` (for example,
+`~/.local/state/bosn-retention` on Linux without an XDG override). They are not
+inside `bosn` and do not follow `BOSN_STATE_DIR`. Losing the entire default
+`bosn` directory therefore preserves the catalog, authoritative registry,
+and last verified explicit opt-out needed to restore its locator. Removing
+both directories loses that recovery proof and retention refuses uncertain
+ownership.
+
 `bosn daemon autostart disable` persists an explicit opt-out, including before
 the first registration. Later automatic startup preserves that choice;
 `bosn daemon autostart enable` clears it after successful registration. Automatic

@@ -139,8 +139,25 @@ The path audit additionally confirms that the production machine catalog is
 currently nested under the default state directory (`machine_state_dir`). The
 existing whole-state-loss fixtures use a separate machine root; they therefore
 do not prove survival when the entire default machine state directory is lost.
-Separate durable catalog placement and compatibility must be resolved before
-claiming that broader recovery guarantee.
+This finding led to the sibling placement correction recorded below.
+
+### Default-state authority location corrected
+
+The production catalog and machine admission/startup locks now live in the
+`bosn-retention` sibling of the platform default `bosn` state directory. The
+per-workspace override and isolated-fixture override remain distinct. This
+catalog layout is introduced by this unreleased issue branch; the installed
+0.1.15 daemon has no such catalog, and neither candidate catalog location
+existed on the inspected host before this correction.
+
+A focused RED test relocated the entire default `bosn` directory, including
+its local authority marker, and failed because the catalog disappeared too.
+After the location correction, the same test restores the original UUID and
+explicit `auto_retention = false` from published authority. All 18 peer
+authority/recovery tests pass in Docker (1.79 seconds). Evidence:
+`/tmp/bosn-545-catalog-location-red.log` and
+`/tmp/bosn-545-catalog-location-green.log`. This closes the placement defect;
+exact final native host validation remains required.
 
 ### Registry cleanup boundary
 
