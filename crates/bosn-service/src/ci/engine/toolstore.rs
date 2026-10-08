@@ -9,7 +9,7 @@ use std::{
 };
 
 const RECIPE: &str = include_str!("toolstore_session.sh");
-const SOURCE: &str = "/var/lib/docker/volumes/act-toolcache/_data";
+pub(super) const SOURCE: &str = "/var/lib/docker/volumes/act-toolcache/_data";
 const MAX_INSTALLS: usize = 128;
 
 enum State {

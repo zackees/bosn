@@ -1725,3 +1725,28 @@ https://github.com/zackees/act2/actions/runs/37853173865 (verified
 37853107016 passed. Full checks remain live; no tag/release or Bosn pin update
 has occurred. Publishing is authorized by the repository dependency-release
 policy but stays gated on exact-candidate full CI and verified artifacts.
+
+### Exact dependency release gate and repeated-save live proof
+
+Full Act2 candidate run 37853173865 completed successfully on
+`ad04e18dc38f07b020b98429d018a4cccae5f62c`: Linux, Windows, macOS, lint and
+snapshot cells all passed. Codespell 37853107016 also passed that SHA. The clean
+`master` checkout and remote default branch still matched the exact candidate;
+remote/local tag and GitHub release absence were checked before creating
+`v0.2.89-act2.16`. The tag targets that candidate and was pushed through the
+existing tag-triggered release workflow, run
+https://github.com/zackees/act2/actions/runs/37854500224. Publishing is live;
+artifact verification and Bosn pin rollout are pending, not assumed successful.
+
+The production tool-save live fixture now uses a full four-byte payload budget
+and repeats three successor saves with fresh private warm copies. It checks
+superseded generation IDs disappear, a completed unselected native publication
+releases measured allocated storage during actual idle maintenance, and the
+exact selected shared generation still validates and serves Tool/4 afterward.
+The nested Docker socket is hidden before idle maintenance; selected shared
+payload verification is independent of the private warm copy. Fixture cleanup
+continues to verify exact engine disappearance. The same reviewer found the
+increment clean after adding the shared-selected check. All-target Clippy passes
+(`/tmp/bosn-545-normal-rollover-final-clippy.log`) and full lint passes
+(`/tmp/bosn-545-normal-rollover-lint.log`). This fixture is compiled/reviewed;
+its runtime result is still pending the verified act2.16 binary and pin update.
