@@ -1425,3 +1425,32 @@ and leave no pending helper. All 21 default-feature registry unit tests passed
 in isolated Docker (58.40 seconds), full lint passed, and the same primary
 reviewer cleared this scoped test correction. This fixes the observed local
 test failure without loosening journal authority or production cleanup.
+
+## Tool publication protocol recovery (October 8)
+
+The standalone `toolstore_session.sh` protocol holds a machine cache lock
+through native publication, frozen initial manifest, selection validation, and
+acknowledgement. It writes canonical host records without interpreting JSON
+fields or treating them as shell code. Conflicting records cannot replace
+existing authority. Published-store loss refuses initialization, and a frozen
+initial manifest also refuses a vanished store. Staging records synchronize
+the file and directory before acknowledgement and remove owned scratch stages
+on process exit.
+
+A private actual-Docker fixture used the pinned act2.15 binary to publish a
+completed install, select its generation, disconnect before acknowledgement,
+reopen the session, verify the same initial manifest and selection, and complete
+publication. Exact helper absence was verified. The report is
+`/tmp/bosn-545-tool-session-live-proof.json`; shell syntax and full lint passed.
+The same primary reviewer cleared the standalone protocol subject to typed
+host validation, source-writer exclusion, finite remote lifetime, private work
+paths, and allocation admission before additional publication. Those
+integration requirements remain unimplemented; the normal producer RED test
+therefore still fails.
+
+Both local-gate attempts are terminal. The private candidate daemon was stopped
+through its authenticated CLI after confirming zero running and queued jobs.
+The daemon process exited successfully, and its recorded ready spare
+`bosn-act-cfc3e04f-9cf0-465d-b2ee-e9abcfcb4256` is absent by Docker inspect.
+Validation state and ownership authority are preserved for later audit. The
+installed user daemon was not stopped or replaced.
