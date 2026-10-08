@@ -68,10 +68,46 @@ while IFS= read -r operation; do
                 --cache-server-path "$store" --max-bytes @PAYLOAD@ --apply || code=$?
             finish "$code" ;;
         usage)
+            if [ ! -e "$store" ] && [ -f "$pending" ] && [ ! -e "$initial" ]; then
+                printf 'absent\n'; finish 0; continue
+            fi
             [ -d "$store" ] && [ ! -L "$store" ] || exit 78
             code=0
             "$work/bin/act" cache tool-usage --cache-server-path "$store" \
                 --max-entries 1000000 || code=$?
+            finish "$code" ;;
+        filesystem)
+            stat -f -c %S "$cache"
+            finish 0 ;;
+        installs)
+            source=/var/lib/docker/volumes/act-toolcache/_data
+            volumes=$(docker volume ls --format '{{.Name}}' --filter 'name=^act-toolcache$') || exit 78
+            if [ -z "$volumes" ]; then finish 0; continue; fi
+            [ "$volumes" = act-toolcache ] || exit 78
+            actual=$(docker volume inspect --format '{{.Mountpoint}}' act-toolcache) || exit 78
+            [ "$actual" = "$source" ] && [ -d "$source" ] && [ ! -L "$source" ] || exit 78
+            writers=$(docker ps -q --filter volume=act-toolcache) || exit 78
+            [ -z "$writers" ] || { finish 75; continue; }
+            (cd "$source"
+                for marker in */*/*.complete; do
+                    [ -f "$marker" ] && [ ! -L "$marker" ] || continue
+                    dir=${marker%.complete}
+                    [ -d "$dir" ] && [ ! -L "$dir" ] || continue
+                    printf '%s\n' "$dir"
+                done
+                find . -mindepth 3 -type f -name .complete | while IFS= read -r stamp; do
+                    dir=${stamp%/.complete}; printf '%s\n' "${dir#./}"
+                done)
+            finish 0 ;;
+        retain)
+            [ -f "$published" ] || exit 78
+            IFS= read -r allocated || exit 78
+            case "$allocated" in ''|*[!0-9]*) exit 78;; esac
+            [ "${#allocated}" -le 19 ] && [ "$allocated" -gt 0 ] || exit 78
+            code=0
+            "$work/bin/act" cache tool-retain --apply --cache-server-path "$store" \
+                --expire-before @EXPIRES@ --max-allocated-bytes "$allocated" \
+                --max-candidates 128 --max-entries 1000000 --max-payload-bytes @PAYLOAD@ || code=$?
             finish "$code" ;;
         generation)
             # Recover selection-before-acknowledgement by deriving the exact

@@ -57,10 +57,16 @@ mod tool_recovery;
 use act_install::act_archive;
 pub(crate) use act_install::install_act_script;
 mod lines;
+mod runner_images;
 mod runner_tools;
+#[cfg(test)]
+use runner_images::{load_runner_body, runner_tar};
+use runner_images::{load_runner_script, reload_runner_script};
 mod toolcache;
+mod toolstore;
 #[cfg(test)]
 mod toolstore_live_tests;
+mod toolstore_records;
 use lines::LineBuffer;
 #[cfg(test)]
 use lines::MAX_LINE;
@@ -310,6 +316,16 @@ pub trait ActEngineBackend: Send + Sync {
     /// `/opt/hostedtoolcache`) into the machine-wide cache, each atomically;
     /// best-effort, before the engine is removed.
     fn save_toolcache<'a>(&'a self, engine: &'a str) -> BoxFuture<'a, Result<(), String>>;
+    /// `None` is the explicitly opted-out legacy cache behavior. Normal saves
+    /// carry the same admitted policy as the workflow invocation.
+    fn save_toolcache_with_policy<'a>(
+        &'a self,
+        engine: &'a str,
+        policy: Option<super::cache_policy::CachePolicy>,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        let _ = policy;
+        self.save_toolcache(engine)
+    }
     /// The cache volume's size in bytes; `None` when it does not exist.
     fn cache_usage<'a>(
         &'a self,
@@ -698,7 +714,18 @@ impl ActEngineBackend for DockerActBackend {
     }
 
     fn save_toolcache<'a>(&'a self, engine: &'a str) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(self.publish_tools(engine, super::cache_policy::CachePolicy::default()))
+    }
+
+    fn save_toolcache_with_policy<'a>(
+        &'a self,
+        engine: &'a str,
+        policy: Option<super::cache_policy::CachePolicy>,
+    ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
+            if let Some(policy) = policy {
+                return self.publish_tools(engine, policy).await;
+            }
             self.checked(
                 "tool cache save",
                 Self::exec(engine, &save_toolcache_script()),
@@ -798,12 +825,14 @@ impl ActEngineBackend for DockerActBackend {
         generation: Option<&'a bosn_registry::act::ActToolGenerationBinding>,
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
-            self.checked(
-                "tool cache seed",
-                Self::exec(engine, &prepare_toolcache_script(generation)?),
-                PULL_DEADLINE,
-            )
-            .await?;
+            if generation.is_some() || !self.seed_published_tools(engine).await? {
+                self.checked(
+                    "tool cache seed",
+                    Self::exec(engine, &prepare_toolcache_script(generation)?),
+                    PULL_DEADLINE,
+                )
+                .await?;
+            }
             self.checked(
                 "runner stock tools",
                 Self::exec(engine, &runner_tools::prepare_script()),
@@ -924,60 +953,6 @@ fn work_dirs_script() -> String {
     format!(
         "mkdir -p {ENGINE_WORK}/bin {ENGINE_WORK}/src {ENGINE_WORK}/overlay {ENGINE_WORK}/artifacts \
          {ENGINE_WORK}/home/.cache {ENGINE_WORK}/home/.config {ENGINE_WORK}/tmp"
-    )
-}
-
-/// The runner image tar in the cache volume.
-fn runner_tar() -> String {
-    format!(
-        "{ENGINE_CACHE}/images/{}.tar",
-        runner_tag().replace([':', '/'], "-")
-    )
-}
-
-/// Shell that loads the runner image tar from the cache volume, or pulls
-/// the pinned image, tags it [`runner_tag`] and saves the tar atomically.
-fn load_runner_script() -> String {
-    format!("{} {}", runner_input_lock(true), load_runner_body())
-}
-
-fn runner_input_lock(shared: bool) -> String {
-    format!(
-        "mkdir -p {ENGINE_CACHE}/images; exec 9>>{}.lock; flock -{} 9;",
-        runner_tar(),
-        if shared { "s" } else { "x" }
-    )
-}
-
-fn load_runner_body() -> String {
-    let tag = runner_tag();
-    let tar = runner_tar();
-    let restore = "[ -f \"$tar\" ] && docker load -q -i \"$tar\" >/dev/null";
-    format!(
-        "tar={tar}; mkdir -p {ENGINE_CACHE}/images; \
-         if ! {{ {restore}; }}; then \
-           flock -x 9; \
-           if ! {{ {restore}; }}; then \
-           docker pull -q --platform linux/amd64 {RUNNER_IMAGE} >/dev/null && \
-           docker tag {RUNNER_IMAGE} {tag} && \
-           stage=$(mktemp \"$tar.XXXXXXXX\") && \
-           trap 'rm -f \"$stage\"' EXIT && \
-           docker save --platform linux/amd64 -o \"$stage\" {tag} && mv \"$stage\" \"$tar\" || exit 1; \
-           fi; \
-         fi; \
-         docker image inspect {tag} >/dev/null"
-    )
-}
-
-/// After a cached tar failed the runner proof: drop it and the image it
-/// loaded, then pull and save again.
-fn reload_runner_script() -> String {
-    format!(
-        "{lock} rm -f {tar}; docker image rm -f {tag} >/dev/null 2>&1 || :; {load}",
-        lock = runner_input_lock(false),
-        tar = runner_tar(),
-        tag = runner_tag(),
-        load = load_runner_body(),
     )
 }
 

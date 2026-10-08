@@ -131,10 +131,15 @@ impl Laps {
 async fn save_toolcache(
     backend: &dyn ActEngineBackend,
     name: &str,
+    policy: Option<super::cache_policy::CachePolicy>,
     observer: &mut dyn EngineObserver,
     laps: &mut Laps,
 ) {
-    let saved = async_engine::timeout(TOOLCACHE_SAVE_DEADLINE, backend.save_toolcache(name)).await;
+    let saved = async_engine::timeout(
+        TOOLCACHE_SAVE_DEADLINE,
+        backend.save_toolcache_with_policy(name, policy),
+    )
+    .await;
     match saved {
         Ok(Ok(())) => observer.note(&format!("tool cache saved in {}", laps.lap())),
         Ok(Err(error)) => observer.note(&format!("tool cache not saved: {error}")),
@@ -548,7 +553,14 @@ pub async fn run_on_engine(
         // machine cache instead of copying from an uncertain live source.
         if matches!(&end, ExecutionEnd::Exited(_)) {
             if held.verify().await.is_ok() {
-                save_toolcache(backend, held.engine(), observer, &mut laps).await;
+                save_toolcache(
+                    backend,
+                    held.engine(),
+                    invocation.auto_retention.then_some(invocation.cache_policy),
+                    observer,
+                    &mut laps,
+                )
+                .await;
             }
         } else {
             observer.note("tool cache not saved: workflow writers are not proven stopped");

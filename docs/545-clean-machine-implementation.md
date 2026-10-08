@@ -1481,3 +1481,60 @@ confirmed; the corrected 64 MiB fixture passed and its exact helper was also
 removed and absence confirmed. Shell syntax and full repository lint passed.
 The normal save-path integration, allocation admission, warm reads, and overall
 issue acceptance remain incomplete. No local-gate rerun or merge is claimed.
+
+
+## Normal tool save and warm-copy integration (October 8)
+
+Normal lifecycle saves now carry the invocation's admitted `CachePolicy` into
+an immutable native tool-store publisher. Explicit opt-out selects the legacy
+save path. The publisher owns one finite framed session and the publication
+lock through typed state recovery, object publication, exact native selection
+validation, and durable enrollment acknowledgement. It verifies the installed
+act binary against the engine architecture's pinned artifact rather than the
+host architecture. Existing frozen empty authority is invalid; a new empty
+workflow, including an absent tool-cache volume, is a successful no-op before
+any enrollment authority is written.
+
+Native receipts are parsed into closed structs. Sources are restricted to the
+actual private Docker tool-cache volume, and a real nested writer census must
+succeed and be empty before publication. The lifecycle retains exclusive
+engine ownership after execution exits. Completed-source discovery is bounded
+by the session output ceiling and 128 installs. Complete unique-inode inventory
+and a conservative payload/per-entry/generation reservation precede additional
+objects. Native retention follows successful publication and precedes an
+ordinary successor's admission. Nonzero retention reports still yield validated
+allocation, limit, and protected-count diagnostics. These are scoped tool-store
+admission bounds, not a total shared-cache-volume or filesystem quota.
+
+Normal preparation now copies the selected native generation into an empty
+real private tool-cache volume under a native generation reader lease. It
+refuses live writers and preexisting destination contents. Private copies use
+independent inodes, so the reader is required for the copy rather than the
+subsequent engine lifetime. Existing frozen-overlay admission remains separate.
+
+The original normal-save RED assertion is now GREEN through the real backend
+and pinned act2.15 in a private actual nested Docker daemon. The expanded same
+test establishes missing/empty first-run no-op, explicit opt-out legacy save,
+refusal of a real running nested writer before authority/store creation,
+successful normal publication after that writer is removed, selected warm
+payload, replacement of the private volume and native warm copy with completion
+marker, and a subsequent save. Exact outer helper absence is asserted even when
+the checked body fails. Final report:
+`/tmp/bosn-545-normal-tools-final-live.log`: **1 passed, 5.85 seconds**.
+
+Targeted regressions also passed: engine **5**, legacy-tool **4** (1 ignored),
+and lifecycle **15** (1 ignored), recorded in
+`/tmp/bosn-545-normal-tools-final-{engine,legacy-tools,lifecycle}.log`.
+Full repository lint passed, and strict service Clippy across **all targets**
+passed in 43.34 seconds (`/tmp/bosn-545-normal-tools-all-target-clippy.log`).
+The initial compile found an Option/Result boundary error; the initial Clippy
+run found function length and a boolean simplification. Both were corrected
+without suppressions. Runner image helpers were extracted by responsibility,
+keeping `engine.rs` below the 1,000-line hard limit. The same primary reviewer
+cleared the final publisher corrections; no additional reviewer was launched.
+
+Full issue acceptance is still incomplete. Background tool retention, retirement
+of legacy cache sources, total shared-volume accounting/admission, interruption
+and repeated-production-run storage evidence, final exact-SHA live inventory,
+and the final Local-Gate/remote CI/merge remain required. This evidence does not
+validate the installed old daemon or claim the retrospective can be closed.
