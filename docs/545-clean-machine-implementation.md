@@ -98,10 +98,10 @@ found no remaining setup-managed fixture volumes.
 ## Current acceptance audit
 
 This is an interim audit of the local implementation checkpoint, not a
-completion claim. Issue #545 remains open; no PR has been created for
-`fix/545-clean-machine`. The journal below records historical progress and may
+completion claim. Issue #545 remains open; draft [PR #546](https://github.com/zackees/bosn/pull/546)
+is pushed from `fix/545-clean-machine` with the `ci-test` label. The journal below records historical progress and may
 mention tasks that were subsequently completed. Final delivery still requires
-the remaining acceptance audit, review, push, required checks, and merge.
+the remaining acceptance audit, final review, required checks, and merge.
 
 | Requirement | Current evidence | Remaining proof or implementation |
 | --- | --- | --- |
@@ -115,7 +115,7 @@ the remaining acceptance audit, review, push, required checks, and merge.
 | Actionable diagnostics | Read failure bounds/totals, held decision totals, zero-candidate reports, manager-confirmed autostart status | Distinct lease/session/intent reasons and full diagnostic scope audit |
 | Repeated/abandoned storage bounds | Physical lifecycle cases, removal/time/read budgets, inventory memory ceiling | Confirmed deletion prunes resource rows and matching intents; crash/absence recovery, events/history bounds, repeated-run storage proof, nested act/external builder scope |
 | Live host confirmation | Incident cleanup evidence; native Docker fixture results | Exact final source SHA/version, host inventory, protection and cleanup evidence on the candidate |
-| Delivery | Local work only; no PR exists | Final review, commit, push, required checks, merge and issue update |
+| Delivery | Reviewed fixes pushed as draft PR #546; ci-test coverage requested | Resolve full acceptance gaps, final review/checks, mark ready, merge and issue update |
 
 ### CI validation after default cache enrollment
 
