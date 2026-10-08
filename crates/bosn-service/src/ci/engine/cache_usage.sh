@@ -14,7 +14,7 @@ sample() {
     printf '%s %s %s\n' "$1" "$apparent" "$allocated"
 }
 sample total "$root"
-for class in tools images actions toolcache actcache; do
+for class in tools images actions toolcache toolstore-v1 actcache; do
     if [ -e "$root/$class" ] || [ -L "$root/$class" ]; then
         sample "$class" "$root/$class"
     else

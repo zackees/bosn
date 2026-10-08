@@ -217,6 +217,8 @@ pub enum CacheClass {
     Images,
     Actions,
     Toolcache,
+    #[serde(rename = "toolstore-v1")]
+    Toolstore,
     Actcache,
 }
 
@@ -227,6 +229,7 @@ impl CacheClass {
             Self::Images => "images",
             Self::Actions => "actions",
             Self::Toolcache => "toolcache",
+            Self::Toolstore => "toolstore-v1",
             Self::Actcache => "actcache",
         }
     }

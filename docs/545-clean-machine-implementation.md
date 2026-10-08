@@ -1797,3 +1797,32 @@ unit tests and the same production rollover test in 13.83 seconds
 (`/tmp/bosn-545-private-seed-final-live.log`). All-target Clippy passes
 (`/tmp/bosn-545-private-seed-exact-clippy.log`), and full repository lint passes
 (`/tmp/bosn-545-private-seed-lint.log`).
+
+
+### Immutable-tool accounting completeness
+
+The shared-volume total already included `toolstore-v1`, but component sampling
+and the typed `CacheClass` boundary omitted it. A focused regression failed
+with `unrecognized cache component identity`
+(`/tmp/bosn-545-toolstore-accounting-red.log`). The sampler, typed class,
+parser, public schema and user documentation now report it separately, without
+adding component sizes into the independently measured total.
+
+Seven accounting tests pass, including a populated actual shell measurement,
+sparse file accounting, partial reads and bounded namespace detail
+(`/tmp/bosn-545-toolstore-accounting-final-green.log`; the schema check in that
+initial log failed separately). That schema check also found an existing stale
+omission of the already-typed nullable `tool_maintenance` field. Regenerating
+through the authoritative schema test adds that field and the new class;
+the exact schema test passes
+(`/tmp/bosn-545-toolstore-accounting-schema-green.log`). All-target Clippy and
+full lint pass (`/tmp/bosn-545-toolstore-accounting-clippy.log` and
+`/tmp/bosn-545-toolstore-accounting-lint.log`); the same reviewer found this
+increment clean.
+
+Current source inspection still finds unbounded shared GoGit action storage:
+`GoGitActionCache.Fetch` reopens the same bare repository and fetches new
+shallow revisions, while `GetTarArchive` reads it without a retention lease.
+Act release archives and runner image archives also retain old pinned versions
+in shared directories. Reporting these bytes now supports the remaining
+storage audit; it does not implement or prove their required retention bounds.

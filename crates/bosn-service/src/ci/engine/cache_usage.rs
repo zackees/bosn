@@ -20,11 +20,12 @@ const MAX_NAMESPACES: usize = 256;
 const MAX_ERRORS: usize = 16;
 
 const SCRIPT: &str = include_str!("cache_usage.sh");
-const CLASSES: [CacheClass; 5] = [
+const CLASSES: [CacheClass; 6] = [
     CacheClass::Tools,
     CacheClass::Images,
     CacheClass::Actions,
     CacheClass::Toolcache,
+    CacheClass::Toolstore,
     CacheClass::Actcache,
 ];
 
@@ -319,16 +320,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn immutable_tool_store_is_reported_separately() {
+        let report = parse(
+            "test",
+            "total 20000 16384\ntools 0 0\nimages 0 0\nactions 0 0\ntoolcache 0 0\ntoolstore-v1 10000 8192\nactcache 10000 8192\n",
+        );
+        assert!(!report.partial, "{:?}", report.errors);
+        let component = report
+            .components
+            .iter()
+            .find(|c| c.class.as_str() == "toolstore-v1")
+            .unwrap();
+        assert_eq!(component.allocated_bytes, Some(8192));
+        assert_eq!(report.allocated_bytes, Some(16384));
+    }
+
+    #[test]
     fn shared_cache_explains_components_and_repository_stores() {
         let report = parse(
             "test",
-            "total 10000 8192\ntools 100 4096\nimages 500 4096\nactions 100 4096\ntoolcache 100 4096\nactcache 8000 4096\nnamespace:0123456789abcdef 7000 4096\n",
+            "total 10000 8192\ntools 100 4096\nimages 500 4096\nactions 100 4096\ntoolcache 100 4096\ntoolstore-v1 0 0\nactcache 8000 4096\nnamespace:0123456789abcdef 7000 4096\n",
         );
         assert_eq!(report.bytes, Some(10000));
         assert_eq!(report.allocated_bytes, Some(8192));
-        assert_eq!(report.components.len(), 6);
+        assert_eq!(report.components.len(), 7);
         assert_eq!(
-            report.components[5].namespace.as_deref(),
+            report.components[6].namespace.as_deref(),
             Some("0123456789abcdef")
         );
         assert!(!report.partial);
@@ -337,7 +354,7 @@ mod tests {
     #[test]
     fn machine_cache_breakdown_stays_within_the_tool_reply_limit() {
         let mut sample = String::from(
-            "total 10000 8192\ntools 0 0\nimages 0 0\nactions 0 0\ntoolcache 0 0\nactcache 10000 8192\n",
+            "total 10000 8192\ntools 0 0\nimages 0 0\nactions 0 0\ntoolcache 0 0\ntoolstore-v1 0 0\nactcache 10000 8192\n",
         );
         for index in 0..1000 {
             sample.push_str(&format!("namespace:{index:016x} {index} {index}\n"));
@@ -399,6 +416,9 @@ mod tests {
             .unwrap()
             .set_len(1 << 20)
             .unwrap();
+        let immutable = root.path().join("toolstore-v1/object/tree");
+        std::fs::create_dir_all(&immutable).unwrap();
+        std::fs::write(immutable.join("tool"), vec![b'x'; 8192]).unwrap();
         let namespace = root.path().join("actcache/0123456789abcdef");
         std::fs::create_dir_all(&namespace).unwrap();
         std::fs::write(namespace.join("archive"), "cached").unwrap();
@@ -448,6 +468,13 @@ mod tests {
                 "actcache/cohort-v1/0123456789abcdef"
             ])
         );
+        let immutable = report
+            .components
+            .iter()
+            .find(|c| c.class == CacheClass::Toolstore)
+            .unwrap();
+        assert!(immutable.bytes.unwrap() >= 8192);
+        assert!(immutable.allocated_bytes.unwrap() >= 8192);
         assert!(report.bytes.unwrap() > report.allocated_bytes.unwrap());
         assert!(
             report.components.iter().any(

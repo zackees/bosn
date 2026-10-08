@@ -25,6 +25,7 @@
         "images",
         "actions",
         "toolcache",
+        "toolstore-v1",
         "actcache"
       ],
       "type": "string"
@@ -1017,6 +1018,12 @@
             "status": {
               "const": "recorded",
               "type": "string"
+            },
+            "tool_maintenance": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [

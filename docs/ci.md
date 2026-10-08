@@ -551,7 +551,8 @@ All runtime state is under the daemon state directory (`ci/`):
   for the newest 10 runs so they can be retried.
 
 `runners cache` reports apparent file bytes and allocated filesystem blocks
-for the shared volume, its cache classes and repository namespaces. JSON
+for the shared volume, its cache classes (including `toolstore-v1` immutable
+tools) and repository namespaces. JSON
 includes `partial` and `errors`; an unreadable cache is unknown, never empty.
 Namespace details are capped at the largest or unknown 256 stores; omitted
 details make the report partial while volume totals stay independent.
