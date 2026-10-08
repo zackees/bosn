@@ -20,6 +20,7 @@ use kernal_api::async_engine::{self, CancellationToken};
 
 use crate::{RegistryActor, act_engine};
 
+mod artifact_lease;
 #[cfg(all(test, unix))]
 mod cache_staging_tests;
 mod cache_usage;

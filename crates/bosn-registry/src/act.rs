@@ -36,6 +36,7 @@ impl ActEngineTmpfsPolicy {
 #[serde(rename_all = "snake_case")]
 pub enum ActCacheCoordination {
     SharedLegacyLeaseV1,
+    SharedLegacyAndArtifactLeaseV2,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -366,6 +367,14 @@ impl ActEngineIntent {
                 labels.insert(
                     "com.zackees.bosn.act.cache-coordination".into(),
                     "shared-legacy-lease-v1".into(),
+                );
+            }
+            if profile.cache_coordination
+                == Some(ActCacheCoordination::SharedLegacyAndArtifactLeaseV2)
+            {
+                labels.insert(
+                    "com.zackees.bosn.act.artifact-cache-coordination".into(),
+                    "shared-artifact-lease-v1".into(),
                 );
             }
             labels.insert(

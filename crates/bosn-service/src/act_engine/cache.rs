@@ -56,7 +56,7 @@ pub(crate) fn creation_profile_with_tools(
     let mut profile = creation_profile(limits)?;
     profile.cache_coordination = cache
         .as_ref()
-        .map(|_| bosn_registry::act::ActCacheCoordination::SharedLegacyLeaseV1);
+        .map(|_| bosn_registry::act::ActCacheCoordination::SharedLegacyAndArtifactLeaseV2);
     profile.init_command_sha256 = command_digest(&engine_command_with_tools(
         cache.as_ref(),
         generation.as_ref(),
@@ -104,7 +104,7 @@ pub(super) fn engine_command_with_tools(
     let act = act_artifact("amd64")
         .ok_or_else(|| ActEngineError("no pinned startup act artifact".into()))?;
     let script = format!(
-        "set -eu; mkdir -p {ENGINE_WORK}/bin; {}; exec 9>&-; exec \"$@\"",
+        "set -eu; mkdir -p {ENGINE_WORK}/bin; {}; exec 9>&-; exec 5>&-; exec \"$@\"",
         install_act_script(act),
     );
     let mut command = vec![
@@ -315,6 +315,27 @@ mod ownership_tests {
             )
             .unwrap(),
         );
+        assert_eq!(
+            intent
+                .required_labels(ANY_REGISTRY)
+                .unwrap()
+                .get("com.zackees.bosn.act.artifact-cache-coordination")
+                .map(String::as_str),
+            Some("shared-artifact-lease-v1")
+        );
+        let mut previous = intent.clone();
+        previous
+            .creation_profile
+            .as_mut()
+            .unwrap()
+            .cache_coordination =
+            Some(bosn_registry::act::ActCacheCoordination::SharedLegacyLeaseV1);
+        assert!(
+            !previous
+                .required_labels(ANY_REGISTRY)
+                .unwrap()
+                .contains_key("com.zackees.bosn.act.artifact-cache-coordination")
+        );
         let args = create_arguments(&intent, ANY_REGISTRY, limits).unwrap();
         assert!(args.windows(2).any(|pair| pair == ["cache", "tool-exec"]));
         assert!(
@@ -409,6 +430,7 @@ mod ownership_tests {
         use std::os::unix::fs::PermissionsExt;
         let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
         let root = temporary.path();
+        std::fs::create_dir(root.join("cache")).unwrap();
         let tools = root.join("commands");
         std::fs::create_dir(&tools).unwrap();
         let executable = |name: &str, script: &str| {
@@ -466,7 +488,10 @@ mod ownership_tests {
             "unverified install entered INIT: checksum_failure={fail_checksum}, exit={:?}",
             result.status.code()
         );
-        assert!(!result.status.success());
+        assert_eq!(
+            result.status.code(),
+            Some(if fail_checksum { 53 } else { 37 })
+        );
     }
 
     #[cfg(unix)]

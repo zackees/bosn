@@ -143,6 +143,8 @@ pub(super) fn helper_create_args(identity: &helper::Identity) -> Vec<String> {
         &identity.label(),
         "--label",
         "com.zackees.bosn.act.cache-coordination=shared-machine-maintenance-v1",
+        "--label",
+        "com.zackees.bosn.act.artifact-cache-coordination=shared-artifact-lease-v1",
         "--pull",
         "never",
         "--network",
@@ -171,11 +173,12 @@ pub(super) fn helper_create_args(identity: &helper::Identity) -> Vec<String> {
 
 fn offline_install_script(act: super::ActArtifact) -> String {
     format!(
-        "mkdir -p {ENGINE_WORK}/bin; tgz={archive}; exec 9>>\"$tgz.lock\"; flock -s 9; \
+        "{lease} mkdir -p {ENGINE_WORK}/bin; tgz={archive}; exec 9>>\"$tgz.lock\"; flock -s 9; \
          echo \"{sum}  $tgz\" | sha256sum -c - >/dev/null && \
          tar -xzf \"$tgz\" -C {ENGINE_WORK}/bin act && \
          echo \"{binary}  {ENGINE_WORK}/bin/act\" | sha256sum -c - >/dev/null && \
          {ENGINE_WORK}/bin/act --version",
+        lease = super::artifact_lease::reader(),
         archive = act_archive(act),
         sum = act.sha256,
         binary = act.binary_sha256,

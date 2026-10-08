@@ -17,9 +17,10 @@ pub(super) fn load_runner_script() -> String {
 
 fn runner_input_lock(shared: bool) -> String {
     format!(
-        "mkdir -p {ENGINE_CACHE}/images; exec 9>>{}.lock; flock -{} 9;",
+        "{lease} mkdir -p {ENGINE_CACHE}/images; exec 9>>{}.lock; flock -{} 9;",
         runner_tar(),
-        if shared { "s" } else { "x" }
+        if shared { "s" } else { "x" },
+        lease = super::artifact_lease::reader(),
     )
 }
 

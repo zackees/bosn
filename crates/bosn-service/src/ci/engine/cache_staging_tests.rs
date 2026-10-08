@@ -6,9 +6,18 @@ use std::{
 };
 
 const DOCKER: &str = r#"#!/usr/bin/env python3
-import os, sys, time
+import os, sys, time, fcntl
 from pathlib import Path
 args = sys.argv[1:]
+if os.environ.get('ARTIFACT_LOCK'):
+    with open(os.environ['ARTIFACT_LOCK'], 'a') as lease:
+        try:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass
+        else:
+            print('archive reader lacks stable class lease', file=sys.stderr)
+            sys.exit(4)
 def record(kind):
     with open(os.environ['EVENTS'], 'a') as log:
         log.write(f'{kind} {os.getpid()} {time.monotonic_ns()}\n')
@@ -56,6 +65,7 @@ fn cold_concurrent_restores_publish_once_and_warm_readers_overlap() {
                         std::env::var("PATH").unwrap()
                     ),
                 )
+                .env("ARTIFACT_LOCK", dir.path().join(".artifact-cache.lock"))
                 .env("EVENTS", &events)
                 .env("WARM_PAIR", if warm { "1" } else { "0" })
                 .stdout(Stdio::null())

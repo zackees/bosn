@@ -1969,3 +1969,55 @@ Final action-retirement gates passed: all-target Clippy with `-D warnings` in
 `/tmp/bosn-545-action-final-lint.log`. The generated status schema test also
 passed in `/tmp/bosn-545-action-schema.log`. These gates close this incremental
 review, not the broader issue acceptance or final Local-Gate/remote CI.
+
+### Archive-class coordination prerequisite (in progress)
+
+Archive input paths (`tools` act releases and `images` runner tarballs) previously
+held only per-file FD9 locks. Deleting or replacing an archive directory and its
+lock files would strand waiting readers on old lock inodes. A new focused RED
+extends the existing production runner shell transport test: every mock Docker
+operation tries exclusive access to a stable root `.artifact-cache.lock` and
+requires contention from the reader's shared lease. The original shell failed
+with `archive reader lacks stable class lease` in
+`/tmp/bosn-545-archive-lease-red.log`.
+
+The current uncommitted implementation takes a shared FD5 root lease before any
+per-file FD9 lock in online act installation, runner load/reload and offline
+maintenance installation. The root control inode sits outside disposable
+archive classes and stays held while a reader waits for its individual lock.
+Warm readers remain concurrent. This prerequisite does not yet reclaim archive
+classes: retirement still needs durable deletion authority, current act archive
+preservation so future offline helpers can start, and explicit distinction of
+historical peers that never promised this new lease. GREEN validation is pending.
+
+Archive reader GREEN: `/tmp/bosn-545-archive-lease-green.log`, 1 passed in
+1.39 seconds; cold restores still publish once and warm loads still overlap.
+Current creation profiles use the typed `SharedLegacyAndArtifactLeaseV2`
+variant and emit a separate `artifact-cache-coordination=shared-artifact-lease-v1`
+label. Historical `SharedLegacyLeaseV1` remains readable and does not emit that
+capability. The existing action/legacy coordination label is preserved. Bootstrap
+closes FD5 after installation before transferring to INIT, preventing a keepalive
+process from retaining the archive-input lease unnecessarily.
+
+The capability ownership tests passed (6) in
+`/tmp/bosn-545-artifact-capability-tests.log`. Inspection then caught that the two
+mock installation failure fixtures lacked a cache root; the new lease guard could
+mask the intended tar/checksum failures. Their fixtures now create the root and
+assert exact exit 37/53 respectively; a rebuild is pending before that stronger
+validation. No archive deletion or whole-machine bound is claimed yet.
+
+Archive lease prerequisite final evidence:
+
+- Strengthened capability/startup tests: 6 passed in
+  `/tmp/bosn-545-artifact-capability-final-tests.log`, including exact 37/53
+  extraction/checksum failures and historical V1 without the new label.
+- Actual bootstrap using the verified published Act2.16 archive and emitted
+  production startup command: `/tmp/bosn-545-artifact-real-bootstrap.log` reports
+  `act version 0.2.89-act2.16`. The substituted INIT acquired exclusive access to
+  the original root lease, proving the shared FD5 descriptor was released before
+  INIT after the real extraction and both digest checks.
+- Full lint passed in `/tmp/bosn-545-artifact-lease-lint.log`; all-target Clippy
+  with `-D warnings` passed in `/tmp/bosn-545-artifact-lease-clippy.log` (42.71s).
+- Existing reviewer approved the prerequisite. Archive retirement, historical
+  peer refusal at its deletion boundary and current-archive preservation remain
+  unfinished; these results establish reader coordination only.
