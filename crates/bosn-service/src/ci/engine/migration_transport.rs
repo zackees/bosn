@@ -1,4 +1,5 @@
 //! Bounded host side of the continuously leased migration protocol.
+use super::process_control::ProcessControl;
 use super::{ImportAttempt, InventoryAttempt};
 use crate::ci::{
     cache_cohort::Namespace,
@@ -12,20 +13,18 @@ use crate::{
     act_registry::{ActRegistryCommand, ActRegistryReply},
 };
 use bosn_registry::cache_migration::{CacheMigrationIntent, CachePublicationEvidence};
-use kernal_api::{ProcessOutputChunk, ProcessOutputEvent, ProcessSession, async_engine};
-use std::time::{Duration, Instant};
+use kernal_api::{ProcessSession, async_engine};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 #[cfg(all(test, unix))]
 mod resume_tests;
 
 pub struct CacheMigrationSession {
-    session: ProcessSession,
+    io: ProcessControl,
     namespace: Namespace,
     policy: CachePolicy,
-    expires: Instant,
-    pending: Vec<u8>,
-    stderr: Vec<u8>,
-    received: usize,
     imported: bool,
     import_evidence: Option<(u64, u64, Option<u64>)>,
     import_started: bool,
@@ -251,9 +250,9 @@ elif mode == 'invalid-report': print('{}\n\nbosn-migration-end:0', flush=True)
                     )
                     .await
                     .unwrap();
-                    control.expires = Instant::now() + Duration::from_secs(5);
+                    control.io.expires = Instant::now() + Duration::from_secs(5);
                     if mode == "deadline" {
-                        control.expires = Instant::now();
+                        control.io.expires = Instant::now();
                     }
                     assert!(control.import().await.is_err(), "accepted {mode}");
                     let repeated = control.import().await.unwrap_err();
@@ -272,13 +271,14 @@ impl CacheMigrationSession {
         policy: CachePolicy,
     ) -> Result<Self, String> {
         let mut control = Self {
-            session,
+            io: ProcessControl::new(
+                session,
+                "migration",
+                b"bosn-migration-end:",
+                Duration::from_secs(150),
+            ),
             namespace,
             policy,
-            expires: Instant::now() + Duration::from_secs(150),
-            pending: Vec::new(),
-            stderr: Vec::new(),
-            received: 0,
             imported: false,
             import_evidence: None,
             import_started: false,
@@ -295,80 +295,19 @@ impl CacheMigrationSession {
     }
 
     fn remaining(&self) -> Result<Duration, String> {
-        let remaining = self.expires.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            Err("migration session deadline exceeded".into())
-        } else {
-            Ok(remaining)
-        }
+        self.io.remaining()
     }
 
     async fn send(&self, bytes: &[u8]) -> Result<(), String> {
-        async_engine::timeout(self.remaining()?, self.session.write_stdin(bytes))
-            .await
-            .map_err(|_| "migration write deadline exceeded".to_string())?
-            .map_err(|error| error.to_string())
+        self.io.send(bytes).await
     }
 
     async fn line(&mut self) -> Result<Vec<u8>, String> {
-        loop {
-            if let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') {
-                let mut line: Vec<u8> = self.pending.drain(..=end).collect();
-                line.pop();
-                return Ok(line);
-            }
-            let event = async_engine::timeout(self.remaining()?, self.session.next_output())
-                .await
-                .map_err(|_| "migration read deadline exceeded".to_string())?;
-            match event {
-                Some(ProcessOutputEvent::Chunk(chunk)) => {
-                    let (destination, bytes) = match chunk {
-                        ProcessOutputChunk::Stdout(bytes) => (&mut self.pending, bytes),
-                        ProcessOutputChunk::Stderr(bytes) => (&mut self.stderr, bytes),
-                    };
-                    self.received = self.received.saturating_add(bytes.len());
-                    if self.received > 256 * 1024
-                        || destination.len().saturating_add(bytes.len()) > 64 * 1024
-                    {
-                        return Err("migration protocol output exceeds bounded evidence".into());
-                    }
-                    destination.extend_from_slice(&bytes);
-                }
-                Some(ProcessOutputEvent::Completion(_)) => {}
-                None => {
-                    return Err(format!(
-                        "migration protocol ended before acknowledgement: {}",
-                        String::from_utf8_lossy(&self.stderr)
-                            .chars()
-                            .take(256)
-                            .collect::<String>()
-                    ));
-                }
-            }
-        }
+        self.io.line().await
     }
 
     async fn command(&mut self, command: &[u8]) -> Result<(i32, Vec<u8>), String> {
-        self.send(command).await?;
-        let mut body = Vec::new();
-        loop {
-            let line = self.line().await?;
-            if let Some(code) = line.strip_prefix(b"bosn-migration-end:") {
-                let code: i32 = std::str::from_utf8(code)
-                    .map_err(|_| "invalid migration exit evidence")?
-                    .parse()
-                    .map_err(|_| "invalid migration exit evidence")?;
-                if !(0..=255).contains(&code) {
-                    return Err("invalid migration exit evidence".into());
-                }
-                return Ok((code, body));
-            }
-            if body.len().saturating_add(line.len()).saturating_add(1) > 64 * 1024 {
-                return Err("migration command evidence exceeds 64 KiB".into());
-            }
-            body.extend_from_slice(&line);
-            body.push(b'\n');
-        }
+        self.io.command(command).await
     }
 
     /// Commit the actor intent before the remote import can mutate storage.
@@ -478,10 +417,7 @@ impl CacheMigrationSession {
         let attempt = ImportAttempt {
             exit_code,
             report,
-            diagnostic: String::from_utf8_lossy(&self.stderr)
-                .chars()
-                .take(256)
-                .collect(),
+            diagnostic: self.io.diagnostic(),
         };
         self.imported = attempt.require_warm_publication().is_ok();
         if self.imported {
@@ -642,7 +578,7 @@ impl CacheMigrationSession {
         if self.line().await? != b"bosn-migration-published" {
             return Err("migration publication acknowledgement is invalid".into());
         }
-        let exit = async_engine::timeout(self.remaining()?, self.session.wait())
+        let exit = async_engine::timeout(self.remaining()?, self.io.session.wait())
             .await
             .map_err(|_| "migration publication exit deadline exceeded")?
             .map_err(|error| error.to_string())?;

@@ -1397,3 +1397,13 @@ worktree so the local-gate run for committed `2f6dfc98` remains isolated from
 in-progress source changes. The passing low-level act2 retention fixture does
 not make this normal producer test pass. Implementing publication, warm
 admission, and bounded retention remains required.
+
+The migration transport's framed I/O is now shared through `ProcessControl`
+for the upcoming continuously locked tool session. The extraction preserves
+its 150-second absolute deadline, 256-KiB total output budget, 64-KiB buffers
+and command bodies, typed exit-code framing, and owned process session.
+Outgoing command bodies additionally refuse more than 64 KiB. All five
+Docker-isolated migration transport/recovery tests passed, strict service
+library Clippy passed (15.91 seconds), and full lint passed after module-order
+formatting. The same primary reviewer cleared the extraction. It does not
+implement tool publication or make the normal producer RED test pass.
