@@ -1373,3 +1373,10 @@ refresh before this final localized correction passed 616 tests with 23 ignored
 (33.60 seconds); the changed autostart scope was rerun afterward. None of these
 results substitutes for the unsuccessful local workflow gate or remaining
 normal tool-cache enrollment and storage-soak requirements.
+
+The existing Rust workflow job now sets `CARGO_BUILD_JOBS=1` to bound cold
+compiler/broker handoffs. This preserves all format, Clippy, boundary, and
+workspace test commands and changes no tier or release gate. Full lint passed
+and the same primary reviewer found no configuration blocker. The next local
+gate run must establish whether this resolves the observed broker failure;
+prior one-job local Clippy success is supporting evidence, not a gate result.

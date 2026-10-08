@@ -127,6 +127,11 @@ jobs:
     # GATE-008/010: skipped only for an attested, trusted PR head.
     if: needs.verify.outputs.skip_rust != 'true'
     runs-on: ubuntu-latest
+    env:
+      # Bound simultaneous broker handoffs on both hosted and nested runners.
+      # The local gate otherwise exceeded progress deadlines compiling cold
+      # dependencies; serial compilation keeps the same format/lint/test scope.
+      CARGO_BUILD_JOBS: "1"
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
