@@ -82,11 +82,11 @@ pub fn act_artifact(architecture: &str) -> Option<ActArtifact> {
             // immutable generation admission with bounded physical retention,
             // and typed durable tool-recovery references (reserve/release)
             // with a finite lifetime that fence the v2 recovery store.
-            // act2.15 retains exact-key cleanup and protected action checkout
-            // reads, and escapes artifact signatures for stock Azure clients.
-            url: "https://github.com/zackees/act2/releases/download/v0.2.89-act2.15/act_Linux_x86_64.tar.gz",
-            sha256: "e21535decdac2c6ed8429b8662825b4c1fca606301e0da54e37b180ad2517e6d",
-            binary_sha256: "b4be8d7ef98729ad16a9a6ddba331f1d2b0feb8abd52eb9e5f3a93155fb4f1df",
+            // act2.16 adds durable interrupted tool retirement, read-only source
+            // planning and expected-generation bounded selection replacement.
+            url: "https://github.com/zackees/act2/releases/download/v0.2.89-act2.16/act_Linux_x86_64.tar.gz",
+            sha256: "67a4285572b00853a17a2c4d35bb5c72ab863451c5dba8c48c23afaff9a74e34",
+            binary_sha256: "24f1b8a26cd77130d3b117e0012e6a2f3ee94c685f096550d05c35120d481b00",
         }),
         _ => None,
     }

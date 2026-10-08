@@ -108,6 +108,22 @@ while IFS= read -r operation; do
                     dir=${stamp%/.complete}; printf '%s\n' "${dir#./}"
                 done)
             finish 0 ;;
+        seed)
+            seed="$work/tool-seed-v1.json"
+            [ ! -L "$seed" ] || exit 78
+            if [ -e "$seed" ]; then [ -f "$seed" ] || exit 78; cat "$seed"; else printf 'absent\n'; fi
+            finish 0 ;;
+        record-seed)
+            IFS= read -r record || exit 78
+            [ "${#record}" -le 65535 ] || exit 78
+            seed="$work/tool-seed-v1.json"
+            [ ! -L "$seed" ] && { [ ! -e "$seed" ] || [ -f "$seed" ]; } || exit 78
+            # Private engine evidence, refreshed only before its jobs start.
+            stage=$(mktemp "$work/.tool-seed.XXXXXXXX") || exit 78
+            printf '%s' "$record" >"$stage"
+            mv -f "$stage" "$seed"
+            stage=
+            finish 0 ;;
         retain)
             [ -f "$published" ] || exit 78
             IFS= read -r allocated || exit 78

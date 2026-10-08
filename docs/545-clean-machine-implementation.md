@@ -1750,3 +1750,50 @@ increment clean after adding the shared-selected check. All-target Clippy passes
 (`/tmp/bosn-545-normal-rollover-final-clippy.log`) and full lint passes
 (`/tmp/bosn-545-normal-rollover-lint.log`). This fixture is compiled/reviewed;
 its runtime result is still pending the verified act2.16 binary and pin update.
+
+
+### Verified act2.16 rollout and private warm-copy identity
+
+Act2 release run 37854500224 completed successfully on exact candidate
+`ad04e18dc38f07b020b98429d018a4cccae5f62c`. All eleven downloaded platform
+archives match both release checksums and GitHub asset SHA-256/size metadata;
+ELF, PE and Mach-O binary machine types match their advertised architectures.
+Evidence is `/tmp/bosn-545-act2-16/verified-assets.json`. The Linux binary reports
+`0.2.89-act2.16`, the expected capabilities, planning, verified current installs
+and expected-generation replacement flags. Its archive digest is
+`67a4285572b00853a17a2c4d35bb5c72ab863451c5dba8c48c23afaff9a74e34`;
+its binary digest is
+`24f1b8a26cd77130d3b117e0012e6a2f3ee94c685f096550d05c35120d481b00`.
+Bosn's pin is updated to those verified artifacts.
+
+The expanded production normal-save test then failed on successor version 3:
+the previous install competed as a new install and won the path ordering.
+A separate real BusyBox copy reproduced nanosecond timestamp truncation from
+`1700000000123456789` to `1700000000000000000`, for directories and files.
+Since native immutable IDs include those timestamps, comparing the private
+copy's planned ID to its shared original was incorrect.
+
+Bosn now captures bounded, typed native fingerprints of the actual private
+warm copy before jobs begin. Subsequent save compares against that private
+baseline; actual payload or metadata changes still produce different IDs.
+The baseline belongs to the engine's disposable work directory, is refreshed
+at each warm seed, and supplies admission priority only, never deletion
+ownership or a bypass of native publication/selection validation. Unknown or
+malformed baseline records refuse admission.
+
+The same actual production rollover fixture passes with the verified release:
+`/tmp/bosn-545-private-seed-live.log`, one test passed in 13.00 seconds. It
+replaces three successors under the four-byte selected budget, verifies exact
+obsolete generation/object absence and measured allocation reduction, validates
+the selected shared payload, and verifies fixture engine disappearance.
+The production permission helper test also passes with act2.16, one test in
+3.33 seconds (`/tmp/bosn-545-act2-16-permissions-live.log`). The same reviewer
+found this correction clean; its exact-sentinel advisory was applied. These
+proofs do not establish whole-volume cache bounds, final machine rollout, final
+gates, or merged/solved status.
+
+Final source after the exact-sentinel correction passes eleven isolated tool
+unit tests and the same production rollover test in 13.83 seconds
+(`/tmp/bosn-545-private-seed-final-live.log`). All-target Clippy passes
+(`/tmp/bosn-545-private-seed-exact-clippy.log`), and full repository lint passes
+(`/tmp/bosn-545-private-seed-lint.log`).

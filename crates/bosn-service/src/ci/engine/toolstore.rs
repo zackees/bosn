@@ -133,6 +133,12 @@ impl DockerActBackend {
             super::PULL_DEADLINE,
         )
         .await?;
+        // Fingerprint the actual private copy before jobs can modify it. BusyBox
+        // cp truncates timestamps, so shared object IDs are not private IDs.
+        let mut session = self.open_tools(engine, proof.intent.policy).await?;
+        let result = session.capture_seed().await;
+        let _ = session.io.send(b"abort\n").await;
+        result?;
         Ok(true)
     }
 
@@ -395,8 +401,9 @@ impl Session {
             if !super::cache_usage::helper::valid_id(&selected.id) {
                 return Err("tool successor lacks a verified expected selection".into());
             }
+            let baseline = self.seed_baseline(current).await?;
             let manifest = self
-                .publish_installs_with_current(&current.installs)
+                .publish_installs_with_current(&baseline.installs)
                 .await?;
             if !manifest.installs.is_empty() {
                 self.update(&format!("replace:{}", selected.id), &manifest)
@@ -420,6 +427,42 @@ impl Session {
         {
             return Err("tool install manifest is invalid or exceeds 128 installs".into());
         }
+        Ok(())
+    }
+
+    async fn seed_baseline(&mut self, current: Manifest) -> Result<Manifest, String> {
+        let seed = self.raw("seed", None).await?;
+        if seed == b"absent\n" || seed == b"absent\n\n" {
+            return Ok(current);
+        }
+        let baseline: Manifest = serde_json::from_slice(&seed).map_err(|e| e.to_string())?;
+        Self::validate_manifest(&baseline)?;
+        Ok(baseline)
+    }
+
+    async fn capture_seed(&mut self) -> Result<(), String> {
+        let census =
+            String::from_utf8(self.raw("installs", None).await?).map_err(|e| e.to_string())?;
+        let paths: BTreeSet<_> = census.lines().filter(|p| !p.is_empty()).collect();
+        if paths.len() > MAX_INSTALLS || paths.iter().any(|p| !install_path(p)) {
+            return Err("warm seed census is invalid".into());
+        }
+        let mut manifest = Manifest {
+            schema_version: 1,
+            installs: Vec::new(),
+        };
+        for path in paths {
+            let source = format!("{SOURCE}/{path}");
+            let plan: Snapshot = self.json("plan", Some(&source)).await?;
+            plan.validate_plan(&source, self.policy)?;
+            manifest.installs.push(Install {
+                path: path.into(),
+                object_id: plan.id,
+            });
+        }
+        Self::validate_manifest(&manifest)?;
+        self.raw("record-seed", Some(&Self::record(&manifest)?))
+            .await?;
         Ok(())
     }
 
