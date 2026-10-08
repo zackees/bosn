@@ -1605,3 +1605,37 @@ object manifest before encountering the protected tree. Retrying this damaged
 store with the corrected capability returns `tool generation object manifest
 is invalid`. The permission fix does not establish crash-safe retirement or
 repair historical damaged objects. Full issue acceptance remains incomplete.
+
+### Coordinated native retirement recovery
+
+Act2 PR https://github.com/zackees/act2/pull/58 is pushed at
+`932155f7df1a0696a8f24199dc4733c0e21ab680`. Bosn PR #546 records the
+dependency. Native retirement now registers exact inode ownership, durably
+moves the publication into a cleanup stage, and only then deletes payload.
+The missing-manifest partial-deletion regression is GREEN for both objects
+and generations. Ledger authority publishes atomically; stage creation uses
+a reserved empty allocation until registration and rename are durable.
+
+Review identified and the implementation corrected two additional failures:
+partial final JSON authority and historical mount IDs across recreated helpers.
+Schema 2 records persist original root device/inode, and cleanup checks fresh
+mount boundaries throughout the current tree. Root replacement, unexpected
+control state and incomplete authority remain held. The same primary reviewer
+cleared the incremental retirement, ledger and creation corrections.
+
+At the exact native source SHA, a real two-helper Docker fixture proved partial
+deletion recovery across mount IDs 1071 -> 1077 with the selected generation
+preserved. Evidence: `/tmp/bosn-545-native-retirement-final-handoff.json`; exact
+private volume removal and absence were verified. Native full artifactcache
+suite: 119 top-level PASS, 7 SKIP, zero failures; pinned golangci-lint v2.11.4:
+zero issues. RED evidence is preserved in the native retirement, ledger and
+allocation logs under `/tmp/bosn-545-native-*.log`.
+
+Full native PR CI is running at
+https://github.com/zackees/act2/actions/runs/37848256656. The correction is not
+released or pinned by Bosn yet. Full CI must pass again on the exact merged
+default-branch release candidate before publishing an authorized Act2 release;
+verify binaries/checksums before changing Bosn's pin. Previously damaged
+published objects lacking any ledger and schema 1 rows with changed mount IDs
+remain preserved. Historical repair, full shared-volume bounds and remaining
+Bosn acceptance criteria are still unresolved; no issue completion is claimed.
