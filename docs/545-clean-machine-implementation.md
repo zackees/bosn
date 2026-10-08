@@ -1639,3 +1639,23 @@ verify binaries/checksums before changing Bosn's pin. Previously damaged
 published objects lacking any ledger and schema 1 rows with changed mount IDs
 remain preserved. Historical repair, full shared-volume bounds and remaining
 Bosn acceptance criteria are still unresolved; no issue completion is claimed.
+
+### Snapshot admission planning follow-up
+
+Act2 retirement recovery #58 is merged at
+`ff69cfa1c897a5bcd3489ceba48276c1ebf0cfca`. Expected-generation replacement #59
+remains gated by its actual checks. Snapshot planning is pushed as
+https://github.com/zackees/act2/pull/60, source `128c8b3` (includes pending #59).
+It measures and hashes completed installs before copying and rejects an expected
+object mismatch before creating the store. It does not reserve storage or
+implement the Bosn bounded selection policy.
+
+The CLI repro failed on absent `--plan`, then passed with no-store-write planning,
+changed-source rejection and matching-plan publication. An incremental review
+found explicit empty expected digests falling through to ordinary publication;
+the regression failed before correction and passes afterward. Six CLI tests
+pass (`/tmp/bosn-545-tool-plan-boundary-green.log`), 122 top-level artifactcache
+tests pass (`/tmp/bosn-545-tool-plan-package.log`), and pinned lint reports zero
+issues (`/tmp/bosn-545-tool-plan-final-lint.log`). The same primary reviewer found
+this incremental capability clean. Bosn pin, installed daemon, automatic
+selection, producer migration and full issue acceptance remain unfinished.
