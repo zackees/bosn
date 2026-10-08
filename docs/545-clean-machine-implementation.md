@@ -117,6 +117,31 @@ the remaining acceptance audit, review, push, required checks, and merge.
 | Live host confirmation | Incident cleanup evidence; native Docker fixture results | Exact final source SHA/version, host inventory, protection and cleanup evidence on the candidate |
 | Delivery | Local work only; no PR exists | Final review, commit, push, required checks, merge and issue update |
 
+### CI validation after default cache enrollment
+
+The native CI lifecycle test was rebuilt from checkpoint `f53ff175` with fixture
+corrections and passed on live Docker in 228.07 seconds. It covers success,
+failure, timeout, killed client, and daemon death/restart with exact restoration
+of the test's host inventory. Evidence: `/tmp/bosn-545-current-ci-live.log`.
+The first refresh failed before workflow admission: the fixture attempted to
+mint a registry on a host already carrying foreign ownership. The fixture now
+establishes its own unique registry before startup and exposes daemon stderr;
+the production identity-loss refusal is unchanged.
+
+The real `actions/cache` second-engine restore test also passed. It now asserts
+the first normal run's durable migration publication and unchanged namespace
+in the second run, in addition to checking restored payload bytes and distinct
+engine IDs. Evidence: `/tmp/bosn-545-current-ci-warm.log`. This proves default
+enrollment and warm restore, not populated historical import or total shared
+cache storage bounds. The corrected integration target passes strict Clippy.
+
+The path audit additionally confirms that the production machine catalog is
+currently nested under the default state directory (`machine_state_dir`). The
+existing whole-state-loss fixtures use a separate machine root; they therefore
+do not prove survival when the entire default machine state directory is lost.
+Separate durable catalog placement and compatibility must be resolved before
+claiming that broader recovery guarantee.
+
 ### Registry cleanup boundary
 
 Confirmed physical deletion now produces typed receipts. The admission guard

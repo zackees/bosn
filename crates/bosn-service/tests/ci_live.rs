@@ -82,6 +82,21 @@ impl Live {
         git(&repo, &["commit", "-qm", "init"]);
         let state = root.path().join("s");
         std::fs::create_dir_all(&state).unwrap();
+        // This fixture deliberately creates an independent registry on a host
+        // that may already have foreign Bosn resources. Establish its identity
+        // before daemon startup; identity-loss admission is covered separately.
+        let digest = kernal_api::hash::sha256_bytes(state.as_os_str().as_encoded_bytes()).to_hex();
+        let owner = format!(
+            "{}-{}-4{}-8{}-{}",
+            &digest[..8],
+            &digest[8..12],
+            &digest[13..16],
+            &digest[17..20],
+            &digest[20..32]
+        );
+        drop(
+            bosn_registry::Registry::create_writer(state.join("registry.sqlite3"), &owner).unwrap(),
+        );
         std::fs::write(
             state.join("config.toml"),
             format!("[engine]\nspares = {}\n", u8::from(spares)),
@@ -102,7 +117,7 @@ impl Live {
             .args(["daemon", "serve", "--state-dir"])
             .arg(&self.state)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .unwrap();
         self.daemon = Some(child);
@@ -488,6 +503,14 @@ fn a_second_run_restores_actions_cache_from_the_local_server() {
     let first = live.submit(&[]);
     let (code, first_view) = live.wait_as::<RunView>(&first);
     assert_eq!(code, Some(0), "{first_view:?}\n{}", live.logs(&first));
+    let namespace = first_view.record.cache_namespace();
+    let registry =
+        bosn_registry::Registry::open_read_only(live.state.join("registry.sqlite3")).unwrap();
+    let migration = registry.cache_migration(&namespace).unwrap().unwrap();
+    assert!(
+        migration.publication.is_some(),
+        "default CI must enroll its cache"
+    );
     assert!(
         !live.logs(&first).contains("Cache restored"),
         "a fresh key cannot hit"
@@ -505,6 +528,7 @@ fn a_second_run_restores_actions_cache_from_the_local_server() {
     let second = live.submit(&[]);
     let (code, second_view) = live.wait_as::<RunView>(&second);
     assert_eq!(code, Some(0), "{second_view:?}\n{}", live.logs(&second));
+    assert_eq!(namespace, second_view.record.cache_namespace());
     assert!(first_view.record.engine_id.is_some(), "{first_view:?}");
     assert_ne!(first_view.record.engine_id, second_view.record.engine_id);
     let logs = live.logs(&second);
