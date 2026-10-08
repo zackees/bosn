@@ -134,7 +134,8 @@ fn pending_pull_recovers_real_repository_digest_and_preserves_pin() {
     let deadline = Instant::now() + READY_DEADLINE;
     let summary = loop {
         let summary = runtime
-            .run(client.managed_retention(
+            .run(managed_retention_when_admitted(
+                &client,
                 RetentionPolicy {
                     container_ttl: Duration::ZERO,
                     volume_ttl: Duration::ZERO,
@@ -282,7 +283,8 @@ exec /usr/local/bin/docker "$@"
             .build()
             .unwrap();
         let client = Client::for_state(request_state).unwrap();
-        runtime.run(client.managed_retention(
+        runtime.run(managed_retention_when_admitted(
+            &client,
             RetentionPolicy {
                 container_ttl: Duration::ZERO,
                 volume_ttl: Duration::ZERO,
@@ -326,7 +328,8 @@ exec /usr/local/bin/docker "$@"
     let deadline = Instant::now() + READY_DEADLINE;
     loop {
         let summary = runtime
-            .run(client.managed_retention(
+            .run(managed_retention_when_admitted(
+                &client,
                 RetentionPolicy {
                     container_ttl: Duration::ZERO,
                     volume_ttl: Duration::ZERO,
@@ -449,7 +452,8 @@ exec /usr/local/bin/docker "$@"
     let mut restarted = DaemonChild::start_with_retention_root(&state, &machine);
     let client = wait_for_client(&runtime, &mut restarted, &state);
     let summary = runtime
-        .run(client.managed_retention(
+        .run(managed_retention_when_admitted(
+            &client,
             RetentionPolicy {
                 container_ttl: Duration::ZERO,
                 volume_ttl: Duration::ZERO,
@@ -648,7 +652,8 @@ fn exercise_image_reclamation(creation: Creation) {
     );
 
     let summary = runtime
-        .run(client.managed_retention(
+        .run(managed_retention_when_admitted(
+            &client,
             RetentionPolicy {
                 container_ttl: Duration::ZERO,
                 volume_ttl: Duration::ZERO,

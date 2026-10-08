@@ -219,6 +219,30 @@ without permanent context protection. Evidence:
 The full production two-workspace shared-image Docker regression remains to
 be added before claiming its end-to-end lifecycle proof.
 
+### Catalog durability and refreshed native lifecycle validation
+
+Catalog registration now syncs the destination directory after rename, and
+also before acknowledging an already-matching registration. This addresses
+the reviewer’s catalog-publication durability finding. The 18 peer authority
+tests passed in Docker (1.71 seconds).
+
+The native lifecycle refresh exposed a fixture admission race: automatic
+startup maintenance can acquire the machine fence immediately after a job
+completes. Explicit GC correctly returned `machine retention admission busy`.
+Fixtures now retry only that exact refusal for up to ten seconds; every other
+outcome still reaches the existing exact removal/pin/accounting assertions.
+The helper is shared across manifest and image/crash scenarios.
+
+All twelve native Docker cases pass on the refreshed candidate: manifest
+11.25 seconds, peer/startup 26.30 seconds, and preparation/crash 34.39 seconds.
+Evidence: `/tmp/bosn-545-current-retention-live.log`. Full local lint also
+passed (`/tmp/bosn-545-current-lint.log`). These tests include the new shared-use
+discovery/accounting behavior, but do not substitute for the pending real
+two-workspace shared-image scenario or total cache-storage bounds.
+Strict service Clippy passed for all targets in 25.30 seconds. The same sole
+primary reviewer found no new blocker in the catalog and fixture corrections
+and approved publication as a draft checkpoint, with full acceptance incomplete.
+
 ### Registry cleanup boundary
 
 Confirmed physical deletion now produces typed receipts. The admission guard

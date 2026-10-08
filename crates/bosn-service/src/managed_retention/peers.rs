@@ -120,7 +120,7 @@ fn register_at(root: &Path, state_dir: &Path, owner: &str) -> Result<(), String>
     if path.exists() {
         let previous = read_entry(&path)?;
         if previous.registry_id == owner && previous.state_dir == state_dir {
-            return Ok(());
+            return sync_catalog(root);
         }
         return Err("registry identity already catalogs a different state directory".into());
     }
@@ -155,7 +155,12 @@ fn register_at(root: &Path, state_dir: &Path, owner: &str) -> Result<(), String>
         .and_then(|()| file.sync_all())
         .map_err(|error| error.to_string())?;
     drop(file);
-    std::fs::rename(&staged, path).map_err(|error| error.to_string())
+    std::fs::rename(&staged, path).map_err(|error| error.to_string())?;
+    sync_catalog(root)
+}
+
+fn sync_catalog(root: &Path) -> Result<(), String> {
+    kernal_api::platform::fs::sync_directory(root).map_err(|error| error.to_string())
 }
 
 fn read_entry(path: &Path) -> Result<Entry, String> {

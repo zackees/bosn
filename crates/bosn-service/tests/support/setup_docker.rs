@@ -26,6 +26,25 @@ pub(crate) const MANAGED_LABEL: &str = "com.zackees.bosn.setup-managed";
 pub(crate) const CONTENT_LABEL: &str = "com.zackees.bosn.setup-content-sha256";
 pub(crate) const NAME_LABEL: &str = "com.zackees.bosn.setup-container";
 
+/// Startup maintenance may hold admission immediately after job completion.
+/// Retry only its explicit busy response; all other outcomes reach assertions.
+pub(crate) async fn managed_retention_when_admitted(
+    client: &Client,
+    policy: bosn_core::retention::RetentionPolicy,
+    apply: bool,
+) -> Result<bosn_service::ManagedRetentionSummary, bosn_service::Error> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let outcome = client.managed_retention(policy, apply).await?;
+        if outcome.refused.as_deref() != Some("machine retention admission busy")
+            || Instant::now() >= deadline
+        {
+            return Ok(outcome);
+        }
+        kernal_api::async_engine::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// A child daemon is reaped even if an assertion fails before the normal
 /// authenticated shutdown path runs.
 pub(crate) struct DaemonChild {

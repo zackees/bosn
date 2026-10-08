@@ -139,7 +139,7 @@ fn live_manifest_retention_reclaims_idle_container_and_unpinned_volume() {
         max_bytes: None,
     };
     let preview = runtime
-        .run(client.managed_retention(policy, false))
+        .run(managed_retention_when_admitted(&client, policy, false))
         .unwrap();
     assert!(!preview.applied);
     assert!(
@@ -148,7 +148,9 @@ fn live_manifest_retention_reclaims_idle_container_and_unpinned_volume() {
             .unwrap()
             .running
     );
-    let applied = runtime.run(client.managed_retention(policy, true)).unwrap();
+    let applied = runtime
+        .run(managed_retention_when_admitted(&client, policy, true))
+        .unwrap();
     assert!(applied.refused.is_none(), "{applied:?}");
     assert!(
         inspect_container(&engine, &container.name)
@@ -267,7 +269,9 @@ fn failed_manifest_start_leaves_reclaimable_intent_backed_volumes() {
         image_ttl: Duration::ZERO,
         ..RetentionPolicy::default()
     };
-    let collected = runtime.run(client.managed_retention(policy, true)).unwrap();
+    let collected = runtime
+        .run(managed_retention_when_admitted(&client, policy, true))
+        .unwrap();
     assert!(collected.refused.is_none(), "{collected:?}");
     assert!(
         inspect_container(&engine, &container.name)
