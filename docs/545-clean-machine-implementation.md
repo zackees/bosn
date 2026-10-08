@@ -1380,3 +1380,20 @@ workspace test commands and changes no tier or release gate. Full lint passed
 and the same primary reviewer found no configuration blocker. The next local
 gate run must establish whether this resolves the observed broker failure;
 prior one-job local Clippy success is supporting evidence, not a gate result.
+
+## Production tool publication RED (October 8)
+
+The isolated `normal_completed_tool_save_publishes_a_selected_generation`
+reproduction calls the actual `DockerActBackend::save_toolcache` producer
+with a completed Tool/1/x64 install and the verified pinned act2.15 binary.
+It then asks the native tool-store API for the selected generation and checks
+its warm payload. Current production failed because the selected tool store
+does not exist; the old mutable-copy save ran successfully. The test verified
+its exact private helper absent before reporting failure. See
+`/tmp/bosn-545-normal-tool-publication-red.log`.
+
+This reproduction is being developed in the separate `fix/545-tool-cache`
+worktree so the local-gate run for committed `2f6dfc98` remains isolated from
+in-progress source changes. The passing low-level act2 retention fixture does
+not make this normal producer test pass. Implementing publication, warm
+admission, and bounded retention remains required.

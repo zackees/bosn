@@ -58,6 +58,8 @@ pub(crate) use act_install::install_act_script;
 mod lines;
 mod runner_tools;
 mod toolcache;
+#[cfg(test)]
+mod toolstore_live_tests;
 use lines::LineBuffer;
 #[cfg(test)]
 use lines::MAX_LINE;
