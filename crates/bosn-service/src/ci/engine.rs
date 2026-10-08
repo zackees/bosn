@@ -70,6 +70,8 @@ mod toolstore;
 mod toolstore_live_tests;
 mod toolstore_records;
 mod toolstore_selection;
+#[cfg(test)]
+mod toolstore_upgrade_live;
 use lines::LineBuffer;
 #[cfg(test)]
 use lines::MAX_LINE;

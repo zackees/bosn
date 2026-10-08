@@ -1826,3 +1826,40 @@ shallow revisions, while `GetTarArchive` reads it without a retention lease.
 Act release archives and runner image archives also retain old pinned versions
 in shared directories. Reporting these bytes now supports the remaining
 storage audit; it does not implement or prove their required retention bounds.
+
+
+### Actual supported historical tool-producer handoff
+
+The new ignored live case
+`previous_producer_upgrades_through_normal_save_and_idle_retention` uses the
+real published Act2.15 Linux executable, not a rewritten producer label on a
+current publication. The downloaded archive matches historical Bosn pin
+`e21535decdac2c6ed8429b8662825b4c1fca606301e0da54e37b180ad2517e6d`;
+the extracted regular executable matches
+`b4be8d7ef98729ad16a9a6ddba331f1d2b0feb8abd52eb9e5f3a93155fb4f1df`.
+The checked-in test recipe is byte-exact `cea9c15e` source, SHA-256
+`66430164c4f2fb7cf9190fb29b43058b53f72b2b37442916f49f33b57c394b50`;
+the live case verifies both fingerprints before use.
+
+That historical executable and recipe actually publish the four-byte object,
+initialize its selected generation and acknowledge its typed durable receipt.
+The old recipe's original FD7 session remains live while the current verified
+executable replaces the private binary. New maintenance must report busy;
+then the historical session is aborted and acquisition of the same original
+lock confirms its release. Current maintenance adopts the historical receipt
+without rewriting it. The ordinary production fixture then warm-seeds that
+historical generation, saves three successors under the four-byte selected
+limit, reclaims obsolete objects/generations during idle maintenance with no
+nested Docker socket, validates the selected shared payload, and checks the
+original receipt remains byte-for-byte identical after the entire sequence.
+Exact fixture engine absence is verified even on a failed case.
+
+The final case passes in 16.61 seconds
+(`/tmp/bosn-545-historical-upgrade-final-live.log`). The nonhistorical normal
+case after the fixture refactor also passes, 15.69 seconds
+(`/tmp/bosn-545-upgrade-fixture-normal-live.log`). All-target Clippy and full
+lint pass (`/tmp/bosn-545-historical-upgrade-final-clippy.log` and
+`/tmp/bosn-545-historical-upgrade-exact-lint.log`). The same reviewer found the
+change clean; its final-receipt advisory was applied. This proves the supported
+Linux native/recipe handoff; installed-daemon rollout, macOS service handoff,
+remaining storage bounds and full parent acceptance remain unproven.

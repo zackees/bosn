@@ -16,6 +16,16 @@ struct Selection {
 #[test]
 #[ignore = "requires isolated Docker and the verified pinned act binary"]
 fn normal_completed_tool_save_publishes_a_selected_generation() {
+    run_normal_tool_proof(false);
+}
+
+#[test]
+#[ignore = "requires isolated Docker and verified current and historical act binaries"]
+fn previous_producer_upgrades_through_normal_save_and_idle_retention() {
+    run_normal_tool_proof(true);
+}
+
+fn run_normal_tool_proof(historical: bool) {
     assert_eq!(std::env::var("BOSN_TEST_ISOLATED").as_deref(), Ok("1"));
     let binary = std::env::var("BOSN_ACT_RETENTION_TEST_BINARY").unwrap();
     assert_eq!(
@@ -66,7 +76,12 @@ fn normal_completed_tool_save_publishes_a_selected_generation() {
             backend.checked("writer refusal leaves no authority", DockerActBackend::exec(&id,
                 "test ! -e /bosn/cache/.bosn-tool-preparing-v1.json; test ! -e /bosn/cache/toolstore-v1"), CONTROL_DEADLINE).await?;
             backend.checked("private writer cleanup", owned(&["exec", &id, "docker", "rm", "-f", &writer]), CONTROL_DEADLINE).await?;
-            backend.save_toolcache_with_policy(&id, Some(policy)).await?;
+            let historical_evidence = if historical {
+                Some(super::toolstore_upgrade_live::enroll_previous(&backend, &id, policy, &binary).await?)
+            } else {
+                backend.save_toolcache_with_policy(&id, Some(policy)).await?;
+                None
+            };
             let current = backend.checked("normal tool selection", owned(&[
                 "exec", &id, "/var/lib/docker/bosn-ci/bin/act", "cache", "tool-current",
                 "--cache-server-path", "/bosn/cache/toolstore-v1", "--max-bytes", "4",
@@ -111,6 +126,9 @@ fn normal_completed_tool_save_publishes_a_selected_generation() {
             verify_selected_payload(&backend, &id, &selected).await?;
             backend.checked("idle retention removes original generation", DockerActBackend::exec(&id,
                 &format!("test ! -e {STORE}/.tool-generations-v1/{}; test \"$(cat {SOURCE}/Tool/4/x64/tool)\" = next", selection.id)), CONTROL_DEADLINE).await?;
+            if let Some(evidence) = historical_evidence {
+                super::toolstore_upgrade_live::require_evidence(&backend, &id, &evidence).await?;
+            }
             Ok(())
         }.await;
         backend.checked("tool proof cleanup", owned(&["rm", "-f", &id]), CONTROL_DEADLINE).await.unwrap();
