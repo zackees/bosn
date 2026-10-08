@@ -21,6 +21,7 @@ pub(crate) async fn registry_actor(
                 let worker = async_engine::launch_blocking(move || {
                     let result =
                         act_registry::apply(&mut registry, *command, &mut act_startup_open);
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, act_startup_open, result)
                 });
                 match worker.await {
@@ -38,6 +39,7 @@ pub(crate) async fn registry_actor(
             DbCommand::Status(reply) => {
                 let worker = async_engine::launch_blocking(move || {
                     let result = registry.status().map(Status::from);
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -54,6 +56,7 @@ pub(crate) async fn registry_actor(
             DbCommand::DoctorIntegrity(reply) => {
                 let worker = async_engine::launch_blocking(move || {
                     let result = registry.integrity_check();
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -80,6 +83,7 @@ pub(crate) async fn registry_actor(
                             next: page.next_offset.map(|value| value as u64),
                             records: page.items.into_iter().map(resource_diagnostic).collect(),
                         });
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -106,6 +110,7 @@ pub(crate) async fn registry_actor(
                             next: page.next_offset.map(|value| value as u64),
                             records: page.items.into_iter().map(event_diagnostic).collect(),
                         });
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -132,6 +137,7 @@ pub(crate) async fn registry_actor(
                             registry.setup_gc_preview(&workspace, after, limit as usize)
                         })
                         .map(setup_gc_preview_diagnostic);
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -158,6 +164,7 @@ pub(crate) async fn registry_actor(
                             registry.manifest_volume_gc_preview(&workspace, after, limit as usize)
                         })
                         .map(manifest_volume_gc_preview_diagnostic);
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -202,6 +209,7 @@ pub(crate) async fn registry_actor(
                                 .collect(),
                             counts: ManifestVolumeGcPreviewCounts::default(),
                         });
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -260,6 +268,7 @@ pub(crate) async fn registry_actor(
                                 .collect::<Result<Vec<_>, bosn_registry::Error>>()?,
                         ))
                     })();
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -299,6 +308,7 @@ pub(crate) async fn registry_actor(
                         }
                         Ok(repaired)
                     })();
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -326,6 +336,7 @@ pub(crate) async fn registry_actor(
                         &name,
                         &generation,
                     );
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -348,6 +359,7 @@ pub(crate) async fn registry_actor(
             } => {
                 let worker = async_engine::launch_blocking(move || {
                     let result = registry.setup_gc_candidate(&workspace, &id, &name, &generation);
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -371,6 +383,7 @@ pub(crate) async fn registry_actor(
                 let worker = async_engine::launch_blocking(move || {
                     let result =
                         registry.manifest_volume_gc_candidate(&workspace, &id, &name, &generation);
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -398,6 +411,7 @@ pub(crate) async fn registry_actor(
                         &name,
                         &generation,
                     );
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -446,6 +460,7 @@ pub(crate) async fn registry_actor(
                         }
                         Ok(removed)
                     })();
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -491,6 +506,7 @@ pub(crate) async fn registry_actor(
                         }
                         Ok(removed)
                     })();
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -536,6 +552,7 @@ pub(crate) async fn registry_actor(
                         }
                         Ok(removed)
                     })();
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -575,6 +592,7 @@ pub(crate) async fn registry_actor(
                         }
                         Ok(recorded)
                     })();
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -604,6 +622,7 @@ pub(crate) async fn registry_actor(
                         }
                         Ok(SetupDoneResult::from(completed))
                     })();
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -620,6 +639,7 @@ pub(crate) async fn registry_actor(
             DbCommand::AppendSetupEnsureEvents { events, reply } => {
                 let worker = async_engine::launch_blocking(move || {
                     let result = append_setup_ensure_events(&mut registry, &events);
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -636,6 +656,77 @@ pub(crate) async fn registry_actor(
             DbCommand::AppendManifestRecoveryEvents { events, reply } => {
                 let worker = async_engine::launch_blocking(move || {
                     let result = append_manifest_recovery_events(&mut registry, &events);
+                    let result = registry.publish_ownership_backup().and(result);
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
+            DbCommand::RecordImageCreationIntent {
+                intent,
+                complete,
+                reply,
+            } => {
+                let Some(returned) =
+                    registry_image_intents::record(registry, intent, complete, reply).await
+                else {
+                    return;
+                };
+                registry = returned;
+            }
+            DbCommand::RecoverImageIntents {
+                admission,
+                deadline,
+                reply,
+            } => {
+                let Some(returned) =
+                    registry_retention::recover(registry, admission, deadline, reply).await
+                else {
+                    return;
+                };
+                registry = returned;
+            }
+            DbCommand::PruneDeletedOwnership {
+                receipts,
+                admission,
+                reply,
+            } => {
+                let Some(returned) =
+                    registry_retention::prune(registry, receipts, admission, reply).await
+                else {
+                    return;
+                };
+                registry = returned;
+            }
+            DbCommand::RecordContainerIntent { container, reply } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = record_container_intent(&mut registry, &container);
+                    let result = registry.publish_ownership_backup().and(result);
+                    (registry, result)
+                });
+                match worker.await {
+                    Ok((returned, result)) => {
+                        registry = returned;
+                        let _ = reply.send(result.map_err(Error::Registry));
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(Error::ActorClosed));
+                        return;
+                    }
+                }
+            }
+            DbCommand::RecordPreparedImage { image, reply } => {
+                let worker = async_engine::launch_blocking(move || {
+                    let result = record_prepared_image(&mut registry, &image);
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -663,6 +754,7 @@ pub(crate) async fn registry_actor(
                 }
                 let worker = async_engine::launch_blocking(move || {
                     let result = record_setup_ensure(&mut registry, job_id, &execution);
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -685,6 +777,7 @@ pub(crate) async fn registry_actor(
                 let worker = async_engine::launch_blocking(move || {
                     let result =
                         record_manifest_ensure(&mut registry, job_id, &execution, &contract);
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -702,6 +795,7 @@ pub(crate) async fn registry_actor(
                 let worker = async_engine::launch_blocking(move || {
                     let result = registry
                         .manifest_recovery_contract_details(MANIFEST_RECOVERY_MAX_CONTRACTS);
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -718,6 +812,7 @@ pub(crate) async fn registry_actor(
             DbCommand::ManifestAutostartIntentDisabled { detail, reply } => {
                 let worker = async_engine::launch_blocking(move || {
                     let result = registry.manifest_autostart_intent_disabled(&detail);
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -741,6 +836,7 @@ pub(crate) async fn registry_actor(
                         &contract.workspace,
                         &manifest_autostart_intent_detail(&contract),
                     );
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -757,6 +853,7 @@ pub(crate) async fn registry_actor(
             DbCommand::PutManifestVolumeIntents { volumes, reply } => {
                 let worker = async_engine::launch_blocking(move || {
                     let result = put_manifest_volume_intents(&mut registry, &volumes);
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -773,6 +870,7 @@ pub(crate) async fn registry_actor(
             DbCommand::RecordSetupAdoption { execution, reply } => {
                 let worker = async_engine::launch_blocking(move || {
                     let result = record_setup_adoption(&mut registry, &execution);
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -794,6 +892,7 @@ pub(crate) async fn registry_actor(
                 let worker = async_engine::launch_blocking(move || {
                     let result =
                         record_setup_app_task_session(&mut registry, job_id, &container_id);
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -814,6 +913,7 @@ pub(crate) async fn registry_actor(
             } => {
                 let worker = async_engine::launch_blocking(move || {
                     let result = finish_setup_app_task_session(&mut registry, job_id, outcome);
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -835,6 +935,7 @@ pub(crate) async fn registry_actor(
                 let worker = async_engine::launch_blocking(move || {
                     let result =
                         record_manifest_app_task_session(&mut registry, job_id, &container_id);
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {
@@ -855,6 +956,7 @@ pub(crate) async fn registry_actor(
             } => {
                 let worker = async_engine::launch_blocking(move || {
                     let result = finish_manifest_app_task_session(&mut registry, job_id, outcome);
+                    let result = registry.publish_ownership_backup().and(result);
                     (registry, result)
                 });
                 match worker.await {

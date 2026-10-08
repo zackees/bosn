@@ -27,6 +27,8 @@ mod control;
 pub use cache_usage::HelperCleanupRetry;
 #[cfg(all(test, unix))]
 mod cache_usage_transport_tests;
+mod cache_writers;
+mod enrollment;
 mod inventory;
 mod legacy_lease;
 mod machine_policy;
@@ -38,11 +40,15 @@ mod maintenance_lease;
 mod maintenance_loop;
 mod maintenance_reporting;
 mod migration;
+mod migration_session;
+mod migration_transport;
+mod routing;
 pub use inventory::InventoryAttempt;
 pub use maintenance::MaintenanceAttempt;
 pub use maintenance_helper::MaintenanceHelperAttempt;
 pub use maintenance_loop::MaintenanceTick;
 pub use migration::ImportAttempt;
+pub use migration_transport::CacheMigrationSession;
 mod act_capabilities;
 mod act_install;
 mod readiness;
@@ -129,6 +135,10 @@ pub struct ActInvocation {
     pub job: Option<String>,
     /// Typed repository route; cohort selection requires verified enrollment.
     pub cache_route: super::cache_cohort::CacheRoute,
+    /// Snapshot of the explicit automatic-retention opt-out at run admission.
+    pub auto_retention: bool,
+    /// Validated requested policy, agreed before shared routing publication.
+    pub cache_policy: super::cache_policy::CachePolicy,
     /// Passed to act as `-s NAME`; values travel only in the docker client's
     /// environment (`exec --env NAME`), never in argv.
     pub secrets: SecretEnv,
@@ -176,6 +186,9 @@ impl ActInvocation {
             format!("{ENGINE_WORK}/artifacts"),
         ];
         args.extend(self.cache_route.args());
+        if !self.auto_retention {
+            args.push("--no-cache-server".into());
+        }
         args.extend(["--env".into(), runner_tools::path_env()]);
         let runner = runner_tag();
         for label in LOCAL_RUNNER_LABELS {
@@ -261,6 +274,16 @@ pub trait ActEngineBackend: Send + Sync {
         event: &'a Path,
         generation: Option<&'a bosn_registry::act::ActToolGenerationBinding>,
     ) -> BoxFuture<'a, Result<(), String>>;
+    /// Resolve cache enrollment after engine preparation and before execution.
+    fn prepare_cache_route<'a>(
+        &'a self,
+        _registry: &'a RegistryActor,
+        _engine: &'a str,
+        invocation: &'a ActInvocation,
+    ) -> BoxFuture<'a, Result<super::cache_cohort::CacheRoute, String>> {
+        Box::pin(async move { Ok(invocation.cache_route.clone()) })
+    }
+
     /// `act -l` for the workflow (declared jobs and their stages).
     fn list<'a>(
         &'a self,
@@ -788,6 +811,15 @@ impl ActEngineBackend for DockerActBackend {
         })
     }
 
+    fn prepare_cache_route<'a>(
+        &'a self,
+        registry: &'a RegistryActor,
+        engine: &'a str,
+        invocation: &'a ActInvocation,
+    ) -> BoxFuture<'a, Result<super::cache_cohort::CacheRoute, String>> {
+        Box::pin(self.admit_cache_route(registry, engine, invocation))
+    }
+
     fn list<'a>(
         &'a self,
         engine: &'a str,
@@ -810,6 +842,12 @@ impl ActEngineBackend for DockerActBackend {
         lines: &'a async_engine::Sender<EngineLine>,
     ) -> BoxFuture<'a, Result<ExecEnd, String>> {
         Box::pin(async move {
+            let mut invocation = invocation.clone();
+            if let super::cache_cohort::CacheRoute::Legacy(namespace) = &invocation.cache_route {
+                invocation.cache_route = self
+                    .published_cache_route(engine, namespace, invocation.cache_policy)
+                    .await?;
+            }
             if !invocation.params.ci_outputs.is_empty() {
                 self.verify_act_capabilities(engine, true).await?;
             }

@@ -19,6 +19,8 @@ pub struct Faults {
     pub save: bool,
     /// The shared cache cannot be measured.
     pub cache_measure: bool,
+    pub cache_prepare: bool,
+    pub cache_hang: bool,
 }
 
 /// In-memory engine host: name -> observation. Creation and retirement
@@ -37,6 +39,7 @@ pub struct FakeBackend {
     pub storage: Mutex<Option<crate::ci::storage::StorageUsage>>,
     /// Engines prepared (act and runner image), spares included.
     pub engine_preparations: Mutex<u32>,
+    pub cohort_maintenances: Mutex<u32>,
     /// The host the fake engine reports; [`FAKE_HOST`] unless set.
     pub host: Mutex<Option<crate::ci::limits::HostResources>>,
     next: Mutex<u64>,
@@ -107,6 +110,18 @@ pub(super) fn later(record: &ActEngineRecord) -> f64 {
     now_seconds().max(record.updated_at)
 }
 impl ActEngineBackend for FakeBackend {
+    fn maintain_existing_cohort<'a>(
+        &'a self,
+        _registry: &'a RegistryActor,
+        _owner: &'a str,
+        stop: &'a CancellationToken,
+    ) -> crate::ci::engine::BoxFuture<'a, ()> {
+        Box::pin(async move {
+            *self.cohort_maintenances.lock().unwrap() += 1;
+            let _ =
+                async_engine::cancellable(stop, async_engine::sleep(Duration::from_secs(30))).await;
+        })
+    }
     fn ensure_engine_image(&self) -> crate::ci::engine::BoxFuture<'_, Result<(), String>> {
         Box::pin(async move {
             if self.faults().slow_image {
@@ -305,6 +320,23 @@ impl ActEngineBackend for FakeBackend {
                 return Err("synthetic prepare failure".into());
             }
             Ok(())
+        })
+    }
+    fn prepare_cache_route<'a>(
+        &'a self,
+        _registry: &'a RegistryActor,
+        engine: &'a str,
+        invocation: &'a crate::ci::engine::ActInvocation,
+    ) -> crate::ci::engine::BoxFuture<'a, Result<crate::ci::cache_cohort::CacheRoute, String>> {
+        Box::pin(async move {
+            assert!(self.live_id(engine));
+            if self.faults().cache_hang {
+                async_engine::sleep(Duration::from_secs(30)).await;
+            }
+            if self.faults().cache_prepare {
+                return Err("synthetic cache enrollment failure".into());
+            }
+            Ok(invocation.cache_route.clone())
         })
     }
     fn list<'a>(

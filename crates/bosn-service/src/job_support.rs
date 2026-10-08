@@ -2,6 +2,94 @@
 
 use super::*;
 
+pub(crate) struct ActorSetupImageRecorder {
+    pub(crate) actor: RegistryActor,
+}
+
+impl SetupImageRecorder for ActorSetupImageRecorder {
+    fn record_preparation<'a>(
+        &'a self,
+        intent: bosn_registry::ImageCreationIntent,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.actor
+                .record_image_creation_intent(intent, false)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+    fn complete_preparation<'a>(
+        &'a self,
+        intent: bosn_registry::ImageCreationIntent,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.actor
+                .record_image_creation_intent(intent, true)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+    fn record_container_intent<'a>(
+        &'a self,
+        container: SetupEnsureResource,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.actor
+                .record_container_intent(container)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+    fn record<'a>(
+        &'a self,
+        image: SetupEnsureImageResource,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.actor
+                .record_prepared_image(image)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+}
+
+/// Compatibility for direct executor test calls outside daemon ownership.
+pub(crate) struct ReceiptOnlyImageRecorder;
+impl SetupImageRecorder for ReceiptOnlyImageRecorder {
+    fn record<'a>(
+        &'a self,
+        _image: SetupEnsureImageResource,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl SetupJobRequest {
+    pub(crate) fn kind(&self) -> SetupJobKind {
+        match self {
+            Self::Prepare(_) => SetupJobKind::Prepare,
+            Self::Task(_) => SetupJobKind::Task,
+            Self::AppTask(_) => SetupJobKind::AppTask,
+            Self::Ensure(_) => SetupJobKind::Ensure,
+            Self::ManifestEnsure(_) => SetupJobKind::ManifestEnsure,
+            Self::ManifestConverge(_) => SetupJobKind::ManifestConverge,
+            Self::ManifestAppTask(_) => SetupJobKind::ManifestAppTask,
+        }
+    }
+
+    pub(crate) fn deadline_mut(&mut self) -> &mut Duration {
+        match self {
+            Self::Prepare(request) => &mut request.deadline,
+            Self::Task(request) => &mut request.deadline,
+            Self::AppTask(request) => &mut request.deadline,
+            Self::Ensure(request) => &mut request.deadline,
+            Self::ManifestEnsure(request) => &mut request.deadline,
+            Self::ManifestConverge(request) => &mut request.deadline,
+            Self::ManifestAppTask(request) => &mut request.deadline,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ActorSetupAppTaskSessionRecorder {
     pub(crate) actor: RegistryActor,
@@ -9,6 +97,30 @@ pub(crate) struct ActorSetupAppTaskSessionRecorder {
 }
 
 impl SetupAppTaskSessionRecorder for ActorSetupAppTaskSessionRecorder {
+    fn checkpoint_preparation<'a>(
+        &'a self,
+        intent: bosn_registry::ImageCreationIntent,
+        complete: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.actor
+                .record_image_creation_intent(intent, complete)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn record_image<'a>(
+        &'a self,
+        image: SetupEnsureImageResource,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.actor
+                .record_prepared_image(image)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
     fn begin<'a>(
         &'a self,
         managed_container_identity: String,
@@ -40,6 +152,31 @@ pub(crate) struct ActorManifestAppTaskSessionRecorder {
     pub(crate) run: Option<RunContext>,
 }
 impl ManifestAppTaskSessionRecorder for ActorManifestAppTaskSessionRecorder {
+    fn checkpoint_preparation<'a>(
+        &'a self,
+        intent: bosn_registry::ImageCreationIntent,
+        complete: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.actor
+                .record_image_creation_intent(intent, complete)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn record_image<'a>(
+        &'a self,
+        image: SetupEnsureImageResource,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.actor
+                .record_prepared_image(image)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+
     fn run_context(&self) -> Option<&RunContext> {
         self.run.as_ref()
     }

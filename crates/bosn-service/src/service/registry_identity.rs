@@ -62,6 +62,8 @@ pub struct PriorObject {
     /// Engine-visible name: a container or volume name, or an image's first
     /// repository tag, falling back to its id.
     pub name: String,
+    /// Immutable engine image ID, independent of mutable repository tags.
+    pub image_id: Option<String>,
     /// The `com.zackees.bosn.registry` value this object carries.
     pub registry_id: String,
     /// Size in bytes, or `None` when the engine reported nothing parseable.
@@ -303,6 +305,7 @@ pub(crate) fn parse_kind(
             |row: ContainerIdentity| PriorObject {
                 kind,
                 name: pick_name(row.name, row.id),
+                image_id: None,
                 registry_id: label_value(row.config, key),
                 bytes: row.size_rw,
             },
@@ -314,6 +317,7 @@ pub(crate) fn parse_kind(
             |row: VolumeIdentity| PriorObject {
                 kind,
                 name: pick_name(row.name, String::new()),
+                image_id: None,
                 registry_id: label_value_from(row.labels, key),
                 bytes: row.usage.and_then(|usage| usage.size),
             },
@@ -331,7 +335,8 @@ pub(crate) fn parse_kind(
                     .unwrap_or_default();
                 PriorObject {
                     kind,
-                    name: pick_name(tag, row.id),
+                    name: pick_name(tag, row.id.clone()),
+                    image_id: Some(row.id),
                     registry_id: label_value(row.config, key),
                     bytes: row.size,
                 }

@@ -582,6 +582,7 @@ fn prior_volume(name: &str, registry_id: &str, bytes: i128) -> PriorObject {
     PriorObject {
         kind: PriorObjectKind::Volume,
         name: name.to_owned(),
+        image_id: None,
         registry_id: registry_id.to_owned(),
         bytes: Some(bytes),
     }
@@ -634,6 +635,7 @@ fn the_prior_registry_refusal_names_every_orphaned_object_and_the_recovery() {
             PriorObject {
                 kind: PriorObjectKind::Container,
                 name: "bosn-task-7".to_owned(),
+                image_id: None,
                 registry_id: "22222222-2222-4222-8222-222222222222".to_owned(),
                 bytes: None,
             },

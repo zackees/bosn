@@ -29,6 +29,19 @@ held 182 volumes, reported as 515 GB. Reclaiming the volumes alone would have fr
 
 ## The policy
 
+Normal `bosn run` and `bosn ci` startup attempts to register the user maintenance
+service on Linux and macOS. The service uses the stable machine state directory,
+independent of `BOSN_STATE_DIR`, so temporary workspace state does not become its
+login-service path. Registration failures are printed; the workspace daemon
+still starts. CI and isolated tests do not register host services. Windows
+persistent registration is not yet supported.
+
+`bosn daemon autostart disable` persists an explicit opt-out, including before
+the first registration. Later automatic startup preserves that choice;
+`bosn daemon autostart enable` clears it after successful registration. Automatic
+retention itself is enabled unless `retention.toml` explicitly sets
+`auto_retention = false`.
+
 `crates/bosn-core/src/retention.rs` is pure and decides one question per object: **may this exact
 object be removed right now?** Callers own the clock, the engine, and the registry.
 
@@ -80,46 +93,18 @@ mounted.
 
 ## Unattended
 
-Opt-in via `retention.toml` in the state directory:
+Automatic retention runs on every daemon maintenance interval by default. To opt out,
+create `retention.toml` in the state directory:
 
 ```toml
-auto_retention = true
+auto_retention = false
 ```
 
-Absent, unreadable, or unparseable means **no**. Without the flag the pass still reads the engine
-and still reports what it *would* remove — a machine is never silently growing without a signal,
-which is the failure mode that produced this issue. An absent file is not a reason to delete; it
-is a reason to say so.
-
-## Stopped setup containers are reported by default (#518)
-
-`bosn-setup-v2-*` containers are created with `docker container create` and **no `--rm`**, and
-cannot gain one: `bosn-setup`'s `validate_observed` actively enforces `AutoRemove == false`, so
-the container is designed to persist and reclamation has to come from this side. A persisted
-container keeps every volume it ever mounted alive, so it is a disk problem rather than a
-container-count problem.
-
-`maintenance_pass` now reports the pile on every maintenance interval, **regardless of the
-opt-in**:
-
-```
-bosn retention: 12 stopped owned setup container(s), oldest 59263.4h old, pinning 34 volume(s),
-8 past the 6h container gate; enable with: auto_retention = true in retention.toml
-```
-
-The line leads with the volume count because that is the actual cost, and it names how many are
-already past the 6 h container gate — the same `bosn-core` gate an apply pass acts on, not a
-constant invented here. Pinned volumes are read from the container's own mount table; a shared
-volume is counted once, and a bind mount or an anonymous volume is not counted at all, since
-neither is a named blob the operator can act on.
-
-Two properties are deliberate:
-
-- **Reporting is unconditional; deletion is not.** The two must not be confused. With the default
-  opt-out config the pass removes nothing and still prints the line; that line is the only bound a
-  default install has.
-- **The advice changes, the facts do not.** Opting in swaps the trailing hint for
-  `bosn gc owned --apply --yes`; the counts are the same either way.
+Absent, unreadable, empty, or malformed configuration uses the enabled default.
+Only an explicit `auto_retention = false` disables automatic reclamation.
+The daemon must be running. The ownership, liveness, pinning, and age gates apply
+to every automatic removal. Stopped setup containers and their pinned volumes
+are reported even when automatic retention is disabled.
 
 ## Relation to the existing paths
 
@@ -133,9 +118,30 @@ This does **not** widen any existing destructive path:
 
 ## Known limits
 
-- **The registry reset.** Every GC path requires a registry row. A registry that is reset or
-  restored from a different `registry_id` orphans everything on disk, and *no* policy can reclaim
-  an object whose row is gone. Reclaiming those needs the label-based path above, which is why it
-  exists — but it is worth knowing that the registry is the authority for everything else.
+- **Lost ownership.** Cataloged registries retain machine-level ownership snapshots.
+  A missing original directory can recover from a clean snapshot with the exact
+  registry UUID, recorded retention setting, and machine writer exclusion.
+  Dirty snapshots, changed identities, and uncataloged historical registries
+  still require reconciliation; names alone never authorize removal.
 - Images report no size from `image ls`; `docker image inspect` is the read used instead.
 - Build cache is out of scope entirely, matching `is_removable_by_id`.
+
+## Pass time budget
+
+One synchronous pass has a ten-minute work budget shared by all resource stages
+and peer sweeps. Each Docker call uses the smaller of its own deadline and the
+remaining pass time. Registry pagination and idle retirement check expiry before
+continuing. Expiry reports an incomplete pass and defers remaining candidates;
+removals already completed remain in the result. An in-flight bounded registry
+read may finish after expiry. The client allows thirty minutes for the reply.
+
+### Registry diagnostic history
+
+Normal event appends retain the newest 4096 event IDs. Each new event accepts
+at most 256 UTF-8 bytes for its kind and 64 KiB for its detail, and requires a
+finite timestamp. Oversized writes return a diagnostic-bounds error before
+insertion. Event history is separate from resource, pin, lease, session and
+creation-intent ownership proof; trimming events never changes those tables.
+Legacy import preserves its source event records and IDs; normal appends then
+age older imported events out of the recent-history window. SQLite reuses freed
+pages, so an existing large database need not shrink on disk to stop growing.

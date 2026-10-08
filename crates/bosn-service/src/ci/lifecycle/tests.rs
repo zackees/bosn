@@ -64,6 +64,8 @@ pub fn plan(run: &str, deadline: Duration) -> EnginePlan {
             workflow: ".github/workflows/ci.yml".into(),
             workflow_overlaid: false,
             job: None,
+            cache_policy: Default::default(),
+            auto_retention: true,
             cache_route: crate::ci::cache_cohort::CacheRoute::Legacy(
                 crate::ci::cache_cohort::Namespace::parse(&"0".repeat(16)).unwrap(),
             ),
@@ -86,6 +88,44 @@ pub fn run_id(n: u32) -> String {
 }
 
 pub const OWNER: &str = "11111111-2222-4333-8444-555555555555";
+
+#[test]
+fn cache_enrollment_failure_and_timeout_retire_engine_before_workflow_execution() {
+    for hangs in [false, true] {
+        with_registry(|registry, directory| async move {
+            let backend = FakeBackend::with(Faults {
+                cache_prepare: !hangs,
+                cache_hang: hangs,
+                ..Default::default()
+            });
+            let run = run_id(545);
+            let plan = plan(&run, Duration::from_secs(1));
+            let cancellation = CancellationSource::new();
+            let mut observer = Collect::default();
+            let report = run_on_engine(
+                &registry,
+                &backend,
+                &plan,
+                &cancellation.token(),
+                &mut observer,
+            )
+            .await;
+            if hangs {
+                assert_eq!(report.execution, ExecutionEnd::TimedOut);
+            } else {
+                assert!(
+                    matches!(report.execution, ExecutionEnd::EngineFailed(ref error) if error.contains("cache enrollment"))
+                );
+            }
+            assert_eq!(report.cleanup, CleanupEnd::Removed);
+            assert_eq!(backend.live(), 0);
+            assert_eq!(*backend.executions.lock().unwrap(), 0);
+            assert!(observer.listing.is_none());
+            let retained = record(&registry, &directory, &run).await;
+            assert_eq!(retained.state, bosn_registry::act::ActEngineState::Terminal);
+        });
+    }
+}
 
 /// One daemon's sole registry writer over a registry file.
 pub struct Daemon {

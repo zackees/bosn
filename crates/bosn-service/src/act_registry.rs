@@ -14,6 +14,16 @@ use kernal_api::async_engine;
 /// There is deliberately no corresponding protobuf/client operation.
 #[derive(Debug)]
 pub enum ActRegistryCommand {
+    CacheMigrationGet {
+        namespace: String,
+    },
+    CacheMigrationBegin(bosn_registry::cache_migration::CacheMigrationIntent),
+    CacheMigrationPublished {
+        namespace: String,
+        nonce: String,
+        proof: bosn_registry::cache_migration::CachePublicationEvidence,
+        at: f64,
+    },
     /// Only before this writer actor admits any new creation/execution.
     StartupInterrupt {
         run: String,
@@ -130,6 +140,7 @@ pub enum ActRegistryCommand {
 }
 #[derive(Debug)]
 pub enum ActRegistryReply {
+    CacheMigration(Option<bosn_registry::cache_migration::CacheMigrationRecord>),
     Committed,
     Authorized(Box<ActEngineRecord>),
     Verified(Box<ActEngineRecord>),
@@ -171,6 +182,7 @@ pub(crate) fn apply(
     if matches!(
         &command,
         ActRegistryCommand::Begin(_)
+            | ActRegistryCommand::CacheMigrationBegin(_)
             | ActRegistryCommand::ToolRecoveryBegin { .. }
             | ActRegistryCommand::ToolRecoveryReserved { .. }
             | ActRegistryCommand::HelperBegin(_)
@@ -239,8 +251,26 @@ pub(crate) fn apply(
             .latest_cache_maintenance()
             .map(ActRegistryReply::Maintenance);
     }
+    if let ActRegistryCommand::CacheMigrationGet { namespace } = command {
+        return registry
+            .cache_migration(&namespace)
+            .map(ActRegistryReply::CacheMigration);
+    }
     let mut transaction = registry.begin_immediate()?;
     let reply = match command {
+        ActRegistryCommand::CacheMigrationBegin(intent) => {
+            transaction.begin_cache_migration(&intent)?;
+            ActRegistryReply::Committed
+        }
+        ActRegistryCommand::CacheMigrationPublished {
+            namespace,
+            nonce,
+            proof,
+            at,
+        } => {
+            transaction.record_cache_publication(&namespace, &nonce, &proof, at)?;
+            ActRegistryReply::Committed
+        }
         ActRegistryCommand::MaintenanceRecord(snapshot) => {
             transaction.record_cache_maintenance(&snapshot)?;
             ActRegistryReply::Committed
@@ -357,6 +387,7 @@ pub(crate) fn apply(
             ActRegistryReply::Committed
         }
         ActRegistryCommand::Pending { .. }
+        | ActRegistryCommand::CacheMigrationGet { .. }
         | ActRegistryCommand::MaintenanceLatest
         | ActRegistryCommand::Get { .. }
         | ActRegistryCommand::HelperPending { .. }
@@ -374,6 +405,103 @@ mod tests {
     use super::*;
     use bosn_registry::{Registry, act::ActEngineIntent};
     use kernal_api::platform::fs::TemporaryDirectory;
+
+    #[test]
+    fn migration_actor_commits_before_reply_and_preserves_evidence_on_conflict() {
+        let directory = TemporaryDirectory::new().unwrap();
+        let path = directory.path().join("registry.sqlite3");
+        let registry =
+            Registry::create_writer(&path, "11111111-2222-4333-8444-555555555555").unwrap();
+        let intent = bosn_registry::cache_migration::CacheMigrationIntent {
+            namespace: "0123456789abcdef".into(),
+            nonce: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".into(),
+            max_bytes: 100,
+            created_at: 1.0,
+        };
+        let proof = bosn_registry::cache_migration::CachePublicationEvidence {
+            source_fingerprint: "a".repeat(64),
+            imported_count: 1,
+            imported_bytes: 80,
+            retained_source_archive_bytes: 80,
+        };
+        kernal_api::async_engine::RuntimeBuilder::multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .run(async {
+                let (sender, receiver) = async_engine::channel(16);
+                let actor = RegistryActor { sender };
+                let task = async_engine::launch(crate::registry_actor(registry, receiver, None));
+                assert!(matches!(
+                    actor
+                        .act_registry(ActRegistryCommand::CacheMigrationBegin(intent.clone()))
+                        .await
+                        .unwrap(),
+                    ActRegistryReply::Committed
+                ));
+                let independent = Registry::open_read_only(&path).unwrap();
+                assert_eq!(
+                    independent
+                        .cache_migration(&intent.namespace)
+                        .unwrap()
+                        .unwrap()
+                        .intent,
+                    intent
+                );
+                assert!(
+                    actor
+                        .act_registry(ActRegistryCommand::CacheMigrationBegin(intent.clone()))
+                        .await
+                        .is_err()
+                );
+                assert!(matches!(
+                    actor
+                        .act_registry(ActRegistryCommand::CacheMigrationPublished {
+                            namespace: intent.namespace.clone(),
+                            nonce: intent.nonce.clone(),
+                            proof: proof.clone(),
+                            at: 2.0,
+                        })
+                        .await
+                        .unwrap(),
+                    ActRegistryReply::Committed
+                ));
+                let mut conflict = proof.clone();
+                conflict.source_fingerprint = "b".repeat(64);
+                assert!(
+                    actor
+                        .act_registry(ActRegistryCommand::CacheMigrationPublished {
+                            namespace: intent.namespace.clone(),
+                            nonce: intent.nonce.clone(),
+                            proof: conflict,
+                            at: 3.0,
+                        })
+                        .await
+                        .is_err()
+                );
+                let reply = actor
+                    .act_registry(ActRegistryCommand::CacheMigrationGet {
+                        namespace: intent.namespace.clone(),
+                    })
+                    .await
+                    .unwrap();
+                let ActRegistryReply::CacheMigration(Some(record)) = reply else {
+                    panic!("migration record missing")
+                };
+                assert_eq!(record.publication, Some(proof.clone()));
+                actor.stop().await;
+                task.await.unwrap();
+            });
+        let reopened = Registry::open_writer(&path).unwrap();
+        assert_eq!(
+            reopened
+                .cache_migration(&intent.namespace)
+                .unwrap()
+                .unwrap()
+                .publication,
+            Some(proof)
+        );
+    }
 
     #[test]
     #[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]

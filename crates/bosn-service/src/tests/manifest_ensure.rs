@@ -583,6 +583,19 @@ fn manifest_volume_intent_precedes_engine_work_and_is_consumed_with_success() {
     assert_eq!(intents.len(), 1);
     assert_eq!(intents[0].name, volume.name);
     assert_eq!(intents[0].labels, volume.labels);
+    let planned = registry
+        .resource_by_kind_name(ResourceKind::Volume, &volume.name)
+        .unwrap()
+        .unwrap();
+    assert_eq!(planned.id, volume.id);
+    assert_eq!(planned.generation, volume.generation);
+    assert_eq!(planned.workspace, volume.workspace);
+    assert_eq!(planned.retention, volume.retention);
+    assert_eq!(planned.scope, volume.scope);
+    let uses = registry.resource_uses(0, 8).unwrap().items;
+    assert_eq!(uses.len(), 1);
+    assert_eq!(uses[0].workspace, volume.workspace);
+    assert_eq!(uses[0].last_used, planned.last_used);
 
     let mut execution = manifest_ensure_execution(workspace, "app", "generation", "sha256:image");
     execution.volumes.push(volume.clone());
@@ -616,6 +629,39 @@ fn manifest_volume_intent_precedes_engine_work_and_is_consumed_with_success() {
             .items
             .iter()
             .any(|use_record| use_record.resource_id == volume.id)
+    );
+    // Reusing the factory's warm default must not undo an explicit registry pin.
+    execution.volumes[0].retention = Retention::Warm;
+    put_manifest_volume_intents(&mut registry, &execution.volumes).unwrap();
+    assert_eq!(
+        registry
+            .resource_by_kind_name(ResourceKind::Volume, &volume.name)
+            .unwrap()
+            .unwrap()
+            .retention,
+        Retention::Pinned
+    );
+    record_manifest_ensure(
+        &mut registry,
+        2,
+        &execution,
+        &test_manifest_recovery_contract(&execution),
+    )
+    .unwrap();
+    assert_eq!(
+        registry
+            .resource_by_kind_name(ResourceKind::Volume, &volume.name)
+            .unwrap()
+            .unwrap()
+            .retention,
+        Retention::Pinned
+    );
+    assert!(
+        registry
+            .volume_creation_intents(0, 8)
+            .unwrap()
+            .items
+            .is_empty()
     );
 }
 

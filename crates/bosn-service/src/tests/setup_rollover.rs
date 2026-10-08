@@ -2,6 +2,142 @@
 
 use super::*;
 
+#[derive(Default)]
+struct RejectPreparedOwnership {
+    images: std::sync::Mutex<Vec<SetupEnsureImageResource>>,
+    containers: std::sync::Mutex<Vec<SetupEnsureResource>>,
+    reject_container: bool,
+    reject_preparation: bool,
+    delay_preparation: bool,
+}
+impl SetupImageRecorder for RejectPreparedOwnership {
+    fn record_preparation<'a>(
+        &'a self,
+        _intent: bosn_registry::ImageCreationIntent,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            if self.delay_preparation {
+                async_engine::sleep(Duration::from_millis(20)).await;
+            }
+            if self.reject_preparation {
+                Err("preparation checkpoint rejected".into())
+            } else {
+                Ok(())
+            }
+        })
+    }
+    fn record<'a>(
+        &'a self,
+        image: SetupEnsureImageResource,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.images.lock().unwrap().push(image);
+            if self.reject_container {
+                Ok(())
+            } else {
+                Err("ownership checkpoint rejected".into())
+            }
+        })
+    }
+    fn record_container_intent<'a>(
+        &'a self,
+        container: SetupEnsureResource,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.containers.lock().unwrap().push(container);
+            Err("ownership checkpoint rejected".into())
+        })
+    }
+}
+
+#[test]
+fn ensure_requires_ownership_checkpoints_before_any_container_operation() {
+    let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+    let workspace = temporary.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let plan = pipeline_plan(&workspace);
+    let runtime = RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for reject_container in [false, true] {
+        for owner in [
+            PreparedImageOwner::Setup,
+            PreparedImageOwner::Manifest("app"),
+        ] {
+            let (namespace, stack) = match &owner {
+                PreparedImageOwner::Setup => ("setup-image", "setup"),
+                PreparedImageOwner::Manifest(stack) => ("manifest-image", *stack),
+            };
+            let engine = PipelineFakeEngine::new(
+                [
+                    Ok(command_result(0, Vec::new())),
+                    Ok(command_result(0, format!("{TEST_IDENTITY}\n"))),
+                ],
+                [],
+            );
+            let recorder = RejectPreparedOwnership {
+                reject_container,
+                ..Default::default()
+            };
+            runtime.run(async {
+                let deadline = async_engine::Deadline::after(Duration::from_secs(1));
+                let cancellation = CancellationSource::new();
+                let (events, _event_receiver) = async_engine::channel(8);
+                let (text_logs, _log_receiver) = async_engine::channel(8);
+                let logs = crate::raw_run_log::JobLogSink::transient(text_logs);
+                let pipeline = SetupEnsurePipeline {
+                    plan: &plan,
+                    workspace: workspace.clone(),
+                    deadline: &deadline,
+                    prepare_output: 512,
+                    ensure_output: 512,
+                    images: Some((&recorder, owner)),
+                };
+                let error = execute_setup_ensure_pipeline(
+                    &engine,
+                    &pipeline,
+                    &cancellation.token(),
+                    &events,
+                    &logs,
+                )
+                .await
+                .err()
+                .unwrap();
+                assert_eq!(error, "ownership checkpoint rejected");
+            });
+            assert!(engine.ensure_calls.lock().unwrap().is_empty());
+            let records = recorder.images.lock().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].generation, TEST_IDENTITY);
+            assert_eq!(records[0].name, records[0].id);
+            assert_eq!(records[0].stack, stack);
+            assert_eq!(records[0].id, format!("{namespace}:{TEST_IDENTITY}"));
+            let containers = recorder.containers.lock().unwrap();
+            assert_eq!(containers.len(), usize::from(reject_container));
+            if reject_container {
+                let container = &containers[0];
+                let namespace = if stack == "setup" {
+                    "setup-container"
+                } else {
+                    "manifest-container"
+                };
+                assert_eq!(container.stack, stack);
+                assert_eq!(
+                    container.generation,
+                    format!("sha256:{}", plan.content_sha256)
+                );
+                assert_eq!(container.workspace, plan.workspace_root.to_string_lossy());
+                assert_eq!(
+                    container.id,
+                    setup_container_resource_id(namespace, stack, &container.name)
+                );
+                assert!(!container.name.is_empty());
+            }
+        }
+    }
+}
+
 #[test]
 fn setup_ensure_rollover_conflict_rolls_back_without_retiring_current_generation() {
     let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
@@ -595,6 +731,7 @@ fn ensure_pipeline_does_not_reset_budget_and_never_mutates_after_prepare_or_owne
             deadline: &deadline,
             prepare_output: 512,
             ensure_output: 512,
+            images: None,
         };
         assert!(
             execute_setup_ensure_pipeline(
@@ -642,6 +779,7 @@ fn ensure_pipeline_does_not_reset_budget_and_never_mutates_after_prepare_or_owne
             deadline: &deadline,
             prepare_output: 512,
             ensure_output: 512,
+            images: None,
         };
         assert!(
             execute_setup_ensure_pipeline(
@@ -699,6 +837,7 @@ fn ensure_pipeline_does_not_reset_budget_and_never_mutates_after_prepare_or_owne
             deadline: &deadline,
             prepare_output: 1024,
             ensure_output: 1025,
+            images: None,
         };
         execute_setup_ensure_pipeline(&success, &pipeline, &cancellation.token(), &events, &logs)
             .await
@@ -709,4 +848,90 @@ fn ensure_pipeline_does_not_reset_budget_and_never_mutates_after_prepare_or_owne
     // the caller's full 2049-byte cap again.
     assert_eq!(success.image_calls.lock().unwrap()[0].1.output_limit, 1024);
     assert_eq!(success.ensure_calls.lock().unwrap()[0].1.output_limit, 1025);
+}
+
+#[test]
+fn preparation_checkpoint_failure_prevents_all_engine_operations() {
+    let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+    let plan = pipeline_plan(temporary.path());
+    let engine = PipelineFakeEngine::new([], []);
+    let recorder = RejectPreparedOwnership {
+        reject_preparation: true,
+        ..Default::default()
+    };
+    let runtime = RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.run(async {
+        let deadline = async_engine::Deadline::after(Duration::from_secs(1));
+        let cancellation = CancellationSource::new();
+        let (events, _receiver) = async_engine::channel(8);
+        let (text_logs, _logs) = async_engine::channel(8);
+        let logs = crate::raw_run_log::JobLogSink::transient(text_logs);
+        let pipeline = SetupEnsurePipeline {
+            plan: &plan,
+            workspace: temporary.path().into(),
+            deadline: &deadline,
+            prepare_output: 512,
+            ensure_output: 512,
+            images: Some((&recorder, PreparedImageOwner::Setup)),
+        };
+        let error = execute_setup_ensure_pipeline(
+            &engine,
+            &pipeline,
+            &cancellation.token(),
+            &events,
+            &logs,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error, "preparation checkpoint rejected");
+    });
+    assert!(engine.image_calls.lock().unwrap().is_empty());
+    assert!(engine.ensure_calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn preparation_checkpoint_latency_cannot_extend_engine_deadline() {
+    let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+    let plan = pipeline_plan(temporary.path());
+    let engine = PipelineFakeEngine::new([], []);
+    let recorder = RejectPreparedOwnership {
+        delay_preparation: true,
+        ..Default::default()
+    };
+    let runtime = RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.run(async {
+        let deadline = async_engine::Deadline::after(Duration::from_millis(10));
+        let cancellation = CancellationSource::new();
+        let (events, _receiver) = async_engine::channel(8);
+        let (text_logs, _logs) = async_engine::channel(8);
+        let logs = crate::raw_run_log::JobLogSink::transient(text_logs);
+        let pipeline = SetupEnsurePipeline {
+            plan: &plan,
+            workspace: temporary.path().into(),
+            deadline: &deadline,
+            prepare_output: 512,
+            ensure_output: 512,
+            images: Some((&recorder, PreparedImageOwner::Setup)),
+        };
+        let error = execute_setup_ensure_pipeline(
+            &engine,
+            &pipeline,
+            &cancellation.token(),
+            &events,
+            &logs,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error, "setup image preparation exceeded its deadline");
+    });
+    assert!(engine.image_calls.lock().unwrap().is_empty());
+    assert!(engine.ensure_calls.lock().unwrap().is_empty());
 }

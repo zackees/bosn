@@ -2,7 +2,7 @@
 //!
 //! #147's second precondition was that something must be running to do the work, and on the
 //! reference machine nothing was: `~/.local/state/bosn` did not exist and bosn had never run.
-//! Autostart is opt-in, and this module is what makes opting in actually work.
+//! Default registration preserves an explicit user opt-out across later starts.
 //!
 //! The original defect it replaces was precise: the Python implementation wrote the
 //! LaunchAgent plist and returned, never registering it with `launchd`. Dropping a file into
@@ -37,10 +37,11 @@ impl CommandRunner for SystemRunner {
         let Some((program, rest)) = argv.split_first() else {
             return Err("empty command".to_owned());
         };
-        let status = std::process::Command::new(program)
-            .args(rest)
-            .status()
-            .map_err(|error| format!("{}: {error}", program.to_string_lossy()))?;
+        let status = run_bounded(
+            std::process::Command::new(program).args(rest),
+            std::time::Duration::from_secs(15),
+        )
+        .map_err(|error| format!("{}: {error}", program.to_string_lossy()))?;
         if status.success() {
             Ok(())
         } else {
@@ -49,6 +50,32 @@ impl CommandRunner for SystemRunner {
                 program.to_string_lossy(),
                 status.code().unwrap_or(-1)
             ))
+        }
+    }
+}
+
+fn run_bounded(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> Result<std::process::ExitStatus, String> {
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            result => {
+                // Reap the child even when polling fails; registration must not
+                // leave a hung service-manager command behind.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(match result {
+                    Err(error) => error.to_string(),
+                    _ => "service-manager command timed out".to_owned(),
+                });
+            }
         }
     }
 }
@@ -84,7 +111,7 @@ pub struct AutostartStatus {
     pub path: PathBuf,
     /// Whether the entry file exists.
     pub written: bool,
-    /// Whether the service manager has the entry registered.
+    /// Whether a service-manager query confirms registration. False also covers an unavailable manager.
     pub registered: bool,
 }
 
@@ -122,8 +149,12 @@ pub fn reload_argv(platform: Platform) -> Option<Vec<OsString>> {
 /// The generated unit file for a platform.
 #[must_use]
 pub fn unit_contents(platform: Platform, binary: &Path, state_dir: &Path) -> String {
-    let binary = binary.to_string_lossy();
-    let state_dir = state_dir.to_string_lossy();
+    let encode = |path: &Path| match platform {
+        Platform::LinuxSystemd => systemd_argument(&path.to_string_lossy()),
+        Platform::MacosLaunchd => xml_text(&path.to_string_lossy()),
+    };
+    let binary = encode(binary);
+    let state_dir = encode(state_dir);
     match platform {
         Platform::LinuxSystemd => format!(
             "[Unit]\n\
@@ -154,10 +185,33 @@ pub fn unit_contents(platform: Platform, binary: &Path, state_dir: &Path) -> Str
              \x20   <string>{state_dir}</string>\n\
              \x20 </array>\n\
              \x20 <key>RunAtLoad</key><true/>\n\
+             \x20 <key>KeepAlive</key>\n\
+             \x20 <dict><key>SuccessfulExit</key><false/></dict>\n\
              </dict>\n\
              </plist>\n"
         ),
     }
+}
+
+fn systemd_argument(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+        .replace('%', "%%")
+        .replace('$', "$$");
+    format!("\"{escaped}\"")
+}
+
+fn xml_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 /// Where the entry file lives for a user.
@@ -196,6 +250,10 @@ pub fn enable(
         runner.run(&reload)?;
     }
     runner.run(&registration_argv(platform, true, &path))?;
+    let disabled = disabled_path(platform, home);
+    if disabled.exists() {
+        std::fs::remove_file(disabled).map_err(|error| error.to_string())?;
+    }
     Ok(AutostartStatus {
         platform,
         path,
@@ -215,6 +273,13 @@ pub fn disable(
     home: &Path,
 ) -> Result<AutostartStatus, String> {
     let path = unit_path(platform, home);
+    let disabled = disabled_path(platform, home);
+    if let Some(parent) = disabled.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    // Persist the user's choice even if registration is absent or the
+    // service manager is unavailable. A later automatic start must honor it.
+    std::fs::write(disabled, b"disabled\n").map_err(|error| error.to_string())?;
     if !path.exists() {
         return Ok(AutostartStatus {
             platform,
@@ -237,16 +302,69 @@ pub fn disable(
     })
 }
 
-/// Report what is on disk. This never mutates, and never consults the service manager.
+fn disabled_path(platform: Platform, home: &Path) -> PathBuf {
+    unit_path(platform, home).with_extension("disabled")
+}
+
+/// Register maintenance unless the user explicitly disabled autostart.
+///
+/// Returns `None` for an opt-out. Registration failures remain visible to the
+/// caller so a detached daemon cannot be mistaken for persistent maintenance.
+///
+/// # Errors
+/// Reports filesystem or service-manager failures.
+pub fn ensure_default(
+    runner: &dyn CommandRunner,
+    platform: Platform,
+    home: &Path,
+    binary: &Path,
+    state_dir: &Path,
+) -> Result<Option<AutostartStatus>, String> {
+    if disabled_path(platform, home).exists() {
+        return Ok(None);
+    }
+    let path = unit_path(platform, home);
+    if platform == Platform::MacosLaunchd
+        && std::fs::read_to_string(&path).ok().as_deref()
+            == Some(unit_contents(platform, binary, state_dir).as_str())
+        && runner
+            .run(&argv(&["launchctl", "list", SERVICE_NAME]))
+            .is_ok()
+    {
+        return Ok(Some(AutostartStatus {
+            platform,
+            path,
+            written: true,
+            registered: true,
+        }));
+    }
+    enable(runner, platform, home, binary, state_dir).map(Some)
+}
+
+/// Report the unit file and service-manager-confirmed registration without mutation.
 #[must_use]
 pub fn status(platform: Platform, home: &Path) -> AutostartStatus {
+    status_with_runner(&SystemRunner, platform, home)
+}
+
+fn status_with_runner(
+    runner: &dyn CommandRunner,
+    platform: Platform,
+    home: &Path,
+) -> AutostartStatus {
     let path = unit_path(platform, home);
     let written = path.is_file();
+    let query = match platform {
+        Platform::LinuxSystemd => {
+            argv(&["systemctl", "--user", "is-enabled", "--quiet", SERVICE_NAME])
+        }
+        Platform::MacosLaunchd => argv(&["launchctl", "list", SERVICE_NAME]),
+    };
     AutostartStatus {
         platform,
         path,
         written,
-        registered: written,
+        registered: runner.run(&query).is_ok(),
     }
 }
 
@@ -264,6 +382,33 @@ fn argv_os(prefix: &[&str], tail: OsString) -> Vec<OsString> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn generated_entries_escape_paths_for_their_platform_parser() {
+        assert_eq!(
+            super::systemd_argument("/a b/%x/$HOME/\"c\\d"),
+            "\"/a b/%%x/$$HOME/\\\"c\\\\d\""
+        );
+        assert_eq!(super::xml_text("/a&b/<c>"), "/a&amp;b/&lt;c&gt;");
+        let unit = super::unit_contents(
+            super::Platform::LinuxSystemd,
+            std::path::Path::new("/a b/bosn"),
+            std::path::Path::new("/state dir"),
+        );
+        assert!(unit.contains("ExecStart=\"/a b/bosn\" daemon serve --state-dir \"/state dir\""));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn service_manager_timeout_terminates_child() {
+        let started = std::time::Instant::now();
+        let result = super::run_bounded(
+            std::process::Command::new("/bin/sleep").arg("5"),
+            std::time::Duration::from_millis(20),
+        );
+        assert_eq!(result.unwrap_err(), "service-manager command timed out");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
     use super::*;
     use std::sync::Mutex;
 
@@ -289,6 +434,128 @@ mod tests {
     }
 
     #[test]
+    fn default_registration_preserves_opt_out_until_explicit_enable() {
+        let home = home();
+        let runner = FakeRunner::default();
+        let platform = Platform::LinuxSystemd;
+        let binary = Path::new("/usr/bin/bosn");
+        let state = Path::new("/state");
+        assert!(
+            ensure_default(&runner, platform, home.path(), binary, state)
+                .expect("default registration")
+                .is_some()
+        );
+        disable(&runner, platform, home.path()).expect("disable");
+        let calls = runner.calls.lock().expect("lock").len();
+        assert!(
+            ensure_default(&runner, platform, home.path(), binary, state)
+                .expect("honor opt-out")
+                .is_none()
+        );
+        assert_eq!(runner.calls.lock().expect("lock").len(), calls);
+        enable(&runner, platform, home.path(), binary, state).expect("explicit enable");
+        assert!(!disabled_path(platform, home.path()).exists());
+    }
+
+    #[test]
+    fn disabling_before_first_registration_preserves_opt_out() {
+        let home = home();
+        let runner = FakeRunner::default();
+        disable(&runner, Platform::MacosLaunchd, home.path()).expect("disable absent unit");
+        assert!(
+            ensure_default(
+                &runner,
+                Platform::MacosLaunchd,
+                home.path(),
+                Path::new("/bosn"),
+                Path::new("/state"),
+            )
+            .expect("opt-out")
+            .is_none()
+        );
+        assert!(runner.calls.lock().expect("lock").is_empty());
+    }
+
+    #[test]
+    fn a_unit_file_does_not_prove_service_manager_registration() {
+        for platform in [Platform::LinuxSystemd, Platform::MacosLaunchd] {
+            let home = home();
+            let path = unit_path(platform, home.path());
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                unit_contents(platform, Path::new("/bosn"), Path::new("/state")),
+            )
+            .unwrap();
+            let unavailable = FakeRunner {
+                fail_on: Some(0),
+                ..Default::default()
+            };
+            let observed = status_with_runner(&unavailable, platform, home.path());
+            assert!(observed.written);
+            assert!(!observed.registered);
+            let available = FakeRunner::default();
+            assert!(status_with_runner(&available, platform, home.path()).registered);
+            assert_eq!(
+                *unavailable.calls.lock().unwrap(),
+                *available.calls.lock().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_macos_registration_checks_the_manager_without_loading_again() {
+        let home = home();
+        let runner = FakeRunner::default();
+        for _ in 0..2 {
+            ensure_default(
+                &runner,
+                Platform::MacosLaunchd,
+                home.path(),
+                Path::new("/bosn"),
+                Path::new("/state"),
+            )
+            .unwrap();
+        }
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0][1], "load");
+        assert_eq!(calls[1], argv(&["launchctl", "list", SERVICE_NAME]));
+    }
+
+    #[test]
+    fn unloaded_macos_file_retries_registration() {
+        let home = home();
+        let path = unit_path(Platform::MacosLaunchd, home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            unit_contents(
+                Platform::MacosLaunchd,
+                Path::new("/bosn"),
+                Path::new("/state"),
+            ),
+        )
+        .unwrap();
+        let runner = FakeRunner {
+            fail_on: Some(0),
+            ..FakeRunner::default()
+        };
+        ensure_default(
+            &runner,
+            Platform::MacosLaunchd,
+            home.path(),
+            Path::new("/bosn"),
+            Path::new("/state"),
+        )
+        .unwrap();
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0][1], "list");
+        assert_eq!(calls[1][1], "load");
+    }
+
+    #[test]
     fn linux_enable_writes_the_unit_and_registers_it() {
         let home = home();
         let runner = FakeRunner::default();
@@ -303,7 +570,7 @@ mod tests {
         assert!(status.written && status.registered);
         assert!(status.path.exists());
         let contents = std::fs::read_to_string(&status.path).expect("read unit");
-        assert!(contents.contains("ExecStart=/usr/bin/bosn daemon serve --state-dir"));
+        assert!(contents.contains("ExecStart=\"/usr/bin/bosn\" daemon serve --state-dir"));
         assert!(contents.contains("WantedBy=default.target"));
         // The defect this replaces: writing the file without ever invoking the manager.
         let calls = runner.calls.lock().expect("lock").clone();
@@ -358,6 +625,8 @@ mod tests {
         );
         let contents = std::fs::read_to_string(&status.path).expect("read plist");
         assert!(contents.contains("<key>RunAtLoad</key>"));
+        assert!(contents.contains("<key>KeepAlive</key>"));
+        assert!(contents.contains("<dict><key>SuccessfulExit</key><false/></dict>"));
         let calls = runner.calls.lock().expect("lock").clone();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0][0], "launchctl");

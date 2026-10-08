@@ -79,6 +79,11 @@ pub struct SetupGcApplyResult {
 /// preview is never trusted: the daemon rebuilds the plan immediately before removing anything.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ManagedRetentionSummary {
+    /// Protection decisions across stages, including registry-level refusals.
+    /// An object can contribute more than once when re-observed in later stages.
+    pub held_total: u64,
+    /// Bounded descriptions of objects protected from this pass.
+    pub held: Vec<String>,
     /// False for a preview. A preview never mutates the engine.
     pub applied: bool,
     /// Reclaimable objects the re-derived plan selected, before any removal.

@@ -558,6 +558,7 @@ fn uncertain_app_task_uses_verified_managed_receipt_identity_to_protect_gc() {
     assert_ne!(managed_identity, observed.container_id);
     record_setup_app_task_session(&mut registry, 7, &managed_identity).unwrap();
     finish_setup_app_task_session(&mut registry, 7, "uncertain").unwrap();
+    assert_eq!(registry.resources(0, 16).unwrap().items[0].last_used, 1.0);
     assert_eq!(registry.status().unwrap().sessions, 1);
     assert_eq!(
         registry.execution_sessions(0, 1).unwrap().items[0].container_id,
@@ -568,6 +569,7 @@ fn uncertain_app_task_uses_verified_managed_receipt_identity_to_protect_gc() {
     assert_eq!(protected.counts.protected_session, 1);
 
     finish_setup_app_task_session(&mut registry, 7, "failed").unwrap();
+    assert!(registry.resources(0, 16).unwrap().items[0].last_used > 1.0);
     assert_eq!(registry.status().unwrap().sessions, 0);
     let eligible = registry.setup_gc_preview("/workspace", 0, 16).unwrap();
     assert_eq!(eligible.candidates.items.len(), 1);
@@ -613,6 +615,7 @@ fn uncertain_manifest_app_task_session_protects_matching_manifest_container() {
     transaction.commit().unwrap();
     record_manifest_app_task_session(&mut registry, 8, name).unwrap();
     finish_manifest_app_task_session(&mut registry, 8, "uncertain").unwrap();
+    assert_eq!(registry.resources(0, 16).unwrap().items[0].last_used, 1.0);
     assert_eq!(
         registry.execution_sessions(0, 1).unwrap().items[0].container_id,
         name
@@ -626,6 +629,7 @@ fn uncertain_manifest_app_task_session_protects_matching_manifest_container() {
             .is_empty()
     );
     finish_manifest_app_task_session(&mut registry, 8, "failed").unwrap();
+    assert!(registry.resources(0, 16).unwrap().items[0].last_used > 1.0);
     assert_eq!(
         registry
             .setup_gc_preview("/workspace", 0, 16)

@@ -107,6 +107,12 @@ impl CiRuntime {
                     .join(&record.workflow)
                     .is_file(),
                 job: record.job.clone(),
+                cache_policy: super::super::config::load(&self.state_dir)?
+                    .cache
+                    .unwrap_or_default(),
+                auto_retention: crate::managed_retention::automatic_retention_enabled(
+                    &self.state_dir,
+                ),
                 cache_route: super::super::cache_cohort::CacheRoute::Legacy(
                     super::super::cache_cohort::Namespace::parse(&record.cache_namespace())?,
                 ),

@@ -32,6 +32,21 @@ impl CiRuntime {
         };
         let runtime = self.clone();
         async_engine::launch(async move {
+            // Spare planning can pull images and filling creates engine and
+            // cache objects. Keep the same machine admission fence as runs
+            // through the final durable ownership handoff.
+            let _admission = match crate::managed_retention::gate::workload(
+                Duration::from_secs(60),
+                fill.cancellation(),
+            )
+            .await
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    runtime.spares.fill(fill, Err(error)).await;
+                    return;
+                }
+            };
             // Stopping the daemon must not wait for planning (an image pull).
             let plan = async_engine::cancellable(fill.cancellation(), runtime.spare_plan())
                 .await

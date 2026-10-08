@@ -163,15 +163,18 @@ impl Client {
             ));
         }
         match self
-            .call(Request {
-                gc_confirm: apply,
-                owned_confirm: apply,
-                owned_container_ttl_secs: policy.container_ttl.as_secs(),
-                owned_volume_ttl_secs: policy.volume_ttl.as_secs(),
-                owned_image_ttl_secs: policy.image_ttl.as_secs(),
-                owned_max_bytes: max_bytes as i64,
-                ..Request::operation(38)
-            })
+            .call_within(
+                Request {
+                    gc_confirm: apply,
+                    owned_confirm: apply,
+                    owned_container_ttl_secs: policy.container_ttl.as_secs(),
+                    owned_volume_ttl_secs: policy.volume_ttl.as_secs(),
+                    owned_image_ttl_secs: policy.image_ttl.as_secs(),
+                    owned_max_bytes: max_bytes as i64,
+                    ..Request::operation(38)
+                },
+                crate::managed_retention::RETENTION_REPLY_DEADLINE,
+            )
             .await?
         {
             Reply::ManagedRetention(v) => Ok(v),
@@ -424,6 +427,7 @@ impl Client {
     /// Confirmed, daemon-owned restoration of registry facts for one existing
     /// managed setup app. This never accepts a container/image selector.
     pub async fn setup_adopt(&self, request: SetupAdoptRequest) -> Result<SetupAdoptResult, Error> {
+        let response_deadline = request.deadline.saturating_add(IO_DEADLINE);
         let workspace = request.workspace.to_string_lossy().into_owned();
         let deadline_ms = u64::try_from(request.deadline.as_millis())
             .map_err(|_| Error::Protocol("setup deadline too large"))?;
@@ -438,15 +442,18 @@ impl Client {
             request.confirm,
         )?;
         match self
-            .call(Request {
-                workspace,
-                setup_config: request.config,
-                setup_policy: request.policy.wire(),
-                setup_deadline_ms: deadline_ms,
-                setup_output_limit: output_limit,
-                setup_adopt_confirm: true,
-                ..Request::operation(17)
-            })
+            .call_within(
+                Request {
+                    workspace,
+                    setup_config: request.config,
+                    setup_policy: request.policy.wire(),
+                    setup_deadline_ms: deadline_ms,
+                    setup_output_limit: output_limit,
+                    setup_adopt_confirm: true,
+                    ..Request::operation(17)
+                },
+                response_deadline,
+            )
             .await?
         {
             Reply::SetupAdopt(v) => Ok(v),
@@ -935,37 +942,6 @@ impl Client {
     }
     pub async fn ci_runners(&self, action: ci::RunnerAction) -> Result<ci::RunnersReply, Error> {
         self.ci_call(ci::CiRequest::Runners { action }).await
-    }
-    pub(crate) async fn call(&self, request: Request) -> Result<Reply, Error> {
-        self.call_within(request, IO_DEADLINE).await
-    }
-    /// One request whose reply may take up to `reply_deadline` to arrive.
-    async fn call_within(
-        &self,
-        request: Request,
-        reply_deadline: Duration,
-    ) -> Result<Reply, Error> {
-        // Resolve on every call: a Client may have been constructed while a
-        // fresh daemon was still creating its registry, before an inode-based
-        // alias-stable endpoint name existed.
-        let ep = endpoint(&self.state_dir)?;
-        let mut stream = async_engine::timeout(IO_DEADLINE, AsyncStream::connect(&ep))
-            .await
-            .map_err(|_| Error::Deadline)??;
-        if !peer_is_authorized(&stream.peer_identity()?.user_id, &ipc::current_user_id()?) {
-            return Err(Error::Unauthorized);
-        }
-        let mut payload = Vec::new();
-        request
-            .encode(&mut payload)
-            .map_err(|_| Error::Protocol("encode"))?;
-        write_frame(
-            &mut stream,
-            DaemonFrame::request(PAYLOAD_PROTOCOL, payload).with_request_id(1),
-        )
-        .await?;
-        let frame = read_frame_within(&mut stream, reply_deadline).await?;
-        decode_response_frame(frame, 1)
     }
 }
 

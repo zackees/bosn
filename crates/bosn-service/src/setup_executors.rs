@@ -23,6 +23,46 @@ impl SetupPrepareExecutor for DockerSetupPrepareExecutor {
         logs: &'a crate::raw_run_log::JobLogSink,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
+            self.execute_owned(request, cancellation, logs)
+                .await
+                .map(|execution| execution.receipt)
+        })
+    }
+
+    fn execute_owned<'a>(
+        &'a self,
+        request: SetupPrepareRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a crate::raw_run_log::JobLogSink,
+    ) -> Pin<Box<dyn Future<Output = Result<SetupPrepareExecution, String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.prepare_recorded(request, cancellation, logs, &ReceiptOnlyImageRecorder)
+                .await
+        })
+    }
+    fn execute_recorded<'a>(
+        &'a self,
+        request: SetupPrepareRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a crate::raw_run_log::JobLogSink,
+        images: &'a dyn SetupImageRecorder,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.prepare_recorded(request, cancellation, logs, images)
+                .await
+                .map(|execution| execution.receipt)
+        })
+    }
+}
+impl DockerSetupPrepareExecutor {
+    fn prepare_recorded<'a>(
+        &'a self,
+        request: SetupPrepareRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a crate::raw_run_log::JobLogSink,
+        images: &'a dyn SetupImageRecorder,
+    ) -> Pin<Box<dyn Future<Output = Result<SetupPrepareExecution, String>> + Send + 'a>> {
+        Box::pin(async move {
             let deadline = async_engine::Deadline::after(request.deadline);
             let plan = async_engine::cancellable(
                 cancellation,
@@ -52,10 +92,20 @@ impl SetupPrepareExecutor for DockerSetupPrepareExecutor {
                 }
                 Ok::<(), String>(())
             });
+            let preparation_intent = PreparedImageOwner::Setup.preparation_intent(&plan)?;
+            images
+                .record_preparation(preparation_intent.clone())
+                .await?;
             let result = prepare_setup_image(
-                &self.engine,
+                &bosn_setup::ImagePreparationEngine::new(
+                    &self.engine,
+                    &preparation_intent
+                        .ownership_proof()
+                        .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?,
                 &plan,
-                RunOptions::streaming(remaining, request.output_limit),
+                RunOptions::streaming(deadline.remaining(), request.output_limit),
                 cancellation,
                 &events,
             )
@@ -65,10 +115,23 @@ impl SetupPrepareExecutor for DockerSetupPrepareExecutor {
                 .await
                 .map_err(|_| "setup log forwarder stopped".to_owned())??;
             let prepared = result.map_err(|error| error.to_string())?;
-            Ok(format!(
-                "prepared {} as {}",
-                prepared.reference, prepared.observed_identity
-            ))
+            images
+                .record(setup_ensure_image_resource(
+                    &prepared,
+                    &plan.workspace_root.to_string_lossy(),
+                ))
+                .await?;
+            images.complete_preparation(preparation_intent).await?;
+            Ok(SetupPrepareExecution {
+                receipt: format!(
+                    "prepared {} as {}",
+                    prepared.reference, prepared.observed_identity
+                ),
+                image: Some(setup_ensure_image_resource(
+                    &prepared,
+                    &plan.workspace_root.to_string_lossy(),
+                )),
+            })
         })
     }
 }
@@ -94,6 +157,18 @@ impl SetupEnsureExecutor for DockerSetupEnsureExecutor {
         request: SetupEnsureJobRequest,
         cancellation: &'a async_engine::CancellationToken,
         logs: &'a crate::raw_run_log::JobLogSink,
+    ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.execute_recorded(request, cancellation, logs, &ReceiptOnlyImageRecorder)
+                .await
+        })
+    }
+    fn execute_recorded<'a>(
+        &'a self,
+        request: SetupEnsureJobRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a crate::raw_run_log::JobLogSink,
+        images: &'a dyn SetupImageRecorder,
     ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>> {
         Box::pin(async move {
             // The two engine stages receive disjoint portions of one caller
@@ -136,6 +211,7 @@ impl SetupEnsureExecutor for DockerSetupEnsureExecutor {
                 deadline: &deadline,
                 prepare_output,
                 ensure_output,
+                images: Some((images, PreparedImageOwner::Setup)),
             };
             let result =
                 execute_setup_ensure_pipeline(&self.engine, &pipeline, cancellation, &events, logs)

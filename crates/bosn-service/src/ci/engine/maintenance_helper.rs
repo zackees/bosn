@@ -131,6 +131,8 @@ pub(super) fn helper_create_args(identity: &helper::Identity) -> Vec<String> {
         &identity.name,
         "--label",
         &identity.label(),
+        "--label",
+        "com.zackees.bosn.act.cache-coordination=shared-machine-maintenance-v1",
         "--pull",
         "never",
         "--network",

@@ -38,17 +38,50 @@ impl DaemonChild {
     }
 
     pub(crate) fn start_with_certificate(state: &Path, certificate: Option<&Path>) -> Self {
+        Self::start_configured(state, certificate, None, None)
+    }
+
+    pub(crate) fn start_with_retention_root(state: &Path, root: &Path) -> Self {
+        Self::start_configured(state, None, Some(root), None)
+    }
+
+    pub(crate) fn start_with_docker_path(
+        state: &Path,
+        root: &Path,
+        path: &std::ffi::OsStr,
+    ) -> Self {
+        Self::start_configured(state, None, Some(root), Some(path))
+    }
+
+    fn start_configured(
+        state: &Path,
+        certificate: Option<&Path>,
+        retention_root: Option<&Path>,
+        path: Option<&std::ffi::OsStr>,
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_bosn"));
         command
             .args(["daemon", "serve", "--state-dir"])
             .arg(state)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(if path.is_some() {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            });
         if let Some(certificate) = certificate {
             command
                 .env("SSL_CERT_FILE", certificate)
                 .env("NO_PROXY", "localhost,127.0.0.1");
+        }
+        if let Some(root) = retention_root {
+            command
+                .env("BOSN_TEST_ISOLATED", "1")
+                .env("BOSN_TEST_RETENTION_ROOT", root);
+        }
+        if let Some(path) = path {
+            command.env("PATH", path);
         }
         Self {
             child: command.spawn().expect("start production Bosn daemon"),
@@ -187,6 +220,75 @@ impl Drop for ExactContainerCleanup {
                 "live setup ensure cleanup could not inspect {}: {error}",
                 self.container_name
             ),
+        }
+    }
+}
+
+/// Own exact fixture resources even if an assertion or client deadline fails.
+/// Volume proof is repeated before teardown; names alone never authorize it.
+pub(crate) struct ExactManifestCleanup {
+    engine: DockerEngine,
+    container: Option<ExactContainerCleanup>,
+    volumes: Vec<bosn_registry::Resource>,
+    image: Option<String>,
+}
+
+impl ExactManifestCleanup {
+    pub(crate) fn new(engine: &DockerEngine, resources: &[bosn_registry::Resource]) -> Self {
+        let container = resources
+            .iter()
+            .find(|row| row.kind == ResourceKind::Container);
+        let image = resources.iter().find(|row| row.kind == ResourceKind::Image);
+        Self {
+            engine: engine.clone(),
+            container: container.map(|container| ExactContainerCleanup {
+                engine: engine.clone(),
+                container_name: container.name.clone(),
+                content_sha256: container.generation.strip_prefix("sha256:").unwrap().into(),
+            }),
+            volumes: resources
+                .iter()
+                .filter(|row| row.kind == ResourceKind::Volume)
+                .cloned()
+                .collect(),
+            image: image.map(|image| image.generation.clone()),
+        }
+    }
+}
+
+impl Drop for ExactManifestCleanup {
+    fn drop(&mut self) {
+        drop(self.container.take());
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Volume {
+            name: String,
+            labels: std::collections::BTreeMap<String, String>,
+        }
+        for row in &self.volumes {
+            let inspected = docker_capture(&self.engine, ["volume", "inspect", row.name.as_str()]);
+            if !inspected.ok() {
+                continue;
+            }
+            let Ok(volumes) = serde_json::from_slice::<Vec<Volume>>(&inspected.stdout) else {
+                continue;
+            };
+            if volumes.len() != 1 {
+                continue;
+            }
+            let volume = &volumes[0];
+            if volume.name != row.name
+                || volume.labels.get(MANAGED_LABEL).map(String::as_str) != Some("v1")
+                || volume.labels.get(NAME_LABEL) != Some(&row.name)
+                || volume.labels.get(CONTENT_LABEL).map(String::as_str)
+                    != row.generation.strip_prefix("sha256:")
+            {
+                continue;
+            }
+            let _ = docker_capture(&self.engine, ["volume", "rm", row.name.as_str()]);
+        }
+        if let Some(image) = &self.image {
+            let _ = docker_capture(&self.engine, ["image", "rm", image.as_str()]);
         }
     }
 }

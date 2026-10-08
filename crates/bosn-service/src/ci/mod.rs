@@ -59,6 +59,7 @@ pub mod cache_import;
 pub mod cache_inventory;
 pub mod cache_maintenance;
 pub mod cache_policy;
+pub mod cache_routing;
 pub mod checkout;
 pub mod client;
 pub mod config;

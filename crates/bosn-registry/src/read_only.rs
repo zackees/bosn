@@ -7,6 +7,7 @@ pub struct ReadOnlyRegistry {
     // Present only for the offline reconciliation preview, whose existing
     // contract excludes a second writer for the complete inspection.
     pub(crate) _writer_lock: Option<kernal_api::platform::fs::OwnedFileLock>,
+    pub(crate) _prior_writer_locks: Vec<kernal_api::platform::fs::OwnedFileLock>,
 }
 impl ReadOnlyRegistry {
     pub fn meta(&self, key: &str) -> Result<Option<String>, Error> {

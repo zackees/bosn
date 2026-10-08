@@ -19,12 +19,28 @@ impl DockerSetupTaskExecutor {
     }
 }
 impl SetupTaskExecutor for DockerSetupTaskExecutor {
-    #[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
     fn execute<'a>(
         &'a self,
         request: SetupTaskJobRequest,
         cancellation: &'a async_engine::CancellationToken,
         logs: &'a crate::raw_run_log::JobLogSink,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.execute_recorded(request, cancellation, logs, &ReceiptOnlyImageRecorder)
+                .await
+        })
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "sequential preparation and task pipeline"
+    )]
+    fn execute_recorded<'a>(
+        &'a self,
+        request: SetupTaskJobRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a crate::raw_run_log::JobLogSink,
+        images: &'a dyn SetupImageRecorder,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
             // Both engine stages are sequential. Partitioning this one input
@@ -75,10 +91,20 @@ impl SetupTaskExecutor for DockerSetupTaskExecutor {
             logs.send("[setup] preparing application image".into())
                 .await
                 .map_err(|_| "setup log consumer closed".to_owned())?;
+            let preparation_intent = PreparedImageOwner::Setup.preparation_intent(&plan)?;
+            images
+                .record_preparation(preparation_intent.clone())
+                .await?;
             let prepared = prepare_setup_image(
-                &self.engine,
+                &bosn_setup::ImagePreparationEngine::new(
+                    &self.engine,
+                    &preparation_intent
+                        .ownership_proof()
+                        .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?,
                 &plan,
-                RunOptions::streaming(remaining, prepare_output),
+                RunOptions::streaming(deadline.remaining(), prepare_output),
                 cancellation,
                 &events,
             )
@@ -93,6 +119,10 @@ impl SetupTaskExecutor for DockerSetupTaskExecutor {
                     return Err(error.to_string());
                 }
             };
+            let image =
+                setup_ensure_image_resource(&prepared, &plan.workspace_root.to_string_lossy());
+            images.record(image.clone()).await?;
+            images.complete_preparation(preparation_intent).await?;
             if cancellation.is_cancelled() {
                 drop(events);
                 forwarder
@@ -127,6 +157,7 @@ impl SetupTaskExecutor for DockerSetupTaskExecutor {
                 },
             )
             .await;
+            images.record(image).await?;
             drop(events);
             forwarder
                 .await
@@ -212,10 +243,20 @@ impl SetupAppTaskExecutor for DockerSetupAppTaskExecutor {
             logs.send("[setup-app-task] verifying application image".into())
                 .await
                 .map_err(|_| "setup app task log consumer closed".to_owned())?;
+            let preparation_intent = PreparedImageOwner::Setup.preparation_intent(&plan)?;
+            session
+                .checkpoint_preparation(preparation_intent.clone(), false)
+                .await?;
             let prepared = prepare_setup_image(
-                &self.engine,
+                &bosn_setup::ImagePreparationEngine::new(
+                    &self.engine,
+                    &preparation_intent
+                        .ownership_proof()
+                        .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?,
                 &plan,
-                RunOptions::streaming(remaining, quarter),
+                RunOptions::streaming(deadline.remaining(), quarter),
                 cancellation,
                 &events,
             )
@@ -230,6 +271,15 @@ impl SetupAppTaskExecutor for DockerSetupAppTaskExecutor {
                     return Err(error.to_string());
                 }
             };
+            session
+                .record_image(setup_ensure_image_resource(
+                    &prepared,
+                    &plan.workspace_root.to_string_lossy(),
+                ))
+                .await?;
+            session
+                .checkpoint_preparation(preparation_intent, true)
+                .await?;
             let remaining = deadline.remaining();
             if cancellation.is_cancelled() || remaining.is_zero() {
                 drop(events);
@@ -247,7 +297,7 @@ impl SetupAppTaskExecutor for DockerSetupAppTaskExecutor {
                     plan: &plan,
                     workspace_root: request.workspace.clone(),
                     prepared_image: &prepared,
-                    options: RunOptions::streaming(remaining, quarter),
+                    options: RunOptions::streaming(deadline.remaining(), quarter),
                     cancellation,
                     events: &events,
                 },

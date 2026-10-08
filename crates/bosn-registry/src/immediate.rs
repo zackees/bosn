@@ -277,6 +277,26 @@ impl<'a> Immediate<'a> {
         self.transaction.execute("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", &[Value::Text(key.into()), Value::Text(value.into())])?;
         Ok(())
     }
+    /// Refresh factory ownership without withdrawing an existing pin. Explicit
+    /// retention changes still use `put_resource`; creation/reuse is not one.
+    pub fn put_resource_preserving_pin(&mut self, value: &Resource) -> Result<(), Error> {
+        let rows = self.transaction.query(
+            "SELECT retention FROM resources WHERE id=?",
+            &[Value::Text(value.id.clone())],
+            QueryLimits {
+                max_rows: 1,
+                max_bytes: 64,
+            },
+        )?;
+        let mut value = value.clone();
+        if rows.first().is_some_and(
+            |row| matches!(row.get(0), Some(Value::Text(retention)) if retention == "pinned"),
+        ) {
+            value.retention = Retention::Pinned;
+        }
+        self.put_resource(&value)
+    }
+
     pub fn put_resource(&mut self, v: &Resource) -> Result<(), Error> {
         let rows = self.transaction.query(
             "SELECT id FROM resources WHERE kind=? AND name=?",
@@ -568,6 +588,13 @@ impl<'a> Immediate<'a> {
         Ok(())
     }
     pub fn append_event(&mut self, at: f64, kind: &str, detail: &str) -> Result<(), Error> {
+        if !at.is_finite()
+            || kind.is_empty()
+            || kind.len() > MAX_EVENT_KIND_BYTES
+            || detail.len() > MAX_EVENT_DETAIL_BYTES
+        {
+            return Err(Error::BadRow("event diagnostic bounds"));
+        }
         self.transaction.execute(
             "INSERT INTO events(at,kind,detail) VALUES(?,?,?)",
             &[
@@ -576,7 +603,7 @@ impl<'a> Immediate<'a> {
                 Value::Text(detail.into()),
             ],
         )?;
-        Ok(())
+        self.trim_event_history()
     }
     pub(crate) fn put_event_with_id(&mut self, value: &Event) -> Result<(), Error> {
         self.transaction.execute(

@@ -30,6 +30,7 @@ use super::{
     workflow,
 };
 use crate::{RegistryActor, secrets::SecretMasker};
+mod cache_maintenance;
 mod cleanup;
 mod observer;
 mod persist;
@@ -718,6 +719,8 @@ impl CiRuntime {
         self.localize_checkouts(record, observer);
         let deadline = async_engine::Deadline::after(Duration::from_secs(record.timeout_secs));
         let token = cancel.token();
+        let _machine_admission =
+            crate::managed_retention::gate::workload(deadline.remaining(), &token).await?;
         let planned = self.plan(record, deadline, &token);
         let Ok(plan) = async_engine::timeout_at(deadline, planned).await else {
             // Nothing exists on the host yet: an engine is only created

@@ -3,10 +3,47 @@
 use super::*;
 
 impl Registry {
+    /// Actual SQLite authority path, including any completed registry relocation.
+    pub fn database_path(&self) -> Result<PathBuf, Error> {
+        let rows = self.connection.query(
+            "PRAGMA database_list",
+            &[],
+            QueryLimits {
+                max_rows: 8,
+                max_bytes: 16 * 1024,
+            },
+        )?;
+        for row in rows {
+            if text(&row, 1)? == "main" {
+                let path = PathBuf::from(text(&row, 2)?);
+                if path.is_absolute() {
+                    return Ok(path);
+                }
+            }
+        }
+        Err(Error::BadRow("registry authority path"))
+    }
+    /// Export committed ownership through SQLite's consistent backup API.
+    /// The destination must be new; callers publish the snapshot only after
+    /// fencing further writes. Copying the database file alone would omit WAL
+    /// commits and could lose pins, leases, or execution sessions.
+    pub fn backup_ownership(&self, destination: impl AsRef<Path>) -> Result<(), Error> {
+        self.connection.backup_to(destination)?;
+        Ok(())
+    }
+
     /// Opens a fully initialized v5 registry for its sole writer.  The lock is
     /// held for the Registry lifetime, including any caller-held immediate tx.
     pub fn open_writer(path: impl AsRef<Path>) -> Result<Self, Error> {
-        let path = path.as_ref();
+        let original = path.as_ref();
+        let resolved = Self::resolve_authority(original)?;
+        let path = resolved.as_path();
+        let mut prior_writers = Vec::new();
+        if path != original && original.try_exists()? {
+            let identity = fs::path_identity(original)?;
+            prior_writers.push(acquire_writer_lock(original)?);
+            verify_database_identity(original, identity)?;
+        }
         // This probe is intentionally before any read-write SQLite open: SQLite's
         // normal open creates a missing file and may alter WAL bookkeeping.
         // Fresh databases must use create_writer's explicit create-new path.
@@ -23,6 +60,9 @@ impl Registry {
         Ok(Self {
             connection,
             _writer: writer,
+            prior_writers,
+            ownership_backup: None,
+            ownership_backup_dirty: false,
         })
     }
     /// Opens the one deliberately offline writer permitted to inspect and
@@ -51,6 +91,9 @@ impl Registry {
         Ok(Self {
             connection,
             _writer: writer,
+            prior_writers: Vec::new(),
+            ownership_backup: None,
+            ownership_backup_dirty: false,
         })
     }
     /// Atomically reserves a new database path, initializes v5, and retains
@@ -58,6 +101,9 @@ impl Registry {
     /// kernel random facade is async and this synchronous registry must not
     /// invent an executor.
     pub fn create_writer(path: impl AsRef<Path>, registry_id: &str) -> Result<Self, Error> {
+        if Self::resolve_authority(path.as_ref())? != path.as_ref() {
+            return Err(Error::BadRow("registry authority already exists"));
+        }
         if !is_uuid(registry_id) {
             return Err(Error::BadRow("registry_id"));
         }
@@ -87,23 +133,59 @@ impl Registry {
         Ok(Self {
             connection,
             _writer: writer,
+            prior_writers: Vec::new(),
+            ownership_backup: None,
+            ownership_backup_dirty: false,
         })
     }
     /// Opens diagnostics only. It never initializes, migrates, or takes a writer lock.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<ReadOnlyRegistry, Error> {
-        let path = path.as_ref();
+        let resolved = Self::resolve_authority(path.as_ref())?;
+        let path = resolved.as_path();
         let connection =
             Connection::open_read_only_with_busy_timeout(path, std::time::Duration::from_secs(5))?;
         Self::validate(&connection, path)?;
         Ok(ReadOnlyRegistry {
             connection,
             _writer_lock: None,
+            _prior_writer_locks: Vec::new(),
         })
     }
     /// Inspect a reconciliation-gated registry without any SQLite write.
     /// This is the preview counterpart to the explicit reconciliation writer.
     pub fn open_reconciliation_preview(path: impl AsRef<Path>) -> Result<ReadOnlyRegistry, Error> {
         Self::open_reconciliation_preview_inner(path.as_ref(), None)
+    }
+
+    /// Read a valid registry while excluding its daemon writer. Peer retention
+    /// holds this guard across Docker observations and removals. This neither
+    /// creates a database nor changes its SQLite contents during preview.
+    pub fn open_retention_snapshot(path: impl AsRef<Path>) -> Result<ReadOnlyRegistry, Error> {
+        let original = path.as_ref();
+        let resolved = Self::resolve_authority(original)?;
+        let path = resolved.as_path();
+        let mut prior_writers = Vec::new();
+        if path != original && original.try_exists()? {
+            let identity = fs::path_identity(original)?;
+            prior_writers.push(acquire_writer_lock(original)?);
+            verify_database_identity(original, identity)?;
+        }
+        let identity = fs::path_identity(path)?;
+        let probe =
+            Connection::open_read_only_with_busy_timeout(path, std::time::Duration::from_secs(5))?;
+        Self::validate(&probe, path)?;
+        drop(probe);
+        let writer = acquire_writer_lock(path)?;
+        verify_database_identity(path, identity)?;
+        let connection =
+            Connection::open_read_only_with_busy_timeout(path, std::time::Duration::from_secs(5))?;
+        Self::validate(&connection, path)?;
+        verify_database_identity(path, identity)?;
+        Ok(ReadOnlyRegistry {
+            connection,
+            _writer_lock: Some(writer),
+            _prior_writer_locks: prior_writers,
+        })
     }
     // The callback is test-only plumbing for a deterministic pre-lock race.
     pub(crate) fn open_reconciliation_preview_inner(
@@ -136,6 +218,7 @@ impl Registry {
         Ok(ReadOnlyRegistry {
             connection,
             _writer_lock: Some(writer),
+            _prior_writer_locks: Vec::new(),
         })
     }
     /// Verify SQLite's internal consistency through the already-open sole
@@ -381,6 +464,7 @@ impl Registry {
         meta(&self.connection, key)
     }
     pub fn begin_immediate(&mut self) -> Result<Immediate<'_>, Error> {
+        self.mark_ownership_backup_dirty()?;
         Ok(Immediate {
             transaction: self.connection.begin_immediate()?,
         })

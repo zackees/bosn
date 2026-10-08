@@ -22,6 +22,18 @@ impl DockerActBackend {
         stop: &CancellationToken,
     ) {
         loop {
+            let admission =
+                match crate::managed_retention::gate::workload(Duration::from_secs(60), stop).await
+                {
+                    Ok(guard) => guard,
+                    Err(detail) => {
+                        eprintln!("bosn: cache policy discovery deferred: {detail}");
+                        if !retry_admission(stop).await {
+                            return;
+                        }
+                        continue;
+                    }
+                };
             let discovered = match async_engine::cancellable(
                 stop,
                 async_engine::timeout(
@@ -35,6 +47,7 @@ impl DockerActBackend {
                 Ok(Err(_)) => Err("shared policy discovery deadline exceeded".into()),
                 Ok(Ok(result)) => result,
             };
+            drop(admission);
             match discovered {
                 Ok(Some(policy)) => {
                     let (reports, mut receiver) = async_engine::channel(1);
@@ -95,6 +108,18 @@ impl DockerActBackend {
     ) {
         let mut cursor = None;
         while !stop.is_cancelled() {
+            let admission =
+                match crate::managed_retention::gate::workload(Duration::from_secs(60), stop).await
+                {
+                    Ok(guard) => guard,
+                    Err(detail) => {
+                        eprintln!("bosn: cache cohort maintenance deferred: {detail}");
+                        if !retry_admission(stop).await {
+                            return;
+                        }
+                        continue;
+                    }
+                };
             let recovery = match async_engine::cancellable(
                 stop,
                 async_engine::timeout(
@@ -141,6 +166,7 @@ impl DockerActBackend {
                 Ok(result) => result,
                 Err(_) => return,
             };
+            drop(admission);
             // Backpressure prevents an unbounded history or unsupervised next
             // pass. Shutdown also interrupts a disconnected/stalled consumer.
             if !matches!(
@@ -160,6 +186,13 @@ impl DockerActBackend {
             }
         }
     }
+}
+
+/// Admission failure defers the next attempt without ending supervision.
+async fn retry_admission(stop: &CancellationToken) -> bool {
+    async_engine::cancellable(stop, async_engine::sleep(Duration::from_secs(60)))
+        .await
+        .is_ok()
 }
 
 #[cfg(test)]

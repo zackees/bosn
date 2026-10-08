@@ -78,6 +78,8 @@ fn published_act_plans_workflows_with_typed_legacy_and_cohort_routes() {
                 workflow: format!("{ENGINE_WORK}/workflow.yaml"),
                 workflow_overlaid: false,
                 job: None,
+                cache_policy: Default::default(),
+                auto_retention: true,
                 cache_route,
                 secrets: Default::default(),
                 params: Default::default(),
@@ -108,6 +110,67 @@ with tempfile.TemporaryDirectory() as directory:
         assert 'proof-job' in command.stdout, (command.stdout, command.stderr)
 "#, &binary, &serde_json::to_string(&invocations).unwrap(), ENGINE_CACHE, ENGINE_WORK,
     ]).output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
+#[ignore = "requires BOSN_ACT_RETENTION_TEST_BINARY pointing to verified pinned act2"]
+fn opted_out_workflow_does_not_open_or_initialize_archive_storage() {
+    let namespace = Namespace::parse("0123456789abcdef").unwrap();
+    let invocation = ActInvocation {
+        event: "push".into(),
+        workflow: "workflow.yaml".into(),
+        workflow_overlaid: false,
+        job: None,
+        cache_route: CacheRoute::Cohort {
+            namespace,
+            policy: CachePolicy::default(),
+        },
+        cache_policy: Default::default(),
+        auto_retention: false,
+        secrets: Default::default(),
+        params: Default::default(),
+    };
+    let result = std::process::Command::new("python3")
+        .args([
+            "-c",
+            r#"
+import json, pathlib, subprocess, sys, tempfile
+binary, encoded, cache, work = sys.argv[1:]
+with tempfile.TemporaryDirectory() as temporary:
+    root = pathlib.Path(temporary)
+    private = root / 'work'
+    (private / 'overlay').mkdir(parents=True)
+    (private / 'event.json').write_text('{}')
+    (private / 'workflow.yaml').write_text('on: [push]\njobs:\n  proof-job:\n    if: false\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n')
+    args = [value.replace(cache, str(root / 'cache')).replace(work, str(private))
+            for value in json.loads(encoded)]
+    args.extend(['-n', '--artifact-server-addr', '127.0.0.1', '--cache-server-addr', '127.0.0.1'])
+    archive = pathlib.Path(args[args.index('--cache-server-path') + 1])
+    for existing in [False, True]:
+        if existing:
+            archive.mkdir(parents=True)
+            (archive / 'preserved').write_bytes(b'archive evidence')
+        completed = subprocess.run([binary, *args], cwd=private, stdin=subprocess.DEVNULL,
+                                   capture_output=True, text=True, timeout=15)
+        assert completed.returncode == 0, (completed.stdout, completed.stderr)
+        if existing:
+            assert sorted(item.name for item in archive.iterdir()) == ['preserved']
+            assert (archive / 'preserved').read_bytes() == b'archive evidence'
+        else:
+            assert not archive.exists(), 'opted-out run initialized archive storage'
+"#,
+            &std::env::var("BOSN_ACT_RETENTION_TEST_BINARY").unwrap(),
+            &serde_json::to_string(&invocation.args()).unwrap(),
+            ENGINE_CACHE,
+            ENGINE_WORK,
+        ])
+        .output()
+        .unwrap();
     assert!(
         result.status.success(),
         "{}",

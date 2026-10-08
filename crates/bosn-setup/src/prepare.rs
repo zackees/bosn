@@ -27,6 +27,12 @@ pub enum SetupImageCommand {
         asset_root: PathBuf,
         dockerfile_path: PathBuf,
     },
+    OwnedBuild {
+        tag: String,
+        asset_root: PathBuf,
+        dockerfile_path: PathBuf,
+        proof: String,
+    },
     Inspect {
         image: String,
     },
@@ -57,6 +63,24 @@ impl SetupImageCommand {
                     .expect("validated plan Dockerfile lies below its asset root"),
                 ".".into(),
             ],
+            Self::OwnedBuild {
+                tag,
+                asset_root,
+                dockerfile_path,
+                proof,
+            } => {
+                let mut arguments = Self::Build {
+                    tag: tag.clone(),
+                    asset_root: asset_root.clone(),
+                    dockerfile_path: dockerfile_path.clone(),
+                }
+                .docker_args();
+                arguments.splice(
+                    1..1,
+                    ["--label".into(), format!("{IMAGE_INTENT_LABEL}={proof}")],
+                );
+                arguments
+            }
             Self::Inspect { image } => vec![
                 "image".into(),
                 "inspect".into(),
@@ -98,10 +122,73 @@ impl SetupImageEngine for DockerEngine {
         events: &'a Sender<EngineEvent>,
     ) -> Self::StreamFuture<'a> {
         let mut engine = self.with_args(command.docker_args());
-        if let SetupImageCommand::Build { asset_root, .. } = command {
+        if let SetupImageCommand::Build { asset_root, .. }
+        | SetupImageCommand::OwnedBuild { asset_root, .. } = command
+        {
             engine = engine.current_dir(asset_root);
         }
         Box::pin(async move { engine.stream(options, Some(cancellation), events).await })
+    }
+}
+
+pub const IMAGE_INTENT_LABEL: &str = "com.zackees.bosn.image-preparation";
+
+/// Adds durable-intent identity to exported builds without modifying pulls.
+/// The label is identity evidence; recovery must verify its registry intent.
+pub struct ImagePreparationEngine<'a, E> {
+    engine: &'a E,
+    proof: Option<String>,
+}
+impl<'a, E> ImagePreparationEngine<'a, E> {
+    pub fn unowned(engine: &'a E) -> Self {
+        Self {
+            engine,
+            proof: None,
+        }
+    }
+    pub fn new(engine: &'a E, proof: &str) -> Result<Self, SetupPrepareError> {
+        if !valid_hash(proof) {
+            return Err(SetupPrepareError::InvalidPlan("invalid image intent proof"));
+        }
+        Ok(Self {
+            engine,
+            proof: Some(proof.into()),
+        })
+    }
+}
+impl<E: SetupImageEngine + Sync> SetupImageEngine for ImagePreparationEngine<'_, E> {
+    type StreamFuture<'a>
+        = E::StreamFuture<'a>
+    where
+        Self: 'a;
+    fn stream<'a>(
+        &'a self,
+        command: SetupImageCommand,
+        options: RunOptions,
+        cancellation: &'a CancellationToken,
+        events: &'a Sender<EngineEvent>,
+    ) -> Self::StreamFuture<'a> {
+        let command = match command {
+            SetupImageCommand::Build {
+                tag,
+                asset_root,
+                dockerfile_path,
+            } => match &self.proof {
+                Some(proof) => SetupImageCommand::OwnedBuild {
+                    tag,
+                    asset_root,
+                    dockerfile_path,
+                    proof: proof.clone(),
+                },
+                None => SetupImageCommand::Build {
+                    tag,
+                    asset_root,
+                    dockerfile_path,
+                },
+            },
+            command => command,
+        };
+        self.engine.stream(command, options, cancellation, events)
     }
 }
 
@@ -123,6 +210,31 @@ pub struct PreparedImage {
     pub reference: String,
     /// Observed Docker image ID (`sha256:<64 lowercase hex>`).
     pub observed_identity: String,
+}
+
+/// Validated preparation identity available before Docker can create an image.
+/// This is an intent, not proof that any existing engine object is owned.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImagePreparationIntent {
+    pub setup_content_sha256: String,
+    pub workspace_root: PathBuf,
+    pub kind: PreparedImageKind,
+    pub reference: String,
+}
+
+/// Derive the exact reference from the same validation used by preparation.
+/// Callers can durably checkpoint this intent before invoking Docker. Recovery
+/// must verify engine identity and ownership before treating it as a receipt.
+pub fn image_preparation_intent(
+    plan: &SetupPlan,
+) -> Result<ImagePreparationIntent, SetupPrepareError> {
+    let validated = validate_plan(plan)?;
+    Ok(ImagePreparationIntent {
+        setup_content_sha256: plan.content_sha256.clone(),
+        workspace_root: plan.workspace_root.clone(),
+        kind: validated.kind(),
+        reference: validated.reference().into(),
+    })
 }
 
 /// Why image preparation failed without escalating into container execution.
@@ -183,83 +295,86 @@ impl From<CommandError> for SetupPrepareError {
 /// rather than being reset for each Docker child.  `events` is forwarded to the
 /// engine's bounded stream unchanged; a slow or closed consumer aborts and
 /// reaps the direct Docker client through `bosn-engine`/`kernal-api`.
-pub async fn prepare_setup_image<E: SetupImageEngine>(
-    engine: &E,
-    plan: &SetupPlan,
+pub fn prepare_setup_image<'a, E: SetupImageEngine + Sync>(
+    engine: &'a E,
+    plan: &'a SetupPlan,
     options: RunOptions,
-    cancellation: &CancellationToken,
-    events: &Sender<EngineEvent>,
-) -> Result<PreparedImage, SetupPrepareError> {
-    let prepared = validate_plan(plan)?;
-    if cancellation.is_cancelled() {
-        return Err(SetupPrepareError::Cancelled);
-    }
-    let deadline = Deadline::after(options.deadline);
-    let mut remaining_output = options.output_limit;
+    cancellation: &'a CancellationToken,
+    events: &'a Sender<EngineEvent>,
+) -> Pin<Box<dyn Future<Output = Result<PreparedImage, SetupPrepareError>> + Send + 'a>> {
+    Box::pin(async move {
+        let prepared = validate_plan(plan)?;
+        if cancellation.is_cancelled() {
+            return Err(SetupPrepareError::Cancelled);
+        }
+        let deadline = Deadline::after(options.deadline);
+        let mut remaining_output = options.output_limit;
 
-    let action = match &prepared {
-        ValidatedPlan::Pinned { image } => SetupImageCommand::Pull {
-            image: image.clone(),
-        },
-        ValidatedPlan::Inline {
-            tag,
-            asset_root,
-            dockerfile_path,
-        } => SetupImageCommand::Build {
-            tag: tag.clone(),
-            asset_root: asset_root.clone(),
-            dockerfile_path: dockerfile_path.clone(),
-        },
-    };
-    let action_name = match &action {
-        SetupImageCommand::Pull { .. } => "image pull",
-        SetupImageCommand::Build { .. } => "build",
-        SetupImageCommand::Inspect { .. } => unreachable!("prepare action is never inspect"),
-    };
-    let action_result = stream_command(
-        engine,
-        action,
-        deadline,
-        &mut remaining_output,
-        cancellation,
-        events,
-    )
-    .await?;
-    if !action_result.ok() {
-        return Err(SetupPrepareError::ActionFailed {
-            action: action_name,
-            detail: failure_detail(&action_result),
-        });
-    }
+        let action = match &prepared {
+            ValidatedPlan::Pinned { image } => SetupImageCommand::Pull {
+                image: image.clone(),
+            },
+            ValidatedPlan::Inline {
+                tag,
+                asset_root,
+                dockerfile_path,
+            } => SetupImageCommand::Build {
+                tag: tag.clone(),
+                asset_root: asset_root.clone(),
+                dockerfile_path: dockerfile_path.clone(),
+            },
+        };
+        let action_name = match &action {
+            SetupImageCommand::Pull { .. } => "image pull",
+            SetupImageCommand::Build { .. } | SetupImageCommand::OwnedBuild { .. } => "build",
+            SetupImageCommand::Inspect { .. } => unreachable!("prepare action is never inspect"),
+        };
+        let action_result = stream_command(
+            engine,
+            action,
+            deadline,
+            &mut remaining_output,
+            cancellation,
+            events,
+        )
+        .await?;
+        if !action_result.ok() {
+            return Err(SetupPrepareError::ActionFailed {
+                action: action_name,
+                detail: failure_detail(&action_result),
+            });
+        }
 
-    let reference = prepared.reference().to_owned();
-    let inspected = stream_command(
-        engine,
-        SetupImageCommand::Inspect {
-            image: reference.clone(),
-        },
-        deadline,
-        &mut remaining_output,
-        cancellation,
-        events,
-    )
-    .await?;
-    if !inspected.ok() {
-        return Err(SetupPrepareError::ActionFailed {
-            action: "image inspect",
-            detail: failure_detail(&inspected),
-        });
-    }
-    let observed_identity =
-        stable_identity(&inspected.stdout).ok_or_else(|| SetupPrepareError::MissingIdentity {
-            reference: reference.clone(),
-            observed: String::from_utf8_lossy(&inspected.stdout).trim().to_owned(),
+        let reference = prepared.reference().to_owned();
+        let inspected = stream_command(
+            engine,
+            SetupImageCommand::Inspect {
+                image: reference.clone(),
+            },
+            deadline,
+            &mut remaining_output,
+            cancellation,
+            events,
+        )
+        .await?;
+        if !inspected.ok() {
+            return Err(SetupPrepareError::ActionFailed {
+                action: "image inspect",
+                detail: failure_detail(&inspected),
+            });
+        }
+        let observed_identity = stable_identity(&inspected.stdout).ok_or_else(|| {
+            SetupPrepareError::MissingIdentity {
+                reference: reference.clone(),
+                observed: String::from_utf8_lossy(&inspected.stdout).trim().to_owned(),
+            }
         })?;
-    Ok(PreparedImage {
-        setup_content_sha256: plan.content_sha256.clone(),
-        kind: prepared.kind(),
-        reference,
-        observed_identity,
+        Ok(PreparedImage {
+            setup_content_sha256: plan.content_sha256.clone(),
+            kind: prepared.kind(),
+            reference,
+            observed_identity,
+        })
     })
 }
 
@@ -553,7 +668,7 @@ mod tests {
         )
     }
 
-    fn run<E: SetupImageEngine>(
+    fn run<E: SetupImageEngine + Sync>(
         engine: &E,
         plan: &SetupPlan,
         cancel: &CancellationToken,
@@ -658,8 +773,12 @@ mod tests {
         let engine =
             FakeEngine::with_results([result(Vec::new()), result(format!("{IDENTITY}\n"))]);
         let cancel = CancellationSource::new();
+        let intent = image_preparation_intent(&plan).unwrap();
         let prepared = run(&engine, &plan, &cancel.token()).unwrap();
         assert_eq!(prepared.reference, tag);
+        assert_eq!(intent.reference, prepared.reference);
+        assert_eq!(intent.kind, prepared.kind);
+        assert_eq!(intent.setup_content_sha256, prepared.setup_content_sha256);
         assert_eq!(
             SetupImageCommand::Build {
                 tag: prepared.reference.clone(),
@@ -693,10 +812,41 @@ mod tests {
     }
 
     #[test]
+    fn owned_build_emits_exact_preparation_proof_label() {
+        let (_temp, plan) = inline_plan();
+        let engine =
+            FakeEngine::with_results([result(Vec::new()), result(format!("{IDENTITY}\n"))]);
+        let owned = ImagePreparationEngine::new(&engine, HASH).unwrap();
+        let cancellation = CancellationSource::new();
+        let (events, _receiver) = channel(8);
+        runtime()
+            .run(prepare_setup_image(
+                &owned,
+                &plan,
+                RunOptions::streaming(Duration::from_secs(1), 1024),
+                &cancellation.token(),
+                &events,
+            ))
+            .unwrap();
+        let calls = engine.calls.lock().unwrap();
+        assert!(matches!(&calls[0], SetupImageCommand::OwnedBuild { proof, .. } if proof == HASH));
+        let arguments = calls[0].docker_args();
+        assert_eq!(
+            &arguments[1..3],
+            &["--label".to_owned(), format!("{IMAGE_INTENT_LABEL}={HASH}")]
+        );
+        assert!(matches!(&calls[1], SetupImageCommand::Inspect { .. }));
+    }
+
+    #[test]
     fn tampered_inline_asset_or_path_is_rejected_before_engine_launch() {
         let (_temp, mut plan) = inline_plan();
         let root = plan.asset_root.clone().unwrap();
         std::fs::write(root.join("Dockerfile"), "FROM injected").unwrap();
+        assert!(matches!(
+            image_preparation_intent(&plan),
+            Err(SetupPrepareError::AssetIntegrity(_))
+        ));
         let engine = FakeEngine::default();
         let cancel = CancellationSource::new();
         assert!(matches!(

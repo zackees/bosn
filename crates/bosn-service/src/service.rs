@@ -129,11 +129,18 @@ impl Service {
     )]
     pub async fn serve(self) -> Result<(), Error> {
         ipc::ensure_owner_private_directory(&self.state_dir)?;
-        let db = self.state_dir.join("registry.sqlite3");
-        let registry = match kernal_api::platform::fs::path_identity(&db) {
-            Ok(Some(_)) => async_engine::launch_blocking(move || Registry::open_writer(&db))
-                .await
-                .map_err(|_| Error::ActorClosed)??,
+        let startup = managed_retention::peers::startup::acquire(&self.state_dir)
+            .map_err(|error| Error::Io(std::io::Error::other(error)))?;
+        managed_retention::peers::restore_lost_state(&self.state_dir)
+            .map_err(|error| Error::Io(std::io::Error::other(error)))?;
+        let original_db = self.state_dir.join("registry.sqlite3");
+        let db = Registry::resolve_authority(&original_db)?;
+        let mut registry = match kernal_api::platform::fs::path_identity(&db) {
+            Ok(Some(_)) => {
+                async_engine::launch_blocking(move || Registry::open_writer(&original_db))
+                    .await
+                    .map_err(|_| Error::ActorClosed)??
+            }
             Ok(None) => return Err(Error::Protocol("registry identity unavailable")),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 // A missing database is either a genuine first run or the loss
@@ -144,7 +151,19 @@ impl Service {
                 let prior = async_engine::launch_blocking(move || probe.as_ref().probe())
                     .await
                     .map_err(|_| Error::ActorClosed)?;
-                if prior.has_prior_objects() {
+                let accounted = if prior.has_prior_objects() {
+                    match managed_retention::peers::proves_prior_ownership(&self.state_dir, &prior)
+                    {
+                        Ok(accounted) => accounted,
+                        Err(detail) => {
+                            eprintln!("bosn: prior ownership verification failed: {detail}");
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                if prior.has_prior_objects() && !accounted {
                     // Refuse loudly rather than adopt silently: an empty
                     // database minted here would make every one of these
                     // objects `ForeignRegistry`, unreachable by every GC path
@@ -182,6 +201,18 @@ impl Service {
         let _run_http = run_http::start(&self.state_dir).await.map_err(Error::Io)?;
         eprintln!("bosn run output listening on {}", _run_http.local_addr);
         let act_owner = registry.registry_id()?;
+        let _retention_owner = managed_retention::peers::register(&self.state_dir, &act_owner)
+            .map_err(|error| Error::Io(std::io::Error::other(error)))?;
+        if let Some(directory) =
+            managed_retention::peers::backup_directory(&self.state_dir, &act_owner)
+                .map_err(|error| Error::Io(std::io::Error::other(error)))?
+        {
+            managed_retention::peers::promote_authority(&mut registry, &self.state_dir, &directory)
+                .map_err(|error| Error::Io(std::io::Error::other(error)))?;
+        }
+        // The registry writer and machine owner now protect the published
+        // authority; subsequent daemon startups can inspect their own state.
+        drop(startup);
         let act_image_proofs = act_engine::bundled_engine_manifests()
             .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?;
         let ep = endpoint(&self.state_dir)?;
@@ -327,7 +358,38 @@ impl Service {
             self.manifest_recovery_executor.as_ref(),
         )
         .await;
-        // Unattended maintenance. A machine that opted into autostart should learn about its
+        // Owned retention has an independent worker: an expensive or stalled
+        // unmanaged size census must never postpone automatic reclamation.
+        let _retention_maintenance = {
+            let state_dir = self.state_dir.clone();
+            let stop = self.stop.token();
+            let retention_jobs = jobs.clone();
+            async_engine::launch(async move {
+                loop {
+                    if stop.is_cancelled() {
+                        break;
+                    }
+                    let apply = managed_retention::automatic_retention_enabled(&state_dir);
+                    match retention_jobs
+                        .managed_retention(bosn_core::retention::RetentionPolicy::default(), apply)
+                        .await
+                    {
+                        Ok(outcome) => managed_retention::report_pass(&outcome),
+                        Err(error) => eprintln!("bosn retention: {error}"),
+                    }
+                    if async_engine::cancellable(
+                        &stop,
+                        async_engine::sleep(unmanaged::MAINTENANCE_INTERVAL),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+        };
+        // Unattended maintenance. A machine with autostart should learn about its
         // unowned Docker footprint on its own: #147 recorded 45 hours of normal use in which
         // nothing was ever said. The pass runs on the blocking pool because the census makes
         // bounded child-process calls, and the accept loop must not wait behind them. The
@@ -337,10 +399,10 @@ impl Service {
             let stop = self.stop.token();
             async_engine::launch(async move {
                 loop {
-                    let state_dir = state_dir.clone();
+                    let scan_state_dir = state_dir.clone();
                     let _ = async_engine::launch_blocking(move || {
                         let (scan, warning) = unmanaged::maintenance_pass(
-                            &state_dir,
+                            &scan_state_dir,
                             bosn_core::CensusConfig::default(),
                         );
                         match warning {
@@ -355,17 +417,6 @@ impl Service {
                             ),
                             None => {}
                         }
-                        // Unattended reclamation of what this registry owns (#456). The
-                        // unmanaged census above can never do this: it protects everything we
-                        // own, which left setup containers, stack/machine volumes and setup
-                        // images with no reclamation path at all.
-                        //
-                        // This is destructive, so it is opt-in: `auto_retention` in the state
-                        // directory's `retention.toml`. Without it the pass still runs and still
-                        // reports what it would remove, so the machine is never silently growing
-                        // with no signal. A pass whose read is incomplete removes nothing and
-                        // says so (see `managed_retention`).
-                        managed_retention::maintenance_pass(&state_dir);
                     })
                     .await;
                     if async_engine::cancellable(

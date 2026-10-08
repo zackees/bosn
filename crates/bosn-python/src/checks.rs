@@ -233,6 +233,9 @@ pub(crate) fn ci_call(state_dir: &Path, name: &str, arguments: &str) -> Result<S
 }
 
 pub(crate) fn service_error(error: bosn_service::Error) -> PyErr {
+    if let bosn_service::Error::Remote(message) = error {
+        return PyRuntimeError::new_err(message);
+    }
     if let bosn_service::Error::Ci { code, message } = &error {
         // CI codes are a stable contract (`refused`, `not_found`, ...).
         return PyRuntimeError::new_err(format!("Bosn CI {code}: {message}"));
@@ -245,6 +248,7 @@ pub(crate) fn service_error(error: bosn_service::Error) -> PyErr {
         bosn_service::Error::EndpointOccupied(_) => "Bosn daemon endpoint is unavailable",
         bosn_service::Error::Protocol(_) => "Bosn daemon rejected the request",
         bosn_service::Error::Ci { .. }
+        | bosn_service::Error::Remote(_)
         | bosn_service::Error::Registry(_)
         | bosn_service::Error::Random
         | bosn_service::Error::ActorClosed => "Bosn daemon request failed",

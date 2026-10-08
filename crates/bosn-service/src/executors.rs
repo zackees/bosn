@@ -148,6 +148,45 @@ pub trait SetupPrepareExecutor: Send + Sync {
         cancellation: &'a async_engine::CancellationToken,
         logs: &'a crate::raw_run_log::JobLogSink,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
+
+    fn execute_owned<'a>(
+        &'a self,
+        request: SetupPrepareRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a crate::raw_run_log::JobLogSink,
+    ) -> Pin<Box<dyn Future<Output = Result<SetupPrepareExecution, String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.execute(request, cancellation, logs)
+                .await
+                .map(|receipt| SetupPrepareExecution {
+                    receipt,
+                    image: None,
+                })
+        })
+    }
+    fn execute_recorded<'a>(
+        &'a self,
+        request: SetupPrepareRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a crate::raw_run_log::JobLogSink,
+        images: &'a dyn SetupImageRecorder,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let execution = self.execute_owned(request, cancellation, logs).await?;
+            if let Some(image) = execution.image {
+                images.record(image).await?;
+            }
+            Ok(execution.receipt)
+        })
+    }
+}
+
+/// Inspected image ownership returned by preparation, before job success.
+/// Executors without a Docker artifact may return no image (the test seam).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupPrepareExecution {
+    pub receipt: String,
+    pub image: Option<SetupEnsureImageResource>,
 }
 
 /// Testable daemon boundary for the complete plan, prepare, and declared-task
@@ -160,6 +199,43 @@ pub trait SetupTaskExecutor: Send + Sync {
         cancellation: &'a async_engine::CancellationToken,
         logs: &'a crate::raw_run_log::JobLogSink,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
+
+    fn execute_recorded<'a>(
+        &'a self,
+        request: SetupTaskJobRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a crate::raw_run_log::JobLogSink,
+        _images: &'a dyn SetupImageRecorder,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        self.execute(request, cancellation, logs)
+    }
+}
+
+/// Persist an inspected image before proceeding to a fallible task stage.
+pub trait SetupImageRecorder: Send + Sync {
+    fn record_preparation<'a>(
+        &'a self,
+        _intent: bosn_registry::ImageCreationIntent,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn complete_preparation<'a>(
+        &'a self,
+        _intent: bosn_registry::ImageCreationIntent,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+    /// Persist the exact planned container identity before engine creation.
+    fn record_container_intent<'a>(
+        &'a self,
+        _container: SetupEnsureResource,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn record<'a>(
+        &'a self,
+        image: SetupEnsureImageResource,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 }
 
 /// Test seam for one declared task inside an already ensured setup app. It
@@ -182,6 +258,20 @@ pub trait SetupAppTaskExecutor: Send + Sync {
 /// the exact resource after an uncertain local client outcome. A recorder
 /// failure fails closed before exec.
 pub trait SetupAppTaskSessionRecorder: Send + Sync {
+    fn checkpoint_preparation<'a>(
+        &'a self,
+        _intent: bosn_registry::ImageCreationIntent,
+        _complete: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn record_image<'a>(
+        &'a self,
+        _image: SetupEnsureImageResource,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
     fn begin<'a>(
         &'a self,
         managed_container_identity: String,
@@ -204,6 +294,15 @@ pub trait SetupEnsureExecutor: Send + Sync {
         cancellation: &'a async_engine::CancellationToken,
         logs: &'a crate::raw_run_log::JobLogSink,
     ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>>;
+    fn execute_recorded<'a>(
+        &'a self,
+        request: SetupEnsureJobRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a crate::raw_run_log::JobLogSink,
+        _images: &'a dyn SetupImageRecorder,
+    ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>> {
+        self.execute(request, cancellation, logs)
+    }
 }
 /// Testable semantic boundary for a single manifest stack ensure. It receives
 /// no raw Docker command, name, label, image, mount, environment, or command.
@@ -230,6 +329,19 @@ pub trait ManifestAppTaskExecutor: Send + Sync {
 /// Durable, conservative ownership evidence for a manifest app task. The
 /// identity is the registry-matching deterministic managed container name.
 pub trait ManifestAppTaskSessionRecorder: Send + Sync {
+    fn checkpoint_preparation<'a>(
+        &'a self,
+        _intent: bosn_registry::ImageCreationIntent,
+        _complete: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Persist preparation ownership before any adoption or task failure.
+    fn record_image<'a>(
+        &'a self,
+        image: SetupEnsureImageResource,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
     fn begin<'a>(
         &'a self,
         managed_container_identity: String,
@@ -320,6 +432,15 @@ pub trait SetupAdoptExecutor: Send + Sync {
         cancellation: &'a async_engine::CancellationToken,
         logs: &'a crate::raw_run_log::JobLogSink,
     ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>>;
+    fn execute_recorded<'a>(
+        &'a self,
+        request: SetupAdoptRequest,
+        cancellation: &'a async_engine::CancellationToken,
+        logs: &'a crate::raw_run_log::JobLogSink,
+        _images: &'a dyn SetupImageRecorder,
+    ) -> Pin<Box<dyn Future<Output = Result<SetupEnsureExecution, String>> + Send + 'a>> {
+        self.execute(request, cancellation, logs)
+    }
 }
 
 /// Testable boundary for Bosn's one fixed, non-mutating engine health probe.

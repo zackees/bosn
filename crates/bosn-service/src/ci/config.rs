@@ -112,9 +112,6 @@ pub fn enable_desktop_ui(state_dir: &Path) -> Result<bool, String> {
 /// Configuration usable by both run and spare engine planning.
 pub(crate) fn load_engine(state_dir: &Path) -> Result<super::limits::EngineConfig, String> {
     let settings = load(state_dir)?;
-    if settings.cache.is_some() {
-        return Err("configured cache retention requires verified act2 retention pin and warm cohort migration; this runner is not enrolled".into());
-    }
     Ok(settings.engine)
 }
 
@@ -136,11 +133,7 @@ mod tests {
         assert!(enable_desktop_ui(dir.path()).unwrap());
         let enabled = load(dir.path()).unwrap();
         assert_eq!(enabled.cache, original_policy);
-        assert!(
-            load_engine(dir.path())
-                .unwrap_err()
-                .contains("not enrolled")
-        );
+        assert_eq!(load_engine(dir.path()).unwrap().cpus, Some(3));
         assert!(enabled.ui.enabled);
         assert_eq!(enabled.engine.cpus, Some(3));
         assert_eq!(
@@ -203,16 +196,12 @@ mod tests {
         assert!(load(dir.path()).unwrap_err().contains("enabeld"));
     }
     #[test]
-    fn engine_configuration_refuses_unenrolled_retention() {
+    fn engine_configuration_accepts_validated_retention_for_admission() {
         let dir = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
         assert!(load_engine(dir.path()).is_ok());
         std::fs::write(dir.path().join("config.toml"),
             "[cache]\nrepository_max_bytes=100\naggregate_max_bytes=200\nmax_age_secs=3600\nunused_age_secs=1800\nmaintenance_interval_secs=60\n").unwrap();
         assert!(load(dir.path()).unwrap().cache.is_some());
-        assert!(
-            load_engine(dir.path())
-                .unwrap_err()
-                .contains("not enrolled")
-        );
+        assert_eq!(load_engine(dir.path()).unwrap(), Default::default());
     }
 }

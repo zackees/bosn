@@ -58,13 +58,18 @@ impl DockerActBackend {
 fn agreement_script(policy: CachePolicy) -> String {
     let canonical = canonical_record(policy);
     format!(
-        "set -eu; directory={ENGINE_CACHE}/actcache; mkdir -p \"$directory\"; \
+        "set -eu; directory={ENGINE_CACHE}/actcache; \
+         [ ! -L \"$directory\" ] || {{ echo 'machine policy directory is a symlink' >&2; exit 78; }}; \
+         mkdir -p \"$directory\"; \
          record=\"$directory/.bosn-cohort-policy-v1\"; \
-         exec 7>>\"$record.lock\"; flock -x -n 7 || {{ echo 'machine cache policy agreement busy' >&2; exit 75; }}; \
-         umask 077; stage=$(mktemp \"$record.XXXXXXXX\"); trap 'rm -f \"$stage\"' EXIT; \
-         printf '%s' '{canonical}' >\"$stage\"; \
+         [ ! -L \"$record\" ] && [ ! -L \"$record.lock\" ] || {{ echo 'machine policy record or lock is a symlink' >&2; exit 78; }}; \
+         [ ! -e \"$record\" ] || [ -f \"$record\" ] || {{ echo 'machine policy record is invalid' >&2; exit 78; }}; \
+         [ ! -e \"$record.lock\" ] || [ -f \"$record.lock\" ] || {{ echo 'machine policy lock is invalid' >&2; exit 78; }}; \
+         exec 7>>\"$record.lock\"; attempt=0; until flock -x -n 7; do attempt=$((attempt + 1)); [ \"$attempt\" -lt 150 ] || {{ echo 'machine cache policy agreement busy' >&2; exit 75; }}; sleep 0.1; done; \
+         umask 077; stage=$(mktemp \"$record.XXXXXXXX\"); trap 'flock -u 7; rm -f \"$stage\"' EXIT; \
+         printf '%s' '{canonical}' >\"$stage\"; sync -f \"$stage\"; \
          if [ ! -e \"$record\" ]; then ln \"$stage\" \"$record\"; fi; \
-         cmp -s \"$stage\" \"$record\" || {{ echo 'machine cache policy conflict; existing policy preserved' >&2; exit 78; }}"
+         cmp -s \"$stage\" \"$record\" || {{ echo 'machine cache policy conflict; existing policy preserved' >&2; exit 78; }}; sync -f \"$directory\""
     )
 }
 
@@ -113,6 +118,74 @@ fn decode_record(output: &str) -> Result<Option<CachePolicy>, String> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[test]
+    fn policy_agreement_refuses_redirected_directory_record_and_lock() {
+        use std::os::unix::fs::symlink;
+        for redirected in ["directory", "record", "lock"] {
+            let scratch = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+            let cache = scratch.path().join("cache");
+            let foreign = scratch.path().join("foreign");
+            std::fs::create_dir_all(cache.join("actcache")).unwrap();
+            std::fs::create_dir(&foreign).unwrap();
+            let policy = CachePolicy::default();
+            let foreign_record = foreign.join("policy");
+            std::fs::write(&foreign_record, canonical_record(policy)).unwrap();
+            match redirected {
+                "directory" => {
+                    std::fs::remove_dir(cache.join("actcache")).unwrap();
+                    symlink(&foreign, cache.join("actcache")).unwrap();
+                }
+                "record" => symlink(
+                    &foreign_record,
+                    cache.join("actcache/.bosn-cohort-policy-v1"),
+                )
+                .unwrap(),
+                "lock" => symlink(
+                    &foreign_record,
+                    cache.join("actcache/.bosn-cohort-policy-v1.lock"),
+                )
+                .unwrap(),
+                _ => unreachable!(),
+            }
+            let output = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    &agreement_script(policy).replace(ENGINE_CACHE, cache.to_str().unwrap()),
+                ])
+                .output()
+                .unwrap();
+            assert!(!output.status.success(), "accepted redirected {redirected}");
+            assert_eq!(
+                std::fs::read_to_string(&foreign_record).unwrap(),
+                canonical_record(policy)
+            );
+            assert_eq!(std::fs::read_dir(&foreign).unwrap().count(), 1);
+        }
+    }
+    #[test]
+    fn policy_is_not_published_when_staged_file_cannot_be_flushed() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let cache = scratch.path().join("cache");
+        let tools = scratch.path().join("tools");
+        std::fs::create_dir(&tools).unwrap();
+        let sync = tools.join("sync");
+        std::fs::write(&sync, "#!/bin/sh\nexit 74\n").unwrap();
+        std::fs::set_permissions(&sync, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let search_path = format!("{}:{}", tools.display(), std::env::var("PATH").unwrap());
+        let output = std::process::Command::new("sh")
+            .env("PATH", search_path)
+            .args([
+                "-c",
+                &agreement_script(CachePolicy::default())
+                    .replace(ENGINE_CACHE, cache.to_str().unwrap()),
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(74));
+        assert!(!cache.join("actcache/.bosn-cohort-policy-v1").exists());
+    }
+
     #[test]
     fn discovery_requires_bounded_versioned_canonical_valid_policy() {
         let policy: CachePolicy = toml::from_str("repository_max_bytes=100\naggregate_max_bytes=200\nmax_age_secs=3600\nunused_age_secs=1800\nmaintenance_interval_secs=60\n").unwrap();

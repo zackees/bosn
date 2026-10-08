@@ -1,5 +1,6 @@
 use super::*;
 use kernal_api::async_engine::RuntimeBuilder;
+mod adoption_deadline;
 
 /// Run the production secret path against a fake `docker` (a shell that
 /// reports its own ps-visible argv and environment, then echoes the token
@@ -185,6 +186,7 @@ mod daemon_jobs;
 mod guest;
 mod manifest_ensure;
 mod manifest_plan;
+mod ownership_contract;
 mod python_v4;
 mod reconcile_wire;
 mod setup_ensure;
@@ -883,6 +885,12 @@ struct FakeManifestGuestSession {
     events: Mutex<Vec<String>>,
 }
 impl ManifestAppTaskSessionRecorder for FakeManifestGuestSession {
+    fn record_image<'a>(
+        &'a self,
+        _image: SetupEnsureImageResource,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(ready(Ok(())))
+    }
     fn begin<'a>(
         &'a self,
         identity: String,

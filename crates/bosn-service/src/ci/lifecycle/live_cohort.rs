@@ -94,6 +94,8 @@ fn cohort_route_restores_across_jobs_and_successive_owned_engines() {
                     workflow: "workflow.yaml".into(),
                     workflow_overlaid: false,
                     job: None,
+                    cache_policy: Default::default(),
+                    auto_retention: true,
                     cache_route: CacheRoute::Cohort {
                         namespace: if mode == 2 {
                             other.clone()

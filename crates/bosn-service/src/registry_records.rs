@@ -2,11 +2,103 @@
 
 use super::*;
 
+pub(crate) fn record_container_intent(
+    registry: &mut Registry,
+    container: &SetupEnsureResource,
+) -> Result<(), bosn_registry::Error> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
+        .as_secs_f64();
+    let mut transaction = registry.begin_immediate()?;
+    put_ensured_container(&mut transaction, container, now)?;
+    transaction.append_event(now, "container.creation.intent", &container.id)?;
+    transaction.commit()
+}
+
+/// Record planned or completed machine-global ownership with the same pin/use policy.
+fn put_ensured_container(
+    transaction: &mut bosn_registry::Immediate<'_>,
+    container: &SetupEnsureResource,
+    now: f64,
+) -> Result<(), bosn_registry::Error> {
+    transaction.put_resource_preserving_pin(&Resource {
+        id: container.id.clone(),
+        kind: ResourceKind::Container,
+        name: container.name.clone(),
+        stack: container.stack.clone(),
+        generation: container.generation.clone(),
+        scope: Scope::Machine,
+        workspace: container.workspace.clone(),
+        created_at: now,
+        last_used: now,
+        state: ResourceState::Active,
+        retention: Retention::Warm,
+    })?;
+    transaction.put_resource_use(&ResourceUse {
+        resource_id: container.id.clone(),
+        workspace: container.workspace.clone(),
+        stack: container.stack.clone(),
+        generation: container.generation.clone(),
+        last_used: now,
+        state: ResourceState::Active,
+    })
+}
+
 pub(crate) fn setup_app_task_session_id(job_id: u64) -> String {
     format!("setup-app-task:{job_id}")
 }
 pub(crate) fn manifest_app_task_session_id(job_id: u64) -> String {
     format!("manifest-app-task:{job_id}")
+}
+
+/// Begin the idle clock at confirmed completion, including caches used by the
+/// container's stack. An uncertain remote execution keeps its durable session.
+fn completed_session_resources(
+    registry: &Registry,
+    session_id: &str,
+    outcome: &str,
+    now: f64,
+) -> Result<Vec<Resource>, bosn_registry::Error> {
+    if outcome == "uncertain" {
+        return Ok(Vec::new());
+    }
+    let mut container_name = None;
+    let mut offset = 0;
+    loop {
+        let page = registry.execution_sessions(offset, 64)?;
+        if let Some(session) = page
+            .items
+            .into_iter()
+            .find(|session| session.id == session_id)
+        {
+            container_name = Some(session.container_id);
+            break;
+        }
+        let Some(next) = page.next_offset else { break };
+        offset = next;
+    }
+    let Some(name) = container_name else {
+        return Ok(Vec::new());
+    };
+    let Some(container) = registry.resource_by_kind_name(ResourceKind::Container, &name)? else {
+        return Ok(Vec::new());
+    };
+    let mut touched = Vec::new();
+    offset = 0;
+    loop {
+        let page = registry.resources(offset, 64)?;
+        touched.extend(page.items.into_iter().filter_map(|mut resource| {
+            if resource.workspace != container.workspace || resource.stack != container.stack {
+                return None;
+            }
+            resource.last_used = resource.last_used.max(now);
+            Some(resource)
+        }));
+        let Some(next) = page.next_offset else { break };
+        offset = next;
+    }
+    Ok(touched)
 }
 
 pub(crate) fn record_setup_app_task_session(
@@ -40,7 +132,12 @@ pub(crate) fn finish_setup_app_task_session(
         .duration_since(UNIX_EPOCH)
         .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
         .as_secs_f64();
+    let touched =
+        completed_session_resources(registry, &setup_app_task_session_id(job_id), outcome, now)?;
     let mut transaction = registry.begin_immediate()?;
+    for resource in touched {
+        transaction.put_resource(&resource)?;
+    }
     if outcome == "uncertain" {
         // Do not remove the session: cancelling/timing out the local Docker
         // client does not prove the remote `exec` process ended.
@@ -82,7 +179,16 @@ pub(crate) fn finish_manifest_app_task_session(
         .duration_since(UNIX_EPOCH)
         .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
         .as_secs_f64();
+    let touched = completed_session_resources(
+        registry,
+        &manifest_app_task_session_id(job_id),
+        outcome,
+        now,
+    )?;
     let mut transaction = registry.begin_immediate()?;
+    for resource in touched {
+        transaction.put_resource(&resource)?;
+    }
     if outcome == "uncertain" {
         transaction.append_event(
             now,
@@ -94,6 +200,47 @@ pub(crate) fn finish_manifest_app_task_session(
         transaction.append_event(now, "manifest.app-task.finished", outcome)?;
     }
     transaction.commit()
+}
+
+pub(crate) fn record_prepared_image(
+    registry: &mut Registry,
+    image: &SetupEnsureImageResource,
+) -> Result<(), bosn_registry::Error> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
+        .as_secs_f64();
+    let mut transaction = registry.begin_immediate()?;
+    put_prepared_image(&mut transaction, image, now)?;
+    transaction.commit()
+}
+
+fn put_prepared_image(
+    transaction: &mut bosn_registry::Immediate<'_>,
+    image: &SetupEnsureImageResource,
+    now: f64,
+) -> Result<(), bosn_registry::Error> {
+    transaction.put_resource_preserving_pin(&Resource {
+        id: image.id.clone(),
+        kind: ResourceKind::Image,
+        name: image.name.clone(),
+        stack: image.stack.clone(),
+        generation: image.generation.clone(),
+        scope: Scope::Machine,
+        workspace: image.workspace.clone(),
+        created_at: now,
+        last_used: now,
+        state: ResourceState::Active,
+        retention: Retention::Warm,
+    })?;
+    transaction.put_resource_use(&ResourceUse {
+        resource_id: image.id.clone(),
+        workspace: image.workspace.clone(),
+        stack: image.stack.clone(),
+        generation: image.generation.clone(),
+        last_used: now,
+        state: ResourceState::Active,
+    })
 }
 
 pub(crate) fn record_setup_ensure(
@@ -108,50 +255,8 @@ pub(crate) fn record_setup_ensure(
     let mut transaction = registry.begin_immediate()?;
     let container = &execution.resource;
     let image = &execution.image;
-    transaction.put_resource(&Resource {
-        id: container.id.clone(),
-        kind: ResourceKind::Container,
-        name: container.name.clone(),
-        stack: container.stack.clone(),
-        generation: container.generation.clone(),
-        // Setup app container names are machine-global and content-addressed.
-        scope: Scope::Machine,
-        workspace: container.workspace.clone(),
-        created_at: now,
-        last_used: now,
-        state: ResourceState::Active,
-        retention: Retention::Pinned,
-    })?;
-    transaction.put_resource_use(&ResourceUse {
-        resource_id: container.id.clone(),
-        workspace: container.workspace.clone(),
-        stack: container.stack.clone(),
-        generation: container.generation.clone(),
-        last_used: now,
-        state: ResourceState::Active,
-    })?;
-    transaction.put_resource(&Resource {
-        id: image.id.clone(),
-        kind: ResourceKind::Image,
-        name: image.name.clone(),
-        stack: image.stack.clone(),
-        generation: image.generation.clone(),
-        // The inspected image ID identifies a machine-local Docker image.
-        scope: Scope::Machine,
-        workspace: image.workspace.clone(),
-        created_at: now,
-        last_used: now,
-        state: ResourceState::Active,
-        retention: Retention::Pinned,
-    })?;
-    transaction.put_resource_use(&ResourceUse {
-        resource_id: image.id.clone(),
-        workspace: image.workspace.clone(),
-        stack: image.stack.clone(),
-        generation: image.generation.clone(),
-        last_used: now,
-        state: ResourceState::Active,
-    })?;
+    put_ensured_container(&mut transaction, container, now)?;
+    put_prepared_image(&mut transaction, image, now)?;
     // A new successful setup document generation supersedes only prior Bosn
     // setup *container* ownership in this exact canonical workspace/stack.
     // It does not stop, delete, or otherwise mutate Docker; it also leaves
@@ -218,7 +323,7 @@ pub(crate) fn record_manifest_ensure(
             &execution.image.workspace,
         ),
     ] {
-        transaction.put_resource(&Resource {
+        transaction.put_resource_preserving_pin(&Resource {
             id: id.clone(),
             kind,
             name: name.clone(),
@@ -229,7 +334,11 @@ pub(crate) fn record_manifest_ensure(
             created_at: now,
             last_used: now,
             state: ResourceState::Active,
-            retention: Retention::Pinned,
+            retention: if kind == ResourceKind::Container && contract.guest {
+                Retention::Pinned
+            } else {
+                Retention::Warm
+            },
         })?;
         transaction.put_resource_use(&ResourceUse {
             resource_id: id.clone(),
@@ -245,7 +354,7 @@ pub(crate) fn record_manifest_ensure(
     // same transaction as container success; normal generation rollover never
     // deletes or retires volume data.
     for volume in &execution.volumes {
-        transaction.put_resource(&Resource {
+        transaction.put_resource_preserving_pin(&Resource {
             id: volume.id.clone(),
             kind: ResourceKind::Volume,
             name: volume.name.clone(),
@@ -312,8 +421,33 @@ pub(crate) fn put_manifest_volume_intents(
     registry: &mut Registry,
     volumes: &[ManifestVolumeResource],
 ) -> Result<(), bosn_registry::Error> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
+        .as_secs_f64();
     let mut transaction = registry.begin_immediate()?;
     for volume in volumes {
+        transaction.put_resource_preserving_pin(&Resource {
+            id: volume.id.clone(),
+            kind: ResourceKind::Volume,
+            name: volume.name.clone(),
+            stack: volume.stack.clone(),
+            generation: volume.generation.clone(),
+            scope: volume.scope,
+            workspace: volume.workspace.clone(),
+            created_at: now,
+            last_used: now,
+            state: ResourceState::Active,
+            retention: volume.retention,
+        })?;
+        transaction.put_resource_use(&ResourceUse {
+            resource_id: volume.id.clone(),
+            workspace: volume.workspace.clone(),
+            stack: volume.stack.clone(),
+            generation: volume.generation.clone(),
+            last_used: now,
+            state: ResourceState::Active,
+        })?;
         transaction.put_volume_creation_intent(&VolumeCreationIntent {
             name: volume.name.clone(),
             labels: volume.labels.clone(),

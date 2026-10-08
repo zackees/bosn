@@ -64,6 +64,11 @@ pub fn default_state_dir() -> PathBuf {
     if let Some(value) = std::env::var_os("BOSN_STATE_DIR") {
         return PathBuf::from(value);
     }
+    machine_state_dir()
+}
+
+/// Machine catalog location, independent of a caller's per-workspace state override.
+pub fn machine_state_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
         if let Some(value) = std::env::var_os("LOCALAPPDATA") {

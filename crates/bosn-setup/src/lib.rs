@@ -39,8 +39,9 @@ pub use plan::{
 
 mod prepare;
 pub use prepare::{
-    PreparedImage, PreparedImageKind, SetupImageCommand, SetupImageEngine, SetupPrepareError,
-    prepare_setup_image,
+    IMAGE_INTENT_LABEL, ImagePreparationEngine, ImagePreparationIntent, PreparedImage,
+    PreparedImageKind, SetupImageCommand, SetupImageEngine, SetupPrepareError,
+    image_preparation_intent, prepare_setup_image,
 };
 
 mod creation;
@@ -53,6 +54,12 @@ pub use ensure::{
 };
 
 mod shell;
+pub use shell::login_shell_args;
+/// Verify the complete production launcher argv for a declared command.
+#[must_use]
+pub fn is_login_shell_command(arguments: &[String], command: &str) -> bool {
+    arguments == shell::login_shell_args(command)
+}
 
 mod task;
 pub use task::{

@@ -1,4 +1,4 @@
-//! act2 arguments for the coordinated root. Production admission remains gated.
+//! act2 arguments for legacy planning and verified coordinated admission.
 use super::{cache_policy::CachePolicy, engine::ENGINE_CACHE};
 
 /// Fixed root shared by fresh engines; legacy sources stay outside this root.
@@ -8,7 +8,8 @@ pub fn root() -> String {
 
 /// An execution route selected by the trusted planner. Choosing a cohort is
 /// not enrollment: its caller must first establish shared routing, current
-/// inventory and writer exclusion. Production planning currently uses Legacy.
+/// inventory and writer exclusion. Normal planning uses Legacy until admission
+/// publishes the verified cohort route.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CacheRoute {
     Legacy(Namespace),

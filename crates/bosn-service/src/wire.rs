@@ -141,6 +141,10 @@ pub(crate) struct ReplyWire {
     pub(crate) owned_failures: Vec<String>,
     #[prost(string, tag = "66")]
     pub(crate) owned_refused: String,
+    #[prost(string, repeated, tag = "67")]
+    pub(crate) owned_held: Vec<String>,
+    #[prost(uint64, tag = "68")]
+    pub(crate) owned_held_total: u64,
 }
 #[derive(Message)]
 pub(crate) struct LogRecordWire {
@@ -487,6 +491,8 @@ pub(crate) fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
         })),
         220 => Ok(Reply::Jobs(v.jobs_json)),
         230 => Ok(Reply::ManagedRetention(ManagedRetentionSummary {
+            held_total: v.owned_held_total.max(v.owned_held.len() as u64),
+            held: v.owned_held,
             applied: v.owned_applied,
             planned: v.owned_planned,
             removed: v.owned_removed,
@@ -498,6 +504,7 @@ pub(crate) fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
         })),
         1 => Err(Error::Protocol("unsupported protocol")),
         2 => Err(Error::Protocol("unknown operation")),
+        3 if !v.job_error.is_empty() => Err(Error::Remote(v.job_error)),
         _ => Err(Error::Protocol("daemon error")),
     }
 }

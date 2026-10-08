@@ -7,6 +7,8 @@ fn invocation_never_names_a_host_socket_and_pins_runners() {
         workflow: ".github/workflows/ci.yml".into(),
         workflow_overlaid: false,
         job: Some("lint".into()),
+        cache_policy: Default::default(),
+        auto_retention: true,
         cache_route: crate::ci::cache_cohort::CacheRoute::Legacy(
             crate::ci::cache_cohort::Namespace::parse("0123456789abcdef").unwrap(),
         ),
@@ -44,6 +46,8 @@ fn act_reads_rewrites_from_the_overlay() {
         workflow: ".github/workflows/ci.yml".into(),
         workflow_overlaid: false,
         job: None,
+        cache_policy: Default::default(),
+        auto_retention: true,
         cache_route: crate::ci::cache_cohort::CacheRoute::Legacy(
             crate::ci::cache_cohort::Namespace::parse("0123456789abcdef").unwrap(),
         ),
@@ -104,4 +108,36 @@ fn line_buffer_splits_and_bounds_lines() {
     b.push(&vec![b'x'; MAX_LINE + 5]);
     assert_eq!(b.drain_lines()[0].len(), MAX_LINE);
     assert_eq!(b.finish(), ["xxxxx"]);
+}
+
+#[test]
+fn explicit_opt_out_disables_workflow_cache_deletion_without_changing_the_route() {
+    let namespace = crate::ci::cache_cohort::Namespace::parse("0123456789abcdef").unwrap();
+    let invocation = ActInvocation {
+        event: "push".into(),
+        workflow: ".github/workflows/ci.yml".into(),
+        workflow_overlaid: false,
+        job: None,
+        cache_route: crate::ci::cache_cohort::CacheRoute::Cohort {
+            namespace: namespace.clone(),
+            policy: crate::ci::cache_policy::CachePolicy::default(),
+        },
+        cache_policy: Default::default(),
+        auto_retention: false,
+        secrets: SecretEnv::default(),
+        params: Default::default(),
+    };
+    let args = invocation.args();
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--cache-server-path", &namespace.path()])
+    );
+    assert!(args.contains(&"--no-cache-server".to_string()));
+    let enabled = ActInvocation {
+        cache_policy: Default::default(),
+        auto_retention: true,
+        ..invocation
+    }
+    .args();
+    assert!(!enabled.contains(&"--no-cache-server".to_string()));
 }

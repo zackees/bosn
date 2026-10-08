@@ -561,8 +561,42 @@ again to the volume total. `runners clear-cache` removes the whole volume;
 removal is refused while a run executes, and the next run recreates it cold.
 The living spec records verification and the remaining retention work.
 
-The newest 200 finished runs are kept; `runners prune-cache --older-than-secs N
---max-bytes N` prunes further.
+Normal CI admission enrolls each repository's archive namespace automatically.
+Before workflow execution, Bosn agrees on a machine policy, imports completed
+legacy archives (or initializes a missing store), checks the import receipt and
+current inventory, and publishes a durable shared route. Concurrent first runs
+wait for enrollment and reuse its publication. The default archive policy is
+8 GiB per repository, 32 GiB across the cohort, 30 days of maximum age, seven
+days unused, with background maintenance every 60 seconds. `[cache]` in the
+state's `config.toml` can supply validated limits; a conflicting machine policy
+is refused and preserved.
+
+Enrollment holds the migration and maintenance leases and checks all existing
+containers attached to the cache. An older or unknown writable attachment
+holds enrollment with its container ID and an upgrade instruction. It is never
+stopped by cache enrollment. This protocol coordinates participating Bosn
+producers; a container census alone cannot prevent an older daemon from
+creating a future uncoordinated writer. Complete the producer upgrade before
+sharing the volume across versions.
+
+These ceilings cover completed archive payloads in the enrolled cohort. Legacy
+source copies retained by import, action checkouts, tool files, image tars, and
+external BuildKit storage have separate lifecycle/accounting requirements;
+the 32 GiB archive limit is not a total Docker-volume allocation limit.
+
+An explicit `auto_retention = false` in the daemon state's `retention.toml`
+pauses its background cache maintenance. Runs admitted with that setting also
+pass `--no-cache-server` to act: the pinned act server always applies age
+retention, so skipping it preserves existing archives. These opted-out runs do
+not use the local archive cache. The setting does not change the selected
+repository cache path or erase stored archives.
+
+The newest 200 finished run records are kept, with source snapshots for the
+newest 10 runs. `runners prune-cache --older-than-secs N --max-bytes N` prunes
+these saved runs and snapshots further. It does not prune archives, tool files
+or image tars inside the shared cache volume. That volume requires its enrolled
+cache retention policy, or an explicit `runners clear-cache` while idle; clearing
+it causes subsequent runs to rebuild their caches cold.
 
 ## Live tests
 

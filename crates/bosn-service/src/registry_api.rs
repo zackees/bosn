@@ -453,6 +453,82 @@ impl RegistryActor {
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
     }
+    pub(crate) async fn record_prepared_image(
+        &self,
+        image: SetupEnsureImageResource,
+    ) -> Result<(), Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::RecordPreparedImage { image, reply })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub(crate) async fn record_image_creation_intent(
+        &self,
+        intent: bosn_registry::ImageCreationIntent,
+        complete: bool,
+    ) -> Result<(), Error> {
+        let (reply, receiver) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::RecordImageCreationIntent {
+                intent,
+                complete,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        receiver.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub(crate) async fn recover_image_intents(
+        &self,
+        admission: managed_retention::gate::Guard,
+        deadline: std::time::Instant,
+    ) -> crate::registry_retention::RecoveryResult {
+        let (reply, receiver) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::RecoverImageIntents {
+                admission,
+                deadline,
+                reply,
+            })
+            .await
+            .map_err(|_| "image recovery actor closed".to_owned())?;
+        receiver
+            .await
+            .map_err(|_| "image recovery actor closed".to_owned())?
+    }
+
+    pub(crate) async fn prune_deleted_ownership(
+        &self,
+        receipts: Vec<managed_retention::DeletionReceipt>,
+        admission: managed_retention::gate::Guard,
+    ) -> Result<(), Error> {
+        let (reply, receiver) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::PruneDeletedOwnership {
+                receipts,
+                admission,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        receiver.await.map_err(|_| Error::ActorClosed)?
+    }
+
+    pub(crate) async fn record_container_intent(
+        &self,
+        container: SetupEnsureResource,
+    ) -> Result<(), Error> {
+        let (reply, receiver) = async_engine::oneshot_channel();
+        self.sender
+            .send(DbCommand::RecordContainerIntent { container, reply })
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        receiver.await.map_err(|_| Error::ActorClosed)?
+    }
     pub(crate) async fn record_manifest_ensure(
         &self,
         job_id: u64,
@@ -662,6 +738,29 @@ pub(crate) enum DbCommand {
     RecordSetupEnsure {
         job_id: u64,
         execution: Box<SetupEnsureExecution>,
+        reply: async_engine::OneshotSender<Result<(), Error>>,
+    },
+    RecordPreparedImage {
+        image: SetupEnsureImageResource,
+        reply: async_engine::OneshotSender<Result<(), Error>>,
+    },
+    RecordImageCreationIntent {
+        intent: bosn_registry::ImageCreationIntent,
+        complete: bool,
+        reply: async_engine::OneshotSender<Result<(), Error>>,
+    },
+    RecoverImageIntents {
+        admission: managed_retention::gate::Guard,
+        deadline: std::time::Instant,
+        reply: async_engine::OneshotSender<crate::registry_retention::RecoveryResult>,
+    },
+    PruneDeletedOwnership {
+        receipts: Vec<managed_retention::DeletionReceipt>,
+        admission: managed_retention::gate::Guard,
+        reply: async_engine::OneshotSender<Result<(), Error>>,
+    },
+    RecordContainerIntent {
+        container: SetupEnsureResource,
         reply: async_engine::OneshotSender<Result<(), Error>>,
     },
     RecordManifestEnsure {

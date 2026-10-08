@@ -98,6 +98,13 @@ pub(crate) enum JobCommand {
     List {
         reply: async_engine::OneshotSender<String>,
     },
+    /// Admission is held while idle resources are retired and reclaimed.
+    ManagedRetention {
+        policy: bosn_core::retention::RetentionPolicy,
+        apply: bool,
+        reply:
+            async_engine::OneshotSender<Result<managed_retention::ManagedRetentionOutcome, String>>,
+    },
     Stop(async_engine::OneshotSender<()>),
 }
 
@@ -328,6 +335,23 @@ impl JobActor {
             .map_err(|_| Error::ActorClosed)?;
         wait.await.map_err(|_| Error::ActorClosed)?
     }
+    pub(crate) async fn managed_retention(
+        &self,
+        policy: bosn_core::retention::RetentionPolicy,
+        apply: bool,
+    ) -> Result<managed_retention::ManagedRetentionOutcome, String> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(JobCommand::ManagedRetention {
+                policy,
+                apply,
+                reply,
+            })
+            .await
+            .map_err(|_| "job actor unavailable".to_owned())?;
+        wait.await.map_err(|_| "job actor unavailable".to_owned())?
+    }
+
     pub(crate) async fn stop(&self) {
         let (reply, wait) = async_engine::oneshot_channel();
         if self.sender.send(JobCommand::Stop(reply)).await.is_ok() {

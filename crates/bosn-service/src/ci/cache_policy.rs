@@ -1,7 +1,7 @@
 //! Explicit archive budgets; these do not describe allocated filesystem blocks.
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(try_from = "Input")]
 pub struct CachePolicy {
     pub(crate) repository_max_bytes: i64,
@@ -9,6 +9,18 @@ pub struct CachePolicy {
     pub(crate) max_age_secs: u64,
     pub(crate) unused_age_secs: u64,
     pub(crate) maintenance_interval_secs: u64,
+}
+
+impl Default for CachePolicy {
+    fn default() -> Self {
+        Self {
+            repository_max_bytes: 8 * 1024 * 1024 * 1024,
+            aggregate_max_bytes: 32 * 1024 * 1024 * 1024,
+            max_age_secs: 30 * 24 * 60 * 60,
+            unused_age_secs: 7 * 24 * 60 * 60,
+            maintenance_interval_secs: 60,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -55,6 +67,21 @@ impl TryFrom<Input> for CachePolicy {
 mod tests {
     use super::*;
     const VALID: &str = "repository_max_bytes=100\naggregate_max_bytes=200\nmax_age_secs=2592000\nunused_age_secs=604800\nmaintenance_interval_secs=300\n";
+    #[test]
+    fn default_policy_has_finite_repository_and_machine_budgets() {
+        let policy = CachePolicy::default();
+        let validated = CachePolicy::try_from(Input {
+            repository_max_bytes: policy.repository_max_bytes,
+            aggregate_max_bytes: policy.aggregate_max_bytes,
+            max_age_secs: policy.max_age_secs,
+            unused_age_secs: policy.unused_age_secs,
+            maintenance_interval_secs: policy.maintenance_interval_secs,
+        })
+        .unwrap();
+        assert_eq!(validated, policy);
+        assert_eq!(policy.repository_max_bytes, 8_589_934_592);
+        assert_eq!(policy.aggregate_max_bytes, 34_359_738_368);
+    }
     #[test]
     fn policy_refuses_disabled_ceilings_overflow_and_typos() {
         let policy: CachePolicy = toml::from_str(VALID).unwrap();

@@ -58,6 +58,7 @@ pub mod autostart;
 pub mod capacity;
 pub mod ci;
 mod client;
+mod client_transport;
 mod diagnostics;
 mod diagnostics_validate;
 mod dispatch;
@@ -68,6 +69,7 @@ mod gc_apply;
 pub mod github_proxy;
 mod job_api;
 mod job_loop;
+mod job_runner;
 mod job_support;
 pub mod jobs;
 pub mod managed_retention;
@@ -80,7 +82,9 @@ pub mod owned_accounting;
 pub mod raw_run_log;
 mod registry_actor;
 mod registry_api;
+mod registry_image_intents;
 mod registry_records;
+mod registry_retention;
 mod run_http;
 mod run_sse;
 pub mod runners;
@@ -102,6 +106,7 @@ pub use executors::*;
 use gc_apply::*;
 use job_api::*;
 use job_loop::*;
+use job_runner::*;
 use job_support::*;
 pub use manifest_executors::*;
 use manifest_plan::*;
@@ -173,6 +178,7 @@ pub enum Error {
     EndpointOccupied(String),
     ActorClosed,
     Protocol(&'static str),
+    Remote(String),
     /// A typed CI refusal or failure (`code` is stable, e.g. `refused`).
     Ci {
         code: String,

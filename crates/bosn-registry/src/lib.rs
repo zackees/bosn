@@ -19,13 +19,20 @@ use kernal_api::{
 };
 
 pub mod act;
+mod authority;
 pub mod cache_helper;
 pub mod cache_maintenance;
 pub mod cache_migration;
 mod gc_query;
+mod image_intents;
 mod immediate;
+pub use image_intents::*;
+mod history;
+mod ownership_backup;
 mod read_only;
 mod registry;
+mod retention_delete;
+pub use history::{MAX_EVENT_DETAIL_BYTES, MAX_EVENT_KIND_BYTES, RETAINED_EVENTS};
 mod rows;
 use gc_query::*;
 pub use immediate::*;
@@ -267,6 +274,9 @@ pub struct RegistryStatus {
 pub struct Registry {
     connection: Connection,
     _writer: kernal_api::platform::fs::OwnedFileLock,
+    prior_writers: Vec<kernal_api::platform::fs::OwnedFileLock>,
+    ownership_backup: Option<PathBuf>,
+    ownership_backup_dirty: bool,
 }
 
 /// Exclusive proof that every bridge-capable Python writer has closed its

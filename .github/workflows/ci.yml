@@ -266,6 +266,10 @@ jobs:
         if: needs.select-tier.outputs.test == 'true'
         run: ./test
 
+      - name: Native retention lifecycle acceptance
+        if: needs.select-tier.outputs.test == 'true'
+        run: uv run python ci/run_retention_docker.py --target-dir "$RUNNER_TEMP/bosn-retention-target"
+
 
   native-wheel:
     name: Native wheel (${{ matrix.os }})

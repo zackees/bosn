@@ -73,12 +73,16 @@ impl ManifestEnsureExecutor for DockerManifestEnsureExecutor {
                 }
                 Ok::<(), String>(())
             });
+            let images = ActorSetupImageRecorder {
+                actor: registry.clone(),
+            };
             let pipeline = SetupEnsurePipeline {
                 plan: &plan,
                 workspace: request.workspace.clone(),
                 deadline: &deadline,
                 prepare_output,
                 ensure_output,
+                images: Some((&images, PreparedImageOwner::Manifest(&request.stack))),
             };
             logs.send("[manifest] preparing immutable application image".into())
                 .await
@@ -117,13 +121,8 @@ impl ManifestEnsureExecutor for DockerManifestEnsureExecutor {
                     generation: generation.clone(),
                     workspace: workspace.clone(),
                 },
-                image: SetupEnsureImageResource {
-                    id: format!("manifest-image:{}", result.prepared.observed_identity),
-                    name: format!("manifest-image:{}", result.prepared.observed_identity),
-                    stack: request.stack,
-                    generation: result.prepared.observed_identity,
-                    workspace,
-                },
+                image: PreparedImageOwner::Manifest(&request.stack)
+                    .resource(&result.prepared, &workspace),
                 volumes,
                 manifest_autostart: autostart,
             })
@@ -283,15 +282,23 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                 logs.send("[manifest-app-task] verifying immutable application image".into())
                     .await
                     .map_err(|_| "manifest app task log consumer closed".to_owned())?;
+                let preparation_intent = PreparedImageOwner::Manifest(&request.stack).preparation_intent(&plan)?;
+                session.checkpoint_preparation(preparation_intent.clone(), false).await?;
                 let prepared = prepare_setup_image(
-                    &self.engine,
+                    &bosn_setup::ImagePreparationEngine::new(&self.engine,
+                    &preparation_intent.ownership_proof().map_err(|error| error.to_string())?)
+                    .map_err(|error| error.to_string())?,
                     &plan,
-                    RunOptions::streaming(remaining, quarter),
+                    RunOptions::streaming(deadline.remaining(), quarter),
                     cancellation,
                     &events,
                 )
                 .await
                 .map_err(|error| error.to_string())?;
+                session.record_image(PreparedImageOwner::Manifest(&request.stack).resource(
+                    &prepared, &plan.workspace_root.to_string_lossy(),
+                )).await?;
+                session.checkpoint_preparation(preparation_intent, true).await?;
                 let remaining = deadline.remaining();
                 if cancellation.is_cancelled() || remaining.is_zero() {
                     return Err("manifest app task ended before ownership inspection".into());
@@ -305,7 +312,7 @@ impl ManifestAppTaskExecutor for DockerManifestAppTaskExecutor {
                         plan: &plan,
                         workspace_root: request.workspace.clone(),
                         prepared_image: &prepared,
-                        options: RunOptions::streaming(remaining, quarter),
+                        options: RunOptions::streaming(deadline.remaining(), quarter),
                         cancellation,
                         events: &events,
                     },

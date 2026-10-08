@@ -409,6 +409,7 @@ pub async fn run_on_engine(
     let mut claim = None;
     let mut laps = Laps::new();
     let mut peak = StoragePeak::default();
+    let mut invocation = plan.invocation.clone();
     let execution = 'run: {
         let acquired = match acquire(
             registry,
@@ -470,6 +471,23 @@ pub async fn run_on_engine(
         }
         match async_engine::timeout_at(
             deadline,
+            async_engine::cancellable(
+                cancellation,
+                backend.prepare_cache_route(registry, held.engine(), &invocation),
+            ),
+        )
+        .await
+        {
+            Err(_) => break 'run ExecutionEnd::TimedOut,
+            Ok(Err(_)) => break 'run ExecutionEnd::Cancelled,
+            Ok(Ok(Err(error))) => break 'run ExecutionEnd::EngineFailed(error),
+            Ok(Ok(Ok(route))) => invocation.cache_route = route,
+        }
+        if let Err(error) = held.verify().await {
+            break 'run ExecutionEnd::EngineFailed(error);
+        }
+        match async_engine::timeout_at(
+            deadline,
             backend.list(held.engine(), &plan.invocation.workflow_arg()),
         )
         .await
@@ -487,7 +505,7 @@ pub async fn run_on_engine(
             let end = backend
                 .execute(
                     held.engine(),
-                    &plan.invocation,
+                    &invocation,
                     deadline.remaining(),
                     cancellation,
                     &lines,

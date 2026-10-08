@@ -360,6 +360,7 @@ pub(crate) fn ensure_daemon(
     client: &Client,
     state_dir: &Path,
 ) -> Result<(), String> {
+    register_maintenance();
     if let Ok(version) = runtime.run(client.daemon_version()) {
         return matching_daemon(state_dir, &version);
     }
@@ -392,6 +393,39 @@ pub(crate) fn ensure_daemon(
         std::thread::sleep(POLL_INTERVAL);
     }
     Err(daemon_start_failure(state_dir))
+}
+
+fn register_maintenance() {
+    // Isolated tests and CI must not register host login services.
+    if std::env::var_os("BOSN_TEST_ISOLATED").is_some() || std::env::var_os("CI").is_some() {
+        return;
+    }
+    let Some(platform) = bosn_service::autostart::Platform::current() else {
+        eprintln!(
+            "bosn: persistent maintenance registration is unsupported on this platform; automatic retention requires a running daemon"
+        );
+        return;
+    };
+    let Some(home) = kernal_api::platform::host::home_dir() else {
+        eprintln!("bosn: cannot register persistent maintenance: home directory unavailable");
+        return;
+    };
+    let result = std::env::current_exe()
+        .map_err(|error| error.to_string())
+        .and_then(|binary| {
+            bosn_service::autostart::ensure_default(
+                &bosn_service::autostart::SystemRunner,
+                platform,
+                &home,
+                &binary,
+                &bosn_service::mcp::machine_state_dir(),
+            )
+        });
+    if let Err(detail) = result {
+        eprintln!(
+            "bosn: persistent maintenance registration failed: {detail}; the workspace daemon will still run, but maintenance after logout is not guaranteed. Retry `bosn daemon autostart enable`"
+        );
+    }
 }
 
 /// Refuse a daemon from another release rather than sending it requests it may

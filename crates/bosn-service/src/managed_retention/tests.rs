@@ -1,7 +1,7 @@
 //! Safety invariants for managed retention (`bosn gc owned`, #456).
 //!
 //! The policy itself is pure and unit-tested in `bosn-core`. These cover the parts that exist
-//! only here: that an incomplete engine read removes nothing, that the opt-in file gates
+//! only here: that an incomplete engine read removes nothing, that an explicit opt-out gates
 //! unattended reclamation, that a destructive pass requires confirmation on both wire flags,
 //! and that the pre-removal re-check and the removal itself never act on stale or live data.
 //! None of them need Docker: the engine reads go through a shell standing in for the CLI.
@@ -38,31 +38,31 @@ fn write_config(dir: &std::path::Path, contents: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// The unattended pass must never delete on a guess.
+// Automatic retention defaults on and accepts an explicit opt-out.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn an_absent_config_never_enables_unattended_reclamation() {
+fn an_absent_config_enables_unattended_reclamation() {
     let dir = scratch_dir("absent");
     let _ = std::fs::remove_file(dir.join("retention.toml"));
     assert!(
-        !auto_retention_enabled(&dir),
-        "a machine with no opt-in file must never reclaim unattended"
+        auto_retention_enabled(&dir),
+        "a default install must reclaim unattended"
     );
 }
 
 #[test]
-fn an_unreadable_state_directory_is_not_an_opt_in() {
+fn an_absent_state_directory_uses_automatic_retention() {
     let missing = std::env::temp_dir().join("bosn-retention-does-not-exist-xyz");
     let _ = std::fs::remove_dir_all(&missing);
     assert!(
-        !auto_retention_enabled(&missing),
-        "an unreadable config must fail closed, not open"
+        auto_retention_enabled(&missing),
+        "an absent config uses the default policy"
     );
 }
 
 #[test]
-fn only_an_explicit_true_enables_unattended_reclamation() {
+fn only_an_explicit_false_disables_unattended_reclamation() {
     let dir = scratch_dir("explicit");
     for (contents, expected) in [
         ("auto_retention = true\n", true),
@@ -71,10 +71,12 @@ fn only_an_explicit_true_enables_unattended_reclamation() {
         ("[retention]\nauto_retention = true\n", true),
         ("auto_retention = true # nightly\n", true),
         ("auto_retention = false\n", false),
-        ("# auto_retention = true\n", false),
-        ("auto_retention = \"true\"\n", false),
-        ("auto_retention\n", false),
-        ("", false),
+        ("[retention]\nauto_retention = false\n", false),
+        ("auto_retention = false # disabled\n", false),
+        ("# auto_retention = true\n", true),
+        ("auto_retention = \"true\"\n", true),
+        ("auto_retention\n", true),
+        ("", true),
     ] {
         write_config(&dir, contents);
         assert_eq!(
@@ -189,7 +191,7 @@ fn fields_belonging_to_other_operations_are_refused() {
 /// The registry id the fake labels its one owned object with.
 const REGISTRY_ID: &str = "11111111-2222-4333-8444-555555555555";
 /// The one container the fake holds.
-const FAKE_ID: &str = "fake-container-id";
+const FAKE_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 /// One old, fully-labelled `bosn-setup-v2-*` container as `docker inspect` reports it.
 ///
@@ -220,9 +222,9 @@ fn owned_container_inspect_with(
         format!(r#","Mounts":[{mounts}]"#)
     };
     format!(
-        r#"[{{"Id":"{FAKE_ID}","Created":"2020-01-01T00:00:00Z","State":{{"Running":{running}}},
+        r#"[{{"Id":"{FAKE_ID}","Name":"/fixture","Created":"2020-01-01T00:00:00Z","State":{{"Running":{running}}},
 "Config":{{"Labels":{{"{registry}":"{REGISTRY_ID}","{kind}":"container","{stack}":"stack",
-"{generation}":"1","{scope}":"scope","{workspace}":"/w","{created}":"2020-01-01T00:00:00Z"}}}}
+"{generation}":"1","{scope}":"machine","{workspace}":"/w","{created}":"2020-01-01T00:00:00Z"}}}}
 {mounts}{size_field}}}]"#,
         registry = bosn_core::LABEL_REGISTRY,
         kind = bosn_core::LABEL_KIND,
@@ -255,7 +257,7 @@ fn fake_docker_reporting(
 ) -> (DockerEngine, std::path::PathBuf) {
     const SCRIPT: &str = r#"
 if [ "$1" = "ps" ]; then
-  case "$*" in *label=*) echo fake-container-id ;; esac
+  case "$*" in *label=com.zackees.bosn.kind*) echo "$FD_ID" ;; esac
   exit 0
 fi
 if [ "$1" = "volume" ] || [ "$1" = "image" ]; then exit 0; fi
@@ -290,7 +292,8 @@ exit 0
     let _ = std::fs::remove_file(dir.join("running"));
 
     let mut engine = DockerEngine::synthetic_for_test("/bin/sh", ["-c", SCRIPT, "fake-docker"])
-        .env("FD_STATE", dir.as_os_str());
+        .env("FD_STATE", dir.as_os_str())
+        .env("FD_ID", FAKE_ID);
     for (index, size) in sizes.iter().enumerate() {
         engine = engine.env(format!("FD_INSPECT_{}", index + 1), render(*size));
     }
@@ -304,6 +307,61 @@ fn state_dir_with_registry(name: &str) -> std::path::PathBuf {
     bosn_registry::Registry::create_writer(dir.join("registry.sqlite3"), REGISTRY_ID)
         .expect("registry");
     dir
+}
+
+#[test]
+fn recently_used_old_container_is_not_reported_past_the_idle_gate() {
+    let (engine, _) = fake_docker_reporting(
+        |size| {
+            owned_container_inspect(size).replacen(
+                "\"Name\":\"/fixture\"",
+                "\"Name\":\"/recent-container\"",
+                1,
+            )
+        },
+        &[Some(1000)],
+    );
+    let dir = state_dir_with_registry("recent-container-report");
+    let mut registry = bosn_registry::Registry::open_writer(dir.join("registry.sqlite3")).unwrap();
+    let mut transaction = registry.begin_immediate().unwrap();
+    transaction
+        .put_resource(&bosn_registry::Resource {
+            id: "setup-container:recent-container".into(),
+            kind: bosn_core::ResourceKind::Container,
+            name: "recent-container".into(),
+            stack: "stack".into(),
+            generation: "1".into(),
+            scope: bosn_core::Scope::Stack,
+            workspace: "/w".into(),
+            created_at: 1.0,
+            last_used: super::now_seconds(),
+            state: bosn_core::ResourceState::Active,
+            retention: bosn_core::Retention::Warm,
+        })
+        .unwrap();
+    transaction.commit().unwrap();
+    drop(registry);
+    let outcome = managed_retention_pass(&engine, &dir, RetentionPolicy::default(), false);
+    assert!(outcome.summary.refused.is_none());
+    assert_eq!(outcome.setup_containers.container_count(), 1);
+    assert!(outcome.setup_containers.stopped[0].age_seconds < 60.0);
+    assert!(
+        setup_container_report_line(&outcome.setup_containers, false)
+            .unwrap()
+            .contains("0 past the")
+    );
+}
+
+#[test]
+fn incomplete_typed_receipt_does_not_change_physical_gc_authorization() {
+    let (engine, _) = fake_docker_reporting(
+        |size| owned_container_inspect(size).replace("\"machine\"", "\"scope\""),
+        &[Some(1000), Some(1000)],
+    );
+    let dir = state_dir_with_registry("incomplete-receipt");
+    let outcome = managed_retention_pass(&engine, &dir, RetentionPolicy::default(), true);
+    assert_eq!(outcome.summary.removed, 1);
+    assert!(outcome.deletion_receipts.is_empty());
 }
 
 /// #522: the summary must account for the size the re-check measured, not the plan's copy.
@@ -324,11 +382,33 @@ fn removed_bytes_reflects_the_size_the_recheck_measured() {
         outcome.summary.removed_bytes, 7_777,
         "removed_bytes must come from the re-check, not the plan's opening read"
     );
+    assert_eq!(outcome.deletion_receipts.len(), 1);
+    let receipt = &outcome.deletion_receipts[0];
+    assert_eq!(receipt.physical_id, FAKE_ID);
+    assert_eq!(receipt.labels.registry, REGISTRY_ID);
+    assert_eq!(receipt.labels.kind, bosn_core::ResourceKind::Container);
+    assert_eq!(receipt.state_dir, dir);
+    assert!(receipt.observed_at.is_finite());
     assert!(
         outcome.summary.failures.is_empty(),
         "{:?}",
         outcome.summary.failures
     );
+}
+
+#[test]
+fn a_growing_object_cannot_exceed_the_removal_time_byte_budget() {
+    let (engine, fake_state) = fake_docker(&[Some(1_000), Some(7_777)]);
+    let dir = state_dir_with_registry("growing-budget");
+    let policy = RetentionPolicy {
+        max_bytes: Some(2_000),
+        ..RetentionPolicy::default()
+    };
+    let outcome = managed_retention_pass(&engine, &dir, policy, true);
+    assert_eq!(outcome.summary.removed, 0);
+    assert_eq!(outcome.summary.deferred, 1);
+    assert_eq!(outcome.summary.failed, 0);
+    assert!(!fake_state.join("rm-argv").exists());
 }
 
 /// #522: a size the engine does not report is unmeasured, not the plan's stale value.
@@ -366,6 +446,7 @@ fn a_container_that_started_mid_pass_survives_and_is_reported_as_a_failure() {
         "a running container is not removed"
     );
     assert_eq!(outcome.summary.removed_bytes, 0, "nothing was freed");
+    assert!(outcome.deletion_receipts.is_empty());
     assert_eq!(
         outcome.summary.failed, 1,
         "the refusal is reported, not swallowed"
@@ -404,7 +485,7 @@ fn an_already_stopped_container_is_removed_without_force() {
 }
 
 // ---------------------------------------------------------------------------
-// #518: stopped setup containers are reported by default, deleted only on opt-in.
+// #518: stopped setup containers are reported even during preview.
 // ---------------------------------------------------------------------------
 
 /// A stopped, fully-labelled setup container holding `volume_count` stack volumes.
@@ -507,9 +588,9 @@ fn only_named_volume_mounts_count_as_pinned() {
     );
 }
 
-/// #518: the report must appear on a default install, where nothing is opt-in yet.
+/// #518: the report must appear on a default install, during a manual preview.
 #[test]
-fn the_report_appears_with_the_default_opt_out_config() {
+fn the_report_appears_during_preview() {
     let (engine, _) =
         fake_docker_reporting(|_| setup_container_pinning(3), &[Some(1_000), Some(1_000)]);
     // No `retention.toml` at all: this is what a default install looks like.
@@ -529,18 +610,19 @@ fn the_report_appears_with_the_default_opt_out_config() {
         "the age is part of the report: {line}"
     );
     assert!(line.contains("past the 6h container gate"), "{line}");
-    assert!(line.contains("auto_retention = true"), "{line}");
+    assert!(line.contains("preview only"), "{line}");
 }
 
-/// #518: without the opt-in, a pass that could reclaim removes nothing.
+/// #518: with an explicit opt-out, a pass that could reclaim removes nothing.
 #[test]
-fn nothing_is_removed_without_the_opt_in() {
+fn nothing_is_removed_with_an_explicit_opt_out() {
     let (engine, fake_state) =
         fake_docker_reporting(|_| setup_container_pinning(2), &[Some(1_000), Some(1_000)]);
-    let dir = state_dir_with_registry("no-opt-in-no-removal");
+    let dir = state_dir_with_registry("explicit-opt-out");
+    write_config(&dir, "auto_retention = false\n");
     assert!(
         !auto_retention_enabled(&dir),
-        "a machine with no opt-in file is not opted in"
+        "an explicit false disables automatic retention"
     );
 
     // Exactly what `maintenance_pass` computes on the default path.
@@ -550,7 +632,7 @@ fn nothing_is_removed_without_the_opt_in() {
     assert!(!outcome.summary.applied, "nothing was applied");
     assert_eq!(
         outcome.summary.removed, 0,
-        "the pile is reported, never reclaimed without the opt-in"
+        "the pile is reported, never reclaimed with an explicit opt-out"
     );
     assert!(
         !fake_state.join("removed").exists(),
@@ -560,27 +642,29 @@ fn nothing_is_removed_without_the_opt_in() {
     assert_eq!(
         outcome.setup_containers.pinned_volume_count(),
         2,
-        "reporting does not depend on the opt-in"
+        "reporting does not depend on automatic retention"
     );
     let line = setup_container_report_line(&outcome.setup_containers, false).expect("a line");
-    assert!(line.contains("enable with"), "{line}");
+    assert!(line.contains("preview only"), "{line}");
 }
 
-/// The opt-in changes only the advice, never the facts.
+/// Applying changes only the advice, never the facts.
 #[test]
-fn an_applied_pass_reports_the_same_pile_and_advises_the_gc_command() {
+fn a_default_pass_reclaims_and_reports_the_pile() {
     let (engine, _) =
         fake_docker_reporting(|_| setup_container_pinning(1), &[Some(1_000), Some(1_000)]);
     let dir = state_dir_with_registry("applied-advice");
-    write_config(&dir, "auto_retention = true\n");
 
     let apply = auto_retention_enabled(&dir);
     let outcome = managed_retention_pass(&engine, &dir, RetentionPolicy::default(), apply);
 
+    assert!(outcome.summary.applied);
+    assert_eq!(outcome.summary.removed, 1);
     assert_eq!(outcome.setup_containers.pinned_volume_count(), 1);
     let line = setup_container_report_line(&outcome.setup_containers, outcome.summary.applied)
         .expect("a line");
-    assert!(line.contains("bosn gc owned --apply --yes"), "{line}");
+    assert!(line.contains("initial inventory for apply pass"), "{line}");
+    assert!(!line.contains("bosn gc owned"), "{line}");
 }
 
 /// A shared volume is one blob on one filesystem; counting it once per container would overstate

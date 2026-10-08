@@ -15,8 +15,7 @@ impl CiRuntime {
         owner: &str,
         stop: &async_engine::CancellationToken,
     ) {
-        self.backend
-            .maintain_existing_cohort(&self.registry, owner, stop)
+        self.maintain_cache_with_policy(owner, stop, Duration::from_secs(60))
             .await;
     }
 
@@ -114,5 +113,30 @@ impl CiRuntime {
             retired: None,
             deferred: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_opt_out_never_starts_cache_maintenance() {
+        crate::ci::lifecycle::tests::with_registry(|registry, directory| async move {
+            std::fs::write(directory.join("retention.toml"), "auto_retention = false\n").unwrap();
+            let backend = Arc::new(crate::ci::lifecycle::tests::FakeBackend::default());
+            let runtime = CiRuntime::start(&directory, registry, backend.clone(), 1);
+            let stop = CancellationSource::new();
+            let token = stop.token();
+            let task = async_engine::launch(async move {
+                runtime
+                    .maintain_existing_cohort(crate::ci::lifecycle::tests::OWNER, &token)
+                    .await;
+            });
+            async_engine::sleep(Duration::from_millis(40)).await;
+            stop.cancel();
+            task.await.unwrap();
+            assert_eq!(*backend.cohort_maintenances.lock().unwrap(), 0);
+        });
     }
 }

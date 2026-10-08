@@ -958,6 +958,7 @@ fn map_bounded(error: BoundedProcessError) -> CommandError {
     }
 }
 
+mod interactive;
 mod managed_reads;
 mod stdin_file;
 

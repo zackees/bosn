@@ -113,22 +113,16 @@ pub(crate) async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Re
                         max_bytes: (r.owned_max_bytes > 0).then_some(i128::from(r.owned_max_bytes)),
                     };
                     let apply = r.owned_confirm;
-                    let state_dir = state_dir.clone();
-                    // The daemon re-derives the plan from its own fresh read here. A preview a
-                    // client built earlier is never trusted: it was taken against engine state
-                    // that may already have changed, and a preview is not an authorization.
-                    let outcome = async_engine::launch_blocking(move || {
-                        let engine = DockerEngine::docker();
-                        managed_retention::managed_retention_pass(
-                            &engine, &state_dir, policy, apply,
-                        )
-                    })
-                    .await;
+                    // The job actor holds admission through the fresh read, idle stop,
+                    // and removal, so ensure/exec cannot race maintenance.
+                    let outcome = jobs.managed_retention(policy, apply).await;
                     match outcome {
                         Ok(outcome) => {
                             let summary = outcome.summary;
                             ReplyWire {
                                 code: 230,
+                                owned_held_total: summary.held_total,
+                                owned_held: summary.held,
                                 owned_applied: summary.applied,
                                 owned_planned: summary.planned,
                                 owned_removed: summary.removed,
@@ -141,8 +135,9 @@ pub(crate) async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Re
                                 ..Default::default()
                             }
                         }
-                        Err(_) => ReplyWire {
-                            code: 3,
+                        Err(error) => ReplyWire {
+                            code: 230,
+                            owned_refused: error,
                             ..Default::default()
                         },
                     }
@@ -530,7 +525,7 @@ pub(crate) async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Re
                         })
                 });
                 match request {
-                    Some(request) => {
+                    Some(mut request) => {
                         let (logs, mut receiver) = async_engine::channel(SETUP_PREPARE_EVENT_QUEUE);
                         let logs = crate::raw_run_log::JobLogSink::transient(logs);
                         let drain = async_engine::launch(async move {
@@ -538,7 +533,26 @@ pub(crate) async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Re
                         });
                         let cancellation = async_engine::CancellationSource::new();
                         let token = cancellation.token();
-                        let result = adopt.execute(request, &token, &logs).await;
+                        let deadline = async_engine::Deadline::after(request.deadline);
+                        let admission =
+                            managed_retention::gate::workload(deadline.remaining(), &token).await;
+                        request.deadline = deadline.remaining();
+                        let images = ActorSetupImageRecorder {
+                            actor: actor.clone(),
+                        };
+                        let (_admission, result) = match admission {
+                            Ok(guard) if request.deadline.is_zero() => (
+                                Some(guard),
+                                Err("setup adoption deadline elapsed during admission".into()),
+                            ),
+                            Ok(guard) => (
+                                Some(guard),
+                                adopt
+                                    .execute_recorded(request, &token, &logs, &images)
+                                    .await,
+                            ),
+                            Err(error) => (None, Err(error)),
+                        };
                         drop(logs);
                         let _ = drain.await;
                         match result {
@@ -553,8 +567,9 @@ pub(crate) async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Re
                                     ..Default::default()
                                 },
                             },
-                            Err(_) => ReplyWire {
+                            Err(error) => ReplyWire {
                                 code: 3,
+                                job_error: error,
                                 ..Default::default()
                             },
                         }

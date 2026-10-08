@@ -167,3 +167,9 @@ living implementation spec.
 (`~/.local/bin/soldr`), which predates the `prepare` subcommand and breaks local cross
 builds. CI is unaffected (it uses `zackees/setup-soldr@v0`). If a local `soldr`
 build fails with "tool not found: prepare", run `uv tool install 'soldr==0.9.15'`.
+
+## Automatic retention
+
+Managed garbage collection runs by default while the daemon is running.
+Operators opt out with `auto_retention = false` in the state directory’s
+`retention.toml`. Keep ownership, age, liveness, and pinning gates on all removals.
