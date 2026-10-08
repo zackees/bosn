@@ -59,8 +59,7 @@ impl Immediate<'_> {
              AND NOT EXISTS (SELECT 1 FROM execution_sessions AS s \
                  WHERE s.container_id=r.id OR s.container_id=r.name OR s.container_id=?) \
              AND NOT EXISTS (SELECT 1 FROM resource_uses AS u WHERE u.resource_id=r.id \
-                 AND (u.last_used>? OR u.workspace<>r.workspace OR u.stack<>r.stack \
-                      OR u.generation<>r.generation)) ORDER BY r.id",
+                 AND u.last_used>?) ORDER BY r.id",
             &[
                 Value::Text(labels.registry.clone()),
                 Value::Text(labels.kind.as_str().into()),
@@ -103,6 +102,70 @@ impl Immediate<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_shared_use_does_not_strand_removed_ownership() {
+        let directory = fs::TemporaryDirectory::new().unwrap();
+        let owner = "11111111-2222-4333-8444-555555555555";
+        let mut registry =
+            Registry::create_writer(directory.path().join("registry.sqlite3"), owner).unwrap();
+        let labels = bosn_core::ResourceLabels::new(
+            owner,
+            ResourceKind::Volume,
+            "stack",
+            "generation",
+            Scope::Machine,
+            "workspace",
+            "1",
+            Some(Retention::Warm),
+        )
+        .unwrap();
+        let resource = Resource {
+            id: "volume:shared".into(),
+            kind: ResourceKind::Volume,
+            name: "shared".into(),
+            stack: "stack".into(),
+            generation: "generation".into(),
+            scope: Scope::Machine,
+            workspace: "workspace".into(),
+            created_at: 1.0,
+            last_used: 2.0,
+            state: ResourceState::Active,
+            retention: Retention::Warm,
+        };
+        for (state, workspace, last_used, expected) in [
+            (ResourceState::Retired, "prior-workspace", 2.0, 1),
+            (ResourceState::Active, "prior-workspace", 2.0, 1),
+            (ResourceState::Active, "workspace", 2.0, 1),
+            (ResourceState::Retired, "prior-workspace", 4.0, 0),
+            (ResourceState::Active, "workspace", 4.0, 0),
+        ] {
+            let mut transaction = registry.begin_immediate().unwrap();
+            transaction.delete_resource(&resource.id).unwrap();
+            transaction.put_resource(&resource).unwrap();
+            transaction
+                .put_resource_use(&ResourceUse {
+                    resource_id: resource.id.clone(),
+                    workspace: workspace.into(),
+                    stack: resource.stack.clone(),
+                    generation: resource.generation.clone(),
+                    last_used,
+                    state,
+                })
+                .unwrap();
+            assert_eq!(
+                transaction
+                    .delete_removed_ownership(&labels, "shared", "physical", 3.0)
+                    .unwrap(),
+                expected
+            );
+            transaction.commit().unwrap();
+            assert_eq!(
+                registry.resource_uses(0, 64).unwrap().items.is_empty(),
+                expected == 1
+            );
+        }
+    }
 
     #[test]
     fn removal_receipt_rechecks_pin_use_incarnation_and_owner() {

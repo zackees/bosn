@@ -184,11 +184,40 @@ storage reuse; strict registry Clippy passed. Evidence:
 Unique operational keys still need their own completed-run lifecycle; a fixed
 total event-count or total registry-storage bound is not claimed.
 
-The resource-use discovery/accounting defect remains open. The review explicitly
+The initial review identified the resource-use discovery/accounting defect. It explicitly
 warns that normal warm producers leave Active use rows after completion, so
 treating every Active row as a lease would prevent ordinary idle reclamation.
 The fix must align newest activity and incompatible active claims across both
 discovery and accounting while permitting retired historical use cleanup.
+
+### Shared-use activity aligned with deletion accounting
+
+The follow-up producer audit confirmed that prior shared-image Active uses are
+not generally retired: normal image preparation adds the current workspace's
+use, and completing a session does not retire the previous workspace's use.
+Therefore treating historical Active context as an unconditional lease would
+permanently retain ordinary shared warm images. The same primary reviewer
+recommended using all finite use clocks for TTL, retaining the existing actual
+leases/sessions/pins, peer policy, workload exclusion, physical-reference and
+exact-incarnation gates.
+
+Managed discovery now pages typed resource uses in batches of 64, requires a
+matching ownership row and finite activity clocks, includes their count in its
+65536-record ceiling, and computes newest activity across every recorded use.
+Receipt accounting refuses post-observation activity rather than stale context
+alone. Explicit retired-only GC query APIs keep their separate stricter rules.
+
+A focused Docker RED reproduced stranded ownership from a retired prior
+workspace use. The updated transaction cases verify old Active/Retired uses
+permit accounting cleanup, fresh uses refuse it, and confirmed deletion clears
+matching use rows. Three transaction cases pass (0.13 seconds); fourteen
+discovery cases pass (0.27 seconds), including Active/Adopted/Retired activity
+without permanent context protection. Evidence:
+`/tmp/bosn-545-shared-use-red.log`,
+`/tmp/bosn-545-shared-use-registry-green.log`, and
+`/tmp/bosn-545-shared-use-discovery-green.log`.
+The full production two-workspace shared-image Docker regression remains to
+be added before claiming its end-to-end lifecycle proof.
 
 ### Registry cleanup boundary
 

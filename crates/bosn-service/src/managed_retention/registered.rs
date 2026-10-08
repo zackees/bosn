@@ -12,6 +12,7 @@ use bosn_registry::{ReadOnlyRegistry, Resource};
 
 mod intents;
 mod pending_images;
+mod uses;
 
 pub(crate) struct RegisteredOwnership {
     pub(super) owner: String,
@@ -54,6 +55,7 @@ impl RegisteredOwnership {
             offset = next;
         }
         let protected = protections(&registry)?;
+        uses::apply(&registry, &mut resources)?;
         let pending = intents::load(&registry, &resources)?;
         let pending_images: Vec<_> = registry
             .image_creation_intents()
