@@ -159,6 +159,37 @@ authority/recovery tests pass in Docker (1.79 seconds). Evidence:
 `/tmp/bosn-545-catalog-location-green.log`. This closes the placement defect;
 exact final native host validation remains required.
 
+### Local pre-push review and operational history correction
+
+The sole `clud-review` primary reviewed the full implementation checkpoint
+`391c8e35...97e27294`, with all changed language buckets and repository rules.
+It found two HIGH defects: diagnostic trimming erased event-backed operational
+authority, and retention discovery omitted independently recorded resource
+uses while deletion accounting enforced incompatible use checks. Two advisory
+findings concern changed launchd registrations and catalog-directory fsync.
+Review agent budget consumed: one; follow-up uses the same reviewer.
+
+The history correction preserves the newest state per exact engine/helper key,
+including terminal tombstones, and distinct manifest contract/veto records.
+Repeated identical contracts/vetoes are deduplicated. Only diagnostic events
+are capped at 4096. A Docker RED flood-and-reopen regression reproduced loss of
+the manifest contract. The expanded regression checks distinct facts, duplicate
+writes, and removal of superseded journal state; it passes after the correction.
+The same reviewer approved the SQL compatibility change pending focused GREEN.
+Both history regressions passed in Docker (55.11 seconds), including repeated
+storage reuse; strict registry Clippy passed. Evidence:
+`/tmp/bosn-545-history-authority-red.log`,
+`/tmp/bosn-545-history-authority-green.log`, and
+`/tmp/bosn-545-history-authority-clippy.log`.
+Unique operational keys still need their own completed-run lifecycle; a fixed
+total event-count or total registry-storage bound is not claimed.
+
+The resource-use discovery/accounting defect remains open. The review explicitly
+warns that normal warm producers leave Active use rows after completion, so
+treating every Active row as a lease would prevent ordinary idle reclamation.
+The fix must align newest activity and incompatible active claims across both
+discovery and accounting while permitting retired historical use cleanup.
+
 ### Registry cleanup boundary
 
 Confirmed physical deletion now produces typed receipts. The admission guard

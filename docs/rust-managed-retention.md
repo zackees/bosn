@@ -146,11 +146,16 @@ read may finish after expiry. The client allows thirty minutes for the reply.
 
 ### Registry diagnostic history
 
-Normal event appends retain the newest 4096 event IDs. Each new event accepts
+Normal event appends retain the newest 4096 diagnostic event IDs. Each new event accepts
 at most 256 UTF-8 bytes for its kind and 64 KiB for its detail, and requires a
 finite timestamp. Oversized writes return a diagnostic-bounds error before
-insertion. Event history is separate from resource, pin, lease, session and
-creation-intent ownership proof; trimming events never changes those tables.
+insertion. Operational events are preserved: the newest record for each exact
+engine/helper journal key (including terminal tombstones), and distinct manifest
+recovery contracts and autostart vetoes. Identical contract/veto records are
+deduplicated. These records authorize recovery and cannot age out with unrelated
+diagnostic traffic. Resource, pin, lease, session and creation-intent tables are
+unchanged by history trimming. The diagnostic ceiling does not bound unique
+operational state across abandoned runs or distinct manifest generations.
 Legacy import preserves its source event records and IDs; normal appends then
-age older imported events out of the recent-history window. SQLite reuses freed
+age older imported diagnostics out of the recent-history window. SQLite reuses freed
 pages, so an existing large database need not shrink on disk to stop growing.
