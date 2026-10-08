@@ -1333,3 +1333,43 @@ was moved to trash with safe-rm. The intended shared target was preserved.
 The final strict Clippy refresh also passed. These results are a local
 implementation checkpoint, not evidence that all retrospective criteria or
 GitHub delivery have finished.
+
+## Candidate gate and tool-store verification (October 8)
+
+The shipping candidate CLI was built from commit
+`8d07df14db87cc42e1ae7e59c79a4b537eb667da` and reports `bosn 0.1.18`.
+Installed 0.1.15 cannot satisfy the local verifier's execution-pin schema.
+A separate private validation registry and daemon supplied the candidate pins
+without replacing the installed daemon. The Rust local-gate run
+`89762df0-fa00-4e35-a11c-3f8073e69bb3` failed after 324 seconds during
+Clippy dependency compilation: Soldr reported broker progress-silence and
+unconfirmed handoff failures. Its engine cleanup is recorded as `removed`.
+No local-gate attestation or successful remote checks are claimed.
+
+An independent private Docker fixture exercised the pinned act2.15 binary's
+`tool-publish`, `tool-update`, `tool-current`, and `tool-retain` commands.
+Replacing an install produced a new selected generation. Retention removed
+the obsolete generation and its unreferenced object, retained the selected
+generation, and reduced unique inode allocation from 81,920 to 53,248 bytes.
+The deliberately one-byte allocation ceiling produced a nonzero protected
+overflow result; that is not a partial inventory or permission to discard the
+selected generation. Exact helper disappearance was verified. The bounded
+fixture report is `/tmp/bosn-545-pinned-tool-retention-proof.json`. This proves
+the pinned transport capability, not normal Bosn tool-store enrollment: that
+production path still requires implementation.
+
+The default macOS registration path now detects changed arguments for an
+already loaded service and defers the upgrade without rewriting its plist or
+stopping it. Automatically unloading it was rejected during primary review
+because the daemon may be serving other sessions. A safe automatic upgrade
+handoff remains an acceptance gap; explicit disable/enable is the currently
+reported recovery after work finishes.
+
+The revised deferred-upgrade behavior passed all 14 Docker-isolated autostart
+tests (`/tmp/bosn-545-macos-deferred-tests.log`), strict service-library Clippy
+(14.10 seconds), and full repository lint. The same primary reviewer inspected
+the correction and cleared the active-work safety finding. A full service unit
+refresh before this final localized correction passed 616 tests with 23 ignored
+(33.60 seconds); the changed autostart scope was rerun afterward. None of these
+results substitutes for the unsuccessful local workflow gate or remaining
+normal tool-cache enrollment and storage-soak requirements.

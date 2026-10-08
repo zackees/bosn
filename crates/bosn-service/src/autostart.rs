@@ -324,19 +324,26 @@ pub fn ensure_default(
         return Ok(None);
     }
     let path = unit_path(platform, home);
-    if platform == Platform::MacosLaunchd
-        && std::fs::read_to_string(&path).ok().as_deref()
-            == Some(unit_contents(platform, binary, state_dir).as_str())
-        && runner
+    if platform == Platform::MacosLaunchd && path.exists() {
+        let loaded = runner
             .run(&argv(&["launchctl", "list", SERVICE_NAME]))
-            .is_ok()
-    {
-        return Ok(Some(AutostartStatus {
-            platform,
-            path,
-            written: true,
-            registered: true,
-        }));
+            .is_ok();
+        if loaded {
+            if std::fs::read_to_string(&path).ok().as_deref()
+                == Some(unit_contents(platform, binary, state_dir).as_str())
+            {
+                return Ok(Some(AutostartStatus {
+                    platform,
+                    path,
+                    written: true,
+                    registered: true,
+                }));
+            }
+            // launchd keeps loaded arguments independently of the plist.
+            // An automatic CLI invocation cannot prove other sessions idle;
+            // preserve their daemon and its loadable configuration.
+            return Err("maintenance upgrade deferred: launchd still has different Bosn arguments loaded; after jobs and sessions finish, explicitly disable then enable daemon autostart".into());
+        }
     }
     enable(runner, platform, home, binary, state_dir).map(Some)
 }
@@ -553,6 +560,37 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0][1], "list");
         assert_eq!(calls[1][1], "load");
+    }
+
+    #[test]
+    fn changed_macos_registration_preserves_running_service_and_old_plist() {
+        let home = home();
+        let platform = Platform::MacosLaunchd;
+        let path = unit_path(platform, home.path());
+        enable(
+            &FakeRunner::default(),
+            platform,
+            home.path(),
+            Path::new("/old-bosn"),
+            Path::new("/old-state"),
+        )
+        .unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+        let runner = FakeRunner::default();
+        let error = ensure_default(
+            &runner,
+            platform,
+            home.path(),
+            Path::new("/new-bosn"),
+            Path::new("/new-state"),
+        )
+        .unwrap_err();
+        assert!(error.contains("maintenance upgrade deferred"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(
+            *runner.calls.lock().unwrap(),
+            vec![argv(&["launchctl", "list", SERVICE_NAME])]
+        );
     }
 
     #[test]
