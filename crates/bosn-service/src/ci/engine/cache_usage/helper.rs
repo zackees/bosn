@@ -119,6 +119,9 @@ impl Identity {
             || !row.host_config.readonly_rootfs
             || row.host_config.privileged
             || row.host_config.network_mode != "none"
+            || row.host_config.cap_drop != ["ALL"]
+            || (!row.host_config.cap_add.is_empty()
+                && (!self.maintenance || row.host_config.cap_add != ["CAP_DAC_OVERRIDE"]))
             || mount.kind != "volume"
             || mount.name != volume
             || mount.destination
@@ -162,6 +165,15 @@ struct HostConfig {
     readonly_rootfs: bool,
     privileged: bool,
     network_mode: String,
+    #[serde(deserialize_with = "nullable_caps")]
+    cap_add: Vec<String>,
+    cap_drop: Vec<String>,
+}
+
+fn nullable_caps<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    Option::<Vec<String>>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 #[derive(Deserialize)]
@@ -253,7 +265,7 @@ mod role_tests {
         let mut document = serde_json::json!({
             "Id": "1".repeat(64), "Name": format!("/{}", maintenance.name),
             "Config": {"Image": intent.image, "Labels": labels},
-            "HostConfig": {"ReadonlyRootfs": true, "Privileged": false, "NetworkMode": "none"},
+            "HostConfig": {"ReadonlyRootfs": true, "Privileged": false, "NetworkMode": "none", "CapAdd": null, "CapDrop": ["ALL"]},
             "Mounts": [{"Type": "volume", "Name": intent.volume, "Destination": "/bosn/cache", "RW": true}]
         });
         let inspect = |value: &serde_json::Value| serde_json::to_string(&vec![value]).unwrap();
@@ -262,6 +274,29 @@ mod role_tests {
                 .verify(&inspect(&document), &intent.volume)
                 .is_ok()
         );
+        // Historical helpers without added capabilities remain removable.
+        document["HostConfig"]["CapAdd"] = serde_json::json!(["CAP_DAC_OVERRIDE"]);
+        assert!(
+            maintenance
+                .verify(&inspect(&document), &intent.volume)
+                .is_ok()
+        );
+        document["HostConfig"]["CapAdd"] = serde_json::json!(["CAP_SYS_ADMIN"]);
+        assert!(
+            maintenance
+                .verify(&inspect(&document), &intent.volume)
+                .is_err()
+        );
+        document["HostConfig"]
+            .as_object_mut()
+            .unwrap()
+            .remove("CapAdd");
+        assert!(
+            maintenance
+                .verify(&inspect(&document), &intent.volume)
+                .is_err()
+        );
+        document["HostConfig"]["CapAdd"] = serde_json::json!(["CAP_DAC_OVERRIDE"]);
         intent.role = None;
         let measurement = Identity::from_intent(&intent).unwrap();
         assert!(

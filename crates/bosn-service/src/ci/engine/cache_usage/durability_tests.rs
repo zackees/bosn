@@ -42,7 +42,7 @@ fn seed_observation(dir: &std::path::Path, value: &CacheHelperIntent) {
     labels.insert("io.bosn.cache.measurement".into(), "@NONCE@".into());
     let document = serde_json::json!([{"Id": ID, "Name": "/@NAME@",
         "Config": {"Image": value.image, "Labels": labels},
-        "HostConfig": {"ReadonlyRootfs": true, "Privileged": false, "NetworkMode": "none"},
+        "HostConfig": {"ReadonlyRootfs": true, "Privileged": false, "NetworkMode": "none", "CapAdd": null, "CapDrop": ["ALL"]},
         "Mounts": [{"Type": "volume", "Name": value.volume, "Destination": "/cache", "RW": false}]}]);
     std::fs::write(dir.join("helper.json"), document.to_string()).unwrap();
 }

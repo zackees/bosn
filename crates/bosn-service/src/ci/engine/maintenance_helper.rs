@@ -146,6 +146,8 @@ pub(super) fn helper_create_args(identity: &helper::Identity) -> Vec<String> {
         "--read-only",
         "--cap-drop",
         "ALL",
+        "--cap-add",
+        "DAC_OVERRIDE",
         "--memory",
         "128m",
         "--cpus",

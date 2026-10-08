@@ -62,6 +62,8 @@ mod runner_tools;
 #[cfg(test)]
 use runner_images::{load_runner_body, runner_tar};
 use runner_images::{load_runner_script, reload_runner_script};
+#[cfg(test)]
+mod tool_permissions_live_tests;
 mod toolcache;
 mod toolstore;
 #[cfg(test)]

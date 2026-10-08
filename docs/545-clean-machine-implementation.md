@@ -1579,3 +1579,29 @@ the helper drops capabilities. Preparing-store abandonment, historical legacy
 source retirement, total shared-volume admission/accounting, production soak,
 final exact-SHA live inventory, and Local-Gate/remote CI/merge remain required.
 The installed user daemon has not been replaced, and no issue closure is claimed.
+
+### Maintenance helper permissions: production regression
+
+The pinned native binary failed to retire a completed 4 MiB tool object whose
+tree is owned by UID/GID 1001 with mode 0555 under the production helper
+profile (`CapDrop=ALL`, no added capabilities). A fresh equivalent fixture
+with only `DAC_OVERRIDE` reclaimed allocated bytes from 4,300,800 to 94,208
+and preserved the selected generation. Evidence:
+`/tmp/bosn-545-tool-permission-fresh-red-green.json`.
+
+The production factory now adds only that capability. Recovery requires
+`CapDrop=[ALL]`; maintenance accepts either the historical empty added-capability
+set or exactly Docker's canonical `CAP_DAC_OVERRIDE`. Measurement helpers
+remain restricted to no added capabilities. Missing capability fields fail
+verification. The new ignored regression
+`production_helper_retires_nonroot_readonly_tool_object` uses the actual factory
+with a private volume and passed against the rebuilt service test binary:
+1 passed in 3.32 seconds; every fixture container and volume was removed and
+absence verified. Related accounting/helper tests: 20 passed, 4 ignored.
+Full repository lint and all-target service Clippy passed.
+
+A separate unresolved native bug is confirmed: the failed removal deleted the
+object manifest before encountering the protected tree. Retrying this damaged
+store with the corrected capability returns `tool generation object manifest
+is invalid`. The permission fix does not establish crash-safe retirement or
+repair historical damaged objects. Full issue acceptance remains incomplete.

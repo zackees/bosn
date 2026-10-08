@@ -16,7 +16,7 @@ pub(super) fn fixture(success: bool, cleanup: &str) -> (TemporaryDirectory, Dock
     let helper = serde_json::json!([{
         "Id": format!("{:064}", 1), "Name": "/@NAME@",
         "Config": {"Image": super::engine_image(), "Labels": {"io.bosn.cache.measurement": "@NONCE@"}},
-        "HostConfig": {"ReadonlyRootfs": true, "Privileged": false, "NetworkMode": "none"},
+        "HostConfig": {"ReadonlyRootfs": true, "Privileged": false, "NetworkMode": "none", "CapAdd": null, "CapDrop": ["ALL"]},
         "Mounts": [{"Type": "volume", "Name": CACHE_VOLUME, "Destination": "/cache", "RW": false}]
     }]);
     std::fs::write(dir.path().join("helper.json"), helper.to_string()).unwrap();
