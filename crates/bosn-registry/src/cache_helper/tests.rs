@@ -152,6 +152,7 @@ fn identical_cleanup_registration_does_not_grow_the_audit_ledger() {
     tx.begin_cache_helper(&value).unwrap();
     tx.register_cache_helper(&value.nonce, ID, 2.0).unwrap();
     tx.commit().unwrap();
+    let initial = registry.events(0, 256).unwrap().items;
     for at in 3..103 {
         let mut tx = registry.begin_immediate().unwrap();
         tx.register_cache_helper(&value.nonce, ID, f64::from(at))
@@ -164,8 +165,11 @@ fn identical_cleanup_registration_does_not_grow_the_audit_ledger() {
         .items
         .into_iter()
         .filter(|event| event.kind == kind(&value.nonce).unwrap())
-        .count();
-    assert_eq!(snapshots, 2, "identical retries must not append snapshots");
+        .collect::<Vec<_>>();
+    assert_eq!(
+        snapshots, initial,
+        "identical retries must not change the journal"
+    );
     drop(registry);
     let mut registry = Registry::open_writer(&path).unwrap();
     let record = registry.cache_helper(&value.nonce).unwrap().unwrap();
@@ -184,11 +188,17 @@ fn identical_cleanup_registration_does_not_grow_the_audit_ledger() {
         .items
         .into_iter()
         .filter(|event| event.kind == kind(&value.nonce).unwrap())
-        .count();
-    assert_eq!(
-        snapshots, 3,
-        "terminal absence is a real durable transition"
-    );
+        .collect::<Vec<_>>();
+    let [terminal] = snapshots.as_slice() else {
+        panic!("terminal authority must replace historical helper snapshots: {snapshots:?}");
+    };
+    assert!(terminal.id > initial[0].id);
+    assert_eq!(terminal.at, 103.0);
+    drop(registry);
+    let registry = Registry::open_writer(&path).unwrap();
+    let record = registry.cache_helper(&value.nonce).unwrap().unwrap();
+    assert_eq!(record.state, CacheHelperState::Removed);
+    assert_eq!(record.updated_at, 103.0);
     assert!(
         registry
             .pending_cache_helpers(None, 64)

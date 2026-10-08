@@ -1380,3 +1380,21 @@ workspace test commands and changes no tier or release gate. Full lint passed
 and the same primary reviewer found no configuration blocker. The next local
 gate run must establish whether this resolves the observed broker failure;
 prior one-job local Clippy success is supporting evidence, not a gate result.
+
+## Serial workflow gate and helper authority regression (October 8)
+
+The serial local Rust gate (`9ae1fcb8-4f8c-4903-9430-e0b2b8c28ecd`,
+commit `2f6dfc98`) passed formatting, all-target Clippy, and the kernel
+boundary check. Workspace tests reached a stale helper-journal assertion: it
+expected two historical snapshots even though reviewed compaction retains
+only the latest exact producer authority. The run completed with failure
+after 665 seconds, and its exact engine cleanup is recorded as `removed`.
+The Linux lane was not run and no attestation was generated.
+
+The regression now compares the complete journal before and after 100
+identical cleanup registrations. The terminal transition must replace that
+authority with a later event ID and timestamp, survive reopening as Removed,
+and leave no pending helper. All 21 default-feature registry unit tests passed
+in isolated Docker (58.40 seconds), full lint passed, and the same primary
+reviewer cleared this scoped test correction. This fixes the observed local
+test failure without loosening journal authority or production cleanup.
