@@ -1695,3 +1695,33 @@ path is pending the dependency release and verified artifact rollout. No merge,
 installation or solved-issue claim follows from these unit checks. Known-producer
 and recipe authority upgrade handling, remaining storage bounds, live repeated
 runs, final local/remote gates and parent merge remain required.
+
+### Compatible enrollment provenance across upgrades
+
+The authority boundary previously required the recorded recipe hash to equal the
+current recipe byte-for-byte, so even a supported source update stranded an
+existing closed cache. The focused test failed on the verified previous receipt
+(`/tmp/bosn-545-tool-upgrade-red.log`). The boundary now recognizes the exact
+act2.15 x86_64 binary digest and recipe digest from `cea9c15e`, while preserving
+that original receipt. Unknown producer/recipe pairs, malformed nonces, unknown
+schemas and policy differences still refuse enrollment. The current pinned
+binary is verified by the caller, and native validation of selected payloads
+still precedes warm copying or maintenance; no ownership is inferred from names.
+
+Two isolated tests pass (`/tmp/bosn-545-tool-upgrade-green.log`), all-target Clippy
+passes (`/tmp/bosn-545-tool-upgrade-clippy.log`), and full lint passes
+(`/tmp/bosn-545-tool-upgrade-lint.log`). The same reviewer found this increment
+clean. Its conditional ARM64 finding was resolved against actual historical
+`act_artifact`: only x86_64/amd64 was supported; other architectures returned None.
+Live upgrade and overlapping old-producer handoff remain unproven.
+
+Act2 #60 is merged at `ad04e18dc38f07b020b98429d018a4cccae5f62c`.
+A clean independent `master` checkout exists at `../act2-545-release` and matches
+that SHA. A clone referencing the older local repository failed on a missing
+object; a fresh shallow network clone succeeded and supplies the release
+checkout. Full checks were dispatched on the exact candidate, run
+https://github.com/zackees/act2/actions/runs/37853173865 (verified
+`workflow_dispatch` and matching head SHA). The candidate's Codespell run
+37853107016 passed. Full checks remain live; no tag/release or Bosn pin update
+has occurred. Publishing is authorized by the repository dependency-release
+policy but stays gated on exact-candidate full CI and verified artifacts.

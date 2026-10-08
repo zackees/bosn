@@ -591,6 +591,15 @@ impl Session {
     }
 }
 
+// Exact producer/recipe provenance from the pre-rollover implementation at
+// cea9c15e. Its canonical object/generation formats and FD7 enrollment fence
+// remain compatible. Keep the original receipt: the current verified native
+// binary must still validate selection/payload before warm use or maintenance.
+const COMPATIBLE_TOOL_PRODUCER: (&str, &str) = (
+    "b4be8d7ef98729ad16a9a6ddba331f1d2b0feb8abd52eb9e5f3a93155fb4f1df",
+    "66430164c4f2fb7cf9190fb29b43058b53f72b2b37442916f49f33b57c394b50",
+);
+
 fn require_producer(intent: &Intent, policy: CachePolicy, act_sha256: &str) -> Result<(), String> {
     let nonce = intent.nonce.len() == 36
         && intent.nonce.bytes().enumerate().all(|(i, b)| {
@@ -600,10 +609,14 @@ fn require_producer(intent: &Intent, policy: CachePolicy, act_sha256: &str) -> R
                 b.is_ascii_hexdigit() && !b.is_ascii_uppercase()
             }
         });
+    let current = intent.act_sha256 == act_sha256
+        && intent.recipe_sha256 == kernal_api::hash::sha256_bytes(RECIPE.as_bytes()).to_hex();
+    let compatible = intent.act_sha256 == COMPATIBLE_TOOL_PRODUCER.0
+        && intent.recipe_sha256 == COMPATIBLE_TOOL_PRODUCER.1;
     if intent.schema_version != 1
         || !nonce
-        || intent.act_sha256 != act_sha256
-        || intent.recipe_sha256 != kernal_api::hash::sha256_bytes(RECIPE.as_bytes()).to_hex()
+        || !super::cache_usage::helper::valid_id(act_sha256)
+        || !(current || compatible)
         || intent.policy != policy
     {
         return Err(
@@ -611,4 +624,47 @@ fn require_producer(intent: &Intent, policy: CachePolicy, act_sha256: &str) -> R
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod authority_tests {
+    use super::*;
+
+    const OLD_ACT: &str = COMPATIBLE_TOOL_PRODUCER.0;
+    const OLD_RECIPE: &str = COMPATIBLE_TOOL_PRODUCER.1;
+
+    fn previous() -> Intent {
+        Intent {
+            schema_version: 1,
+            nonce: "12345678-1234-1234-1234-123456789abc".into(),
+            act_sha256: OLD_ACT.into(),
+            recipe_sha256: OLD_RECIPE.into(),
+            policy: CachePolicy::default(),
+        }
+    }
+
+    #[test]
+    fn verified_previous_enrollment_survives_recipe_and_native_upgrade() {
+        let intent = previous();
+        require_producer(&intent, intent.policy, OLD_ACT).unwrap();
+        require_producer(&intent, intent.policy, &"a".repeat(64)).unwrap();
+        assert_eq!(intent.act_sha256, OLD_ACT);
+        assert_eq!(intent.recipe_sha256, OLD_RECIPE);
+    }
+
+    #[test]
+    fn previous_enrollment_does_not_authorize_unknown_producers_or_changed_policy() {
+        let mut intent = previous();
+        intent.act_sha256 = "c".repeat(64);
+        assert!(require_producer(&intent, intent.policy, OLD_ACT).is_err());
+        intent = previous();
+        intent.recipe_sha256 = "c".repeat(64);
+        assert!(require_producer(&intent, intent.policy, OLD_ACT).is_err());
+        intent = previous();
+        let mut policy = intent.policy;
+        policy.repository_max_bytes /= 2;
+        assert!(require_producer(&intent, policy, OLD_ACT).is_err());
+        intent.nonce = "not-an-enrollment".into();
+        assert!(require_producer(&intent, intent.policy, OLD_ACT).is_err());
+    }
 }
