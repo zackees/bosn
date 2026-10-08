@@ -35,6 +35,14 @@ fn latest_snapshot_survives_restart_and_requires_real_helper_cleanup_evidence() 
             reclaimed_archive_bytes: Some(80),
         },
         recovery_error: None,
+        tool_outcome: Some(ToolMaintenanceOutcome::Observed {
+            stats: ToolMaintenanceStats {
+                allocated_before: 80,
+                allocated_after: 50,
+                retired_generations: 1,
+                retired_objects: 1,
+            },
+        }),
     };
     let mut partial = snapshot.clone();
     if let MaintenanceOutcome::Observed { partial, .. } = &mut partial.outcome {
@@ -79,6 +87,7 @@ fn latest_snapshot_survives_restart_and_requires_real_helper_cleanup_evidence() 
             diagnostic: "transport timeout; totals unknown".into(),
         },
         recovery_error: Some("cleanup remains pending".into()),
+        tool_outcome: None,
     };
     let mut tx = registry.begin_immediate().unwrap();
     tx.record_cache_maintenance(&unknown).unwrap();

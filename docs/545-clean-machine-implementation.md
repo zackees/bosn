@@ -1538,3 +1538,44 @@ of legacy cache sources, total shared-volume accounting/admission, interruption
 and repeated-production-run storage evidence, final exact-SHA live inventory,
 and the final Local-Gate/remote CI/merge remain required. This evidence does not
 validate the installed old daemon or claim the retrospective can be closed.
+
+
+## Background tool maintenance integration (October 8)
+
+The existing tracked maintenance helper now invokes tool-store retention after
+verifying its identity, offline pinned act, and frozen machine policy. Tool
+retention uses the same finite publication session and control lock as normal
+saves. It does not require a nested Docker daemon or a source volume: fresh
+stores remain unenrolled, preparing stores are held for publication recovery,
+and only validated published authority and native current selection authorize
+retention. Tool failure does not prevent the independent cohort pass, and its
+evidence survives cohort and helper-cleanup failures.
+
+Latest maintenance snapshots now optionally preserve a closed tool outcome:
+not enrolled, validated allocated bytes before/after with retired-generation
+and object counts, or a bounded held diagnostic. Older snapshots remain
+readable through the optional field's default. Tool outcomes require tracked
+helper authority, nonnegative counts/bytes, and matching 128 retirement limits
+at both native receipt and snapshot boundaries. Status displays tool evidence
+separately from archive evidence; no combined machine-total claim is made.
+
+The production-backend live regression now hides the nested Docker socket
+and confirms maintenance still recognizes published authority, returns complete
+positive allocation evidence, and preserves the selected warm tree. Final
+same-source live result: **1 passed, 7.14 seconds**
+(`/tmp/bosn-545-idle-tools-final-live.log`). Status **1**, cache-status **2**, and
+registry persistence **1** tests also passed, including restart preservation
+of typed tool statistics. Strict Clippy across service and registry all targets
+passed in 37.96 seconds; full repository lint passed. The initial all-target
+run caught a missing new optional field in a status test literal; it was fixed
+and the final build/tests/Clippy passed. The same primary reviewer cleared the
+integration and final boundaries without spawning another reviewer.
+
+This connects idle scheduling to tool retention; it does not establish all
+remaining acceptance. In particular, actual orphan retirement under the
+production nonprivileged helper profile still needs coverage for non-root
+ownership and read-only install modes: native snapshots preserve UID/mode and
+the helper drops capabilities. Preparing-store abandonment, historical legacy
+source retirement, total shared-volume admission/accounting, production soak,
+final exact-SHA live inventory, and Local-Gate/remote CI/merge remain required.
+The installed user daemon has not been replaced, and no issue closure is claimed.

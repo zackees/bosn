@@ -1,5 +1,7 @@
 //! Latest evidence from this daemon's registry; never machine-wide totals.
-use bosn_registry::cache_maintenance::{MaintenanceOutcome, MaintenanceSnapshot};
+use bosn_registry::cache_maintenance::{
+    MaintenanceOutcome, MaintenanceSnapshot, ToolMaintenanceOutcome,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -12,6 +14,8 @@ pub enum MaintenanceStatus {
         recovery_failed: bool,
         cleanup_failed: bool,
         outcome: MaintenanceResult,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_maintenance: Option<String>,
     },
 }
 
@@ -59,6 +63,17 @@ impl From<MaintenanceSnapshot> for MaintenanceStatus {
                 .helper
                 .is_some_and(|helper| helper.cleanup_error.is_some()),
             outcome,
+            tool_maintenance: snapshot.tool_outcome.map(|outcome| match outcome {
+                ToolMaintenanceOutcome::NotEnrolled => "tools: not enrolled".into(),
+                ToolMaintenanceOutcome::Held { diagnostic } => format!("tools: held: {diagnostic}"),
+                ToolMaintenanceOutcome::Observed { stats } => format!(
+                    "tools: allocated bytes {} -> {}; retired generations {}, objects {}",
+                    stats.allocated_before,
+                    stats.allocated_after,
+                    stats.retired_generations,
+                    stats.retired_objects
+                ),
+            }),
         }
     }
 }
@@ -73,6 +88,7 @@ impl MaintenanceStatus {
                 recovery_failed,
                 cleanup_failed,
                 outcome,
+                tool_maintenance,
             } => {
                 let result = match outcome {
                     MaintenanceResult::Unknown => "unknown result".to_owned(),
@@ -99,7 +115,7 @@ impl MaintenanceStatus {
                     ),
                 };
                 format!(
-                    "maintenance: last recorded at {observed_at:.3} (Unix seconds, this registry); {result}{}{}",
+                    "maintenance: last recorded at {observed_at:.3} (Unix seconds, this registry); {result}{}{}{}",
                     if *recovery_failed {
                         "; helper recovery failed"
                     } else {
@@ -109,7 +125,10 @@ impl MaintenanceStatus {
                         "; helper cleanup failed"
                     } else {
                         ""
-                    }
+                    },
+                    tool_maintenance
+                        .as_ref()
+                        .map_or_else(String::new, |tools| format!("; {tools}"))
                 )
             }
         }
@@ -140,6 +159,7 @@ mod tests {
                 reclaimed_archive_bytes: None,
             },
             recovery_error: None,
+            tool_outcome: None,
         };
         snapshot.validate().unwrap();
         let status = MaintenanceStatus::from(snapshot);

@@ -42,6 +42,7 @@ fn runner_cache_reports_unknown_maintenance_without_exposing_diagnostics() {
                 diagnostic: "private diagnostic".into(),
             },
             recovery_error: Some("private recovery output".into()),
+            tool_outcome: None,
         };
         assert!(matches!(
             registry
@@ -65,6 +66,7 @@ fn runner_cache_reports_unknown_maintenance_without_exposing_diagnostics() {
                 recovery_failed: true,
                 cleanup_failed: false,
                 outcome: MaintenanceResult::Unknown,
+                tool_maintenance: None,
             })
         );
         assert!(!reply.to_json().contains("private"));

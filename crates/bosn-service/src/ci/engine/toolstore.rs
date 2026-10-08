@@ -136,11 +136,29 @@ impl DockerActBackend {
         Ok(true)
     }
 
+    pub(super) async fn maintain_published_tools(
+        &self,
+        engine: &str,
+        policy: CachePolicy,
+    ) -> Result<Option<bosn_registry::cache_maintenance::ToolMaintenanceStats>, String> {
+        let mut session = self.open_tools(engine, policy).await?;
+        let result = session.maintain().await;
+        let _ = session.io.send(b"abort\n").await;
+        result
+    }
+
     pub(super) async fn publish_tools(
         &self,
         engine: &str,
         policy: CachePolicy,
     ) -> Result<(), String> {
+        let mut session = self.open_tools(engine, policy).await?;
+        let result = session.save().await;
+        let _ = session.io.send(b"abort\n").await;
+        result
+    }
+
+    async fn open_tools(&self, engine: &str, policy: CachePolicy) -> Result<Session, String> {
         let act_sha256 = self.tool_producer_digest(engine).await?;
         // The lifecycle retains exclusive ownership of this engine after its
         // execution exits; nobody may start a new invocation during this save.
@@ -184,18 +202,13 @@ impl DockerActBackend {
             recipe_sha256: kernal_api::hash::sha256_bytes(RECIPE.as_bytes()).to_hex(),
             policy,
         };
-        let mut session = Session {
+        Ok(Session {
             io,
             policy,
             intent,
             published: false,
             reservation: 0,
-        };
-        let result = session.save().await;
-        // Closing stdin and the independent guest timeout also release FD7
-        // after cancellation; do not leave an interactive lease running.
-        let _ = session.io.send(b"abort\n").await;
-        result
+        })
     }
 }
 
@@ -267,6 +280,37 @@ impl Session {
         }
     }
 
+    async fn maintain(
+        &mut self,
+    ) -> Result<Option<bosn_registry::cache_maintenance::ToolMaintenanceStats>, String> {
+        match self.state().await? {
+            State::Fresh => Ok(None),
+            State::Preparing(intent) => {
+                self.validate_intent(&intent)?;
+                Err("tool retention held: enrollment awaits source publication recovery".into())
+            }
+            State::Published(proof) => {
+                self.adopt(proof).await?;
+                self.retain(self.policy.aggregate_max_bytes).await.map(Some)
+            }
+        }
+    }
+
+    async fn adopt(&mut self, proof: Proof) -> Result<(), String> {
+        self.validate_intent(&proof.intent)?;
+        if proof.schema_version != 1
+            || !super::cache_usage::helper::valid_id(&proof.initial_generation)
+        {
+            return Err("tool enrollment proof is invalid".into());
+        }
+        self.intent = proof.intent;
+        self.published = true;
+        self.current()
+            .await?
+            .ok_or("published tool selection is missing")?;
+        Ok(())
+    }
+
     async fn save(&mut self) -> Result<(), String> {
         match self.state().await? {
             State::Fresh => {
@@ -285,19 +329,7 @@ impl Session {
                 self.validate_intent(&intent)?;
                 self.intent = intent;
             }
-            State::Published(proof) => {
-                self.validate_intent(&proof.intent)?;
-                if proof.schema_version != 1
-                    || !super::cache_usage::helper::valid_id(&proof.initial_generation)
-                {
-                    return Err("tool enrollment proof is invalid".into());
-                }
-                self.intent = proof.intent;
-                self.published = true;
-                self.current()
-                    .await?
-                    .ok_or("published tool selection is missing")?;
-            }
+            State::Published(proof) => self.adopt(proof).await?,
         }
         let block = String::from_utf8(self.raw("filesystem", None).await?)
             .map_err(|e| e.to_string())?
@@ -440,7 +472,10 @@ impl Session {
         Ok(update.generation.id)
     }
 
-    async fn retain(&mut self, bound: i64) -> Result<(), String> {
+    async fn retain(
+        &mut self,
+        bound: i64,
+    ) -> Result<bosn_registry::cache_maintenance::ToolMaintenanceStats, String> {
         let (code, body) = self.command("retain", Some(&bound.to_string())).await?;
         let report: Retention =
             serde_json::from_slice(&body).map_err(|e| format!("tool retain receipt: {e}"))?;
@@ -453,6 +488,14 @@ impl Session {
         if report.schema_version != 1
             || report.partial
             || !report.error.is_empty()
+            || report
+                .retired_generations
+                .as_ref()
+                .is_some_and(|ids| ids.len() > 128)
+            || report
+                .retired_objects
+                .as_ref()
+                .is_some_and(|ids| ids.len() > 128)
             || report.stage_retention.schema_version != 1
             || report.stage_retention.partial
             || !report.stage_retention.error.is_empty()
@@ -479,7 +522,7 @@ impl Session {
                 "tool retention held: incomplete inventory or protected storage overflow".into(),
             );
         }
-        report.before.allocated()?;
+        let before = report.before.allocated()?;
         report.stage_retention.after.allocated()?;
         let allocated = report.after.allocated()?;
         if code != 0 || report.protected_overflow || allocated > bound {
@@ -489,7 +532,18 @@ impl Session {
                 report.protected_objects.as_ref().map_or(0, Vec::len)
             ));
         }
-        Ok(())
+        Ok(bosn_registry::cache_maintenance::ToolMaintenanceStats {
+            allocated_before: before,
+            allocated_after: allocated,
+            retired_generations: report
+                .retired_generations
+                .as_ref()
+                .map_or(0, |ids| ids.len() as u32),
+            retired_objects: report
+                .retired_objects
+                .as_ref()
+                .map_or(0, |ids| ids.len() as u32),
+        })
     }
 }
 

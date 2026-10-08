@@ -13,6 +13,25 @@ pub struct MaintenanceSnapshot {
     pub helper: Option<MaintenanceHelper>,
     pub outcome: MaintenanceOutcome,
     pub recovery_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_outcome: Option<ToolMaintenanceOutcome>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ToolMaintenanceOutcome {
+    NotEnrolled,
+    Observed { stats: ToolMaintenanceStats },
+    Held { diagnostic: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolMaintenanceStats {
+    pub allocated_before: i64,
+    pub allocated_after: i64,
+    pub retired_generations: u32,
+    pub retired_objects: u32,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,6 +63,20 @@ impl MaintenanceSnapshot {
             || !self.observed_at.is_finite()
             || self.observed_at < 0.0
             || self.recovery_error.as_deref().is_some_and(|s| !bounded(s))
+            || (self.tool_outcome.is_some() && self.helper.is_none())
+            || self
+                .tool_outcome
+                .as_ref()
+                .is_some_and(|outcome| match outcome {
+                    ToolMaintenanceOutcome::NotEnrolled => false,
+                    ToolMaintenanceOutcome::Observed { stats } => {
+                        stats.allocated_before < 0
+                            || stats.allocated_after < 0
+                            || stats.retired_generations > 128
+                            || stats.retired_objects > 128
+                    }
+                    ToolMaintenanceOutcome::Held { diagnostic } => !bounded(diagnostic),
+                })
         {
             return Err(Error::BadRow("maintenance snapshot"));
         }

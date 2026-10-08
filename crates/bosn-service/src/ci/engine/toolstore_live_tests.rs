@@ -74,6 +74,12 @@ fn normal_completed_tool_save_publishes_a_selected_generation() {
             backend.checked("normal warm tool payload", DockerActBackend::exec(&id,
                 "test \"$(cat /var/lib/docker/volumes/act-toolcache/_data/Tool/1/x64/tool)\" = warm; test -f /var/lib/docker/volumes/act-toolcache/_data/Tool/1/x64.complete"), CONTROL_DEADLINE).await?;
             backend.save_toolcache(&id).await?;
+            backend.checked("hide private daemon endpoint", DockerActBackend::exec(&id,
+                "mv /var/run/docker.sock /var/run/docker.sock.hidden; ! docker info >/dev/null 2>&1"), CONTROL_DEADLINE).await?;
+            let maintenance = backend.maintain_published_tools(&id, super::super::cache_policy::CachePolicy::default()).await?
+                .ok_or("idle tool retention failed to recognize published authority")?;
+            if maintenance.allocated_after <= 0 { return Err("idle tool inventory is incomplete".into()); }
+            backend.checked("idle retention keeps selected warm tree", DockerActBackend::exec(&id, &script), CONTROL_DEADLINE).await?;
             Ok(())
         }.await;
         backend.checked("tool proof cleanup", owned(&["rm", "-f", &id]), CONTROL_DEADLINE).await.unwrap();

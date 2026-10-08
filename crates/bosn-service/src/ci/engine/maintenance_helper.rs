@@ -14,6 +14,9 @@ pub struct MaintenanceHelperAttempt {
     pub container_id: String,
     /// Reclamation evidence survives a cleanup failure.
     pub outcome: Result<MaintenanceAttempt, String>,
+    /// Independent tool evidence survives a cohort or helper-cleanup failure.
+    pub tools:
+        Option<Result<Option<bosn_registry::cache_maintenance::ToolMaintenanceStats>, String>>,
     /// Success requires explicit Docker absence and a committed journal finish.
     pub cleanup: Result<(), String>,
 }
@@ -60,6 +63,7 @@ impl DockerActBackend {
                 ));
             }
         };
+        let mut tools = None;
         let outcome = async {
             tracker.register(&id).await?;
             let document = self
@@ -98,6 +102,7 @@ impl DockerActBackend {
                 .await?;
             self.verify_installed_act(&id, &version).await?;
             self.require_cache_policy(&id, policy).await?;
+            tools = Some(self.maintain_published_tools(&id, policy).await);
             self.maintain_cache_cohort(&id, policy).await
         }
         .await;
@@ -117,6 +122,7 @@ impl DockerActBackend {
             nonce: intent.nonce,
             container_id: id,
             outcome,
+            tools,
             cleanup,
         })
     }
