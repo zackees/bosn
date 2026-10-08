@@ -1,6 +1,6 @@
 //! Latest evidence from this daemon's registry; never machine-wide totals.
 use bosn_registry::cache_maintenance::{
-    MaintenanceOutcome, MaintenanceSnapshot, ToolMaintenanceOutcome,
+    ActionMaintenanceOutcome, MaintenanceOutcome, MaintenanceSnapshot, ToolMaintenanceOutcome,
 };
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +16,8 @@ pub enum MaintenanceStatus {
         outcome: MaintenanceResult,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_maintenance: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action_maintenance: Option<String>,
     },
 }
 
@@ -63,6 +65,18 @@ impl From<MaintenanceSnapshot> for MaintenanceStatus {
                 .helper
                 .is_some_and(|helper| helper.cleanup_error.is_some()),
             outcome,
+            action_maintenance: snapshot.action_outcome.map(|outcome| match outcome {
+                ActionMaintenanceOutcome::Held { diagnostic } => {
+                    format!("actions: held: {diagnostic}")
+                }
+                ActionMaintenanceOutcome::Observed { stats } => format!(
+                    "actions: allocated bytes {} -> {}; budget {}; retired classes {}",
+                    stats.allocated_before,
+                    stats.allocated_after,
+                    stats.budget_bytes,
+                    stats.retired_classes
+                ),
+            }),
             tool_maintenance: snapshot.tool_outcome.map(|outcome| match outcome {
                 ToolMaintenanceOutcome::NotEnrolled => "tools: not enrolled".into(),
                 ToolMaintenanceOutcome::Held { diagnostic } => format!("tools: held: {diagnostic}"),
@@ -89,6 +103,7 @@ impl MaintenanceStatus {
                 cleanup_failed,
                 outcome,
                 tool_maintenance,
+                action_maintenance,
             } => {
                 let result = match outcome {
                     MaintenanceResult::Unknown => "unknown result".to_owned(),
@@ -115,7 +130,7 @@ impl MaintenanceStatus {
                     ),
                 };
                 format!(
-                    "maintenance: last recorded at {observed_at:.3} (Unix seconds, this registry); {result}{}{}{}",
+                    "maintenance: last recorded at {observed_at:.3} (Unix seconds, this registry); {result}{}{}{}{}",
                     if *recovery_failed {
                         "; helper recovery failed"
                     } else {
@@ -128,7 +143,10 @@ impl MaintenanceStatus {
                     },
                     tool_maintenance
                         .as_ref()
-                        .map_or_else(String::new, |tools| format!("; {tools}"))
+                        .map_or_else(String::new, |tools| format!("; {tools}")),
+                    action_maintenance
+                        .as_ref()
+                        .map_or_else(String::new, |actions| format!("; {actions}"))
                 )
             }
         }
@@ -159,6 +177,9 @@ mod tests {
                 reclaimed_archive_bytes: None,
             },
             recovery_error: None,
+            action_outcome: Some(ActionMaintenanceOutcome::Held {
+                diagnostic: "reader lease busy".into(),
+            }),
             tool_outcome: None,
         };
         snapshot.validate().unwrap();
@@ -168,6 +189,7 @@ mod tests {
         assert!(text.contains("budget not met"));
         assert!(text.contains("reclaimed archive bytes unknown"));
         assert!(text.contains("helper cleanup failed"));
+        assert!(text.contains("actions: held: reader lease busy"));
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("private output"));
         assert!(!json.contains("container_id"));

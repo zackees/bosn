@@ -28,9 +28,29 @@ struct Mount {
     writable: bool,
 }
 
+#[derive(Clone, Copy)]
+enum AccessScope {
+    Writers,
+    AllAttachments,
+}
+
 impl DockerActBackend {
     pub(super) async fn require_coordinated_cache_writers(&self) -> Result<(), String> {
-        let filter = format!("volume={CACHE_VOLUME}");
+        self.require_coordinated_cache_access(CACHE_VOLUME, AccessScope::Writers)
+            .await
+    }
+
+    pub(super) async fn require_coordinated_cache_readers(&self) -> Result<(), String> {
+        self.require_coordinated_cache_access(CACHE_VOLUME, AccessScope::AllAttachments)
+            .await
+    }
+
+    async fn require_coordinated_cache_access(
+        &self,
+        volume: &str,
+        scope: AccessScope,
+    ) -> Result<(), String> {
+        let filter = format!("volume={volume}");
         let output = self
             .checked(
                 "cache writer inventory",
@@ -45,7 +65,7 @@ impl DockerActBackend {
             let inspected = self
                 .checked("cache writer details", args, CONTROL_DEADLINE)
                 .await?;
-            require_participants(inspected.as_bytes(), batch)?;
+            require_participants(inspected.as_bytes(), batch, volume, scope)?;
         }
         Ok(())
     }
@@ -67,7 +87,12 @@ fn parse_ids(output: &str) -> Result<BTreeSet<String>, String> {
     Ok(ids)
 }
 
-fn require_participants(document: &[u8], expected: &[&String]) -> Result<(), String> {
+fn require_participants(
+    document: &[u8],
+    expected: &[&String],
+    volume: &str,
+    scope: AccessScope,
+) -> Result<(), String> {
     let writers: Vec<CacheWriter> = serde_json::from_slice(document)
         .map_err(|_| "cache writer detail is incomplete or invalid")?;
     let mut observed = BTreeSet::new();
@@ -78,7 +103,7 @@ fn require_participants(document: &[u8], expected: &[&String]) -> Result<(), Str
         let attachments: Vec<_> = writer
             .mounts
             .iter()
-            .filter(|mount| mount.kind == "volume" && mount.name.as_deref() == Some(CACHE_VOLUME))
+            .filter(|mount| mount.kind == "volume" && mount.name.as_deref() == Some(volume))
             .collect();
         if attachments.is_empty() {
             return Err("cache attachment changed during writer inventory; retry".into());
@@ -89,14 +114,15 @@ fn require_participants(document: &[u8], expected: &[&String]) -> Result<(), Str
             .as_ref()
             .and_then(|labels| labels.get(COORDINATION))
             .map(String::as_str);
-        if attachments.iter().any(|mount| mount.writable)
+        if (matches!(scope, AccessScope::AllAttachments)
+            || attachments.iter().any(|mount| mount.writable))
             && !matches!(
                 coordination,
                 Some(PARTICIPATING | "shared-machine-maintenance-v1")
             )
         {
             return Err(format!(
-                "cache enrollment held by uncoordinated container {}; finish its work and upgrade its Bosn producer before retrying",
+                "cache maintenance held by uncoordinated attachment {}; finish its work and upgrade its Bosn producer before retrying",
                 writer.id
             ));
         }
@@ -137,13 +163,33 @@ mod tests {
                 document = document.replace(&id, &"b".repeat(64));
             }
             assert_eq!(
-                require_participants(document.as_bytes(), &[&id]).is_ok(),
+                require_participants(
+                    document.as_bytes(),
+                    &[&id],
+                    CACHE_VOLUME,
+                    AccessScope::Writers
+                )
+                .is_ok(),
                 matches!(mode, "coordinated" | "read-only"),
                 "{mode}"
             );
         }
-        assert!(require_participants(b"[]", &[&id]).is_err());
+        let reader = serde_json::to_vec(&serde_json::json!([{
+            "Id": id, "Config": { "Labels": null },
+            "Mounts": [{"Type": "volume", "Name": CACHE_VOLUME, "RW": false}]
+        }]))
+        .unwrap();
+        assert!(require_participants(&reader, &[&id], CACHE_VOLUME, AccessScope::Writers).is_ok());
+        assert!(
+            require_participants(&reader, &[&id], CACHE_VOLUME, AccessScope::AllAttachments)
+                .is_err()
+        );
+        assert!(require_participants(b"[]", &[&id], CACHE_VOLUME, AccessScope::Writers).is_err());
         assert!(parse_ids(&format!("{id}\n{id}")).is_err());
         assert!(parse_ids("short").is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "cache_readers_live_tests.rs"]
+mod live_tests;

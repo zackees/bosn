@@ -1896,3 +1896,76 @@ checking the archive-only baseline. Full repository lint passes
 (`/tmp/bosn-545-action-fixture-lint.log`); the same reviewer found the fixture
 and scoped claims clean. These results establish the reproducible failure,
 not an implemented action-cache ceiling.
+
+### Action cache pressure retirement: current validation
+
+The uncommitted action controller now preserves the `actions` directory below
+`repository_max_bytes` and retires the entire disposable class under pressure.
+The original FD8 migration lease is held exclusively throughout observation,
+durable retirement recording, rename, deletion, and acknowledgement. The public
+entry point also verifies the measured volume and rechecks attached writers while
+holding that lease. Action results are independently persisted and displayed;
+archive success cannot stand in for successful action retirement.
+
+Live production-shell protocol checks on October 8 established:
+
+- The real GoGit fixture from `ci/action_cache_fixture.go`, previously unchanged
+  by native archive maintenance, contained 1,105,920 allocated bytes. The actual
+  action session recipe retired it and confirmed both source and ledger absent.
+- `/tmp/bosn-545-action-recovery-live.log`: a fault-injected first session exited
+  after deleting the embedded custody marker. A fresh unmodified recipe resumed
+  deletion using the outside ledger, removed the old stage, and preserved a new
+  `actions/new-payload` directory created after the original rename.
+- `/tmp/bosn-545-action-reader-live.log`: an actual shared descriptor on the
+  original FD8 lock caused the production session to exit busy (75), preserving
+  the payload. The reader then released its descriptor.
+- `/tmp/bosn-545-action-records-isolated.log`: both typed identity/mount-boundary
+  tests passed in the isolated OCI environment. The CLI status test also passed,
+  including visibility of an action-specific held diagnostic.
+
+These protocol checks do not establish public-helper volume ownership,
+attachment census, or the full issue acceptance criteria. A tracked isolated live
+Rust-controller test is being built to prove below-budget warm preservation,
+pressure deletion, and an idempotent empty follow-up pass. The original failed
+Rust test attempt was a Soldr broker startup timeout; after daemon recovery the
+build succeeded, but the host runner guard refused execution. Tests were then
+executed in OCI, respecting the repository's host-test restriction.
+
+The tracked Rust-controller live test passed after correcting command framing:
+`/tmp/bosn-545-action-controller-green.log`, 1 passed, 2.00 seconds. It preserves
+an allocated warm cache below budget, retires it above budget, proves an empty
+follow-up is idempotent, and verifies exact private helper/volume disappearance.
+Its private fixture calls the production session/controller, not the public
+machine-volume ownership/attachment guards. The preceding RED test failed with
+`action mount census lacks separator`: the shell frame's trailing blank line was
+incorrectly parsed as a mount row. The caller now removes that single framing
+newline without accepting incomplete kernel mount entries. Full `./lint` passed
+in `/tmp/bosn-545-action-lint.log`; all source files remain below 1,000 lines.
+
+Review found and corrected a retirement-specific reader hazard: the existing
+writer enrollment census intentionally accepts uncoordinated read-only mounts.
+Pressure deletion now requests `AllAttachments`, requiring the existing
+participation proof for read-only consumers too, while holding exclusive FD8.
+Unknown consumers hold retirement with an actionable attachment diagnostic.
+Writer enrollment retains its prior semantics. The focused census test passed
+in `/tmp/bosn-545-action-reader-census-tests.log`, and full lint passed in
+`/tmp/bosn-545-action-reader-lint.log`. The existing reviewer approved the
+correction; a real private-volume read-only consumer regression is being built.
+Clippy previously rejected the enlarged restart test at 104 lines; action
+snapshot construction was extracted to a helper before rerunning that gate.
+
+The tracked read-only consumer regression passed in
+`/tmp/bosn-545-readonly-consumer-live.log` (1 passed, 0.92 seconds). It uses the
+actual Docker census/parser on a private volume, proves writer enrollment accepts
+an unlabelled read-only consumer while retirement refuses it, verifies the
+consumer remains executable, and confirms private container/volume absence after
+cleanup. The reviewer inspected the volume parameterization and live test and
+reported no new blocker; production entry points still use the fixed machine
+cache volume. This is census evidence, not a full public-maintenance acceptance
+claim. Final Clippy and lint reruns remain pending before commit.
+
+Final action-retirement gates passed: all-target Clippy with `-D warnings` in
+`/tmp/bosn-545-action-clippy-retry.log` (63.95 seconds), and full lint in
+`/tmp/bosn-545-action-final-lint.log`. The generated status schema test also
+passed in `/tmp/bosn-545-action-schema.log`. These gates close this incremental
+review, not the broader issue acceptance or final Local-Gate/remote CI.

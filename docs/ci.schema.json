@@ -1002,6 +1002,12 @@
         },
         {
           "properties": {
+            "action_maintenance": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "cleanup_failed": {
               "type": "boolean"
             },

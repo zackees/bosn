@@ -35,6 +35,7 @@ fn latest_snapshot_survives_restart_and_requires_real_helper_cleanup_evidence() 
             reclaimed_archive_bytes: Some(80),
         },
         recovery_error: None,
+        action_outcome: Some(action_observed()),
         tool_outcome: Some(ToolMaintenanceOutcome::Observed {
             stats: ToolMaintenanceStats {
                 allocated_before: 80,
@@ -87,6 +88,7 @@ fn latest_snapshot_survives_restart_and_requires_real_helper_cleanup_evidence() 
             diagnostic: "transport timeout; totals unknown".into(),
         },
         recovery_error: Some("cleanup remains pending".into()),
+        action_outcome: None,
         tool_outcome: None,
     };
     let mut tx = registry.begin_immediate().unwrap();
@@ -100,4 +102,54 @@ fn latest_snapshot_survives_restart_and_requires_real_helper_cleanup_evidence() 
             .unwrap(),
         Some(unknown)
     );
+}
+
+#[test]
+fn action_evidence_requires_a_helper_and_a_met_budget() {
+    let mut snapshot = MaintenanceSnapshot {
+        schema_version: 1,
+        observed_at: 1.0,
+        helper: None,
+        outcome: MaintenanceOutcome::Unknown {
+            diagnostic: "archive unavailable".into(),
+        },
+        recovery_error: None,
+        tool_outcome: None,
+        action_outcome: Some(ActionMaintenanceOutcome::Held {
+            diagnostic: "reader lease busy".into(),
+        }),
+    };
+    assert!(snapshot.validate().is_err());
+    snapshot.helper = Some(MaintenanceHelper {
+        nonce: NONCE.into(),
+        container_id: "a".repeat(64),
+        cleanup_error: None,
+    });
+    snapshot.validate().unwrap();
+    snapshot.action_outcome = Some(ActionMaintenanceOutcome::Observed {
+        stats: ActionMaintenanceStats {
+            allocated_before: 8192,
+            allocated_after: 8192,
+            budget_bytes: 4096,
+            retired_classes: 0,
+        },
+    });
+    assert!(snapshot.validate().is_err());
+    snapshot.action_outcome = None;
+    let mut old = serde_json::to_value(&snapshot).unwrap();
+    old.as_object_mut().unwrap().remove("action_outcome");
+    let decoded: MaintenanceSnapshot = serde_json::from_value(old).unwrap();
+    assert_eq!(decoded.action_outcome, None);
+    decoded.validate().unwrap();
+}
+
+fn action_observed() -> ActionMaintenanceOutcome {
+    ActionMaintenanceOutcome::Observed {
+        stats: ActionMaintenanceStats {
+            allocated_before: 8192,
+            allocated_after: 0,
+            budget_bytes: 4096,
+            retired_classes: 1,
+        },
+    }
 }

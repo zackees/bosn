@@ -15,6 +15,24 @@ pub struct MaintenanceSnapshot {
     pub recovery_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_outcome: Option<ToolMaintenanceOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_outcome: Option<ActionMaintenanceOutcome>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ActionMaintenanceOutcome {
+    Observed { stats: ActionMaintenanceStats },
+    Held { diagnostic: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActionMaintenanceStats {
+    pub allocated_before: u64,
+    pub allocated_after: u64,
+    pub budget_bytes: u64,
+    pub retired_classes: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -63,6 +81,18 @@ impl MaintenanceSnapshot {
             || !self.observed_at.is_finite()
             || self.observed_at < 0.0
             || self.recovery_error.as_deref().is_some_and(|s| !bounded(s))
+            || (self.action_outcome.is_some() && self.helper.is_none())
+            || self
+                .action_outcome
+                .as_ref()
+                .is_some_and(|outcome| match outcome {
+                    ActionMaintenanceOutcome::Observed { stats } => {
+                        stats.budget_bytes == 0
+                            || stats.allocated_after > stats.budget_bytes
+                            || stats.retired_classes > 2
+                    }
+                    ActionMaintenanceOutcome::Held { diagnostic } => !bounded(diagnostic),
+                })
             || (self.tool_outcome.is_some() && self.helper.is_none())
             || self
                 .tool_outcome

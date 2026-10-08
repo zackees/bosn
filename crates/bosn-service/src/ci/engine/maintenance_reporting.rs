@@ -5,7 +5,8 @@ use crate::{
     act_registry::{ActRegistryCommand, ActRegistryReply},
 };
 use bosn_registry::cache_maintenance::{
-    MaintenanceHelper, MaintenanceOutcome, MaintenanceSnapshot, ToolMaintenanceOutcome,
+    ActionMaintenanceOutcome, MaintenanceHelper, MaintenanceOutcome, MaintenanceSnapshot,
+    ToolMaintenanceOutcome,
 };
 
 pub(super) async fn persist(
@@ -59,6 +60,19 @@ pub(super) async fn persist(
         helper,
         outcome,
         recovery_error,
+        action_outcome: tick
+            .attempt
+            .as_ref()
+            .ok()
+            .and_then(|attempt| attempt.actions.as_ref())
+            .map(|actions| match actions {
+                Ok(stats) => ActionMaintenanceOutcome::Observed {
+                    stats: stats.clone(),
+                },
+                Err(error) => ActionMaintenanceOutcome::Held {
+                    diagnostic: diagnostic(error),
+                },
+            }),
         tool_outcome: tick
             .attempt
             .as_ref()

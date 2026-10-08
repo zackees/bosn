@@ -51,6 +51,8 @@ pub use migration::ImportAttempt;
 pub use migration_transport::CacheMigrationSession;
 mod act_capabilities;
 mod act_install;
+mod action_cache;
+mod action_cache_records;
 mod process_control;
 mod readiness;
 mod tool_recovery;
