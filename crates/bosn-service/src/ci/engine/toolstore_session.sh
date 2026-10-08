@@ -59,8 +59,27 @@ while IFS= read -r operation; do
             # keeps the install path separate from native CLI arguments.
             IFS= read -r source || exit 78
             [ "${#source}" -le 1024 ] || exit 78
+            # A finished act process is insufficient: a detached job may still
+            # own the source volume. Fail closed on a missing nested daemon.
+            writers=$(docker ps -q --filter volume=act-toolcache) || exit 78
+            [ -z "$writers" ] || { printf 'tool source still has live writers\n'; finish 75; continue; }
             code=0
             "$work/bin/act" cache tool-publish --from "$source" --source-quiescent \
+                --cache-server-path "$store" --max-bytes @PAYLOAD@ --apply || code=$?
+            finish "$code" ;;
+        usage)
+            [ -d "$store" ] && [ ! -L "$store" ] || exit 78
+            code=0
+            "$work/bin/act" cache tool-usage --cache-server-path "$store" \
+                --max-entries 1000000 || code=$?
+            finish "$code" ;;
+        generation)
+            # Recover selection-before-acknowledgement by deriving the exact
+            # first generation from the immutable, durably frozen manifest.
+            # Never accept an unrelated current selection as enrollment proof.
+            [ -f "$pending" ] && [ -f "$initial" ] && [ ! -e "$published" ] || exit 78
+            code=0
+            "$work/bin/act" cache tool-generation --manifest "$initial" \
                 --cache-server-path "$store" --max-bytes @PAYLOAD@ --apply || code=$?
             finish "$code" ;;
         initial)

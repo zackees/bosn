@@ -1454,3 +1454,30 @@ The daemon process exited successfully, and its recorded ready spare
 `bosn-act-cfc3e04f-9cf0-465d-b2ee-e9abcfcb4256` is absent by Docker inspect.
 Validation state and ownership authority are preserved for later audit. The
 installed user daemon was not stopped or replaced.
+
+
+## Tool source exclusion and initial-generation recovery (October 8)
+
+The publication protocol now refuses observed nested containers using
+`act-toolcache`, and fails closed if the nested Docker census fails. This
+snapshot is an additional guard, not continuous writer exclusion: production
+integration must hold source ownership through publication and restrict the
+source to the inspected volume. The same primary reviewer cleared this delta
+with those requirements still open.
+
+The protocol also exposes complete native allocated-storage inventory and
+reconstructs the first generation from the durable frozen initial manifest.
+An actual pinned act2.15 fixture proved that the reconstructed generation ID
+matches the selection made before disconnection, and that inventory reports
+complete positive allocated bytes. This fixture used a controlled empty writer
+response, so it does not prove real nested-daemon exclusion. Reports:
+`/tmp/bosn-545-tool-generation-recovery.json` and
+`/tmp/bosn-545-tool-source-writer-refusal.json`. Separate refusal cases established
+that a reported live writer and an unavailable daemon create no tool store.
+
+The first recovery fixture failed because its 16 MiB executable tmpfs could
+not hold the 23 MB act binary. Its exact helper was removed and absence
+confirmed; the corrected 64 MiB fixture passed and its exact helper was also
+removed and absence confirmed. Shell syntax and full repository lint passed.
+The normal save-path integration, allocation admission, warm reads, and overall
+issue acceptance remain incomplete. No local-gate rerun or merge is claimed.
