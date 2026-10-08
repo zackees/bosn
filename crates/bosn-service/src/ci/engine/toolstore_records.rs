@@ -46,6 +46,14 @@ pub(super) struct Selection {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct SelectionState {
+    pub schema_version: u32,
+    pub id: String,
+    pub installs: Vec<Install>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Snapshot {
     pub schema_version: u32,
     pub source: String,
@@ -73,6 +81,23 @@ impl Snapshot {
         generation: bool,
         policy: CachePolicy,
     ) -> Result<(), String> {
+        self.validate_shape(source, generation, policy, true)
+    }
+
+    pub fn validate_plan(&self, source: &str, policy: CachePolicy) -> Result<(), String> {
+        if self.reused {
+            return Err("tool plan cannot claim a reused publication".into());
+        }
+        self.validate_shape(source, false, policy, false)
+    }
+
+    fn validate_shape(
+        &self,
+        source: &str,
+        generation: bool,
+        policy: CachePolicy,
+        published: bool,
+    ) -> Result<(), String> {
         let destination = if generation {
             format!("{STORE}/.tool-generations-v1/{}", self.id)
         } else {
@@ -88,7 +113,7 @@ impl Snapshot {
             || !valid_id(&self.id)
             || self.destination != destination
             || !completion
-            || !self.published
+            || self.published != published
             || self.partial
             || !self.error.is_empty()
             || !self.pending_stage.is_empty()

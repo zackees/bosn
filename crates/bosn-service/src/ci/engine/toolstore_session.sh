@@ -53,7 +53,7 @@ while IFS= read -r operation; do
             [ "${#record}" -le 4096 ] || exit 78
             publish_record "$pending" "$record"
             finish 0 ;;
-        object)
+        plan|object:*)
             [ -f "$pending" ] || [ -f "$published" ] || exit 78
             # Paths are validated by the typed host boundary. Quoting also
             # keeps the install path separate from native CLI arguments.
@@ -64,8 +64,17 @@ while IFS= read -r operation; do
             writers=$(docker ps -q --filter volume=act-toolcache) || exit 78
             [ -z "$writers" ] || { printf 'tool source still has live writers\n'; finish 75; continue; }
             code=0
-            "$work/bin/act" cache tool-publish --from "$source" --source-quiescent \
-                --cache-server-path "$store" --max-bytes @PAYLOAD@ --apply || code=$?
+            if [ "$operation" = plan ]; then
+                "$work/bin/act" cache tool-publish --from "$source" --source-quiescent \
+                    --cache-server-path "$store" --max-bytes @PAYLOAD@ --plan || code=$?
+            else
+                expected=${operation#object:}
+                case "$expected" in ''|*[!0-9a-f]*) exit 78;; esac
+                [ "${#expected}" -eq 64 ] || exit 78
+                "$work/bin/act" cache tool-publish --from "$source" --source-quiescent \
+                    --cache-server-path "$store" --max-bytes @PAYLOAD@ --apply \
+                    --expected-object "$expected" || code=$?
+            fi
             finish "$code" ;;
         usage)
             if [ ! -e "$store" ] && [ -f "$pending" ] && [ ! -e "$initial" ]; then
@@ -134,7 +143,13 @@ while IFS= read -r operation; do
                     --max-bytes @PAYLOAD@ || code=$?
                 finish "$code"
             fi ;;
-        initialize|update)
+        selection)
+            [ -f "$published" ] || exit 78
+            code=0
+            "$work/bin/act" cache tool-current --installs --cache-server-path "$store" \
+                --max-bytes @PAYLOAD@ || code=$?
+            finish "$code" ;;
+        initialize|replace:*)
             mode="$operation"
             IFS= read -r manifest || exit 78
             [ "${#manifest}" -le 65535 ] || exit 78
@@ -154,8 +169,12 @@ while IFS= read -r operation; do
                 "$work/bin/act" cache tool-update --initialize --manifest "$manifest_path" \
                     --cache-server-path "$store" --max-bytes @PAYLOAD@ --apply || code=$?
             else
-                "$work/bin/act" cache tool-update --manifest "$manifest_path" \
-                    --cache-server-path "$store" --max-bytes @PAYLOAD@ --apply || code=$?
+                expected=${mode#replace:}
+                case "$expected" in ''|*[!0-9a-f]*) exit 78;; esac
+                [ "${#expected}" -eq 64 ] || exit 78
+                "$work/bin/act" cache tool-update --replace --expected-generation "$expected" \
+                    --manifest "$manifest_path" --cache-server-path "$store" \
+                    --max-bytes @PAYLOAD@ --apply || code=$?
             fi
             finish "$code" ;;
         acknowledge)

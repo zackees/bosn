@@ -9,7 +9,7 @@ pub(super) struct ProcessControl {
     end_marker: &'static [u8],
     pending: Vec<u8>,
     stderr: Vec<u8>,
-    received: usize,
+    output: OutputCounter,
 }
 
 impl ProcessControl {
@@ -26,8 +26,19 @@ impl ProcessControl {
             end_marker,
             pending: Vec::new(),
             stderr: Vec::new(),
-            received: 0,
+            output: OutputCounter {
+                received: 0,
+                limit: 256 * 1024,
+            },
         }
+    }
+
+    pub(super) fn with_total_output_limit(mut self, limit: usize) -> Result<Self, String> {
+        if !(256 * 1024..=4 * 1024 * 1024).contains(&limit) {
+            return Err("process evidence limit is outside supported bounds".into());
+        }
+        self.output.limit = limit;
+        Ok(self)
     }
 
     pub(super) fn remaining(&self) -> Result<Duration, String> {
@@ -72,8 +83,7 @@ impl ProcessControl {
                         ProcessOutputChunk::Stdout(bytes) => (&mut self.pending, bytes),
                         ProcessOutputChunk::Stderr(bytes) => (&mut self.stderr, bytes),
                     };
-                    self.received = self.received.saturating_add(bytes.len());
-                    if self.received > 256 * 1024
+                    if !self.output.observe(bytes.len())
                         || destination.len().saturating_add(bytes.len()) > 64 * 1024
                     {
                         return Err(format!(
@@ -114,5 +124,45 @@ impl ProcessControl {
             body.extend_from_slice(&line);
             body.push(b'\n');
         }
+    }
+}
+
+struct OutputCounter {
+    received: usize,
+    limit: usize,
+}
+
+impl OutputCounter {
+    fn observe(&mut self, bytes: usize) -> bool {
+        self.received = self.received.saturating_add(bytes);
+        self.received <= self.limit
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OutputCounter;
+
+    #[test]
+    fn maximum_tool_census_and_admitted_publication_fit_bounded_evidence() {
+        let mut standard = OutputCounter {
+            received: 0,
+            limit: 256 * 1024,
+        };
+        let mut tools = OutputCounter {
+            received: 0,
+            limit: 4 * 1024 * 1024,
+        };
+        // Conservative 2 KiB success receipts for 1,024 plans, 128
+        // publications and inventories, plus four maximum-size command bodies.
+        let sizes =
+            std::iter::repeat_n(2048, 1024 + 128 + 128).chain(std::iter::repeat_n(64 * 1024, 4));
+        let mut standard_fits = true;
+        for size in sizes {
+            standard_fits &= standard.observe(size);
+            assert!(tools.observe(size));
+        }
+        assert!(!standard_fits);
+        assert!(!tools.observe(4 * 1024 * 1024));
     }
 }

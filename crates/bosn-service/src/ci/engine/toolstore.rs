@@ -189,7 +189,8 @@ impl DockerActBackend {
             "tool publication",
             b"bosn-tool-end:",
             Duration::from_secs(110),
-        );
+        )
+        .with_total_output_limit(4 * 1024 * 1024)?;
         match io.line().await?.as_slice() {
             b"bosn-tool-ready" => {}
             b"bosn-tool-busy" => return Err("tool publication lease busy".into()),
@@ -385,9 +386,21 @@ impl Session {
         } else {
             self.retain(self.policy.aggregate_max_bytes - self.reservation)
                 .await?;
-            let manifest = self.publish_installs().await?;
+            let selected: SelectionState = self.json("selection", None).await?;
+            let current = Manifest {
+                schema_version: selected.schema_version,
+                installs: selected.installs.clone(),
+            };
+            Self::validate_manifest(&current)?;
+            if !super::cache_usage::helper::valid_id(&selected.id) {
+                return Err("tool successor lacks a verified expected selection".into());
+            }
+            let manifest = self
+                .publish_installs_with_current(&current.installs)
+                .await?;
             if !manifest.installs.is_empty() {
-                self.update("update", &manifest).await?;
+                self.update(&format!("replace:{}", selected.id), &manifest)
+                    .await?;
             }
         }
         self.retain(self.policy.aggregate_max_bytes).await?;
@@ -411,17 +424,43 @@ impl Session {
     }
 
     async fn publish_installs(&mut self) -> Result<Manifest, String> {
+        self.publish_installs_with_current(&[]).await
+    }
+
+    async fn publish_installs_with_current(
+        &mut self,
+        current: &[Install],
+    ) -> Result<Manifest, String> {
         let installs =
             String::from_utf8(self.raw("installs", None).await?).map_err(|e| e.to_string())?;
         let paths: BTreeSet<_> = installs.lines().filter(|line| !line.is_empty()).collect();
-        if paths.len() > MAX_INSTALLS || paths.iter().any(|path| !install_path(path)) {
-            return Err("completed tool sources exceed bounds or contain invalid paths".into());
+        if paths.len() > 1024 || paths.iter().any(|path| !install_path(path)) {
+            return Err(
+                "completed tool source census exceeds bounds or contains invalid paths".into(),
+            );
         }
+        let mut candidates = Vec::new();
+        for path in paths {
+            let source = format!("{SOURCE}/{path}");
+            let plan: Snapshot = self.json("plan", Some(&source)).await?;
+            plan.validate_plan(&source, self.policy)?;
+            candidates.push(super::toolstore_selection::Candidate {
+                path: path.into(),
+                object_id: plan.id,
+                bytes: plan.bytes.ok_or("tool plan lacks byte count")?,
+                entries: plan.entries.ok_or("tool plan lacks entry count")?,
+            });
+        }
+        let admitted = super::toolstore_selection::choose(
+            candidates,
+            current,
+            self.policy.repository_max_bytes,
+        )?;
         let mut manifest = Manifest {
             schema_version: 1,
             installs: Vec::new(),
         };
-        for path in paths {
+        for candidate in admitted {
             let usage = self.raw("usage", None).await?;
             let allocated = if usage == b"absent\n\n" || usage == b"absent\n" {
                 0
@@ -433,11 +472,16 @@ impl Session {
             if allocated > self.policy.aggregate_max_bytes - self.reservation {
                 return Err("tool storage admission held: allocated inventory leaves insufficient publication space".into());
             }
-            let source = format!("{SOURCE}/{path}");
-            let report: Snapshot = self.json("object", Some(&source)).await?;
+            let source = format!("{SOURCE}/{}", candidate.path);
+            let report: Snapshot = self
+                .json(&format!("object:{}", candidate.object_id), Some(&source))
+                .await?;
             report.validate(&source, false, self.policy)?;
+            if report.id != candidate.object_id {
+                return Err("tool publication differs from its admitted plan".into());
+            }
             manifest.installs.push(Install {
-                path: path.into(),
+                path: candidate.path,
                 object_id: report.id,
             });
         }

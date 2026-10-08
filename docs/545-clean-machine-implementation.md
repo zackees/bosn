@@ -1659,3 +1659,39 @@ tests pass (`/tmp/bosn-545-tool-plan-package.log`), and pinned lint reports zero
 issues (`/tmp/bosn-545-tool-plan-final-lint.log`). The same primary reviewer found
 this incremental capability clean. Bosn pin, installed daemon, automatic
 selection, producer migration and full issue acceptance remain unfinished.
+
+### Automatic bounded tool selection implementation
+
+Act2 #59 passed every check and is merged at
+`4c693fe33f7c264f17440063b57da6a8e62bd9ea`. Act2 #60 source
+`d061907b8e3335b72cf1d3b983a27c3113debb34` adds a verified current install set
+alongside snapshot planning. Its opt-in state report is observed under the same
+catalog writer; the old selection-only JSON shape remains unchanged. The missing
+flag repro failed, then six CLI and 30 generation tests passed, pinned lint
+reported zero issues, and the same primary reviewer found the increment clean.
+
+Bosn normal save now plans the complete source census before copying, admits at
+most 128 installs within the logical payload and conservative entry bounds,
+prioritizes new/changed installs over unchanged seeded installs, publishes with
+expected object IDs, and replaces using the observed generation ID as a CAS
+condition. Source census is bounded by 1,024 paths and the existing 64 KiB command
+body limit. An invalid/incomplete census is held, never treated as empty. Existing
+scoped allocated-byte admission and native reader/pin protections remain active.
+This is not a total shared-volume quota.
+
+The initial chooser reproduced all-source admission failures (two retained
+4-byte installs against a 4-byte limit and 129 selected installs against 128),
+then passed. Final isolated tests cover 1,024 candidates, new/changed priority,
+entry budgets, duplicates, negative counts, arithmetic overflow and output
+budget enforcement: four chooser tests and one protocol-budget test pass in
+`/tmp/bosn-545-tool-selection-final-count-green.log`. Only tool sessions opt into
+4 MiB cumulative output; the default stays 256 KiB and per-command/line limits
+stay 64 KiB. The same reviewer found that correction clean. All-target Clippy
+passes (`/tmp/bosn-545-tool-selection-final-clippy.log`), and full repository lint
+passes (`/tmp/bosn-545-tool-selection-lint.log`).
+
+The native pin is still act2.15, so live production execution of this updated save
+path is pending the dependency release and verified artifact rollout. No merge,
+installation or solved-issue claim follows from these unit checks. Known-producer
+and recipe authority upgrade handling, remaining storage bounds, live repeated
+runs, final local/remote gates and parent merge remain required.
