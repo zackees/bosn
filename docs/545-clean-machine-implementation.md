@@ -1863,3 +1863,36 @@ lint pass (`/tmp/bosn-545-historical-upgrade-final-clippy.log` and
 change clean; its final-receipt advisory was applied. This proves the supported
 Linux native/recipe handoff; installed-daemon rollout, macOS service handoff,
 remaining storage bounds and full parent acceptance remain unproven.
+
+
+### Reproduced action storage beyond archive maintenance scope
+
+A real GoGitActionCache local fetch and archive read on released Act2.16 source
+creates 1,105,920 allocated bytes in the shared action class. Actual enrolled
+cohort maintenance with a 65,536-byte budget completes with `partial=false`,
+`budget_met=true` and zero archive bytes, while all 1,105,920 action bytes remain.
+The focused assertion fails (`/tmp/bosn-545-action-pressure-red.log`). This is
+expected for the scoped archive API and demonstrates the missing Bosn class
+lifecycle; it is not a claim that the archive API falsely accounts for actions.
+`ci/action_cache_fixture.go` reproduces those real production writes locally
+without GitHub access or handmade cache layouts. It runs from the verified
+Act2 module and refuses an existing fixture destination.
+
+Current execution already holds FD8's original shared legacy lease for the
+entire act process. Idle action retirement can take its exclusive side and
+recheck `require_coordinated_cache_writers` while holding it to exclude older
+nonparticipating attachments. Oversized warm action storage needs explicit
+pressure eviction with cold-rebuild consequences, a durable outside-payload
+retirement intent tied to original cache/class inodes, fresh mount-boundary
+checks and crash recovery; deleting a directory or relying on an embedded
+manifest alone would repeat the previously proven interrupted-delete bug.
+That retirement implementation and its production-helper GREEN proof remain
+required, alongside old release/image archive bounds and final acceptance.
+
+The fixture generator was executed successfully against exact released Act2
+source with networking disabled (`/tmp/bosn-545-action-fixture-checked.log`). It
+counts allocated blocks once per device/inode and emits its JSON only after
+checking the archive-only baseline. Full repository lint passes
+(`/tmp/bosn-545-action-fixture-lint.log`); the same reviewer found the fixture
+and scoped claims clean. These results establish the reproducible failure,
+not an implemented action-cache ceiling.
