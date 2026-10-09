@@ -5,6 +5,10 @@ use super::*;
 /// Fault points for the synthetic engine.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Faults {
+    /// Fail before `docker create` is sent (an image, cache-volume or storage-volume step):
+    /// the engine provably never existed (#554).
+    pub pre_create: bool,
+    /// `docker create` was sent and reported failure; Docker may still finish it.
     pub create: bool,
     /// Create the container, then report failure (partial creation).
     pub create_after_side_effect: bool,
@@ -186,6 +190,17 @@ impl ActEngineBackend for FakeBackend {
         Box::pin(async move {
             let f = self.faults();
             commit(registry, ActRegistryCommand::Begin(intent.clone())).await?;
+            if f.pre_create {
+                return Err("synthetic failure before docker create".into());
+            }
+            commit(
+                registry,
+                ActRegistryCommand::CreateRequested {
+                    run: intent.run_id.clone(),
+                    at,
+                },
+            )
+            .await?;
             if f.create {
                 return Err("synthetic create failure".into());
             }
@@ -223,7 +238,7 @@ impl ActEngineBackend for FakeBackend {
             let found = self.engines.lock().unwrap().get(&name).cloned();
             let engine_id = match found {
                 None => {
-                    crate::act_runtime::confirm_absence(record.engine_id.as_deref())
+                    crate::act_runtime::confirm_absence(record)
                         .map_err(|error| error.to_string())?;
                     record.engine_id.clone()
                 }

@@ -22,6 +22,11 @@ pub enum ActRegistryCommand {
     /// Irreversibly withdraw startup recovery authority for this actor.
     SealStartup,
     Begin(ActEngineIntent),
+    /// `docker create` is about to be sent for this pending engine (#554).
+    CreateRequested {
+        run: String,
+        at: f64,
+    },
     ToolRecoveryBegin {
         run: String,
         token: String,
@@ -247,6 +252,10 @@ pub(crate) fn apply(
         }
         ActRegistryCommand::Begin(intent) => {
             transaction.begin_act_engine(&intent)?;
+            ActRegistryReply::Committed
+        }
+        ActRegistryCommand::CreateRequested { run, at } => {
+            transaction.request_act_create(&run, at)?;
             ActRegistryReply::Committed
         }
         ActRegistryCommand::ToolRecoveryBegin {

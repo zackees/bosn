@@ -316,6 +316,14 @@ fn every_phase_reports_how_long_it_took() {
 fn every_fault_point_ends_terminal_or_cleanup_required() {
     with_registry(|registry, dir| async move {
         let cases = [
+            // #554: a failure before `docker create` was sent retires to terminal.
+            (
+                Faults {
+                    pre_create: true,
+                    ..Faults::default()
+                },
+                ActRunOutcome::Failed,
+            ),
             (
                 Faults {
                     create: true,
@@ -518,22 +526,31 @@ fn daemon_restart_mid_run_is_recovered_as_interrupted() {
         for task in tasks {
             assert!(task.await.is_err(), "run must have been in flight");
         }
-        commit(
-            &daemon.registry,
+        // Run 200's `docker create` was sent and never resolved; run 201 died before sending it.
+        for command in [
             ActRegistryCommand::Begin(intent(&run_id(200))),
-        )
-        .await
-        .unwrap();
+            ActRegistryCommand::CreateRequested {
+                run: run_id(200),
+                at: 1.0,
+            },
+            ActRegistryCommand::Begin(intent(&run_id(201))),
+        ] {
+            commit(&daemon.registry, command).await.unwrap();
+        }
         assert_eq!(backend.live(), 50);
         daemon.stop().await;
         backend.faults.lock().unwrap().hang = false;
         let (daemon, retired, failed) = restarted(&path, &backend).await;
         assert_eq!(failed.len(), 1, "{failed:?}");
         assert_eq!(failed[0].0, run_id(200));
-        assert_eq!(retired.len(), 50);
+        assert_eq!(retired.len(), 51, "#554: an unsent creation retires");
         assert_eq!(
             record_of(&daemon.registry, &run_id(200)).await.state,
             ActEngineState::CleanupRequired
+        );
+        assert_eq!(
+            record_of(&daemon.registry, &run_id(201)).await.state,
+            ActEngineState::Terminal
         );
         assert_eq!(backend.live(), 0, "no orphaned engine");
         for n in (0..50).map(|n| run_id(100 + n)) {

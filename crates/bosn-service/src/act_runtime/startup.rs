@@ -232,7 +232,7 @@ pub(crate) async fn retire_engine(
         named.push(ids);
     }
     if named.iter().all(Vec::is_empty) {
-        confirm_absence(record.engine_id.as_deref())?;
+        confirm_absence(record)?;
         // Engine absence is the writer-quiescence half of the source stop; the
         // retained-volume ownership probe is the other half. Both must hold
         // before a native recovery record can advance.
@@ -318,10 +318,11 @@ pub(crate) async fn retire_engine(
     .map_err(|e| error(e.to_string()))
 }
 
-/// An empty lookup proves removal only after this creation was observed.
-/// No waiting period establishes that an unresolved Docker request is done.
-pub(crate) fn confirm_absence(engine_id: Option<&str>) -> std::io::Result<()> {
-    if engine_id.is_none() {
+/// An empty lookup proves removal only after this creation was observed, or when `docker
+/// create` was provably never sent (#554). No waiting period establishes that an unresolved
+/// Docker request is done.
+pub(crate) fn confirm_absence(record: &bosn_registry::act::ActEngineRecord) -> std::io::Result<()> {
+    if record.engine_id.is_none() && record.create_requested != Some(false) {
         return Err(error(
             "engine creation remains unresolved; retaining cleanup_required for reconciliation",
         ));

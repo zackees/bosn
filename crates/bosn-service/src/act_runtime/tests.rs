@@ -143,6 +143,10 @@ mod startup_recovery {
                 };
                 let mut tx = registry.begin_immediate().unwrap();
                 tx.begin_act_engine(&intent).unwrap();
+                if n != 2 {
+                    // Creation was sent and never resolved: an empty lookup proves nothing.
+                    tx.request_act_create(&intent.run_id, 1.5).unwrap();
+                }
                 if n == 2 {
                     let observed = ActEngineObservation {
                         name: intent.engine_name(),
@@ -169,6 +173,8 @@ mod startup_recovery {
                         serde_json::to_value(registry.act_engine(&intent.run_id).unwrap().unwrap())
                             .unwrap();
                     old["schema_version"] = json!(2);
+                    // Historical records predate the create marker (#554).
+                    old.as_object_mut().unwrap().remove("create_requested");
                     old["intent"]
                         .as_object_mut()
                         .unwrap()
