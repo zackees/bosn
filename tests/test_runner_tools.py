@@ -1,6 +1,7 @@
 """Bosn supplies stock hosted-runner tools before executing workflows."""
 
 import hashlib
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -37,7 +38,10 @@ class RunnerToolsTests(unittest.TestCase):
     def test_corrupt_archive_never_publishes_a_completed_generation(self):
         self.exercise_install(corrupt=True)
 
-    def exercise_install(self, corrupt):
+    def test_a_tampered_cached_tool_is_reinstalled_not_reused(self):
+        self.exercise_install(corrupt=False, tamper=True)
+
+    def exercise_install(self, corrupt, tamper=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             script = (ROOT / "crates/bosn-service/src/ci/engine/runner_tools.sh").read_text()
@@ -81,11 +85,23 @@ class RunnerToolsTests(unittest.TestCase):
                 self.assertTrue(marker.exists())
                 downloads = (root / "downloads").read_text()
                 self.assertEqual(len(downloads.splitlines()), 2)
+                cached = root / "cache/bosn-runner-tools/fixture/github-cli/bin/gh"
+                if tamper:
+                    cached.write_text("#!/bin/sh\necho rewritten-by-a-job\n")
+                    # The real script installs into a fresh mktemp directory.
+                    shutil.rmtree(install)
+                    install.mkdir()
                 second = subprocess.run(
                     ["bash", "-ec", script], stdout=output, stderr=output, check=False
                 )
                 self.assertEqual(second.returncode, 0)
-                self.assertEqual((root / "downloads").read_text(), downloads)
+                if tamper:
+                    # Verification failed, so both archives were fetched again
+                    # and the pinned tool replaced the rewritten one.
+                    self.assertEqual(len((root / "downloads").read_text().splitlines()), 4)
+                    self.assertIn("verified-tool", cached.read_text())
+                else:
+                    self.assertEqual((root / "downloads").read_text(), downloads)
 
     def test_tools_are_prepared_after_the_tool_cache_is_seeded(self):
         engine = (ROOT / "crates/bosn-service/src/ci/engine.rs").read_text()

@@ -63,14 +63,27 @@ pub(super) fn prepare_toolcache_script(
 /// sibling marker is copied last; an inner stamp travels inside the renamed
 /// directory. Either way a reader never sees a half-saved install as
 /// complete.
+///
+/// The store is shared by every repository, so only a pristine install is
+/// published (#557): one with nothing newer than its completion marker. A job
+/// that ran `pip install` into setup-python's interpreter, or rewrote a tool,
+/// changed the install after it completed; publishing that would hand one
+/// repository's packages to every other. Files are compared, not directories:
+/// an interpreter writes bytecode caches (exempt) on import, which also
+/// touches their parent directory. A job that only deleted files is not
+/// detected.
 pub(super) fn save_toolcache_script() -> String {
     format!(
         "src={TOOLCACHE_MOUNT}; dst={ENGINE_CACHE}/toolcache; [ -d \"$src\" ] || exit 0; mkdir -p \"$dst\" || exit $?; cd \"$src\" || exit $?; \
          new_stage() {{ tmp=$(mktemp -d \"$dst/.saving-XXXXXXXX\") || return $?; \
            mkdir -p \"$dst/${{dir%/*}}\" || {{ code=$?; rm -rf \"$tmp\"; return \"$code\"; }}; }}; \
+         pristine() {{ changed=$(find \"$dir\" -mindepth 1 ! -type d -newer \"$1\" ! -path '*/__pycache__/*' | head -n 1); \
+           [ -z \"$changed\" ] && return 0; \
+           echo \"tool cache: not saving $dir: changed after it completed ($changed)\" >&2; return 1; }}; \
          for marker in */*/*.complete; do \
            [ -f \"$marker\" ] || continue; dir=${{marker%.complete}}; \
            [ -d \"$dir\" ] && [ ! -e \"$dst/$marker\" ] || continue; \
+           pristine \"$marker\" || continue; \
            new_stage || exit $?; \
            cp -a \"$dir\" \"$tmp/install\" && mv -T \"$tmp/install\" \"$dst/$dir\" 2>/dev/null && \
              cp \"$marker\" \"$dst/$marker\"; \
@@ -79,6 +92,7 @@ pub(super) fn save_toolcache_script() -> String {
          find . -mindepth 3 -type f -name .complete | while read -r stamp; do \
            dir=${{stamp%/.complete}}; dir=${{dir#./}}; \
            [ ! -e \"$dst/$dir\" ] || continue; \
+           pristine \"$stamp\" || continue; \
            new_stage || exit $?; \
            cp -a \"$dir\" \"$tmp/install\" && mv -T \"$tmp/install\" \"$dst/$dir\" 2>/dev/null; \
            rm -rf \"$tmp\"; \
@@ -219,6 +233,66 @@ mod tests {
         save(&src, &cache);
         no_leftovers(&cache.join("toolcache"));
     }
+    /// Back-date `path` by `secs`, so a later write is unambiguously newer.
+    fn age(path: &Path, secs: u64) {
+        let when = std::time::SystemTime::now() - Duration::from_secs(secs);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    /// #557: the store is shared by every repository, so an install a job
+    /// changed after it completed (a `pip install` into setup-python's
+    /// interpreter, a rewritten tool) is never published.
+    #[test]
+    fn installs_changed_after_completion_are_not_published() {
+        let tmp = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let (src, cache) = (tmp.path().join("volume"), tmp.path().join("cache"));
+        // Sibling-marker installs: one changed after completion, one only
+        // compiled bytecode on import.
+        write(src.join("Python/3.12.9/x64/bin/python"), "py");
+        write(src.join("Python/3.12.9/x64.complete"), "");
+        age(&src.join("Python/3.12.9/x64.complete"), 60);
+        write(
+            src.join("Python/3.12.9/x64/lib/site-packages/requests/__init__.py"),
+            "repo A's dependency",
+        );
+        write(src.join("Python/3.11.9/x64/lib/os.py"), "stdlib");
+        write(src.join("Python/3.11.9/x64.complete"), "");
+        age(&src.join("Python/3.11.9/x64/lib/os.py"), 120);
+        age(&src.join("Python/3.11.9/x64.complete"), 60);
+        write(
+            src.join("Python/3.11.9/x64/lib/__pycache__/os.pyc"),
+            "bytecode",
+        );
+        // An inner-stamped install whose tool was rewritten after its stamp.
+        let tools = "bosn-runner-tools/fixture";
+        write(src.join(tools).join("bin/gh"), "pinned gh");
+        write(src.join(tools).join(".complete"), "");
+        age(&src.join(tools).join(".complete"), 60);
+        write(src.join(tools).join("bin/gh"), "rewritten by a job");
+
+        save(&src, &cache);
+        let saved = cache.join("toolcache");
+        assert!(
+            !saved.join("Python/3.12.9").exists()
+                && !saved.join("Python/3.12.9/x64.complete").exists(),
+            "a changed install is not published"
+        );
+        assert!(
+            !saved.join(tools).exists(),
+            "a rewritten tool is not published"
+        );
+        assert!(
+            saved.join("Python/3.11.9/x64.complete").exists(),
+            "bytecode written on import does not block publication"
+        );
+        no_leftovers(&saved);
+    }
+
     #[test]
     fn seeding_does_not_copy_unfinished_publication_stages() {
         let tmp = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
