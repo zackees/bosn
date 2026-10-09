@@ -126,6 +126,50 @@ fn a_run_claims_the_prepared_spare_and_never_prepares_an_engine() {
     });
 }
 
+/// #556: a spare whose container stopped behind the daemon's back (a host Docker restart) is
+/// retired, and the run falls back to a fresh engine instead of failing at its first exec.
+#[test]
+fn a_spare_whose_container_stopped_is_retired_and_the_run_gets_a_fresh_engine() {
+    with_registry(|registry, _dir| async move {
+        let backend = Arc::new(FakeBackend::default());
+        let keeper = keeper(&registry, &backend);
+        filled(&keeper, 905).await;
+        let held = record_of(&registry, &run_id(905)).await;
+        backend
+            .stopped
+            .lock()
+            .unwrap()
+            .insert(held.engine_id.clone().unwrap());
+
+        let mut run = plan(&run_id(5), Duration::from_secs(5));
+        run.spare = keeper
+            .take(&run.intent, far(), &CancellationSource::new().token())
+            .await;
+        assert!(run.spare.is_some());
+        let mut seen = Collect::default();
+        let report = run_on_engine(
+            &registry,
+            backend.as_ref(),
+            &run,
+            &CancellationSource::new().token(),
+            &mut seen,
+        )
+        .await;
+        assert_eq!(report.execution, ExecutionEnd::Exited(0), "{report:?}");
+        assert_eq!(report.cleanup, CleanupEnd::Removed);
+        assert_ne!(report.engine_id, held.engine_id, "a fresh engine ran it");
+        let notes = seen.notes.join("\n");
+        assert!(notes.contains("not running"), "{notes}");
+        assert!(notes.contains("creating isolated engine"), "{notes}");
+        assert_eq!(
+            record_of(&registry, &run_id(905)).await.state,
+            ActEngineState::Terminal,
+            "the stopped spare is retired"
+        );
+        assert_eq!(backend.live(), 0);
+    });
+}
+
 #[test]
 fn two_runs_racing_for_one_spare_claim_it_once() {
     with_registry(|registry, _dir| async move {

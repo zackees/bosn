@@ -223,6 +223,10 @@ pub trait ActEngineBackend: Send + Sync {
     fn host_resources(&self) -> BoxFuture<'_, Result<super::limits::HostResources, String>>;
     /// Create the machine-wide cache volume unless it exists.
     fn ensure_cache<'a>(&'a self, cache: &'a CacheVolume) -> BoxFuture<'a, Result<(), String>>;
+    /// Whether the engine container `engine_id` is running now. A prepared spare can stop
+    /// behind the daemon's back (a host Docker restart, its inner dockerd exiting), and a stopped
+    /// one must never be handed to a run (#556). A failed read is "not running".
+    fn engine_running<'a>(&'a self, engine_id: &'a str) -> BoxFuture<'a, bool>;
     /// Commit `intent`, then create, verify, register and start its engine.
     /// A failure after the intent commits leaves the record for cleanup.
     fn create<'a>(
@@ -566,6 +570,23 @@ fn owned(args: &[&str]) -> Vec<String> {
 }
 
 impl ActEngineBackend for DockerActBackend {
+    fn engine_running<'a>(&'a self, engine_id: &'a str) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            let inspect = owned(&[
+                "container",
+                "inspect",
+                "--format",
+                "{{.State.Running}}",
+                engine_id,
+            ]);
+            self.run(inspect, CONTROL_DEADLINE)
+                .await
+                .is_ok_and(|result| {
+                    result.ok() && String::from_utf8_lossy(&result.stdout).trim() == "true"
+                })
+        })
+    }
+
     fn ensure_engine_image(&self) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async move {
             let image = engine_image();
