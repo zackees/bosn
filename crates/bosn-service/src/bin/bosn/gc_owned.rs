@@ -65,14 +65,27 @@ pub(crate) fn parse_gc_owned_arguments(
         }?;
     }
 
-    // Every gate is required. A defaulted gate would silently reclaim under a TTL the operator
-    // never chose, which is the opposite of what an explicit command should do.
+    // Applying requires every gate and the state directory: a defaulted gate would silently
+    // reclaim under a TTL the operator never chose. A preview removes nothing, so it defaults to
+    // the daemon's own state directory and policy, which makes the bare `bosn gc owned` the
+    // maintenance log prints runnable as shown (#551).
+    let defaults = RetentionPolicy::default();
+    let gate = |value: Option<u64>, default: std::time::Duration| match value {
+        Some(secs) => Ok(std::time::Duration::from_secs(secs)),
+        None if !apply => Ok(default),
+        None => Err(()),
+    };
+    let state_dir = match state_dir {
+        Some(dir) => dir,
+        None if !apply => bosn_service::mcp::default_state_dir(),
+        None => return Err(()),
+    };
     Ok((
-        state_dir.ok_or(())?,
+        state_dir,
         RetentionPolicy {
-            container_ttl: std::time::Duration::from_secs(container_ttl.ok_or(())?),
-            volume_ttl: std::time::Duration::from_secs(volume_ttl.ok_or(())?),
-            image_ttl: std::time::Duration::from_secs(image_ttl.ok_or(())?),
+            container_ttl: gate(container_ttl, defaults.container_ttl)?,
+            volume_ttl: gate(volume_ttl, defaults.volume_ttl)?,
+            image_ttl: gate(image_ttl, defaults.image_ttl)?,
             max_bytes,
         },
         apply,
@@ -166,4 +179,42 @@ pub(crate) fn owned_failure(json: bool) -> ! {
         eprintln!("bosn gc owned: daemon unavailable or request failed");
     }
     std::process::exit(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RetentionPolicy, parse_gc_owned_arguments};
+
+    fn parse(args: &[&str]) -> Result<RetentionPolicy, ()> {
+        parse_gc_owned_arguments(args.iter().map(std::ffi::OsString::from)).map(|parsed| parsed.1)
+    }
+
+    /// #551: the maintenance log prints `bosn gc owned`; a preview must run as printed, while
+    /// applying still requires every gate and the state directory.
+    #[test]
+    fn a_preview_defaults_to_the_daemon_policy_but_applying_does_not() {
+        assert_eq!(parse(&[]), Ok(RetentionPolicy::default()));
+        assert_eq!(parse(&["--json"]), Ok(RetentionPolicy::default()));
+        let explicit = parse(&["--container-ttl-secs", "60"]).unwrap();
+        assert_eq!(explicit.container_ttl, std::time::Duration::from_secs(60));
+        assert_eq!(explicit.volume_ttl, RetentionPolicy::default().volume_ttl);
+        let all = [
+            "--state-dir",
+            "/s",
+            "--container-ttl-secs",
+            "1",
+            "--volume-ttl-secs",
+            "2",
+            "--image-ttl-secs",
+            "3",
+            "--apply",
+            "--yes",
+        ];
+        assert!(parse(&all).is_ok());
+        for missing in [1, 3, 5, 7] {
+            let mut args = all.to_vec();
+            args.drain(missing - 1..=missing);
+            assert_eq!(parse(&args), Err(()), "{args:?}");
+        }
+    }
 }
