@@ -416,6 +416,12 @@ mod tests {
             .unwrap()
             .set_len(1 << 20)
             .unwrap();
+        for (name, size) in [
+            (".act-maintenance-archive-v1.tgz", 8192),
+            (".act-maintenance-archive-pending-v1.tgz", 4096),
+        ] {
+            std::fs::write(root.path().join(name), vec![b'x'; size]).unwrap();
+        }
         let immutable = root.path().join("toolstore-v1/object/tree");
         std::fs::create_dir_all(&immutable).unwrap();
         std::fs::write(immutable.join("tool"), vec![b'x'; 8192]).unwrap();
@@ -475,6 +481,13 @@ mod tests {
             .unwrap();
         assert!(immutable.bytes.unwrap() >= 8192);
         assert!(immutable.allocated_bytes.unwrap() >= 8192);
+        let tools = report
+            .components
+            .iter()
+            .find(|c| c.class == CacheClass::Tools)
+            .unwrap();
+        assert!(tools.bytes.unwrap() >= (1 << 20) + 12288);
+        assert!(tools.allocated_bytes.unwrap() >= 12288);
         assert!(report.bytes.unwrap() > report.allocated_bytes.unwrap());
         assert!(
             report.components.iter().any(

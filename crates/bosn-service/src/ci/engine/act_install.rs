@@ -42,7 +42,7 @@ pub(crate) fn install_act_script(act: ActArtifact) -> String {
     format!(
         "{lease} tgz={archive}; mkdir -p {ENGINE_CACHE}/tools; \
          exec 9>>\"$tgz.lock\"; flock -x 9; \
-         if ! echo \"{sum}  $tgz\" | sha256sum -c - >/dev/null 2>&1; then \
+         {preferred} if ! echo \"{sum}  $tgz\" | sha256sum -c - >/dev/null 2>&1; then \
            stage=$(mktemp \"$tgz.XXXXXXXX\"); trap 'rm -f \"$stage\"' EXIT; \
            wget -q -O \"$stage\" '{url}' && \
            echo \"{sum}  $stage\" | sha256sum -c - >/dev/null && mv \"$stage\" \"$tgz\" || exit 1; \
@@ -51,6 +51,7 @@ pub(crate) fn install_act_script(act: ActArtifact) -> String {
          echo \"{binary}  {ENGINE_WORK}/bin/act\" | sha256sum -c - >/dev/null && \
          {ENGINE_WORK}/bin/act --version || exit $?",
         lease = super::artifact_lease::reader(),
+        preferred = super::artifact_lease::prefer_preserved_archive(act.sha256),
         url = act.url,
         sum = act.sha256,
         binary = act.binary_sha256,

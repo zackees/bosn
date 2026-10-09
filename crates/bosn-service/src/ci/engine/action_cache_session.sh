@@ -53,6 +53,39 @@ while IFS= read -r operation; do
                 cat "$ledger"
             else printf 'absent\n'; fi
             finish 0;;
+        preserve)
+            [ '@CLASS@' = tools ] || exit 78
+            IFS= read -r value || exit 78
+            set -- $value
+            [ "$#" -eq 2 ] || exit 78
+            name="$1"; digest="$2"
+            case "$name" in ''|.|..|*[!A-Za-z0-9._-]*) exit 78;; esac
+            case "$digest" in ''|*[!0-9a-f]*) exit 78;; esac
+            [ "${#name}" -le 255 ] && [ "${#digest}" -eq 64 ] || exit 78
+            kept=@PINNED_ARCHIVE@
+            copy="$cache/.act-maintenance-archive-pending-v1.tgz"
+            for file in "$kept" "$copy"; do
+                [ ! -L "$file" ] || exit 78
+                if [ -e "$file" ]; then
+                    [ -f "$file" ] && [ "$(stat -c '%a %u %h' "$file")" = '600 0 1' ] || exit 78
+                fi
+            done
+            if ! echo "$digest  $kept" | sha256sum -c - >/dev/null 2>&1; then
+                original="$source/$name"
+                [ -f "$original" ] && [ ! -L "$original" ] || exit 78
+                echo "$digest  $original" | sha256sum -c - >/dev/null || exit 78
+                cat "$original" >"$copy"
+                sync -f "$copy"
+                echo "$digest  $copy" | sha256sum -c - >/dev/null || exit 78
+                mv -T "$copy" "$kept"
+                sync -f "$cache"
+            elif [ -e "$copy" ]; then
+                rm -f -- "$copy"
+                sync -f "$cache"
+            fi
+            size=$(du -sk "$kept") || exit 78
+            printf 'preserved %s\n' "${size%%[[:space:]]*}"
+            finish 0;;
         prepare)
             argument || exit 78
             identity "$source" "$device" "$inode" || exit 78

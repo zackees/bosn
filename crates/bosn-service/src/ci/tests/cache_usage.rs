@@ -44,6 +44,7 @@ fn runner_cache_reports_unknown_maintenance_without_exposing_diagnostics() {
             recovery_error: Some("private recovery output".into()),
             action_outcome: None,
             image_outcome: None,
+            archive_outcome: None,
             tool_outcome: None,
         };
         assert!(matches!(
@@ -71,6 +72,7 @@ fn runner_cache_reports_unknown_maintenance_without_exposing_diagnostics() {
                 tool_maintenance: None,
                 action_maintenance: None,
                 image_maintenance: None,
+                archive_maintenance: None,
             })
         );
         assert!(!reply.to_json().contains("private"));

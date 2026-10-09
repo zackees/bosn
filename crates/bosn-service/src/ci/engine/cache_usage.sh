@@ -2,19 +2,37 @@
 # Read-only, non-atomic samples. Never follow symlinks outside the cache.
 root=/cache
 sample() {
+    tag=$1
+    shift
     apparent=unknown
     allocated=unknown
-    if value=$(du -sb "$2" 2>/dev/null); then
+    if value=$(du -sbc "$@" 2>/dev/null); then
+        value=$(printf '%s\n' "$value" | tail -n 1)
         apparent=${value%%[[:space:]]*}
     fi
-    if value=$(du -sk "$2" 2>/dev/null); then
+    if value=$(du -skc "$@" 2>/dev/null); then
+        value=$(printf '%s\n' "$value" | tail -n 1)
         blocks=${value%%[[:space:]]*}
         allocated=$((blocks * 1024))
     fi
-    printf '%s %s %s\n' "$1" "$apparent" "$allocated"
+    printf '%s %s %s\n' "$tag" "$apparent" "$allocated"
 }
 sample total "$root"
 for class in tools images actions toolcache toolstore-v1 actcache; do
+    if [ "$class" = tools ]; then
+        set --
+        for path in "$root/tools" "$root/.act-maintenance-archive-v1.tgz" "$root/.act-maintenance-archive-pending-v1.tgz"; do
+            if [ -e "$path" ] || [ -L "$path" ]; then
+                set -- "$@" "$path"
+            fi
+        done
+        if [ "$#" -gt 0 ]; then
+            sample tools "$@"
+        else
+            printf 'tools 0 0\n'
+        fi
+        continue
+    fi
     if [ -e "$root/$class" ] || [ -L "$root/$class" ]; then
         sample "$class" "$root/$class"
     else

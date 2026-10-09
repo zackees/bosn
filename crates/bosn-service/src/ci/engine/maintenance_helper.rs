@@ -15,6 +15,7 @@ pub struct MaintenanceHelperAttempt {
     /// Reclamation evidence survives a cleanup failure.
     pub outcome: Result<MaintenanceAttempt, String>,
     /// Independent tool evidence survives a cohort or helper-cleanup failure.
+    pub archives: Option<Result<super::action_cache::ActionMaintenanceStats, String>>,
     pub images: Option<Result<super::action_cache::ActionMaintenanceStats, String>>,
     pub actions: Option<Result<super::action_cache::ActionMaintenanceStats, String>>,
     pub tools:
@@ -68,6 +69,7 @@ impl DockerActBackend {
         let mut tools = None;
         let mut actions = None;
         let mut images = None;
+        let mut archives = None;
         let outcome = async {
             tracker.register(&id).await?;
             let document = self
@@ -91,6 +93,7 @@ impl DockerActBackend {
             self.require_cache_policy(&id, policy).await?;
             actions = Some(self.maintain_actions(&id, policy).await);
             images = Some(self.maintain_image_archives(&id, policy).await);
+            archives = Some(self.maintain_tool_archives(&id, policy).await);
             tools = Some(self.maintain_published_tools(&id, policy).await);
             self.maintain_cache_cohort(&id, policy).await
         }
@@ -114,6 +117,7 @@ impl DockerActBackend {
             tools,
             actions,
             images,
+            archives,
             cleanup,
         })
     }
@@ -178,14 +182,16 @@ pub(super) fn helper_create_args(identity: &helper::Identity) -> Vec<String> {
     args
 }
 
-fn offline_install_script(act: super::ActArtifact) -> String {
+pub(super) fn offline_install_script(act: super::ActArtifact) -> String {
     format!(
-        "{lease} mkdir -p {ENGINE_WORK}/bin; tgz={archive}; exec 9>>\"$tgz.lock\"; flock -s 9; \
+        "{lease} mkdir -p {ENGINE_WORK}/bin {super_cache}/tools; tgz={archive}; exec 9>>\"$tgz.lock\"; flock -s 9; {preferred} \
          echo \"{sum}  $tgz\" | sha256sum -c - >/dev/null && \
          tar -xzf \"$tgz\" -C {ENGINE_WORK}/bin act && \
          echo \"{binary}  {ENGINE_WORK}/bin/act\" | sha256sum -c - >/dev/null && \
          {ENGINE_WORK}/bin/act --version",
         lease = super::artifact_lease::reader(),
+        super_cache = super::ENGINE_CACHE,
+        preferred = super::artifact_lease::prefer_preserved_archive(act.sha256),
         archive = act_archive(act),
         sum = act.sha256,
         binary = act.binary_sha256,

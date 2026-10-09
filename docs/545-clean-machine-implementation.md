@@ -2065,3 +2065,38 @@ running before commit. The real-image scratch fixture was moved to trash with
 `safe-rm`; no host Docker images, active workloads or foreign cache volumes were
 removed by these fixture checks.
 Final full lint passed in `/tmp/bosn-545-image-retirement-final-lint.log`.
+
+
+### Act2 release archive retirement and offline restart evidence
+
+The tools archive class now shares the stable root artifact lease with image
+archives. Maintenance verifies and durably publishes the current pinned archive
+into `.act-maintenance-archive-v1.tgz` before retiring the tools directory using
+the existing outside-ledger inode and custody protocol. Both online bootstrap
+and the offline maintenance installer prefer that copy only when its digest
+matches their expected pin. The original root lease remains outside retirement.
+The fixed pending copy and preserved copy are included in Tools disk accounting;
+this is a steady-state cache policy, not a filesystem quota.
+
+The live controller test now uses the actual released Act2.16 archive, rather
+than synthetic archive bytes. All three class tests passed in 2.01 seconds:
+actions, images, and tools. After tools retirement, the production offline
+installation script extracted the retained archive with networking disabled,
+verified the binary digest, and passed installed Act2 capability validation.
+Every private fixture container and volume was removed with verified absence.
+Evidence: `/tmp/bosn-545-real-archive-restart-live.log`.
+
+The real filesystem accounting test passed with sparse data plus both preserved
+and pending archives. Published schema regeneration passed. The incremental
+review found no blocker, while explicitly identifying preservation interruption
+and the public helper ownership/census path as still unverified. These results
+do not prove complete issue acceptance or installed-machine rollout.
+
+Final increment gates: workspace all-target Clippy passed (23.05 seconds), full
+lint passed, final rebuilt live controller tests passed (3 tests, 2.14 seconds),
+and final registry restart/validation tests passed (2 tests, 0.10 seconds).
+Review of the reporting and test refactors found no regression. Logs:
+`/tmp/bosn-545-tools-retirement-clippy-final3.log`,
+`/tmp/bosn-545-tools-retirement-lint-final.log`,
+`/tmp/bosn-545-tools-final-live.log`, and
+`/tmp/bosn-545-tools-final-registry.log`.

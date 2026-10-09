@@ -37,6 +37,7 @@ fn latest_snapshot_survives_restart_and_requires_real_helper_cleanup_evidence() 
         recovery_error: None,
         action_outcome: Some(action_observed()),
         image_outcome: Some(action_observed()),
+        archive_outcome: Some(action_observed()),
         tool_outcome: Some(ToolMaintenanceOutcome::Observed {
             stats: ToolMaintenanceStats {
                 allocated_before: 80,
@@ -46,22 +47,7 @@ fn latest_snapshot_survives_restart_and_requires_real_helper_cleanup_evidence() 
             },
         }),
     };
-    let mut partial = snapshot.clone();
-    if let MaintenanceOutcome::Observed { partial, .. } = &mut partial.outcome {
-        *partial = true;
-    }
-    assert!(
-        partial.validate().is_err(),
-        "partial root cannot claim total reclamation"
-    );
-    if let MaintenanceOutcome::Observed {
-        reclaimed_archive_bytes,
-        ..
-    } = &mut partial.outcome
-    {
-        *reclaimed_archive_bytes = None;
-    }
-    partial.validate().unwrap();
+    require_partial_reclamation_rejected(&snapshot);
     let mut tx = registry.begin_immediate().unwrap();
     tx.begin_cache_helper(&intent).unwrap();
     tx.register_cache_helper(NONCE, &id, 2.0).unwrap();
@@ -91,6 +77,7 @@ fn latest_snapshot_survives_restart_and_requires_real_helper_cleanup_evidence() 
         recovery_error: Some("cleanup remains pending".into()),
         action_outcome: None,
         image_outcome: None,
+        archive_outcome: None,
         tool_outcome: None,
     };
     let mut tx = registry.begin_immediate().unwrap();
@@ -117,6 +104,7 @@ fn action_evidence_requires_a_helper_and_a_met_budget() {
         },
         recovery_error: None,
         image_outcome: None,
+        archive_outcome: None,
         tool_outcome: None,
         action_outcome: Some(ActionMaintenanceOutcome::Held {
             diagnostic: "reader lease busy".into(),
@@ -155,4 +143,23 @@ fn action_observed() -> ActionMaintenanceOutcome {
             retired_classes: 1,
         },
     }
+}
+
+fn require_partial_reclamation_rejected(snapshot: &MaintenanceSnapshot) {
+    let mut partial = snapshot.clone();
+    if let MaintenanceOutcome::Observed { partial, .. } = &mut partial.outcome {
+        *partial = true;
+    }
+    assert!(
+        partial.validate().is_err(),
+        "partial root cannot claim total reclamation"
+    );
+    if let MaintenanceOutcome::Observed {
+        reclaimed_archive_bytes,
+        ..
+    } = &mut partial.outcome
+    {
+        *reclaimed_archive_bytes = None;
+    }
+    partial.validate().unwrap();
 }

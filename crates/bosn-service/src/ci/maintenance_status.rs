@@ -20,6 +20,8 @@ pub enum MaintenanceStatus {
         action_maintenance: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         image_maintenance: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        archive_maintenance: Option<String>,
     },
 }
 
@@ -67,6 +69,9 @@ impl From<MaintenanceSnapshot> for MaintenanceStatus {
                 .helper
                 .is_some_and(|helper| helper.cleanup_error.is_some()),
             outcome,
+            archive_maintenance: snapshot
+                .archive_outcome
+                .map(|outcome| disposable_summary("act release archives", outcome)),
             image_maintenance: snapshot
                 .image_outcome
                 .map(|outcome| disposable_summary("image archives", outcome)),
@@ -101,6 +106,7 @@ impl MaintenanceStatus {
                 tool_maintenance,
                 action_maintenance,
                 image_maintenance,
+                archive_maintenance,
             } => {
                 let result = match outcome {
                     MaintenanceResult::Unknown => "unknown result".to_owned(),
@@ -127,7 +133,7 @@ impl MaintenanceStatus {
                     ),
                 };
                 format!(
-                    "maintenance: last recorded at {observed_at:.3} (Unix seconds, this registry); {result}{}{}{}{}{}",
+                    "maintenance: last recorded at {observed_at:.3} (Unix seconds, this registry); {result}{}{}{}{}{}{}",
                     if *recovery_failed {
                         "; helper recovery failed"
                     } else {
@@ -146,7 +152,10 @@ impl MaintenanceStatus {
                         .map_or_else(String::new, |actions| format!("; {actions}")),
                     image_maintenance
                         .as_ref()
-                        .map_or_else(String::new, |images| format!("; {images}"))
+                        .map_or_else(String::new, |images| format!("; {images}")),
+                    archive_maintenance
+                        .as_ref()
+                        .map_or_else(String::new, |archives| format!("; {archives}"))
                 )
             }
         }
@@ -196,6 +205,7 @@ mod tests {
             image_outcome: Some(ActionMaintenanceOutcome::Held {
                 diagnostic: "older archive reader".into(),
             }),
+            archive_outcome: None,
             tool_outcome: None,
         };
         snapshot.validate().unwrap();

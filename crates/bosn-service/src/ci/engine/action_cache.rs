@@ -12,12 +12,14 @@ pub use bosn_registry::cache_maintenance::ActionMaintenanceStats;
 enum DisposableClass {
     Actions,
     Images,
+    Tools,
 }
 impl DisposableClass {
     fn name(self) -> &'static str {
         match self {
             Self::Actions => "actions",
             Self::Images => "images",
+            Self::Tools => "tools",
         }
     }
     fn lease(self) -> (&'static str, &'static str) {
@@ -26,7 +28,7 @@ impl DisposableClass {
                 "/bosn/cache/actcache",
                 "/bosn/cache/actcache/.legacy-migration.lock",
             ),
-            Self::Images => ("/bosn/cache", "/bosn/cache/.artifact-cache.lock"),
+            Self::Images | Self::Tools => ("/bosn/cache", "/bosn/cache/.artifact-cache.lock"),
         }
     }
 }
@@ -48,6 +50,14 @@ impl DockerActBackend {
         self.maintain_disposable_class(engine, policy, DisposableClass::Images)
             .await
     }
+    pub(super) async fn maintain_tool_archives(
+        &self,
+        engine: &str,
+        policy: CachePolicy,
+    ) -> Result<ActionMaintenanceStats, String> {
+        self.maintain_disposable_class(engine, policy, DisposableClass::Tools)
+            .await
+    }
     async fn maintain_disposable_class(
         &self,
         engine: &str,
@@ -60,7 +70,19 @@ impl DockerActBackend {
             // Recheck all attachments while the original exclusive lease is held.
             match class {
                 DisposableClass::Actions => self.require_coordinated_cache_readers().await?,
-                DisposableClass::Images => self.require_coordinated_artifact_readers().await?,
+                DisposableClass::Images | DisposableClass::Tools => {
+                    self.require_coordinated_artifact_readers().await?
+                }
+            }
+            if matches!(class, DisposableClass::Tools) {
+                let act = super::act_artifact("amd64").ok_or("missing pinned act archive")?;
+                let path = super::act_archive(act);
+                session
+                    .preserve(
+                        path.rsplit('/').next().ok_or("missing archive filename")?,
+                        act.sha256,
+                    )
+                    .await?;
             }
             session
                 .maintain(u64::try_from(policy.repository_max_bytes).map_err(|e| e.to_string())?)
@@ -74,6 +96,7 @@ impl DockerActBackend {
 
 struct Session {
     class: DisposableClass,
+    preserved_bytes: u64,
     io: ProcessControl,
 }
 impl Session {
@@ -89,7 +112,11 @@ impl Session {
                 .replace("@CACHE@", ENGINE_CACHE)
                 .replace("@CLASS@", class.name())
                 .replace("@LEASE_DIR@", directory)
-                .replace("@LEASE@", lease),
+                .replace("@LEASE@", lease)
+                .replace(
+                    "@PINNED_ARCHIVE@",
+                    &super::artifact_lease::maintenance_archive(),
+                ),
         );
         let process = backend
             .docker
@@ -99,6 +126,7 @@ impl Session {
             .map_err(|e| e.to_string())?;
         let mut session = Self {
             class,
+            preserved_bytes: 0,
             io: ProcessControl::new(
                 process,
                 "cache retention",
@@ -136,6 +164,14 @@ impl Session {
         // The shell frame contributes one blank line after command output.
         let table = table.strip_suffix(b"\n").unwrap_or(&table);
         let stage = proof.map(|proof| proof.stage(self.class.name()));
+        if matches!(self.class, DisposableClass::Tools) {
+            require_no_submounts(table, &super::artifact_lease::maintenance_archive(), None)?;
+            require_no_submounts(
+                table,
+                &format!("{ENGINE_CACHE}/.act-maintenance-archive-pending-v1.tgz"),
+                None,
+            )?;
+        }
         require_no_submounts(
             table,
             &format!("{ENGINE_CACHE}/{}", self.class.name()),
@@ -143,10 +179,35 @@ impl Session {
         )
     }
 
+    async fn preserve(&mut self, name: &str, digest: &str) -> Result<(), String> {
+        self.mounts(None).await?;
+        let bytes = self
+            .raw("preserve", Some(&format!("{name} {digest}")))
+            .await?;
+        let text = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
+        let fields: Vec<_> = text.split_whitespace().collect();
+        let ["preserved", kilobytes] = fields.as_slice() else {
+            return Err("invalid preserved archive allocation".into());
+        };
+        self.preserved_bytes = kilobytes
+            .parse::<u64>()
+            .map_err(|e| e.to_string())?
+            .checked_mul(1024)
+            .ok_or("preserved archive allocation overflows")?;
+        Ok(())
+    }
+
     async fn maintain(&mut self, budget: u64) -> Result<ActionMaintenanceStats, String> {
         self.mounts(None).await?;
+        if self.preserved_bytes > budget {
+            return Err("pinned archive alone exceeds the cache budget".into());
+        }
         let initial = Observation::parse(&self.raw("observe", None).await?)?;
-        let mut before = initial.source.map_or(0, |(_, bytes)| bytes);
+        let mut before = initial
+            .source
+            .map_or(0, |(_, bytes)| bytes)
+            .checked_add(self.preserved_bytes)
+            .ok_or("archive allocation overflows")?;
         let mut retired = 0;
         let ledger = self.raw("ledger", None).await?;
         if ledger != b"absent\n" && ledger != b"absent\n\n" {
@@ -168,7 +229,7 @@ impl Session {
             return Err("cache changed during maintenance".into());
         }
         if let Some((source, bytes)) = current.source
-            && bytes > budget
+            && (bytes > budget || matches!(self.class, DisposableClass::Tools))
         {
             let proof = Retirement {
                 schema_version: 1,
@@ -190,7 +251,11 @@ impl Session {
         if final_state.cache != initial.cache {
             return Err("cache changed before acknowledgement".into());
         }
-        let after = final_state.source.map_or(0, |(_, bytes)| bytes);
+        let after = final_state
+            .source
+            .map_or(0, |(_, bytes)| bytes)
+            .checked_add(self.preserved_bytes)
+            .ok_or("archive allocation overflows")?;
         if after > budget {
             return Err("cache class remains over budget".into());
         }

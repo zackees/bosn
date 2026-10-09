@@ -65,27 +65,19 @@ pub(super) async fn persist(
             .as_ref()
             .ok()
             .and_then(|attempt| attempt.actions.as_ref())
-            .map(|actions| match actions {
-                Ok(stats) => ActionMaintenanceOutcome::Observed {
-                    stats: stats.clone(),
-                },
-                Err(error) => ActionMaintenanceOutcome::Held {
-                    diagnostic: diagnostic(error),
-                },
-            }),
+            .map(disposable_outcome),
         image_outcome: tick
             .attempt
             .as_ref()
             .ok()
             .and_then(|attempt| attempt.images.as_ref())
-            .map(|images| match images {
-                Ok(stats) => ActionMaintenanceOutcome::Observed {
-                    stats: stats.clone(),
-                },
-                Err(error) => ActionMaintenanceOutcome::Held {
-                    diagnostic: diagnostic(error),
-                },
-            }),
+            .map(disposable_outcome),
+        archive_outcome: tick
+            .attempt
+            .as_ref()
+            .ok()
+            .and_then(|attempt| attempt.archives.as_ref())
+            .map(disposable_outcome),
         tool_outcome: tick
             .attempt
             .as_ref()
@@ -108,6 +100,18 @@ pub(super) async fn persist(
     {
         ActRegistryReply::Committed => Ok(()),
         _ => Err("maintenance snapshot registry reply mismatch".into()),
+    }
+}
+fn disposable_outcome(
+    result: &Result<super::action_cache::ActionMaintenanceStats, String>,
+) -> ActionMaintenanceOutcome {
+    match result {
+        Ok(stats) => ActionMaintenanceOutcome::Observed {
+            stats: stats.clone(),
+        },
+        Err(error) => ActionMaintenanceOutcome::Held {
+            diagnostic: diagnostic(error),
+        },
     }
 }
 fn diagnostic(value: &str) -> String {

@@ -19,6 +19,8 @@ pub struct MaintenanceSnapshot {
     pub action_outcome: Option<ActionMaintenanceOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_outcome: Option<DisposableMaintenanceOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_outcome: Option<DisposableMaintenanceOutcome>,
 }
 
 pub type ActionMaintenanceOutcome = DisposableMaintenanceOutcome;
@@ -86,21 +88,29 @@ impl MaintenanceSnapshot {
             || !self.observed_at.is_finite()
             || self.observed_at < 0.0
             || self.recovery_error.as_deref().is_some_and(|s| !bounded(s))
-            || ([&self.action_outcome, &self.image_outcome]
-                .iter()
-                .any(|outcome| outcome.is_some())
+            || ([
+                &self.action_outcome,
+                &self.image_outcome,
+                &self.archive_outcome,
+            ]
+            .iter()
+            .any(|outcome| outcome.is_some())
                 && self.helper.is_none())
-            || [&self.action_outcome, &self.image_outcome]
-                .iter()
-                .filter_map(|outcome| outcome.as_ref())
-                .any(|outcome| match outcome {
-                    DisposableMaintenanceOutcome::Observed { stats } => {
-                        stats.budget_bytes == 0
-                            || stats.allocated_after > stats.budget_bytes
-                            || stats.retired_classes > 2
-                    }
-                    DisposableMaintenanceOutcome::Held { diagnostic } => !bounded(diagnostic),
-                })
+            || [
+                &self.action_outcome,
+                &self.image_outcome,
+                &self.archive_outcome,
+            ]
+            .iter()
+            .filter_map(|outcome| outcome.as_ref())
+            .any(|outcome| match outcome {
+                DisposableMaintenanceOutcome::Observed { stats } => {
+                    stats.budget_bytes == 0
+                        || stats.allocated_after > stats.budget_bytes
+                        || stats.retired_classes > 2
+                }
+                DisposableMaintenanceOutcome::Held { diagnostic } => !bounded(diagnostic),
+            })
             || (self.tool_outcome.is_some() && self.helper.is_none())
             || self
                 .tool_outcome
