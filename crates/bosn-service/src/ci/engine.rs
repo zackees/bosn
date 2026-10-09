@@ -207,6 +207,24 @@ pub enum ExecEnd {
 pub enum EngineLine {
     Stdout(String),
     Stderr(String),
+    /// The kept prefix of a stdout line longer than the line bound. It is logged, never parsed
+    /// as act's JSON: a cut line is truncated output, not malformed evidence (#563).
+    TruncatedStdout(String),
+}
+
+impl EngineLine {
+    fn stdout(line: lines::Line) -> Self {
+        match line {
+            lines::Line::Whole(text) => Self::Stdout(text),
+            lines::Line::Truncated(text) => Self::TruncatedStdout(text),
+        }
+    }
+    fn stderr(line: lines::Line) -> Self {
+        match line {
+            lines::Line::Whole(text) => Self::Stderr(text),
+            lines::Line::Truncated(text) => Self::Stderr(format!("{text} [bosn: line truncated]")),
+        }
+    }
 }
 
 /// The trusted engine runtime behind `bosn ci`. Engine identity, ownership
@@ -852,16 +870,17 @@ impl ActEngineBackend for DockerActBackend {
                 let mut stdout = LineBuffer::default();
                 let mut stderr = LineBuffer::default();
                 while let Some(event) = receiver.recv().await {
-                    let (buffer, make): (&mut LineBuffer, fn(String) -> EngineLine) = match event {
-                        EngineEvent::Stdout(bytes) => {
-                            stdout.push(&bytes);
-                            (&mut stdout, EngineLine::Stdout)
-                        }
-                        EngineEvent::Stderr(bytes) => {
-                            stderr.push(&bytes);
-                            (&mut stderr, EngineLine::Stderr)
-                        }
-                    };
+                    let (buffer, make): (&mut LineBuffer, fn(lines::Line) -> EngineLine) =
+                        match event {
+                            EngineEvent::Stdout(bytes) => {
+                                stdout.push(&bytes);
+                                (&mut stdout, EngineLine::stdout)
+                            }
+                            EngineEvent::Stderr(bytes) => {
+                                stderr.push(&bytes);
+                                (&mut stderr, EngineLine::stderr)
+                            }
+                        };
                     for line in buffer.drain_lines() {
                         if lines.send(make(line)).await.is_err() {
                             return;
@@ -869,10 +888,10 @@ impl ActEngineBackend for DockerActBackend {
                     }
                 }
                 for line in stdout.finish() {
-                    let _ = lines.send(EngineLine::Stdout(line)).await;
+                    let _ = lines.send(EngineLine::stdout(line)).await;
                 }
                 for line in stderr.finish() {
-                    let _ = lines.send(EngineLine::Stderr(line)).await;
+                    let _ = lines.send(EngineLine::stderr(line)).await;
                 }
             };
             let stream = async {
