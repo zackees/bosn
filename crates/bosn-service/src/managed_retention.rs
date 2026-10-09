@@ -178,13 +178,22 @@ pub fn managed_retention_pass(
         for candidate in &plan.candidates {
             // Re-verify this exact object immediately before removing it. A container that
             // started while the pass was running must never be removed by a stale plan.
-            let outcome = revalidate(engine, candidate, our_registry.as_deref(), policy)
-                .and_then(|measured| remove_owned(engine, candidate).map(|()| measured));
+            // An object that is already gone has reached the desired state: neither a removal
+            // nor a failure, and nothing reclaimed is accounted for (#550).
+            let outcome = revalidate(engine, candidate, our_registry.as_deref(), policy).and_then(
+                |recheck| match recheck {
+                    Recheck::Gone => Ok(None),
+                    Recheck::Reclaimable(measured) => {
+                        remove_owned(engine, candidate).map(|removed| removed.then_some(measured))
+                    }
+                },
+            );
             match outcome {
-                Ok(measured) => {
+                Ok(Some(measured)) => {
                     removed += 1;
                     removed_bytes = removed_bytes.saturating_add(measured.unwrap_or(0));
                 }
+                Ok(None) => {}
                 Err(detail) => {
                     failed += 1;
                     failures.push(detail);
@@ -420,10 +429,18 @@ fn signals(in_use: bool) -> bosn_core::Signals {
     }
 }
 
+/// What the pre-removal re-check found.
+enum Recheck {
+    /// The object no longer exists.
+    Gone,
+    /// Still reclaimable, with the size this read measured (if the engine reported one).
+    Reclaimable(Option<i128>),
+}
+
 /// Re-check one candidate immediately before its removal.
 ///
-/// Returns the size measured by that same fresh inspection, or `None` when the engine did not
-/// report one. Every field of the decision comes from this read: the plan's `bytes` is a
+/// Returns the size measured by that same fresh inspection (`None` inside when the engine did
+/// not report one), or [`Recheck::Gone`] when the object no longer exists. Every field of the decision comes from this read: the plan's `bytes` is a
 /// snapshot from the start of the pass and must never stand in for a value the engine did not
 /// give us now, because the summary's `removed_bytes` is an account of what actually went away.
 fn revalidate(
@@ -431,7 +448,7 @@ fn revalidate(
     candidate: &RetentionVerdict,
     our_registry: Option<&str>,
     policy: RetentionPolicy,
-) -> Result<Option<i128>, String> {
+) -> Result<Recheck, String> {
     let options = RunOptions::bounded(RETENTION_READ_DEADLINE, RETENTION_OUTPUT_LIMIT);
     let (labels, age, in_use, bytes) = match candidate.kind {
         ResourceKind::Container => {
@@ -444,7 +461,7 @@ fn revalidate(
             let Some(entry) = entries.into_iter().next() else {
                 // Already gone: the desired state is reached, not a failure. Nothing was
                 // reclaimed, so nothing is accounted for either.
-                return Ok(None);
+                return Ok(Recheck::Gone);
             };
             (
                 entry.labels(),
@@ -460,7 +477,7 @@ fn revalidate(
                 return Err(format!("volume {} could not be re-read", candidate.id));
             };
             let Some(entry) = entries.into_iter().next() else {
-                return Ok(None);
+                return Ok(Recheck::Gone);
             };
             let in_use = !volume_is_unused(engine, &entry.name, options);
             (
@@ -477,7 +494,7 @@ fn revalidate(
                 return Err(format!("image {} could not be re-read", candidate.id));
             };
             let Some(entry) = entries.into_iter().next() else {
-                return Ok(None);
+                return Ok(Recheck::Gone);
             };
             let in_use = !image_is_unused(engine, &entry.id, options);
             (
@@ -509,7 +526,7 @@ fn revalidate(
         age_seconds: Some(age),
     };
     match classify_managed(&fresh, our_registry, policy).hold {
-        None => Ok(bytes),
+        None => Ok(Recheck::Reclaimable(bytes)),
         Some(reason) => Err(format!(
             "{} {} is no longer reclaimable: {}",
             candidate.kind.as_str(),
@@ -523,7 +540,8 @@ fn revalidate(
 ///
 /// A volume's identity *is* its name, since Docker exposes no separate volume id; the name is
 /// what was proven by the label read and what is passed here. Nothing is removed by tag.
-fn remove_owned(engine: &DockerEngine, candidate: &RetentionVerdict) -> Result<(), String> {
+/// `Ok(true)` when this call removed the object, `Ok(false)` when Docker reports it already gone.
+fn remove_owned(engine: &DockerEngine, candidate: &RetentionVerdict) -> Result<bool, String> {
     let options = RunOptions::bounded(RETENTION_REMOVAL_DEADLINE, RETENTION_REMOVAL_OUTPUT_LIMIT);
     let argv: Vec<&str> = match candidate.kind {
         // No `-f`: a container can start between the re-check and this call, and forcing it
@@ -543,7 +561,9 @@ fn remove_owned(engine: &DockerEngine, candidate: &RetentionVerdict) -> Result<(
         )
     })?;
     if result.ok() {
-        Ok(())
+        Ok(true)
+    } else if result.reports_missing() {
+        Ok(false)
     } else {
         Err(format!(
             "removing {} {}: {}",

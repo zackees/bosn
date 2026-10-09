@@ -239,15 +239,20 @@ impl CommandResult {
         self.exit_code == 0
     }
 
-    /// Docker answered that the object does not exist. The CLI exits 1 for every failure
-    /// (an unreachable daemon, a refused socket), so only Docker's own "no such" answer is
-    /// proof of absence; any other failure is an unreadable object, never a missing one.
+    /// Docker answered that the object (or, for a multi-object read, each failed object)
+    /// does not exist. The CLI exits 1 for every failure (an unreachable daemon, a refused
+    /// socket), so only Docker's own "no such" answer is proof of absence; any other failure,
+    /// even alongside a "no such" line, is an unreadable read, never a missing object.
     #[must_use]
     pub fn reports_missing(&self) -> bool {
+        let stderr = String::from_utf8_lossy(&self.stderr).to_ascii_lowercase();
+        let mut errors = stderr
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .peekable();
         self.exit_code == 1
-            && String::from_utf8_lossy(&self.stderr)
-                .to_ascii_lowercase()
-                .contains("no such ")
+            && errors.peek().is_some()
+            && errors.all(|line| line.contains("no such "))
     }
 }
 
@@ -719,7 +724,7 @@ impl DockerEngine {
             .collect();
         args.extend(names.iter().cloned().map(OsString::from));
         let result = self.with_args(args).capture(options)?;
-        Ok(census_read(result, "docker volume inspect"))
+        Ok(managed_reads::inspect_read(result, "docker volume inspect"))
     }
 
     /// Read-only image IDs carrying one label key, as a bounded `docker image ls`.

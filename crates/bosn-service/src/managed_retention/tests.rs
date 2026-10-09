@@ -615,3 +615,75 @@ fn an_empty_pile_produces_no_line() {
         "a machine with nothing leaked must stay quiet"
     );
 }
+
+/// A fake `docker` whose owned container `fake-container-id` is listed beside `gone-id`, an
+/// object removed between the listing and the reads. Docker answers an inspect naming a missing
+/// object with the found ones on stdout and `No such object` on stderr, exiting 1. With
+/// `vanish_before_recheck`, the owned container disappears too, after the opening read.
+fn fake_docker_with_vanishing(vanish_before_recheck: bool) -> (DockerEngine, std::path::PathBuf) {
+    const SCRIPT: &str = r#"
+if [ "$1" = "ps" ]; then
+  case "$*" in *label=*) printf 'fake-container-id\ngone-id\n' ;; esac
+  exit 0
+fi
+if [ "$1" = "volume" ] || [ "$1" = "image" ]; then exit 0; fi
+if [ "$1" = "inspect" ]; then
+  n=$(cat "$FD_STATE/inspects" 2>/dev/null || echo 0)
+  n=$((n + 1))
+  printf '%s' "$n" > "$FD_STATE/inspects"
+  if [ "$n" -gt 1 ] && [ -n "$FD_VANISH" ]; then
+    printf '[]\n'
+    printf 'Error: No such object: fake-container-id\n' >&2
+    exit 1
+  fi
+  printf '%s' "$FD_INSPECT"
+  case "$*" in *gone-id*) printf 'Error: No such object: gone-id\n' >&2; exit 1 ;; esac
+  exit 0
+fi
+if [ "$1" = "rm" ]; then
+  printf '%s\n' "$*" >> "$FD_STATE/rm-argv"
+  exit 0
+fi
+exit 0
+"#;
+    let dir = scratch_dir("fake-docker-vanishing");
+    let _ = std::fs::remove_file(dir.join("inspects"));
+    let _ = std::fs::remove_file(dir.join("rm-argv"));
+    let mut engine = DockerEngine::synthetic_for_test("/bin/sh", ["-c", SCRIPT, "fake-docker"])
+        .env("FD_STATE", dir.as_os_str())
+        .env("FD_INSPECT", owned_container_inspect(Some(10)));
+    if vanish_before_recheck {
+        engine = engine.env("FD_VANISH", "1");
+    }
+    (engine, dir)
+}
+
+/// #550: an object removed between the listing and the inspect is absent, not an unreadable
+/// engine, so the pass still reclaims everything else.
+#[test]
+fn an_object_that_vanished_before_the_read_does_not_refuse_the_pass() {
+    let (engine, fake) = fake_docker_with_vanishing(false);
+    let dir = state_dir_with_registry("vanished-before-read");
+    let outcome = managed_retention_pass(&engine, &dir, RetentionPolicy::default(), true);
+
+    assert_eq!(outcome.summary.refused, None, "{:?}", outcome.summary);
+    assert_eq!(outcome.summary.removed, 1, "{:?}", outcome.summary);
+    assert_eq!(outcome.summary.failed, 0, "{:?}", outcome.summary);
+    let removed = std::fs::read_to_string(fake.join("rm-argv")).expect("one removal");
+    assert_eq!(removed.trim(), "rm fake-container-id");
+}
+
+/// #550: a candidate that disappears before its re-check reached the desired state. It is
+/// neither a failure nor a removal, and no `rm` is issued for it.
+#[test]
+fn a_candidate_gone_before_its_recheck_is_neither_removed_nor_failed() {
+    let (engine, fake) = fake_docker_with_vanishing(true);
+    let dir = state_dir_with_registry("vanished-before-recheck");
+    let outcome = managed_retention_pass(&engine, &dir, RetentionPolicy::default(), true);
+
+    assert_eq!(outcome.summary.refused, None, "{:?}", outcome.summary);
+    assert_eq!(outcome.summary.planned, 1, "{:?}", outcome.summary);
+    assert_eq!(outcome.summary.removed, 0, "{:?}", outcome.summary);
+    assert_eq!(outcome.summary.failed, 0, "{:?}", outcome.summary);
+    assert!(!fake.join("rm-argv").exists(), "nothing was removed");
+}
