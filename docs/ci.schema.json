@@ -1011,6 +1011,12 @@
             "cleanup_failed": {
               "type": "boolean"
             },
+            "image_maintenance": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "observed_at": {
               "format": "double",
               "type": "number"

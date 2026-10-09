@@ -18,6 +18,8 @@ pub enum MaintenanceStatus {
         tool_maintenance: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         action_maintenance: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image_maintenance: Option<String>,
     },
 }
 
@@ -65,18 +67,12 @@ impl From<MaintenanceSnapshot> for MaintenanceStatus {
                 .helper
                 .is_some_and(|helper| helper.cleanup_error.is_some()),
             outcome,
-            action_maintenance: snapshot.action_outcome.map(|outcome| match outcome {
-                ActionMaintenanceOutcome::Held { diagnostic } => {
-                    format!("actions: held: {diagnostic}")
-                }
-                ActionMaintenanceOutcome::Observed { stats } => format!(
-                    "actions: allocated bytes {} -> {}; budget {}; retired classes {}",
-                    stats.allocated_before,
-                    stats.allocated_after,
-                    stats.budget_bytes,
-                    stats.retired_classes
-                ),
-            }),
+            image_maintenance: snapshot
+                .image_outcome
+                .map(|outcome| disposable_summary("image archives", outcome)),
+            action_maintenance: snapshot
+                .action_outcome
+                .map(|outcome| disposable_summary("actions", outcome)),
             tool_maintenance: snapshot.tool_outcome.map(|outcome| match outcome {
                 ToolMaintenanceOutcome::NotEnrolled => "tools: not enrolled".into(),
                 ToolMaintenanceOutcome::Held { diagnostic } => format!("tools: held: {diagnostic}"),
@@ -104,6 +100,7 @@ impl MaintenanceStatus {
                 outcome,
                 tool_maintenance,
                 action_maintenance,
+                image_maintenance,
             } => {
                 let result = match outcome {
                     MaintenanceResult::Unknown => "unknown result".to_owned(),
@@ -130,7 +127,7 @@ impl MaintenanceStatus {
                     ),
                 };
                 format!(
-                    "maintenance: last recorded at {observed_at:.3} (Unix seconds, this registry); {result}{}{}{}{}",
+                    "maintenance: last recorded at {observed_at:.3} (Unix seconds, this registry); {result}{}{}{}{}{}",
                     if *recovery_failed {
                         "; helper recovery failed"
                     } else {
@@ -146,10 +143,26 @@ impl MaintenanceStatus {
                         .map_or_else(String::new, |tools| format!("; {tools}")),
                     action_maintenance
                         .as_ref()
-                        .map_or_else(String::new, |actions| format!("; {actions}"))
+                        .map_or_else(String::new, |actions| format!("; {actions}")),
+                    image_maintenance
+                        .as_ref()
+                        .map_or_else(String::new, |images| format!("; {images}"))
                 )
             }
         }
+    }
+}
+
+fn disposable_summary(class: &str, outcome: ActionMaintenanceOutcome) -> String {
+    match outcome {
+        ActionMaintenanceOutcome::Held { diagnostic } => format!("{class}: held: {diagnostic}"),
+        ActionMaintenanceOutcome::Observed { stats } => format!(
+            "{class}: allocated bytes {} -> {}; budget {}; retired classes {}",
+            stats.allocated_before,
+            stats.allocated_after,
+            stats.budget_bytes,
+            stats.retired_classes
+        ),
     }
 }
 
@@ -180,6 +193,9 @@ mod tests {
             action_outcome: Some(ActionMaintenanceOutcome::Held {
                 diagnostic: "reader lease busy".into(),
             }),
+            image_outcome: Some(ActionMaintenanceOutcome::Held {
+                diagnostic: "older archive reader".into(),
+            }),
             tool_outcome: None,
         };
         snapshot.validate().unwrap();
@@ -190,6 +206,7 @@ mod tests {
         assert!(text.contains("reclaimed archive bytes unknown"));
         assert!(text.contains("helper cleanup failed"));
         assert!(text.contains("actions: held: reader lease busy"));
+        assert!(text.contains("image archives: held: older archive reader"));
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("private output"));
         assert!(!json.contains("container_id"));

@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const COORDINATION: &str = "com.zackees.bosn.act.cache-coordination";
 const PARTICIPATING: &str = "shared-legacy-lease-v1";
+const ARTIFACT_COORDINATION: &str = "com.zackees.bosn.act.artifact-cache-coordination";
+const ARTIFACT_PARTICIPATING: &str = "shared-artifact-lease-v1";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -32,6 +34,7 @@ struct Mount {
 enum AccessScope {
     Writers,
     AllAttachments,
+    ArtifactReaders,
 }
 
 impl DockerActBackend {
@@ -42,6 +45,11 @@ impl DockerActBackend {
 
     pub(super) async fn require_coordinated_cache_readers(&self) -> Result<(), String> {
         self.require_coordinated_cache_access(CACHE_VOLUME, AccessScope::AllAttachments)
+            .await
+    }
+
+    pub(super) async fn require_coordinated_artifact_readers(&self) -> Result<(), String> {
+        self.require_coordinated_cache_access(CACHE_VOLUME, AccessScope::ArtifactReaders)
             .await
     }
 
@@ -114,8 +122,24 @@ fn require_participants(
             .as_ref()
             .and_then(|labels| labels.get(COORDINATION))
             .map(String::as_str);
-        if (matches!(scope, AccessScope::AllAttachments)
-            || attachments.iter().any(|mount| mount.writable))
+        if matches!(scope, AccessScope::ArtifactReaders)
+            && writer
+                .config
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(ARTIFACT_COORDINATION))
+                .map(String::as_str)
+                != Some(ARTIFACT_PARTICIPATING)
+        {
+            return Err(format!(
+                "archive retirement held by attachment {} without the stable archive lease; finish its work and upgrade its Bosn producer",
+                writer.id
+            ));
+        }
+        if (matches!(
+            scope,
+            AccessScope::AllAttachments | AccessScope::ArtifactReaders
+        ) || attachments.iter().any(|mount| mount.writable))
             && !matches!(
                 coordination,
                 Some(PARTICIPATING | "shared-machine-maintenance-v1")
@@ -136,6 +160,43 @@ fn require_participants(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn historical_archive_readers_cannot_claim_the_new_lease() {
+        let id = "a".repeat(64);
+        for readonly in [true, false] {
+            for modern in [true, false] {
+                let mut labels = BTreeMap::from([(COORDINATION, PARTICIPATING)]);
+                if modern {
+                    labels.insert(ARTIFACT_COORDINATION, ARTIFACT_PARTICIPATING);
+                }
+                let document = serde_json::to_vec(&serde_json::json!([{
+                    "Id": id, "Config": {"Labels": labels},
+                    "Mounts": [{"Type":"volume", "Name":CACHE_VOLUME, "RW": !readonly}]
+                }]))
+                .unwrap();
+                assert_eq!(
+                    require_participants(
+                        &document,
+                        &[&id],
+                        CACHE_VOLUME,
+                        AccessScope::ArtifactReaders
+                    )
+                    .is_ok(),
+                    modern
+                );
+                assert!(
+                    require_participants(
+                        &document,
+                        &[&id],
+                        CACHE_VOLUME,
+                        AccessScope::AllAttachments
+                    )
+                    .is_ok()
+                );
+            }
+        }
+    }
 
     #[test]
     fn missing_old_and_incomplete_writer_proofs_refuse_enrollment() {

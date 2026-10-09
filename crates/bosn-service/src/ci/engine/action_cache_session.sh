@@ -1,11 +1,11 @@
 set -euf
 cache=@CACHE@
-source="$cache/actions"
-ledger="$cache/.bosn-actions-retirement-v1.json"
-pending="$cache/.bosn-actions-intent-pending-v1"
-directory="$cache/actcache"
+source="$cache/@CLASS@"
+ledger="$cache/.bosn-@CLASS@-retirement-v1.json"
+pending="$cache/.bosn-@CLASS@-intent-pending-v1"
+directory=@LEASE_DIR@
 [ -d "$cache" ] && [ ! -L "$cache" ] && [ -d "$directory" ] && [ ! -L "$directory" ] || exit 78
-lock="$directory/.legacy-migration.lock"
+lock=@LEASE@
 [ ! -L "$lock" ] && { [ ! -e "$lock" ] || [ -f "$lock" ]; } || exit 78
 exec 8>>"$lock"
 flock -x -n 8 || { printf 'bosn-actions-busy\n'; exit 75; }
@@ -39,7 +39,7 @@ argument() {
         [ "${#value}" -le 20 ] || return 78
     done
     identity "$cache" "$cache_device" "$cache_inode" || return $?
-    stage="$cache/.actions-retired-$nonce"
+    stage="$cache/.@CLASS@-retired-$nonce"
 }
 while IFS= read -r operation; do
     case "$operation" in
@@ -56,7 +56,7 @@ while IFS= read -r operation; do
         prepare)
             argument || exit 78
             identity "$source" "$device" "$inode" || exit 78
-            custody="$source/.bosn-actions-custody-v1"
+            custody="$source/.bosn-@CLASS@-custody-v1"
             [ ! -L "$custody" ] || exit 78
             if [ -e "$custody" ]; then
                 [ -f "$custody" ] && [ "$(stat -c '%a %u %h' "$custody")" = '600 0 1' ] || exit 78
@@ -92,7 +92,7 @@ while IFS= read -r operation; do
             elif [ -e "$source" ] || [ -L "$source" ]; then
                 [ -d "$source" ] && [ ! -L "$source" ] || exit 78
                 if [ "$(stat -c '%d %i' "$source")" = "$device $inode" ]; then
-                    custody="$source/.bosn-actions-custody-v1"
+                    custody="$source/.bosn-@CLASS@-custody-v1"
                     [ -f "$custody" ] && [ ! -L "$custody" ] && [ "$(cat "$custody")" = "$nonce" ] || exit 78
                     mv -nT "$source" "$stage"
                     identity "$stage" "$device" "$inode" || exit 78

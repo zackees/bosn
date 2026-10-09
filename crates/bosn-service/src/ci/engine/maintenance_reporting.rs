@@ -73,6 +73,19 @@ pub(super) async fn persist(
                     diagnostic: diagnostic(error),
                 },
             }),
+        image_outcome: tick
+            .attempt
+            .as_ref()
+            .ok()
+            .and_then(|attempt| attempt.images.as_ref())
+            .map(|images| match images {
+                Ok(stats) => ActionMaintenanceOutcome::Observed {
+                    stats: stats.clone(),
+                },
+                Err(error) => ActionMaintenanceOutcome::Held {
+                    diagnostic: diagnostic(error),
+                },
+            }),
         tool_outcome: tick
             .attempt
             .as_ref()

@@ -6,6 +6,16 @@ use kernal_api::async_engine;
 #[test]
 #[ignore = "requires isolated Docker"]
 fn controller_preserves_warm_actions_and_retires_pressure_cache() {
+    live_case(DisposableClass::Actions);
+}
+
+#[test]
+#[ignore = "requires isolated Docker"]
+fn controller_preserves_warm_images_and_retires_pressure_cache() {
+    live_case(DisposableClass::Images);
+}
+
+fn live_case(class: DisposableClass) {
     assert_eq!(std::env::var("BOSN_TEST_ISOLATED").as_deref(), Ok("1"));
     async_engine::RuntimeBuilder::multi_thread()
         .enable_all()
@@ -49,7 +59,7 @@ fn controller_preserves_warm_actions_and_retires_pressure_cache() {
                 )
                 .await
                 .unwrap();
-            let result = exercise(&backend, &id).await;
+            let result = exercise(&backend, &id, class).await;
             backend
                 .checked(
                     "action proof helper cleanup",
@@ -72,10 +82,14 @@ fn controller_preserves_warm_actions_and_retires_pressure_cache() {
         });
 }
 
-async fn exercise(backend: &DockerActBackend, id: &str) -> Result<(), String> {
+async fn exercise(
+    backend: &DockerActBackend,
+    id: &str,
+    class: DisposableClass,
+) -> Result<(), String> {
     backend.checked("action proof payload", DockerActBackend::exec(id,
-        "mkdir -p /bosn/cache/actcache /bosn/cache/actions; dd if=/dev/zero of=/bosn/cache/actions/payload bs=1024 count=128 2>/dev/null"), CONTROL_DEADLINE).await?;
-    let mut session = Session::open(backend, id).await?;
+        &format!("mkdir -p /bosn/cache/actcache /bosn/cache/{name}; dd if=/dev/zero of=/bosn/cache/{name}/payload bs=1024 count=128 2>/dev/null", name=class.name())), CONTROL_DEADLINE).await?;
+    let mut session = Session::open_class(backend, id, class).await?;
     let warm = session.maintain(1024 * 1024).await?;
     assert!(warm.allocated_before > 65536);
     assert_eq!(warm.allocated_before, warm.allocated_after);
@@ -89,6 +103,6 @@ async fn exercise(backend: &DockerActBackend, id: &str) -> Result<(), String> {
     assert_eq!(empty.retired_classes, 0);
     session.io.send(b"abort\n").await?;
     backend.checked("action proof absence", DockerActBackend::exec(id,
-        "test ! -e /bosn/cache/actions; test ! -e /bosn/cache/.bosn-actions-retirement-v1.json"), CONTROL_DEADLINE).await?;
+        &format!("test ! -e /bosn/cache/{name}; test ! -e /bosn/cache/.bosn-{name}-retirement-v1.json", name=class.name())), CONTROL_DEADLINE).await?;
     Ok(())
 }

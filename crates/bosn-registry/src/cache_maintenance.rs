@@ -17,18 +17,23 @@ pub struct MaintenanceSnapshot {
     pub tool_outcome: Option<ToolMaintenanceOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action_outcome: Option<ActionMaintenanceOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_outcome: Option<DisposableMaintenanceOutcome>,
 }
+
+pub type ActionMaintenanceOutcome = DisposableMaintenanceOutcome;
+pub type ActionMaintenanceStats = DisposableMaintenanceStats;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ActionMaintenanceOutcome {
-    Observed { stats: ActionMaintenanceStats },
+pub enum DisposableMaintenanceOutcome {
+    Observed { stats: DisposableMaintenanceStats },
     Held { diagnostic: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ActionMaintenanceStats {
+pub struct DisposableMaintenanceStats {
     pub allocated_before: u64,
     pub allocated_after: u64,
     pub budget_bytes: u64,
@@ -81,17 +86,20 @@ impl MaintenanceSnapshot {
             || !self.observed_at.is_finite()
             || self.observed_at < 0.0
             || self.recovery_error.as_deref().is_some_and(|s| !bounded(s))
-            || (self.action_outcome.is_some() && self.helper.is_none())
-            || self
-                .action_outcome
-                .as_ref()
-                .is_some_and(|outcome| match outcome {
-                    ActionMaintenanceOutcome::Observed { stats } => {
+            || ([&self.action_outcome, &self.image_outcome]
+                .iter()
+                .any(|outcome| outcome.is_some())
+                && self.helper.is_none())
+            || [&self.action_outcome, &self.image_outcome]
+                .iter()
+                .filter_map(|outcome| outcome.as_ref())
+                .any(|outcome| match outcome {
+                    DisposableMaintenanceOutcome::Observed { stats } => {
                         stats.budget_bytes == 0
                             || stats.allocated_after > stats.budget_bytes
                             || stats.retired_classes > 2
                     }
-                    ActionMaintenanceOutcome::Held { diagnostic } => !bounded(diagnostic),
+                    DisposableMaintenanceOutcome::Held { diagnostic } => !bounded(diagnostic),
                 })
             || (self.tool_outcome.is_some() && self.helper.is_none())
             || self

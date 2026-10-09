@@ -8,34 +8,89 @@ const RECIPE: &str = include_str!("action_cache_session.sh");
 
 pub use bosn_registry::cache_maintenance::ActionMaintenanceStats;
 
+#[derive(Clone, Copy)]
+enum DisposableClass {
+    Actions,
+    Images,
+}
+impl DisposableClass {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Actions => "actions",
+            Self::Images => "images",
+        }
+    }
+    fn lease(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Actions => (
+                "/bosn/cache/actcache",
+                "/bosn/cache/actcache/.legacy-migration.lock",
+            ),
+            Self::Images => ("/bosn/cache", "/bosn/cache/.artifact-cache.lock"),
+        }
+    }
+}
+
 impl DockerActBackend {
     pub(super) async fn maintain_actions(
         &self,
         engine: &str,
         policy: CachePolicy,
     ) -> Result<ActionMaintenanceStats, String> {
+        self.maintain_disposable_class(engine, policy, DisposableClass::Actions)
+            .await
+    }
+    pub(super) async fn maintain_image_archives(
+        &self,
+        engine: &str,
+        policy: CachePolicy,
+    ) -> Result<ActionMaintenanceStats, String> {
+        self.maintain_disposable_class(engine, policy, DisposableClass::Images)
+            .await
+    }
+    async fn maintain_disposable_class(
+        &self,
+        engine: &str,
+        policy: CachePolicy,
+        class: DisposableClass,
+    ) -> Result<ActionMaintenanceStats, String> {
         self.verify_measured_volume(super::CACHE_VOLUME).await?;
-        let mut session = Session::open(self, engine).await?;
+        let mut session = Session::open_class(self, engine, class).await?;
         let result = async {
-            // Recheck readers and writers while the original exclusive FD8 is held.
-            self.require_coordinated_cache_readers().await?;
+            // Recheck all attachments while the original exclusive lease is held.
+            match class {
+                DisposableClass::Actions => self.require_coordinated_cache_readers().await?,
+                DisposableClass::Images => self.require_coordinated_artifact_readers().await?,
+            }
             session
                 .maintain(u64::try_from(policy.repository_max_bytes).map_err(|e| e.to_string())?)
                 .await
         }
         .await;
         let _ = session.io.send(b"abort\n").await;
-        result
+        result.map_err(|error| format!("{} cache: {error}", class.name()))
     }
 }
 
 struct Session {
+    class: DisposableClass,
     io: ProcessControl,
 }
 impl Session {
-    async fn open(backend: &DockerActBackend, engine: &str) -> Result<Self, String> {
+    async fn open_class(
+        backend: &DockerActBackend,
+        engine: &str,
+        class: DisposableClass,
+    ) -> Result<Self, String> {
         let mut args = owned(&["exec", "-i", engine, "timeout", "180", "sh", "-c"]);
-        args.push(RECIPE.replace("@CACHE@", ENGINE_CACHE));
+        let (directory, lease) = class.lease();
+        args.push(
+            RECIPE
+                .replace("@CACHE@", ENGINE_CACHE)
+                .replace("@CLASS@", class.name())
+                .replace("@LEASE_DIR@", directory)
+                .replace("@LEASE@", lease),
+        );
         let process = backend
             .docker
             .with_args(args)
@@ -43,15 +98,16 @@ impl Session {
             .await
             .map_err(|e| e.to_string())?;
         let mut session = Self {
+            class,
             io: ProcessControl::new(
                 process,
-                "action retention",
+                "cache retention",
                 b"bosn-actions-end:",
                 Duration::from_secs(110),
             ),
         };
         if session.io.line().await? != b"bosn-actions-ready" {
-            return Err("action cache held by a live reader or unavailable original lease".into());
+            return Err("cache held by a live reader or unavailable original lease".into());
         }
         Ok(session)
     }
@@ -59,13 +115,13 @@ impl Session {
     async fn raw(&mut self, operation: &str, argument: Option<&str>) -> Result<Vec<u8>, String> {
         let command = match argument {
             Some(value) if !value.contains(['\n', '\r']) => format!("{operation}\n{value}\n"),
-            Some(_) => return Err("action command has invalid framing".into()),
+            Some(_) => return Err("cache command has invalid framing".into()),
             None => format!("{operation}\n"),
         };
         let (code, bytes) = self.io.command(command.as_bytes()).await?;
         if code != 0 {
             return Err(format!(
-                "action {operation} failed ({code}): {}",
+                "cache {operation} failed ({code}): {}",
                 String::from_utf8_lossy(&bytes)
                     .chars()
                     .take(256)
@@ -79,8 +135,12 @@ impl Session {
         let table = self.raw("mounts", None).await?;
         // The shell frame contributes one blank line after command output.
         let table = table.strip_suffix(b"\n").unwrap_or(&table);
-        let stage = proof.map(Retirement::stage);
-        require_no_submounts(table, &format!("{ENGINE_CACHE}/actions"), stage.as_deref())
+        let stage = proof.map(|proof| proof.stage(self.class.name()));
+        require_no_submounts(
+            table,
+            &format!("{ENGINE_CACHE}/{}", self.class.name()),
+            stage.as_deref(),
+        )
     }
 
     async fn maintain(&mut self, budget: u64) -> Result<ActionMaintenanceStats, String> {
@@ -99,13 +159,13 @@ impl Session {
             {
                 before = before
                     .checked_add(bytes)
-                    .ok_or("action recovery allocation overflows")?;
+                    .ok_or("cache recovery allocation overflows")?;
             }
             retired += u32::from(removed);
         }
         let current = Observation::parse(&self.raw("observe", None).await?)?;
         if current.cache != initial.cache {
-            return Err("action cache changed during maintenance".into());
+            return Err("cache changed during maintenance".into());
         }
         if let Some((source, bytes)) = current.source
             && bytes > budget
@@ -128,11 +188,11 @@ impl Session {
         }
         let final_state = Observation::parse(&self.raw("observe", None).await?)?;
         if final_state.cache != initial.cache {
-            return Err("action cache changed before acknowledgement".into());
+            return Err("cache changed before acknowledgement".into());
         }
         let after = final_state.source.map_or(0, |(_, bytes)| bytes);
         if after > budget {
-            return Err("action class remains over budget".into());
+            return Err("cache class remains over budget".into());
         }
         Ok(ActionMaintenanceStats {
             allocated_before: before,
@@ -148,7 +208,7 @@ impl Session {
         proof.validate(stage.cache)?;
         let bytes = if let Some((identity, bytes)) = stage.source {
             if identity != proof.source {
-                return Err("action retirement stage changed inode".into());
+                return Err("cache retirement stage changed inode".into());
             }
             self.mounts(Some(proof)).await?;
             self.raw("remove", Some(&proof.argument())).await?;

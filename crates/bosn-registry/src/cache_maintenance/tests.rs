@@ -36,6 +36,7 @@ fn latest_snapshot_survives_restart_and_requires_real_helper_cleanup_evidence() 
         },
         recovery_error: None,
         action_outcome: Some(action_observed()),
+        image_outcome: Some(action_observed()),
         tool_outcome: Some(ToolMaintenanceOutcome::Observed {
             stats: ToolMaintenanceStats {
                 allocated_before: 80,
@@ -89,6 +90,7 @@ fn latest_snapshot_survives_restart_and_requires_real_helper_cleanup_evidence() 
         },
         recovery_error: Some("cleanup remains pending".into()),
         action_outcome: None,
+        image_outcome: None,
         tool_outcome: None,
     };
     let mut tx = registry.begin_immediate().unwrap();
@@ -114,6 +116,7 @@ fn action_evidence_requires_a_helper_and_a_met_budget() {
             diagnostic: "archive unavailable".into(),
         },
         recovery_error: None,
+        image_outcome: None,
         tool_outcome: None,
         action_outcome: Some(ActionMaintenanceOutcome::Held {
             diagnostic: "reader lease busy".into(),

@@ -28,14 +28,14 @@ impl Retirement {
             || self.source.inode == cache.inode
         {
             return Err(
-                "action retirement authority differs from the original cache or class".into(),
+                "cache retirement authority differs from the original cache or class".into(),
             );
         }
         Ok(())
     }
 
-    pub(super) fn stage(&self) -> String {
-        format!("{}/.actions-retired-{}", super::ENGINE_CACHE, self.nonce)
+    pub(super) fn stage(&self, class: &str) -> String {
+        format!("{}/.{class}-retired-{}", super::ENGINE_CACHE, self.nonce)
     }
 
     pub(super) fn argument(&self) -> String {
@@ -56,19 +56,19 @@ impl Observation {
         let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
         let rows: Vec<_> = text.lines().filter(|row| !row.is_empty()).collect();
         if rows.len() != 2 {
-            return Err("action observation lacks exact root/class rows".into());
+            return Err("cache observation lacks exact root/class rows".into());
         }
         let cache: Vec<_> = rows[0].split_whitespace().collect();
         let source: Vec<_> = rows[1].split_whitespace().collect();
         if cache.len() != 3 || cache[0] != "cache" {
-            return Err("action cache root identity is invalid".into());
+            return Err("cache root identity is invalid".into());
         }
         let cache = identity(&cache[1..])?;
         let source = if source == ["source", "absent"] {
             None
         } else {
             if source.len() != 4 || source[0] != "source" {
-                return Err("action class observation is invalid".into());
+                return Err("cache class observation is invalid".into());
             }
             let id = identity(&source[1..3])?;
             let blocks = number(source[3])?;
@@ -76,11 +76,11 @@ impl Observation {
                 id,
                 blocks
                     .checked_mul(1024)
-                    .ok_or("action allocation overflows")?,
+                    .ok_or("cache allocation overflows")?,
             ))
         };
         if source.is_some_and(|(id, _)| id.device != cache.device || id.inode == cache.inode) {
-            return Err("action class crosses the original cache filesystem".into());
+            return Err("cache class crosses the original cache filesystem".into());
         }
         Ok(Self { cache, source })
     }
@@ -92,18 +92,18 @@ fn identity(fields: &[&str]) -> Result<Identity, String> {
         inode: number(fields[1])?,
     };
     if value.inode == 0 {
-        return Err("action inode identity is invalid".into());
+        return Err("cache inode identity is invalid".into());
     }
     Ok(value)
 }
 
 fn number(value: &str) -> Result<u64, String> {
     if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-        return Err("action observation contains an invalid integer".into());
+        return Err("cache observation contains an invalid integer".into());
     }
     value
         .parse()
-        .map_err(|_| "action observation integer overflows".into())
+        .map_err(|_| "cache observation integer overflows".into())
 }
 
 /// Same-device bind mounts are boundaries too; a device-only census is insufficient.
@@ -115,26 +115,26 @@ pub(super) fn require_no_submounts(
     let table = std::str::from_utf8(table).map_err(|e| e.to_string())?;
     let rows: Vec<_> = table.lines().collect();
     if rows.is_empty() || rows.len() > 4096 {
-        return Err("action mount census is empty or exceeds bounds".into());
+        return Err("cache mount census is empty or exceeds bounds".into());
     }
     for row in rows {
         let fields: Vec<_> = row.split_whitespace().collect();
         let separator = fields
             .iter()
             .position(|f| *f == "-")
-            .ok_or("action mount census lacks separator")?;
+            .ok_or("cache mount census lacks separator")?;
         if separator < 6 || fields.len() < separator + 4 {
-            return Err("action mount census is incomplete".into());
+            return Err("cache mount census is incomplete".into());
         }
         number(fields[0])?;
         number(fields[1])?;
         let mount = decode_mount(fields[4])?;
         let path = Path::new(&mount);
         if !path.is_absolute() {
-            return Err("action mount path is not absolute".into());
+            return Err("cache mount path is not absolute".into());
         }
         if path.starts_with(class) || stage.is_some_and(|stage| path.starts_with(stage)) {
-            return Err("action retirement held by a nested mount boundary".into());
+            return Err("cache retirement held by a nested mount boundary".into());
         }
     }
     Ok(())
@@ -147,13 +147,13 @@ fn decode_mount(value: &str) -> Result<String, String> {
         result.push_str(&remaining[..at]);
         let escaped = remaining
             .get(at + 1..at + 4)
-            .ok_or("action mount escape is truncated")?;
+            .ok_or("cache mount escape is truncated")?;
         result.push(match escaped {
             "040" => ' ',
             "011" => '\t',
             "012" => '\n',
             "134" => '\\',
-            _ => return Err("action mount escape is unknown".into()),
+            _ => return Err("cache mount escape is unknown".into()),
         });
         remaining = &remaining[at + 4..];
     }

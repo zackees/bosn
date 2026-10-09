@@ -15,6 +15,7 @@ pub struct MaintenanceHelperAttempt {
     /// Reclamation evidence survives a cleanup failure.
     pub outcome: Result<MaintenanceAttempt, String>,
     /// Independent tool evidence survives a cohort or helper-cleanup failure.
+    pub images: Option<Result<super::action_cache::ActionMaintenanceStats, String>>,
     pub actions: Option<Result<super::action_cache::ActionMaintenanceStats, String>>,
     pub tools:
         Option<Result<Option<bosn_registry::cache_maintenance::ToolMaintenanceStats>, String>>,
@@ -66,6 +67,7 @@ impl DockerActBackend {
         };
         let mut tools = None;
         let mut actions = None;
+        let mut images = None;
         let outcome = async {
             tracker.register(&id).await?;
             let document = self
@@ -85,26 +87,10 @@ impl DockerActBackend {
                 CONTROL_DEADLINE,
             )
             .await?;
-            let arch = self
-                .checked(
-                    "maintenance architecture",
-                    Self::exec(&id, "uname -m"),
-                    CONTROL_DEADLINE,
-                )
-                .await?;
-            let act = act_artifact(&arch)
-                .ok_or_else(|| format!("unsupported maintenance architecture {arch}"))?;
-            let script = offline_install_script(act);
-            let version = self
-                .checked(
-                    "maintenance offline act",
-                    Self::exec(&id, &script),
-                    CONTROL_DEADLINE,
-                )
-                .await?;
-            self.verify_installed_act(&id, &version).await?;
+            self.install_offline_maintenance_act(&id).await?;
             self.require_cache_policy(&id, policy).await?;
             actions = Some(self.maintain_actions(&id, policy).await);
+            images = Some(self.maintain_image_archives(&id, policy).await);
             tools = Some(self.maintain_published_tools(&id, policy).await);
             self.maintain_cache_cohort(&id, policy).await
         }
@@ -127,8 +113,29 @@ impl DockerActBackend {
             outcome,
             tools,
             actions,
+            images,
             cleanup,
         })
+    }
+    async fn install_offline_maintenance_act(&self, id: &str) -> Result<(), String> {
+        let arch = self
+            .checked(
+                "maintenance architecture",
+                Self::exec(id, "uname -m"),
+                CONTROL_DEADLINE,
+            )
+            .await?;
+        let act = act_artifact(&arch)
+            .ok_or_else(|| format!("unsupported maintenance architecture {arch}"))?;
+        let script = offline_install_script(act);
+        let version = self
+            .checked(
+                "maintenance offline act",
+                Self::exec(id, &script),
+                CONTROL_DEADLINE,
+            )
+            .await?;
+        self.verify_installed_act(id, &version).await
     }
 }
 
