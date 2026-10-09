@@ -450,6 +450,15 @@ pub(super) async fn create_owned_engine_inner(
         verify_cache_volume(&volume, cache)?;
     }
     ensure_storage_volume(engine, &intent, owner).await?;
+    // From here an engine may exist even if this daemon never learns its ID, so its absence can
+    // no longer be proven by an empty lookup. Before here it can (#554).
+    registry
+        .act_registry(ActRegistryCommand::CreateRequested {
+            run: intent.run_id.clone(),
+            at: at.max(intent.created_at),
+        })
+        .await
+        .map_err(|e| ActEngineError(e.to_string()))?;
     let created = docker_control(engine, args).await?;
     let id = std::str::from_utf8(&created)
         .map_err(|_| ActEngineError("Docker create returned non-UTF8 ID".into()))?

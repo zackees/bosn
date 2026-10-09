@@ -245,6 +245,12 @@ pub struct ActEngineRecord {
     pub tool_recovery_reserved_at: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_recovery_source_stopped_at: Option<f64>,
+    /// Whether `docker create` may have been sent for this engine: `Some(false)` from the intent
+    /// until the request is about to go out, then `Some(true)`. Until then an empty name lookup
+    /// proves the engine never existed (#554). `None` in historical records, which are treated as
+    /// possibly sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_requested: Option<bool>,
 }
 /// Keyset page ordered by immutable canonical run UUID, independent of state.
 #[derive(Clone, Debug, PartialEq)]
@@ -551,7 +557,21 @@ impl Immediate<'_> {
             tool_recovery: None,
             tool_recovery_reserved_at: None,
             tool_recovery_source_stopped_at: None,
+            create_requested: Some(false),
         })
+    }
+    /// Durably record that `docker create` is about to be sent for a pending engine (#554).
+    pub fn request_act_create(&mut self, run: &str, at: f64) -> Result<(), Error> {
+        let mut record = self
+            .act_record(run)?
+            .ok_or(Error::BadRow("act intent missing"))?;
+        if record.state != ActEngineState::Pending || record.engine_id.is_some() || !at.is_finite()
+        {
+            return Err(Error::BadRow("act create request out of order"));
+        }
+        record.create_requested = Some(true);
+        record.updated_at = record.updated_at.max(at);
+        self.store_act_record(&record)
     }
     /// Exact ownership predicate for both registration and pending-intent
     /// crash recovery. A deterministic name alone never authorizes adoption.
