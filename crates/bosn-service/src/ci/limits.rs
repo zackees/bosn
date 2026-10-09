@@ -1,9 +1,9 @@
 //! How big one `bosn ci` engine may grow, sized from the engine's host.
 //!
 //! Memory: half the host's total, but no more than three quarters of what is
-//! available right now, held between [`MEMORY_FLOOR`] and
-//! [`MEMORY_CEILING`]. It reserves nothing until it is written; it only
-//! bounds a runaway job, so a large host gets a large bound.
+//! available right now, rounded down to [`MEMORY_STEP`] and held between
+//! [`MEMORY_FLOOR`] and [`MEMORY_CEILING`]. It reserves nothing until it is
+//! written; it only bounds a runaway job, so a large host gets a large bound.
 //!
 //! Storage (the engine's `/var/lib/docker`) is disk by default (#425): an
 //! anonymous volume on the host engine's disk, removed with the engine, so a
@@ -44,6 +44,11 @@ const GIB: u64 = 1 << 30;
 pub const MEMORY_FLOOR: u64 = 4 * GIB;
 /// The most memory an engine is sized to, however large the host.
 pub const MEMORY_CEILING: u64 = 48 * GIB;
+/// Sized memory is a whole multiple of this. Available memory changes from one
+/// sample to the next, and a spare engine is claimed only by a run whose
+/// limits match it exactly, so unrounded memory retired the spare on almost
+/// every run (#553).
+pub const MEMORY_STEP: u64 = 4 * GIB;
 /// Memory always left outside a storage tmpfs.
 pub const MEMORY_HEADROOM: u64 = 2 * GIB;
 /// The least private storage an engine is sized to.
@@ -217,8 +222,8 @@ pub fn size_engine(host: HostResources, config: EngineConfig) -> Result<ActEngin
         Some(StorageBacking::Disk) => Some(disk_budget(host, pinned_storage)?),
         None => disk_budget(host, pinned_storage).ok(),
     };
-    let sized_memory = (host.total_memory / 2)
-        .min(host.available_memory / 4 * 3)
+    let sized_memory = ((host.total_memory / 2).min(host.available_memory / 4 * 3) / MEMORY_STEP
+        * MEMORY_STEP)
         .clamp(MEMORY_FLOOR, MEMORY_CEILING);
     let memory_bytes = match (config.memory_gib, pinned_storage, disk) {
         (Some(value), _, _) => gib(value, "memory_gib")?,
@@ -339,13 +344,31 @@ mod tests {
         assert_eq!(limits.storage, EngineStorage::Memory);
         assert_eq!(limits.storage_bytes, 12 * GIB);
         assert_eq!(limits.nano_cpus, 4_000_000_000);
-        // A busy host: three quarters of the 8 GiB still available.
+        // A busy host: three quarters of the 8 GiB still available, in whole steps.
         let busy = size_engine(host(32, 8, 4), memory).unwrap();
-        assert_eq!(busy.memory_bytes, 6 * GIB);
+        assert_eq!(busy.memory_bytes, 4 * GIB);
         assert!(busy.memory_bytes - busy.storage_bytes >= MEMORY_HEADROOM);
         // A large host's tmpfs is the old 36 GiB.
         let large = size_engine(host(128, 120, 32), memory).unwrap();
         assert_eq!(large.storage_bytes, 36 * GIB);
+    }
+
+    /// #553: a run claims the prepared spare only when its limits match exactly, so samples of
+    /// available memory a few GiB apart must size the same engine.
+    #[test]
+    fn small_changes_in_available_memory_size_the_same_engine() {
+        let config = EngineConfig::default();
+        let sized = |available_mib: u64| {
+            let mut sample = host(64, 0, 8);
+            sample.available_memory = available_mib << 20;
+            size_engine(sample, config).unwrap()
+        };
+        assert_eq!(
+            sized(30_000),
+            sized(30_700),
+            "a 700 MiB swing keeps the spare"
+        );
+        assert_eq!(sized(24 * 1024 + 100).memory_bytes % MEMORY_STEP, 0);
     }
 
     #[test]
