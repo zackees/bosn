@@ -69,6 +69,11 @@ pub(super) fn prepare_toolcache_script(
 /// save first removes stages older than [`STALE_STAGE_MINUTES`], far past any live save, so
 /// only abandoned ones go; removing a live stage would only fail that copy, never publish it.
 ///
+/// An install directory is renamed into place whole, and only after its copy succeeded, so a
+/// published directory whose sibling marker is missing (the marker copy failed or was killed)
+/// is complete: the next save writes the marker instead of re-staging the install, which
+/// `mv -T` could never place over the existing directory (#559).
+///
 /// The store is shared by every repository, so only a pristine install is
 /// published (#557): one with nothing newer than its completion marker. A job
 /// that ran `pip install` into setup-python's interpreter, or rewrote a tool,
@@ -92,6 +97,7 @@ pub(super) fn save_toolcache_script() -> String {
          for marker in */*/*.complete; do \
            [ -f \"$marker\" ] || continue; dir=${{marker%.complete}}; \
            [ -d \"$dir\" ] && [ ! -e \"$dst/$marker\" ] || continue; \
+           if [ -d \"$dst/$dir\" ]; then cp \"$marker\" \"$dst/$marker\" || exit $?; continue; fi; \
            pristine \"$marker\" || continue; \
            new_stage || exit $?; \
            cp -a \"$dir\" \"$tmp/install\" && mv -T \"$tmp/install\" \"$dst/$dir\" 2>/dev/null && \
@@ -325,6 +331,32 @@ mod tests {
             saved.join(".saving-live0001").exists(),
             "a live stage is kept"
         );
+    }
+
+    /// #559: an install published without its sibling marker gets the marker on the next save,
+    /// instead of being re-staged forever and never seen as complete.
+    #[test]
+    fn a_published_install_missing_its_marker_is_completed() {
+        let tmp = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let (src, cache) = (tmp.path().join("volume"), tmp.path().join("cache"));
+        write(src.join("Python/3.11.9/x64/bin/python"), "py");
+        write(src.join("Python/3.11.9/x64.complete"), "");
+        let saved = cache.join("toolcache");
+        write(
+            saved.join("Python/3.11.9/x64/bin/python"),
+            "published whole",
+        );
+        save(&src, &cache);
+        assert!(
+            saved.join("Python/3.11.9/x64.complete").exists(),
+            "the marker is repaired"
+        );
+        assert_eq!(
+            std::fs::read_to_string(saved.join("Python/3.11.9/x64/bin/python")).unwrap(),
+            "published whole",
+            "the published install is kept, not replaced"
+        );
+        no_leftovers(&saved);
     }
 
     #[test]
