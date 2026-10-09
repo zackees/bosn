@@ -25,8 +25,41 @@ fn api_path(target: &str) -> &str {
     }
 }
 
-pub(super) fn is_container_list(method: &str, target: &str) -> bool {
-    method == "GET" && api_path(target) == "/containers/json"
+/// What the proxy does with a request that is not one of the three creates.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Scope {
+    /// Forwarded byte for byte.
+    Forward,
+    /// The run's label is added to the request's `filters`, so a listing or a
+    /// prune sees only the run's own objects (#560).
+    Label,
+    /// A build-cache prune. BuildKit takes no label filter and its cache is
+    /// shared with the host, so the prune is narrowed to a record id that never
+    /// exists: it succeeds and removes nothing.
+    BuildCache,
+    /// `DELETE /volumes/{name}`: forwarded only once the volume proves to be
+    /// the run's own, or absent.
+    VolumeRemove(String),
+}
+
+/// Classify a request. Image and network listings stay whole: images carry no
+/// run label, and act resolves networks by listing them.
+pub(super) fn scope(method: &str, target: &str) -> Scope {
+    let path = api_path(target);
+    match (method, path) {
+        ("GET", "/containers/json" | "/volumes")
+        | ("POST", "/containers/prune" | "/volumes/prune" | "/networks/prune" | "/images/prune") => {
+            Scope::Label
+        }
+        ("POST", "/build/prune") => Scope::BuildCache,
+        ("DELETE", _) => match path.strip_prefix("/volumes/") {
+            Some(name) if !name.is_empty() && !name.contains('/') => {
+                Scope::VolumeRemove(decode(name))
+            }
+            _ => Scope::Forward,
+        },
+        _ => Scope::Forward,
+    }
 }
 
 /// Split a target into its path and decoded `key=value` query pairs.
@@ -113,16 +146,45 @@ pub(super) fn suffix_name(target: &str, suffix: &str) -> String {
     }
 }
 
-/// Add `label=com.zackees.bosn.run=<run>` to a container listing's filters.
-pub(super) fn scope_listing(target: &str, run: &str) -> io::Result<String> {
-    let (path, mut pairs) = query_pairs(target);
-    let label = Value::String(format!("{}={run}", crate::docker_api::LABEL_RUN));
+/// The `filters` query parameter of a target, decoded, and its position.
+fn filters_of(pairs: &[(String, String)]) -> io::Result<(Option<usize>, Map<String, Value>)> {
     let position = pairs.iter().position(|(k, _)| k == "filters");
-    let mut filters: Map<String, Value> = match position {
+    let filters = match position {
         Some(i) if !pairs[i].1.trim().is_empty() => serde_json::from_str(&pairs[i].1)
-            .map_err(|_| io::Error::other("malformed container list filters"))?,
+            .map_err(|_| io::Error::other("malformed request filters"))?,
         _ => Map::new(),
     };
+    Ok((position, filters))
+}
+
+fn with_filters(
+    path: &str,
+    mut pairs: Vec<(String, String)>,
+    position: Option<usize>,
+    filters: Map<String, Value>,
+) -> String {
+    let encoded = Value::Object(filters).to_string();
+    match position {
+        Some(i) => pairs[i].1 = encoded,
+        None => pairs.push(("filters".into(), encoded)),
+    }
+    join_query(path, &pairs)
+}
+
+/// Narrow a build-cache prune to a record id that never exists. BuildKit
+/// matches `id` as a regular expression, and `^$` matches no record.
+pub(super) fn scope_build_prune(target: &str) -> io::Result<String> {
+    let (path, pairs) = query_pairs(target);
+    let (position, mut filters) = filters_of(&pairs)?;
+    filters.insert("id".into(), Value::Array(vec![Value::String("^$".into())]));
+    Ok(with_filters(path, pairs, position, filters))
+}
+
+/// Add `label=com.zackees.bosn.run=<run>` to a listing's or prune's filters.
+pub(super) fn scope_listing(target: &str, run: &str) -> io::Result<String> {
+    let (path, pairs) = query_pairs(target);
+    let label = Value::String(format!("{}={run}", crate::docker_api::LABEL_RUN));
+    let (position, mut filters) = filters_of(&pairs)?;
     match filters.get_mut("label") {
         // Docker accepts a list, or the legacy {"k=v": true} map.
         Some(Value::Array(labels)) => labels.push(label),
@@ -133,12 +195,7 @@ pub(super) fn scope_listing(target: &str, run: &str) -> io::Result<String> {
             filters.insert("label".into(), Value::Array(vec![label]));
         }
     }
-    let encoded = Value::Object(filters).to_string();
-    match position {
-        Some(i) => pairs[i].1 = encoded,
-        None => pairs.push(("filters".into(), encoded)),
-    }
-    Ok(join_query(path, &pairs))
+    Ok(with_filters(path, pairs, position, filters))
 }
 
 /// Which create call, if any, a request target names. Docker accepts an
@@ -537,8 +594,8 @@ mod tests {
         let filters: Value = serde_json::from_str(&pairs[0].1).unwrap();
         assert_eq!(filters["label"]["com.zackees.bosn.run=r-1"], true);
         assert!(scope_listing("/containers/json?filters=%7Bbad", "r").is_err());
-        assert!(is_container_list("GET", "/v1.41/containers/json?all=1"));
-        assert!(!is_container_list("GET", "/containers/abc/json"));
+        assert_eq!(scope("GET", "/v1.41/containers/json?all=1"), Scope::Label);
+        assert_eq!(scope("GET", "/containers/abc/json"), Scope::Forward);
         assert_eq!(decode("a%2Fb+c%"), "a/b c%");
     }
 }
