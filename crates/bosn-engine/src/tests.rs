@@ -148,3 +148,30 @@ fn doctor_result_is_structured_and_never_retains_raw_output() {
     assert_eq!(limited.state, DockerDoctorState::OutputLimit);
     assert_eq!(limited.server_version, None);
 }
+
+#[test]
+fn only_dockers_no_such_answer_reports_missing() {
+    let result = |exit_code, stderr: &str| CommandResult {
+        exit_code,
+        stdout: Vec::new(),
+        stderr: stderr.as_bytes().to_vec(),
+    };
+    assert!(result(1, "Error response from daemon: No such container: x").reports_missing());
+    assert!(result(1, "Error: No such object: x").reports_missing());
+    assert!(result(1, "Error response from daemon: get x: no such volume").reports_missing());
+    assert!(
+        !result(
+            1,
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock."
+        )
+        .reports_missing()
+    );
+    assert!(
+        !result(
+            1,
+            "permission denied while trying to connect to the Docker daemon socket"
+        )
+        .reports_missing()
+    );
+    assert!(!result(125, "No such container: x").reports_missing());
+}

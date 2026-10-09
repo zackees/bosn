@@ -561,7 +561,7 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
             let observed = crate::creation::bounded_json(&result.stdout)
                 .map_err(|_| SetupEnsureError::OwnershipMismatch)?;
             verify_volume_observation(volume, &observed, None)?;
-        } else if result.exit_code == 1 {
+        } else if result.reports_missing() {
             let response = invoke(
                 engine,
                 SetupEnsureCommand::VolumeCreate {

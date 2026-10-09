@@ -114,10 +114,7 @@ pub(crate) fn parse_created_id(stdout: &[u8]) -> Result<String, SetupEnsureError
 }
 
 pub(crate) fn is_absent_container(result: &CommandResult) -> bool {
-    result.exit_code == 1
-        && String::from_utf8_lossy(&result.stderr)
-            .to_ascii_lowercase()
-            .contains("no such container")
+    result.reports_missing()
 }
 
 pub(crate) fn protocol_error(detail: &'static str) -> CommandError {

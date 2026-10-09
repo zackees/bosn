@@ -269,7 +269,7 @@ impl PythonV4ReconcileExecutor for OfflinePythonV4Docker {
             .with_args([object, "inspect", "--format", format, name])
             .capture(RunOptions::bounded(Duration::from_secs(3), 16 * 1024))
             .map_err(|_| "inspect failed".to_owned())?;
-        if result.exit_code == 1 {
+        if result.reports_missing() {
             return Ok(None);
         }
         if !result.ok() {
