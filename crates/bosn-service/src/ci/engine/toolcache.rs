@@ -64,6 +64,11 @@ pub(super) fn prepare_toolcache_script(
 /// directory. Either way a reader never sees a half-saved install as
 /// complete.
 ///
+/// A save the engine was killed in the middle of (its 120 s deadline fired, or the daemon died)
+/// leaves its `.saving-*` stage behind, and nothing else ever reads or removes one (#558). Each
+/// save first removes stages older than [`STALE_STAGE_MINUTES`], far past any live save, so
+/// only abandoned ones go; removing a live stage would only fail that copy, never publish it.
+///
 /// The store is shared by every repository, so only a pristine install is
 /// published (#557): one with nothing newer than its completion marker. A job
 /// that ran `pip install` into setup-python's interpreter, or rewrote a tool,
@@ -72,9 +77,13 @@ pub(super) fn prepare_toolcache_script(
 /// an interpreter writes bytecode caches (exempt) on import, which also
 /// touches their parent directory. A job that only deleted files is not
 /// detected.
+pub(super) const STALE_STAGE_MINUTES: u32 = 30;
+
 pub(super) fn save_toolcache_script() -> String {
     format!(
-        "src={TOOLCACHE_MOUNT}; dst={ENGINE_CACHE}/toolcache; [ -d \"$src\" ] || exit 0; mkdir -p \"$dst\" || exit $?; cd \"$src\" || exit $?; \
+        "src={TOOLCACHE_MOUNT}; dst={ENGINE_CACHE}/toolcache; [ -d \"$src\" ] || exit 0; mkdir -p \"$dst\" || exit $?; \
+         find \"$dst\" -mindepth 1 -maxdepth 1 -name '.saving-*' -mmin +{STALE_STAGE_MINUTES} -exec rm -rf {{}} + || exit $?; \
+         cd \"$src\" || exit $?; \
          new_stage() {{ tmp=$(mktemp -d \"$dst/.saving-XXXXXXXX\") || return $?; \
            mkdir -p \"$dst/${{dir%/*}}\" || {{ code=$?; rm -rf \"$tmp\"; return \"$code\"; }}; }}; \
          pristine() {{ changed=$(find \"$dir\" -mindepth 1 ! -type d -newer \"$1\" ! -path '*/__pycache__/*' | head -n 1); \
@@ -291,6 +300,31 @@ mod tests {
             "bytecode written on import does not block publication"
         );
         no_leftovers(&saved);
+    }
+
+    /// #558: a stage abandoned by a killed save is removed by the next save; a recent one,
+    /// which may belong to a save still running in another engine, is kept.
+    #[test]
+    fn abandoned_save_stages_are_removed_and_live_ones_kept() {
+        let tmp = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let (src, cache) = (tmp.path().join("volume"), tmp.path().join("cache"));
+        std::fs::create_dir_all(&src).unwrap();
+        let saved = cache.join("toolcache");
+        let abandoned = saved.join(".saving-abandon1");
+        write(abandoned.join("install/huge"), "partial copy");
+        let stale = std::time::SystemTime::now()
+            - Duration::from_secs(u64::from(STALE_STAGE_MINUTES + 5) * 60);
+        std::fs::File::open(&abandoned)
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+        write(saved.join(".saving-live0001/install/part"), "in progress");
+        save(&src, &cache);
+        assert!(!abandoned.exists(), "an abandoned stage is removed");
+        assert!(
+            saved.join(".saving-live0001").exists(),
+            "a live stage is kept"
+        );
     }
 
     #[test]
