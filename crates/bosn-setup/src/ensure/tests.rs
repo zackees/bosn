@@ -640,6 +640,47 @@ fn matching_stopped_container_is_only_started_and_running_one_is_reused() {
     ));
 }
 
+/// #562: a converge and a per-stack ensure race to create one deterministic container. The
+/// loser's `container create` reports the name in use; it then inspects and reuses the
+/// winner's container after full verification instead of failing the job.
+#[test]
+fn losing_the_create_race_reuses_the_verified_container() {
+    let temporary = tempfile::tempdir().unwrap();
+    let workspace = temporary.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::create_dir(workspace.join("src")).unwrap();
+    let plan = plan(&workspace);
+    let image = prepared(&plan);
+    let conflict = result(
+        1,
+        [],
+        b"Error response from daemon: Conflict. The container name \"/bosn-setup-v2-x\" is \
+          already in use by container \"abc\". You have to remove (or rename) that container to \
+          be able to reuse that name.",
+    );
+    // The fake answers the next inspect with the configuration the create carried, standing in
+    // for the winner's identical container.
+    let engine = FakeEngine::with_results([
+        absent(),
+        Ok(SetupEnsureResponse::Command(conflict)),
+        command([]),
+    ]);
+    let receipt = run(
+        &engine,
+        &plan,
+        &workspace,
+        &image,
+        &CancellationSource::new().token(),
+        RunOptions::streaming(Duration::from_secs(2), 1 << 16),
+    )
+    .unwrap();
+    assert!(!receipt.created && receipt.started && receipt.running);
+    let calls = engine.calls.lock().unwrap();
+    let count = |want: fn(&SetupEnsureCommand) -> bool| calls.iter().filter(|c| want(c)).count();
+    assert_eq!(count(|c| matches!(c, SetupEnsureCommand::Create { .. })), 1);
+    assert_eq!(count(|c| matches!(c, SetupEnsureCommand::Start { .. })), 1);
+}
+
 #[test]
 fn matching_container_reuse_reinspects_volume_metadata_without_mutation() {
     let temporary = tempfile::tempdir().unwrap();

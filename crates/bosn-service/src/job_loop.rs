@@ -348,10 +348,11 @@ pub(crate) async fn job_actor(
             JobCommand::SubmitManifestConverge { request, reply } => {
                 let digest = manifest_converge_digest(&request);
                 let workspace = request.workspace.to_string_lossy().into_owned();
-                // Jobs are globally single-flight today. Giving a topology its
-                // own coalescing key makes same-manifest submissions join while
-                // preserving the existing per-stack API and ordering all
-                // member volume/guest work through one parent job.
+                // A topology gets its own coalescing key, so same-manifest
+                // submissions join and all member volume/guest work is ordered
+                // through one parent job. It can run beside a per-stack ensure
+                // (the control lane runs several jobs at once); the setup ensure
+                // primitive resolves their race on one container (#562).
                 let result = jobs
                     .submit(&workspace, "manifest-converge", &digest)
                     .map(|submission| match submission {

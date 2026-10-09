@@ -436,12 +436,29 @@ impl From<CommandError> for SetupEnsureError {
 /// refuses uncertainty; it does not adopt, delete, replace, stop, or GC any
 /// existing Docker container.  Registry persistence and reconciliation are
 /// separate future layers.
-#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 pub async fn ensure_setup_app<E: SetupEnsureEngine>(
     engine: &E,
     request: SetupEnsureRequest<'_>,
 ) -> Result<SetupEnsureResult, SetupEnsureError> {
-    let derived = derive_command(&request)?;
+    match ensure_setup_app_once(engine, &request).await {
+        // #562: another job (a manifest converge beside a per-stack ensure) created this
+        // deterministic container between this attempt's inspect and its create. Ensure once
+        // more: that pass inspects the container and reuses it only after the same exact
+        // ownership and configuration verification as any existing candidate.
+        Err(SetupEnsureError::ActionFailed {
+            action: "container create",
+            detail,
+        }) if detail.contains("is already in use") => ensure_setup_app_once(engine, &request).await,
+        outcome => outcome,
+    }
+}
+
+#[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
+async fn ensure_setup_app_once<E: SetupEnsureEngine>(
+    engine: &E,
+    request: &SetupEnsureRequest<'_>,
+) -> Result<SetupEnsureResult, SetupEnsureError> {
+    let derived = derive_command(request)?;
     if request.cancellation.is_cancelled() {
         return Err(SetupEnsureError::Cancelled);
     }
@@ -461,7 +478,7 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
         },
         &deadline,
         &mut remaining_output,
-        &request,
+        request,
     )
     .await?;
     let observed = match inspection {
@@ -502,7 +519,7 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
             &derived,
             &deadline,
             &mut remaining_output,
-            &request,
+            request,
         )
         .await?;
         if observed.running {
@@ -522,7 +539,7 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
             },
             &deadline,
             &mut remaining_output,
-            &request,
+            request,
         )
         .await?;
         require_action_success(
@@ -554,7 +571,7 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
             },
             &deadline,
             &mut remaining_output,
-            &request,
+            request,
         )
         .await?;
         let SetupEnsureResponse::Command(result) = response else {
@@ -575,7 +592,7 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
                 },
                 &deadline,
                 &mut remaining_output,
-                &request,
+                request,
             )
             .await?;
             require_action_success(
@@ -596,7 +613,7 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
         derived.create_command(),
         &deadline,
         &mut remaining_output,
-        &request,
+        request,
     )
     .await?;
     let created = require_action_success(
@@ -613,7 +630,7 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
         },
         &deadline,
         &mut remaining_output,
-        &request,
+        request,
     )
     .await?;
     let SetupEnsureResponse::Inspection(Some(observed), result) = response else {
@@ -630,7 +647,7 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
         &derived,
         &deadline,
         &mut remaining_output,
-        &request,
+        request,
     )
     .await?;
     let response = invoke(
@@ -640,7 +657,7 @@ pub async fn ensure_setup_app<E: SetupEnsureEngine>(
         },
         &deadline,
         &mut remaining_output,
-        &request,
+        request,
     )
     .await?;
     require_action_success(
