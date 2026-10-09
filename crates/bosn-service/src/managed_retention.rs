@@ -845,22 +845,36 @@ pub fn report_pass(outcome: &ManagedRetentionOutcome) {
     // #518: the stopped-container pile is reported whether or not anything is reclaimable, and
     // whether or not the operator opted in. It is the only signal a default install gets.
     report_setup_containers(&outcome.setup_containers, summary.applied);
-    if summary.planned == 0 {
-        return;
+    if let Some(line) = pass_report_line(summary) {
+        eprintln!("bosn retention: {line}");
     }
-    let verb = if summary.applied {
-        "removed"
-    } else {
-        "would remove"
-    };
-    eprintln!(
-        "bosn retention: {verb} {} owned object(s), {} bytes, {} deferred ({} failure(s)); \
-         see them: bosn gc owned",
-        summary.planned, summary.removed_bytes, summary.deferred, summary.failed,
-    );
     for failure in &summary.failures {
         eprintln!("bosn retention: {failure}");
     }
+}
+
+/// The pass's one-line summary, or `None` when it planned nothing. An applied pass reports what
+/// it actually removed, never what it planned (#551).
+fn pass_report_line(summary: &ManagedRetentionSummary) -> Option<String> {
+    if summary.planned == 0 {
+        return None;
+    }
+    Some(if summary.applied {
+        format!(
+            "removed {} of {} planned owned object(s), {} bytes, {} deferred, {} failed; \
+             see them: bosn gc owned",
+            summary.removed,
+            summary.planned,
+            summary.removed_bytes,
+            summary.deferred,
+            summary.failed,
+        )
+    } else {
+        format!(
+            "would remove {} owned object(s), {} deferred; see them: bosn gc owned",
+            summary.planned, summary.deferred,
+        )
+    })
 }
 
 /// Print the stopped setup-container pile, if there is one.
@@ -887,7 +901,7 @@ fn setup_container_report_line(report: &SetupContainerReport, applied: bool) -> 
         |age| format!("{:.1}h old", age / 3600.0),
     );
     let action = if applied {
-        "reclaim with: bosn gc owned --apply --yes"
+        "the daemon reclaims them once past the gate; see them: bosn gc owned"
     } else {
         "enable with: auto_retention = true in retention.toml"
     };

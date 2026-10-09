@@ -11,9 +11,10 @@ use std::io::Write;
 use bosn_core::retention::RetentionPolicy;
 use bosn_engine::DockerEngine;
 
+use crate::diagnostics::ManagedRetentionSummary;
 use crate::managed_retention::{
     SetupContainerReport, StoppedSetupContainer, auto_retention_enabled, managed_retention_pass,
-    setup_container_report_line,
+    pass_report_line, setup_container_report_line,
 };
 use crate::wire::Request;
 use crate::wire_validate::{OWNED_MAX_TTL_SECS, validate_managed_retention_request_wire};
@@ -580,7 +581,34 @@ fn an_applied_pass_reports_the_same_pile_and_advises_the_gc_command() {
     assert_eq!(outcome.setup_containers.pinned_volume_count(), 1);
     let line = setup_container_report_line(&outcome.setup_containers, outcome.summary.applied)
         .expect("a line");
-    assert!(line.contains("bosn gc owned --apply --yes"), "{line}");
+    assert!(line.contains("see them: bosn gc owned"), "{line}");
+}
+
+fn summary(applied: bool, planned: u64, removed: u64, failed: u64) -> ManagedRetentionSummary {
+    ManagedRetentionSummary {
+        applied,
+        planned,
+        removed,
+        removed_bytes: 0,
+        deferred: 0,
+        failed,
+        failures: Vec::new(),
+        refused: None,
+    }
+}
+
+/// #551: an applied pass reports what it removed, not what it planned.
+#[test]
+fn the_pass_line_reports_removals_not_the_plan() {
+    let line = pass_report_line(&summary(true, 5, 0, 5)).expect("a line");
+    assert!(line.starts_with("removed 0 of 5 planned"), "{line}");
+    assert!(line.contains("5 failed"), "{line}");
+    let preview = pass_report_line(&summary(false, 3, 0, 0)).expect("a line");
+    assert!(
+        preview.starts_with("would remove 3 owned object(s)"),
+        "{preview}"
+    );
+    assert!(pass_report_line(&summary(true, 0, 0, 0)).is_none());
 }
 
 /// A shared volume is one blob on one filesystem; counting it once per container would overstate

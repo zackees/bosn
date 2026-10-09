@@ -66,13 +66,16 @@ be proven to fit a budget.
 ## Running it
 
 ```
-bosn gc owned --state-dir DIR --container-ttl-secs N --volume-ttl-secs N \
-              --image-ttl-secs N [--max-bytes N] [--apply --yes] [--json]
+bosn gc owned [--state-dir DIR] [--container-ttl-secs N] [--volume-ttl-secs N] \
+              [--image-ttl-secs N] [--max-bytes N] [--apply --yes] [--json]
 ```
 
 Preview is the default. `--apply` and `--yes` must both be present, matching `gc --unmanaged`, so
-a bare invocation from shell history cannot delete. All three gates are **required** — a defaulted
-gate would silently reclaim under a TTL the operator never chose.
+a bare invocation from shell history cannot delete. Applying requires `--state-dir` and all three
+gates — a defaulted gate would silently reclaim under a TTL the operator never chose. A preview
+removes nothing, so it defaults to the daemon's state directory and policy: the bare
+`bosn gc owned` that the maintenance log prints runs as shown (#551). `--max-bytes` must be
+positive.
 
 The daemon re-derives the plan from its own fresh read and re-verifies each object immediately
 before removing it. A pass that takes minutes can otherwise remove a volume a new run just
@@ -118,8 +121,9 @@ Two properties are deliberate:
 - **Reporting is unconditional; deletion is not.** The two must not be confused. With the default
   opt-out config the pass removes nothing and still prints the line; that line is the only bound a
   default install has.
-- **The advice changes, the facts do not.** Opting in swaps the trailing hint for
-  `bosn gc owned --apply --yes`; the counts are the same either way.
+- **The advice changes, the facts do not.** Opting in swaps the trailing hint for a note that
+  the daemon reclaims them once past the gate; the counts are the same either way. An applied
+  pass reports what it removed and what failed, never the planned count as removed (#551).
 
 ## Relation to the existing paths
 
