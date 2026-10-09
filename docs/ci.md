@@ -374,7 +374,9 @@ stubbed job.
   - Its limits are sized from the host engine's machine (`docker info`, plus
     `/proc/meminfo` and the free space under Docker's root directory when
     that is the same machine): memory is half the total, at most three
-    quarters of what is available, held between 4 and 48 GiB; CPUs are
+    quarters of what is available, rounded down to whole 4 GiB steps (so a
+    prepared spare still matches the next run, #553) and held between 4 and
+    48 GiB; CPUs are
     min(cores, 8); 4096 processes. Memory reserves no RAM until it is
     written; it only bounds a runaway job.
   - **Storage is disk by default (#425).** The engine's `/var/lib/docker` is
