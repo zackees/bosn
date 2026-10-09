@@ -687,3 +687,71 @@ fn a_candidate_gone_before_its_recheck_is_neither_removed_nor_failed() {
     assert_eq!(outcome.summary.failed, 0, "{:?}", outcome.summary);
     assert!(!fake.join("rm-argv").exists(), "nothing was removed");
 }
+
+/// One owned volume's inspect document, as `docker volume inspect` renders it: no size.
+fn owned_volume_inspect(name: &str) -> String {
+    format!(
+        r#"[{{"Name":"{name}","CreatedAt":"2020-01-01T00:00:00Z",
+"Labels":{{"{registry}":"{REGISTRY_ID}","{kind}":"volume","{stack}":"stack",
+"{generation}":"1","{scope}":"scope","{workspace}":"/w","{created}":"2020-01-01T00:00:00Z"}}}}]"#,
+        registry = bosn_core::LABEL_REGISTRY,
+        kind = bosn_core::LABEL_KIND,
+        stack = bosn_core::LABEL_STACK,
+        generation = bosn_core::LABEL_GENERATION,
+        scope = bosn_core::LABEL_SCOPE,
+        workspace = bosn_core::LABEL_WORKSPACE,
+        created = bosn_core::LABEL_CREATED,
+    )
+}
+
+/// #549: a fake that reports sizes only where Docker does. `SizeRw` appears only for
+/// `inspect --size`, and a volume's size only in `system df -v`, never in `volume inspect`.
+fn fake_docker_with_sizes() -> (DockerEngine, std::path::PathBuf) {
+    const SCRIPT: &str = r#"
+case "$1" in
+  ps) case "$*" in *label=*) echo fake-container-id ;; esac; exit 0 ;;
+  image) exit 0 ;;
+  system) printf '%s' '{"Images":[],"Containers":[],"Volumes":[{"Name":"bosn-v-owned","Size":"2GB"}],"BuildCache":[]}'; exit 0 ;;
+  volume)
+    case "$2" in
+      ls) echo bosn-v-owned ;;
+      inspect) printf '%s' "$FD_VOLUME" ;;
+      rm) printf '%s\n' "$*" >> "$FD_STATE/rm-argv" ;;
+    esac
+    exit 0 ;;
+  inspect)
+    case "$*" in *--size*) printf '%s' "$FD_SIZED" ;; *) printf '%s' "$FD_UNSIZED" ;; esac
+    exit 0 ;;
+  rm) printf '%s\n' "$*" >> "$FD_STATE/rm-argv"; exit 0 ;;
+esac
+exit 0
+"#;
+    let dir = scratch_dir("fake-docker-sizes");
+    let _ = std::fs::remove_file(dir.join("rm-argv"));
+    let engine = DockerEngine::synthetic_for_test("/bin/sh", ["-c", SCRIPT, "fake-docker"])
+        .env("FD_STATE", dir.as_os_str())
+        .env("FD_SIZED", owned_container_inspect(Some(4_096)))
+        .env("FD_UNSIZED", owned_container_inspect(None))
+        .env("FD_VOLUME", owned_volume_inspect("bosn-v-owned"));
+    (engine, dir)
+}
+
+/// #549: under a byte ceiling, a container and a volume are measured, fit the budget and are
+/// removed, and the reclaimed bytes are accounted for rather than reported as zero.
+#[test]
+fn containers_and_volumes_are_measured_so_a_byte_ceiling_can_remove_them() {
+    let (engine, fake) = fake_docker_with_sizes();
+    let dir = state_dir_with_registry("sizes-under-ceiling");
+    let policy = RetentionPolicy {
+        max_bytes: Some(10_000_000_000),
+        ..RetentionPolicy::default()
+    };
+    let outcome = managed_retention_pass(&engine, &dir, policy, true);
+
+    assert_eq!(outcome.summary.refused, None, "{:?}", outcome.summary);
+    assert_eq!(outcome.summary.deferred, 0, "{:?}", outcome.summary);
+    assert_eq!(outcome.summary.removed, 2, "{:?}", outcome.summary);
+    assert_eq!(outcome.summary.removed_bytes, 4_096 + 2_000_000_000);
+    let removed = std::fs::read_to_string(fake.join("rm-argv")).expect("removals");
+    assert_eq!(removed, "rm fake-container-id\nvolume rm bosn-v-owned\n");
+}

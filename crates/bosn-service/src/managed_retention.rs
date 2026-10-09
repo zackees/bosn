@@ -347,6 +347,11 @@ fn observe_volumes(
     ) else {
         return;
     };
+    let sizes = if names.is_empty() {
+        BTreeMap::new()
+    } else {
+        sizes::volume_sizes(engine, options)
+    };
     for chunk in names.chunks(INSPECT_CHUNK) {
         let Some(entries) = parse_inspect::<VolumeDetail>(
             engine.inspect_volumes(chunk, options),
@@ -361,7 +366,9 @@ fn observe_volumes(
                 continue;
             };
             let in_use = volume_is_unused(engine, &entry.name, options);
-            let bytes = entry.size_bytes();
+            let bytes = entry
+                .size_bytes()
+                .or_else(|| sizes.get(&entry.name).copied());
             artifacts.push(bosn_core::ObservedArtifact {
                 id: entry.name,
                 kind: ResourceKind::Volume,
@@ -480,11 +487,14 @@ fn revalidate(
                 return Ok(Recheck::Gone);
             };
             let in_use = !volume_is_unused(engine, &entry.name, options);
+            // The pass's `system df` measurement stands in for a fresh one here: re-walking the
+            // volume per removal is the slow probe #538 avoids, and a volume no container mounts
+            // (which this re-check proves) cannot have changed size since the pass began.
             (
                 entry.labels.clone(),
                 entry.created_age(now_seconds()),
                 in_use,
-                entry.size_bytes(),
+                entry.size_bytes().or(candidate.bytes),
             )
         }
         ResourceKind::Image => {
@@ -933,6 +943,8 @@ fn auto_retention_enabled(state_dir: &Path) -> bool {
         key.trim() == "auto_retention" && matches!(value.trim(), "true" | "yes" | "1")
     })
 }
+
+mod sizes;
 
 #[cfg(test)]
 mod tests;

@@ -49,7 +49,8 @@ impl DockerEngine {
         ids: &[String],
         options: RunOptions,
     ) -> Result<CensusRead, CommandError> {
-        let mut args: Vec<OsString> = ["inspect", "--type", "container"]
+        // `--size`: Docker reports `SizeRw` only when asked (#549).
+        let mut args: Vec<OsString> = ["inspect", "--type", "container", "--size"]
             .into_iter()
             .map(OsString::from)
             .collect();
