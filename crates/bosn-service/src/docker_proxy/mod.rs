@@ -33,6 +33,16 @@
 //! * `GET /containers/json` is filtered to the run's own containers, so a
 //!   job can neither see nor remove another run's containers by listing.
 //!
+//! A job's whole-host calls are scoped to the run too (#560), so a workflow's
+//! "free disk space" step cannot delete other runs' or Bosn's objects:
+//!
+//! * container, volume, network and image prunes, and the volume listing,
+//!   get the run's label filter;
+//! * a build-cache prune is narrowed to match nothing (BuildKit takes no
+//!   label filter, and its cache is the host's);
+//! * `DELETE /volumes/{name}` is refused unless the volume carries the run's
+//!   label (or does not exist).
+//!
 //! Hijacked streams (`attach`, `exec start`: `Upgrade: tcp`) switch to a raw
 //! copy after the request, so interactive streams pass through untouched.
 
@@ -56,10 +66,12 @@ use std::os::unix::net::{UnixListener, UnixStream};
 
 mod rewrite;
 pub use rewrite::rewrite_create;
-use rewrite::{create_kind, is_container_list, scope_listing, suffix_name};
+use rewrite::{Scope, create_kind, scope, scope_build_prune, scope_listing, suffix_name};
 
 const MAX_HEAD_BYTES: usize = 1024 * 1024;
 const MAX_REWRITE_BODY: usize = 8 * 1024 * 1024;
+const MAX_INSPECT_BYTES: u64 = 1024 * 1024;
+const INSPECT_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Last activity of a job, shared between its proxy, the executor and the
 /// daemon's stall sweep. Milliseconds since the Unix epoch.
@@ -460,8 +472,19 @@ fn forward_requests<R: BufRead, W: Write>(
             continue;
         }
         let mut head = head;
-        if is_container_list(&head.method, &head.target) {
-            head.target = scope_listing(&head.target, &settings.run)?;
+        match scope(&head.method, &head.target) {
+            Scope::Forward => {}
+            Scope::Label => head.target = scope_listing(&head.target, &settings.run)?,
+            Scope::BuildCache => head.target = scope_build_prune(&head.target)?,
+            Scope::VolumeRemove(name) => {
+                if let Err(error) = volume_removable(&settings.upstream, &name, &settings.run) {
+                    let message = serde_json::json!({
+                        "message": format!("bosn docker proxy refused removing volume {name}: {error}")
+                    })
+                    .to_string();
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, message));
+                }
+            }
         }
         let mut out = head.encode(&[]);
         out.extend_from_slice(b"\r\n");
@@ -483,6 +506,51 @@ fn forward_requests<R: BufRead, W: Write>(
         }
     }
     Ok(())
+}
+
+/// A job may remove only a volume it created (it carries the run's label), or
+/// one that does not exist, which Docker then answers itself. Proven by one
+/// bounded inspect on a separate upstream connection.
+#[cfg(unix)]
+fn volume_removable(upstream: &Path, name: &str, run: &str) -> io::Result<()> {
+    let mut stream = UnixStream::connect(upstream)?;
+    stream.set_read_timeout(Some(INSPECT_DEADLINE))?;
+    stream.set_write_timeout(Some(INSPECT_DEADLINE))?;
+    let target = format!("/volumes/{}", crate::docker_api::encode(name));
+    stream.write_all(format!("GET {target} HTTP/1.0\r\nHost: docker\r\n\r\n").as_bytes())?;
+    let mut response = Vec::new();
+    stream.take(MAX_INSPECT_BYTES).read_to_end(&mut response)?;
+    volume_owner_verdict(&response, run)
+}
+
+#[cfg(not(unix))]
+fn volume_removable(_upstream: &Path, _name: &str, _run: &str) -> io::Result<()> {
+    Err(io::Error::other("the Docker proxy needs Unix sockets"))
+}
+
+fn volume_owner_verdict(response: &[u8], run: &str) -> io::Result<()> {
+    let split = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| io::Error::other("volume inspect returned no response"))?;
+    let head = String::from_utf8_lossy(&response[..split]);
+    let status = head.split_whitespace().nth(1).unwrap_or("");
+    match status {
+        "404" => Ok(()),
+        "200" => {
+            let body: serde_json::Value = serde_json::from_slice(&response[split + 4..])
+                .map_err(|_| io::Error::other("volume inspect returned malformed JSON"))?;
+            let owner = body["Labels"][crate::docker_api::LABEL_RUN].as_str();
+            if owner == Some(run) {
+                Ok(())
+            } else {
+                Err(io::Error::other("it was not created by this run"))
+            }
+        }
+        _ => Err(io::Error::other(format!(
+            "volume inspect answered {status}"
+        ))),
+    }
 }
 
 fn read_body<R: BufRead>(reader: &mut R, head: &Head) -> io::Result<Vec<u8>> {
@@ -568,6 +636,8 @@ impl ChunkWrite for ChunkSink<'_> {
 }
 
 #[cfg(test)]
+mod scope_tests;
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::Value;
@@ -584,7 +654,7 @@ mod tests {
         }
     }
 
-    fn settings(volumes: Arc<dyn VolumePolicy>) -> ProxySettings {
+    pub(super) fn settings(volumes: Arc<dyn VolumePolicy>) -> ProxySettings {
         ProxySettings {
             upstream: PathBuf::from("/nonexistent"),
             run: "r-1".into(),
@@ -635,7 +705,7 @@ mod tests {
     }
 
     /// Run [`forward_requests`] over in-memory buffers.
-    fn forward(input: &[u8], settings: &ProxySettings) -> (io::Result<()>, Vec<u8>) {
+    pub(super) fn forward(input: &[u8], settings: &ProxySettings) -> (io::Result<()>, Vec<u8>) {
         let mut reader = BufReader::new(input);
         let mut out = Vec::new();
         let result = forward_requests(&mut reader, &mut out, settings);
