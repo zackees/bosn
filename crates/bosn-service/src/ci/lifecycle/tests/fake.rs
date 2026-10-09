@@ -43,6 +43,8 @@ pub struct FakeBackend {
     pub engine_preparations: Mutex<u32>,
     /// The host the fake engine reports; [`FAKE_HOST`] unless set.
     pub host: Mutex<Option<crate::ci::limits::HostResources>>,
+    /// Engine IDs whose container has stopped behind the daemon's back (#556).
+    pub stopped: Mutex<std::collections::BTreeSet<String>>,
     next: Mutex<u64>,
 }
 impl FakeBackend {
@@ -111,6 +113,11 @@ pub(super) fn later(record: &ActEngineRecord) -> f64 {
     now_seconds().max(record.updated_at)
 }
 impl ActEngineBackend for FakeBackend {
+    fn engine_running<'a>(&'a self, engine_id: &'a str) -> crate::ci::engine::BoxFuture<'a, bool> {
+        Box::pin(async move {
+            self.live_id(engine_id) && !self.stopped.lock().unwrap().contains(engine_id)
+        })
+    }
     fn ensure_engine_image(&self) -> crate::ci::engine::BoxFuture<'_, Result<(), String>> {
         Box::pin(async move {
             if self.faults().slow_image {
@@ -316,6 +323,9 @@ impl ActEngineBackend for FakeBackend {
     ) -> crate::ci::engine::BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             assert!(self.live_id(engine), "prepare addresses the engine by ID");
+            if self.stopped.lock().unwrap().contains(engine) {
+                return Err("Error response from daemon: container is not running".into());
+            }
             if self.faults().prepare {
                 return Err("synthetic prepare failure".into());
             }

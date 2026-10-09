@@ -341,7 +341,14 @@ async fn acquire<'a>(
             "claiming prepared spare engine {}",
             spare.intent.engine_name()
         ));
-        match Claim::take_spare(registry, spare, plan.intent.binding(), clock.now()).await {
+        // The registry still holds a spare whose container stopped (#556); claiming it would
+        // fail the run at its first `docker exec`.
+        let claimed = if backend.engine_running(&spare.observed.engine_id).await {
+            Claim::take_spare(registry, spare, plan.intent.binding(), clock.now()).await
+        } else {
+            Err("its container is not running".to_owned())
+        };
+        match claimed {
             Ok(claim) => {
                 *engine_id = Some(claim.observed.engine_id.clone());
                 return Ok(Acquired {
