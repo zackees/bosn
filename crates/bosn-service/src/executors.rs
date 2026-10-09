@@ -505,7 +505,7 @@ impl ManifestRecoveryExecutor for DockerManifestRecoveryExecutor {
                 ))
                 .await
                 .map_err(|_| "manifest recovery inspect failed".to_owned())?;
-            if result.exit_code == 1 {
+            if result.reports_missing() {
                 return Ok(None);
             }
             if !result.ok() {
@@ -576,7 +576,7 @@ impl SetupReconcileExecutor for DockerSetupReconcileExecutor {
                 .capture_async(RunOptions::bounded(Duration::from_secs(3), 4 * 1024))
                 .await
                 .map_err(|_| "inspect_error".to_owned())?;
-            if result.exit_code == 1 {
+            if result.reports_missing() {
                 return Ok(None);
             }
             if !result.ok() {

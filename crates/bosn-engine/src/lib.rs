@@ -238,6 +238,17 @@ impl CommandResult {
     pub const fn ok(&self) -> bool {
         self.exit_code == 0
     }
+
+    /// Docker answered that the object does not exist. The CLI exits 1 for every failure
+    /// (an unreachable daemon, a refused socket), so only Docker's own "no such" answer is
+    /// proof of absence; any other failure is an unreadable object, never a missing one.
+    #[must_use]
+    pub fn reports_missing(&self) -> bool {
+        self.exit_code == 1
+            && String::from_utf8_lossy(&self.stderr)
+                .to_ascii_lowercase()
+                .contains("no such ")
+    }
 }
 
 #[derive(Debug)]

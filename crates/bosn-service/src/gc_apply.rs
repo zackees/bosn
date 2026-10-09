@@ -20,7 +20,7 @@ pub(crate) async fn inspect_setup_gc_container(
         ))
         .await
         .map_err(|_| Error::Protocol("setup gc container inspection failed"))?;
-    if result.exit_code == 1 {
+    if result.reports_missing() {
         return Ok(None);
     }
     if !result.ok() {
@@ -150,7 +150,7 @@ pub(crate) async fn inspect_manifest_volume_gc(
         ))
         .await
         .map_err(|_| Error::Protocol("manifest volume gc inspection failed"))?;
-    if result.exit_code == 1 {
+    if result.reports_missing() {
         return Ok(None);
     }
     if !result.ok() {
@@ -607,3 +607,7 @@ async fn stop_retired_container(
         already_stopped: false,
     }))
 }
+
+#[cfg(all(test, unix))]
+#[path = "gc_apply_tests.rs"]
+mod tests;
