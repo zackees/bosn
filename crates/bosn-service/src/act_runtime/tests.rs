@@ -267,13 +267,19 @@ if mode=='foreign':print('f'*64)
                 } else {
                     recovery.await
                 };
-                if matches!(
-                    mode,
-                    "ceiling" | "cancelled" | "invalid" | "deadline" | "dropped"
-                ) {
+                if matches!(mode, "ceiling" | "cancelled" | "invalid" | "dropped") {
                     assert!(result.is_err(), "{mode}");
                 } else {
-                    let report = result.unwrap();
+                    // #555: a spent budget defers the remaining records and still seals; it
+                    // never fails startup.
+                    let report = result.unwrap_or_else(|e| panic!("{mode}: {e}"));
+                    if mode == "deadline" {
+                        assert!(report.runs.iter().all(|run| {
+                            run.deferred_reason
+                                .as_deref()
+                                .is_some_and(|reason| reason.contains("deadline"))
+                        }));
+                    }
                     assert_eq!(report.runs.len(), 3);
                     assert_eq!(
                         report.runs.iter().filter(|run| run.engine_removed).count(),
@@ -307,10 +313,7 @@ if mode=='foreign':print('f'*64)
                     assert_eq!(record.state, ActEngineState::Terminal);
                     assert_eq!(record.outcome, Some(ActRunOutcome::Interrupted));
                     assert_ne!(record.execution, Some(ActRunOutcome::Passed));
-                } else if !matches!(
-                    mode,
-                    "cancelled" | "invalid" | "ceiling" | "deadline" | "dropped"
-                ) {
+                } else if !matches!(mode, "cancelled" | "invalid" | "ceiling" | "dropped") {
                     assert_eq!(record.state, ActEngineState::CleanupRequired);
                     assert!(record.removal.is_none());
                 }

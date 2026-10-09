@@ -60,7 +60,10 @@ pub async fn recover_startup_act_engines(
             return Err(error("invalid bounded startup recovery options"));
         }
         let started = Instant::now();
-        let budget = options.deadline - Duration::from_secs(5);
+        // Engine work gets four fifths of the guarded window. The rest is headroom for marking
+        // and deferring every remaining record once the budget is spent, so an exhausted budget
+        // defers work instead of reaching the outer guard, which would stop the daemon (#555).
+        let budget = recovery_window(options.deadline) / 5 * 4;
         let mut report = ActStartupRecoveryReport::default();
         let mut cursor = None;
         loop {
@@ -112,13 +115,10 @@ pub async fn recover_startup_act_engines(
             }
         }
     };
-    let result = async_engine::timeout(
-        options.deadline.saturating_sub(Duration::from_secs(5)),
-        work,
-    )
-    .await
-    .map_err(|_| error("startup recovery deadline exceeded"))
-    .and_then(|r| r);
+    let result = async_engine::timeout(recovery_window(options.deadline), work)
+        .await
+        .map_err(|_| error("startup recovery deadline exceeded"))
+        .and_then(|r| r);
     let sealed = async_engine::timeout(
         Duration::from_secs(5),
         registry.act_registry(ActRegistryCommand::SealStartup),
@@ -132,6 +132,11 @@ pub async fn recover_startup_act_engines(
     seal.0 = None;
     result
 }
+/// The part of the deadline recovery may use; the last five seconds are the seal's.
+fn recovery_window(deadline: Duration) -> Duration {
+    deadline.saturating_sub(Duration::from_secs(5))
+}
+
 pub(super) async fn recovery_control(
     engine: &DockerEngine,
     args: Vec<String>,
