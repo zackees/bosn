@@ -149,7 +149,20 @@ fn fixture_image() -> serde_json::Value {
     }})
 }
 
+/// The mode a create asked for with `flag`, or `default`: this fake models a daemon whose
+/// own defaults are `default-cgroupns-mode: host` and `default-ipc-mode: shareable` (a cgroup
+/// v1 host), so only an explicit request yields a private namespace (#561).
+fn requested(command: &SetupEnsureCommand, flag: &str, default: &str) -> String {
+    let args = command.docker_args();
+    args.iter()
+        .position(|arg| arg == flag)
+        .and_then(|index| args.get(index + 1))
+        .map_or_else(|| default.to_owned(), Clone::clone)
+}
+
 fn fixture_configuration(command: &SetupEnsureCommand, running: bool) -> serde_json::Value {
+    let cgroupns = requested(command, "--cgroupns", "host");
+    let ipc = requested(command, "--ipc", "shareable");
     let SetupEnsureCommand::Create {
         image_identity,
         mounts,
@@ -213,7 +226,7 @@ fn fixture_configuration(command: &SetupEnsureCommand, running: bool) -> serde_j
     let declared_mounts: Vec<_> = actual_mounts.iter().map(|m| serde_json::json!({"Type":m["Type"],
         "Source":if m["Type"] == "volume" { &m["Name"] } else { &m["Source"] }, "Target":m["Destination"],"ReadOnly":!m["RW"].as_bool().unwrap()})).collect();
     let mut host = serde_json::json!({"Mounts":declared_mounts,"VolumeDriver":"","Privileged":false,"NetworkMode":"default","Binds":null,"VolumesFrom":null,"DeviceRequests":null,
-        "SecurityOpt":null,"GroupAdd":null,"DeviceCgroupRules":null,"PublishAllPorts":false,"AutoRemove":false,"CgroupnsMode":"private","RestartPolicy":{"Name":"no","MaximumRetryCount":0},"ReadonlyRootfs":false,"PidMode":"","UTSMode":"","UsernsMode":"","IpcMode":"private",
+        "SecurityOpt":null,"GroupAdd":null,"DeviceCgroupRules":null,"PublishAllPorts":false,"AutoRemove":false,"CgroupnsMode":cgroupns,"RestartPolicy":{"Name":"no","MaximumRetryCount":0},"ReadonlyRootfs":false,"PidMode":"","UTSMode":"","UsernsMode":"","IpcMode":ipc,
         "Devices":[],"CapAdd":null,"CapDrop":null,"PortBindings":{},"Tmpfs":tmpfs});
     if let Some(guest) = macos_guest.as_ref() {
         host["Devices"] = serde_json::json!([{"PathOnHost":"/dev/kvm","PathInContainer":"/dev/kvm","CgroupPermissions":"rwm"},

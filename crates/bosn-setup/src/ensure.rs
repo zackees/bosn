@@ -158,11 +158,17 @@ impl SetupEnsureCommand {
                 labels,
                 macos_guest,
             } => {
+                // Request the namespaces verification requires (#561): a daemon's own
+                // defaults are `host` cgroupns on cgroup v1 and may be `shareable` IPC.
                 let mut args = vec![
                     "container".into(),
                     "create".into(),
                     "--name".into(),
                     container_name.clone(),
+                    "--cgroupns".into(),
+                    "private".into(),
+                    "--ipc".into(),
+                    "private".into(),
                 ];
                 for (key, value) in labels {
                     args.push("--label".into());
