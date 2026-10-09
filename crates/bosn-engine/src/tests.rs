@@ -175,3 +175,23 @@ fn only_dockers_no_such_answer_reports_missing() {
     );
     assert!(!result(125, "No such container: x").reports_missing());
 }
+
+#[test]
+fn a_failure_beside_a_missing_object_is_not_absence() {
+    let result = CommandResult {
+        exit_code: 1,
+        stdout: b"[]".to_vec(),
+        stderr: b"Error: No such object: a\nCannot connect to the Docker daemon\n".to_vec(),
+    };
+    assert!(!result.reports_missing());
+    let only_missing = CommandResult {
+        exit_code: 1,
+        stdout: b"[{\"Id\":\"b\"}]".to_vec(),
+        stderr: b"Error: No such object: a\nError: No such object: c\n".to_vec(),
+    };
+    assert!(only_missing.reports_missing());
+    assert_eq!(
+        super::managed_reads::inspect_read(only_missing, "docker inspect").document(),
+        Some("[{\"Id\":\"b\"}]")
+    );
+}

@@ -4,7 +4,9 @@
 //! this engine hold, and is anything still using it?" — and `lib.rs` is already at the
 //! project's file-length ceiling. None of them mutates engine state.
 
-use super::{CensusRead, CommandError, DockerEngine, RunOptions, census_read, split_lines};
+use super::{
+    CensusRead, CommandError, CommandResult, DockerEngine, RunOptions, census_read, split_lines,
+};
 use std::ffi::OsString;
 
 impl DockerEngine {
@@ -53,7 +55,7 @@ impl DockerEngine {
             .collect();
         args.extend(ids.iter().cloned().map(OsString::from));
         let result = self.with_args(args).capture(options)?;
-        Ok(census_read(result, "docker inspect"))
+        Ok(inspect_read(result, "docker inspect"))
     }
 
     /// Read-only: detail for specific images, as one bounded `docker image inspect`.
@@ -68,7 +70,7 @@ impl DockerEngine {
             .collect();
         args.extend(ids.iter().cloned().map(OsString::from));
         let result = self.with_args(args).capture(options)?;
-        Ok(census_read(result, "docker image inspect"))
+        Ok(inspect_read(result, "docker image inspect"))
     }
 
     /// Read-only: whether one container is running right now.
@@ -108,4 +110,20 @@ impl DockerEngine {
             .capture(options)?;
         Ok(split_lines(result))
     }
+}
+
+/// A read of several named objects. Docker prints the ones it found and names each missing one
+/// on stderr, exiting 1, so an object removed between a listing and this read is simply absent
+/// from the document (#550). Any other failure leaves the read unavailable.
+pub(crate) fn inspect_read(result: CommandResult, what: &str) -> CensusRead {
+    if result.reports_missing() {
+        return match String::from_utf8(result.stdout) {
+            Ok(text) if text.trim().is_empty() => CensusRead::Document("[]".to_owned()),
+            Ok(text) => CensusRead::Document(text),
+            Err(_) => CensusRead::Unavailable {
+                detail: format!("{what} returned non-UTF-8 output"),
+            },
+        };
+    }
+    census_read(result, what)
 }
