@@ -96,12 +96,24 @@ fn cache_scripts_verify_the_pinned_act_and_save_atomically() {
 
 #[test]
 fn line_buffer_splits_and_bounds_lines() {
+    use lines::Line::{Truncated, Whole};
     let mut b = LineBuffer::default();
     b.push(b"one\ntw");
-    assert_eq!(b.drain_lines(), ["one"]);
+    assert_eq!(b.drain_lines(), [Whole("one".into())]);
     b.push(b"o\n");
-    assert_eq!(b.drain_lines(), ["two"]);
+    assert_eq!(b.drain_lines(), [Whole("two".into())]);
+    // #563: a ~70 KB act JSON line (a large output-evidence event) arrives whole.
+    let event = format!("{{\"msg\":\"{}\"}}", "y".repeat(70 * 1024));
+    // It streams in before its newline does, as pipe-sized reads deliver it.
+    b.push(event.as_bytes());
+    assert_eq!(b.drain_lines(), [], "an unfinished line is held, not cut");
+    b.push(b"\n");
+    assert_eq!(b.drain_lines(), [Whole(event)]);
+    // A line past the bound is cut once; the rest of it, up to its newline, is dropped.
     b.push(&vec![b'x'; MAX_LINE + 5]);
-    assert_eq!(b.drain_lines()[0].len(), MAX_LINE);
-    assert_eq!(b.finish(), ["xxxxx"]);
+    let cut = b.drain_lines();
+    assert!(matches!(&cut[..], [Truncated(text)] if text.len() == MAX_LINE));
+    b.push(b"xxxxx\nnext");
+    assert_eq!(b.drain_lines(), []);
+    assert_eq!(b.finish(), [Whole("next".into())]);
 }

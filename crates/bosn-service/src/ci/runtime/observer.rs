@@ -89,6 +89,15 @@ impl EngineObserver for RunObserver {
                 section: None,
                 text: self.masker.mask_text(&text),
             },
+            // Kept for the log, but never parsed: a cut JSON line is truncated output, not
+            // malformed act evidence that would make the run incomplete (#563).
+            EngineLine::TruncatedStdout(text) => LogRecord {
+                seq,
+                stream: "stdout".into(),
+                job: None,
+                section: None,
+                text: format!("{} [bosn: line truncated]", self.masker.mask_text(&text)),
+            },
         };
         self.seq = seq;
         self.append(record);
