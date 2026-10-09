@@ -2,10 +2,17 @@ set -euo pipefail
 # Archives from the publishers' GitHub release asset digests. The installed
 # generation is saved by bosn's existing inner-.complete tool-cache protocol.
 cache=/opt/hostedtoolcache/bosn-runner-tools/@TOOLS_ID@
+# A cached generation is reused only while every installed file still matches
+# the digests recorded when it was verified (#557): the tool cache is shared by
+# every repository and every job can write to it.
 if [ -f "$cache/.complete" ]; then
-  "$cache/bin/pwsh" --version
-  "$cache/bin/gh" --version
-  exit 0
+  if (cd "$cache" && sha256sum --quiet -c .sha256sums) >/dev/null 2>&1; then
+    "$cache/bin/pwsh" --version
+    "$cache/bin/gh" --version
+    exit 0
+  fi
+  echo "bosn runner tools: the cached copy failed verification; reinstalling" >&2
+  rm -rf "$cache"
 fi
 install=$(mktemp -d)
 mkdir -p "$install/bin" "$install/powershell" "$install/github-cli"
@@ -24,4 +31,5 @@ ln -s ../github-cli/bin/gh "$install/bin/gh"
 # generation; copy only the installed tools into the shared tool volume.
 mkdir -p "$cache"
 cp -a "$install/powershell" "$install/github-cli" "$install/bin" "$cache/"
+(cd "$cache" && find powershell github-cli -type f -print0 | sort -z | xargs -0 sha256sum > .sha256sums)
 touch "$cache/.complete"
