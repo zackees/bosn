@@ -99,6 +99,8 @@ fn parse_retention_seconds(value: std::ffi::OsString) -> Result<u64, ()> {
 }
 
 /// Byte counts accept a `k`/`m`/`g` suffix so an operator can write `--max-bytes 50g`.
+/// A ceiling must be positive: on the wire `0` means "no ceiling" (#552), so a
+/// zero meant as "remove nothing" would otherwise remove without a limit.
 fn parse_byte_count(value: std::ffi::OsString) -> Result<i128, ()> {
     let raw = value.to_str().ok_or(())?.trim().to_ascii_lowercase();
     let (digits, multiplier) = match raw.strip_suffix('k') {
@@ -113,8 +115,10 @@ fn parse_byte_count(value: std::ffi::OsString) -> Result<i128, ()> {
     };
     digits
         .parse::<i128>()
+        .ok()
+        .filter(|n| *n > 0)
         .map(|n| n.saturating_mul(multiplier))
-        .map_err(|_| ())
+        .ok_or(())
 }
 
 /// `bosn gc owned` — preview by default, `--apply --yes` to reclaim.
@@ -183,7 +187,7 @@ pub(crate) fn owned_failure(json: bool) -> ! {
 
 #[cfg(test)]
 mod tests {
-    use super::{RetentionPolicy, parse_gc_owned_arguments};
+    use super::{RetentionPolicy, parse_byte_count, parse_gc_owned_arguments};
 
     fn parse(args: &[&str]) -> Result<RetentionPolicy, ()> {
         parse_gc_owned_arguments(args.iter().map(std::ffi::OsString::from)).map(|parsed| parsed.1)
@@ -215,6 +219,17 @@ mod tests {
             let mut args = all.to_vec();
             args.drain(missing - 1..=missing);
             assert_eq!(parse(&args), Err(()), "{args:?}");
+        }
+    }
+
+    /// #552: `0` on the wire means "no ceiling", so a zero or negative ceiling
+    /// is refused instead of silently removing without a limit.
+    #[test]
+    fn a_byte_ceiling_must_be_positive() {
+        assert_eq!(parse_byte_count("50g".into()), Ok(50 * 1024 * 1024 * 1024));
+        assert_eq!(parse_byte_count("1".into()), Ok(1));
+        for refused in ["0", "0g", "-5", "", "g", "ten"] {
+            assert_eq!(parse_byte_count(refused.into()), Err(()), "{refused}");
         }
     }
 }

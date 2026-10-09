@@ -156,12 +156,16 @@ impl Client {
         policy: RetentionPolicy,
         apply: bool,
     ) -> Result<ManagedRetentionSummary, Error> {
-        let max_bytes = policy.max_bytes.unwrap_or(0);
-        if max_bytes < 0 || max_bytes > i64::MAX as i128 {
-            return Err(Error::Protocol(
-                "managed retention byte ceiling out of range",
-            ));
-        }
+        // On the wire 0 means "no ceiling", so an explicit ceiling must be positive (#552).
+        let max_bytes = match policy.max_bytes {
+            None => 0,
+            Some(ceiling) if ceiling > 0 && ceiling <= i64::MAX as i128 => ceiling,
+            Some(_) => {
+                return Err(Error::Protocol(
+                    "managed retention byte ceiling out of range",
+                ));
+            }
+        };
         match self
             .call(Request {
                 gc_confirm: apply,
