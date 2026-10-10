@@ -83,16 +83,29 @@ mounted.
 
 ## Unattended
 
-Opt-in via `retention.toml` in the state directory:
+**On by default (#545).** A machine has to stay clean by itself, so the daemon's maintenance pass
+applies the plan without any configuration. Opt out with `retention.toml` in the state directory:
 
 ```toml
-auto_retention = true
+auto_retention = false
 ```
 
-Absent, unreadable, or unparseable means **no**. Without the flag the pass still reads the engine
-and still reports what it *would* remove — a machine is never silently growing without a signal,
-which is the failure mode that produced this issue. An absent file is not a reason to delete; it
-is a reason to say so.
+An absent file, or a file without the key, means **yes**. `true`, `yes` or `1` mean yes; any other
+explicit value (including a typo or a quoted string) means **no**, as does a file that exists but
+cannot be read, because the daemon cannot then prove the operator did not opt out. Opting out
+does not silence the pass: it still reads the engine and reports what it *would* remove.
+
+Every removal keeps the same gates whether or not it is unattended: complete ownership labels
+naming this registry, liveness (running / mounted / referenced), an explicit pin, and the
+per-kind age gate, each re-checked immediately before the object is removed.
+
+### Why an object was kept
+
+Each pass counts the objects it kept by hold reason (`in-use`, `pinned`, `within-ttl`,
+`age-unknown`, `foreign-registry`, `incomplete-labels`, ...). `bosn gc owned --json` returns them
+as `held`, and the maintenance log prints a `kept owned object(s): ...` line whenever an
+actionable reason (anything other than young or alive) is present, so "nothing to reclaim" and
+"held for foreign ownership" no longer look the same.
 
 ## Stopped setup containers are reported by default (#518)
 
@@ -102,12 +115,12 @@ the container is designed to persist and reclamation has to come from this side.
 container keeps every volume it ever mounted alive, so it is a disk problem rather than a
 container-count problem.
 
-`maintenance_pass` now reports the pile on every maintenance interval, **regardless of the
-opt-in**:
+`maintenance_pass` reports the pile on every maintenance interval, **including after an
+opt-out**:
 
 ```
 bosn retention: 12 stopped owned setup container(s), oldest 59263.4h old, pinning 34 volume(s),
-8 past the 6h container gate; enable with: auto_retention = true in retention.toml
+8 past the 6h container gate; the daemon reclaims them once past the gate; see them: bosn gc owned
 ```
 
 The line leads with the volume count because that is the actual cost, and it names how many are

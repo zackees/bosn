@@ -58,3 +58,8 @@ cmd = "soldr toolchain ensure --json && soldr cargo test -p bosn-service --lib c
 [task.docker-proxy-test]
 stack = "test"
 cmd = "soldr toolchain ensure --json && soldr cargo test -p bosn-service --lib docker_proxy --locked"
+
+# Managed retention and its daemon wire (#545); reuses the isolated test stack.
+[task.retention-test]
+stack = "test"
+cmd = "soldr toolchain ensure --json && soldr cargo test -p bosn-core --lib retention --locked && soldr cargo test -p bosn-service --lib managed_retention --locked && soldr cargo test -p bosn-service --lib protocol_surface_is_pinned --locked"

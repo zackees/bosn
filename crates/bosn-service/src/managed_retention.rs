@@ -14,7 +14,7 @@
 //! on an apply pass, re-checks each object immediately before removing it. The policy is pure and
 //! unit-tested in `bosn-core`; everything here is I/O.
 //!
-//! #518: stopped setup containers are reported by default, deleted only on opt-in
+//! #518 / #545: stopped setup containers are reported and, by default, reclaimed
 //!
 //! `bosn-setup-v2-*` containers cannot be created with `--rm`: `validate_observed` actively
 //! enforces `AutoRemove == false`, so the container is designed to persist and reclamation must
@@ -22,10 +22,9 @@
 //! a disk problem and not a container-count problem — and why the report counts *pinned volumes*,
 //! not containers.
 //!
-//! Reclamation stays opt-in through `retention.toml` (never delete what Bosn does not own, never
-//! delete what cannot be recreated). But **reporting** is not reclamation, so
-//! [`maintenance_pass`] emits the pile on every maintenance interval even with the default
-//! opt-out config. Before this, a default install had no bound at all and no signal.
+//! #545: unattended reclamation is **on by default**; only an explicit `auto_retention = false`
+//! in `retention.toml` turns it off. [`maintenance_pass`] reports the pile on every interval
+//! either way, and says why each kept object was held.
 //!
 //! Three invariants hold for every removal this module performs:
 //!
@@ -162,6 +161,7 @@ pub fn managed_retention_pass(
                 failed: 0,
                 failures: Vec::new(),
                 refused: Some(detail),
+                held: std::collections::BTreeMap::new(),
             },
             plan: bosn_core::retention::RetentionPlan::default(),
             setup_containers,
@@ -212,6 +212,7 @@ pub fn managed_retention_pass(
             failed,
             failures,
             refused: None,
+            held: plan.held_counts(),
         },
         plan,
         setup_containers,
@@ -821,142 +822,10 @@ impl ImageDetail {
         self.size
     }
 }
-/// The unattended pass the daemon runs on its maintenance interval.
-///
-/// Reclamation is destructive, so applying it is opt-in through `retention.toml` in the state
-/// directory (`auto_retention = true`). Without the flag this still reads the engine and still
-/// reports what it would remove, so a machine is never silently growing without a signal — the
-/// failure mode that produced #456.
-pub fn maintenance_pass(state_dir: &Path) {
-    let policy = RetentionPolicy::default();
-    let apply = auto_retention_enabled(state_dir);
-    let engine = DockerEngine::docker();
-    let outcome = managed_retention_pass(&engine, state_dir, policy, apply);
-    report_pass(&outcome);
-}
-
-/// Print what a pass did, or would do.
-pub fn report_pass(outcome: &ManagedRetentionOutcome) {
-    let summary = &outcome.summary;
-    if let Some(refused) = &summary.refused {
-        eprintln!("bosn retention: {refused}");
-        return;
-    }
-    // #518: the stopped-container pile is reported whether or not anything is reclaimable, and
-    // whether or not the operator opted in. It is the only signal a default install gets.
-    report_setup_containers(&outcome.setup_containers, summary.applied);
-    if let Some(line) = pass_report_line(summary) {
-        eprintln!("bosn retention: {line}");
-    }
-    for failure in &summary.failures {
-        eprintln!("bosn retention: {failure}");
-    }
-}
-
-/// The pass's one-line summary, or `None` when it planned nothing. An applied pass reports what
-/// it actually removed, never what it planned (#551).
-fn pass_report_line(summary: &ManagedRetentionSummary) -> Option<String> {
-    if summary.planned == 0 {
-        return None;
-    }
-    Some(if summary.applied {
-        format!(
-            "removed {} of {} planned owned object(s), {} bytes, {} deferred, {} failed; \
-             see them: bosn gc owned",
-            summary.removed,
-            summary.planned,
-            summary.removed_bytes,
-            summary.deferred,
-            summary.failed,
-        )
-    } else {
-        format!(
-            "would remove {} owned object(s), {} deferred; see them: bosn gc owned",
-            summary.planned, summary.deferred,
-        )
-    })
-}
-
-/// Print the stopped setup-container pile, if there is one.
-///
-/// The message leads with the volume count, because that is the actual cost: a stopped
-/// `bosn-setup-v2-*` container is kilobytes of writable layer holding megabytes of volumes
-/// unreclaimable. `applied` only changes the advice, never the facts.
-fn report_setup_containers(report: &SetupContainerReport, applied: bool) {
-    if let Some(line) = setup_container_report_line(report, applied) {
-        eprintln!("bosn retention: {line}");
-    }
-}
-
-/// The one-line report for a stopped-container pile, or `None` when there is nothing to report.
-///
-/// Split from the printing so the message is testable without capturing stderr.
-fn setup_container_report_line(report: &SetupContainerReport, applied: bool) -> Option<String> {
-    if report.is_empty() {
-        return None;
-    }
-    let past_gate = past_container_gate(report);
-    let oldest = report.oldest_age_seconds().map_or_else(
-        || "unknown age".to_owned(),
-        |age| format!("{:.1}h old", age / 3600.0),
-    );
-    let action = if applied {
-        "the daemon reclaims them once past the gate; see them: bosn gc owned"
-    } else {
-        "enable with: auto_retention = true in retention.toml"
-    };
-    Some(format!(
-        "{} stopped owned setup container(s), oldest {oldest}, pinning {} volume(s), {} past the \
-         {} container gate; {action}",
-        report.container_count(),
-        report.pinned_volume_count(),
-        past_gate,
-        describe_container_gate(),
-    ))
-}
-
-/// How many stopped containers are already past the container age gate.
-///
-/// The gate comes from `bosn-core`'s policy rather than a constant invented here, so the number
-/// the report calls stale is the same one an apply pass would act on.
-fn past_container_gate(report: &SetupContainerReport) -> usize {
-    let gate = RetentionPolicy::default()
-        .ttl_for(ResourceKind::Container)
-        .map_or(0.0, |ttl| ttl.as_secs_f64());
-    report
-        .stopped
-        .iter()
-        .filter(|container| container.age_seconds >= gate)
-        .count()
-}
-
-/// The container gate, phrased for a human reading a log line.
-fn describe_container_gate() -> String {
-    let gate = RetentionPolicy::default()
-        .ttl_for(ResourceKind::Container)
-        .map_or(0, |ttl| ttl.as_secs() / 3600);
-    format!("{gate}h")
-}
-
-/// The file that opts a machine into unattended reclamation.
-const RETENTION_CONFIG: &str = "retention.toml";
-
-/// Whether the operator asked for unattended reclamation.
-///
-/// An unreadable or absent file means "no". A daemon that could not parse its own opt-in must
-/// never delete on the strength of a guess.
-fn auto_retention_enabled(state_dir: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(state_dir.join(RETENTION_CONFIG)) else {
-        return false;
-    };
-    text.lines().any(|line| {
-        let line = line.split('#').next().unwrap_or("").trim();
-        let Some((key, value)) = line.split_once('=') else {
-            return false;
-        };
-        key.trim() == "auto_retention" && matches!(value.trim(), "true" | "yes" | "1")
-    })
-}
+mod report;
+#[cfg(test)]
+use report::{auto_retention_enabled, pass_report_line, setup_container_report_line};
+pub use report::{maintenance_pass, report_pass};
 
 mod sizes;
 

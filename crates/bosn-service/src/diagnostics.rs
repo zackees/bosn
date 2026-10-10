@@ -94,6 +94,9 @@ pub struct ManagedRetentionSummary {
     pub failures: Vec<String>,
     /// Set when the pass refused to remove anything.
     pub refused: Option<String>,
+    /// Observed objects kept, counted by why (#545): distinguishes "nothing to do" from
+    /// "held for missing labels, foreign ownership, liveness, age or a pin".
+    pub held: std::collections::BTreeMap<bosn_core::retention::HoldReason, u64>,
 }
 
 /// Outcome of one `gc --unmanaged --apply`.

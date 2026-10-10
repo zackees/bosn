@@ -124,6 +124,26 @@ impl HoldReason {
             Self::UnsupportedKind => "unsupported-kind",
         }
     }
+
+    /// Every reason, in report order.
+    pub const ALL: [Self; 8] = [
+        Self::InUse,
+        Self::Pinned,
+        Self::WithinTtl,
+        Self::AgeUnknown,
+        Self::ForeignRegistry,
+        Self::IncompleteLabels,
+        Self::NotBosnOwned,
+        Self::UnsupportedKind,
+    ];
+
+    /// The inverse of [`Self::as_str`].
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|reason| reason.as_str() == value)
+    }
 }
 
 /// The verdict for one observed object.
@@ -238,6 +258,21 @@ pub struct RetentionPlan {
     pub bytes: i128,
     /// Reclaimable objects left over because a cap was reached.
     pub deferred: usize,
+}
+
+impl RetentionPlan {
+    /// How many observed objects each reason held (#545). An object nothing reclaimed is never
+    /// silent: "no candidates" and "held for a reason" read differently.
+    #[must_use]
+    pub fn held_counts(&self) -> BTreeMap<HoldReason, u64> {
+        let mut counts = BTreeMap::new();
+        for verdict in &self.held {
+            if let Some(reason) = verdict.hold {
+                *counts.entry(reason).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
 }
 
 /// Build a plan for one pass over the observed Bosn-owned objects.

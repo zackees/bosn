@@ -152,6 +152,40 @@ pub(crate) struct ReplyWire {
     /// On a code-5 refusal: the client protocol the daemon refused.
     #[prost(uint32, tag = "69")]
     pub(crate) refused_client_protocol: u32,
+    /// Code 230: objects the pass kept, by hold reason (#545). Empty from an older daemon.
+    #[prost(message, repeated, tag = "70")]
+    pub(crate) owned_held: Vec<HeldCountWire>,
+}
+/// One `HoldReason` and how many observed objects it kept.
+#[derive(Message)]
+pub(crate) struct HeldCountWire {
+    #[prost(string, tag = "1")]
+    pub(crate) reason: String,
+    #[prost(uint64, tag = "2")]
+    pub(crate) count: u64,
+}
+impl HeldCountWire {
+    pub(crate) fn encode_counts(
+        held: &std::collections::BTreeMap<bosn_core::retention::HoldReason, u64>,
+    ) -> Vec<Self> {
+        held.iter()
+            .map(|(reason, count)| Self {
+                reason: reason.as_str().to_owned(),
+                count: *count,
+            })
+            .collect()
+    }
+    /// Unknown reasons (a newer daemon) are dropped rather than misreported.
+    pub(crate) fn decode_counts(
+        wire: Vec<Self>,
+    ) -> std::collections::BTreeMap<bosn_core::retention::HoldReason, u64> {
+        wire.into_iter()
+            .filter_map(|entry| {
+                bosn_core::retention::HoldReason::parse(&entry.reason)
+                    .map(|reason| (reason, entry.count))
+            })
+            .collect()
+    }
 }
 #[derive(Message)]
 pub(crate) struct LogRecordWire {
@@ -521,6 +555,7 @@ pub(crate) fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
             failed: v.owned_failed,
             failures: v.owned_failures,
             refused: (!v.owned_refused.is_empty()).then_some(v.owned_refused),
+            held: HeldCountWire::decode_counts(v.owned_held),
         })),
         1 => Err(Error::Protocol("unsupported protocol")),
         2 => Err(Error::Protocol("unknown operation")),
