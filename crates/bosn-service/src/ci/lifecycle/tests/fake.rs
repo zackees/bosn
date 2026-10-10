@@ -317,6 +317,7 @@ impl ActEngineBackend for FakeBackend {
     fn prepare_run<'a>(
         &'a self,
         engine: &'a str,
+        _invocation: &'a ActInvocation,
         _source: &'a std::path::Path,
         _event: &'a std::path::Path,
         _generation: Option<&'a bosn_registry::act::ActToolGenerationBinding>,
@@ -335,9 +336,16 @@ impl ActEngineBackend for FakeBackend {
     fn list<'a>(
         &'a self,
         _engine: &'a str,
-        _workflow: &'a str,
+        _invocation: &'a ActInvocation,
     ) -> crate::ci::engine::BoxFuture<'a, Result<String, String>> {
         Box::pin(async { Ok(LISTING.to_string()) })
+    }
+    fn close_scope<'a>(
+        &'a self,
+        _engine: &'a str,
+        _scope: &'a crate::ci::engine::RunScope,
+    ) -> crate::ci::engine::BoxFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
     }
     fn execute<'a>(
         &'a self,

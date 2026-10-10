@@ -12,6 +12,7 @@ fn invocation_never_names_a_host_socket_and_pins_runners() {
         ),
         secrets: SecretEnv(vec![("GITHUB_TOKEN".into(), "ghp_secretvalue".into())]),
         params: Default::default(),
+        scope: None,
     }
     .args();
     assert!(args.iter().all(|a| !a.contains("docker.sock")));
@@ -49,6 +50,7 @@ fn act_reads_rewrites_from_the_overlay() {
         ),
         secrets: SecretEnv::default(),
         params: Default::default(),
+        scope: None,
     };
     let overlay = format!("{ENGINE_WORK}/overlay");
     let args = invocation.args();

@@ -69,6 +69,7 @@ pub fn plan(run: &str, deadline: Duration) -> EnginePlan {
             ),
             secrets: Default::default(),
             params: Default::default(),
+            scope: None,
         },
         cache: test_cache(),
         deadline: async_engine::Deadline::after(deadline),

@@ -81,6 +81,7 @@ fn published_act_plans_workflows_with_typed_legacy_and_cohort_routes() {
                 cache_route,
                 secrets: Default::default(),
                 params: Default::default(),
+                scope: None,
             }
             .args();
             args.push("-l".into());

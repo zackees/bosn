@@ -106,6 +106,7 @@ impl CiRuntime {
             }
             Spares::None => None,
         };
+        let scope = run_scope(&record.id, &intent)?;
         Ok(EnginePlan {
             act: spec.act,
             intent,
@@ -125,10 +126,32 @@ impl CiRuntime {
                 ),
                 secrets: self.secrets(record)?,
                 params: record.params.clone(),
+                scope,
             },
             cache: spec.cache,
             deadline,
             spare,
         })
     }
+}
+
+/// The run's scope inside its engine (#547) when the engine binds a socket
+/// directory, sized from the whole engine (one run per engine).
+fn run_scope(
+    run: &str,
+    intent: &ActEngineIntent,
+) -> Result<Option<super::super::engine::RunScope>, String> {
+    let Some(profile) = intent
+        .creation_profile
+        .as_ref()
+        .filter(|profile| profile.docker_socket.is_some())
+    else {
+        return Ok(None);
+    };
+    let limits = super::super::engine::RunLimits::within_engine(
+        profile.memory_bytes,
+        profile.nano_cpus,
+        profile.pids,
+    );
+    super::super::engine::RunScope::new(run, 0, limits).map(Some)
 }
