@@ -26,6 +26,8 @@
 //! cpus = 4
 //! pids = 4096
 //! spares = 0        # opt out of the prepared spare engine (#410; default 1)
+//! shared = false     # one engine per run, not the shared engine (#547)
+//! idle_retire_secs = 600  # how long an idle shared engine is kept
 //! ```
 //!
 //! Pinned memory-backed storage grows a sized memory limit to fit it (by the
@@ -167,6 +169,13 @@ pub struct EngineConfig {
     /// Prepared spare engines kept (#410); `spares = 0` opts out.
     #[serde(default)]
     pub spares: super::spare::Spares,
+    /// One long-lived engine shared by concurrent runs (#547); `false`
+    /// gives each run its own engine. Default: on, where the daemon can
+    /// share a Docker socket with its engines (Linux).
+    pub shared: Option<bool>,
+    /// Seconds a shared engine with no run is kept before it is retired;
+    /// default 600.
+    pub idle_retire_secs: Option<u64>,
 }
 
 /// The disk budget for `host`, or why disk-backed storage cannot be used.

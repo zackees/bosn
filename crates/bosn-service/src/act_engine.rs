@@ -51,6 +51,13 @@ mod create;
 pub use create::*;
 mod socket;
 pub(crate) use socket::with_docker_socket;
+
+/// Remove the socket directory of an engine proven gone (#547).
+pub(crate) fn remove_socket_dir(intent: &ActEngineIntent) {
+    if let Some(dir) = socket::of(intent) {
+        socket::remove_dir(dir);
+    }
+}
 mod observe;
 pub use observe::*;
 #[cfg(test)]

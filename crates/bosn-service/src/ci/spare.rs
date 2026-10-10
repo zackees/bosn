@@ -70,7 +70,8 @@ pub struct Spare {
     pub token: String,
 }
 
-/// What a new spare is made from.
+/// What a new spare (or the shared engine, #547) is made from.
+#[derive(Clone, Debug)]
 pub struct SparePlan {
     pub intent: ActEngineIntent,
     pub act: ActArtifact,
@@ -291,7 +292,8 @@ impl SpareKeeper {
 
 /// Create, claim and prepare a spare engine. Any failure removes what was
 /// created (or leaves its record `cleanup_required` for startup recovery).
-async fn prepare(
+/// The shared engine (#547) is made the same way.
+pub(super) async fn prepare(
     registry: &RegistryActor,
     backend: &dyn ActEngineBackend,
     plan: SparePlan,
