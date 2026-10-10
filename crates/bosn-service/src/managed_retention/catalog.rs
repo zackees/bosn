@@ -116,6 +116,38 @@ fn cataloged_identity_at(root: &Path, state_dir: &Path) -> Option<String> {
     found
 }
 
+/// Registries the machine catalog names whose `registry.sqlite3` still exists: live peers (#545).
+///
+/// Their objects (the machine-wide CI engine another daemon made, say) are not evidence that a
+/// *new* state directory lost its own registry, so the #515 first-run guard ignores them.
+pub(crate) fn live_peer_registries() -> BTreeSet<String> {
+    machine_root().map_or_else(BTreeSet::new, |root| live_peers_at(&root))
+}
+
+fn live_peers_at(root: &Path) -> BTreeSet<String> {
+    let Ok(items) = std::fs::read_dir(root) else {
+        return BTreeSet::new();
+    };
+    items
+        .flatten()
+        .take(MAX_ENTRIES)
+        .filter_map(|item| {
+            let path = item.path();
+            let stem = path
+                .file_name()?
+                .to_str()?
+                .strip_suffix(".json")?
+                .to_owned();
+            let entry = read_entry(&path)?;
+            (entry.registry_id == stem
+                && entry.schema == SCHEMA
+                && valid_registry_id(&entry.registry_id)
+                && entry.state_dir.join("registry.sqlite3").is_file())
+            .then_some(entry.registry_id)
+        })
+        .collect()
+}
+
 /// Where a released registry's tombstone entry points: a path this code never creates.
 const RELEASED: &str = ".released";
 
@@ -380,5 +412,23 @@ mod tests {
         .unwrap();
         assert!(abandoned_at(&root, OURS).is_empty());
         assert!(enroll_at(&root, temporary.path(), "../escape").is_err());
+    }
+
+    #[test]
+    fn live_peers_are_cataloged_registries_whose_database_exists() {
+        let dir = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let root = dir.path().join("catalog");
+        let (live, gone) = (dir.path().join("live"), dir.path().join("gone"));
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::create_dir_all(&gone).unwrap();
+        std::fs::write(live.join("registry.sqlite3"), "").unwrap();
+        let (a, b) = (
+            "0f3c5706-153e-455e-b0c4-d7d532037a0b",
+            "b3718269-079a-4b01-a761-b3c94b987a8e",
+        );
+        enroll_at(&root, &live, a).unwrap();
+        enroll_at(&root, &gone, b).unwrap();
+        assert_eq!(live_peers_at(&root), BTreeSet::from([a.to_owned()]));
+        assert!(live_peers_at(&dir.path().join("absent")).is_empty());
     }
 }

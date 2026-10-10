@@ -307,17 +307,30 @@ pub(crate) fn parse_kind(
                 bytes: row.size_rw,
             },
         ),
-        PriorObjectKind::Volume => record(
-            prior,
-            document,
-            "docker volume inspect",
-            |row: VolumeIdentity| PriorObject {
-                kind,
-                name: pick_name(row.name, String::new()),
-                registry_id: label_value_from(row.labels, key),
-                bytes: row.usage.and_then(|usage| usage.size),
-            },
-        ),
+        PriorObjectKind::Volume => {
+            record(
+                prior,
+                document,
+                "docker volume inspect",
+                |row: VolumeIdentity| PriorObject {
+                    kind,
+                    name: pick_name(row.name, String::new()),
+                    registry_id: if is_shared_ci_cache(&row.labels) {
+                        SHARED_CI_CACHE.to_owned()
+                    } else {
+                        label_value_from(row.labels, key)
+                    },
+                    bytes: row.usage.and_then(|usage| usage.size),
+                },
+            );
+            // The machine-wide CI cache volume (#544) is shared by every state directory on
+            // the host, not owned by the registry that happened to create it. Counting it made
+            // every fresh state directory on a machine that had ever run CI refuse to start
+            // (#545 live check). Only that exact volume, by name and machine scope, is skipped.
+            prior
+                .objects
+                .retain(|object| object.registry_id != SHARED_CI_CACHE);
+        }
         PriorObjectKind::Image => record(
             prior,
             document,
@@ -338,6 +351,14 @@ pub(crate) fn parse_kind(
             },
         ),
     }
+}
+
+/// Sentinel for the skipped shared CI cache volume; never a registry id (not a UUID).
+const SHARED_CI_CACHE: &str = "<machine-wide CI cache>";
+
+fn is_shared_ci_cache(labels: &BTreeMap<String, String>) -> bool {
+    labels.get(bosn_core::LABEL_SCOPE).map(String::as_str) == Some("machine")
+        && labels.get(bosn_core::LABEL_STACK).map(String::as_str) == Some("ci-cache")
 }
 
 /// Deserialize one inspect document and fold its rows into the prior identity.

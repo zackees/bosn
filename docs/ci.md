@@ -603,6 +603,46 @@ with its VM. It holds:
 Artifacts use a per-engine store, so concurrent runs never share an artifact
 server or its port.
 
+### Shared cache budget (#544)
+
+Every daemon's maintenance loop (it needs no workflow, engine or run) applies
+this budget to `actcache/` while no cohort policy is enrolled, which is the
+case on every machine today. The pass runs hourly from daemon start:
+
+| Bound | Value |
+|---|---|
+| Completed archives per repository namespace | ≤ 8 GiB; least recently used go first |
+| Archive unused for | 7 days, then it expires (an idle repository's namespace empties) |
+| Archive age | 30 days, then it expires even if it is still used |
+| Whole `actcache/` | ≤ 8 GiB × repositories that ran CI in the last 7 days |
+
+These are act2's logical archive bytes (`act cache prune --apply`, the same
+retention act2's cache server runs in-process), not filesystem blocks. A pass
+deletes only archives inside the volume, never the volume, which stays
+pinned. Its gates:
+
+- **Liveness.** act2 takes the namespace's transfer lock and `bolt.db`
+  exclusively, each with a 25 ms timeout. A namespace a live cache server or
+  transfer holds is reported `busy` and left alone, and archives used in the
+  last five minutes are always protected.
+- **Ownership.** The pass runs in the journaled, finite-lived maintenance
+  helper on the measured Bosn-owned volume, and visits only direct 16-hex
+  namespace directories. A namespace without act2's `transfers.bolt` (written
+  by an act2 that predates it) can't be locked, so it is skipped, named on
+  stderr, and never deleted. `bosn ci runners clear-cache` remains the operator
+  path for it.
+- **Exclusion.** The pass holds the machine maintenance lock that cohort
+  maintenance and import take. An enrolled cohort policy (#508) replaces this
+  budget with its own aggregate ceiling.
+
+**Visible results.** Each pass is persisted as the registry's latest cache
+maintenance snapshot (outcome, budget, remaining and reclaimed bytes, partial,
+helper cleanup error) and logged as `bosn cache maintenance: legacy pass over
+N namespace(s): reclaimed …`. A failed deletion, a busy namespace or a failed
+helper cleanup makes the pass partial, which the snapshot records and the next
+pass retries. `tools/`, `images/` and `actions/` hold pinned, content-keyed
+inputs (about 5.5 GB on the development host) and are not expired by this pass.
+
 ## GitHub token (opt-in)
 
 `bosn ci run --github-token` passes the daemon-owned secret

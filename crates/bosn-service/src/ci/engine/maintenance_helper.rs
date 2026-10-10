@@ -18,6 +18,15 @@ pub struct MaintenanceHelperAttempt {
     pub cleanup: Result<(), String>,
 }
 
+/// What one maintenance helper runs.
+#[derive(Clone, Copy, Debug)]
+pub enum HelperPass {
+    /// Aggregate retention of an enrolled cohort, under its agreed machine policy.
+    Cohort(CachePolicy),
+    /// Default per-namespace expiry of the legacy namespaces (no cohort is enrolled).
+    Legacy(super::legacy_maintenance::LegacyBudget),
+}
+
 impl DockerActBackend {
     /// The caller must supply the verified machine policy. This does not enroll
     /// repositories, admit legacy writers or authorize source-volume deletion.
@@ -26,6 +35,17 @@ impl DockerActBackend {
         registry: &RegistryActor,
         owner: &str,
         policy: CachePolicy,
+    ) -> Result<MaintenanceHelperAttempt, String> {
+        self.run_maintenance_helper(registry, owner, HelperPass::Cohort(policy))
+            .await
+    }
+
+    /// One journaled, finite-lived helper on the measured shared volume, running `pass`.
+    pub async fn run_maintenance_helper(
+        &self,
+        registry: &RegistryActor,
+        owner: &str,
+        pass: HelperPass,
     ) -> Result<MaintenanceHelperAttempt, String> {
         self.verify_measured_volume(CACHE_VOLUME).await?;
         self.ensure_engine_image().await?;
@@ -97,8 +117,13 @@ impl DockerActBackend {
                 )
                 .await?;
             self.verify_installed_act(&id, &version).await?;
-            self.require_cache_policy(&id, policy).await?;
-            self.maintain_cache_cohort(&id, policy).await
+            match pass {
+                HelperPass::Cohort(policy) => {
+                    self.require_cache_policy(&id, policy).await?;
+                    self.maintain_cache_cohort(&id, policy).await
+                }
+                HelperPass::Legacy(budget) => self.maintain_legacy_namespaces(&id, budget).await,
+            }
         }
         .await;
         // Re-inspect the complete ownership profile before removal. Recovery

@@ -30,14 +30,17 @@ impl DockerActBackend {
         &self,
         registry: &crate::RegistryActor,
         owner: &str,
-    ) -> Result<Option<CachePolicy>, String> {
+    ) -> Result<Discovery, String> {
         if !self.volume_exists(CACHE_VOLUME).await? {
-            return Ok(None);
+            return Ok(Discovery::NoVolume);
         }
         let output = self
             .read_cache_tracked(CACHE_VOLUME, Some((registry, owner)), READ_POLICY)
             .await?;
-        decode_record(&output)
+        Ok(match decode_record(&output)? {
+            Some(policy) => Discovery::Enrolled(policy),
+            None => Discovery::Unenrolled,
+        })
     }
 
     pub(super) async fn agree_cache_policy(
@@ -53,6 +56,17 @@ impl DockerActBackend {
         .await
         .map(|_| ())
     }
+}
+
+/// What discovery found on the shared cache volume.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Discovery {
+    /// No shared volume: nothing to maintain.
+    NoVolume,
+    /// A volume with no agreed cohort policy: its legacy namespaces get the default budget.
+    Unenrolled,
+    /// An agreed cohort policy, which replaces the legacy budget.
+    Enrolled(CachePolicy),
 }
 
 fn agreement_script(policy: CachePolicy) -> String {
@@ -144,8 +158,10 @@ mod tests {
             let policy = backend
                 .discover_cache_policy(&registry, crate::ci::lifecycle::tests::OWNER)
                 .await
-                .unwrap()
                 .unwrap();
+            let Discovery::Enrolled(policy) = policy else {
+                panic!("an agreed policy is required, got {policy:?}")
+            };
             assert_eq!(policy.repository_max_bytes, 104857600);
             assert_eq!(policy.aggregate_max_bytes, 209715200);
             assert_eq!(policy.maintenance_interval_secs, 60);

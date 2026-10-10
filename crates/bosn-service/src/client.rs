@@ -7,6 +7,9 @@ use bosn_core::retention::RetentionPolicy;
 pub struct Client {
     pub(crate) state_dir: PathBuf,
 }
+/// Reply deadline for [`Client::managed_retention`]: a whole read-and-reclaim pass.
+const MANAGED_RETENTION_DEADLINE: Duration = Duration::from_secs(600);
+
 impl Client {
     pub fn for_state(state: impl AsRef<Path>) -> Result<Self, Error> {
         Ok(Self {
@@ -153,6 +156,8 @@ impl Client {
     }
 
     /// Preview or reclaim the resources this registry owns, by age gate (#456).
+    /// The reply waits for a full fresh engine read (and any removals): far over the 3 s
+    /// control deadline on a busy host (#545), so it gets its own.
     ///
     /// The daemon re-derives the plan itself and revalidates ownership, liveness and pins
     /// immediately before each removal. A destructive pass requires `confirm`, and the daemon
@@ -174,15 +179,18 @@ impl Client {
             }
         };
         match self
-            .call(Request {
-                gc_confirm: apply,
-                owned_confirm: apply,
-                owned_container_ttl_secs: policy.container_ttl.as_secs(),
-                owned_volume_ttl_secs: policy.volume_ttl.as_secs(),
-                owned_image_ttl_secs: policy.image_ttl.as_secs(),
-                owned_max_bytes: max_bytes as i64,
-                ..Request::operation(38)
-            })
+            .call_within(
+                Request {
+                    gc_confirm: apply,
+                    owned_confirm: apply,
+                    owned_container_ttl_secs: policy.container_ttl.as_secs(),
+                    owned_volume_ttl_secs: policy.volume_ttl.as_secs(),
+                    owned_image_ttl_secs: policy.image_ttl.as_secs(),
+                    owned_max_bytes: max_bytes as i64,
+                    ..Request::operation(38)
+                },
+                MANAGED_RETENTION_DEADLINE,
+            )
             .await?
         {
             Reply::ManagedRetention(v) => Ok(v),

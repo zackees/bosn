@@ -183,9 +183,15 @@ impl Service {
                 // tell those apart, so ask it before minting an identity that
                 // would strand every object the previous one created (#515).
                 let probe = Arc::clone(&self.identity_probe);
-                let prior = async_engine::launch_blocking(move || probe.as_ref().probe())
+                let mut prior = async_engine::launch_blocking(move || probe.as_ref().probe())
                     .await
                     .map_err(|_| Error::ActorClosed)?;
+                // A live peer's objects (the shared CI engine, say) prove nothing about this
+                // directory's lost registry; only unknown or abandoned registries do (#545).
+                let peers = crate::managed_retention::catalog::live_peer_registries();
+                prior
+                    .objects
+                    .retain(|object| !peers.contains(&object.registry_id));
                 if prior.has_prior_objects() {
                     // Refuse loudly rather than adopt silently: an empty
                     // database minted here would make every one of these

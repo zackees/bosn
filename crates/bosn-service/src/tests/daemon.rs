@@ -849,6 +849,17 @@ fn prior_identity_parses_typed_inspect_documents() {
     parse_kind(&mut prior, PriorObjectKind::Image, images, key);
     assert_eq!(prior.objects[0].name, "sha256:deadbeef");
     assert_eq!(prior.objects[0].bytes, Some(9));
+
+    // The machine-wide CI cache volume is shared by every state directory, so it is not evidence
+    // of a lost registry (#545). A machine-scoped volume of another stack still is.
+    let volumes = r#"[{"Name":"bosn-ci-cache-v1","Labels":{"com.zackees.bosn.registry":"bbbb",
+        "com.zackees.bosn.scope":"machine","com.zackees.bosn.stack":"ci-cache"}},
+        {"Name":"bosn-v-machine-x","Labels":{"com.zackees.bosn.registry":"cccc",
+        "com.zackees.bosn.scope":"machine","com.zackees.bosn.stack":"dev"}}]"#;
+    let mut prior = PriorIdentity::default();
+    parse_kind(&mut prior, PriorObjectKind::Volume, volumes, key);
+    assert_eq!(prior.objects.len(), 1);
+    assert_eq!(prior.objects[0].registry_id, "cccc");
 }
 
 #[test]

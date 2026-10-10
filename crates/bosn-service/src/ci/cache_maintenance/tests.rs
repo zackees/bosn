@@ -108,11 +108,11 @@ fn eviction_receipts_have_checked_counts_bytes_and_unique_ids() {
         protected_bytes: Some(0),
         budget_met: Some(true),
     };
-    proof.validate(policy()).unwrap();
+    proof.validate(policy().repository_max_bytes).unwrap();
     let mut invalid = proof;
     invalid.receipts_omitted = u64::MAX;
-    assert!(invalid.validate(policy()).is_err());
+    assert!(invalid.validate(policy().repository_max_bytes).is_err());
     invalid.receipts_omitted = 1;
     invalid.reclaimed_archive_bytes = 79;
-    assert!(invalid.validate(policy()).is_err());
+    assert!(invalid.validate(policy().repository_max_bytes).is_err());
 }
