@@ -68,6 +68,7 @@ pub(crate) async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Re
             1 => ReplyWire {
                 code: 10,
                 daemon_version: release_version.to_string(),
+                daemon_protocol: DAEMON_PROTOCOL,
                 ..Default::default()
             },
             2 => {

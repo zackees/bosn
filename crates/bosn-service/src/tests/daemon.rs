@@ -117,19 +117,20 @@ fn response_envelope_rejects_wrong_correlation_protocol_kind_and_encoding() {
     let request = DaemonFrame::request(PAYLOAD_PROTOCOL, Vec::new()).with_request_id(7);
     assert!(matches!(
         decode_response_frame(DaemonFrame::response_to(&request, payload.clone()), 7),
-        Ok(Reply::Pong(version)) if version.is_empty()
+        Ok(Reply::Pong(identity)) if identity.release.is_empty() && identity.protocol == 0
     ));
     let mut versioned = Vec::new();
     ReplyWire {
         code: 10,
         daemon_version: "0.1.6".into(),
+        daemon_protocol: DAEMON_PROTOCOL,
         ..Default::default()
     }
     .encode(&mut versioned)
     .unwrap();
     assert!(matches!(
         decode_response_frame(DaemonFrame::response_to(&request, versioned), 7),
-        Ok(Reply::Pong(version)) if version == "0.1.6"
+        Ok(Reply::Pong(identity)) if identity.release == "0.1.6" && identity.protocol == DAEMON_PROTOCOL
     ));
     let state = Path::new("/state");
     assert_eq!(daemon_version_mismatch(state, "0.1.6", "0.1.6"), None);
@@ -780,4 +781,39 @@ fn independent_state_directories_serve_concurrently() {
         stopped(left_server).await;
         stopped(right_server).await;
     });
+}
+
+/// The files that define what a daemon and a client exchange (#509). Any edit
+/// to them may change the wire, so it must come with a [`DAEMON_PROTOCOL`]
+/// decision: bump the protocol when the edit changes the wire, then record
+/// the new fingerprint below either way. This is a tripwire, not a proof.
+const PROTOCOL_SURFACE: [&str; 6] = [
+    "src/wire.rs",
+    "src/wire_validate.rs",
+    "src/ci/wire.rs",
+    "src/ci/model.rs",
+    "src/ci/reply.rs",
+    "../../docs/ci.schema.json",
+];
+const PROTOCOL_FINGERPRINT: (u32, &str) = (
+    DAEMON_PROTOCOL,
+    "fb73d5e7fdd2a7b9053ffd5fd2b6e5b9c04c3a9b69dacc5265d8e39e745b7bfe",
+);
+
+#[test]
+fn protocol_surface_is_pinned() {
+    let mut hasher = kernal_api::hash::Sha256Hasher::new();
+    for path in PROTOCOL_SURFACE {
+        let full = Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+        let text = std::fs::read_to_string(&full).unwrap();
+        // Line endings depend on the checkout, never on the protocol.
+        hasher.update(text.replace("\r\n", "\n").as_bytes());
+    }
+    let fingerprint = hasher.finalize().to_hex();
+    assert_eq!(
+        PROTOCOL_FINGERPRINT,
+        (DAEMON_PROTOCOL, fingerprint.as_str()),
+        "the daemon protocol surface changed: bump DAEMON_PROTOCOL if the wire changed, \
+         then record the new fingerprint in PROTOCOL_FINGERPRINT"
+    );
 }

@@ -167,3 +167,22 @@ living implementation spec.
 (`~/.local/bin/soldr`), which predates the `prepare` subcommand and breaks local cross
 builds. CI is unaffected (it uses `zackees/setup-soldr@v0`). If a local `soldr`
 build fails with "tool not found: prepare", run `uv tool install 'soldr==0.9.15'`.
+
+## Daemon version contract (#509, #324)
+
+Decided 2026-10-09.
+
+- **Every daemon-backed CLI command runs the version pre-flight** before it
+  sends work (#324): a daemon from another release is refused with both
+  versions and the remedy, never a bare "request failed".
+- **Compatibility moves from release equality to a wire protocol (#509).**
+  Every daemon reports `DAEMON_PROTOCOL` on its ping reply (zero means it
+  predates the handshake). Bump it on any change to the request/reply wire or
+  the JSON documents it carries; `protocol_surface_is_pinned` fingerprints those
+  files and fails until the bump decision and new fingerprint are recorded.
+- **Not soldr's per-generation daemons.** soldr's broker can launch one daemon
+  generation per client image because its daemons are caches. Bosn's daemon is
+  the sole registry writer and Docker owner for a state directory, so it stays
+  one daemon per state directory; skew is solved by the daemon serving a
+  window of protocols, not by running several daemons. The exact-release
+  refusal stays until clients accept a matching protocol (phased plan on #509).
