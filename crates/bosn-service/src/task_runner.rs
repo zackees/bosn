@@ -116,6 +116,7 @@ pub(crate) async fn attach(
                 labels: runners.labels(record),
                 nano_cpus: capacity.nano_cpus(),
                 memory: capacity.memory_per_slot,
+                cgroup_parent: None,
                 volumes: Arc::new(volumes),
                 activity: Arc::clone(&context.activity),
                 notes: Some(notes),

@@ -53,3 +53,8 @@ cmd = "soldr toolchain ensure --json && soldr cargo fmt --all --check && soldr c
 [task.ci-snapshot-test]
 stack = "test"
 cmd = "soldr toolchain ensure --json && soldr cargo test -p bosn-service --lib ci::snapshot --locked"
+
+# The Docker proxy's run scoping (#560, #547); reuses the isolated test stack.
+[task.docker-proxy-test]
+stack = "test"
+cmd = "soldr toolchain ensure --json && soldr cargo test -p bosn-service --lib docker_proxy --locked"
