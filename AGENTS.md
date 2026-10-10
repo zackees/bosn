@@ -203,8 +203,8 @@ Decided 2026-10-09.
   a bump (phase 3 itself added its fields this way).
 - **The daemon starts from one authoritative executable (#509 phase 4).**
   `ensure_daemon` launches `<state>/daemon/bosn-daemon`, never the client
-  binary that happened to call it. A client installs itself there (with the
-  Linux OpenSSL sidecars, by atomic rename, stamped in `bosn-daemon.release`)
+  binary that happened to call it. A client installs itself there (the binary
+  is self-contained since #265; by atomic rename, stamped in `bosn-daemon.release`)
   only when it is a newer release, or the same release from another build; an
   older client never downgrades it.
 - **Idle handoff only (#509 phase 4).** A client newer than the running

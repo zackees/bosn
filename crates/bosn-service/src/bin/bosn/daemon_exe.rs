@@ -9,9 +9,6 @@
 
 use std::path::{Path, PathBuf};
 
-/// Linux OpenSSL sidecars the wheel's CLI finds through an `$ORIGIN` rpath;
-/// they travel with the binary so the installed copy still starts.
-const SIDECARS: [&str; 2] = ["libssl.so.3", "libcrypto.so.3"];
 const STAMP: &str = "bosn-daemon.release";
 
 fn executable_name() -> &'static str {
@@ -112,14 +109,6 @@ pub(crate) fn install_daemon_executable(
     }
     let result = (|| -> std::io::Result<()> {
         std::fs::create_dir_all(target.parent().unwrap_or(state_dir))?;
-        if let Some(beside) = source.parent() {
-            for sidecar in SIDECARS {
-                let from = beside.join(sidecar);
-                if from.is_file() {
-                    replace_atomically(&from, &target.with_file_name(sidecar))?;
-                }
-            }
-        }
         replace_atomically(&source, &target)?;
         let pending = target.with_file_name(format!(".{STAMP}.{}.tmp", std::process::id()));
         std::fs::write(&pending, &wanted)?;
