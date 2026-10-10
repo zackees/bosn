@@ -586,9 +586,7 @@ pub async fn remove_owned_engine(
     }
     crate::act_engine::stop_source_writers(registry, engine, &record, &record.registry_id).await?;
     remove_storage_volume(engine, &record, &record.registry_id).await?;
-    if let Some(socket) = socket::of(&record.intent) {
-        socket::remove_dir(socket);
-    }
+    remove_socket_dir(&record.intent);
     registry
         .act_registry(ActRegistryCommand::Finalize {
             run: run.into(),
