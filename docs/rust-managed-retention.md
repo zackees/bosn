@@ -127,6 +127,26 @@ record's `Pinned` is not: every setup and manifest ensure writes it unconditiona
 sets or clears it, so it is bookkeeping rather than a human promise. A container is protected by
 liveness, leases and sessions instead, and an explicit `pinned` label on the object still wins.
 
+## Idle keepalive containers are stopped (#545, #536)
+
+A setup or manifest app with no declared command runs the fixed keepalive
+(`trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done`) so later tasks can `exec`
+into it. Docker reports it running forever, so the pass above would hold it as `in-use` and it
+would pin its volumes indefinitely. Before each unattended pass the daemon therefore **stops**
+(never removes) a keepalive container when all of these hold, re-checking the container, its
+process table and the registry immediately before the stop:
+
+- running, setup-labelled and proven by a record in this registry (above);
+- its `Config.Cmd` is exactly the keepalive launcher, not a declared command;
+- no lease, execution session or creation intent names it, and it has no `pinned` label;
+- both its age and the registry's idle time are past the container gate (6 h);
+- `docker top` shows exactly the keepalive shell and its `sleep`.
+
+At most 16 are stopped per pass, with a 10 s grace for the keepalive's `TERM` trap. The same
+pass then reclaims the stopped container and, in later passes, the volumes it no longer pins,
+under the ordinary gates. A later `setup ensure` or manifest run starts or recreates it. Declared
+app containers (a real service) and `manifest-guest` VMs are never stopped by this rule.
+
 ## Stopped setup containers are reported by default (#518)
 
 `bosn-setup-v2-*` containers are created with `docker container create` and **no `--rm`**, and

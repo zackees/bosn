@@ -53,6 +53,7 @@ pub use ensure::{
 };
 
 mod shell;
+pub use shell::login_shell_args;
 
 mod task;
 pub use task::{
