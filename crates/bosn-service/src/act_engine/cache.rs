@@ -60,6 +60,7 @@ pub(crate) fn creation_profile_with_tools(
     profile.init_command_sha256 = command_digest(&engine_command_with_tools(
         cache.as_ref(),
         generation.as_ref(),
+        None,
     )?)?;
     profile.cache_volume = cache;
     profile.tool_generation = generation;
@@ -77,20 +78,23 @@ pub(crate) fn creation_profile_with_tools(
 pub(super) fn engine_command_with_cache(
     cache: Option<&ActEngineCacheVolume>,
 ) -> Result<Vec<String>, ActEngineError> {
-    engine_command_with_tools(cache, None)
+    engine_command_with_tools(cache, None, None)
 }
 
 pub(super) fn engine_command_with_tools(
     cache: Option<&ActEngineCacheVolume>,
     generation: Option<&bosn_registry::act::ActToolGenerationBinding>,
+    socket: Option<&bosn_registry::act::ActEngineDockerSocket>,
 ) -> Result<Vec<String>, ActEngineError> {
+    let mut dockerd = engine_command();
+    dockerd.extend(socket::listener_args(socket));
     if generation.is_some() && cache.is_none() {
         return Err(ActEngineError(
             "tool generation requires shared cache".into(),
         ));
     }
     let Some(cache) = cache else {
-        return Ok(engine_command());
+        return Ok(dockerd);
     };
     cache
         .validate()
@@ -131,7 +135,7 @@ pub(super) fn engine_command_with_tools(
             "--".into(),
         ]);
     }
-    command.extend(engine_command());
+    command.extend(dockerd);
     Ok(command)
 }
 

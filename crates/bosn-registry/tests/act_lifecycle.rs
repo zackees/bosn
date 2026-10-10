@@ -17,6 +17,7 @@ fn profile() -> ActEngineCreationProfile {
         cache_volume: None,
         cache_coordination: None,
         tool_generation: None,
+        docker_socket: None,
     }
 }
 fn intent() -> ActEngineIntent {

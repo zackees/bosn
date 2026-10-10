@@ -12,6 +12,8 @@ mod recovery;
 pub use recovery::{ActToolRecoveryIntent, ActToolSourceStopProof};
 mod spare;
 pub use spare::ActEngineBinding;
+mod socket;
+pub use socket::{ActEngineDockerSocket, ENGINE_DOCKER_SOCKET, ENGINE_SOCKET_DIR, SOCKET_DIR_MAX};
 
 const PREFIX: &str = "act.engine.v1:";
 /// Frozen producer policy, not client-selected Docker options.
@@ -61,6 +63,10 @@ pub struct ActEngineCreationProfile {
     /// Exact immutable tool generation admitted by the engine startup process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_generation: Option<ActToolGenerationBinding>,
+    /// The bound Docker socket directory (#547); absent in earlier profiles,
+    /// whose serialized identity stays unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker_socket: Option<ActEngineDockerSocket>,
 }
 /// A frozen named-volume mount: Docker's `local` driver, read-write, at
 /// `target`. The volume's ownership is verified before creation and the
@@ -144,6 +150,9 @@ impl ActEngineCreationProfile {
         }
         if let Some(cache) = &self.cache_volume {
             cache.validate()?;
+        }
+        if let Some(socket) = &self.docker_socket {
+            socket.validate()?;
         }
         // Disk-backed storage is not RAM: only the tmpfs mounts are reserved.
         let in_memory = if self.tmpfs_policy.storage_in_memory() {

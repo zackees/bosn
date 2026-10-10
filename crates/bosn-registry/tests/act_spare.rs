@@ -23,6 +23,7 @@ fn profile() -> ActEngineCreationProfile {
         cache_volume: None,
         cache_coordination: None,
         tool_generation: None,
+        docker_socket: None,
     }
 }
 
@@ -225,4 +226,33 @@ fn a_spare_matches_only_an_identical_engine() {
     let mut pins = run.clone();
     pins.runner_image_digest = format!("sha256:{}", "0".repeat(64));
     assert!(!base.same_engine(&pins), "a pin changed (#378)");
+}
+
+#[test]
+fn a_spare_matches_whatever_its_socket_directory_is_named() {
+    let socket = |dir: &str, group: u32| ActEngineDockerSocket {
+        host_dir: dir.into(),
+        group,
+    };
+    let mut base = spare(SPARE);
+    base.creation_profile.as_mut().unwrap().docker_socket = Some(socket("/s/aaaaaaaa", 100));
+    let mut run = base.clone();
+    run.run_id = RUN.into();
+    run.creation_profile.as_mut().unwrap().docker_socket = Some(socket("/s/bbbbbbbb", 100));
+    assert!(
+        base.same_engine(&run),
+        "each engine names its own directory"
+    );
+    let mut group = run.clone();
+    group.creation_profile.as_mut().unwrap().docker_socket = Some(socket("/s/bbbbbbbb", 0));
+    assert!(
+        !base.same_engine(&group),
+        "the socket's group is the engine's"
+    );
+    let mut none = run;
+    none.creation_profile.as_mut().unwrap().docker_socket = None;
+    assert!(
+        !base.same_engine(&none),
+        "an engine without the socket differs"
+    );
 }

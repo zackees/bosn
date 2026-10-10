@@ -223,3 +223,12 @@ Decided 2026-10-09.
   the sole registry writer and Docker owner for a state directory, so it stays
   one daemon per state directory; skew is solved by the daemon serving a
   window of protocols, not by running several daemons (phased plan on #509).
+- **Docker access into the engine (2026-10-09, #547 step 2).** Each Linux engine binds
+  its own short host directory (`<state>/sock/<key>`, or `/tmp/bosn-sock-<hash>/<key>`
+  when the state path is too long for the 108-byte socket limit) at `/bosn/sock`; the
+  engine's `dockerd` also listens there (`engine.sock`, group = the daemon user's). The
+  per-run Docker proxy runs in the daemon on the host, in that directory, so act and
+  its job containers reach Docker only through their run's proxy. No proxy binary is
+  shipped into the engine. The directory is frozen in the creation profile
+  (`docker_socket`) and removed with the engine. Non-Linux daemons (Docker Desktop VMs)
+  bind nothing and keep per-run engines.

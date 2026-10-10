@@ -49,6 +49,8 @@ mod manifest;
 pub use manifest::*;
 mod create;
 pub use create::*;
+mod socket;
+pub(crate) use socket::with_docker_socket;
 mod observe;
 pub use observe::*;
 #[cfg(test)]
