@@ -68,13 +68,23 @@ impl ActEngineIntent {
     /// Whether `other` would create exactly the engine this intent did: the
     /// same pinned act, engine and runner, and the same frozen creation
     /// profile. A spare is only ever claimed by a run whose intent matches.
+    /// The Docker socket directory is named after each engine (#547), so only
+    /// its presence and group must match.
     pub fn same_engine(&self, other: &Self) -> bool {
+        let shape = |intent: &Self| {
+            intent.creation_profile.clone().map(|mut profile| {
+                if let Some(socket) = &mut profile.docker_socket {
+                    socket.host_dir.clear();
+                }
+                profile
+            })
+        };
         self.act_version == other.act_version
             && self.act_image_digest == other.act_image_digest
             && self.engine_image_digest == other.engine_image_digest
             && self.runner_image_digest == other.runner_image_digest
             && self.creation_profile.is_some()
-            && self.creation_profile == other.creation_profile
+            && shape(self) == shape(other)
     }
 }
 

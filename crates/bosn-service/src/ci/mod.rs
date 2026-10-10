@@ -82,6 +82,7 @@ pub mod runtime;
 pub mod scheduler;
 pub mod schema;
 pub mod snapshot;
+pub mod socket_dir;
 pub mod spare;
 pub mod status;
 pub mod storage;

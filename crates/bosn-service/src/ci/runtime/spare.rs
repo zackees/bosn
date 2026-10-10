@@ -52,7 +52,7 @@ impl CiRuntime {
         let id = new_uuid().await.map_err(|e| e.message)?;
         let workspace = self.state_dir.to_string_lossy().into_owned();
         Ok(Some(SparePlan {
-            intent: spec.intent(ActEngineBinding::spare(&id, &workspace), true),
+            intent: spec.intent(ActEngineBinding::spare(&id, &workspace), true)?,
             act: spec.act,
             cache: spec.cache,
         }))

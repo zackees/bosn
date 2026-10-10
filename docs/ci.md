@@ -445,7 +445,13 @@ stubbed job.
       the cache volume retires it first. Opt out with `[engine] spares = 0`.
   - Its one named mount is the machine-wide cache volume (below), frozen into
     the creation profile, verified before creation and on every observation.
-    No host path or socket is mounted.
+    The host Docker socket is never mounted. On Linux the one host path is the
+    engine's own socket directory (`<state>/sock/<key>`, or
+    `/tmp/bosn-sock-<hash>/<key>` when the state path is too long for a Unix
+    socket), bound at `/bosn/sock`: the engine's `dockerd` also listens there
+    (`engine.sock`, mode 0660, the daemon user's group) so the daemon's per-run
+    Docker proxies can reach it (#547). It is frozen in the creation profile
+    and removed with the engine.
   - Every artifact is pinned in one place (`crates/bosn-service/src/ci/pins.rs`).
     act is downloaded into the cache volume from the pinned release URL; the
     tarball and the binary inside are checked against their pinned sha256s.

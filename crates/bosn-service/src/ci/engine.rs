@@ -2,8 +2,8 @@
 //!
 //! #349's owned engine ([`crate::act_engine`]) freezes its creation profile
 //! before creating the pinned Docker image with a read-only root, private
-//! storage/cgroup namespace and no host path or socket. Its verified machine
-//! cache mount survives; everything else goes with the engine on retirement.
+//! storage/cgroup namespace and, on Linux, one host path: its own Docker
+//! socket directory (#547). Its verified machine cache mount survives; everything else goes with the engine on retirement.
 //!
 //! [`DockerActBackend`] runs act through the nested engine's private socket.
 //! [`super::pins`] verifies the act archive/binary and runner manifest/config.

@@ -176,6 +176,7 @@ pub(crate) fn creation_profile(
         cache_volume: None,
         cache_coordination: None,
         tool_generation: None,
+        docker_socket: None,
     };
     profile
         .validate()
@@ -202,7 +203,22 @@ pub(crate) fn frozen_limits(intent: &ActEngineIntent) -> Result<ActEngineLimits,
 }
 
 /// Only the trusted daemon may use these arguments, after its intent commits.
-/// No source directory, host socket, credentials or anonymous volume is bound.
+/// A cache-backed engine installs act at startup: it must be the pinned one.
+fn verify_startup_act(intent: &ActEngineIntent) -> Result<(), ActEngineError> {
+    let act = crate::ci::pins::act_artifact("amd64")
+        .ok_or_else(|| ActEngineError("no pinned startup act artifact".into()))?;
+    if intent.act_version != crate::ci::pins::ACT_VERSION
+        || intent.act_image_digest != format!("sha256:{}", act.sha256)
+    {
+        return Err(ActEngineError(
+            "startup act differs from frozen intent".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// No source directory, host Docker socket, credentials or anonymous volume
+/// is bound; the only host path is the engine's own socket directory (#547).
 pub fn create_arguments(
     intent: &ActEngineIntent,
     owner: &str,
@@ -214,21 +230,17 @@ pub fn create_arguments(
         .as_ref()
         .and_then(|profile| profile.cache_volume.clone());
     if cache.is_some() {
-        let act = crate::ci::pins::act_artifact("amd64")
-            .ok_or_else(|| ActEngineError("no pinned startup act artifact".into()))?;
-        if intent.act_version != crate::ci::pins::ACT_VERSION
-            || intent.act_image_digest != format!("sha256:{}", act.sha256)
-        {
-            return Err(ActEngineError(
-                "startup act differs from frozen intent".into(),
-            ));
-        }
+        verify_startup_act(intent)?;
     }
     let generation = intent
         .creation_profile
         .as_ref()
         .and_then(|profile| profile.tool_generation.clone());
-    let expected_profile = creation_profile_with_tools(limits, cache.clone(), generation.clone())?;
+    let socket = socket::of(intent).cloned();
+    let expected_profile = socket::frozen_into(
+        creation_profile_with_tools(limits, cache.clone(), generation.clone())?,
+        socket.clone(),
+    )?;
     if intent.creation_profile.as_ref() != Some(&expected_profile) {
         return Err(ActEngineError(
             "creation differs from frozen engine profile".into(),
@@ -290,8 +302,12 @@ pub fn create_arguments(
             ),
         ]);
     }
-    if let Some(cache) = &cache {
-        args.extend(["--mount".into(), cache_mount_argument(cache)]);
+    for mount in cache
+        .iter()
+        .map(cache_mount_argument)
+        .chain(socket.iter().map(socket::bind_argument))
+    {
+        args.extend(["--mount".into(), mount]);
     }
     for (key, value) in labels {
         args.extend(["--label".into(), format!("{key}={value}")]);
@@ -303,6 +319,7 @@ pub fn create_arguments(
     args.extend(engine_command_with_tools(
         cache.as_ref(),
         generation.as_ref(),
+        socket.as_ref(),
     )?);
     Ok(args)
 }
@@ -450,6 +467,7 @@ pub(super) async fn create_owned_engine_inner(
         verify_cache_volume(&volume, cache)?;
     }
     ensure_storage_volume(engine, &intent, owner).await?;
+    socket::of(&intent).map_or(Ok(()), socket::ensure_dir)?;
     // From here an engine may exist even if this daemon never learns its ID, so its absence can
     // no longer be proven by an empty lookup. Before here it can (#554).
     registry
@@ -568,6 +586,9 @@ pub async fn remove_owned_engine(
     }
     crate::act_engine::stop_source_writers(registry, engine, &record, &record.registry_id).await?;
     remove_storage_volume(engine, &record, &record.registry_id).await?;
+    if let Some(socket) = socket::of(&record.intent) {
+        socket::remove_dir(socket);
+    }
     registry
         .act_registry(ActRegistryCommand::Finalize {
             run: run.into(),

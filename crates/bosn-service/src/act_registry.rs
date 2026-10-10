@@ -415,6 +415,7 @@ mod tests {
                 cache_volume: None,
                 cache_coordination: None,
                 tool_generation: None,
+                docker_socket: None,
             }),
         };
         let runtime = kernal_api::async_engine::RuntimeBuilder::multi_thread()
@@ -550,6 +551,7 @@ mod tests {
                 cache_volume: None,
                 cache_coordination: None,
                 tool_generation: None,
+                docker_socket: None,
             }),
         }
     }

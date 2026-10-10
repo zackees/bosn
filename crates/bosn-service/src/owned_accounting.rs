@@ -532,6 +532,7 @@ mod tests {
                 cache_volume: None,
                 cache_coordination: None,
                 tool_generation: None,
+                docker_socket: None,
             }),
         };
         let mut writer = bosn_registry::Registry::create_writer(&path, owner).unwrap();

@@ -16,12 +16,24 @@ pub(super) struct EngineSpec {
     pub(super) act: ActArtifact,
     pub(super) cache: CacheVolume,
     profile: ActEngineCreationProfile,
+    state_dir: std::path::PathBuf,
 }
 
 impl EngineSpec {
-    /// The intent of an engine bound to `binding` (a run, or a spare).
-    pub(super) fn intent(&self, binding: ActEngineBinding, spare: bool) -> ActEngineIntent {
-        ActEngineIntent {
+    /// The intent of an engine bound to `binding` (a run, or a spare), with
+    /// its own Docker socket directory when this daemon can share one (#547).
+    pub(super) fn intent(
+        &self,
+        binding: ActEngineBinding,
+        spare: bool,
+    ) -> Result<ActEngineIntent, String> {
+        let profile =
+            match super::super::socket_dir::engine_socket(&self.state_dir, &binding.run_id) {
+                Some(socket) => crate::act_engine::with_docker_socket(self.profile.clone(), socket)
+                    .map_err(|e| e.to_string())?,
+                None => self.profile.clone(),
+            };
+        Ok(ActEngineIntent {
             run_id: binding.run_id,
             workspace: binding.workspace,
             candidate_sha: binding.candidate_sha,
@@ -32,9 +44,9 @@ impl EngineSpec {
             engine_image_digest: crate::act_engine::ENGINE_MANIFEST.into(),
             runner_image_digest: super::super::pins::runner_manifest().into(),
             created_at: lifecycle::now_seconds(),
-            creation_profile: Some(self.profile.clone()),
+            creation_profile: Some(profile),
             spare,
-        }
+        })
     }
 }
 
@@ -60,6 +72,7 @@ impl CiRuntime {
             act,
             cache,
             profile,
+            state_dir: self.state_dir.clone(),
         })
     }
 
@@ -83,7 +96,7 @@ impl CiRuntime {
                 snapshot_sha256: record.tree_digest.clone(),
             },
             false,
-        );
+        )?;
         let spare = match config.spares {
             Spares::One => {
                 let spare = self.spares.take(&intent, deadline, cancellation).await;

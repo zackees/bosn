@@ -47,9 +47,19 @@ pub fn observe_engine(
     let host = &engine["HostConfig"];
     let tmpfs: BTreeMap<String, String> =
         serde_json::from_value(host["Tmpfs"].clone()).map_err(|e| ActEngineError(e.to_string()))?;
+    let socket = profile.docker_socket.as_ref();
+    let mismatch = || {
+        ActEngineError(
+            "Act engine identity, ownership or isolation does not match committed intent".into(),
+        )
+    };
+    // The frozen socket directory (#547) is the one bind an engine may have.
     let mounts = engine["Mounts"]
         .as_array()
         .ok_or_else(|| ActEngineError("missing mount observation".into()))?;
+    let mounts = &super::socket::without_socket_bind(mounts, socket).ok_or_else(mismatch)?;
+    let host_mounts =
+        super::socket::host_without_socket_bind(&host["Mounts"], socket).ok_or_else(mismatch)?;
     // The volumes (the frozen cache, a disk-backed engine's storage) are
     // checked on their own; every other reported mount must be one of the
     // declared tmpfs mounts.
@@ -109,7 +119,7 @@ pub fn observe_engine(
             .is_none_or(|v| !v.is_null() && !v.as_array().is_some_and(|v| v.is_empty()))
         || !empty(&host["Binds"])
         || !empty(&host["VolumesFrom"])
-        || !host_mounts_match(&host["Mounts"], profile.cache_volume.as_ref(), storage, storage_name.as_deref())
+        || !host_mounts_match(&host_mounts, profile.cache_volume.as_ref(), storage, storage_name.as_deref())
         || !volume_mounts_match(mounts, profile.cache_volume.as_ref(), storage, storage_name.as_deref())
         || !empty(&host["PortBindings"])
         || tmpfs != expected_tmpfs
@@ -154,9 +164,7 @@ pub fn observe_engine(
             .as_object()
             .is_none_or(|v| v.len() != 1 || !v.contains_key("/var/lib/docker"))
     {
-        return Err(ActEngineError(
-            "Act engine identity, ownership or isolation does not match committed intent".into(),
-        ));
+        return Err(mismatch());
     }
     Ok(ActEngineObservation {
         name: intent.engine_name(),
