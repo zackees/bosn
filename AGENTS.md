@@ -246,12 +246,52 @@ Decided 2026-10-09.
 - **Shared engine rollout (2026-10-09, #547 step 2).** `[engine] shared` defaults to
   on for Linux daemons: concurrent runs lease slots (ports `40000+2·slot`) in one
   long-lived engine, each in its own run scope, and the engine retires after
-  `[engine] idle_retire_secs` (default 600) with no run. Per-run engines remain for
-  `shared = false`, non-Linux daemons, and a run whose wanted engine differs from a
-  busy shared one. Spares are not kept while sharing is on. act's `act-<…>` job
+  `[engine] idle_retire_secs` (default 600) with no run. Per-run engines remain only
+  for `shared = false` and non-Linux daemons; a run whose wanted engine differs from
+  the machine's engine waits for it to drain (#544), never gets its own. Spares are
+  not kept while sharing is on. act's `act-<…>` job
   volumes are renamed with the run key by the run proxy; `act-toolcache` stays shared
   and is seeded once per engine. Step 4 (#547) removes the per-run path. Non-Linux daemons (Docker Desktop VMs)
   bind nothing and keep per-run engines.
+
+## CI engine architecture (#544, #547)
+
+Decided 2026-10-08. This replaces "one private nested engine per run."
+
+- **One long-lived act engine per machine.** Concurrent runs execute inside it,
+  each isolated by its own parent cgroup (`--cgroup-parent=/run-<id>` with
+  memory/CPU/pids limits), network, work directory, artifact path and a
+  run-scoped Docker proxy. Per-run cleanup inside the engine is keyed by the run
+  label; the engine has one storage budget, in-engine GC and idle retirement.
+- **No per-run engines with an external cache-sharing protocol.** The cache has
+  one owner inside the engine, not leases coordinated across engines (the
+  approach in #546, rejected).
+- **act2 owns CI; Bosn stays a generic Docker lifecycle manager.** An act2
+  serve mode inside the engine owns run admission, concurrency, isolation, the
+  action/tool/image cache and in-engine cleanup. Bosn manages the engine as an
+  ordinary long-lived owned container and forwards `bosn ci` unchanged. Move
+  CI-specific code out of `bosn-service` behind that boundary; do not add new
+  act-specific machinery to Bosn. No third composite app unless something
+  other than act2 needs the cache.
+- Trust model is unchanged: the engine is privileged, so it runs trusted
+  workflows only.
+- **Singleton enforcement is a Docker name claim (2026-10-10, #544).** The host
+  Docker engine decides which daemon makes the machine's engine: a created, never
+  started container named `bosn-ci-engine-claim` whose labels name the engine and
+  the holding daemon (registry, boot ID, pid, pid start time). Docker's name
+  uniqueness makes it atomic across daemons, state directories, users and
+  restarts, and it is scoped to the actual Docker engine, not the host's
+  filesystem. A machine-level file lock was rejected: it is scoped to a
+  filesystem, not the Docker engine, and does not survive into the engine. Other
+  daemons adopt the claimed engine when its identity (pinned act/engine/runner
+  images and init command) matches, else request retirement and wait; a dead
+  holder's claim is taken over once no live run is in it.
+- **Slots live in the engine (#544).** Runs from every daemon lease slots in
+  `/run/bosn-slots` inside the engine under one `flock`, so idleness and ports
+  are the engine's. Only the engine's maker retires it (registry proof); others
+  only retire one whose maker died. Legacy engines (any act engine but the
+  claimed one) are drained: busy ones finish, idle ones older than 10 minutes
+  and seen idle twice are removed with their storage volumes, proven absent.
 
 ## Automatic retention (#545)
 

@@ -51,6 +51,8 @@ pub struct FakeBackend {
     pub stopped: Mutex<std::collections::BTreeSet<String>>,
     /// Run labels whose scope was closed (#547).
     pub closed_scopes: Mutex<Vec<String>>,
+    /// The host engine's claim and slot tables (#544).
+    pub machine: super::fake_machine::FakeMachine,
     next: Mutex<u64>,
 }
 impl FakeBackend {
@@ -119,6 +121,9 @@ pub(super) fn later(record: &ActEngineRecord) -> f64 {
     now_seconds().max(record.updated_at)
 }
 impl ActEngineBackend for FakeBackend {
+    fn machine(&self) -> Option<&dyn crate::ci::machine::MachineEngine> {
+        Some(self)
+    }
     fn engine_running<'a>(&'a self, engine_id: &'a str) -> crate::ci::engine::BoxFuture<'a, bool> {
         Box::pin(async move {
             self.live_id(engine_id) && !self.stopped.lock().unwrap().contains(engine_id)
