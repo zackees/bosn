@@ -145,6 +145,13 @@ pub(crate) struct ReplyWire {
     /// daemon that predates the protocol handshake (#509).
     #[prost(uint32, tag = "67")]
     pub(crate) daemon_protocol: u32,
+    /// The oldest protocol the daemon serves, on a ping reply and on a code-5
+    /// refusal (#509 phase 3). Zero from a daemon that predates the window.
+    #[prost(uint32, tag = "68")]
+    pub(crate) daemon_protocol_min: u32,
+    /// On a code-5 refusal: the client protocol the daemon refused.
+    #[prost(uint32, tag = "69")]
+    pub(crate) refused_client_protocol: u32,
 }
 #[derive(Message)]
 pub(crate) struct LogRecordWire {
@@ -372,7 +379,16 @@ pub(crate) fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
         10 => Ok(Reply::Pong(DaemonIdentity {
             release: v.daemon_version,
             protocol: v.daemon_protocol,
+            protocol_min: v.daemon_protocol_min,
         })),
+        5 => Err(Error::ProtocolUnsupported {
+            daemon: DaemonIdentity {
+                release: v.daemon_version,
+                protocol: v.daemon_protocol,
+                protocol_min: v.daemon_protocol_min,
+            },
+            client_protocol: v.refused_client_protocol,
+        }),
         360 => Ok(Reply::Ci(v.ci_reply)),
         361 => Ok(Reply::CiError(v.ci_reply)),
         20 => Ok(Reply::Status(Status {
@@ -573,6 +589,10 @@ pub(crate) struct Request {
     /// Set only together with `gc_confirm`: this is a destructive pass, not a preview.
     #[prost(bool, tag = "28")]
     pub(crate) owned_confirm: bool,
+    /// The client's [`DAEMON_PROTOCOL`] (#509 phase 3). Zero from a client
+    /// that predates the window; the daemon serves it as before.
+    #[prost(uint32, tag = "29")]
+    pub(crate) client_protocol: u32,
 }
 impl Request {
     pub(crate) fn operation(operation: u32) -> Self {
@@ -605,6 +625,7 @@ impl Request {
             owned_image_ttl_secs: 0,
             owned_max_bytes: 0,
             owned_confirm: false,
+            client_protocol: DAEMON_PROTOCOL,
         }
     }
 }

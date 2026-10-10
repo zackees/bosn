@@ -173,6 +173,12 @@ pub enum Error {
     EndpointOccupied(String),
     ActorClosed,
     Protocol(&'static str),
+    /// The daemon refused this client's protocol (#509 phase 3): it is outside
+    /// the window the daemon serves.
+    ProtocolUnsupported {
+        daemon: DaemonIdentity,
+        client_protocol: u32,
+    },
     /// A typed CI refusal or failure (`code` is stable, e.g. `refused`).
     Ci {
         code: String,
@@ -191,6 +197,13 @@ impl From<bosn_registry::Error> for Error {
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Self::ProtocolUnsupported {
+            daemon,
+            client_protocol,
+        } = self
+        {
+            return f.write_str(&protocol_refusal(daemon, *client_protocol));
+        }
         write!(f, "{self:?}")
     }
 }

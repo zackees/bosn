@@ -181,6 +181,16 @@ Decided 2026-10-09.
   release-skew note goes to stderr); another protocol is refused. A daemon
   reporting protocol 0 predates the handshake and keeps the exact-release
   check. `daemon_version_mismatch` is the one place this is decided.
+- **The daemon serves a protocol window (#509 phase 3).** It advertises
+  `[DAEMON_PROTOCOL_MIN, DAEMON_PROTOCOL]` on ping, and every request carries
+  the client's protocol. A bump of `DAEMON_PROTOCOL` keeps the previous
+  protocol's decoders: `DAEMON_PROTOCOL_MIN` trails it by exactly one (N-1). A
+  client outside the window gets one typed refusal from the daemon (reply code
+  5, `Error::ProtocolUnsupported`, `protocol_unsupported:` with both windows
+  and the remedy). Ping and stop are always served so the remedy stays
+  reachable; a request reporting protocol 0 predates the window and is served.
+  Additive fields that every peer of the current protocol still reads are not
+  a bump (phase 3 itself added its fields this way).
 - **Compatibility moves from release equality to a wire protocol (#509).**
   Every daemon reports `DAEMON_PROTOCOL` on its ping reply (zero means it
   predates the handshake). Bump it on any change to the request/reply wire or

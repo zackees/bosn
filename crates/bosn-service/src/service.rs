@@ -26,6 +26,7 @@ impl Service {
             identity: Arc::new(DaemonIdentity {
                 release: String::new(),
                 protocol: DAEMON_PROTOCOL,
+                protocol_min: DAEMON_PROTOCOL_MIN,
             }),
             act_backend: Arc::new(ci::engine::DockerActBackend::default()),
             identity_probe: default_identity_probe(),
@@ -50,8 +51,15 @@ impl Service {
     /// The wire protocol this daemon reports on ping, overriding
     /// [`DAEMON_PROTOCOL`]. A test seam: zero emulates a daemon that predates
     /// the protocol handshake (#509).
-    pub fn with_reported_protocol(mut self, protocol: u32) -> Self {
-        Arc::make_mut(&mut self.identity).protocol = protocol;
+    pub fn with_reported_protocol(self, protocol: u32) -> Self {
+        self.with_protocol_window(protocol, protocol)
+    }
+    /// The protocol window this daemon serves and reports, overriding
+    /// `[DAEMON_PROTOCOL_MIN, DAEMON_PROTOCOL]`. A test seam (#509 phase 3).
+    pub fn with_protocol_window(mut self, min: u32, max: u32) -> Self {
+        let identity = Arc::make_mut(&mut self.identity);
+        identity.protocol_min = min;
+        identity.protocol = max;
         self
     }
     /// Substitute only the semantic setup executor. This is primarily an
