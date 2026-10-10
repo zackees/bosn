@@ -29,6 +29,7 @@ pub use cache_usage::HelperCleanupRetry;
 mod cache_usage_transport_tests;
 mod inventory;
 mod legacy_lease;
+mod machine_docker;
 mod machine_policy;
 mod maintenance;
 #[cfg(test)]
@@ -282,6 +283,10 @@ pub trait ActEngineBackend: Send + Sync {
     /// Remove the cache volume. The host engine refuses while any container
     /// (another daemon's run included) still uses it.
     fn remove_cache<'a>(&'a self, volume: &'a str) -> BoxFuture<'a, Result<(), String>>;
+    /// The host Docker engine's singleton coordination (#544), if any.
+    fn machine(&self) -> Option<&dyn super::machine::MachineEngine> {
+        None
+    }
 }
 
 const CONTROL_DEADLINE: Duration = Duration::from_secs(60);
@@ -546,6 +551,9 @@ fn owned(args: &[&str]) -> Vec<String> {
 }
 
 impl ActEngineBackend for DockerActBackend {
+    fn machine(&self) -> Option<&dyn super::machine::MachineEngine> {
+        Some(self)
+    }
     fn engine_running<'a>(&'a self, engine_id: &'a str) -> BoxFuture<'a, bool> {
         Box::pin(async move {
             let inspect = owned(&[

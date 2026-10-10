@@ -18,7 +18,6 @@ impl CiRuntime {
         match plan.shared.take() {
             Some(want) => {
                 lifecycle::shared::run_on_shared(
-                    &self.registry,
                     self.backend.as_ref(),
                     &self.shared,
                     want,

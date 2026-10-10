@@ -63,3 +63,8 @@ cmd = "soldr toolchain ensure --json && soldr cargo test -p bosn-service --lib d
 [task.retention-test]
 stack = "test"
 cmd = "soldr toolchain ensure --json && soldr cargo test -p bosn-core --lib retention --locked && soldr cargo test -p bosn-service --lib managed_retention --locked && soldr cargo test -p bosn-service --lib protocol_surface_is_pinned --locked"
+
+# The machine-wide shared engine (#544, #547); reuses the isolated test stack.
+[task.shared-engine-test]
+stack = "test"
+cmd = "soldr toolchain ensure --json && soldr cargo test -p bosn-service --lib --locked -- ci::lifecycle ci::machine ci::spare ci::shared_engine"

@@ -1,4 +1,4 @@
-//! One long-lived engine shared by concurrent runs (#547, plan step 2).
+//! One long-lived engine shared by every run on the machine (#547, #544).
 //!
 //! The engine is an ordinary #349 owned engine, made exactly like a spare
 //! ([`super::spare::prepare`]): its intent is durable before it exists, the
@@ -10,17 +10,19 @@
 //! (from the slot) and its own Docker proxy. When a run ends, everything
 //! carrying its label is removed from the engine, and the engine stays up.
 //!
-//! **Idle retirement.** An engine with no leased slot for
-//! `[engine] idle_retire_secs` (default [`DEFAULT_IDLE_RETIRE`], 10 minutes)
-//! is retired by the daemon: removed with proof, its storage volume with it,
-//! exactly like a finished per-run engine. The next run makes a new one. A
-//! daemon that stops retires an idle engine; one it leaves behind (busy, or
-//! the daemon died) is retired by the next daemon's startup recovery.
+//! **One per machine (#544).** Which daemon makes the engine is decided by
+//! the host Docker engine's claim ([`super::machine`]). Every other daemon,
+//! from any state directory, runs in the claimed engine when it is the
+//! engine it would make, and otherwise waits for it to drain and retire.
+//! Slots are leased in the engine itself, so the slot table spans daemons.
+//! A run never falls back to an engine of its own.
 //!
-//! An engine whose intent no longer matches what a run would create (the
-//! config, the host sizing or a pin changed) is retired once idle and
-//! replaced; until then runs that want the new engine get their own per-run
-//! engine, so nothing waits on a busy engine to drain.
+//! **Idle retirement.** The daemon that made the engine retires it once no
+//! slot has been held for `[engine] idle_retire_secs` (default
+//! [`DEFAULT_IDLE_RETIRE`], 10 minutes), or as soon as it is empty when a
+//! daemon needs a different engine: removed with proof, its storage volume
+//! with it, and the claim released. One whose daemon died is retired by any
+//! daemon's reaper once idle, as are idle legacy engines.
 
 use std::{
     collections::BTreeSet,
@@ -32,16 +34,24 @@ use bosn_registry::act::ActEngineDockerSocket;
 use kernal_api::async_engine::{self, CancellationToken};
 
 use super::{
-    engine::{ActEngineBackend, MAX_SLOTS},
+    engine::ActEngineBackend,
     lifecycle::Claim,
-    spare::{self, Spare, SparePlan},
+    machine::{Daemon, EngineIdentity, Holder, Leased, MachineEngine},
+    spare::{Spare, SparePlan},
 };
 use crate::RegistryActor;
+
+mod machine_ops;
 
 /// How long an engine with no run is kept before it is retired.
 pub const DEFAULT_IDLE_RETIRE: Duration = Duration::from_secs(600);
 /// How often the daemon checks for an idle engine.
 const REAP_EVERY: Duration = Duration::from_secs(15);
+/// How often a waiting run looks again.
+const WAIT_TICK: Duration = Duration::from_secs(2);
+/// How long a new engine waits for busy legacy engines to finish before
+/// it is made beside them (they are still retired once idle).
+const LEGACY_DRAIN_WAIT: Duration = Duration::from_secs(10 * 60);
 
 /// A run's slot in the shared engine; give it back with [`SharedEngine::release`].
 #[derive(Debug)]
@@ -56,24 +66,61 @@ pub struct Lease {
     pub pids: u64,
 }
 
+/// Whose engine it is.
+enum Kind {
+    /// This daemon made it (its registry holds the record) and holds the
+    /// machine claim `claim` (the claim container's ID).
+    Owned { engine: Box<Spare>, claim: String },
+    /// Another daemon's.
+    Adopted,
+}
+
 struct Held {
-    engine: Spare,
+    kind: Kind,
+    id: String,
+    name: String,
+    identity: EngineIdentity,
+    socket: ActEngineDockerSocket,
+    memory_bytes: u64,
+    nano_cpus: u64,
+    pids: u64,
+    /// This daemon's runs in it.
     slots: BTreeSet<u16>,
-    idle_since: Instant,
+}
+
+impl Held {
+    fn lease(&self, slot: u16) -> Lease {
+        Lease {
+            engine_id: self.id.clone(),
+            engine_name: self.name.clone(),
+            slot,
+            socket: self.socket.clone(),
+            memory_bytes: self.memory_bytes,
+            nano_cpus: self.nano_cpus,
+            pids: self.pids,
+        }
+    }
 }
 
 #[derive(Default)]
 struct State {
     closed: bool,
+    /// This daemon runs CI: only then does it tend the machine's engines.
+    wanted: bool,
+    /// Since when a new engine has waited for busy legacy engines.
+    legacy_since: Option<Instant>,
+    /// Legacy engines found idle on the last look: one is retired only when
+    /// found idle twice, so a gap between two steps of a run is not idle.
+    idle_legacy: BTreeSet<String>,
 }
 
-/// Why no slot was leased.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Refused {
-    /// The engine is busy and is not the engine this run would create; the
-    /// run should use its own engine.
-    Mismatched,
-    Failed(String),
+/// One pass of a lease.
+enum Step {
+    Leased(Lease),
+    /// Look again now (the claim changed hands).
+    Again,
+    /// Look again after [`WAIT_TICK`]; why, for the run's log.
+    Wait(String),
 }
 
 pub struct SharedEngine {
@@ -97,130 +144,181 @@ impl SharedEngine {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A slot in the shared engine, making (and preparing) the engine when
-    /// there is none. `want` describes the engine this run would create.
+    fn machine(&self) -> Result<&dyn MachineEngine, String> {
+        self.backend
+            .machine()
+            .ok_or_else(|| "this Docker backend cannot share an engine".into())
+    }
+
+    /// A slot for run `run` in the machine's shared engine, making (and
+    /// preparing) the engine when there is none, and waiting while the
+    /// engine there is not one this run can use. `want` describes the engine
+    /// this daemon would make; `note` hears each reason the run waits.
     pub async fn lease(
         &self,
+        run: &str,
         want: SparePlan,
         cancellation: &CancellationToken,
-    ) -> Result<Lease, Refused> {
-        if self.state().closed {
-            return Err(Refused::Failed("the daemon is stopping".into()));
-        }
-        let mut held = self.held.lock().await;
-        if let Some(current) = held.as_ref() {
-            let usable = current.engine.intent.same_engine(&want.intent)
-                && self
-                    .backend
-                    .engine_running(&current.engine.observed.engine_id)
-                    .await
-                && Claim::held(&self.registry, &current.engine)
-                    .verify()
-                    .await
-                    .is_ok();
-            if !usable {
-                if !current.slots.is_empty() {
-                    return Err(Refused::Mismatched);
-                }
-                if let Some(stale) = held.take() {
-                    self.retire(&stale.engine).await;
+        note: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<Lease, String> {
+        self.state().wanted = true;
+        let identity =
+            EngineIdentity::of(&want.intent).ok_or("the shared engine has no creation profile")?;
+        let holder = Holder {
+            run: run.into(),
+            registry: super::lifecycle::registry_owner(&self.registry).await?,
+            daemon: Daemon::current(),
+        };
+        let mut said = BTreeSet::new();
+        loop {
+            if self.state().closed {
+                return Err("the daemon is stopping".into());
+            }
+            match self.step(&want, &identity, &holder, cancellation).await? {
+                Step::Leased(lease) => return Ok(lease),
+                Step::Again => async_engine::sleep(Duration::from_millis(100)).await,
+                Step::Wait(why) => {
+                    if said.insert(why.clone()) {
+                        note(&why);
+                    }
+                    async_engine::sleep(WAIT_TICK).await;
                 }
             }
         }
-        if held.is_none() {
-            let engine = spare::prepare(&self.registry, self.backend.as_ref(), want, cancellation)
-                .await
-                .map_err(Refused::Failed)?;
-            *held = Some(Held {
-                engine,
-                slots: BTreeSet::new(),
-                idle_since: Instant::now(),
-            });
+    }
+
+    async fn step(
+        &self,
+        want: &SparePlan,
+        identity: &EngineIdentity,
+        holder: &Holder,
+        cancellation: &CancellationToken,
+    ) -> Result<Step, String> {
+        let machine = self.machine()?;
+        let mut held = self.held.lock().await;
+        if let Some(current) = held.take() {
+            if self.usable(&current, identity).await {
+                *held = Some(current);
+            } else if let Some(wait) = self.replace(current, &mut held).await {
+                return Ok(Step::Wait(wait));
+            }
         }
-        let current = held
-            .as_mut()
-            .ok_or_else(|| Refused::Failed("no engine".into()))?;
-        let slot = (0..MAX_SLOTS)
-            .find(|slot| !current.slots.contains(slot))
-            .ok_or_else(|| Refused::Failed("the shared engine has no free slot".into()))?;
-        let profile = current
-            .engine
-            .intent
-            .creation_profile
-            .as_ref()
-            .ok_or_else(|| Refused::Failed("shared engine has no creation profile".into()))?;
-        let socket = profile
-            .docker_socket
-            .clone()
-            .ok_or_else(|| Refused::Failed("shared engine has no socket directory".into()))?;
-        let lease = Lease {
-            engine_id: current.engine.observed.engine_id.clone(),
-            engine_name: current.engine.intent.engine_name(),
-            slot,
-            socket,
-            memory_bytes: profile.memory_bytes,
-            nano_cpus: profile.nano_cpus,
-            pids: profile.pids,
+        if held.is_none() {
+            match self.find_or_make(want, identity, cancellation).await? {
+                Ok(found) => *held = Some(found),
+                Err(step) => return Ok(step),
+            }
+        }
+        let Some(current) = held.as_mut() else {
+            return Ok(Step::Again);
         };
-        current.slots.insert(slot);
-        Ok(lease)
+        match machine.lease_slot(&current.id, holder).await? {
+            Leased::Slot(slot) => {
+                current.slots.insert(slot);
+                Ok(Step::Leased(current.lease(slot)))
+            }
+            Leased::Preparing => Ok(Step::Wait(format!(
+                "the machine's shared engine {} is still being prepared",
+                current.name
+            ))),
+            Leased::Retiring => {
+                if matches!(current.kind, Kind::Adopted) {
+                    *held = None;
+                }
+                Ok(Step::Wait(
+                    "the shared engine is retiring; waiting for the next one".into(),
+                ))
+            }
+            Leased::Full => Ok(Step::Wait(
+                "every slot in the shared engine is taken; waiting for one".into(),
+            )),
+        }
+    }
+
+    /// Whether runs can still use the engine this daemon holds.
+    async fn usable(&self, current: &Held, identity: &EngineIdentity) -> bool {
+        if current.identity != *identity || !self.backend.engine_running(&current.id).await {
+            return false;
+        }
+        match &current.kind {
+            Kind::Owned { engine, .. } => {
+                Claim::held(&self.registry, engine).verify().await.is_ok()
+            }
+            Kind::Adopted => true,
+        }
+    }
+
+    /// Let go of an engine runs can no longer use: an adopted one is
+    /// forgotten; an owned one is retired once empty. Until then, why the
+    /// run waits (and the engine stays held).
+    async fn replace(&self, current: Held, held: &mut Option<Held>) -> Option<String> {
+        if matches!(current.kind, Kind::Adopted) {
+            return None;
+        }
+        let machine = self.machine().ok()?;
+        let running = self.backend.engine_running(&current.id).await;
+        if running && machine.begin_retire(&current.id).await != Ok(true) {
+            let _ = machine.request_retire(&current.id).await;
+            let name = current.name.clone();
+            *held = Some(current);
+            return Some(format!(
+                "the shared engine {name} is busy as a different engine (config or pins \
+                 changed); waiting for its runs to finish"
+            ));
+        }
+        self.retire_owned(current).await;
+        None
     }
 
     /// The engine's claim still holds (checked before each in-engine step).
     pub async fn verify(&self, lease: &Lease) -> Result<(), String> {
         let held = self.held.lock().await;
         match held.as_ref() {
-            Some(current) if current.engine.observed.engine_id == lease.engine_id => {
-                Claim::held(&self.registry, &current.engine).verify().await
-            }
+            Some(current) if current.id == lease.engine_id => match &current.kind {
+                Kind::Owned { engine, .. } => Claim::held(&self.registry, engine).verify().await,
+                Kind::Adopted if self.backend.engine_running(&current.id).await => Ok(()),
+                Kind::Adopted => Err("the shared engine stopped".into()),
+            },
             _ => Err("the shared engine was retired".into()),
         }
     }
 
-    /// Give a slot back; the engine is idle from now when it was the last.
+    /// Give a slot back.
     pub async fn release(&self, lease: Lease) {
+        if let Ok(machine) = self.machine()
+            && let Err(error) = machine.release_slot(&lease.engine_id, lease.slot).await
+        {
+            // An engine that is gone took its slot table with it.
+            eprintln!(
+                "bosn ci: slot {} in {} not released: {error}",
+                lease.slot, lease.engine_name
+            );
+        }
         let mut held = self.held.lock().await;
         if let Some(current) = held.as_mut()
-            && current.engine.observed.engine_id == lease.engine_id
+            && current.id == lease.engine_id
         {
             current.slots.remove(&lease.slot);
-            if current.slots.is_empty() {
-                current.idle_since = Instant::now();
-            }
         }
     }
 
-    /// Retire the engine if no run has held it for `ttl`; whether it did.
-    pub async fn retire_idle(&self, ttl: Duration) -> bool {
-        let mut held = self.held.lock().await;
-        let idle = held
-            .as_ref()
-            .is_some_and(|current| current.slots.is_empty() && current.idle_since.elapsed() >= ttl);
-        if !idle {
-            return false;
-        }
-        if let Some(current) = held.take() {
-            self.retire(&current.engine).await;
-        }
-        true
-    }
-
-    /// The engine and how many runs it holds, for status.
+    /// The engine and how many of this daemon's runs it holds, for status.
     pub async fn status(&self) -> Option<(String, usize)> {
         let held = self.held.lock().await;
         held.as_ref()
-            .map(|current| (current.engine.intent.engine_name(), current.slots.len()))
+            .map(|current| (current.name.clone(), current.slots.len()))
     }
 
-    /// Stop leasing and retire an idle engine (daemon shutdown). A busy one
-    /// is left to the next daemon's startup recovery.
+    /// Stop leasing and retire this daemon's engine if no run (of any
+    /// daemon) holds it (daemon shutdown). A busy one is left: its other
+    /// daemons' reapers retire it once idle, or the next startup recovery.
     pub async fn close(&self) {
         self.state().closed = true;
         self.retire_idle(Duration::ZERO).await;
     }
 
-    /// Check for an idle engine every [`REAP_EVERY`] until closed. `ttl`
-    /// is read on each check, so a config change applies live.
+    /// Tend the machine every [`REAP_EVERY`] until closed. `ttl` is read on
+    /// each check, so a config change applies live.
     pub fn spawn_reaper(self: &Arc<Self>, ttl: impl Fn() -> Duration + Send + 'static) {
         let keeper = Arc::downgrade(self);
         async_engine::launch(async move {
@@ -232,20 +330,15 @@ impl SharedEngine {
                 if keeper.state().closed {
                     return;
                 }
-                if keeper.retire_idle(ttl()).await {
+                let ttl = ttl();
+                if keeper.retire_idle(ttl).await {
                     eprintln!("bosn ci: idle shared engine retired");
+                }
+                if keeper.state().wanted {
+                    keeper.tend_machine(ttl).await;
                 }
             }
         })
         .detach();
-    }
-
-    async fn retire(&self, engine: &Spare) {
-        if let Err(error) = spare::retire(&self.registry, self.backend.as_ref(), engine).await {
-            eprintln!(
-                "bosn ci: shared engine {} not removed: {error}",
-                engine.intent.engine_name()
-            );
-        }
     }
 }

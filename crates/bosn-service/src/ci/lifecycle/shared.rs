@@ -4,9 +4,8 @@
 //! give the slot back. The engine itself stays up for the next run; it is
 //! retired only when idle ([`super::super::shared_engine`]).
 //!
-//! A run whose wanted engine differs from a busy shared engine (config, host
-//! sizing or pins changed) runs on its own per-run engine instead
-//! ([`super::run_on_engine`]), so nothing waits for the shared one to drain.
+//! A run never gets an engine of its own here (#544): when the machine's
+//! engine is not one it can use, it waits for that engine to drain and retire.
 
 use kernal_api::async_engine::{self, CancellationToken};
 
@@ -14,19 +13,16 @@ use super::{
     super::{
         engine::{ActEngineBackend, ActInvocation, ExecEnd, RunLimits, RunScope},
         run_proxy::RunProxy,
-        shared_engine::{Lease, Refused, SharedEngine},
+        shared_engine::{Lease, SharedEngine},
         spare::SparePlan,
         storage::{self, StoragePeak},
     },
     CleanupEnd, EngineObserver, EnginePlan, EngineReport, ExecutionEnd, Laps, close_scope,
-    drain_output, run_on_engine, save_toolcache,
+    drain_output, save_toolcache,
 };
-use crate::RegistryActor;
 
-/// Run `plan` in the shared engine, or on its own engine when the shared
-/// one is busy as a different engine.
+/// Run `plan` in the machine's shared engine.
 pub async fn run_on_shared(
-    registry: &RegistryActor,
     backend: &dyn ActEngineBackend,
     shared: &SharedEngine,
     want: SparePlan,
@@ -36,22 +32,22 @@ pub async fn run_on_shared(
 ) -> EngineReport {
     let mut laps = Laps::new();
     observer.note("leasing a slot in the shared engine");
-    let leased = async_engine::timeout_at(
-        plan.deadline,
-        async_engine::cancellable(cancellation, shared.lease(want, cancellation)),
-    )
-    .await;
+    let run = plan.intent.run_id.clone();
+    let leased = {
+        let mut note = |why: &str| observer.note(why);
+        async_engine::timeout_at(
+            plan.deadline,
+            async_engine::cancellable(
+                cancellation,
+                shared.lease(&run, want, cancellation, &mut note),
+            ),
+        )
+        .await
+    };
     let lease = match leased {
         Err(_) => return report(ExecutionEnd::TimedOut, CleanupEnd::Removed, None, None),
         Ok(Err(_)) => return report(ExecutionEnd::Cancelled, CleanupEnd::Removed, None, None),
-        Ok(Ok(Err(Refused::Mismatched))) => {
-            observer.note(
-                "the shared engine is busy as a different engine (config or pins changed); \
-                 this run gets its own engine",
-            );
-            return run_on_engine(registry, backend, plan, cancellation, observer).await;
-        }
-        Ok(Ok(Err(Refused::Failed(error)))) => {
+        Ok(Ok(Err(error))) => {
             return report(
                 ExecutionEnd::EngineFailed(error),
                 CleanupEnd::Removed,

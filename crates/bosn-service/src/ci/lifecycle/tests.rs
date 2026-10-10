@@ -9,6 +9,7 @@ use std::{
 };
 
 mod fake;
+mod fake_machine;
 #[path = "live_cohort.rs"]
 mod live_cohort;
 mod shared;

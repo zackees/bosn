@@ -316,12 +316,14 @@ stubbed job.
 
 ## What runs, and where
 
-- **One shared engine for concurrent runs (#547).** On Linux, runs share one
-  long-lived engine instead of getting one each (`[engine] shared = false`
-  restores per-run engines; non-Linux daemons always use them). The engine is
-  an ordinary owned engine, made and prepared (act, runner image, tool cache)
-  once and held under the daemon's own claim. Each run leases a slot in it
-  and runs in its own **scope**:
+- **One engine per machine (#544, #547).** On Linux, every run on the
+  machine, from every daemon and state directory, runs in one long-lived
+  engine. This is the target design; per-run engines remain only as the
+  `[engine] shared = false` opt-out and on non-Linux daemons (Docker Desktop
+  cannot share the engine's socket directory), and are being retired. The
+  engine is an ordinary owned engine, made and prepared (act, runner image,
+  tool cache) once by one daemon and held under that daemon's claim. Each
+  run leases a slot in it and runs in its own **scope**:
   - a cgroup `/bosn-run-<key>` with `memory.max`, `memory.swap.max = 0`,
     `cpu.max` and `pids.max`, sized from the engine (minus 1 GiB and 256
     processes for its own daemons). act itself runs in the cgroup's `act`
@@ -329,31 +331,64 @@ stubbed job.
   - its own labelled network, work tree and artifact path
     (`/var/lib/docker/bosn-ci/runs/<key>`), and its own artifact and cache
     server ports (`40000 + 2·slot`, `+1`);
-  - its own Docker proxy, served by the daemon on the host in the engine's
-    socket directory (`/bosn/sock/<key>.sock` inside the engine). act and
-    every job container reach Docker only through it: everything they create
-    carries the run's label (`com.zackees.bosn.run`), act's per-job volumes
-    get the run's key, and they cannot see or touch another run's objects.
+  - its own Docker proxy, served by the run's daemon on the host in the
+    engine's socket directory (`/bosn/sock/<key>.sock` inside the engine).
+    act and every job container reach Docker only through it: everything
+    they create carries the run's label (`com.zackees.bosn.run`), act's
+    per-job volumes get the run's key, and they cannot see or touch another
+    run's objects.
 
   When a run ends, however it ends (success, failure, cancellation, timeout),
   its act process tree is killed and every container, network and volume
   with its label, its work tree and its cgroup are removed, and their absence
   is proven. Other runs keep running.
 
-  **Idle retirement.** An engine with no run for `[engine] idle_retire_secs`
-  (default 600 s) is retired: removed with proof, its storage volume and
-  socket directory with it, exactly like a finished per-run engine. A
-  stopping daemon retires an idle engine; one left behind (busy at shutdown,
-  or the daemon died) is retired by the next daemon's startup recovery. An
-  engine whose intent no longer matches what a new run would create (config,
-  host sizing or pins changed) is replaced once idle; until then such a run
-  gets its own per-run engine. A shared engine is itself the warm engine, so
-  no spare is kept while sharing is on.
+  **The machine claim.** Which daemon makes the engine is decided by the host
+  Docker engine itself: a created, never started container named
+  `bosn-ci-engine-claim`. Docker refuses a second container of that name
+  atomically, so across daemons, state directories (temporary ones
+  included), users, restarts and crashes exactly one daemon holds the right
+  to make the engine. The claim's labels name the engine and its daemon
+  (registry, boot ID, pid and the pid's start time). Another daemon:
+  - runs in the claimed engine when it is the engine it would make (the same
+    pinned act, engine and runner images and init command; sizing may
+    differ, and a run is sized from the engine it gets);
+  - otherwise asks it to retire once empty and waits, logging why. A run
+    never falls back to an engine of its own;
+  - takes a claim over when its daemon has died (or its engine was still not
+    running 45 minutes after the claim was made), once no live run is in it.
+
+  **Slots span daemons.** A run's slot is leased inside the engine, under one
+  lock there (`/run/bosn-slots/<n>` names the run, its registry and daemon),
+  so slots, ports and idleness are the engine's, not one daemon's. A slot
+  whose daemon died is reclaimed by the engine's owner: its scope is closed
+  and proven empty, then the slot is freed.
+
+  **Idle retirement.** The engine's daemon retires it once no slot has been
+  held for `[engine] idle_retire_secs` (default 600 s), or as soon as it is
+  empty when another daemon asked for a different engine: removed with
+  proof, its storage volume and socket directory with it, and the claim
+  released. A stopping daemon retires its engine if no run of any daemon is
+  in it; otherwise it is left, and once idle any daemon's reaper retires it
+  (its daemon is gone). A shared engine is itself the warm engine, so no
+  spare is kept while sharing is on. A config or pin change takes effect
+  when the engine next retires.
+
+  **Migrating from per-run engines.** Before a daemon makes the machine's
+  engine, it drains legacy engines (per-run engines and spares of earlier
+  releases or of `shared = false`, any act engine but the claimed one):
+  an engine running an exec session or a job container is left to finish,
+  and one that is idle, older than 10 minutes and seen idle on two looks is
+  removed with its storage volume, both proven absent. The new engine waits
+  up to 10 minutes for busy legacy engines, then is made beside them; every
+  daemon that runs CI keeps retiring idle legacy engines every 15 s.
 
   What it gives up: a crashed inner `dockerd` or a full engine disk fails
   every run in it, and there is no per-run disk quota, only the engine's
-  budget. The trust model is unchanged (one privileged engine, trusted
-  workflows only).
+  budget. When the daemon that made the engine restarts, its startup
+  recovery retires the engine, ending other daemons' runs in it as an
+  engine crash would. The trust model is unchanged (one privileged engine,
+  trusted workflows only).
 
 - **Provider and engine are separate axes.** The provider is auto-detected:
   `.github/workflows/` means GitHub, and `.gitlab-ci.yml` (planned) means GitLab.
@@ -405,8 +440,9 @@ stubbed job.
     so they neither show in `git status` nor are reverted by a restore.
   - A detached `HEAD` is checked out detached at the same commit (#393).
   - Editing the checkout during a run does not change what the run sees.
-- **Isolation.** Each run gets one owned Act engine on the host engine
-  (`crates/bosn-service/src/act_engine`, #349): a privileged container of the
+- **Isolation.** Runs execute in an owned Act engine on the host engine
+  (`crates/bosn-service/src/act_engine`, #349), the machine's shared one
+  above (or, opted out, one per run): a privileged container of the
   pinned `docker:29.7.2` publisher manifest, named `bosn-act-<run>`, with a
   read-only root, a private cgroup namespace, bounded memory, CPUs and
   processes, and its Docker storage on disk (or, when the host has no room,
@@ -447,7 +483,7 @@ stubbed job.
     cpus = 4
     pids = 4096
     spares = 0   # no prepared spare engine (default 1)
-    shared = false          # one engine per run instead of the shared engine (#547)
+    shared = false          # opt out: one engine per run (legacy; #544, #547)
     idle_retire_secs = 600  # how long an idle shared engine is kept (default 600)
     ```
 
