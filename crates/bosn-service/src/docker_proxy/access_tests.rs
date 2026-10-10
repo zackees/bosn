@@ -285,7 +285,7 @@ fn a_create_reaching_into_another_run_is_refused() {
             "POST /containers/create HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
-        assert_eq!(answer(&s, &request), Some(404), "{body}");
+        assert_eq!(answer(&s, &request), Some(403), "{body}");
     }
     let own = r#"{"HostConfig":{"VolumesFrom":["aaa"],"NetworkMode":"net-a"}}"#;
     let request = format!(

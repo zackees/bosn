@@ -457,7 +457,21 @@ fn forward_requests<R: BufRead, W: Write>(
             let rewritten = rewrite_create(kind, &body, settings).and_then(|rewritten| {
                 if kind == "container" {
                     for reference in create_references(&rewritten)? {
-                        access::check(&settings.upstream, &reference, &settings.run)?;
+                        // 403, not 404: the Docker CLI reads a 404 on create
+                        // as a missing image and starts pulling.
+                        access::check(&settings.upstream, &reference, &settings.run).map_err(
+                            |error| match error.get_ref().and_then(|e| e.downcast_ref::<Refusal>())
+                            {
+                                Some(refusal) => Refusal::error(
+                                    403,
+                                    format!(
+                                        "bosn docker proxy refused the container create: {}",
+                                        refusal.message
+                                    ),
+                                ),
+                                None => error,
+                            },
+                        )?;
                     }
                 }
                 Ok(rewritten)
