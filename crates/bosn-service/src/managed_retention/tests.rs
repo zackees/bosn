@@ -1,7 +1,7 @@
 //! Safety invariants for managed retention (`bosn gc owned`, #456).
 //!
 //! The policy itself is pure and unit-tested in `bosn-core`. These cover the parts that exist
-//! only here: that an incomplete engine read removes nothing, that the opt-in file gates
+//! only here: that an incomplete engine read removes nothing, that the opt-out file gates
 //! unattended reclamation, that a destructive pass requires confirmation on both wire flags,
 //! and that the pre-removal re-check and the removal itself never act on stale or live data.
 //! None of them need Docker: the engine reads go through a shell standing in for the CLI.
@@ -12,6 +12,7 @@ use bosn_core::retention::RetentionPolicy;
 use bosn_engine::DockerEngine;
 
 use crate::diagnostics::ManagedRetentionSummary;
+use crate::managed_retention::report::held_report_line;
 use crate::managed_retention::{
     SetupContainerReport, StoppedSetupContainer, auto_retention_enabled, managed_retention_pass,
     pass_report_line, setup_container_report_line,
@@ -43,27 +44,28 @@ fn write_config(dir: &std::path::Path, contents: &str) {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn an_absent_config_never_enables_unattended_reclamation() {
+fn an_absent_config_enables_unattended_reclamation_by_default() {
     let dir = scratch_dir("absent");
     let _ = std::fs::remove_file(dir.join("retention.toml"));
     assert!(
-        !auto_retention_enabled(&dir),
-        "a machine with no opt-in file must never reclaim unattended"
+        auto_retention_enabled(&dir),
+        "#545: a default install must reclaim unattended without an opt-in file"
     );
 }
 
 #[test]
-fn an_unreadable_state_directory_is_not_an_opt_in() {
-    let missing = std::env::temp_dir().join("bosn-retention-does-not-exist-xyz");
-    let _ = std::fs::remove_dir_all(&missing);
+fn an_unreadable_config_is_treated_as_an_opt_out() {
+    let dir = scratch_dir("unreadable");
+    // A directory where the file should be: it exists but cannot be read as text.
+    std::fs::create_dir_all(dir.join("retention.toml")).expect("dir");
     assert!(
-        !auto_retention_enabled(&missing),
-        "an unreadable config must fail closed, not open"
+        !auto_retention_enabled(&dir),
+        "a config that exists but cannot be read must not be assumed to allow deletion"
     );
 }
 
 #[test]
-fn only_an_explicit_true_enables_unattended_reclamation() {
+fn only_an_explicit_non_true_value_disables_unattended_reclamation() {
     let dir = scratch_dir("explicit");
     for (contents, expected) in [
         ("auto_retention = true\n", true),
@@ -71,11 +73,13 @@ fn only_an_explicit_true_enables_unattended_reclamation() {
         ("auto_retention = 1\n", true),
         ("[retention]\nauto_retention = true\n", true),
         ("auto_retention = true # nightly\n", true),
+        ("# auto_retention = false\n", true),
+        ("auto_retention\n", true),
+        ("", true),
         ("auto_retention = false\n", false),
-        ("# auto_retention = true\n", false),
+        ("auto_retention = no\n", false),
         ("auto_retention = \"true\"\n", false),
-        ("auto_retention\n", false),
-        ("", false),
+        ("auto_retention = flase\n", false),
     ] {
         write_config(&dir, contents);
         assert_eq!(
@@ -405,7 +409,7 @@ fn an_already_stopped_container_is_removed_without_force() {
 }
 
 // ---------------------------------------------------------------------------
-// #518: stopped setup containers are reported by default, deleted only on opt-in.
+// #518 / #545: stopped setup containers are reported, and reclaimed unless opted out.
 // ---------------------------------------------------------------------------
 
 /// A stopped, fully-labelled setup container holding `volume_count` stack volumes.
@@ -508,18 +512,18 @@ fn only_named_volume_mounts_count_as_pinned() {
     );
 }
 
-/// #518: the report must appear on a default install, where nothing is opt-in yet.
+/// #518: the report must appear even when reclamation is opted out.
 #[test]
-fn the_report_appears_with_the_default_opt_out_config() {
+fn the_report_appears_after_an_explicit_opt_out() {
     let (engine, _) =
         fake_docker_reporting(|_| setup_container_pinning(3), &[Some(1_000), Some(1_000)]);
-    // No `retention.toml` at all: this is what a default install looks like.
     let dir = state_dir_with_registry("default-config-report");
+    write_config(&dir, "auto_retention = false\n");
 
     let outcome = managed_retention_pass(&engine, &dir, RetentionPolicy::default(), false);
 
     let line = setup_container_report_line(&outcome.setup_containers, outcome.summary.applied)
-        .expect("a default install must still be told it is leaking");
+        .expect("an opted-out install must still be told it is leaking");
     assert!(
         line.contains("1 stopped owned setup container(s)"),
         "{line}"
@@ -530,28 +534,29 @@ fn the_report_appears_with_the_default_opt_out_config() {
         "the age is part of the report: {line}"
     );
     assert!(line.contains("past the 6h container gate"), "{line}");
-    assert!(line.contains("auto_retention = true"), "{line}");
+    assert!(line.contains("auto_retention = false"), "{line}");
 }
 
-/// #518: without the opt-in, a pass that could reclaim removes nothing.
+/// #518 / #545: an explicit opt-out still reports, and removes nothing.
 #[test]
-fn nothing_is_removed_without_the_opt_in() {
+fn nothing_is_removed_after_an_explicit_opt_out() {
     let (engine, fake_state) =
         fake_docker_reporting(|_| setup_container_pinning(2), &[Some(1_000), Some(1_000)]);
     let dir = state_dir_with_registry("no-opt-in-no-removal");
+    write_config(&dir, "auto_retention = false\n");
     assert!(
         !auto_retention_enabled(&dir),
-        "a machine with no opt-in file is not opted in"
+        "an explicit opt-out disables unattended reclamation"
     );
 
-    // Exactly what `maintenance_pass` computes on the default path.
+    // Exactly what `maintenance_pass` computes on the opted-out path.
     let apply = auto_retention_enabled(&dir);
     let outcome = managed_retention_pass(&engine, &dir, RetentionPolicy::default(), apply);
 
     assert!(!outcome.summary.applied, "nothing was applied");
     assert_eq!(
         outcome.summary.removed, 0,
-        "the pile is reported, never reclaimed without the opt-in"
+        "the pile is reported, never reclaimed after an opt-out"
     );
     assert!(
         !fake_state.join("removed").exists(),
@@ -561,13 +566,13 @@ fn nothing_is_removed_without_the_opt_in() {
     assert_eq!(
         outcome.setup_containers.pinned_volume_count(),
         2,
-        "reporting does not depend on the opt-in"
+        "reporting does not depend on the opt-out"
     );
     let line = setup_container_report_line(&outcome.setup_containers, false).expect("a line");
-    assert!(line.contains("enable with"), "{line}");
+    assert!(line.contains("auto_retention = false"), "{line}");
 }
 
-/// The opt-in changes only the advice, never the facts.
+/// The opt-out changes only the advice, never the facts.
 #[test]
 fn an_applied_pass_reports_the_same_pile_and_advises_the_gc_command() {
     let (engine, _) =
@@ -594,6 +599,7 @@ fn summary(applied: bool, planned: u64, removed: u64, failed: u64) -> ManagedRet
         failed,
         failures: Vec::new(),
         refused: None,
+        held: std::collections::BTreeMap::new(),
     }
 }
 
@@ -782,4 +788,34 @@ fn containers_and_volumes_are_measured_so_a_byte_ceiling_can_remove_them() {
     assert_eq!(outcome.summary.removed_bytes, 4_096 + 2_000_000_000);
     let removed = std::fs::read_to_string(fake.join("rm-argv")).expect("removals");
     assert_eq!(removed, "rm fake-container-id\nvolume rm bosn-v-owned\n");
+}
+
+/// #545: a kept object always says why, and only actionable reasons earn a log line.
+#[test]
+fn held_reasons_are_reported_only_when_actionable() {
+    use bosn_core::retention::HoldReason;
+    let mut quiet = summary(true, 0, 0, 0);
+    quiet.held.insert(HoldReason::InUse, 4);
+    quiet.held.insert(HoldReason::WithinTtl, 9);
+    assert_eq!(held_report_line(&quiet), None);
+    let mut loud = quiet.clone();
+    loud.held.insert(HoldReason::ForeignRegistry, 3);
+    let line = held_report_line(&loud).expect("a foreign hold is actionable");
+    assert!(line.contains("foreign-registry=3"), "{line}");
+    assert!(line.contains("in-use=4"), "{line}");
+}
+
+#[test]
+fn held_counts_survive_the_wire() {
+    use bosn_core::retention::HoldReason;
+    let held = std::collections::BTreeMap::from([
+        (HoldReason::Pinned, 2_u64),
+        (HoldReason::IncompleteLabels, 1),
+    ]);
+    let mut wire = crate::wire::HeldCountWire::encode_counts(&held);
+    wire.push(crate::wire::HeldCountWire {
+        reason: "from-a-newer-daemon".into(),
+        count: 7,
+    });
+    assert_eq!(crate::wire::HeldCountWire::decode_counts(wire), held);
 }

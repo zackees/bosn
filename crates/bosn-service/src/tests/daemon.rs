@@ -893,10 +893,11 @@ const PROTOCOL_SURFACE: [&str; 6] = [
 // 68-69, refusal code 5) without a bump: each is additive, so a protocol-1 peer
 // on either side still reads every message it did before. Phase 4 added
 // operation 39 and reply code 32 the same way: an older daemon answers the
-// unknown operation, which the client reads as "no handoff".
+// unknown operation, which the client reads as "no handoff". #545 added reply
+// tag 70 (`owned_held`) the same additive way: an older peer reads it as empty.
 const PROTOCOL_FINGERPRINT: (u32, &str) = (
     DAEMON_PROTOCOL,
-    "4a9173aa426cda39eb9788dd4a227e5637989e3ef622c8f3be3e9463e6eb76c5",
+    "2c3c8ee1c0de2d1f2da5ff756f06a9079b33806f1d5e764dfdf87a6bca1a1c95",
 );
 
 #[test]

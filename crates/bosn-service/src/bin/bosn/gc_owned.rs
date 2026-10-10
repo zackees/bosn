@@ -155,6 +155,11 @@ pub(crate) fn run_gc_owned(arguments: impl Iterator<Item = std::ffi::OsString>) 
             "failed": summary.failed,
             "failures": summary.failures,
             "refused": summary.refused,
+            "held": summary
+                .held
+                .iter()
+                .map(|(reason, count)| (reason.as_str(), *count))
+                .collect::<std::collections::BTreeMap<_, _>>(),
         })
     );
 }
