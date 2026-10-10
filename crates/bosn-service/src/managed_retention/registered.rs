@@ -181,5 +181,6 @@ fn read_all<T>(
     }
 }
 
+pub(super) mod images;
 #[cfg(test)]
 mod tests;

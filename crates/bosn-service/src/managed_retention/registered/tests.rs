@@ -198,3 +198,44 @@ fn a_lease_or_session_protects_the_object() {
         .unwrap();
     assert!(proof.protected, "a leased object is in use");
 }
+
+#[test]
+fn a_recorded_built_image_is_proven_by_its_tag_and_record() {
+    let id = format!("sha256:{}", "c".repeat(64));
+    let mut setup = record(
+        &format!("setup-image:{id}"),
+        ResourceKind::Image,
+        &format!("setup-image:{id}"),
+        Retention::Pinned,
+    );
+    setup.generation = id.clone();
+    let mut manifest = setup.clone();
+    manifest.id = format!("manifest-image:{id}");
+    manifest.name = manifest.id.clone();
+    manifest.last_used = NOW - 2.0 * DAY;
+    let root = state_with(&[setup, manifest]);
+    let ownership = RegisteredOwnership::load(root.path()).unwrap();
+    let built = vec![format!("bosn-setup:{}", digest())];
+    let proof = ownership
+        .normalize_image(&id, &built, &BTreeMap::new(), NOW)
+        .expect("a bosn-setup tag plus its record proves the image");
+    assert!(
+        (proof.idle_seconds - 2.0 * DAY).abs() < 1.0,
+        "the latest use wins"
+    );
+    // A historical `pinned` image row is bookkeeping, not a promise.
+    assert_eq!(hold(ResourceKind::Image, proof.labels, 40.0 * DAY), None);
+    // A pulled or retagged image, or an unrecorded id, proves nothing.
+    let pulled = vec!["python:3.12".to_owned()];
+    assert!(
+        ownership
+            .normalize_image(&id, &pulled, &BTreeMap::new(), NOW)
+            .is_none()
+    );
+    let other = format!("sha256:{}", "d".repeat(64));
+    assert!(
+        ownership
+            .normalize_image(&other, &built, &BTreeMap::new(), NOW)
+            .is_none()
+    );
+}

@@ -42,6 +42,29 @@ impl Authority {
         &self.abandoned
     }
 
+    /// [`Self::prove`] for an image, which a Bosn-built tag and its registry record can also prove.
+    pub(super) fn prove_image(
+        &self,
+        id: &str,
+        tags: &[String],
+        labels: BTreeMap<String, String>,
+        age: f64,
+        in_use: bool,
+    ) -> Proven {
+        match self
+            .ownership
+            .as_ref()
+            .and_then(|ownership| ownership.normalize_image(id, tags, &labels, now_seconds()))
+        {
+            Some(proof) => Proven {
+                labels: proof.labels,
+                age: age.min(proof.idle_seconds),
+                in_use: in_use || proof.protected,
+            },
+            None => self.prove(ResourceKind::Image, id, labels, age, in_use),
+        }
+    }
+
     /// Apply every proof that applies; otherwise the engine's labels stand as they are.
     ///
     /// A setup-labelled object recorded in this registry gains its canonical labels, and only
