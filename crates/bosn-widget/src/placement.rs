@@ -45,29 +45,62 @@ fn loaded(reply: Option<String>) -> Option<bool> {
     }
 }
 
-async fn live_ready<F, Fut>(configured: bool, mut query: F) -> bool
+/// Outcome of one bounded readiness check of the compositor placement script.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Readiness {
+    /// Placement is not installed/enabled, or KWin reports the script unloaded.
+    Unavailable,
+    /// A KWin reply was missing or malformed.
+    NoReply,
+    /// KWin reports the script loaded, but its readiness pulse never changed.
+    StalePulse,
+    /// The script was observed executing.
+    Ready,
+}
+
+impl Readiness {
+    fn diagnostic(self) -> Option<&'static str> {
+        (self == Self::StalePulse).then_some(
+            "KWin reports placement script bosn-widget-corner loaded, but its readiness \
+             pulse did not change within 12 probes (1.2s); the script is likely stopped. \
+             Compact panel refused. Recover with `bosn widget install`, which reloads only \
+             the owned placement script.",
+        )
+    }
+}
+
+async fn live_ready<F, Fut>(configured: bool, mut query: F) -> Readiness
 where
     F: FnMut(Query) -> Fut,
     Fut: Future<Output = Option<String>>,
 {
-    if !configured || loaded(query(Query::Loaded).await) != Some(true) {
-        return false;
+    if !configured {
+        return Readiness::Unavailable;
+    }
+    match loaded(query(Query::Loaded).await) {
+        Some(true) => {}
+        Some(false) => return Readiness::Unavailable,
+        None => return Readiness::NoReply,
     }
     let Some(initial) = loaded(query(Query::Pulse).await) else {
-        return false;
+        return Readiness::NoReply;
     };
     // A cached marker is insufficient: require fresh execution after geometry
     // readback. Every call is bounded; at most twelve pulse probes are issued.
     for _ in 0..12 {
         kernal_api::async_engine::sleep(Duration::from_millis(100)).await;
         let Some(current) = loaded(query(Query::Pulse).await) else {
-            return false;
+            return Readiness::NoReply;
         };
         if current != initial {
-            return loaded(query(Query::Loaded).await) == Some(true);
+            return match loaded(query(Query::Loaded).await) {
+                Some(true) => Readiness::Ready,
+                Some(false) => Readiness::Unavailable,
+                None => Readiness::NoReply,
+            };
         }
     }
-    false
+    Readiness::StalePulse
 }
 
 fn enabled(desktop: &str, wayland: bool, script: bool, config: &str) -> bool {
@@ -118,7 +151,11 @@ fn installed_configuration() -> bool {
 }
 
 pub async fn configured() -> bool {
-    live_ready(installed_configuration(), bus).await
+    let readiness = live_ready(installed_configuration(), bus).await;
+    if let Some(message) = readiness.diagnostic() {
+        eprintln!("bosn-widget: {message}");
+    }
+    readiness == Readiness::Ready
 }
 
 #[cfg(test)]
@@ -138,10 +175,11 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        assert!(
-            !runtime.run(live_ready(configured, |_| std::future::ready(Some(
+        assert_eq!(
+            runtime.run(live_ready(configured, |_| std::future::ready(Some(
                 "b false\n".into()
-            ))))
+            )))),
+            Readiness::Unavailable
         );
     }
 
@@ -151,15 +189,28 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        assert!(!runtime.run(live_ready(true, |_| std::future::ready(Some(
-            "b true".into()
-        )))));
-        assert!(!runtime.run(live_ready(true, |_| std::future::ready(None))));
-        assert!(!runtime.run(live_ready(true, |_| std::future::ready(Some(
-            "garbage".into()
-        )))));
+        // #484: loaded script with a stale pulse is diagnosed, not silent.
+        let stale = runtime.run(live_ready(true, |_| {
+            std::future::ready(Some("b true".into()))
+        }));
+        assert_eq!(stale, Readiness::StalePulse);
+        assert!(stale.diagnostic().unwrap().contains("bosn widget install"));
+        assert_eq!(
+            runtime.run(live_ready(true, |_| std::future::ready(None))),
+            Readiness::NoReply
+        );
+        assert_eq!(
+            runtime.run(live_ready(true, |_| std::future::ready(Some(
+                "garbage".into()
+            )))),
+            Readiness::NoReply
+        );
+        assert_eq!(
+            runtime.run(live_ready(false, |_| std::future::ready(None))),
+            Readiness::Unavailable
+        );
         let mut pulse = false;
-        assert!(runtime.run(live_ready(true, |query| {
+        let ready = runtime.run(live_ready(true, |query| {
             let value = match query {
                 Query::Loaded => true,
                 Query::Pulse => {
@@ -168,7 +219,9 @@ mod tests {
                 }
             };
             std::future::ready(Some(format!("b {value}")))
-        })));
+        }));
+        assert_eq!(ready, Readiness::Ready);
+        assert_eq!(ready.diagnostic(), None);
     }
 
     #[test]
