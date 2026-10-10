@@ -35,6 +35,7 @@ pub fn run(mut arguments: impl Iterator<Item = OsString>) {
         }
     }
     let state_dir = state_dir.unwrap_or_else(bosn_service::mcp::default_state_dir);
+    super::require_matching_daemon(&state_dir, "jobs", json);
     let view = RuntimeBuilder::current_thread()
         .enable_all()
         .build()

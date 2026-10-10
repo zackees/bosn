@@ -64,6 +64,8 @@ mod secret;
 mod setup;
 #[path = "bosn/setup_args.rs"]
 mod setup_args;
+#[path = "bosn/version_check.rs"]
+mod version_check;
 #[path = "bosn/widget.rs"]
 mod widget;
 use args::*;
@@ -76,6 +78,7 @@ use registry::*;
 use scan::*;
 use setup::*;
 use setup_args::*;
+use version_check::*;
 
 const SETUP_PREPARE_MAX_DEADLINE_MS: u64 = 5 * 60 * 1_000;
 const SETUP_PREPARE_MAX_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
