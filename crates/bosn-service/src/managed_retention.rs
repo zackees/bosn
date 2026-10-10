@@ -340,13 +340,6 @@ fn observe_containers(
                 ));
                 continue;
             };
-            if !entry.running() {
-                stopped_containers.push(StoppedSetupContainer {
-                    id: entry.id().to_owned(),
-                    age_seconds: age,
-                    pinned_volumes: entry.pinned_volume_names(),
-                });
-            }
             let proven = authority.prove(
                 ResourceKind::Container,
                 entry.engine_name(),
@@ -354,6 +347,18 @@ fn observe_containers(
                 age,
                 entry.running(),
             );
+            // #545: only a container proven ours is reported as an owned stopped container; a
+            // foreign registry's is counted as held for foreign ownership, never as ours.
+            if !entry.running()
+                && bosn_core::classify_ownership(&proven.labels, authority.our())
+                    == bosn_core::OwnershipClass::Ours
+            {
+                stopped_containers.push(StoppedSetupContainer {
+                    id: entry.id().to_owned(),
+                    age_seconds: age,
+                    pinned_volumes: entry.pinned_volume_names(),
+                });
+            }
             artifacts.push(bosn_core::ObservedArtifact {
                 id: entry.id().to_owned(),
                 kind: ResourceKind::Container,
@@ -929,9 +934,9 @@ impl ImageDetail {
     }
 }
 mod report;
+pub use report::{MaintenanceOutcome, maintenance_pass, maintenance_pass_with, report_pass};
 #[cfg(test)]
 use report::{auto_retention_enabled, pass_report_line, setup_container_report_line};
-pub use report::{maintenance_pass, report_pass};
 
 mod authority;
 pub(crate) mod catalog;

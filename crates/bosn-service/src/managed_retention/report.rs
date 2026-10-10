@@ -16,26 +16,13 @@ use crate::diagnostics::ManagedRetentionSummary;
 /// pass still reads the engine and reports what it would remove. Every removal keeps the
 /// ownership, liveness, pin and age gates in [`super::managed_retention_pass`].
 pub fn maintenance_pass(state_dir: &Path) {
-    let policy = RetentionPolicy::default();
-    let apply = auto_retention_enabled(state_dir);
-    let engine = DockerEngine::docker();
-    // #545: an idle keepalive is "running" and so held as in use forever. Stop the provably idle
-    // ones first, so this same pass can reclaim them and the volumes they pinned.
-    if apply {
-        let idle = super::idle::retire_idle_keepalives(
-            &engine,
-            state_dir,
-            policy.container_ttl,
-            super::idle::MAX_STOPS_PER_PASS,
-        );
-        for line in idle.report_lines() {
-            eprintln!("bosn retention: {line}");
-        }
-    }
-    let outcome = managed_retention_pass(&engine, state_dir, policy, apply);
-    report_pass(&outcome);
+    let outcome = maintenance_pass_with(
+        &DockerEngine::docker(),
+        state_dir,
+        RetentionPolicy::default(),
+    );
     // One timestamped line per pass, so `<state>/daemon.log` shows that passes run (#545).
-    let summary = &outcome.summary;
+    let summary = &outcome.retention.summary;
     eprintln!(
         "bosn retention: pass finished at unix {:.0}: applied={} planned={} removed={} \
          removed_bytes={} failed={}",
@@ -46,6 +33,45 @@ pub fn maintenance_pass(state_dir: &Path) {
         summary.removed_bytes,
         summary.failed,
     );
+}
+
+/// What one maintenance pass did: the idle keepalives it stopped, then the retention pass.
+#[derive(Debug)]
+pub struct MaintenanceOutcome {
+    /// Idle keepalive containers stopped before the retention pass.
+    pub stopped_idle: Vec<String>,
+    pub retention: ManagedRetentionOutcome,
+}
+
+/// [`maintenance_pass`] against `engine` with `policy`: the same steps and gates. Live-Docker
+/// tests use it with zero ages so they need not wait out the production gates (#545).
+pub fn maintenance_pass_with(
+    engine: &DockerEngine,
+    state_dir: &Path,
+    policy: RetentionPolicy,
+) -> MaintenanceOutcome {
+    let apply = auto_retention_enabled(state_dir);
+    // #545: an idle keepalive is "running" and so held as in use forever. Stop the provably idle
+    // ones first, so this same pass can reclaim them and the volumes they pinned.
+    let mut stopped_idle = Vec::new();
+    if apply {
+        let idle = super::idle::retire_idle_keepalives(
+            engine,
+            state_dir,
+            policy.container_ttl,
+            super::idle::MAX_STOPS_PER_PASS,
+        );
+        for line in idle.report_lines() {
+            eprintln!("bosn retention: {line}");
+        }
+        stopped_idle = idle.stopped;
+    }
+    let retention = managed_retention_pass(engine, state_dir, policy, apply);
+    report_pass(&retention);
+    MaintenanceOutcome {
+        stopped_idle,
+        retention,
+    }
 }
 
 /// Print what a pass did, or would do.
