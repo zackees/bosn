@@ -381,13 +381,20 @@ impl Service {
         // nothing was ever said. The pass runs on the blocking pool because the census makes
         // bounded child-process calls, and the accept loop must not wait behind them. The
         // wait between passes is cancellable, so shutdown is not delayed by up to an hour.
-        let _maintenance = {
+        //
+        // The pass runs on its own detached thread, not the runtime's blocking pool: it reads
+        // the real engine with 30 s per-read deadlines, and runtime teardown waits for every
+        // blocking task, so a pass in flight held shutdown for seconds to minutes. Shutdown now
+        // stops waiting at once; the thread's bounded children end with it. A test daemon never
+        // reads the developer's Docker (as with `EmptyIdentityProbe`), so it runs no pass.
+        let _maintenance = (!cfg!(test)).then(|| {
             let state_dir = self.state_dir.clone();
             let stop = self.stop.token();
             async_engine::launch(async move {
                 loop {
                     let state_dir = state_dir.clone();
-                    let _ = async_engine::launch_blocking(move || {
+                    let (done, finished) = async_engine::oneshot_channel::<()>();
+                    let pass = move || {
                         let (scan, warning) = unmanaged::maintenance_pass(
                             &state_dir,
                             bosn_core::CensusConfig::default(),
@@ -414,8 +421,17 @@ impl Service {
                         // remove. A pass whose read is incomplete removes nothing and says so
                         // (see `managed_retention`).
                         managed_retention::maintenance_pass(&state_dir);
-                    })
-                    .await;
+                        let _ = done.send(());
+                    };
+                    if std::thread::Builder::new()
+                        .name("bosn-maintenance".into())
+                        .spawn(pass)
+                        .is_err()
+                    {
+                        eprintln!("bosn maintenance: could not start the maintenance thread");
+                    } else if async_engine::cancellable(&stop, finished).await.is_err() {
+                        break;
+                    }
                     if async_engine::cancellable(
                         &stop,
                         async_engine::sleep(unmanaged::MAINTENANCE_INTERVAL),
@@ -427,7 +443,7 @@ impl Service {
                     }
                 }
             })
-        };
+        });
         // Existing cohort policy authorizes idle maintenance independently of jobs.
         let cohort_maintenance = {
             let ci = ci.clone();
@@ -562,8 +578,6 @@ impl Service {
         // one left behind is retired by the next daemon's startup recovery.
         let _ =
             async_engine::timeout(crate::dispatch::SPARE_CLOSE_DEADLINE, ci.close_spares()).await;
-        let _ =
-            async_engine::timeout(crate::dispatch::SPARE_CLOSE_DEADLINE, ci.close_shared()).await;
         // Keep the sole registry writer alive while the job actor cancels and
         // drains typed work: a shutdown-cancelled setup ensure still needs its
         // durable terminal audit event before the writer can be released.
