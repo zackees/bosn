@@ -229,7 +229,6 @@ def test_native_cli_stages_the_reported_executable(backend, monkeypatch, layout)
     decoy.write_bytes(b"stale-decoy")
     monkeypatch.setattr(module, "_WHEEL_DATA", module._ROOT / "wheel-data")
     monkeypatch.setattr(module, "_WHEEL_NATIVE_DIRECTORY", module._ROOT / "stage")
-    monkeypatch.setattr(module, "_copy_linux_openssl", lambda *args: None)
     monkeypatch.delenv("BOSN_WHEEL_TARGET", raising=False)
 
     def compiled(_argv, **kwargs):

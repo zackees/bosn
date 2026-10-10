@@ -17,6 +17,8 @@ from typing import NoReturn
 
 import tomllib
 
+# No wheel ships a shared OpenSSL (#265); lockstep with verify_installed_wheel.py.
+OPENSSL_LIBRARIES = ("libssl", "libcrypto")
 RETIRED_LIFECYCLE_MODULES = (
     "daemon",
     "engine",
@@ -184,7 +186,7 @@ def verify(wheel: Path, target: Target, root: Path) -> None:
             name
             for name in names
             if name.endswith(".exe")
-            or name.endswith(".so.3")
+            or Path(name).name.startswith(OPENSSL_LIBRARIES)
             or archive.read(name).startswith(b"\x7fELF")
         ]
         if forbidden:
