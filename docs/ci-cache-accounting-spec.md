@@ -4155,3 +4155,44 @@ previous public provider, not the new provider's execution.
 New candidate qualification, exact-main full CI, pretag verification, publication
 and actual local writer replay through act2.15 remain pending. Compiler payload
 durability and residual misses remain separate unproven requirements.
+
+### Serve-mode provider (act2.17; #547 plan step 3)
+
+[Act2 PR #63](https://github.com/zackees/act2/pull/63) adds `act serve`
+([act2#62](https://github.com/zackees/act2/issues/62)): run admission into
+slots and port pairs, each run's cgroup v2 scope, labelled network and work
+tree, act executed in the run's cgroup with a streamed exit, cancel, and a
+close that removes and proves gone every object of the run.
+[PR #65](https://github.com/zackees/act2/pull/65) adds the read-only
+`act doctor` ([act2#61](https://github.com/zackees/act2/issues/61)), and
+[PR #66](https://github.com/zackees/act2/pull/66) keeps a gosec waiver that
+CI's golangci-lint v2.11 needs. Full CI on the first candidate
+(`c9a9f73a`, [run 38067466017](https://github.com/zackees/act2/actions/runs/38067466017))
+failed lint, so no tag was made from it. Full CI then passed all five jobs on
+exact master `8998d436146f4ec6a9f76773c91b0c53e70187a0`
+([run 38069050519](https://github.com/zackees/act2/actions/runs/38069050519)).
+From a clean checkout of master at that SHA, with neither the tag nor the
+release present, `v0.2.89-act2.17` was pushed, and the existing tag-triggered
+[release run 38069860794](https://github.com/zackees/act2/actions/runs/38069860794)
+published it. The downloaded Linux x86_64 archive matches its published
+checksum `9adc44420ec4eac8800925c7194c52d2f4c3923f510ef60ef2885197f572aadd`;
+the executable hashes to
+`29858fabb6ae3824552486ec3df31673c6de0277c366d30260e628747bf6ef18`, reports
+`act version 0.2.89-act2.17` and the capabilities
+`qualified-job-identity-v1`, `step-stage-result-v1`, `selected-job-outputs-v1`,
+`cache-exact-delete-v1` and `serve-v1`.
+
+Bosn pins those bytes and forwards each scoped run to `act serve`. Live
+check (2026-10-10): a daemon built from the branch, on its own state
+directory, against a throwaway Docker 29.7.2 engine (`memory_gib = 4`,
+`idle_retire_secs = 60`). Runs A and B shared one engine (slots 0 and 1, ports
+40000 and 40002). A's `head -c 3500m` was `Killed` (`exitcode '137'`) while B
+succeeded; each job's `docker ps` showed only its own container. Cancelling
+run C mid-step removed its container, network, volumes, cgroup and work tree
+(all counts 0 twenty seconds later) while a concurrent B succeeded. Every run
+logged `run scope cleaned up`, serve's status showed no runs afterwards, and
+the idle engine was retired, leaving only `bosn-ci-cache-v1`. Everything was
+removed afterwards.
+
+Still Bosn's, and moving to act2 before step 4: the per-run Docker proxy, the
+runner-image load and the tool-cache seed and save.

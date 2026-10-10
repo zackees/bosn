@@ -294,6 +294,15 @@ Decided 2026-10-08. This replaces "one private nested engine per run."
   only retire one whose maker died. Legacy engines (any act engine but the
   claimed one) are drained: busy ones finish, idle ones older than 10 minutes
   and seen idle twice are removed with their storage volumes, proven absent.
+- **How Bosn forwards (decided 2026-10-10, act2#62).** Bosn reaches `act serve`
+  only through `docker exec <engine> act serve <admit|exec|close>` (the same
+  act binary is the client), so the transport works wherever `docker exec`
+  does and needs no host-side socket. Bosn starts serve once per engine under
+  a lock. The engine's slot lease still picks the slot and Bosn passes it to
+  `admit`, which serve honours or refuses; Bosn refuses any admitted scope
+  other than the one it expected. The Docker proxy, the runner-image load and
+  the tool cache stay in Bosn until they move behind act2; only then does
+  step 4 remove the per-run engine path.
 
 ## Automatic retention (#545)
 

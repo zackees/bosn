@@ -323,7 +323,13 @@ stubbed job.
   cannot share the engine's socket directory), and are being retired. The
   engine is an ordinary owned engine, made and prepared (act, runner image,
   tool cache) once by one daemon and held under that daemon's claim. Each
-  run leases a slot in it and runs in its own **scope**:
+  run leases a slot in it and runs in its own **scope**, which act2's serve
+  mode ([act2#62](https://github.com/zackees/act2/issues/62)) owns inside the
+  engine. Bosn starts `act serve` once per engine (under a lock, so a second
+  serve never reaps the first's runs), then forwards each run through
+  `act serve admit` (the run ID, its slot and limits; an admission that
+  answers with any other scope is refused), `act serve exec` (for `act -l`
+  and the run; secrets pass by name, never in argv) and `act serve close`:
   - a cgroup `/bosn-run-<key>` with `memory.max`, `memory.swap.max = 0`,
     `cpu.max` and `pids.max`, sized from the engine (minus 1 GiB and 256
     processes for its own daemons). act itself runs in the cgroup's `act`
@@ -339,9 +345,12 @@ stubbed job.
     run's objects.
 
   When a run ends, however it ends (success, failure, cancellation, timeout),
-  its act process tree is killed and every container, network and volume
-  with its label, its work tree and its cgroup are removed, and their absence
-  is proven. Other runs keep running.
+  `act serve close` kills its act process tree and removes every container
+  with its label or on its network, its networks and volumes, its work tree
+  and its cgroup, and proves them gone. Other runs keep running. A restarted
+  serve reaps whatever a previous one left. The Docker proxy, the runner
+  image load and the tool cache are still Bosn's; they move to act2 before
+  the per-run engine path is retired (#547 step 4).
 
   **The machine claim.** Which daemon makes the engine is decided by the host
   Docker engine itself: a created, never started container named

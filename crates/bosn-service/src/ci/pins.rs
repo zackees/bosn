@@ -84,9 +84,11 @@ pub fn act_artifact(architecture: &str) -> Option<ActArtifact> {
             // with a finite lifetime that fence the v2 recovery store.
             // act2.15 retains exact-key cleanup and protected action checkout
             // reads, and escapes artifact signatures for stock Azure clients.
-            url: "https://github.com/zackees/act2/releases/download/v0.2.89-act2.15/act_Linux_x86_64.tar.gz",
-            sha256: "e21535decdac2c6ed8429b8662825b4c1fca606301e0da54e37b180ad2517e6d",
-            binary_sha256: "b4be8d7ef98729ad16a9a6ddba331f1d2b0feb8abd52eb9e5f3a93155fb4f1df",
+            // act2.17 adds `act serve` (act2#62), which owns each run's scope
+            // inside the shared engine (#547), and `act doctor` (act2#61).
+            url: "https://github.com/zackees/act2/releases/download/v0.2.89-act2.17/act_Linux_x86_64.tar.gz",
+            sha256: "9adc44420ec4eac8800925c7194c52d2f4c3923f510ef60ef2885197f572aadd",
+            binary_sha256: "29858fabb6ae3824552486ec3df31673c6de0277c366d30260e628747bf6ef18",
         }),
         _ => None,
     }
