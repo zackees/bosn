@@ -212,12 +212,12 @@ if mode=='foreign':print('f'*64)
 "#,
             )
             .unwrap();
+            // Plain python3, as every other synthetic engine uses: `uv run` added
+            // seconds of start-up to each listing, so a loaded gate overran the
+            // recovery budget and the test timed out.
             let engine = DockerEngine::synthetic_for_test(
-                "uv",
+                "python3",
                 [
-                    "run".into(),
-                    "--no-project".into(),
-                    "python".into(),
                     script.to_string_lossy().into_owned(),
                     mode.into(),
                     log.to_string_lossy().into_owned(),
