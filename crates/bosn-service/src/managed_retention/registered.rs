@@ -132,10 +132,17 @@ impl RegisteredOwnership {
 }
 
 /// Only the record namespaces setup ensure and manifest ensure write.
+///
+/// A `manifest-guest:` container is the macOS guest's VM container. Its disk lives in the guest's
+/// storage volume, which manifest planning always declares pinned, so reclaiming the stopped
+/// container past its gate loses nothing the next ensure cannot recreate. A running guest is in
+/// use, and never matches the keepalive launcher idle retirement stops.
 fn setup_record_id(kind: ResourceKind, id: &str) -> bool {
     match kind {
         ResourceKind::Container => {
-            id.starts_with("setup-container:") || id.starts_with("manifest-container:")
+            id.starts_with("setup-container:")
+                || id.starts_with("manifest-container:")
+                || id.starts_with("manifest-guest:")
         }
         ResourceKind::Volume => id.starts_with("manifest-volume:"),
         _ => false,

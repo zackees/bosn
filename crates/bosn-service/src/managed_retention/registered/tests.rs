@@ -169,6 +169,9 @@ fn name_digest_and_namespace_must_all_agree() {
     );
     assert!(!setup_record_id(ResourceKind::Volume, "setup-container:x"));
     assert!(!setup_record_id(ResourceKind::Image, "setup-image:x"));
+    // #545: a macOS guest's container is reclaimable; its pinned storage volume is not.
+    assert!(setup_record_id(ResourceKind::Container, "manifest-guest:x"));
+    assert!(!setup_record_id(ResourceKind::Volume, "manifest-guest:x"));
 }
 
 #[test]
