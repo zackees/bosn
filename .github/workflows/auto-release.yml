@@ -150,7 +150,7 @@ jobs:
       - name: Set up Soldr for the wheel backend
         uses: zackees/setup-soldr@fe965fc7e2c5203570072e1d0fd19d0935d98e39
         with:
-          version: "0.9.27"
+          version: "0.9.32"
           toolchain: "1.95.0"
           prebuild-deps: none
 

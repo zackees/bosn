@@ -123,7 +123,7 @@ def test_native_backend_and_compiler_fixtures_have_provisioned_tools() -> None:
             if "soldr cargo" in step.get("run", "") or "uv build --wheel" in step.get("run", "")
         ]
         assert consumers and max(soldr, uv) < min(consumers)
-        assert steps[soldr]["with"]["version"] == "0.9.27"
+        assert steps[soldr]["with"]["version"] == "0.9.32"
         declared = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]
         assert steps[soldr]["with"].get("toolchain", declared["channel"]) == "1.95.0"
         if job is CI["jobs"]["rust"]:
