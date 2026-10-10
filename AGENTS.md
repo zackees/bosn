@@ -184,11 +184,13 @@ Decided 2026-10-09.
   sends work (#324), and `bosn mcp` runs it once at startup against a live
   daemon: an incompatible daemon is refused with both releases, both
   protocols and the remedy, never a bare "request failed".
-- **Clients accept by protocol (#509 phase 2).** A daemon reporting this
-  client's `DAEMON_PROTOCOL` is accepted whatever its release (a one-line
-  release-skew note goes to stderr); another protocol is refused. A daemon
-  reporting protocol 0 predates the handshake and keeps the exact-release
-  check. `daemon_version_mismatch` is the one place this is decided.
+- **Clients accept by protocol (#509 phases 2 and 5).** A daemon whose
+  protocol window holds this client's `DAEMON_PROTOCOL` is accepted whatever
+  its release (a one-line release-skew note goes to stderr); otherwise it is
+  refused. The release guard is retired to the legacy path: only a daemon
+  reporting protocol 0 (it predates the handshake) is still compared by exact
+  release (`legacy_release_matches`). `daemon_version_mismatch` is the one
+  place this is decided.
 - **The daemon serves a protocol window (#509 phase 3).** It advertises
   `[DAEMON_PROTOCOL_MIN, DAEMON_PROTOCOL]` on ping, and every request carries
   the client's protocol. A bump of `DAEMON_PROTOCOL` keeps the previous
@@ -201,8 +203,8 @@ Decided 2026-10-09.
   a bump (phase 3 itself added its fields this way).
 - **The daemon starts from one authoritative executable (#509 phase 4).**
   `ensure_daemon` launches `<state>/daemon/bosn-daemon`, never the client
-  binary that happened to call it. A client installs itself there (with the
-  Linux OpenSSL sidecars, by atomic rename, stamped in `bosn-daemon.release`)
+  binary that happened to call it. A client installs itself there (the binary
+  is self-contained since #265; by atomic rename, stamped in `bosn-daemon.release`)
   only when it is a newer release, or the same release from another build; an
   older client never downgrades it.
 - **Idle handoff only (#509 phase 4).** A client newer than the running

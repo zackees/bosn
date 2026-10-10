@@ -96,21 +96,21 @@ pub(crate) fn protocol_refusal(daemon: &DaemonIdentity, client_protocol: u32) ->
 /// Explain a daemon this client cannot talk to instead of letting it misread
 /// this client's requests (it may answer with a reset connection or a refusal).
 ///
-/// Compatibility is by wire protocol (#509 phases 2-3): a daemon whose protocol
-/// window holds this client's [`DAEMON_PROTOCOL`] is accepted whatever its release (see
-/// [`daemon_release_skew`]). A daemon reporting protocol zero predates the
-/// handshake, so it keeps the exact-release check. `None` when compatible. An
-/// empty release is a daemon from bosn 0.1.5 or older.
+/// Compatibility is by wire protocol (#509): a daemon whose protocol window
+/// holds this client's [`DAEMON_PROTOCOL`] is accepted whatever its release
+/// (see [`daemon_release_skew`]). Release equality survives only as the
+/// legacy guard for a protocol-0 daemon (see [`legacy_release_matches`]).
+/// `None` when compatible. An empty release is a daemon from bosn 0.1.5 or older.
 pub fn daemon_version_mismatch(
     state_dir: &Path,
     client_version: &str,
     daemon: &DaemonIdentity,
 ) -> Option<String> {
-    if daemon.protocol != 0 {
-        if daemon.serves(DAEMON_PROTOCOL) {
-            return None;
-        }
-    } else if daemon.release == client_version {
+    let compatible = match daemon.protocol {
+        0 => legacy_release_matches(client_version, daemon),
+        _ => daemon.serves(DAEMON_PROTOCOL),
+    };
+    if compatible {
         return None;
     }
     let release = if daemon.release.is_empty() {
@@ -127,9 +127,18 @@ pub fn daemon_version_mismatch(
         "the bosn daemon for {state} is {release} speaking {protocol}, but this client is \
          bosn {client_version} speaking protocol {DAEMON_PROTOCOL}; a daemon on another \
          protocol can misread this client's requests. \
-         Stop it with `bosn daemon stop --state-dir {state}` (this also cancels any job it \
-         is running for another session), then retry: a matching daemon starts on demand"
+         A newer bosn restarts an idle older daemon by itself; otherwise stop it with \
+         `bosn daemon stop --state-dir {state}` (this also cancels any job it is running \
+         for another session), then retry: a matching daemon starts on demand"
     ))
+}
+
+/// The retired release guard (#324), kept only for a daemon that reports
+/// protocol 0: it predates the protocol handshake, so its release is the only
+/// evidence of what it decodes. Never consulted for a daemon with a protocol.
+fn legacy_release_matches(client_version: &str, daemon: &DaemonIdentity) -> bool {
+    debug_assert_eq!(daemon.protocol, 0);
+    daemon.release == client_version
 }
 
 /// A one-line note for a compatible daemon from another release (#509): the
