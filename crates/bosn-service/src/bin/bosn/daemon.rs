@@ -170,7 +170,8 @@ fn run_daemon_status(runtime: &kernal_api::async_engine::Runtime, state_dir: &Pa
     };
     // Ask for the version first: it is the one request every daemon
     // release answers, so a mismatch is reported, not a bare failure.
-    let daemon_version = runtime.run(client.daemon_version()).ok();
+    let identity = runtime.run(client.daemon_identity()).ok();
+    let daemon_version = identity.as_ref().map(|identity| identity.release.clone());
     let status = match runtime.run(client.status()) {
         Ok(status) => status,
         Err(_) => {
@@ -183,7 +184,7 @@ fn run_daemon_status(runtime: &kernal_api::async_engine::Runtime, state_dir: &Pa
             daemon_failure("status", json)
         }
     };
-    print_daemon_status(&status, daemon_version.as_deref(), state_dir, json);
+    print_daemon_status(&status, identity.as_ref(), state_dir, json);
 }
 
 pub(crate) enum DaemonInvocation {
@@ -328,10 +329,15 @@ fn print_run_http_value(
 
 pub(crate) fn print_daemon_status(
     status: &bosn_service::Status,
-    daemon_version: Option<&str>,
+    identity: Option<&bosn_service::DaemonIdentity>,
     state_dir: &Path,
     json: bool,
 ) {
+    let daemon_version = identity.map(|identity| identity.release.as_str());
+    // Zero is a daemon that predates the protocol handshake (#509).
+    let daemon_protocol = identity
+        .map(|identity| identity.protocol)
+        .filter(|protocol| *protocol != 0);
     let client_version = env!("CARGO_PKG_VERSION");
     let mismatch = daemon_version.and_then(|version| {
         bosn_service::daemon_version_mismatch(state_dir, client_version, version)
@@ -350,6 +356,8 @@ pub(crate) fn print_daemon_status(
                 "reconciliation_required": status.reconciliation_required,
                 "daemon_version": daemon_version.filter(|version| !version.is_empty()),
                 "client_version": client_version,
+                "daemon_protocol": daemon_protocol,
+                "client_protocol": bosn_service::DAEMON_PROTOCOL,
                 "version_mismatch": mismatch,
             })
         );

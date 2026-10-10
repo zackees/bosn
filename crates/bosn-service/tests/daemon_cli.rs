@@ -117,6 +117,7 @@ fn daemon_cli_serves_status_stops_and_preserves_singleton() {
     assert_eq!(value["daemon"], "online");
     assert_eq!(value["schema_version"], 5);
     assert_eq!(value["daemon_version"], value["client_version"]);
+    assert_eq!(value["daemon_protocol"], value["client_protocol"]);
     assert!(
         value["daemon_version"]
             .as_str()

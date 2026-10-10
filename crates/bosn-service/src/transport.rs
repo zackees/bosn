@@ -26,6 +26,22 @@ pub(crate) fn retire_stale_socket(ep: &Endpoint) -> Result<(), Error> {
     Err(Error::EndpointOccupied(ep.display().into()))
 }
 
+/// The daemon wire protocol this build speaks (#509). Every daemon reports it
+/// on a ping reply, so a later client can decide compatibility by protocol
+/// rather than by exact release. Bump it on any change to the request/reply
+/// wire or the JSON documents it carries; `protocol_surface_is_pinned` fails
+/// until the bump and its fingerprint are recorded together.
+pub const DAEMON_PROTOCOL: u32 = 1;
+
+/// What a daemon says about itself on a ping reply.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DaemonIdentity {
+    /// The release version. Empty from bosn 0.1.5 and older.
+    pub release: String,
+    /// The wire protocol. Zero from a daemon that predates #509.
+    pub protocol: u32,
+}
+
 /// Explain a daemon from another release instead of letting it misread this
 /// client's requests (it may answer with a reset connection or a refusal).
 /// `None` when the versions match. An empty `daemon_version` is a daemon that

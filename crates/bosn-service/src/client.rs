@@ -20,8 +20,14 @@ impl Client {
     /// a daemon that predates the version handshake (bosn 0.1.5 and older).
     /// Compare it with [`daemon_version_mismatch`] before submitting work.
     pub async fn daemon_version(&self) -> Result<String, Error> {
+        self.daemon_identity()
+            .await
+            .map(|identity| identity.release)
+    }
+    /// Ping the daemon and return its release and wire protocol (#509).
+    pub async fn daemon_identity(&self) -> Result<DaemonIdentity, Error> {
         match self.call(Request::operation(1)).await? {
-            Reply::Pong(version) => Ok(version),
+            Reply::Pong(identity) => Ok(identity),
             _ => Err(Error::Protocol("unexpected ping response")),
         }
     }
@@ -979,21 +985,5 @@ fn daemon_refused<T>(result: &Result<T, Error>) -> bool {
 }
 
 #[cfg(test)]
-mod ci_tests {
-    use super::*;
-
-    #[test]
-    fn only_a_definite_refusal_discards_the_staged_snapshot() {
-        let refused: Result<(), Error> = Err(Error::Ci {
-            code: "refused".into(),
-            message: "no".into(),
-        });
-        assert!(daemon_refused(&refused));
-        // The daemon may have accepted the run before the reply was lost.
-        assert!(!daemon_refused::<()>(&Err(Error::Deadline)));
-        assert!(!daemon_refused::<()>(&Err(Error::Protocol(
-            "ci reply decode"
-        ))));
-        assert!(!daemon_refused(&Ok(())));
-    }
-}
+#[path = "client_tests.rs"]
+mod ci_tests;

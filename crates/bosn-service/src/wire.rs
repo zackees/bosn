@@ -141,6 +141,10 @@ pub(crate) struct ReplyWire {
     pub(crate) owned_failures: Vec<String>,
     #[prost(string, tag = "66")]
     pub(crate) owned_refused: String,
+    /// The daemon's [`DAEMON_PROTOCOL`], on a ping reply only. Zero from a
+    /// daemon that predates the protocol handshake (#509).
+    #[prost(uint32, tag = "67")]
+    pub(crate) daemon_protocol: u32,
 }
 #[derive(Message)]
 pub(crate) struct LogRecordWire {
@@ -337,7 +341,7 @@ impl From<SetupReconcileRecordWire> for SetupReconcileRecord {
     }
 }
 pub(crate) enum Reply {
-    Pong(String),
+    Pong(DaemonIdentity),
     Status(Status),
     Shutdown,
     Job(u64),
@@ -365,7 +369,10 @@ pub(crate) enum Reply {
 #[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
 pub(crate) fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
     match v.code {
-        10 => Ok(Reply::Pong(v.daemon_version)),
+        10 => Ok(Reply::Pong(DaemonIdentity {
+            release: v.daemon_version,
+            protocol: v.daemon_protocol,
+        })),
         360 => Ok(Reply::Ci(v.ci_reply)),
         361 => Ok(Reply::CiError(v.ci_reply)),
         20 => Ok(Reply::Status(Status {
