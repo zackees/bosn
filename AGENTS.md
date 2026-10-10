@@ -242,13 +242,5 @@ Decided 2026-10-09.
   per-run Docker proxy runs in the daemon on the host, in that directory, so act and
   its job containers reach Docker only through their run's proxy. No proxy binary is
   shipped into the engine. The directory is frozen in the creation profile
-  (`docker_socket`) and removed with the engine.
-- **Shared engine rollout (2026-10-09, #547 step 2).** `[engine] shared` defaults to
-  on for Linux daemons: concurrent runs lease slots (ports `40000+2·slot`) in one
-  long-lived engine, each in its own run scope, and the engine retires after
-  `[engine] idle_retire_secs` (default 600) with no run. Per-run engines remain for
-  `shared = false`, non-Linux daemons, and a run whose wanted engine differs from a
-  busy shared one. Spares are not kept while sharing is on. act's `act-<…>` job
-  volumes are renamed with the run key by the run proxy; `act-toolcache` stays shared
-  and is seeded once per engine. Step 4 (#547) removes the per-run path. Non-Linux daemons (Docker Desktop VMs)
+  (`docker_socket`) and removed with the engine. Non-Linux daemons (Docker Desktop VMs)
   bind nothing and keep per-run engines.

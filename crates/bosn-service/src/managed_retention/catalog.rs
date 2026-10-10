@@ -78,6 +78,44 @@ fn enroll_at(root: &Path, state_dir: &Path, registry_id: &str) -> Result<(), Str
     })
 }
 
+/// The registry id this machine cataloged for `state_dir`, if exactly one entry names it (#545).
+///
+/// A state directory whose `registry.sqlite3` was lost would otherwise refuse to start (#515) or
+/// mint a new id that strands everything the old one created. Restoring the cataloged id keeps
+/// those objects owned, under every ordinary gate. Two entries naming one directory prove nothing.
+pub(crate) fn cataloged_identity(state_dir: &Path) -> Option<String> {
+    cataloged_identity_at(&machine_root()?, state_dir)
+}
+
+fn cataloged_identity_at(root: &Path, state_dir: &Path) -> Option<String> {
+    let state_dir = std::fs::canonicalize(state_dir).ok()?;
+    let mut found = None;
+    for item in std::fs::read_dir(root).ok()?.flatten().take(MAX_ENTRIES) {
+        let path = item.path();
+        let Some(stem) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        let Some(entry) = read_entry(&path) else {
+            continue;
+        };
+        if entry.registry_id != stem
+            || entry.schema != SCHEMA
+            || !valid_registry_id(&entry.registry_id)
+            || entry.state_dir != state_dir
+        {
+            continue;
+        }
+        if found.replace(entry.registry_id).is_some() {
+            return None;
+        }
+    }
+    found
+}
+
 /// Registries this pass may reclaim for: empty unless `state_dir` is the machine state directory.
 pub(super) fn abandoned(state_dir: &Path, our_registry: Option<&str>) -> BTreeSet<String> {
     let (Some(root), Some(ours)) = (machine_root(), our_registry) else {
@@ -206,6 +244,25 @@ mod tests {
         assert_eq!(abandoned_at(&root, OURS), BTreeSet::from([GONE.to_owned()]));
         forget_at(&root, GONE);
         assert!(abandoned_at(&root, OURS).is_empty());
+    }
+
+    #[test]
+    fn a_lost_database_restores_only_its_own_unambiguous_identity() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let root = temporary.path().join("catalog");
+        let lost = registry_dir(temporary.path(), "lost", GONE);
+        let live = registry_dir(temporary.path(), "live", LIVE);
+        enroll_at(&root, &lost, GONE).unwrap();
+        enroll_at(&root, &live, LIVE).unwrap();
+        std::fs::remove_file(lost.join("registry.sqlite3")).unwrap();
+        assert_eq!(cataloged_identity_at(&root, &lost).as_deref(), Some(GONE));
+        assert_eq!(cataloged_identity_at(&root, &live).as_deref(), Some(LIVE));
+        let unknown = temporary.path().join("unknown");
+        std::fs::create_dir_all(&unknown).unwrap();
+        assert_eq!(cataloged_identity_at(&root, &unknown), None);
+        // A second registry claiming the same directory makes the answer ambiguous.
+        enroll_at(&root, &lost, OURS).unwrap();
+        assert_eq!(cataloged_identity_at(&root, &lost), None);
     }
 
     #[test]
