@@ -10,7 +10,7 @@ fi
 
 export PATH="$HOME/.local/bin:$PATH"
 if ! command -v soldr > /dev/null 2>&1; then
-  uv tool install soldr==0.9.27
+  uv tool install soldr==0.9.32
 fi
 soldr toolchain ensure --json
 # The dev/test install builds a dev-profile wheel (AGENTS.md, "Test install
