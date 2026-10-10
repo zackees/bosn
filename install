@@ -15,6 +15,6 @@ fi
 soldr toolchain ensure --json
 # The dev/test install builds a dev-profile wheel (AGENTS.md, "Test install
 # profile"); release wheels come only from the native-wheel and release lanes.
-export BOSN_WHEEL_PROFILE="${BOSN_WHEEL_PROFILE:-dev}"
+. ci/dev_profile.sh
 uv sync --frozen --all-groups
 echo "bosn environment ready."

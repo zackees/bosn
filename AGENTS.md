@@ -85,7 +85,9 @@ living implementation spec.
     **soldr#3239** (native aux-bin staging).
 
 - **Test install profile (#600, decided 2026-10-09): `./install` builds a `dev`-profile
-  wheel.** It exports `BOSN_WHEEL_PROFILE=dev` (unless already set), so both the
+  wheel.** It exports `BOSN_WHEEL_PROFILE=dev` (unless already set) from
+  `ci/dev_profile.sh`, which `./lint` and `./test` source too: the variable is a uv
+  cache key, so a bare `uv run` without it rebuilt the wheel in release (#503). Both the
   `bosn-native` CLI and the extension build with Cargo's `dev` profile; the backend
   accepts only `release` (the default) or `dev`. This is the wheel the local gate and
   the `linux` lane test. The gate must check what ci.yml checks, and it still does: the

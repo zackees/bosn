@@ -1,4 +1,5 @@
 #!/bin/bash
 set -e
 cd "$(dirname "$0")"
+. ci/dev_profile.sh
 exec uv run python ci/lint.py "$@"
