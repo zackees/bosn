@@ -8,8 +8,11 @@ explicit new decision, not by inference.
 Ordinary PRs and `main` pushes run minimal CI; the literal `ci-test` PR label
 adds Linux lint, unit, and Docker tests. The literal `ci-full` PR label runs the
 full platform matrix, including hosted Intel and Apple Silicon macOS smoke
-checks. Before **any** tag or release, full CI must pass on the exact candidate
-commit SHA. See [CI tiers and queue cost](docs/ci-queue-slo.md) and the
+checks. One path rule sits beside the labels: a PR or `main` push that changes
+`crates/bosn-widget/**` (its own Cargo workspace, which no other lane builds)
+runs the required `Desktop widget (Linux, WebKitGTK)` job, selected by
+`ci/select_ci_tier.py`; `ci-widget` forces it otherwise. Before **any** tag or release, full CI must pass
+on the exact candidate commit SHA. See [CI tiers and queue cost](docs/ci-queue-slo.md) and the
 [fleet rollout issue](https://github.com/zackees/soldr/issues/3345).
 
 Releases go only through the **pretag release gate** (see "Releasing" below):

@@ -216,3 +216,18 @@ def test_no_job_runs_unconditionally_under_a_cancelled_run() -> None:
     # merge even though the live run is green (#373).
     for name, job in CI["jobs"].items():
         assert "always()" not in str(job.get("if", "")), name
+
+
+def test_widget_lane_is_path_selected() -> None:
+    # bosn-widget is its own workspace; no routine lane tests it, so a change
+    # under it selects the required WebKitGTK job by path (#484, #581).
+    job = CI["jobs"]["widget"]
+    assert "needs.select-tier.outputs.widget == 'true'" in job["if"]
+    assert CI["jobs"]["select-tier"]["steps"][0]["with"]["fetch-depth"] == 0
+    assert select_ci_tier.touches_widget(["crates/bosn-widget/src/placement.rs"])
+    assert not select_ci_tier.touches_widget(["crates/bosn-core/src/lib.rs", "docs/ci.md"])
+    pr = {"pull_request": {"base": {"sha": "b" * 40}}}
+    assert select_ci_tier.diff_base("pull_request", pr) == "b" * 40
+    assert select_ci_tier.diff_base("push", {"before": "a" * 40}) == "a" * 40
+    assert select_ci_tier.diff_base("push", {"before": "0" * 40}) == ""
+    assert select_ci_tier.diff_base("workflow_dispatch", {}) == ""

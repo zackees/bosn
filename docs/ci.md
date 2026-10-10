@@ -157,8 +157,10 @@ fails if the matching artifact is absent; it does not select another version.
 The desktop runtime needs GTK 3, WebKitGTK 4.1 and libsoup 3. The headless CLI
 and its four platform wheels remain separate from the desktop archive.
 
-For Linux widget implementation changes, `ci-widget` selects the existing
-WebKitGTK lint/test job without selecting unrelated full-tier platforms.
+`crates/bosn-widget` is a separate Cargo workspace that no routine lane builds,
+so any PR (or `main` push) changing a file under it selects the WebKitGTK
+lint/test job by path; it is a required check. `ci-widget` forces the job on
+other PRs without selecting unrelated full-tier platforms.
 Release candidates still require the complete full tier.
 
 **When it appears.** `[widget] auto_launch` is `always` (the default),
