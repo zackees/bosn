@@ -28,6 +28,7 @@ pub(crate) fn run_setup_reconcile(mut arguments: impl Iterator<Item = std::ffi::
     }
     let (state_dir, workspace, after, limit, json_output) =
         parse_gc_preview_arguments(arguments).unwrap_or_else(|_| usage());
+    require_matching_daemon(&state_dir, "setup reconcile preview", json_output);
     let result = Client::for_state(state_dir).ok().and_then(|client| {
         RuntimeBuilder::current_thread()
             .enable_all()
@@ -98,6 +99,7 @@ pub(crate) fn run_setup_reconcile_repair_missing(
     if !apply || !yes {
         usage();
     }
+    require_matching_daemon(&state_dir, "setup reconcile repair-missing", json_output);
     let result = Client::for_state(&state_dir).ok().and_then(|client| {
         RuntimeBuilder::current_thread()
             .enable_all()
@@ -169,6 +171,7 @@ pub(crate) fn run_setup_stop_retired(mut arguments: impl Iterator<Item = std::ff
     if !apply || !yes {
         usage();
     }
+    require_matching_daemon(&state_dir, "setup stop-retired", json_output);
     let result = Client::for_state(&state_dir).ok().and_then(|client| {
         RuntimeBuilder::current_thread()
             .enable_all()
@@ -226,6 +229,7 @@ pub(crate) fn run_setup_adopt(arguments: impl Iterator<Item = std::ffi::OsString
         output_limit: invocation.request.output_limit,
         confirm: true,
     };
+    require_matching_daemon(&invocation.state_dir, "setup adopt", invocation.json);
     let result = Client::for_state(&invocation.state_dir)
         .ok()
         .and_then(|client| {
@@ -278,6 +282,7 @@ pub(crate) fn run_setup_prepare(arguments: impl Iterator<Item = std::ffi::OsStri
         Ok(invocation) => invocation,
         Err(()) => usage(),
     };
+    require_matching_daemon(&invocation.state_dir, "setup prepare", invocation.json);
     let client = match Client::for_state(&invocation.state_dir) {
         Ok(client) => client,
         Err(_) => setup_prepare_failure(),
@@ -309,6 +314,7 @@ pub(crate) fn run_setup_task(arguments: impl Iterator<Item = std::ffi::OsString>
         Ok(invocation) => invocation,
         Err(()) => usage(),
     };
+    require_matching_daemon(&invocation.state_dir, "setup task", invocation.json);
     let client = match Client::for_state(&invocation.state_dir) {
         Ok(client) => client,
         Err(_) => setup_task_failure(invocation.json),
@@ -348,6 +354,7 @@ pub(crate) fn run_setup_app_task(arguments: impl Iterator<Item = std::ffi::OsStr
         deadline: invocation.request.deadline,
         output_limit: invocation.request.output_limit,
     };
+    require_matching_daemon(&invocation.state_dir, "setup app-task", invocation.json);
     let client = match Client::for_state(&invocation.state_dir) {
         Ok(client) => client,
         Err(_) => setup_task_failure(invocation.json),
@@ -380,6 +387,7 @@ pub(crate) fn run_setup_ensure(arguments: impl Iterator<Item = std::ffi::OsStrin
         Ok(invocation) => invocation,
         Err(()) => usage(),
     };
+    require_matching_daemon(&invocation.state_dir, "setup ensure", invocation.json);
     let client = match Client::for_state(&invocation.state_dir) {
         Ok(client) => client,
         Err(_) => setup_ensure_failure(invocation.json),
@@ -432,6 +440,7 @@ pub(crate) fn run_setup_done(mut arguments: impl Iterator<Item = std::ffi::OsStr
     if !yes {
         usage();
     }
+    require_matching_daemon(&state_dir, "setup done", json_output);
     let result = Client::for_state(&state_dir).ok().and_then(|client| {
         RuntimeBuilder::current_thread()
             .enable_all()

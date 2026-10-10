@@ -43,6 +43,11 @@ pub(crate) fn run_registry(mut arguments: impl Iterator<Item = std::ffi::OsStrin
     .unwrap_or_else(|_| usage());
     let state_dir = invocation.state_dir();
     let json_output = invocation.json();
+    require_matching_daemon(
+        state_dir,
+        &format!("registry {}", invocation.action()),
+        json_output,
+    );
     let client = Client::for_state(state_dir)
         .unwrap_or_else(|_| registry_failure(invocation.action(), json_output));
     let runtime = RuntimeBuilder::current_thread()

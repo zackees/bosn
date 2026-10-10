@@ -19,6 +19,11 @@ pub(crate) fn run_job(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
         Ok(invocation) => invocation,
         Err(()) => usage(),
     };
+    require_matching_daemon(
+        invocation.state_dir(),
+        &format!("job {}", invocation.action()),
+        invocation.json(),
+    );
     let client = match Client::for_state(invocation.state_dir()) {
         Ok(client) => client,
         Err(_) => job_failure(invocation.action(), invocation.json()),

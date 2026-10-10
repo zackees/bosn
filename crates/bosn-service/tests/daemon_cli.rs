@@ -291,7 +291,7 @@ fn daemon_json_failures_are_stable_and_redacted() {
 /// misread -- 0.1.4 answered a newer client's manifest ensure with a bare
 /// `ConnectionReset`. It is never stopped on the user's behalf.
 #[test]
-fn bosn_run_refuses_a_daemon_from_another_release_with_the_remedy() {
+fn every_daemon_command_refuses_a_daemon_from_another_release_with_the_remedy() {
     let root = tempfile::tempdir().unwrap();
     let state = root.path().join("state");
     let workspace = root.path().join("workspace");
@@ -368,6 +368,8 @@ fn bosn_run_refuses_a_daemon_from_another_release_with_the_remedy() {
             .is_some_and(|text| text.contains("bosn daemon stop"))
     );
 
+    assert_every_family_refuses(&state, &workspace);
+
     // The refused daemon was left running for whoever owns it.
     assert!(runtime.run(client.ping()).is_ok());
     runtime.run(client.shutdown()).unwrap();
@@ -421,4 +423,76 @@ fn serve_reclaims_a_socket_file_left_by_a_killed_daemon() {
     ]);
     assert!(stop.status.success());
     assert!(second.wait_for_exit().success());
+}
+
+/// Every other daemon-backed family runs the same pre-flight as `bosn run`
+/// (#324): both versions and the remedy, never a bare "request failed".
+fn assert_every_family_refuses(state: &Path, workspace: &Path) {
+    let state_arg = state.to_str().unwrap();
+    let workspace_arg = workspace.to_str().unwrap();
+    let families: [&[&str]; 6] = [
+        &[
+            "setup",
+            "done",
+            "--state-dir",
+            state_arg,
+            "--workspace",
+            workspace_arg,
+            "--yes",
+        ],
+        &["job", "status", "--state-dir", state_arg, "--job-id", "1"],
+        &["jobs", "--state-dir", state_arg],
+        &[
+            "manifest",
+            "volume-gc",
+            "preview",
+            "--state-dir",
+            state_arg,
+            "--workspace",
+            workspace_arg,
+        ],
+        &[
+            "gc",
+            "preview",
+            "--state-dir",
+            state_arg,
+            "--workspace",
+            workspace_arg,
+        ],
+        &["registry", "resources", "--state-dir", state_arg],
+    ];
+    for family in families {
+        let args: Vec<&std::ffi::OsStr> = family.iter().map(|arg| arg.as_ref()).collect();
+        let output = run(&args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{family:?}: {stderr}");
+        assert!(
+            stderr.contains("is an older bosn (0.1.5 or earlier"),
+            "{family:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!(
+                "but this client is bosn {}",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "{family:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains("bosn daemon stop --state-dir"),
+            "{family:?}: {stderr}"
+        );
+        assert!(!stderr.contains("request failed"), "{family:?}: {stderr}");
+    }
+    let mut json_args: Vec<&std::ffi::OsStr> = families[1].iter().map(|arg| arg.as_ref()).collect();
+    json_args.push("--json".as_ref());
+    let output = run(&json_args);
+    assert!(!output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["action"], "job_status");
+    assert_eq!(value["error"], "version_mismatch");
+    assert!(
+        value["message"]
+            .as_str()
+            .is_some_and(|text| text.contains("bosn daemon stop"))
+    );
 }

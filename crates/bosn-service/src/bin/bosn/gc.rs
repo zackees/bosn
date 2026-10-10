@@ -20,6 +20,7 @@ pub(crate) fn run_gc(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
     }
     let (state_dir, workspace, after, limit, json_output) =
         parse_gc_preview_arguments(arguments).unwrap_or_else(|_| usage());
+    require_matching_daemon(&state_dir, "gc preview", json_output);
     let client = Client::for_state(state_dir).unwrap_or_else(|_| gc_failure(json_output));
     let runtime = RuntimeBuilder::current_thread()
         .enable_all()
@@ -100,6 +101,7 @@ pub(crate) fn run_gc_unmanaged(mut arguments: impl Iterator<Item = std::ffi::OsS
         // The daemon re-derives the census and the plan itself. The preview this process
         // could build is never trusted: it was taken against state that may have changed.
         let ttl = ttl_seconds.map_or(0u64, |value| value.max(0.0) as u64);
+        require_matching_daemon(&state_dir, "gc unmanaged apply", json_output);
         let result = Client::for_state(state_dir).ok().and_then(|client| {
             RuntimeBuilder::current_thread()
                 .enable_all()
@@ -312,6 +314,7 @@ pub(crate) fn run_gc_apply(mut arguments: impl Iterator<Item = std::ffi::OsStrin
     if !apply || !yes {
         usage();
     }
+    require_matching_daemon(&state_dir, "gc volumes apply", json_output);
     let result = Client::for_state(state_dir).ok().and_then(|client| {
         RuntimeBuilder::current_thread()
             .enable_all()
