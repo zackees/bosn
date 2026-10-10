@@ -39,6 +39,10 @@ pub struct FakeBackend {
     pub saved_while_live: Mutex<u32>,
     /// What sampling the engine's storage reports; `None` fails the sample.
     pub storage: Mutex<Option<crate::ci::storage::StorageUsage>>,
+    /// How long each storage sample takes to answer (#538).
+    pub storage_delay: Mutex<Duration>,
+    /// Storage samples started, and how many were in flight at once at most.
+    pub storage_probes: Mutex<(u32, u32, u32)>,
     /// Engines prepared (act and runner image), spares included.
     pub engine_preparations: Mutex<u32>,
     /// The host the fake engine reports; [`FAKE_HOST`] unless set.
@@ -164,7 +168,18 @@ impl ActEngineBackend for FakeBackend {
         _engine: &'a str,
     ) -> crate::ci::engine::BoxFuture<'a, Result<crate::ci::storage::StorageUsage, String>> {
         let usage = *self.storage.lock().unwrap();
-        Box::pin(async move { usage.ok_or_else(|| "df: not sampled".to_string()) })
+        let delay = *self.storage_delay.lock().unwrap();
+        Box::pin(async move {
+            {
+                let mut probes = self.storage_probes.lock().unwrap();
+                probes.0 += 1;
+                probes.1 += 1;
+                probes.2 = probes.2.max(probes.1);
+            }
+            async_engine::sleep(delay).await;
+            self.storage_probes.lock().unwrap().1 -= 1;
+            usage.ok_or_else(|| "df: not sampled".to_string())
+        })
     }
     fn save_toolcache<'a>(
         &'a self,
