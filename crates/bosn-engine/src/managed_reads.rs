@@ -100,6 +100,26 @@ impl DockerEngine {
     }
 
     /// Read-only: container ids created from one image.
+    /// Full ids of every image tagged in `repository`, one per tag (#545).
+    pub fn image_ids_with_reference(
+        &self,
+        repository: &str,
+        options: RunOptions,
+    ) -> Result<CensusRead, CommandError> {
+        let filter = format!("reference={repository}");
+        let result = self
+            .with_args([
+                "image",
+                "ls",
+                "-q",
+                "--no-trunc",
+                "--filter",
+                filter.as_str(),
+            ])
+            .capture(options)?;
+        Ok(census_read(result, "docker image ls --filter reference"))
+    }
+
     pub fn container_ids_using_image(
         &self,
         id: &str,

@@ -434,8 +434,11 @@ fn observe_images(
     artifacts: &mut Vec<bosn_core::ObservedArtifact>,
     unreadable: &mut Vec<String>,
 ) {
-    let Some(ids) = labeled_ids(
-        engine.image_ids_with_label(probe, options),
+    // #545: Bosn-built setup and manifest images carry no labels; they are found by their
+    // `bosn-setup` tag and proven by this registry's record of building them.
+    let Some(ids) = labeled_union(
+        &[probe, images::BUILT_REFERENCE_PROBE],
+        |probe| images::image_ids(engine, probe, options),
         "docker image ls",
         unreadable,
     ) else {
@@ -456,9 +459,9 @@ fn observe_images(
             let Some(age) = entry.created_age(now_seconds()) else {
                 continue;
             };
-            let proven = authority.prove(
-                ResourceKind::Image,
+            let proven = authority.prove_image(
                 &entry.id,
+                &entry.repo_tags,
                 entry.labels(),
                 age,
                 !image_is_unused(engine, &entry.id, options),
@@ -509,6 +512,7 @@ fn revalidate(
     let options = RunOptions::bounded(RETENTION_READ_DEADLINE, RETENTION_OUTPUT_LIMIT);
     // A fresh registry read: a lease or session taken since the plan was built must protect.
     let authority = authority::Authority::load(state_dir);
+    let mut tags = None;
     let (name, labels, age, in_use, bytes) = match candidate.kind {
         ResourceKind::Container => {
             let probe = vec![candidate.id.clone()];
@@ -561,6 +565,7 @@ fn revalidate(
                 return Ok(Recheck::Gone);
             };
             let in_use = !image_is_unused(engine, &entry.id, options);
+            tags = Some(entry.repo_tags.clone());
             (
                 entry.id.clone(),
                 entry.labels(),
@@ -578,7 +583,10 @@ fn revalidate(
             candidate.id
         ));
     };
-    let proven = authority.prove(candidate.kind, &name, labels, age, in_use);
+    let proven = match &tags {
+        Some(tags) => authority.prove_image(&name, tags, labels, age, in_use),
+        None => authority.prove(candidate.kind, &name, labels, age, in_use),
+    };
     let fresh = bosn_core::ObservedArtifact {
         id: candidate.id.clone(),
         kind: candidate.kind,
@@ -605,16 +613,17 @@ fn revalidate(
 /// `Ok(true)` when this call removed the object, `Ok(false)` when Docker reports it already gone.
 fn remove_owned(engine: &DockerEngine, candidate: &RetentionVerdict) -> Result<bool, String> {
     let options = RunOptions::bounded(RETENTION_REMOVAL_DEADLINE, RETENTION_REMOVAL_OUTPUT_LIMIT);
-    let argv: Vec<&str> = match candidate.kind {
+    let argv: Vec<std::borrow::Cow<'_, str>> = match candidate.kind {
         // No `-f`: a container can start between the re-check and this call, and forcing it
         // would kill live work this pass never looked at. A plain `rm` already removes an
         // already-stopped container, and refuses a running one, which the caller reports as a
         // failure and moves on from.
-        ResourceKind::Container => vec!["rm", &candidate.id],
-        ResourceKind::Volume => vec!["volume", "rm", &candidate.id],
-        ResourceKind::Image => vec!["rmi", &candidate.id],
+        ResourceKind::Container => vec!["rm".into(), candidate.id.as_str().into()],
+        ResourceKind::Volume => vec!["volume".into(), "rm".into(), candidate.id.as_str().into()],
+        ResourceKind::Image => images::removal_argv(engine, &candidate.id),
         _ => return Err("unsupported kind for removal".to_owned()),
     };
+    let argv: Vec<&str> = argv.iter().map(AsRef::as_ref).collect();
     let result = engine.with_args(argv).capture(options).map_err(|error| {
         format!(
             "removing {} {}: {error}",
@@ -888,6 +897,15 @@ struct ImageDetail {
     size: Option<i128>,
     #[serde(rename = "Config", default)]
     config: Option<LabelledConfig>,
+    #[serde(rename = "RepoTags", default, deserialize_with = "null_as_empty_vec")]
+    repo_tags: Vec<String>,
+}
+
+fn null_as_empty_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl ImageDetail {
@@ -912,6 +930,7 @@ pub use report::{maintenance_pass, report_pass};
 mod authority;
 pub(crate) mod catalog;
 mod idle;
+mod images;
 mod registered;
 mod sizes;
 
