@@ -42,7 +42,7 @@ pub(crate) fn run_scan(mut arguments: impl Iterator<Item = std::ffi::OsString>) 
     let state_dir = state_dir.unwrap_or_else(bosn_service::mcp::default_state_dir);
     let config = census_config(ttl_seconds);
     let threshold = warning_threshold(warn_bytes, warn_objects);
-    let (scan, our_registry) = scan_host(&state_dir, config, census_deadline(deadline));
+    let (scan, _) = scan_host(&state_dir, config, census_deadline(deadline));
     let census = &scan.census;
     let warning = bosn_core::warning(census, threshold);
     let acknowledged = bosn_core::acknowledgement_suppresses(
@@ -74,15 +74,34 @@ pub(crate) fn run_scan(mut arguments: impl Iterator<Item = std::ffi::OsString>) 
     let mut owned = bosn_service::owned_accounting::summarize(&scan.artifacts, census.partial);
     let registry = bosn_registry::Registry::open_read_only(state_dir.join("registry.sqlite3")).ok();
     owned.correlate(registry.as_ref());
+    let running = bosn_service::managed_retention::running_containers(
+        &DockerEngine::docker(),
+        census_deadline(deadline),
+    );
     if json_output {
         println!(
             "{}",
-            scan_json(scan, warning.as_ref(), acknowledged, &owned)
+            scan_json(scan, warning.as_ref(), acknowledged, &owned, &running)
         );
         return;
     }
     println!("scan");
     print_census(census);
+    print_owned(owned);
+    print_running(&running.0);
+    for detail in scan.unreadable.iter().chain(&running.1) {
+        eprintln!("scan: partial: {detail}");
+    }
+    // A partial census is never a clean machine, so it warns regardless of size.
+    if let Some(warning) = warning
+        && !acknowledged
+    {
+        print_warning(&warning);
+    }
+}
+
+/// Bosn's own storage classes.
+fn print_owned(owned: bosn_service::owned_accounting::OwnedStorage) {
     println!("Bosn storage (Docker approximate sizes):");
     for row in owned.classes {
         let bytes = row
@@ -96,16 +115,23 @@ pub(crate) fn run_scan(mut arguments: impl Iterator<Item = std::ffi::OsString>) 
             row.detached_objects
         );
     }
-    for detail in &scan.unreadable {
-        eprintln!("scan: partial: {detail}");
+}
+
+/// Running Bosn containers with their uptime; an idle keepalive is flagged (#536). Running
+/// containers are never retention candidates, so this is the only place their age shows.
+fn print_running(running: &[bosn_service::managed_retention::RunningContainer]) {
+    if running.is_empty() {
+        return;
     }
-    // A partial census is never a clean machine, so it warns regardless of size.
-    if let Some(warning) = warning
-        && !acknowledged
-    {
-        print_warning(&warning);
+    println!("Running Bosn containers:");
+    for row in running {
+        let note = match (row.keepalive, row.idle) {
+            (true, true) => "  idle keepalive (maintenance stops it once idle past 6h)",
+            (true, false) => "  keepalive, task running",
+            (false, _) => "",
+        };
+        println!("  {}: up {:.1}h{note}", row.name, row.up_seconds / 3600.0);
     }
-    let _ = our_registry;
 }
 
 /// The census configuration, with the documented default age gate.
@@ -211,6 +237,10 @@ pub(crate) fn scan_json(
     warning: Option<&bosn_core::Warning>,
     acknowledged: bool,
     owned: &bosn_service::owned_accounting::OwnedStorage,
+    running: &(
+        Vec<bosn_service::managed_retention::RunningContainer>,
+        Vec<String>,
+    ),
 ) -> serde_json::Value {
     let census = &scan.census;
     let classes: Vec<_> = census
@@ -262,6 +292,8 @@ pub(crate) fn scan_json(
         "owned_storage": owned,
         "foreign_reclaimable": foreign_reclaimable,
         "unreadable": scan.unreadable,
+        "running_containers": running.0,
+        "running_unreadable": running.1,
     })
 }
 

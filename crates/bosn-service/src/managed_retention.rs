@@ -790,6 +790,8 @@ struct ContainerDetail {
 struct ContainerState {
     #[serde(rename = "Running", default)]
     running: bool,
+    #[serde(rename = "StartedAt", default)]
+    started_at: String,
 }
 
 /// One entry of a container's mount table.
@@ -834,6 +836,10 @@ impl ContainerDetail {
     }
     fn created_age(&self, now: f64) -> Option<f64> {
         parse_docker_time(&self.created).map(|created| (now - created).max(0.0))
+    }
+    fn started_age(&self, now: f64) -> Option<f64> {
+        let started = parse_docker_time(&self.state.as_ref()?.started_at)?;
+        (started > 0.0).then(|| (now - started).max(0.0))
     }
     fn size_bytes(&self) -> Option<i128> {
         self.size_rw
@@ -933,7 +939,9 @@ pub use catalog::{Release, labelled_registries, release_registry};
 mod idle;
 mod images;
 mod registered;
+mod running;
 mod sizes;
+pub use running::{RunningContainer, running_containers};
 
 #[cfg(test)]
 mod tests;

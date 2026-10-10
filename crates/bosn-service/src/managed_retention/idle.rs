@@ -188,7 +188,7 @@ fn stop_if_still_idle(
 }
 
 /// The exact keepalive launcher argv, never a declared command that merely ends in one.
-fn is_keepalive(entry: &ContainerDetail) -> bool {
+pub(super) fn is_keepalive(entry: &ContainerDetail) -> bool {
     entry
         .config
         .as_ref()
@@ -196,6 +196,14 @@ fn is_keepalive(entry: &ContainerDetail) -> bool {
         .is_some_and(|cmd| {
             cmd == bosn_setup::login_shell_args(crate::MANIFEST_LINUX_IDLE_COMMAND).as_slice()
         })
+}
+
+/// Whether `docker top` shows only the keepalive right now. Unreadable is `false`.
+pub(super) fn keepalive_only(engine: &DockerEngine, id: &str, options: RunOptions) -> bool {
+    engine
+        .with_args(["top", id, "-eo", "pid,comm"])
+        .capture(options)
+        .is_ok_and(|top| top.ok() && only_keepalive_processes(&top.stdout))
 }
 
 /// `docker top -eo pid,comm` shows exactly one shell and one `sleep`.
