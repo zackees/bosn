@@ -165,10 +165,8 @@ jobs:
       # build cache above (nearest-ancestor restore per zackees/ci.yml
       # CACHE-024), and an attested PR head skips this job altogether.
 
-      - name: Install native build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes pkg-config libssl-dev
+      # No apt-get (#600): pkg-config and libssl-dev ship in both GitHub's
+      # ubuntu-latest image and bosn's pinned act runner image.
 
       - name: Rust format and Clippy
         run: |
@@ -187,7 +185,10 @@ jobs:
       # unit tests instead link the selected CPython explicitly.
       - name: Test Rust workspace
         run: |
-          soldr cargo test --workspace --exclude bosn-python --locked
+          # nextest runs every test binary in parallel (#600); it cannot run
+          # doctests, so they run separately and nothing is dropped.
+          soldr cargo nextest run --workspace --exclude bosn-python --locked
+          soldr cargo test --workspace --exclude bosn-python --doc --locked
           PYO3_PYTHON="$(command -v python)" soldr cargo test -p bosn-python --lib --locked --no-default-features --features embedded-python-tests
 
   linux:
@@ -253,10 +254,9 @@ jobs:
 
       - name: Install
         if: needs.select-tier.outputs.test == 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes pkg-config libssl-dev patchelf
-          ./install
+        # No apt-get (#600): pkg-config and libssl-dev ship in both runner
+        # images, and patchelf comes from the wheel's build requirements.
+        run: ./install
 
       - name: Lint
         if: needs.select-tier.outputs.test == 'true'

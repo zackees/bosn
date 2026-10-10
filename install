@@ -13,5 +13,8 @@ if ! command -v soldr > /dev/null 2>&1; then
   uv tool install soldr==0.9.27
 fi
 soldr toolchain ensure --json
+# The dev/test install builds a dev-profile wheel (AGENTS.md, "Test install
+# profile"); release wheels come only from the native-wheel and release lanes.
+export BOSN_WHEEL_PROFILE="${BOSN_WHEEL_PROFILE:-dev}"
 uv sync --frozen --all-groups
 echo "bosn environment ready."

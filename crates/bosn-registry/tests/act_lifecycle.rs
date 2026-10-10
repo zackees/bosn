@@ -198,10 +198,10 @@ fn success_requires_execution_and_exact_cleanup_proof() {
 fn pending_create_failure_is_recoverable_and_history_does_not_cap_recovery() {
     let dir = TemporaryDirectory::new().unwrap();
     let mut r = Registry::create_writer(dir.path().join("r"), OWNER).unwrap();
+    let mut tx = r.begin_immediate().unwrap(); // one fsync, not 1,100 (#600)
     for n in 0..1100 {
         let mut i = intent();
         i.run_id = format!("{n:08x}-bbbb-4ccc-8ddd-eeeeeeeeeeee");
-        let mut tx = r.begin_immediate().unwrap();
         tx.begin_act_engine(&i).unwrap();
         tx.request_act_cleanup(&i.run_id, ActRunOutcome::Interrupted, 2.0)
             .unwrap();
@@ -215,8 +215,8 @@ fn pending_create_failure_is_recoverable_and_history_does_not_cap_recovery() {
             3.0,
         )
         .unwrap();
-        tx.commit().unwrap();
     }
+    tx.commit().unwrap();
     {
         let mut tx = r.begin_immediate().unwrap();
         tx.begin_act_engine(&intent()).unwrap();

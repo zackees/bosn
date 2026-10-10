@@ -78,6 +78,38 @@ def _wheel_target() -> _DarwinTarget | None:
         ) from error
 
 
+@dataclass(frozen=True)
+class _BuildProfile:
+    """The Cargo profile both native artifacts in one wheel are built with."""
+
+    cargo_arguments: tuple[str, ...]
+    # Maturin's PEP 517 path already builds release unless told otherwise.
+    maturin_arguments: tuple[str, ...]
+    directory: str
+
+
+# A release wheel is the default and the only kind CI's native-wheel lanes and
+# the release ship. `./install` opts into `dev` for the local/test install
+# (AGENTS.md, "Test install profile"): the gate checks behaviour, and the
+# shipped release wheel is still built and verified by full CI and release.
+_BUILD_PROFILES = {
+    "release": _BuildProfile(("--release",), (), "release"),
+    "dev": _BuildProfile(("--profile", "dev"), ("--profile", "dev"), "debug"),
+}
+
+
+def _build_profile() -> _BuildProfile:
+    requested = environ.get("BOSN_WHEEL_PROFILE") or "release"
+    try:
+        return _BUILD_PROFILES[requested]
+    except KeyError as error:
+        allowed = ", ".join(sorted(_BUILD_PROFILES))
+        raise RuntimeError(
+            f"BOSN_WHEEL_PROFILE={requested!r} is not a supported Bosn build profile; "
+            f"allowed values: {allowed}"
+        ) from error
+
+
 # The command installed on PATH.  The Cargo bin stays `bosn-native` (the
 # workspace already has a distinct `bosn` bin in bosn-service; a second one
 # would collide on `target/<profile>/bosn`), so the backend renames it to the
@@ -202,7 +234,7 @@ def _build_native_cli() -> None:
         _soldr_executable(),
         "cargo",
         "build",
-        "--release",
+        *_build_profile().cargo_arguments,
         "--locked",
         "--package",
         "bosn-python",
@@ -307,6 +339,8 @@ def _wheel_config(config_settings: Mapping[str, Any] | None) -> dict[str, Any]:
         arguments = arguments.split()
     else:
         arguments = list(arguments)
+    if "--release" not in arguments and "--profile" not in arguments:
+        arguments.extend(_build_profile().maturin_arguments)
     if "--compatibility" not in arguments and "--manylinux" not in arguments:
         arguments.extend(["--compatibility", "pypi"])
     target = _wheel_target()
@@ -344,6 +378,7 @@ def _detach_repaired_cargo_aliases(target: _DarwinTarget | None) -> None:  # noq
     if target is not None or not platform.startswith("linux"):
         return
     base = _cargo_target_directory()
+    profile = _build_profile().directory
     staged = base / "maturin" / "libbosn_native.so"
     if not staged.exists():
         return
@@ -351,12 +386,12 @@ def _detach_repaired_cargo_aliases(target: _DarwinTarget | None) -> None:  # noq
         raise RuntimeError("unsafe maturin extension artifact")
     aliases = [
         path
-        for path in (base / "release" / "deps").glob("libbosn_native*.so")
+        for path in (base / profile / "deps").glob("libbosn_native*.so")
         if path.is_file() and path.samefile(staged)
     ]
     if not aliases:
         return
-    pristine = base / "release" / staged.name
+    pristine = base / profile / staged.name
     if pristine.is_symlink() or not pristine.is_file() or pristine.samefile(staged):
         raise RuntimeError("pristine Cargo extension unavailable; use a fresh owned target tree")
     for alias in aliases:
