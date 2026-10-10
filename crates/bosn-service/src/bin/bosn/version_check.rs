@@ -7,16 +7,22 @@
 
 use super::*;
 
-/// The mismatch message when the daemon for `state_dir` answers with another
-/// release's version; `None` when it matches or does not answer (the command
-/// then fails, or starts a daemon, in its own way).
+/// The mismatch message when the daemon for `state_dir` speaks another wire
+/// protocol (or, predating the handshake, is another release); `None` when it
+/// is compatible or does not answer (the command then fails, or starts a
+/// daemon, in its own way). A compatible daemon from another release gets a
+/// one-line note on stderr (#509).
 pub(crate) fn daemon_mismatch(
     runtime: &kernal_api::async_engine::Runtime,
     client: &Client,
     state_dir: &Path,
 ) -> Option<String> {
-    let version = runtime.run(client.daemon_version()).ok()?;
-    bosn_service::daemon_version_mismatch(state_dir, env!("CARGO_PKG_VERSION"), &version)
+    let identity = runtime.run(client.daemon_identity()).ok()?;
+    let client_version = env!("CARGO_PKG_VERSION");
+    if let Some(note) = bosn_service::daemon_release_skew(client_version, &identity) {
+        eprintln!("bosn: {note}");
+    }
+    bosn_service::daemon_version_mismatch(state_dir, client_version, &identity)
 }
 
 /// Exit with the mismatch, as JSON on stdout or text on stderr, before

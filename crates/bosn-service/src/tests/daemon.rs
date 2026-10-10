@@ -133,11 +133,37 @@ fn response_envelope_rejects_wrong_correlation_protocol_kind_and_encoding() {
         Ok(Reply::Pong(identity)) if identity.release == "0.1.6" && identity.protocol == DAEMON_PROTOCOL
     ));
     let state = Path::new("/state");
-    assert_eq!(daemon_version_mismatch(state, "0.1.6", "0.1.6"), None);
-    let newer = daemon_version_mismatch(state, "0.1.6", "0.1.7").unwrap();
-    assert!(newer.contains("is bosn 0.1.7, but this client is bosn 0.1.6"));
-    assert!(newer.contains("`bosn daemon stop --state-dir /state`"));
-    let legacy = daemon_version_mismatch(state, "0.1.6", "").unwrap();
+    let daemon = |release: &str, protocol| DaemonIdentity {
+        release: release.into(),
+        protocol,
+    };
+    // Same protocol: accepted whatever the release, with a skew note (#509).
+    let skewed = daemon("0.1.7", DAEMON_PROTOCOL);
+    assert_eq!(daemon_version_mismatch(state, "0.1.6", &skewed), None);
+    assert!(
+        daemon_release_skew("0.1.6", &skewed)
+            .unwrap()
+            .contains("release 0.1.7")
+    );
+    let same = daemon("0.1.6", DAEMON_PROTOCOL);
+    assert_eq!(daemon_version_mismatch(state, "0.1.6", &same), None);
+    assert_eq!(daemon_release_skew("0.1.6", &same), None);
+    // Another protocol: refused even on the same release, naming both.
+    let other = daemon("0.1.6", DAEMON_PROTOCOL + 1);
+    let refused = daemon_version_mismatch(state, "0.1.6", &other).unwrap();
+    assert!(refused.contains(&format!("speaking protocol {}", DAEMON_PROTOCOL + 1)));
+    assert!(refused.contains(&format!("bosn 0.1.6 speaking protocol {DAEMON_PROTOCOL}")));
+    assert!(refused.contains("`bosn daemon stop --state-dir /state`"));
+    assert_eq!(daemon_release_skew("0.1.6", &other), None);
+    // Protocol zero predates the handshake: the exact-release check stays.
+    assert_eq!(
+        daemon_version_mismatch(state, "0.1.6", &daemon("0.1.6", 0)),
+        None
+    );
+    let newer = daemon_version_mismatch(state, "0.1.6", &daemon("0.1.7", 0)).unwrap();
+    assert!(newer.contains("is bosn 0.1.7 speaking no protocol"));
+    assert_eq!(daemon_release_skew("0.1.6", &daemon("0.1.7", 0)), None);
+    let legacy = daemon_version_mismatch(state, "0.1.6", &daemon("", 0)).unwrap();
     assert!(legacy.contains("0.1.5 or earlier"));
     for frame in [
         DaemonFrame::response_to(&request, payload.clone()).with_request_id(8),

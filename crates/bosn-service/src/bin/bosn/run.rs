@@ -360,8 +360,8 @@ pub(crate) fn ensure_daemon(
     client: &Client,
     state_dir: &Path,
 ) -> Result<(), String> {
-    if let Ok(version) = runtime.run(client.daemon_version()) {
-        return matching_daemon(state_dir, &version);
+    if let Ok(identity) = runtime.run(client.daemon_identity()) {
+        return matching_daemon(state_dir, &identity);
     }
     let executable = std::env::current_exe()
         .map_err(|_| "cannot locate the bosn executable to start its daemon".to_owned())?;
@@ -380,9 +380,9 @@ pub(crate) fn ensure_daemon(
         .map_err(|error| format!("cannot start the bosn daemon: {error}"))?;
     let started = Instant::now();
     while started.elapsed() < DAEMON_START_WAIT {
-        if let Ok(version) = runtime.run(client.daemon_version()) {
+        if let Ok(identity) = runtime.run(client.daemon_identity()) {
             // Another session may have won the start race with its own binary.
-            matching_daemon(state_dir, &version)?;
+            matching_daemon(state_dir, &identity)?;
             eprintln!("bosn: started the bosn daemon for {}", state_dir.display());
             return Ok(());
         }
@@ -394,15 +394,11 @@ pub(crate) fn ensure_daemon(
     Err(daemon_start_failure(state_dir))
 }
 
-/// Refuse a daemon from another release rather than sending it requests it may
-/// misread. It is never restarted here: it may be running another session's
+/// Refuse a daemon on another wire protocol rather than sending it requests it
+/// may misread. It is never restarted here: it may be running another session's
 /// jobs, so stopping it is the user's explicit choice.
-fn matching_daemon(state_dir: &Path, daemon_version: &str) -> Result<(), String> {
-    match bosn_service::daemon_version_mismatch(
-        state_dir,
-        env!("CARGO_PKG_VERSION"),
-        daemon_version,
-    ) {
+fn matching_daemon(state_dir: &Path, daemon: &bosn_service::DaemonIdentity) -> Result<(), String> {
+    match bosn_service::daemon_version_mismatch(state_dir, env!("CARGO_PKG_VERSION"), daemon) {
         Some(mismatch) => Err(mismatch),
         None => Ok(()),
     }

@@ -171,12 +171,15 @@ fn run_daemon_status(runtime: &kernal_api::async_engine::Runtime, state_dir: &Pa
     // Ask for the version first: it is the one request every daemon
     // release answers, so a mismatch is reported, not a bare failure.
     let identity = runtime.run(client.daemon_identity()).ok();
-    let daemon_version = identity.as_ref().map(|identity| identity.release.clone());
     let status = match runtime.run(client.status()) {
         Ok(status) => status,
         Err(_) => {
-            if let Some(mismatch) = daemon_version.as_deref().and_then(|version| {
-                bosn_service::daemon_version_mismatch(state_dir, env!("CARGO_PKG_VERSION"), version)
+            if let Some(mismatch) = identity.as_ref().and_then(|identity| {
+                bosn_service::daemon_version_mismatch(
+                    state_dir,
+                    env!("CARGO_PKG_VERSION"),
+                    identity,
+                )
             }) && !json
             {
                 eprintln!("bosn daemon status: {mismatch}");
@@ -339,8 +342,8 @@ pub(crate) fn print_daemon_status(
         .map(|identity| identity.protocol)
         .filter(|protocol| *protocol != 0);
     let client_version = env!("CARGO_PKG_VERSION");
-    let mismatch = daemon_version.and_then(|version| {
-        bosn_service::daemon_version_mismatch(state_dir, client_version, version)
+    let mismatch = identity.and_then(|identity| {
+        bosn_service::daemon_version_mismatch(state_dir, client_version, identity)
     });
     if json {
         println!(

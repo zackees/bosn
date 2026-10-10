@@ -23,7 +23,10 @@ impl Service {
             doctor_executor: Arc::new(DockerDoctorExecutor::new()),
             setup_reconcile_executor: Arc::new(DockerSetupReconcileExecutor::new()),
             manifest_recovery_executor: Arc::new(DockerManifestRecoveryExecutor::new()),
-            release_version: Arc::from(""),
+            identity: Arc::new(DaemonIdentity {
+                release: String::new(),
+                protocol: DAEMON_PROTOCOL,
+            }),
             act_backend: Arc::new(ci::engine::DockerActBackend::default()),
             identity_probe: default_identity_probe(),
             state_dir,
@@ -41,7 +44,14 @@ impl Service {
     /// release can refuse it clearly instead of sending requests the daemon may
     /// misread. The `bosn` binary passes its own package version.
     pub fn with_release_version(mut self, version: impl Into<String>) -> Self {
-        self.release_version = Arc::from(version.into());
+        Arc::make_mut(&mut self.identity).release = version.into();
+        self
+    }
+    /// The wire protocol this daemon reports on ping, overriding
+    /// [`DAEMON_PROTOCOL`]. A test seam: zero emulates a daemon that predates
+    /// the protocol handshake (#509).
+    pub fn with_reported_protocol(mut self, protocol: u32) -> Self {
+        Arc::make_mut(&mut self.identity).protocol = protocol;
         self
     }
     /// Substitute only the semantic setup executor. This is primarily an
@@ -489,7 +499,7 @@ impl Service {
             let reconcile = Arc::clone(&self.setup_reconcile_executor);
             let adopt = Arc::clone(&self.setup_adopt_executor);
             let state_dir = self.state_dir.clone();
-            let release_version = Arc::clone(&self.release_version);
+            let identity = Arc::clone(&self.identity);
             let ci = ci.clone();
             clients.spawn(async move {
                 handle(
@@ -502,7 +512,7 @@ impl Service {
                         adopt,
                         reconcile,
                         state_dir,
-                        release_version,
+                        identity,
                         ci,
                     },
                 )
@@ -542,7 +552,8 @@ pub struct Service {
     pub(crate) doctor_executor: Arc<dyn DoctorExecutor>,
     pub(crate) setup_reconcile_executor: Arc<dyn SetupReconcileExecutor>,
     pub(crate) manifest_recovery_executor: Arc<dyn ManifestRecoveryExecutor>,
-    pub(crate) release_version: Arc<str>,
+    /// What this daemon reports on ping (#509).
+    pub(crate) identity: Arc<DaemonIdentity>,
     /// Runner capacity from `bosn daemon serve` flags; `None` loads
     /// `runners.toml` and the environment at serve time.
     pub(crate) capacity: Option<capacity::RunnerCapacity>,

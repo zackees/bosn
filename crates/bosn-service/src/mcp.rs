@@ -100,6 +100,18 @@ pub fn serve_stdio(state_dir: impl Into<PathBuf>) -> Result<(), Error> {
         .map_err(Error::Io)?;
     let state_dir = state_dir.into();
     let client = Client::for_state(&state_dir)?;
+    // The #324 pre-flight for this long-running session: refuse a live daemon
+    // on another wire protocol up front instead of letting each tool call
+    // fail with a bare transport error.
+    if let Ok(identity) = runtime.run(client.daemon_identity())
+        && let Some(message) =
+            crate::daemon_version_mismatch(&state_dir, env!("CARGO_PKG_VERSION"), &identity)
+    {
+        return Err(Error::Ci {
+            code: "version_mismatch".into(),
+            message,
+        });
+    }
     let mut backend = DaemonBackend {
         runtime: &runtime,
         client,

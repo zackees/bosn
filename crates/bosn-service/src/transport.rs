@@ -42,30 +42,56 @@ pub struct DaemonIdentity {
     pub protocol: u32,
 }
 
-/// Explain a daemon from another release instead of letting it misread this
-/// client's requests (it may answer with a reset connection or a refusal).
-/// `None` when the versions match. An empty `daemon_version` is a daemon that
-/// predates the version handshake (bosn 0.1.5 and older).
+/// Explain a daemon this client cannot talk to instead of letting it misread
+/// this client's requests (it may answer with a reset connection or a refusal).
+///
+/// Compatibility is by wire protocol (#509 phase 2): a daemon reporting this
+/// client's [`DAEMON_PROTOCOL`] is accepted whatever its release (see
+/// [`daemon_release_skew`]). A daemon reporting protocol zero predates the
+/// handshake, so it keeps the exact-release check. `None` when compatible. An
+/// empty release is a daemon from bosn 0.1.5 or older.
 pub fn daemon_version_mismatch(
     state_dir: &Path,
     client_version: &str,
-    daemon_version: &str,
+    daemon: &DaemonIdentity,
 ) -> Option<String> {
-    if daemon_version == client_version {
+    if daemon.protocol != 0 {
+        if daemon.protocol == DAEMON_PROTOCOL {
+            return None;
+        }
+    } else if daemon.release == client_version {
         return None;
     }
-    let daemon = if daemon_version.is_empty() {
+    let release = if daemon.release.is_empty() {
         "an older bosn (0.1.5 or earlier, which does not report its version)".to_owned()
     } else {
-        format!("bosn {daemon_version}")
+        format!("bosn {}", daemon.release)
+    };
+    let protocol = match daemon.protocol {
+        0 => "no protocol (it predates the protocol handshake)".to_owned(),
+        n => format!("protocol {n}"),
     };
     let state = state_dir.display();
     Some(format!(
-        "the bosn daemon for {state} is {daemon}, but this client is bosn {client_version}; \
-         a daemon from another release can misread this client's requests. \
+        "the bosn daemon for {state} is {release} speaking {protocol}, but this client is \
+         bosn {client_version} speaking protocol {DAEMON_PROTOCOL}; a daemon on another \
+         protocol can misread this client's requests. \
          Stop it with `bosn daemon stop --state-dir {state}` (this also cancels any job it \
          is running for another session), then retry: a matching daemon starts on demand"
     ))
+}
+
+/// A one-line note for a compatible daemon from another release (#509): the
+/// protocols match, so the client proceeds. `None` when the releases match or
+/// the daemon is not compatible (see [`daemon_version_mismatch`]).
+pub fn daemon_release_skew(client_version: &str, daemon: &DaemonIdentity) -> Option<String> {
+    (daemon.protocol == DAEMON_PROTOCOL && daemon.release != client_version).then(|| {
+        format!(
+            "note: the bosn daemon is release {}, this client is {client_version}; \
+             both speak protocol {DAEMON_PROTOCOL}, so proceeding",
+            daemon.release
+        )
+    })
 }
 
 pub(crate) fn peer_is_authorized(peer_user_id: &str, expected_user_id: &str) -> bool {

@@ -173,8 +173,14 @@ build fails with "tool not found: prepare", run `uv tool install 'soldr==0.9.15'
 Decided 2026-10-09.
 
 - **Every daemon-backed CLI command runs the version pre-flight** before it
-  sends work (#324): a daemon from another release is refused with both
-  versions and the remedy, never a bare "request failed".
+  sends work (#324), and `bosn mcp` runs it once at startup against a live
+  daemon: an incompatible daemon is refused with both releases, both
+  protocols and the remedy, never a bare "request failed".
+- **Clients accept by protocol (#509 phase 2).** A daemon reporting this
+  client's `DAEMON_PROTOCOL` is accepted whatever its release (a one-line
+  release-skew note goes to stderr); another protocol is refused. A daemon
+  reporting protocol 0 predates the handshake and keeps the exact-release
+  check. `daemon_version_mismatch` is the one place this is decided.
 - **Compatibility moves from release equality to a wire protocol (#509).**
   Every daemon reports `DAEMON_PROTOCOL` on its ping reply (zero means it
   predates the handshake). Bump it on any change to the request/reply wire or
@@ -184,5 +190,4 @@ Decided 2026-10-09.
   generation per client image because its daemons are caches. Bosn's daemon is
   the sole registry writer and Docker owner for a state directory, so it stays
   one daemon per state directory; skew is solved by the daemon serving a
-  window of protocols, not by running several daemons. The exact-release
-  refusal stays until clients accept a matching protocol (phased plan on #509).
+  window of protocols, not by running several daemons (phased plan on #509).
