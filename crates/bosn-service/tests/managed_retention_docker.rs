@@ -120,20 +120,3 @@ fn live_docker_managed_retention_reclaims_a_real_setup_app() {
     assert!(docker_capture(&engine, ["image", "inspect", base.as_str()]).ok());
     eprintln!("managed retention released {removed} object(s), {bytes} bytes");
 }
-
-/// This test's own registry: on a machine that already has Bosn objects, a daemon refuses to
-/// mint an identity in an empty state directory (#515), and the pass must judge every
-/// pre-existing object as foreign to it.
-fn own_registry(state: &Path) {
-    std::fs::create_dir_all(state).expect("create state directory");
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    let registry_id = format!(
-        "{:08x}-0000-4000-8000-{:012x}",
-        (nanos >> 48) as u32,
-        nanos & 0xffff_ffff_ffff
-    );
-    drop(Registry::create_writer(state.join("registry.sqlite3"), &registry_id).expect("registry"));
-}

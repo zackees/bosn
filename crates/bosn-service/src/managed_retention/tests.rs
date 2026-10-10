@@ -483,6 +483,37 @@ fn a_running_container_is_not_reported_as_stopped() {
     );
 }
 
+/// #545: a stopped container naming another registry is held as foreign, never reported as an
+/// owned setup container (found by the live-Docker proofs, whose foreign decoy was counted).
+#[test]
+fn a_foreign_stopped_container_is_not_reported_as_owned() {
+    let (engine, _) = fake_docker_reporting(
+        |size| owned_container_inspect_with(false, &[("volume", "bosn-v-stack-0")], size),
+        &[Some(1_000), Some(1_000)],
+    );
+    let dir = scratch_dir("foreign-not-reported");
+    bosn_registry::Registry::create_writer(
+        dir.join("registry.sqlite3"),
+        "99999999-0000-4000-8000-000000000545",
+    )
+    .expect("registry");
+
+    let outcome = managed_retention_pass(&engine, &dir, RetentionPolicy::default(), false);
+
+    assert!(
+        outcome.setup_containers.is_empty(),
+        "a foreign container is not ours to report: {:?}",
+        outcome.setup_containers
+    );
+    assert_eq!(
+        outcome
+            .summary
+            .held
+            .get(&bosn_core::retention::HoldReason::ForeignRegistry),
+        Some(&1)
+    );
+}
+
 /// A bind mount is not a volume, and an anonymous volume's name is not something the operator can
 /// act on. Counting either would inflate the number the report exists to make honest.
 #[test]
