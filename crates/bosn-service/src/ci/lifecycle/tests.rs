@@ -11,7 +11,6 @@ use std::{
 mod fake;
 #[path = "live_cohort.rs"]
 mod live_cohort;
-mod shared;
 pub use fake::*;
 
 #[derive(Default)]
@@ -70,12 +69,10 @@ pub fn plan(run: &str, deadline: Duration) -> EnginePlan {
             ),
             secrets: Default::default(),
             params: Default::default(),
-            scope: None,
         },
         cache: test_cache(),
         deadline: async_engine::Deadline::after(deadline),
         spare: None,
-        shared: None,
     }
 }
 pub fn test_cache() -> CacheVolume {
@@ -123,9 +120,6 @@ where
 {
     let dir = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let path = dir.path().join("registry.sqlite3");
-    // These fixtures exercise per-run engines; the shared engine (#547) has
-    // its own (`tests/shared.rs`).
-    std::fs::write(dir.path().join("config.toml"), "[engine]\nshared = false\n").unwrap();
     RuntimeBuilder::multi_thread()
         // Each parallel fixture owns its pool; retain concurrent execution
         // without multiplying the container's CPU-sized pool per test.

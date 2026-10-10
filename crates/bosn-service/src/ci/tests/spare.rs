@@ -129,7 +129,7 @@ fn a_host_without_room_keeps_no_spare() {
 fn spares_zero_opts_out_and_retires_a_kept_spare() {
     with_registry(|registry, dir| async move {
         let config = dir.join("config.toml");
-        std::fs::write(&config, "[engine]\nshared = false\nspares = 0\n").unwrap();
+        std::fs::write(&config, "[engine]\nspares = 0\n").unwrap();
         let backend = Arc::new(FakeBackend::roomy());
         let runtime = CiRuntime::start(&dir, registry, backend.clone(), 2);
         spare(&runtime).await;
@@ -145,9 +145,9 @@ fn spares_zero_opts_out_and_retires_a_kept_spare() {
             1,
             "the run's own"
         );
-        std::fs::write(&config, "[engine]\nshared = false\nspares = 1\n").unwrap();
+        std::fs::write(&config, "[engine]\nspares = 1\n").unwrap();
         ready(&runtime, None).await;
-        std::fs::write(&config, "[engine]\nshared = false\nspares = 0\n").unwrap();
+        std::fs::write(&config, "[engine]\nspares = 0\n").unwrap();
         spare(&runtime).await;
         until_live(&backend, 0).await;
         assert!(spare(&runtime).await.is_none());

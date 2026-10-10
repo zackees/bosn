@@ -2,11 +2,64 @@
 
 use super::*;
 
+// Setup and manifest container and image rows are written `warm` (#545): nothing pins an app
+// container or its image, so a `pinned` row was bookkeeping, not a promise. Liveness, leases and
+// execution sessions protect them. A row someone did pin stays pinned.
+
 pub(crate) fn setup_app_task_session_id(job_id: u64) -> String {
     format!("setup-app-task:{job_id}")
 }
 pub(crate) fn manifest_app_task_session_id(job_id: u64) -> String {
     format!("manifest-app-task:{job_id}")
+}
+
+/// The resources a finished app task used, with `last_used` moved to `now` (#545).
+///
+/// A keepalive container used only through `exec` would otherwise age from its last ensure and be
+/// stopped mid-use cadence. The task's container and every resource of its exact workspace and
+/// stack (its image and volumes) restart their idle clock at completion. Retention is untouched.
+fn completed_session_resources(
+    registry: &Registry,
+    session_id: &str,
+    now: f64,
+) -> Result<Vec<Resource>, bosn_registry::Error> {
+    let mut container_name = None;
+    let mut offset = 0;
+    loop {
+        let page = registry.execution_sessions(offset, 64)?;
+        if let Some(session) = page
+            .items
+            .into_iter()
+            .find(|session| session.id == session_id)
+        {
+            container_name = Some(session.container_id);
+            break;
+        }
+        let Some(next) = page.next_offset else { break };
+        offset = next;
+    }
+    let Some(name) = container_name else {
+        return Ok(Vec::new());
+    };
+    let Some(container) = registry.resource_by_kind_name(ResourceKind::Container, &name)? else {
+        return Ok(Vec::new());
+    };
+    let mut touched = Vec::new();
+    offset = 0;
+    loop {
+        let page = registry.resources(offset, 64)?;
+        touched.extend(page.items.into_iter().filter_map(|mut resource| {
+            (resource.workspace == container.workspace && resource.stack == container.stack).then(
+                || {
+                    resource.last_used = resource.last_used.max(now);
+                    resource
+                },
+            )
+        }));
+        let Some(next) = page.next_offset else { break };
+        offset = next;
+    }
+    Ok(touched)
 }
 
 pub(crate) fn record_setup_app_task_session(
@@ -40,12 +93,16 @@ pub(crate) fn finish_setup_app_task_session(
         .duration_since(UNIX_EPOCH)
         .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
         .as_secs_f64();
+    let touched = completed_session_resources(registry, &setup_app_task_session_id(job_id), now)?;
     let mut transaction = registry.begin_immediate()?;
     if outcome == "uncertain" {
         // Do not remove the session: cancelling/timing out the local Docker
         // client does not prove the remote `exec` process ended.
         transaction.append_event(now, "setup.app-task.uncertain", "remote_completion_unknown")?;
     } else {
+        for resource in &touched {
+            transaction.put_resource(resource)?;
+        }
         transaction.delete_execution_session(&setup_app_task_session_id(job_id))?;
         transaction.append_event(now, "setup.app-task.finished", outcome)?;
     }
@@ -82,6 +139,8 @@ pub(crate) fn finish_manifest_app_task_session(
         .duration_since(UNIX_EPOCH)
         .map_err(|_| bosn_registry::Error::BadRow("system clock before epoch"))?
         .as_secs_f64();
+    let touched =
+        completed_session_resources(registry, &manifest_app_task_session_id(job_id), now)?;
     let mut transaction = registry.begin_immediate()?;
     if outcome == "uncertain" {
         transaction.append_event(
@@ -90,6 +149,9 @@ pub(crate) fn finish_manifest_app_task_session(
             "remote_completion_unknown",
         )?;
     } else {
+        for resource in &touched {
+            transaction.put_resource(resource)?;
+        }
         transaction.delete_execution_session(&manifest_app_task_session_id(job_id))?;
         transaction.append_event(now, "manifest.app-task.finished", outcome)?;
     }
@@ -108,7 +170,7 @@ pub(crate) fn record_setup_ensure(
     let mut transaction = registry.begin_immediate()?;
     let container = &execution.resource;
     let image = &execution.image;
-    transaction.put_resource(&Resource {
+    transaction.put_resource_preserving_pin(&Resource {
         id: container.id.clone(),
         kind: ResourceKind::Container,
         name: container.name.clone(),
@@ -120,7 +182,7 @@ pub(crate) fn record_setup_ensure(
         created_at: now,
         last_used: now,
         state: ResourceState::Active,
-        retention: Retention::Pinned,
+        retention: Retention::Warm,
     })?;
     transaction.put_resource_use(&ResourceUse {
         resource_id: container.id.clone(),
@@ -130,7 +192,7 @@ pub(crate) fn record_setup_ensure(
         last_used: now,
         state: ResourceState::Active,
     })?;
-    transaction.put_resource(&Resource {
+    transaction.put_resource_preserving_pin(&Resource {
         id: image.id.clone(),
         kind: ResourceKind::Image,
         name: image.name.clone(),
@@ -142,7 +204,7 @@ pub(crate) fn record_setup_ensure(
         created_at: now,
         last_used: now,
         state: ResourceState::Active,
-        retention: Retention::Pinned,
+        retention: Retention::Warm,
     })?;
     transaction.put_resource_use(&ResourceUse {
         resource_id: image.id.clone(),
@@ -218,7 +280,7 @@ pub(crate) fn record_manifest_ensure(
             &execution.image.workspace,
         ),
     ] {
-        transaction.put_resource(&Resource {
+        transaction.put_resource_preserving_pin(&Resource {
             id: id.clone(),
             kind,
             name: name.clone(),
@@ -229,7 +291,7 @@ pub(crate) fn record_manifest_ensure(
             created_at: now,
             last_used: now,
             state: ResourceState::Active,
-            retention: Retention::Pinned,
+            retention: Retention::Warm,
         })?;
         transaction.put_resource_use(&ResourceUse {
             resource_id: id.clone(),
@@ -359,8 +421,7 @@ pub(crate) fn record_setup_adoption(
                 || existing.generation != *generation
                 || existing.workspace != *workspace
                 || existing.scope != Scope::Machine
-                || existing.state != ResourceState::Active
-                || existing.retention != Retention::Pinned)
+                || existing.state != ResourceState::Active)
         {
             return Err(bosn_registry::Error::ResourceIdentityConflict);
         }
@@ -388,7 +449,7 @@ pub(crate) fn record_setup_adoption(
             &image.workspace,
         ),
     ] {
-        tx.put_resource(&Resource {
+        tx.put_resource_preserving_pin(&Resource {
             id: id.clone(),
             kind,
             name: name.clone(),
@@ -399,7 +460,7 @@ pub(crate) fn record_setup_adoption(
             created_at: now,
             last_used: now,
             state: ResourceState::Active,
-            retention: Retention::Pinned,
+            retention: Retention::Warm,
         })?;
         tx.put_resource_use(&ResourceUse {
             resource_id: id.clone(),

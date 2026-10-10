@@ -12,7 +12,7 @@
 //!   (soldr's syslib store, which setup-soldr keeps under
 //!   `soldr-syslib/<platform>/<lib>/<version>/<slug>`, setup-soldr#553).
 
-use super::{ENGINE_CACHE, ENGINE_WORK};
+use super::ENGINE_CACHE;
 
 pub(super) const TOOLCACHE_VOLUME: &str = "act-toolcache";
 pub(super) const TOOLCACHE_MOUNT: &str = "/var/lib/docker/volumes/act-toolcache/_data";
@@ -26,17 +26,6 @@ pub(super) fn seed_toolcache_script() -> String {
            [ -e \"$entry\" ] || [ -L \"$entry\" ] || continue; \
            cp -a \"$entry\" {TOOLCACHE_MOUNT}/ || exit $?; \
          done"
-    )
-}
-
-/// Run `seed` then `tools` once per engine: runs that share an engine
-/// (#547) wait on the first one's lock, then find its stamp.
-pub(super) fn once_per_engine(seed: &str, tools: &str) -> String {
-    let done = format!("{ENGINE_WORK}/.tools-ready");
-    format!(
-        "mkdir -p {ENGINE_WORK}; exec 9>>{ENGINE_WORK}/.tools.lock; flock 9; \
-         [ ! -e {done} ] || exit 0; \
-         ( {seed} ) && ( {tools} ) && touch {done}"
     )
 }
 

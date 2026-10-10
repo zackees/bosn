@@ -613,6 +613,17 @@ fn uncertain_manifest_app_task_session_protects_matching_manifest_container() {
     transaction.commit().unwrap();
     record_manifest_app_task_session(&mut registry, 8, name).unwrap();
     finish_manifest_app_task_session(&mut registry, 8, "uncertain").unwrap();
+    let row = |registry: &Registry| {
+        registry
+            .resource_by_kind_name(ResourceKind::Container, name)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(
+        row(&registry).last_used,
+        1.0,
+        "an uncertain task proves no use"
+    );
     assert_eq!(
         registry.execution_sessions(0, 1).unwrap().items[0].container_id,
         name
@@ -626,6 +637,9 @@ fn uncertain_manifest_app_task_session_protects_matching_manifest_container() {
             .is_empty()
     );
     finish_manifest_app_task_session(&mut registry, 8, "failed").unwrap();
+    // #545: a finished task restarts the idle clock and never changes retention.
+    assert!(row(&registry).last_used > 1.0);
+    assert_eq!(row(&registry).retention, Retention::Pinned);
     assert_eq!(
         registry
             .setup_gc_preview("/workspace", 0, 16)
