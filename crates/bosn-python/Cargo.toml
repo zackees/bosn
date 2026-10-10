@@ -41,6 +41,15 @@ pyo3 = "=0.29.2"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.149"
 
+# One OpenSSL for the whole Linux wheel (#265): kernal-api's http-client pulls
+# reqwest default-tls, which is OpenSSL on Linux. Vendoring links it statically
+# into both the extension and the `bosn` CLI, so the wheel ships no libssl or
+# libcrypto (no auditwheel `bosn.libs/` copy, no `.data/scripts/` sidecars, no
+# `$ORIGIN` rpath). Not a direct API dependency: it only selects the feature.
+# macOS (Security.framework) and Windows (SChannel) never build OpenSSL.
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl-sys = { version = "=0.9.117", features = ["vendored"] }
+
 [build-dependencies]
 # Only for the embedded-python-tests rpath (see build.rs); same pin as pyo3's own.
 pyo3-build-config = { version = "=0.29.2", features = ["resolve-config"] }

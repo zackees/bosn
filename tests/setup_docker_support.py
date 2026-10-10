@@ -83,8 +83,8 @@ def production_daemon(
 
     executable = native_binary()
     assert executable.is_file()
-    # The installed binary carries an $ORIGIN rpath to its co-located OpenSSL
-    # sidecars, so it runs with no launcher configuring the library path.
+    # The installed binary links OpenSSL statically, so it runs with no
+    # launcher configuring the library path.
     daemon = subprocess.Popen(
         [str(executable), "daemon", "serve", "--state-dir", str(state_dir)],
         stdin=subprocess.DEVNULL,

@@ -23,6 +23,7 @@ import zipfile
 from pathlib import Path
 from typing import BinaryIO, NoReturn
 
+OPENSSL_LIBRARIES = ("libssl", "libcrypto")
 RETIRED_LIFECYCLE_MODULES = (
     "daemon",
     "engine",
@@ -198,6 +199,12 @@ def assert_platform_wheel_contents(wheel: Path) -> None:
     ]
     if retired:
         fail(f"wheel includes retired Python lifecycle modules: {retired}")
+    # OpenSSL is vendored and statically linked on Linux (#265); macOS and
+    # Windows use the system TLS stack.  No wheel ships a shared OpenSSL.
+    # Kept in lockstep with ci/verify_cross_wheel.py.
+    bundled_openssl = [name for name in names if Path(name).name.startswith(OPENSSL_LIBRARIES)]
+    if bundled_openssl:
+        fail(f"wheel bundles a shared OpenSSL: {bundled_openssl}")
     if extension not in names:
         fail(f"wheel is missing this platform extension {extension!r}: {names}")
     if not any(name.endswith(executable) for name in names):

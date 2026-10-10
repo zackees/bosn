@@ -68,16 +68,21 @@ living implementation spec.
   cannot. So a custom PEP 517 backend that builds the CLI and stages it, then lets
   maturin build the extension, is the correct shape — do not "simplify" it away.
   - **The `bosn` command IS the native binary** (#262, done): the backend stages the
-    CLI into the wheel's `.data/scripts/` (installed on PATH as `bosn`), with an
-    `$ORIGIN` rpath so it finds its co-located OpenSSL sidecars — there is no
+    CLI into the wheel's `.data/scripts/` (installed on PATH as `bosn`) — there is no
     `native_cli.py` launcher and no `[project.scripts]`. The Cargo bin stays
     `bosn-native` (bosn-service already owns a `bosn` bin; a second would collide on
     `target/<profile>/bosn`); the backend renames it to `bosn` while staging.
-  - Remaining cruft is tracked in **#265**: OpenSSL is bundled twice (`bosn.libs/` by
-    auditwheel for the extension, plus the hand-copied `.data/scripts/` sidecars for the
-    CLI); collapse via static/rustls or an rpath into `bosn.libs/`. Dropping
-    `bosn_build_backend.py` entirely still waits on **soldr#3239** (native aux-bin
-    staging).
+  - **One OpenSSL, statically linked (#265, decided).** Linux TLS comes from
+    kernal-api's `http-client` (reqwest `default-tls`, i.e. OpenSSL; macOS uses
+    Security.framework, Windows SChannel). `crates/bosn-python` enables
+    `openssl-sys/vendored` on Linux, so the extension and the CLI each link OpenSSL
+    statically: no `bosn.libs/` OpenSSL, no `.data/scripts/` sidecars, no `$ORIGIN`
+    rpath. Both wheel verifiers reject any bundled `libssl`/`libcrypto`. An rpath into
+    `bosn.libs/` was rejected (auditwheel hash-renames the sonames and does not repair
+    scripts). rustls is the fleet's choice (soldr, zccache, fbuild) and the eventual
+    target, but needs a TLS-backend feature in kernal-api first; when it lands, drop the
+    vendored dependency (kernal-api#427). Dropping `bosn_build_backend.py` entirely still waits on
+    **soldr#3239** (native aux-bin staging).
 
 ## Releasing (the pretag release gate)
 
