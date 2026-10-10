@@ -40,6 +40,8 @@ mod bounded_output;
 mod ci;
 #[path = "bosn/daemon.rs"]
 mod daemon;
+#[path = "bosn/daemon_exe.rs"]
+mod daemon_exe;
 #[path = "bosn/gc.rs"]
 mod gc;
 #[path = "bosn/gc_owned.rs"]

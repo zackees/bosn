@@ -116,6 +116,9 @@ pub(crate) async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Re
                     ..Default::default()
                 }
             }
+            crate::handoff::OP_STOP_IF_IDLE => {
+                crate::handoff::stop_if_idle(&actor, &jobs, &ci, &stop).await
+            }
             4 => match jobs.submit(r.workspace, r.stack, r.digest).await {
                 Ok(job_id) => ReplyWire {
                     code: 40,

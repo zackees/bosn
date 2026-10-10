@@ -191,6 +191,18 @@ Decided 2026-10-09.
   reachable; a request reporting protocol 0 predates the window and is served.
   Additive fields that every peer of the current protocol still reads are not
   a bump (phase 3 itself added its fields this way).
+- **The daemon starts from one authoritative executable (#509 phase 4).**
+  `ensure_daemon` launches `<state>/daemon/bosn-daemon`, never the client
+  binary that happened to call it. A client installs itself there (with the
+  Linux OpenSSL sidecars, by atomic rename, stamped in `bosn-daemon.release`)
+  only when it is a newer release, or the same release from another build; an
+  older client never downgrades it.
+- **Idle handoff only (#509 phase 4).** A client newer than the running
+  daemon sends operation 39; the daemon stops only if it has no unfinished
+  jobs, no queued or running CI runs and no held leases, and otherwise answers
+  busy (code 32) and keeps running. The daemon decides, never the client: a
+  busy daemon is never stopped on anyone's behalf, and a daemon that predates
+  operation 39 is left alone.
 - **Compatibility moves from release equality to a wire protocol (#509).**
   Every daemon reports `DAEMON_PROTOCOL` on its ping reply (zero means it
   predates the handshake). Bump it on any change to the request/reply wire or

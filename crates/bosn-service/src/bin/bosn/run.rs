@@ -360,11 +360,17 @@ pub(crate) fn ensure_daemon(
     client: &Client,
     state_dir: &Path,
 ) -> Result<(), String> {
-    if let Ok(identity) = runtime.run(client.daemon_identity()) {
+    let release = env!("CARGO_PKG_VERSION");
+    let executable = crate::daemon_exe::install_daemon_executable(state_dir, release)?;
+    if let Ok(identity) = runtime.run(client.daemon_identity())
+        // Only a daemon that reports a protocol window (#509 phase 3 or
+        // later) can be asked to hand off; older ones are never touched.
+        && (identity.protocol_min == 0
+            || !crate::daemon_exe::is_newer_release(release, &identity.release)
+            || !hand_off_idle_daemon(runtime, client, state_dir))
+    {
         return matching_daemon(state_dir, &identity);
     }
-    let executable = std::env::current_exe()
-        .map_err(|_| "cannot locate the bosn executable to start its daemon".to_owned())?;
     let mut command = std::process::Command::new(executable);
     command
         .arg("daemon")
@@ -392,6 +398,33 @@ pub(crate) fn ensure_daemon(
         std::thread::sleep(POLL_INTERVAL);
     }
     Err(daemon_start_failure(state_dir))
+}
+
+/// Restart an older daemon onto the authoritative executable, but only when
+/// the daemon itself reports it idle (#509 phase 4). Returns whether it
+/// stopped; a busy daemon, or one that predates the handoff, keeps running.
+fn hand_off_idle_daemon(runtime: &Runtime, client: &Client, state_dir: &Path) -> bool {
+    match runtime.run(client.stop_if_idle()) {
+        Ok(bosn_service::IdleHandoff::Stopping) => {
+            let started = Instant::now();
+            while runtime.run(client.ping()).is_ok() {
+                if started.elapsed() >= DAEMON_START_WAIT {
+                    return false;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            eprintln!(
+                "bosn: restarted the idle older bosn daemon for {} onto this release",
+                state_dir.display()
+            );
+            true
+        }
+        Ok(bosn_service::IdleHandoff::Busy(reason)) => {
+            eprintln!("bosn: the older bosn daemon is busy ({reason}); not restarting it");
+            false
+        }
+        Ok(bosn_service::IdleHandoff::Unsupported) | Err(_) => false,
+    }
 }
 
 /// Refuse a daemon on another wire protocol rather than sending it requests it

@@ -66,6 +66,8 @@ pub mod docker_proxy;
 mod executors;
 mod gc_apply;
 pub mod github_proxy;
+mod handoff;
+pub use handoff::IdleHandoff;
 mod job_api;
 mod job_loop;
 mod job_support;

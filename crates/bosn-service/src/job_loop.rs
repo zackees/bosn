@@ -503,6 +503,9 @@ pub(crate) async fn job_actor(
                     let _ = jobs.log(id, bounded_log_line(&line));
                 }
             }
+            JobCommand::Unfinished(reply) => {
+                let _ = reply.send(jobs.load().values().map(|(q, r)| q + r).sum());
+            }
             JobCommand::List { reply } => {
                 let view = jobs_view(&jobs, executors.runners.as_deref());
                 let _ = reply.send(view.to_string());
