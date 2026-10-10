@@ -240,6 +240,10 @@ def _build_native_cli() -> None:
         "bosn-python",
         "--bin",
         "bosn-native",
+        # The same feature set as maturin's extension build ([tool.maturin]),
+        # so the two cargo builds share every dependency unit.
+        "--features",
+        "wheel",
         "--message-format=json-render-diagnostics",
     ]
     if target is not None:

@@ -5,12 +5,10 @@
 //! pinned Alpine image documented below.  Its drop guard removes only the
 //! exact deterministic container after re-checking Bosn's ownership labels.
 
-mod support;
-
-use support::setup_docker::*;
+use crate::support::setup_docker::*;
 
 /// Run with:
-/// `cargo test -p bosn-service --test setup_ensure_docker -- --ignored --exact live_docker_setup_ensure_creates_and_reuses_one_managed_app`
+/// `cargo test -p bosn-service --test integration -- --ignored --exact setup_ensure_docker::live_docker_setup_ensure_creates_and_reuses_one_managed_app`
 ///
 /// It needs a usable local Docker daemon and the exact `PINNED_ALPINE` image.
 /// The test does not pull an unpinned image, and its cleanup refuses to remove
@@ -151,7 +149,7 @@ fn live_docker_setup_ensure_creates_and_reuses_one_managed_app() {
 }
 
 /// Run with:
-/// `soldr cargo test -j1 -p bosn-service --test setup_ensure_docker --locked -- --ignored --exact live_docker_setup_reconcile_repair_missing_retires_then_ensure_recreates_app`
+/// `soldr cargo test -j1 -p bosn-service --test integration --locked -- --ignored --exact setup_ensure_docker::live_docker_setup_reconcile_repair_missing_retires_then_ensure_recreates_app`
 #[test]
 #[ignore = "requires a local Docker daemon and the pinned Alpine image"]
 #[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
@@ -283,7 +281,7 @@ fn live_docker_setup_reconcile_repair_missing_retires_then_ensure_recreates_app(
 }
 
 /// Run with:
-/// `soldr cargo test -j1 -p bosn-service --test setup_ensure_docker --locked -- --ignored --exact live_docker_setup_adopt_restores_lost_registry_without_touching_app`
+/// `soldr cargo test -j1 -p bosn-service --test integration --locked -- --ignored --exact setup_ensure_docker::live_docker_setup_adopt_restores_lost_registry_without_touching_app`
 ///
 /// This intentionally deletes only the disposable test registry after its
 /// daemon is cleanly stopped. It preserves the private setup cache and proves

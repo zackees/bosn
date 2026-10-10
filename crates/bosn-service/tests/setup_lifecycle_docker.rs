@@ -2,12 +2,10 @@
 //!
 //! Ignored by default like `setup_ensure_docker.rs`; see that file for what they need.
 
-mod support;
-
-use support::setup_docker::*;
+use crate::support::setup_docker::*;
 
 /// Run with:
-/// `soldr cargo test -j1 -p bosn-service --test setup_ensure_docker --locked -- --ignored --exact live_docker_setup_gc_apply_removes_only_retired_generation`
+/// `soldr cargo test -j1 -p bosn-service --test integration --locked -- --ignored --exact setup_lifecycle_docker::live_docker_setup_gc_apply_removes_only_retired_generation`
 ///
 /// This opt-in observation uses two different one-file documents for one
 /// canonical workspace. The preview token may identify only the retired first
@@ -240,7 +238,7 @@ fn live_docker_setup_gc_apply_removes_only_retired_generation() {
 }
 
 /// Run with:
-/// `cargo test -p bosn-service --test setup_ensure_docker -- --ignored --exact live_docker_setup_ensure_builds_and_reuses_inline_app`
+/// `cargo test -p bosn-service --test integration -- --ignored --exact setup_lifecycle_docker::live_docker_setup_ensure_builds_and_reuses_inline_app`
 ///
 /// This is the one-file setup acceptance path: the TOML carries its whole
 /// Dockerfile and no separately-authored Dockerfile, script, or workspace
@@ -416,7 +414,7 @@ fn live_docker_setup_ensure_builds_and_reuses_inline_app() {
 }
 
 /// Run with:
-/// `soldr cargo test -j1 -p bosn-service --test setup_ensure_docker --locked -- --ignored --exact live_docker_setup_ensure_fetches_one_https_document_then_reuses_it_offline`
+/// `soldr cargo test -j1 -p bosn-service --test integration --locked -- --ignored --exact setup_lifecycle_docker::live_docker_setup_ensure_fetches_one_https_document_then_reuses_it_offline`
 ///
 /// The Bosn daemons use their normal kernal-api verified HTTPS transport. The
 /// public fixture CA is passed only to those child processes. This test needs

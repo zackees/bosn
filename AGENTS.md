@@ -183,6 +183,30 @@ living implementation spec.
   architectures now have hosted full CI and release smoke checks. See
   `docs/macos-guest.md` "Executing the wheel".
 
+## Rust lane shape (#503, decided 2026-10-10)
+
+The `rust` job compiles the workspace once per edit. Restructure it; never drop a check.
+
+- **Clippy runs inside the test build.** `cargo clippy` is cargo with clippy-driver as
+  `RUSTC_WORKSPACE_WRAPPER` and its `-- <args>` in `CLIPPY_ARGS`, so the `Clippy and test
+  Rust workspace` step wraps `cargo nextest run --workspace --all-targets` the same way
+  (`-D warnings`). It lints every target `clippy --all-targets` did (plus bosn-python) and
+  compiles each crate once instead of a check build then a full rebuild. Doctests run in
+  the same step with the same wrapper and features, so they reuse those library units.
+- **One integration-test binary per crate.** bosn-core, bosn-registry and bosn-service set
+  `autotests = false` and declare `tests/integration.rs`, whose modules are the former
+  `tests/<name>.rs` files: an edit relinks one binary per crate, not one per file. Add a
+  new integration test as a module there. Run one with
+  `cargo test -p <crate> --test integration -- <module>::`.
+- **bosn-python is tested in the workspace build.** Its wheel-only features (`wheel` =
+  `extension-module` + vendored OpenSSL) are not crate defaults; `[tool.maturin] features`
+  and the backend's CLI build select `wheel`. The test build selects
+  `bosn-python/embedded-python-tests` and links CPython and system OpenSSL. Do not make
+  vendored OpenSSL a default: its C build would serialise ~40 s ahead of every test build.
+- **No lane-input narrowing for the Rust lane yet.** Rust tests read `docs/` (`ci.schema.json`,
+  `macos-guest.md`), `bosn.toml` and `tests/fixtures/`, so a docs or fixture exclusion is
+  unsafe without the per-path input evidence GATE-007 requires.
+
 ## Toolchain note (host hazard)
 
 `clud`, on launch, re-pins its blessed `soldr==0.7.11` as the `uv` tool

@@ -191,8 +191,8 @@ rejected by the closed MCP schema. The managed app is inspected for image and
 all three ownership labels, then its exact identity is reused after restart.
 
 ```sh
-soldr cargo test -j1 -p bosn-service --test mcp_setup_ensure_docker --locked \
-  -- --ignored --exact live_docker_mcp_setup_ensure_creates_and_reuses_one_managed_app
+soldr cargo test -j1 -p bosn-service --test integration --locked \
+  -- --ignored --exact mcp_setup_ensure_docker::live_docker_mcp_setup_ensure_creates_and_reuses_one_managed_app
 ```
 
 It needs a running local Docker daemon and the exact Alpine digest named by
@@ -230,8 +230,8 @@ On a machine with that exact Hermes version installed, run:
 hermes --version # must report: Hermes Agent v0.21.0
 # If this locally built Bosn binary is dynamically linked, set its actual
 # OpenSSL/zlib runtime-library directories here before running the test.
-BOSN_HERMES_ACCEPTANCE=1 soldr cargo test -j1 -p bosn-service --test hermes_mcp --locked \
-  -- --ignored --exact hermes_agent_stdio_contract_survives_daemon_restart
+BOSN_HERMES_ACCEPTANCE=1 soldr cargo test -j1 -p bosn-service --test integration --locked \
+  -- --ignored --exact hermes_mcp::hermes_agent_stdio_contract_survives_daemon_restart
 ```
 
 The test makes a fresh `HERMES_HOME`, state directory, workspace, and a

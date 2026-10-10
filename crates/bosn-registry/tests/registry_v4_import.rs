@@ -1,7 +1,6 @@
 //! One-way import of Python bosn v4 registries.
 
-mod common;
-use common::*;
+use crate::common::*;
 
 #[test]
 fn v4_import_refuses_missing_cutover_marker_without_creating_destination() {

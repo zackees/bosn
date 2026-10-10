@@ -1,7 +1,6 @@
 //! Core registry behaviour: transactions, paging, read-only access, writer fencing.
 
-mod common;
-use common::*;
+use crate::common::*;
 
 #[test]
 fn typed_transaction_writes_round_trip_all_tables_and_roll_back() {

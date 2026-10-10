@@ -6,13 +6,11 @@
 //! The machine engine claim is engine-wide, so this test refuses to run on an engine where one is
 //! already held. Run it against a throwaway engine (for example a privileged `docker:29.7.2`
 //! daemon as `$DOCKER_HOST`) with `XDG_STATE_HOME` pointing at a temporary directory:
-//! `soldr cargo test -j1 -p bosn-service --test managed_retention_ci_docker --locked -- --ignored --test-threads 1`
+//! `soldr cargo test -j1 -p bosn-service --test integration --locked -- managed_retention_ci_docker:: --ignored --test-threads 1`
 //! It needs network access for the runner image.
 
-mod support;
-
-use support::retention_docker::*;
-use support::setup_docker::*;
+use crate::support::retention_docker::*;
+use crate::support::setup_docker::*;
 
 const CLAIM: &str = "bosn-ci-engine-claim";
 const MACHINE_CACHE: &str = "bosn-ci-cache-v1";

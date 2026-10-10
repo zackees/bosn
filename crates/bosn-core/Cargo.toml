@@ -5,6 +5,9 @@ edition = "2024"
 rust-version = "1.95"
 # Internal: amalgamated into the crates.io `bosn` crate at release.
 publish = false
+# One integration-test binary (tests/integration.rs) instead of one per file:
+# each would relink the whole crate graph after every edit (bosn#503).
+autotests = false
 
 [lib]
 path = "src/lib.rs"
@@ -18,3 +21,7 @@ toml = "=0.8.23"
 
 [lints]
 workspace = true
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"

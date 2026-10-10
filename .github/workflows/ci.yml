@@ -171,11 +171,10 @@ jobs:
       # No apt-get (#600): pkg-config and libssl-dev ship in both GitHub's
       # ubuntu-latest image and bosn's pinned act runner image.
 
-      - name: Rust format and Clippy
+      - name: Rust format
         run: |
           soldr cargo fmt --all --check
           soldr cargo fmt --check --manifest-path crates/bosn-widget/Cargo.toml
-          soldr cargo clippy --workspace --exclude bosn-python --all-targets --locked -- -D warnings
 
       - name: Verify kernal-api boundary and locked resolution
         run: |
@@ -184,15 +183,27 @@ jobs:
 
       # Deliberately does not include --ignored: Docker and Hermes acceptance
       # cases retain their explicit opt-in prerequisites and dedicated proofs.
-      # The extension-module feature leaves CPython symbols for a wheel host;
-      # unit tests instead link the selected CPython explicitly.
-      - name: Test Rust workspace
+      # Only the wheel build selects bosn-python's `wheel` feature; here
+      # bosn-python links the selected CPython and its tests run in the same
+      # build as the rest of the workspace (#503).
+      #
+      # Clippy runs inside the test build (#503): `cargo clippy` is cargo with
+      # clippy-driver as RUSTC_WORKSPACE_WRAPPER and its `-- <args>` passed in
+      # CLIPPY_ARGS. Wrapping this build the same way lints every workspace
+      # target that `clippy --all-targets` checks (lib, lib tests, bins,
+      # integration tests, examples) while compiling each crate once, instead
+      # of a separate check build followed by a full rebuild. Doctests reuse
+      # the same wrapped library units.
+      - name: Clippy and test Rust workspace
         run: |
+          sysroot="$(soldr rustc --print sysroot | tail -n 1)"
+          export RUSTC_WORKSPACE_WRAPPER="$sysroot/bin/clippy-driver"
+          export CLIPPY_ARGS="-D__CLIPPY_HACKERY__warnings__CLIPPY_HACKERY__"
+          test -x "$RUSTC_WORKSPACE_WRAPPER"
           # nextest runs every test binary in parallel (#600); it cannot run
           # doctests, so they run separately and nothing is dropped.
-          soldr cargo nextest run --workspace --exclude bosn-python --locked
-          soldr cargo test --workspace --exclude bosn-python --doc --locked
-          PYO3_PYTHON="$(command -v python)" soldr cargo test -p bosn-python --lib --locked --no-default-features --features embedded-python-tests
+          PYO3_PYTHON="$(command -v python)" soldr cargo nextest run --workspace --all-targets --locked --features bosn-python/embedded-python-tests
+          PYO3_PYTHON="$(command -v python)" soldr cargo test --workspace --doc --locked --features bosn-python/embedded-python-tests
 
   linux:
     name: Linux (lint + unit + docker)

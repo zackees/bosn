@@ -68,6 +68,9 @@ cache-keys = [
 
 [tool.maturin]
 manifest-path = "crates/bosn-python/Cargo.toml"
+# The wheel-only features (extension module, vendored OpenSSL) are not crate
+# defaults, so the workspace test build links CPython and system OpenSSL (bosn#503).
+features = ["wheel"]
 module-name = "bosn._native"
 python-source = "src"
 data = ".bosn-build/wheel-data"

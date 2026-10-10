@@ -24,7 +24,7 @@ cmd = "soldr toolchain ensure --json && uv sync --frozen --all-groups --no-edita
 # The Rust suite, isolated like the Python one (zackees/ci.yml GATE-005).
 [task.rust-test]
 stack = "test"
-cmd = "soldr toolchain ensure --json && soldr cargo test --workspace --exclude bosn-python --locked && PYO3_PYTHON=$(command -v python3) soldr cargo test -p bosn-python --lib --locked --no-default-features --features embedded-python-tests"
+cmd = "soldr toolchain ensure --json && PYO3_PYTHON=$(command -v python3) soldr cargo test --workspace --locked --features bosn-python/embedded-python-tests"
 
 [task.rust-lint]
 stack = "test"

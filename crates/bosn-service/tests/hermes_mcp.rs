@@ -8,13 +8,10 @@
 //! and environment Hermes registered. No unit-test backend is involved.
 //!
 //! Run only where Hermes Agent `0.21.0` is installed:
-//! `BOSN_HERMES_ACCEPTANCE=1 cargo test -p bosn-service --test hermes_mcp --
-//! --ignored --exact hermes_agent_stdio_contract_survives_daemon_restart`.
+//! `BOSN_HERMES_ACCEPTANCE=1 cargo test -p bosn-service --test integration --
+//! --ignored --exact hermes_mcp::hermes_agent_stdio_contract_survives_daemon_restart`.
 
 #![cfg(unix)]
-
-#[allow(dead_code)]
-mod support;
 
 use std::{
     env,
@@ -27,10 +24,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::support::tls_setup_server::{TlsSetupServer, certificate_path};
 use bosn_service::Client;
 use kernal_api::async_engine::RuntimeBuilder;
 use serde_json::{Value, json};
-use support::tls_setup_server::{TlsSetupServer, certificate_path};
 
 const HERMES_VERSION: &str = "0.21.0";
 const READY_DEADLINE: Duration = Duration::from_secs(10);

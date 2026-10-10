@@ -428,7 +428,7 @@ fn ensure_arguments(workspace: &Path, config: &Path) -> Value {
 }
 
 /// Run with:
-/// `soldr cargo test -j1 -p bosn-service --test mcp_setup_ensure_docker --locked -- --ignored --exact live_docker_mcp_setup_ensure_creates_and_reuses_one_managed_app`
+/// `soldr cargo test -j1 -p bosn-service --test integration --locked -- --ignored --exact mcp_setup_ensure_docker::live_docker_mcp_setup_ensure_creates_and_reuses_one_managed_app`
 ///
 /// This requires a usable Docker daemon and the exact pre-pulled
 /// `PINNED_ALPINE` image. It sends setup plan, ensure, status, and log calls

@@ -174,7 +174,7 @@ fn assert_removed_task_container(engine: &DockerEngine, short_id: &str) {
 }
 
 /// Run with:
-/// `soldr cargo test -j1 -p bosn-service --test setup_task_docker --locked -- --ignored --exact live_docker_setup_task_runs_only_the_declared_one_file_task`
+/// `soldr cargo test -j1 -p bosn-service --test integration --locked -- --ignored --exact setup_task_docker::live_docker_setup_task_runs_only_the_declared_one_file_task`
 ///
 /// The production daemon receives only a [`SetupTaskJobRequest`]. It can pick
 /// the named document task, policy, deadline, and output budget; it has no
@@ -340,7 +340,7 @@ fn live_docker_setup_task_runs_only_the_declared_one_file_task() {
 }
 
 /// Run with:
-/// `soldr cargo test -j1 -p bosn-service --test setup_task_docker --locked -- --ignored --exact live_docker_setup_task_keeps_the_declared_path_through_the_login_profile`
+/// `soldr cargo test -j1 -p bosn-service --test integration --locked -- --ignored --exact setup_task_docker::live_docker_setup_task_keeps_the_declared_path_through_the_login_profile`
 ///
 /// Alpine's `/etc/profile`, like Debian's, assigns `PATH` outright, so a bare
 /// `sh -lc` dropped every container `PATH` entry (an image's `ENV PATH`, or
