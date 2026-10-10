@@ -242,7 +242,7 @@ fn setup_ensure_persists_container_and_content_addressed_image_across_daemon_res
     assert_eq!(container.scope, Scope::Machine);
     assert_eq!(container.workspace, workspace.to_string_lossy());
     assert_eq!(container.state, ResourceState::Active);
-    assert_eq!(container.retention, Retention::Pinned);
+    assert_eq!(container.retention, Retention::Warm);
     let image = resources
         .iter()
         .find(|resource| resource.kind == ResourceKind::Image)
@@ -255,7 +255,7 @@ fn setup_ensure_persists_container_and_content_addressed_image_across_daemon_res
     assert_eq!(image.scope, Scope::Machine);
     assert_eq!(image.workspace, workspace.to_string_lossy());
     assert_eq!(image.state, ResourceState::Active);
-    assert_eq!(image.retention, Retention::Pinned);
+    assert_eq!(image.retention, Retention::Warm);
     let uses = registry.resource_uses(0, 10).unwrap().items;
     assert_eq!(uses.len(), 2);
     for use_record in uses {

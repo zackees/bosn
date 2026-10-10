@@ -278,6 +278,17 @@ impl<'a> Immediate<'a> {
         Ok(())
     }
     pub fn put_resource(&mut self, v: &Resource) -> Result<(), Error> {
+        self.upsert_resource(v, "excluded.retention")
+    }
+    /// Upsert like [`Self::put_resource`], but a row already `pinned` stays pinned: a producer
+    /// that records its objects `warm` never removes a pin someone else placed (#545).
+    pub fn put_resource_preserving_pin(&mut self, v: &Resource) -> Result<(), Error> {
+        self.upsert_resource(
+            v,
+            "CASE WHEN resources.retention='pinned' THEN 'pinned' ELSE excluded.retention END",
+        )
+    }
+    fn upsert_resource(&mut self, v: &Resource, retention: &str) -> Result<(), Error> {
         let rows = self.transaction.query(
             "SELECT id FROM resources WHERE kind=? AND name=?",
             &[
@@ -294,7 +305,7 @@ impl<'a> Immediate<'a> {
         {
             return Err(Error::ResourceIdentityConflict);
         }
-        self.transaction.execute("INSERT INTO resources(id,kind,name,stack,generation,scope,workspace,created_at,last_used,state,retention) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(kind,name) DO UPDATE SET stack=excluded.stack,generation=excluded.generation,scope=excluded.scope,workspace=excluded.workspace,last_used=excluded.last_used,state=excluded.state,retention=excluded.retention", &[Value::Text(v.id.clone()),Value::Text(v.kind.as_str().into()),Value::Text(v.name.clone()),Value::Text(v.stack.clone()),Value::Text(v.generation.clone()),Value::Text(v.scope.as_str().into()),Value::Text(v.workspace.clone()),Value::Real(v.created_at),Value::Real(v.last_used),Value::Text(v.state.as_str().into()),Value::Text(v.retention.as_str().into())])?;
+        self.transaction.execute(&format!("INSERT INTO resources(id,kind,name,stack,generation,scope,workspace,created_at,last_used,state,retention) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(kind,name) DO UPDATE SET stack=excluded.stack,generation=excluded.generation,scope=excluded.scope,workspace=excluded.workspace,last_used=excluded.last_used,state=excluded.state,retention={retention}"), &[Value::Text(v.id.clone()),Value::Text(v.kind.as_str().into()),Value::Text(v.name.clone()),Value::Text(v.stack.clone()),Value::Text(v.generation.clone()),Value::Text(v.scope.as_str().into()),Value::Text(v.workspace.clone()),Value::Real(v.created_at),Value::Real(v.last_used),Value::Text(v.state.as_str().into()),Value::Text(v.retention.as_str().into())])?;
         Ok(())
     }
     pub fn put_resource_use(&mut self, v: &ResourceUse) -> Result<(), Error> {

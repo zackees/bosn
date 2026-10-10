@@ -247,7 +247,6 @@ pub(crate) async fn retire_engine(
         crate::act_engine::remove_storage_volume(engine, record, owner)
             .await
             .map_err(|e| error(e.to_string()))?;
-        crate::act_engine::remove_socket_dir(intent);
         registry
             .act_registry(ActRegistryCommand::Finalize {
                 run: intent.run_id.clone(),

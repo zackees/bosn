@@ -35,7 +35,6 @@ mod observer;
 mod persist;
 mod plan;
 mod runners;
-mod shared;
 mod spare;
 mod widget;
 use observer::*;
@@ -110,8 +109,6 @@ pub struct CiRuntime {
     backend: Arc<dyn ActEngineBackend>,
     /// The one prepared spare engine (#410).
     spares: Arc<SpareKeeper>,
-    /// The engine concurrent runs share (#547).
-    shared: Arc<super::shared_engine::SharedEngine>,
     feed: Feed,
     /// Set once when the opt-in UI listener is serving.
     ui: Arc<OnceLock<Arc<UiHandle>>>,
@@ -175,10 +172,6 @@ impl CiRuntime {
             state: Arc::new(Mutex::new(state)),
             kick,
             spares: Arc::new(SpareKeeper::new(registry.clone(), Arc::clone(&backend))),
-            shared: Arc::new(super::shared_engine::SharedEngine::new(
-                registry.clone(),
-                Arc::clone(&backend),
-            )),
             registry,
             backend,
             feed: Feed::new(),
@@ -194,7 +187,6 @@ impl CiRuntime {
             }
         })
         .detach();
-        runtime.start_shared_reaper();
         runtime
     }
 
@@ -763,7 +755,14 @@ impl CiRuntime {
             record.mode.as_str(),
             record.actor
         ));
-        Ok(self.run_planned(plan, &cancel.token(), observer).await)
+        Ok(lifecycle::run_on_engine(
+            &self.registry,
+            self.backend.as_ref(),
+            &plan,
+            &cancel.token(),
+            observer,
+        )
+        .await)
     }
 
     /// The opted-in secrets, read from the daemon's secret store. A refused

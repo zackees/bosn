@@ -81,3 +81,57 @@ fn v4_import_refuses_source_replacement_after_identity_capture() {
     assert!(matches!(error, Error::ReplacedPath(path) if path == source));
     assert!(!destination.exists());
 }
+
+#[test]
+fn preserving_upsert_never_removes_a_pin_but_plain_upsert_does() {
+    let directory = fs::TemporaryDirectory::new().unwrap();
+    let path = directory.path().join("registry.sqlite3");
+    let mut registry =
+        Registry::create_writer(&path, "11111111-2222-4333-8444-555555555555").unwrap();
+    let row = |name: &str, retention| Resource {
+        id: format!("setup-container:{name}"),
+        kind: ResourceKind::Container,
+        name: name.into(),
+        stack: "setup".into(),
+        generation: "sha256:a".into(),
+        scope: Scope::Machine,
+        workspace: "/w".into(),
+        created_at: 1.0,
+        last_used: 1.0,
+        state: ResourceState::Active,
+        retention,
+    };
+    let mut transaction = registry.begin_immediate().unwrap();
+    transaction
+        .put_resource(&row("pinned", Retention::Pinned))
+        .unwrap();
+    transaction
+        .put_resource(&row("warm", Retention::Warm))
+        .unwrap();
+    transaction
+        .put_resource_preserving_pin(&row("pinned", Retention::Warm))
+        .unwrap();
+    transaction
+        .put_resource_preserving_pin(&row("warm", Retention::Warm))
+        .unwrap();
+    transaction
+        .put_resource_preserving_pin(&row("new", Retention::Warm))
+        .unwrap();
+    transaction.commit().unwrap();
+    let retention = |registry: &Registry, name| {
+        registry
+            .resource_by_kind_name(ResourceKind::Container, name)
+            .unwrap()
+            .unwrap()
+            .retention
+    };
+    assert_eq!(retention(&registry, "pinned"), Retention::Pinned);
+    assert_eq!(retention(&registry, "warm"), Retention::Warm);
+    assert_eq!(retention(&registry, "new"), Retention::Warm);
+    let mut transaction = registry.begin_immediate().unwrap();
+    transaction
+        .put_resource(&row("pinned", Retention::Warm))
+        .unwrap();
+    transaction.commit().unwrap();
+    assert_eq!(retention(&registry, "pinned"), Retention::Warm);
+}

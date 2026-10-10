@@ -89,7 +89,6 @@ fn cohort_route_restores_across_jobs_and_successive_owned_engines() {
                 cache: cache.clone(),
                 deadline: async_engine::Deadline::after(Duration::from_secs(600)),
                 spare: None,
-                shared: None,
                 invocation: ActInvocation {
                     event: "push".into(),
                     workflow: "workflow.yaml".into(),
@@ -105,7 +104,6 @@ fn cohort_route_restores_across_jobs_and_successive_owned_engines() {
                     },
                     secrets: Default::default(),
                     params: Default::default(),
-                    scope: None,
                 },
             };
             let mut observer = Collect::default();
