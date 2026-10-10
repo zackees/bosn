@@ -22,12 +22,14 @@ fn live_docker_managed_retention_reclaims_a_real_setup_app() {
     std::fs::create_dir_all(&workspace).expect("create workspace");
     let config = root.path().join("setup.toml");
     let unique = test_unique_suffix();
-    // No declared command: the app runs the production keepalive, the #536 shape.
+    own_registry(&state);
     let dockerfile =
         format!("FROM {PINNED_ALPINE}\nRUN printf '%s\\n' bosn-retention-{unique} > /proof\n");
     std::fs::write(
         &config,
-        format!("version = 1\n[app]\ndockerfile = '''{dockerfile}'''\n"),
+        format!(
+            "version = 1\n[app]\ndockerfile = '''{dockerfile}'''\ncommand = 'exec sleep 600'\n"
+        ),
     )
     .expect("write inline setup document");
     let runtime = RuntimeBuilder::multi_thread()
@@ -80,13 +82,18 @@ fn live_docker_managed_retention_reclaims_a_real_setup_app() {
         image_ttl: Duration::ZERO,
         max_bytes: None,
     };
+    let before = inspect_container(&engine, &container)
+        .unwrap()
+        .expect("container exists");
+    assert!(before.running, "the ensured app is running");
     // Running: in use, nothing of ours is removed.
     let held = bosn_service::managed_retention::managed_retention_pass(&engine, &state, zero, true);
     assert_eq!(held.summary.refused, None, "the read was complete");
+    eprintln!("running pass: {:?}", held.summary);
     assert!(inspect_container(&engine, &container).unwrap().is_some());
     assert!(docker_capture(&engine, ["image", "inspect", image_tag.as_str()]).ok());
 
-    // Stopped (what idle retirement does to a keepalive): container, then image, go.
+    // Stopped (as idle retirement leaves a keepalive): container, then image, go.
     assert!(docker_capture(&engine, ["stop", "--time", "1", container.as_str()]).ok());
     let first =
         bosn_service::managed_retention::managed_retention_pass(&engine, &state, zero, true);
@@ -112,4 +119,21 @@ fn live_docker_managed_retention_reclaims_a_real_setup_app() {
     // The shared base image was never ours to remove.
     assert!(docker_capture(&engine, ["image", "inspect", base.as_str()]).ok());
     eprintln!("managed retention released {removed} object(s), {bytes} bytes");
+}
+
+/// This test's own registry: on a machine that already has Bosn objects, a daemon refuses to
+/// mint an identity in an empty state directory (#515), and the pass must judge every
+/// pre-existing object as foreign to it.
+fn own_registry(state: &Path) {
+    std::fs::create_dir_all(state).expect("create state directory");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let registry_id = format!(
+        "{:08x}-0000-4000-8000-{:012x}",
+        (nanos >> 48) as u32,
+        nanos & 0xffff_ffff_ffff
+    );
+    drop(Registry::create_writer(state.join("registry.sqlite3"), &registry_id).expect("registry"));
 }
