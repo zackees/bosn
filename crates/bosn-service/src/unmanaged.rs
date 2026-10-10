@@ -5,7 +5,7 @@
 //! decides to delete; see [`docs/rust-unmanaged.md`](../../../docs/rust-unmanaged.md).
 
 use std::collections::BTreeSet;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use std::path::Path;
 
@@ -81,9 +81,70 @@ pub fn unmanaged_census_within(
     config: CensusConfig,
     deadline: Duration,
 ) -> UnmanagedCensus {
-    let options = RunOptions::bounded(deadline, CENSUS_READ_OUTPUT_LIMIT);
+    census_with_budget(
+        engine,
+        our_registry,
+        config,
+        CensusBudget::per_read(deadline),
+    )
+}
+
+/// Run the census with each read bounded by `deadline` and the whole pass by `overall`.
+///
+/// #300: `bosn doctor` must finish inside its caller's budget, and a per-read deadline alone
+/// multiplies by the number of reads. Each read is given only what is left of `overall`; a
+/// read that runs out fails like any timed-out read, so the census is reported partial,
+/// never clean.
+#[must_use]
+pub fn unmanaged_census_until(
+    engine: &DockerEngine,
+    our_registry: Option<&str>,
+    config: CensusConfig,
+    deadline: Duration,
+    overall: Duration,
+) -> UnmanagedCensus {
+    let budget = CensusBudget {
+        per_read: deadline,
+        until: Instant::now().checked_add(overall),
+    };
+    census_with_budget(engine, our_registry, config, budget)
+}
+
+/// A per-read deadline, optionally clamped by an end time for the whole pass.
+#[derive(Clone, Copy)]
+struct CensusBudget {
+    per_read: Duration,
+    until: Option<Instant>,
+}
+
+impl CensusBudget {
+    const fn per_read(per_read: Duration) -> Self {
+        Self {
+            per_read,
+            until: None,
+        }
+    }
+
+    /// Options for the next read. An exhausted budget still yields a (1 ms) bounded read,
+    /// so the read reports its own deadline failure rather than being silently skipped.
+    fn options(self) -> RunOptions {
+        let remaining = self.until.map_or(self.per_read, |until| {
+            until
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1))
+        });
+        RunOptions::bounded(self.per_read.min(remaining), CENSUS_READ_OUTPUT_LIMIT)
+    }
+}
+
+fn census_with_budget(
+    engine: &DockerEngine,
+    our_registry: Option<&str>,
+    config: CensusConfig,
+    budget: CensusBudget,
+) -> UnmanagedCensus {
     let mut unreadable = Vec::new();
-    let report = match engine.system_df_verbose(options) {
+    let report = match engine.system_df_verbose(budget.options()) {
         Ok(CensusRead::Document(text)) => match serde_json::from_str::<SystemDfReport>(&text) {
             Ok(report) => Some(report),
             Err(_) => {
@@ -104,13 +165,13 @@ pub fn unmanaged_census_within(
     };
     let observed = match &report {
         Some(report) => {
-            let labeled = bosn_labeled_image_ids(engine, options, &mut unreadable);
+            let labeled = bosn_labeled_image_ids(engine, budget, &mut unreadable);
             let dangling = ids_from(
-                engine.image_ids_dangling(options),
+                engine.image_ids_dangling(budget.options()),
                 "docker image ls --filter dangling",
                 &mut unreadable,
             );
-            let inspected = inspect_volumes(engine, report, options, &mut unreadable);
+            let inspected = inspect_volumes(engine, report, budget, &mut unreadable);
             observe(EngineObservation {
                 report,
                 dangling_image_ids: &dangling,
@@ -477,13 +538,13 @@ struct AckWire {
 /// which the caller surfaces as `unreadable` rather than as "no labels".
 fn bosn_labeled_image_ids(
     engine: &DockerEngine,
-    options: RunOptions,
+    budget: CensusBudget,
     unreadable: &mut Vec<String>,
 ) -> Vec<String> {
     let mut ids = BTreeSet::new();
     for key in bosn_core::REQUIRED_LABELS {
         ids.extend(ids_from(
-            engine.image_ids_with_label(key, options),
+            engine.image_ids_with_label(key, budget.options()),
             "docker image ls --filter label",
             unreadable,
         ));
@@ -522,7 +583,7 @@ fn ids_from(
 fn inspect_volumes(
     engine: &DockerEngine,
     report: &SystemDfReport,
-    options: RunOptions,
+    budget: CensusBudget,
     unreadable: &mut Vec<String>,
 ) -> Vec<InspectedVolume> {
     let names: Vec<String> = report
@@ -543,7 +604,7 @@ fn inspect_volumes(
         .chunks(CENSUS_INSPECT_CHUNK)
         .take(CENSUS_INSPECT_MAX / CENSUS_INSPECT_CHUNK)
     {
-        let text = match engine.inspect_volumes(chunk, options) {
+        let text = match engine.inspect_volumes(chunk, budget.options()) {
             Ok(CensusRead::Document(text)) => text,
             Ok(CensusRead::Unavailable { detail }) => {
                 unreadable.push(detail);
@@ -573,6 +634,22 @@ fn now_seconds() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_census_budget_clamps_each_read_to_what_is_left() {
+        let open = CensusBudget::per_read(Duration::from_secs(30));
+        assert_eq!(open.options().deadline, Duration::from_secs(30));
+        let short = CensusBudget {
+            per_read: Duration::from_secs(30),
+            until: Instant::now().checked_add(Duration::from_secs(2)),
+        };
+        assert!(short.options().deadline <= Duration::from_secs(2));
+        let spent = CensusBudget {
+            per_read: Duration::from_secs(30),
+            until: Some(Instant::now()),
+        };
+        assert_eq!(spent.options().deadline, Duration::from_millis(1));
+    }
 
     #[test]
     fn an_unreadable_census_is_never_trustworthy() {
