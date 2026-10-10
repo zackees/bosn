@@ -40,8 +40,12 @@
 //!   get the run's label filter;
 //! * a build-cache prune is narrowed to match nothing (BuildKit takes no
 //!   label filter, and its cache is the host's);
-//! * `DELETE /volumes/{name}` is refused unless the volume carries the run's
-//!   label (or does not exist).
+//! * a request that names one object (container, exec, network, volume, image
+//!   delete) is forwarded only when that object carries the run's label (#547,
+//!   see `access`), and a container create cannot reach into another run's
+//!   containers or networks;
+//! * with [`ProxySettings::cgroup_parent`], every container is forced into the
+//!   run's cgroup parent, whatever the caller asked for.
 //!
 //! Hijacked streams (`attach`, `exec start`: `Upgrade: tcp`) switch to a raw
 //! copy after the request, so interactive streams pass through untouched.
@@ -64,8 +68,10 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 
+mod access;
 mod rewrite;
-pub use rewrite::rewrite_create;
+use access::{Refusal, addressed, create_references, refusal_status};
+pub use rewrite::{LABEL_CGROUP_PARENT, rewrite_create};
 use rewrite::{Scope, create_kind, scope, scope_build_prune, scope_listing, suffix_name};
 
 const MAX_HEAD_BYTES: usize = 1024 * 1024;
@@ -154,6 +160,9 @@ pub struct ProxySettings {
     /// `0` leaves CPU unlimited.
     pub nano_cpus: i64,
     pub memory: Option<u64>,
+    /// Forced as `HostConfig.CgroupParent` on every container the job
+    /// creates (#547); `None` leaves Docker's default.
+    pub cgroup_parent: Option<String>,
     pub volumes: Arc<dyn VolumePolicy>,
     pub activity: Arc<Activity>,
     /// Receives one line per notable rewrite, for the job log.
@@ -304,12 +313,17 @@ fn serve_connection(client: UnixStream, upstream: UnixStream, settings: &ProxySe
         && error.kind() == io::ErrorKind::PermissionDenied
         && let Ok(mut writer) = refusal_writer
     {
-        // Answer the refused create in Docker's error shape; the client
+        // Answer the refused request in Docker's error shape; the client
         // reports the message instead of a bare EOF.
+        let status = refusal_status(&error);
+        let reason = match error.get_ref().and_then(|e| e.downcast_ref::<Refusal>()) {
+            Some(refusal) => refusal.reason(),
+            None => "Internal Server Error",
+        };
         let body = error.to_string();
         let _ = writer.write_all(
             format!(
-                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             )
             .as_bytes(),
@@ -440,10 +454,21 @@ fn forward_requests<R: BufRead, W: Write>(
         settings.activity.touch();
         if let Some(kind) = create_kind(&head.method, &head.target) {
             let body = read_body(reader, &head)?;
-            let body = match rewrite_create(kind, &body, settings) {
+            let rewritten = rewrite_create(kind, &body, settings).and_then(|rewritten| {
+                if kind == "container" {
+                    for reference in create_references(&rewritten)? {
+                        access::check(&settings.upstream, &reference, &settings.run)?;
+                    }
+                }
+                Ok(rewritten)
+            });
+            let body = match rewritten {
                 Ok(rewritten) => {
                     settings.activity.creates.fetch_add(1, Ordering::Relaxed);
                     rewritten
+                }
+                Err(error) if error.get_ref().is_some_and(|e| e.is::<Refusal>()) => {
+                    return Err(error);
                 }
                 Err(error) => {
                     // Never forward an unaccounted create: refuse it with a
@@ -476,15 +501,20 @@ fn forward_requests<R: BufRead, W: Write>(
             Scope::Forward => {}
             Scope::Label => head.target = scope_listing(&head.target, &settings.run)?,
             Scope::BuildCache => head.target = scope_build_prune(&head.target)?,
-            Scope::VolumeRemove(name) => {
-                if let Err(error) = volume_removable(&settings.upstream, &name, &settings.run) {
-                    let message = serde_json::json!({
-                        "message": format!("bosn docker proxy refused removing volume {name}: {error}")
-                    })
-                    .to_string();
-                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, message));
+        }
+        if let Some(access) = addressed(&head.method, &head.target) {
+            access::check(&settings.upstream, &access, &settings.run).map_err(|error| {
+                if error.get_ref().is_some_and(|e| e.is::<Refusal>()) {
+                    error
+                } else {
+                    // Fail closed: an object the proxy cannot resolve is not
+                    // forwarded.
+                    Refusal::error(
+                        500,
+                        format!("bosn docker proxy could not resolve {}: {error}", access.id),
+                    )
                 }
-            }
+            })?;
         }
         let mut out = head.encode(&[]);
         out.extend_from_slice(b"\r\n");
@@ -506,51 +536,6 @@ fn forward_requests<R: BufRead, W: Write>(
         }
     }
     Ok(())
-}
-
-/// A job may remove only a volume it created (it carries the run's label), or
-/// one that does not exist, which Docker then answers itself. Proven by one
-/// bounded inspect on a separate upstream connection.
-#[cfg(unix)]
-fn volume_removable(upstream: &Path, name: &str, run: &str) -> io::Result<()> {
-    let mut stream = UnixStream::connect(upstream)?;
-    stream.set_read_timeout(Some(INSPECT_DEADLINE))?;
-    stream.set_write_timeout(Some(INSPECT_DEADLINE))?;
-    let target = format!("/volumes/{}", crate::docker_api::encode(name));
-    stream.write_all(format!("GET {target} HTTP/1.0\r\nHost: docker\r\n\r\n").as_bytes())?;
-    let mut response = Vec::new();
-    stream.take(MAX_INSPECT_BYTES).read_to_end(&mut response)?;
-    volume_owner_verdict(&response, run)
-}
-
-#[cfg(not(unix))]
-fn volume_removable(_upstream: &Path, _name: &str, _run: &str) -> io::Result<()> {
-    Err(io::Error::other("the Docker proxy needs Unix sockets"))
-}
-
-fn volume_owner_verdict(response: &[u8], run: &str) -> io::Result<()> {
-    let split = response
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| io::Error::other("volume inspect returned no response"))?;
-    let head = String::from_utf8_lossy(&response[..split]);
-    let status = head.split_whitespace().nth(1).unwrap_or("");
-    match status {
-        "404" => Ok(()),
-        "200" => {
-            let body: serde_json::Value = serde_json::from_slice(&response[split + 4..])
-                .map_err(|_| io::Error::other("volume inspect returned malformed JSON"))?;
-            let owner = body["Labels"][crate::docker_api::LABEL_RUN].as_str();
-            if owner == Some(run) {
-                Ok(())
-            } else {
-                Err(io::Error::other("it was not created by this run"))
-            }
-        }
-        _ => Err(io::Error::other(format!(
-            "volume inspect answered {status}"
-        ))),
-    }
 }
 
 fn read_body<R: BufRead>(reader: &mut R, head: &Head) -> io::Result<Vec<u8>> {
@@ -636,6 +621,8 @@ impl ChunkWrite for ChunkSink<'_> {
 }
 
 #[cfg(test)]
+mod access_tests;
+#[cfg(test)]
 mod scope_tests;
 #[cfg(test)]
 mod tests {
@@ -662,6 +649,7 @@ mod tests {
             labels: BTreeMap::from([("com.zackees.bosn.run".into(), "r-1".into())]),
             nano_cpus: 4_000_000_000,
             memory: Some(1 << 30),
+            cgroup_parent: None,
             volumes,
             activity: Arc::new(Activity::new()),
             notes: None,
@@ -712,9 +700,19 @@ mod tests {
         (result, out)
     }
 
+    #[cfg(unix)]
     #[test]
     fn requests_pass_through_byte_for_byte_except_create_bodies() {
-        let s = settings(Arc::new(NoVolumes));
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = settings(Arc::new(NoVolumes));
+        let own = r#"{"Config":{"Labels":{"com.zackees.bosn.run":"r-1"}}}"#;
+        s.upstream = super::access_tests::inspecting_upstream(
+            dir.path(),
+            &[
+                ("/containers/x/json", own),
+                ("/exec/1/json", r#"{"ContainerID":"x"}"#),
+            ],
+        );
         let plain = b"GET /_ping HTTP/1.1\r\nHost: docker\r\n\r\nPUT /containers/x/archive?path=/ HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nPOST /exec/1/start HTTP/1.1\r\nContent-Length: 2\r\nUpgrade: tcp\r\nConnection: Upgrade\r\n\r\n{}raw stdin bytes";
         let (result, out) = forward(plain, &s);
         result.unwrap();

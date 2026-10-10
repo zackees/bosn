@@ -1,5 +1,7 @@
 //! #560: a job's whole-host Docker calls reach only the run's own objects.
 
+#[cfg(unix)]
+use super::access_tests::inspecting_upstream;
 use super::tests::{forward, settings};
 use super::*;
 use serde_json::Value;
@@ -55,8 +57,6 @@ fn image_and_network_listings_and_other_calls_pass_through() {
     for request in [
         "GET /v1.47/images/json HTTP/1.1\r\n\r\n",
         "GET /v1.47/networks HTTP/1.1\r\n\r\n",
-        "GET /v1.47/volumes/x HTTP/1.1\r\n\r\n",
-        "DELETE /v1.47/containers/x?force=1 HTTP/1.1\r\n\r\n",
     ] {
         let s = settings(Arc::new(NoVolumes));
         let (result, out) = forward(request.as_bytes(), &s);
@@ -65,66 +65,18 @@ fn image_and_network_listings_and_other_calls_pass_through() {
     }
 }
 
-#[test]
-fn volume_ownership_is_decided_by_the_run_label() {
-    let inspect = |status: &str, body: &str| {
-        format!("HTTP/1.0 {status}\r\nContent-Type: application/json\r\n\r\n{body}")
-    };
-    let own = inspect(
-        "200 OK",
-        r#"{"Name":"v","Labels":{"com.zackees.bosn.run":"r-1"}}"#,
-    );
-    let foreign = inspect(
-        "200 OK",
-        r#"{"Name":"bosn-ci-cache-v1","Labels":{"com.zackees.bosn.kind":"volume"}}"#,
-    );
-    let other_run = inspect(
-        "200 OK",
-        r#"{"Name":"v","Labels":{"com.zackees.bosn.run":"r-2"}}"#,
-    );
-    let unlabelled = inspect("200 OK", r#"{"Name":"v","Labels":null}"#);
-    assert!(volume_owner_verdict(own.as_bytes(), "r-1").is_ok());
-    assert!(volume_owner_verdict(inspect("404 Not Found", "{}").as_bytes(), "r-1").is_ok());
-    for refused in [
-        foreign,
-        other_run,
-        unlabelled,
-        inspect("500 Internal Server Error", "{}"),
-    ] {
-        assert!(
-            volume_owner_verdict(refused.as_bytes(), "r-1").is_err(),
-            "{refused}"
-        );
-    }
-    assert!(volume_owner_verdict(b"", "r-1").is_err());
-}
-
-/// One upstream that answers a single volume inspect with `body`.
-#[cfg(unix)]
-fn inspecting_upstream(dir: &Path, body: &'static str) -> PathBuf {
-    let path = dir.join("up.sock");
-    let listener = UnixListener::bind(&path).unwrap();
-    std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let head = read_head(&mut reader).unwrap().unwrap();
-        assert_eq!(head.method, "GET");
-        let mut writer = stream;
-        let reply = format!(
-            "HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        );
-        writer.write_all(reply.as_bytes()).unwrap();
-    });
-    path
-}
-
 #[cfg(unix)]
 #[test]
 fn removing_another_owners_volume_is_refused_and_never_forwarded() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = settings(Arc::new(NoVolumes));
-    s.upstream = inspecting_upstream(dir.path(), r#"{"Name":"bosn-ci-cache-v1","Labels":{}}"#);
+    s.upstream = inspecting_upstream(
+        dir.path(),
+        &[(
+            "/volumes/bosn-ci-cache-v1",
+            r#"{"Name":"bosn-ci-cache-v1","Labels":{}}"#,
+        )],
+    );
     let (result, out) = forward(
         b"DELETE /v1.47/volumes/bosn-ci-cache-v1 HTTP/1.1\r\n\r\n",
         &s,
@@ -145,7 +97,10 @@ fn removing_the_runs_own_volume_is_forwarded() {
     let mut s = settings(Arc::new(NoVolumes));
     s.upstream = inspecting_upstream(
         dir.path(),
-        r#"{"Name":"act-env","Labels":{"com.zackees.bosn.run":"r-1"}}"#,
+        &[(
+            "/volumes/act-env",
+            r#"{"Name":"act-env","Labels":{"com.zackees.bosn.run":"r-1"}}"#,
+        )],
     );
     let request = b"DELETE /v1.47/volumes/act-env HTTP/1.1\r\n\r\n";
     let (result, out) = forward(request, &s);

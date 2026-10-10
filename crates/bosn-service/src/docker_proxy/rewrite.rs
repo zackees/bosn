@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 use super::ProxySettings;
 
 /// Strip Docker's optional `/v1.NN` prefix and the query string.
-fn api_path(target: &str) -> &str {
+pub(super) fn api_path(target: &str) -> &str {
     let path = target.split('?').next().unwrap_or(target);
     match path.strip_prefix("/v") {
         Some(rest) => match rest.find('/') {
@@ -37,9 +37,6 @@ pub(super) enum Scope {
     /// shared with the host, so the prune is narrowed to a record id that never
     /// exists: it succeeds and removes nothing.
     BuildCache,
-    /// `DELETE /volumes/{name}`: forwarded only once the volume proves to be
-    /// the run's own, or absent.
-    VolumeRemove(String),
 }
 
 /// Classify a request. Image and network listings stay whole: images carry no
@@ -52,12 +49,6 @@ pub(super) fn scope(method: &str, target: &str) -> Scope {
             Scope::Label
         }
         ("POST", "/build/prune") => Scope::BuildCache,
-        ("DELETE", _) => match path.strip_prefix("/volumes/") {
-            Some(name) if !name.is_empty() && !name.contains('/') => {
-                Scope::VolumeRemove(decode(name))
-            }
-            _ => Scope::Forward,
-        },
         _ => Scope::Forward,
     }
 }
@@ -93,7 +84,7 @@ fn join_query(path: &str, pairs: &[(String, String)]) -> String {
     format!("{path}?{}", query.join("&"))
 }
 
-fn decode(value: &str) -> String {
+pub(super) fn decode(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -224,7 +215,10 @@ pub fn rewrite_create(kind: &str, body: &[u8], settings: &ProxySettings) -> io::
         .ok_or_else(|| io::Error::other("body is not a JSON object"))?;
     add_labels(object, &settings.labels)?;
     match kind {
-        "container" => rewrite_container(object, settings)?,
+        "container" => {
+            rewrite_container(object, settings)?;
+            pin_cgroup_parent(object, settings);
+        }
         "volume" => {
             if let Some(name) = object.get("Name").and_then(Value::as_str) {
                 let mapped = settings.volumes.map_volume(name)?;
@@ -238,6 +232,33 @@ pub fn rewrite_create(kind: &str, body: &[u8], settings: &ProxySettings) -> io::
     }
     serde_json::to_vec(&value).map_err(io::Error::other)
 }
+
+/// Force the run's cgroup parent on every container, whatever the caller
+/// (act's `--container-options`, a workflow's `container.options`, a service
+/// container) asked for, and record it in a label.
+fn pin_cgroup_parent(object: &mut Map<String, Value>, settings: &ProxySettings) {
+    let Some(parent) = &settings.cgroup_parent else {
+        return;
+    };
+    if let Some(Value::Object(labels)) = object.get_mut("Labels") {
+        labels.insert(LABEL_CGROUP_PARENT.into(), Value::String(parent.clone()));
+    }
+    if let Some(Value::Object(host)) = object.get_mut("HostConfig") {
+        let asked = host.insert("CgroupParent".into(), Value::String(parent.clone()));
+        if let Some(Value::String(asked)) = asked
+            && !asked.is_empty()
+            && asked != *parent
+        {
+            note(
+                settings,
+                format!("[bosn] cgroup parent {asked} replaced by the run's {parent}"),
+            );
+        }
+    }
+}
+
+/// Records the cgroup parent the proxy pinned on a container.
+pub const LABEL_CGROUP_PARENT: &str = "com.zackees.bosn.cgroup-parent";
 
 fn note(settings: &ProxySettings, line: String) {
     if let Some(notes) = &settings.notes {
@@ -417,6 +438,7 @@ mod tests {
             labels: BTreeMap::from([("com.zackees.bosn.run".into(), "r-1".into())]),
             nano_cpus: 4_000_000_000,
             memory: Some(1 << 30),
+            cgroup_parent: None,
             volumes,
             activity: Arc::new(Activity::new()),
             notes: None,
