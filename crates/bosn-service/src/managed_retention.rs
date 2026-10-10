@@ -911,6 +911,7 @@ pub use report::{maintenance_pass, report_pass};
 
 mod authority;
 pub(crate) mod catalog;
+pub use catalog::{Release, labelled_registries, release_registry};
 mod idle;
 mod registered;
 mod sizes;

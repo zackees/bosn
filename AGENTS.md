@@ -244,3 +244,22 @@ Decided 2026-10-09.
   shipped into the engine. The directory is frozen in the creation profile
   (`docker_socket`) and removed with the engine. Non-Linux daemons (Docker Desktop VMs)
   bind nothing and keep per-run engines.
+
+## Automatic retention (#545)
+
+Managed garbage collection runs by default while the daemon is running.
+Operators opt out with `auto_retention = false` in the state directory's
+`retention.toml`. Keep the ownership, age, liveness and pinning gates on every
+removal.
+
+**Objects from registries that predate the machine catalog** (decided
+2026-10-10). A label naming a registry the catalog never saw is not proof that
+the registry is gone, so those objects stay `foreign-registry`: never reclaimed
+automatically, never adopted by guessing. The operator decides once per
+registry. `bosn gc release-registry` lists the registry ids Docker objects
+carry; `bosn gc release-registry <UUID> --yes` records that registry as
+abandoned in the machine catalog, and the machine daemon then reclaims its
+objects through the ordinary pass under every gate. It refuses this machine's
+own registry and any cataloged registry whose database still exists. No bulk
+"adopt everything foreign" command, and no re-labelling of foreign objects into
+the current registry.

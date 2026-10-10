@@ -12,6 +12,9 @@ pub(crate) fn run_gc(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
     if verb.as_os_str() == std::ffi::OsStr::new("owned") {
         return super::gc_owned::run_gc_owned(arguments);
     }
+    if verb.as_os_str() == std::ffi::OsStr::new("release-registry") {
+        return super::gc_release::run_gc_release(arguments);
+    }
     if verb.as_os_str() == std::ffi::OsStr::new("apply") {
         return run_gc_apply(arguments);
     }
