@@ -535,6 +535,8 @@ impl Service {
         // one left behind is retired by the next daemon's startup recovery.
         let _ =
             async_engine::timeout(crate::dispatch::SPARE_CLOSE_DEADLINE, ci.close_spares()).await;
+        let _ =
+            async_engine::timeout(crate::dispatch::SPARE_CLOSE_DEADLINE, ci.close_shared()).await;
         // Keep the sole registry writer alive while the job actor cancels and
         // drains typed work: a shutdown-cancelled setup ensure still needs its
         // durable terminal audit event before the writer can be released.
