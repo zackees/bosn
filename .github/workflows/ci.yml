@@ -153,6 +153,9 @@ jobs:
           job-status: ${{ job.status }}
           save-cache: auto
           save-cache-remote: ${{ github.ref == 'refs/heads/main' && 'auto' || 'false' }}
+          # CACHE-024 (setup-soldr#552): the sanctioned automatic key. Under
+          # act it saves per source, so workspace units accumulate (#503).
+          key: auto
           target-cache: false
           cargo-registry-cache: false
           prebuild-deps: none
@@ -248,6 +251,9 @@ jobs:
           job-status: ${{ job.status }}
           save-cache: auto
           save-cache-remote: ${{ github.ref == 'refs/heads/main' && 'auto' || 'false' }}
+          # CACHE-024 (setup-soldr#552): the sanctioned automatic key. Under
+          # act it saves per source, so workspace units accumulate (#503).
+          key: auto
           target-cache: false
           cargo-registry-cache: false
           prebuild-deps: none
