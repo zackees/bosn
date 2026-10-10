@@ -114,9 +114,12 @@ class RunnerToolsTests(unittest.TestCase):
         # those tools install into the tool cache the seed just populated.
         self.assertIn("prepare_toolcache_script(generation)?", engine)
         self.assertLess(
-            engine.index("Self::exec(engine, &prepare_toolcache_script(generation)?)"),
+            engine.index("let seed = prepare_toolcache_script(generation)?"),
             engine.index("runner_tools::prepare_script()"),
         )
+        self.assertIn("toolcache::once_per_engine(&seed, &tools)", engine)
+        toolcache = (ROOT / "crates/bosn-service/src/ci/engine/toolcache.rs").read_text()
+        self.assertIn("( {seed} ) && ( {tools} )", toolcache)
 
     def test_archives_are_pinned_and_completion_follows_probes(self):
         script = (ROOT / "crates/bosn-service/src/ci/engine/runner_tools.sh").read_text()

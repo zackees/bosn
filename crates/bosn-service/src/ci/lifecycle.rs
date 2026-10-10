@@ -57,6 +57,9 @@ pub struct EnginePlan {
     /// A prepared spare engine to take over instead of creating one; only
     /// ever one whose intent is [`ActEngineIntent::same_engine`] as `intent`.
     pub spare: Option<Spare>,
+    /// The shared engine to make when there is none (#547); `None` runs on
+    /// the run's own engine.
+    pub shared: Option<super::spare::SparePlan>,
 }
 
 /// How the workflow execution itself ended.
@@ -316,6 +319,16 @@ impl<'a> Claim<'a> {
     pub(super) fn engine(&self) -> &str {
         &self.observed.engine_id
     }
+
+    /// The claim the daemon holds on a spare or the shared engine (#547).
+    pub(super) fn held(registry: &'a RegistryActor, spare: &Spare) -> Self {
+        Self {
+            registry,
+            run: spare.intent.run_id.clone(),
+            observed: spare.observed.clone(),
+            token: spare.token.clone(),
+        }
+    }
 }
 
 /// The run's engine under its claim, whether it is already prepared, and
@@ -549,7 +562,7 @@ pub async fn run_on_engine(
         // The run's processes and containers go before its tool cache is
         // saved, so no job is still writing it.
         if let Some((engine, scope)) = scoped.take() {
-            close_scope(backend, &engine, scope, observer).await;
+            let _ = close_scope(backend, &engine, scope, observer).await;
         }
         let end = match end {
             Ok(ExecEnd::Exited(code)) => ExecutionEnd::Exited(code),
@@ -583,7 +596,7 @@ pub async fn run_on_engine(
         end
     };
     if let Some((engine, scope)) = scoped.take() {
-        close_scope(backend, &engine, scope, observer).await;
+        let _ = close_scope(backend, &engine, scope, observer).await;
     }
     drop(proxy);
     let outcome = registry_outcome(&execution);
@@ -627,12 +640,15 @@ async fn close_scope(
     engine: &str,
     scope: &super::engine::RunScope,
     observer: &mut dyn EngineObserver,
-) {
-    match async_engine::timeout(CLEANUP_BUDGET, backend.close_scope(engine, scope)).await {
-        Ok(Ok(())) => observer.note("run scope cleaned up: no container, network or volume left"),
-        Ok(Err(error)) => observer.note(&format!("run scope not cleaned up: {error}")),
-        Err(_) => observer.note("run scope not cleaned up: timed out"),
+) -> Result<(), String> {
+    let closed = async_engine::timeout(CLEANUP_BUDGET, backend.close_scope(engine, scope))
+        .await
+        .unwrap_or_else(|_| Err("timed out".into()));
+    match &closed {
+        Ok(()) => observer.note("run scope cleaned up: no container, network or volume left"),
+        Err(error) => observer.note(&format!("run scope not cleaned up: {error}")),
     }
+    closed
 }
 
 fn registry_outcome(end: &ExecutionEnd) -> ActRunOutcome {
@@ -686,6 +702,8 @@ pub(super) async fn cleanup(
         .retire(registry, owner, &current, CLEANUP_BUDGET)
         .await
 }
+
+pub mod shared;
 
 #[cfg(test)]
 pub(crate) mod tests;

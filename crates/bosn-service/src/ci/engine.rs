@@ -53,7 +53,7 @@ mod invocation;
 pub use invocation::{ActInvocation, LOCAL_RUNNER_LABELS};
 mod lines;
 mod run_scope;
-pub use run_scope::{RunLimits, RunScope};
+pub use run_scope::{MAX_SLOTS, RunLimits, RunScope};
 mod runner_tools;
 mod toolcache;
 use lines::LineBuffer;
@@ -770,15 +770,13 @@ impl ActEngineBackend for DockerActBackend {
         generation: Option<&'a bosn_registry::act::ActToolGenerationBinding>,
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
+            // Seeded before runner stock tools, which install into it; once
+            // per engine, however many runs share it (#547).
+            let seed = prepare_toolcache_script(generation)?;
+            let tools = runner_tools::prepare_script();
             self.checked(
-                "tool cache seed",
-                Self::exec(engine, &prepare_toolcache_script(generation)?),
-                PULL_DEADLINE,
-            )
-            .await?;
-            self.checked(
-                "runner stock tools",
-                Self::exec(engine, &runner_tools::prepare_script()),
+                "tool cache seed and runner stock tools",
+                Self::exec(engine, &toolcache::once_per_engine(&seed, &tools)),
                 PULL_DEADLINE,
             )
             .await?;

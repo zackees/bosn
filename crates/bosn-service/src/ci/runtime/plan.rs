@@ -7,7 +7,7 @@ use bosn_registry::act::{ActEngineBinding, ActEngineCreationProfile, ActEngineIn
 use super::super::{
     engine::{ACT_VERSION, ActArtifact, ActInvocation, CacheVolume, act_artifact},
     limits::EngineConfig,
-    spare::Spares,
+    spare::{SparePlan, Spares},
 };
 use super::*;
 
@@ -97,7 +97,20 @@ impl CiRuntime {
             },
             false,
         )?;
+        // The shared engine (#547): what to make when there is none.
+        let shared = if shared_enabled(config) && run_scope(&record.id, &intent)?.is_some() {
+            let id = new_uuid().await.map_err(|e| e.message)?;
+            let workspace = self.state_dir.to_string_lossy().into_owned();
+            Some(SparePlan {
+                intent: spec.intent(ActEngineBinding::spare(&id, &workspace), true)?,
+                act: spec.act,
+                cache: spec.cache.clone(),
+            })
+        } else {
+            None
+        };
         let spare = match config.spares {
+            _ if shared.is_some() => None,
             Spares::One => {
                 let spare = self.spares.take(&intent, deadline, cancellation).await;
                 // Replenish in the background while this run executes.
@@ -131,8 +144,15 @@ impl CiRuntime {
             cache: spec.cache,
             deadline,
             spare,
+            shared,
         })
     }
+}
+
+/// Whether runs share one long-lived engine (#547): `[engine] shared`,
+/// on by default.
+pub(super) fn shared_enabled(config: EngineConfig) -> bool {
+    config.shared.unwrap_or(true)
 }
 
 /// The run's scope inside its engine (#547) when the engine binds a socket
