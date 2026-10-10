@@ -136,6 +136,7 @@ fn response_envelope_rejects_wrong_correlation_protocol_kind_and_encoding() {
     let daemon = |release: &str, protocol| DaemonIdentity {
         release: release.into(),
         protocol,
+        protocol_min: 0,
     };
     // Same protocol: accepted whatever the release, with a skew note (#509).
     let skewed = daemon("0.1.7", DAEMON_PROTOCOL);
@@ -165,6 +166,29 @@ fn response_envelope_rejects_wrong_correlation_protocol_kind_and_encoding() {
     assert_eq!(daemon_release_skew("0.1.6", &daemon("0.1.7", 0)), None);
     let legacy = daemon_version_mismatch(state, "0.1.6", &daemon("", 0)).unwrap();
     assert!(legacy.contains("0.1.5 or earlier"));
+    // A window holding this client's protocol is accepted (#509 phase 3).
+    let window = |min, max| DaemonIdentity {
+        release: "0.2.0".into(),
+        protocol: max,
+        protocol_min: min,
+    };
+    let newer_window = window(DAEMON_PROTOCOL, DAEMON_PROTOCOL + 1);
+    assert_eq!(daemon_version_mismatch(state, "0.1.6", &newer_window), None);
+    assert!(
+        daemon_release_skew("0.1.6", &newer_window)
+            .unwrap()
+            .contains(&format!(
+                "protocols {DAEMON_PROTOCOL}-{}",
+                DAEMON_PROTOCOL + 1
+            ))
+    );
+    let past = window(DAEMON_PROTOCOL + 1, DAEMON_PROTOCOL + 2);
+    let refused = daemon_version_mismatch(state, "0.1.6", &past).unwrap();
+    assert!(refused.contains(&format!(
+        "speaking protocols {}-{}",
+        DAEMON_PROTOCOL + 1,
+        DAEMON_PROTOCOL + 2
+    )));
     for frame in [
         DaemonFrame::response_to(&request, payload.clone()).with_request_id(8),
         DaemonFrame::request(PAYLOAD_PROTOCOL, payload.clone()).with_request_id(7),
@@ -821,9 +845,12 @@ const PROTOCOL_SURFACE: [&str; 6] = [
     "src/ci/reply.rs",
     "../../docs/ci.schema.json",
 ];
+// #509 phase 3 added the protocol-window fields (request tag 29, reply tags
+// 68-69, refusal code 5) without a bump: each is additive, so a protocol-1 peer
+// on either side still reads every message it did before.
 const PROTOCOL_FINGERPRINT: (u32, &str) = (
     DAEMON_PROTOCOL,
-    "fb73d5e7fdd2a7b9053ffd5fd2b6e5b9c04c3a9b69dacc5265d8e39e745b7bfe",
+    "4e4b92b83c36cb0756c00b5c4e0cc178e28af94b44ddc726263683e5b20c67c3",
 );
 
 #[test]

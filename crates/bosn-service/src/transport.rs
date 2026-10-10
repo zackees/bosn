@@ -33,20 +33,71 @@ pub(crate) fn retire_stale_socket(ep: &Endpoint) -> Result<(), Error> {
 /// until the bump and its fingerprint are recorded together.
 pub const DAEMON_PROTOCOL: u32 = 1;
 
+/// The oldest client protocol this daemon still serves (#509 phase 3). The
+/// daemon serves the window `[DAEMON_PROTOCOL_MIN, DAEMON_PROTOCOL]`: a bump of
+/// [`DAEMON_PROTOCOL`] keeps the previous protocol's decoders, so this trails it
+/// by one (N-1) and never by more.
+pub const DAEMON_PROTOCOL_MIN: u32 = 1;
+
 /// What a daemon says about itself on a ping reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DaemonIdentity {
     /// The release version. Empty from bosn 0.1.5 and older.
     pub release: String,
-    /// The wire protocol. Zero from a daemon that predates #509.
+    /// The newest wire protocol it serves. Zero from a daemon that predates #509.
     pub protocol: u32,
+    /// The oldest wire protocol it serves. Zero from a daemon that predates the
+    /// protocol window (#509 phase 3), which serves only `protocol`.
+    pub protocol_min: u32,
+}
+
+impl DaemonIdentity {
+    /// The `[min, max]` protocol window this daemon serves. A daemon from
+    /// before the window serves exactly the one protocol it reports.
+    pub fn protocol_window(&self) -> (u32, u32) {
+        match self.protocol_min {
+            0 => (self.protocol, self.protocol),
+            min => (min, self.protocol),
+        }
+    }
+    /// Whether this daemon serves a client speaking `protocol`. Protocol zero
+    /// (a daemon that predates the handshake) serves no declared protocol.
+    pub fn serves(&self, protocol: u32) -> bool {
+        let (min, max) = self.protocol_window();
+        max != 0 && (min..=max).contains(&protocol)
+    }
+}
+
+/// Describe a protocol window for a message: `protocol 2` or `protocols 1-2`.
+pub(crate) fn describe_window((min, max): (u32, u32)) -> String {
+    if min == max {
+        format!("protocol {max}")
+    } else {
+        format!("protocols {min}-{max}")
+    }
+}
+
+/// The daemon's typed refusal of a client outside its protocol window (#509
+/// phase 3): both windows and the remedy, in one sentence.
+pub(crate) fn protocol_refusal(daemon: &DaemonIdentity, client_protocol: u32) -> String {
+    let release = match daemon.release.as_str() {
+        "" => "an unknown release".to_owned(),
+        release => format!("bosn {release}"),
+    };
+    format!(
+        "protocol_unsupported: the bosn daemon ({release}) serves {}, but this client speaks \
+         protocol {client_protocol}; upgrade whichever side is older, or stop the daemon with \
+         `bosn daemon stop` (this also cancels any job it is running for another session) \
+         so a matching daemon starts on demand",
+        describe_window(daemon.protocol_window())
+    )
 }
 
 /// Explain a daemon this client cannot talk to instead of letting it misread
 /// this client's requests (it may answer with a reset connection or a refusal).
 ///
-/// Compatibility is by wire protocol (#509 phase 2): a daemon reporting this
-/// client's [`DAEMON_PROTOCOL`] is accepted whatever its release (see
+/// Compatibility is by wire protocol (#509 phases 2-3): a daemon whose protocol
+/// window holds this client's [`DAEMON_PROTOCOL`] is accepted whatever its release (see
 /// [`daemon_release_skew`]). A daemon reporting protocol zero predates the
 /// handshake, so it keeps the exact-release check. `None` when compatible. An
 /// empty release is a daemon from bosn 0.1.5 or older.
@@ -56,7 +107,7 @@ pub fn daemon_version_mismatch(
     daemon: &DaemonIdentity,
 ) -> Option<String> {
     if daemon.protocol != 0 {
-        if daemon.protocol == DAEMON_PROTOCOL {
+        if daemon.serves(DAEMON_PROTOCOL) {
             return None;
         }
     } else if daemon.release == client_version {
@@ -69,7 +120,7 @@ pub fn daemon_version_mismatch(
     };
     let protocol = match daemon.protocol {
         0 => "no protocol (it predates the protocol handshake)".to_owned(),
-        n => format!("protocol {n}"),
+        _ => describe_window(daemon.protocol_window()),
     };
     let state = state_dir.display();
     Some(format!(
@@ -85,11 +136,13 @@ pub fn daemon_version_mismatch(
 /// protocols match, so the client proceeds. `None` when the releases match or
 /// the daemon is not compatible (see [`daemon_version_mismatch`]).
 pub fn daemon_release_skew(client_version: &str, daemon: &DaemonIdentity) -> Option<String> {
-    (daemon.protocol == DAEMON_PROTOCOL && daemon.release != client_version).then(|| {
+    (daemon.serves(DAEMON_PROTOCOL) && daemon.release != client_version).then(|| {
         format!(
             "note: the bosn daemon is release {}, this client is {client_version}; \
-             both speak protocol {DAEMON_PROTOCOL}, so proceeding",
-            daemon.release
+             the daemon serves {} and this client speaks protocol {DAEMON_PROTOCOL}, \
+             so proceeding",
+            daemon.release,
+            describe_window(daemon.protocol_window())
         )
     })
 }

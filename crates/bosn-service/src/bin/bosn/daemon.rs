@@ -360,6 +360,8 @@ pub(crate) fn print_daemon_status(
                 "daemon_version": daemon_version.filter(|version| !version.is_empty()),
                 "client_version": client_version,
                 "daemon_protocol": daemon_protocol,
+                "daemon_protocol_min": daemon_protocol
+                    .and(identity.map(|identity| identity.protocol_window().0)),
                 "client_protocol": bosn_service::DAEMON_PROTOCOL,
                 "version_mismatch": mismatch,
             })

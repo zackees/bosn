@@ -30,6 +30,25 @@ pub(crate) fn ci_error_wire(code: &str, message: String) -> ReplyWire {
     }
 }
 
+/// The daemon's one typed refusal (code 5) of a client outside its protocol
+/// window (#509 phase 3). A ping is always answered, so a client can learn the
+/// window before it sends work; a client reporting no protocol predates the
+/// window and is served as before, and so does a daemon emulating one.
+fn protocol_window_refusal(identity: &DaemonIdentity, r: &Request) -> Option<ReplyWire> {
+    let refused = r.operation != 1
+        && r.client_protocol != 0
+        && identity.protocol != 0
+        && !identity.serves(r.client_protocol);
+    refused.then(|| ReplyWire {
+        code: 5,
+        daemon_version: identity.release.clone(),
+        daemon_protocol: identity.protocol,
+        daemon_protocol_min: identity.protocol_min,
+        refused_client_protocol: r.client_protocol,
+        ..Default::default()
+    })
+}
+
 #[expect(
     clippy::cognitive_complexity,
     clippy::too_many_lines,
@@ -63,12 +82,15 @@ pub(crate) async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Re
             code: 1,
             ..Default::default()
         }
+    } else if let Some(refusal) = protocol_window_refusal(&identity, &r) {
+        refusal
     } else {
         match r.operation {
             1 => ReplyWire {
                 code: 10,
                 daemon_version: identity.release.clone(),
                 daemon_protocol: identity.protocol,
+                daemon_protocol_min: identity.protocol_min,
                 ..Default::default()
             },
             2 => {
