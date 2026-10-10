@@ -156,11 +156,8 @@ impl Client {
     }
 
     /// Preview or reclaim the resources this registry owns, by age gate (#456).
-    ///
-    /// The daemon answers only after a full fresh read of the engine (one `inspect` per owned
-    /// object, each bounded at 30 s) and, when applying, the removals themselves. On a busy
-    /// host with ~150 volumes that takes well over the 3 s control deadline (#545: every live
-    /// `gc owned` failed as "daemon unavailable" at exactly 3 s), so it gets its own.
+    /// The reply waits for a full fresh engine read (and any removals): far over the 3 s
+    /// control deadline on a busy host (#545), so it gets its own.
     ///
     /// The daemon re-derives the plan itself and revalidates ownership, liveness and pins
     /// immediately before each removal. A destructive pass requires `confirm`, and the daemon
