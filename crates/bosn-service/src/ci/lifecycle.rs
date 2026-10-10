@@ -24,8 +24,8 @@ use std::{
 };
 
 use bosn_registry::act::{
-    ActEngineBinding, ActEngineIntent, ActEngineObservation, ActEngineRecord, ActEngineState,
-    ActRunOutcome,
+    ActEngineBinding, ActEngineDockerSocket, ActEngineIntent, ActEngineObservation,
+    ActEngineRecord, ActEngineState, ActRunOutcome,
 };
 use kernal_api::async_engine::{self, CancellationToken};
 
@@ -57,6 +57,9 @@ pub struct EnginePlan {
     /// A prepared spare engine to take over instead of creating one; only
     /// ever one whose intent is [`ActEngineIntent::same_engine`] as `intent`.
     pub spare: Option<Spare>,
+    /// The shared engine to make when there is none (#547); `None` runs on
+    /// the run's own engine.
+    pub shared: Option<super::spare::SparePlan>,
 }
 
 /// How the workflow execution itself ended.
@@ -316,12 +319,31 @@ impl<'a> Claim<'a> {
     pub(super) fn engine(&self) -> &str {
         &self.observed.engine_id
     }
+
+    /// The claim the daemon holds on a spare or the shared engine (#547).
+    pub(super) fn held(registry: &'a RegistryActor, spare: &Spare) -> Self {
+        Self {
+            registry,
+            run: spare.intent.run_id.clone(),
+            observed: spare.observed.clone(),
+            token: spare.token.clone(),
+        }
+    }
 }
 
-/// The run's engine under its claim, and whether it is already prepared.
+/// The run's engine under its claim, whether it is already prepared, and
+/// the socket directory it binds (#547).
 struct Acquired<'a> {
     claim: Claim<'a>,
     prepared: bool,
+    socket: Option<ActEngineDockerSocket>,
+}
+
+fn docker_socket(intent: &ActEngineIntent) -> Option<ActEngineDockerSocket> {
+    intent
+        .creation_profile
+        .as_ref()
+        .and_then(|profile| profile.docker_socket.clone())
 }
 
 /// Claim the plan's spare (retiring it and falling back to a new engine when
@@ -354,6 +376,7 @@ async fn acquire<'a>(
                 return Ok(Acquired {
                     claim,
                     prepared: true,
+                    socket: docker_socket(&spare.intent),
                 });
             }
             Err(error) => {
@@ -379,6 +402,7 @@ async fn acquire<'a>(
     Ok(Acquired {
         claim,
         prepared: false,
+        socket: docker_socket(&plan.intent),
     })
 }
 
@@ -416,6 +440,10 @@ pub async fn run_on_engine(
     let mut claim = None;
     let mut laps = Laps::new();
     let mut peak = StoragePeak::default();
+    // The run's scope inside the engine (#547): its proxy, and the engine it
+    // must be closed in once anything of it may exist.
+    let mut proxy = None;
+    let mut scoped = None;
     let execution = 'run: {
         let acquired = match acquire(
             registry,
@@ -432,6 +460,13 @@ pub async fn run_on_engine(
             Err(error) => break 'run ExecutionEnd::EngineFailed(error),
         };
         let held = claim.insert(acquired.claim);
+        if let (Some(scope), Some(socket)) = (&plan.invocation.scope, &acquired.socket) {
+            match super::run_proxy::RunProxy::start(socket, scope) {
+                Ok(started) => proxy = Some(started),
+                Err(error) => break 'run ExecutionEnd::EngineFailed(error),
+            }
+            scoped = Some((held.engine().to_owned(), scope));
+        }
         let how = if acquired.prepared {
             "spare engine claimed"
         } else {
@@ -454,6 +489,7 @@ pub async fn run_on_engine(
             backend
                 .prepare_run(
                     held.engine(),
+                    &plan.invocation,
                     &plan.source,
                     &plan.event,
                     plan.intent
@@ -475,11 +511,8 @@ pub async fn run_on_engine(
         if let Err(error) = held.verify().await {
             break 'run ExecutionEnd::EngineFailed(error);
         }
-        match async_engine::timeout_at(
-            deadline,
-            backend.list(held.engine(), &plan.invocation.workflow_arg()),
-        )
-        .await
+        match async_engine::timeout_at(deadline, backend.list(held.engine(), &plan.invocation))
+            .await
         {
             Err(_) => break 'run ExecutionEnd::TimedOut,
             Ok(Ok(listing)) => observer.declared(&listing),
@@ -526,6 +559,11 @@ pub async fn run_on_engine(
             (None, Some(error)) => observer.note(&format!("engine storage not sampled: {error}")),
             (None, None) => {}
         }
+        // The run's processes and containers go before its tool cache is
+        // saved, so no job is still writing it.
+        if let Some((engine, scope)) = scoped.take() {
+            let _ = close_scope(backend, &engine, scope, observer).await;
+        }
         let end = match end {
             Ok(ExecEnd::Exited(code)) => ExecutionEnd::Exited(code),
             Ok(ExecEnd::TimedOut) => ExecutionEnd::TimedOut,
@@ -557,6 +595,10 @@ pub async fn run_on_engine(
         }
         end
     };
+    if let Some((engine, scope)) = scoped.take() {
+        let _ = close_scope(backend, &engine, scope, observer).await;
+    }
+    drop(proxy);
     let outcome = registry_outcome(&execution);
     let token = claim.as_ref().map(|held| held.token.clone());
     // The claimed engine's key: a spare's own UUID once one was claimed.
@@ -589,6 +631,24 @@ pub async fn run_on_engine(
         engine_id,
         storage: peak.peak(),
     }
+}
+
+/// Close the run's scope in its engine, noting (never failing on) an error:
+/// the engine's removal, or its next use, finds what is left.
+async fn close_scope(
+    backend: &dyn ActEngineBackend,
+    engine: &str,
+    scope: &super::engine::RunScope,
+    observer: &mut dyn EngineObserver,
+) -> Result<(), String> {
+    let closed = async_engine::timeout(CLEANUP_BUDGET, backend.close_scope(engine, scope))
+        .await
+        .unwrap_or_else(|_| Err("timed out".into()));
+    match &closed {
+        Ok(()) => observer.note("run scope cleaned up: no container, network or volume left"),
+        Err(error) => observer.note(&format!("run scope not cleaned up: {error}")),
+    }
+    closed
 }
 
 fn registry_outcome(end: &ExecutionEnd) -> ActRunOutcome {
@@ -642,6 +702,8 @@ pub(super) async fn cleanup(
         .retire(registry, owner, &current, CLEANUP_BUDGET)
         .await
 }
+
+pub mod shared;
 
 #[cfg(test)]
 pub(crate) mod tests;

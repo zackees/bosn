@@ -355,6 +355,7 @@ mod tests {
             ),
             secrets: Default::default(),
             params: installer(),
+            scope: None,
         }
         .args();
         assert_eq!(args[0], "workflow_call");
