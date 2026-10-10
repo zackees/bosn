@@ -21,8 +21,11 @@ impl CiRuntime {
         if !idle {
             return;
         }
-        let enabled = super::super::config::load_engine(&self.state_dir)
-            .is_ok_and(|config| config.spares == Spares::One);
+        // A shared engine (#547) is itself the warm engine.
+        let enabled = super::super::config::load_engine(&self.state_dir).is_ok_and(|config| {
+            config.spares == Spares::One
+                && !(cfg!(target_os = "linux") && super::plan::shared_enabled(config))
+        });
         if !enabled {
             self.spares.discard();
             return;
