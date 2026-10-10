@@ -316,6 +316,45 @@ stubbed job.
 
 ## What runs, and where
 
+- **One shared engine for concurrent runs (#547).** On Linux, runs share one
+  long-lived engine instead of getting one each (`[engine] shared = false`
+  restores per-run engines; non-Linux daemons always use them). The engine is
+  an ordinary owned engine, made and prepared (act, runner image, tool cache)
+  once and held under the daemon's own claim. Each run leases a slot in it
+  and runs in its own **scope**:
+  - a cgroup `/bosn-run-<key>` with `memory.max`, `memory.swap.max = 0`,
+    `cpu.max` and `pids.max`, sized from the engine (minus 1 GiB and 256
+    processes for its own daemons). act itself runs in the cgroup's `act`
+    leaf, and every container the run creates gets it as cgroup parent;
+  - its own labelled network, work tree and artifact path
+    (`/var/lib/docker/bosn-ci/runs/<key>`), and its own artifact and cache
+    server ports (`40000 + 2·slot`, `+1`);
+  - its own Docker proxy, served by the daemon on the host in the engine's
+    socket directory (`/bosn/sock/<key>.sock` inside the engine). act and
+    every job container reach Docker only through it: everything they create
+    carries the run's label (`com.zackees.bosn.run`), act's per-job volumes
+    get the run's key, and they cannot see or touch another run's objects.
+
+  When a run ends, however it ends (success, failure, cancellation, timeout),
+  its act process tree is killed and every container, network and volume
+  with its label, its work tree and its cgroup are removed, and their absence
+  is proven. Other runs keep running.
+
+  **Idle retirement.** An engine with no run for `[engine] idle_retire_secs`
+  (default 600 s) is retired: removed with proof, its storage volume and
+  socket directory with it, exactly like a finished per-run engine. A
+  stopping daemon retires an idle engine; one left behind (busy at shutdown,
+  or the daemon died) is retired by the next daemon's startup recovery. An
+  engine whose intent no longer matches what a new run would create (config,
+  host sizing or pins changed) is replaced once idle; until then such a run
+  gets its own per-run engine. A shared engine is itself the warm engine, so
+  no spare is kept while sharing is on.
+
+  What it gives up: a crashed inner `dockerd` or a full engine disk fails
+  every run in it, and there is no per-run disk quota, only the engine's
+  budget. The trust model is unchanged (one privileged engine, trusted
+  workflows only).
+
 - **Provider and engine are separate axes.** The provider is auto-detected:
   `.github/workflows/` means GitHub, and `.gitlab-ci.yml` (planned) means GitLab.
   If a checkout has both, pass `--provider`. The only engine so far is `act`.
@@ -408,6 +447,8 @@ stubbed job.
     cpus = 4
     pids = 4096
     spares = 0   # no prepared spare engine (default 1)
+    shared = false          # one engine per run instead of the shared engine (#547)
+    idle_retire_secs = 600  # how long an idle shared engine is kept (default 600)
     ```
 
     The chosen limits are frozen into the creation profile; creation and every

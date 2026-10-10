@@ -45,6 +45,8 @@ pub struct FakeBackend {
     pub host: Mutex<Option<crate::ci::limits::HostResources>>,
     /// Engine IDs whose container has stopped behind the daemon's back (#556).
     pub stopped: Mutex<std::collections::BTreeSet<String>>,
+    /// Run labels whose scope was closed (#547).
+    pub closed_scopes: Mutex<Vec<String>>,
     next: Mutex<u64>,
 }
 impl FakeBackend {
@@ -343,9 +345,15 @@ impl ActEngineBackend for FakeBackend {
     fn close_scope<'a>(
         &'a self,
         _engine: &'a str,
-        _scope: &'a crate::ci::engine::RunScope,
+        scope: &'a crate::ci::engine::RunScope,
     ) -> crate::ci::engine::BoxFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            self.closed_scopes
+                .lock()
+                .unwrap()
+                .push(scope.label().into());
+            Ok(())
+        })
     }
     fn execute<'a>(
         &'a self,

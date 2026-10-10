@@ -82,6 +82,7 @@ pub mod run_proxy;
 pub mod runtime;
 pub mod scheduler;
 pub mod schema;
+pub mod shared_engine;
 pub mod snapshot;
 pub mod socket_dir;
 pub mod spare;
