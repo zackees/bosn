@@ -313,3 +313,38 @@ objects through the ordinary pass under every gate. It refuses this machine's
 own registry and any cataloged registry whose database still exists. No bulk
 "adopt everything foreign" command, and no re-labelling of foreign objects into
 the current registry.
+
+**Host decision, 2026-10-10 (v0.1.20).** The only pre-catalog registry left on
+the development host is `b3718269-079a-4b01-a761-b3c94b987a8e`, and the only
+object naming it is `bosn-ci-cache-v1`: the machine-scoped, pinned, shared CI
+cache that every run mounts. It is **not released**. Its state directory can't
+be proved gone (none of the 83 registry databases on the host names it, but
+that is absence of evidence), and releasing it could reclaim nothing anyway,
+because the volume is pinned and in use. Release a registry only when its
+state directory is provably gone and its objects are not shared machine
+resources.
+
+**Diagnosing a pass.** A daemon started on demand appends its stderr to
+`<state>/daemon.log` (rotated to `daemon.log.1` past 8 MiB at start). Every
+retention pass ends with a timestamped `bosn retention: pass finished at unix
+…` line. `bosn gc owned --json` waits up to 600 s for its fresh read; the 3 s
+control deadline made it fail on any busy host.
+
+## Shared CI cache budget (#544)
+
+Decided 2026-10-10. While no cohort policy is enrolled (#508), every daemon's
+cache maintenance loop applies a default budget to the legacy `actcache/`
+namespaces of `bosn-ci-cache-v1`, hourly: at most 8 GiB of completed archives
+per repository namespace, expiry after 7 days unused or 30 days old. It uses
+act2's own `cache prune --apply` in the journaled maintenance helper, under the
+machine maintenance lock, and persists each pass as the maintenance snapshot.
+act2's exclusive transfer and metadata locks are the liveness gate: a namespace
+a live server holds is left alone. A namespace without `transfers.bolt` is
+skipped, never deleted. The volume itself is never removed. An enrolled cohort
+policy replaces this budget. Don't raise the budget to avoid a cold cache; see
+`docs/ci.md` "Shared cache budget".
+
+This is **interim** under "CI engine architecture" above. It reuses the
+existing cohort maintenance helper and adds no new engine machinery. When act2
+serve mode owns the cache and in-engine cleanup (#547), this budget moves
+behind that boundary and the Bosn-side pass is deleted.

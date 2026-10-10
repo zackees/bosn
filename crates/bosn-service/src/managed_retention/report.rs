@@ -34,6 +34,18 @@ pub fn maintenance_pass(state_dir: &Path) {
     }
     let outcome = managed_retention_pass(&engine, state_dir, policy, apply);
     report_pass(&outcome);
+    // One timestamped line per pass, so `<state>/daemon.log` shows that passes run (#545).
+    let summary = &outcome.summary;
+    eprintln!(
+        "bosn retention: pass finished at unix {:.0}: applied={} planned={} removed={} \
+         removed_bytes={} failed={}",
+        super::now_seconds(),
+        summary.applied,
+        summary.planned,
+        summary.removed,
+        summary.removed_bytes,
+        summary.failed,
+    );
 }
 
 /// Print what a pass did, or would do.

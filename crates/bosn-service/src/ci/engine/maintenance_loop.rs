@@ -1,5 +1,8 @@
 //! Cancellable scheduling independent of workflow engines.
-use super::{DockerActBackend, HelperCleanupRetry, MaintenanceHelperAttempt};
+use super::{
+    DockerActBackend, HelperCleanupRetry, HelperPass, LegacyBudget, MaintenanceHelperAttempt,
+    machine_policy::Discovery,
+};
 use crate::{RegistryActor, ci::cache_policy::CachePolicy};
 use kernal_api::async_engine::{self, CancellationToken};
 use std::time::Duration;
@@ -14,13 +17,15 @@ pub struct MaintenanceTick {
 
 impl DockerActBackend {
     /// Normal daemon startup discovers immutable participating policy. Absence
-    /// never bootstraps or migrates legacy stores; failures remain unknown.
+    /// never bootstraps or migrates legacy stores; failures remain unknown. While
+    /// no cohort is enrolled, the legacy namespaces get the default budget (#544).
     pub(crate) async fn supervise_existing_cohort(
         &self,
         registry: &RegistryActor,
         owner: &str,
         stop: &CancellationToken,
     ) {
+        let mut next_legacy = std::time::Instant::now();
         loop {
             let discovered = match async_engine::cancellable(
                 stop,
@@ -36,7 +41,7 @@ impl DockerActBackend {
                 Ok(Ok(result)) => result,
             };
             match discovered {
-                Ok(Some(policy)) => {
+                Ok(Discovery::Enrolled(policy)) => {
                     let (reports, mut receiver) = async_engine::channel(1);
                     let worker =
                         self.supervise_cache_maintenance(registry, owner, policy, stop, &reports);
@@ -52,7 +57,16 @@ impl DockerActBackend {
                     async_engine::join(worker, consumer).await;
                     return;
                 }
-                Ok(None) => {}
+                Ok(Discovery::NoVolume) => {}
+                Ok(Discovery::Unenrolled) => {
+                    if std::time::Instant::now() >= next_legacy {
+                        if !self.legacy_tick(registry, owner, stop).await {
+                            return;
+                        }
+                        next_legacy = std::time::Instant::now()
+                            + Duration::from_secs(LegacyBudget::DEFAULT.interval_secs);
+                    }
+                }
                 Err(error) => {
                     let tick = MaintenanceTick {
                         recovery: Ok(HelperCleanupRetry::default()),
@@ -79,6 +93,52 @@ impl DockerActBackend {
             {
                 return;
             }
+        }
+    }
+
+    /// One default-budget pass over the legacy namespaces, persisted like a cohort tick.
+    /// Returns false only when shutdown interrupted it.
+    async fn legacy_tick(
+        &self,
+        registry: &RegistryActor,
+        owner: &str,
+        stop: &CancellationToken,
+    ) -> bool {
+        let pass = HelperPass::Legacy(LegacyBudget::DEFAULT);
+        let attempt = match async_engine::cancellable(
+            stop,
+            async_engine::timeout(
+                Duration::from_secs(600),
+                self.run_maintenance_helper(registry, owner, pass),
+            ),
+        )
+        .await
+        {
+            Err(_) => return false,
+            Ok(Err(_)) => Err(
+                "legacy cache maintenance deadline exceeded; helper journal needs reconciliation"
+                    .into(),
+            ),
+            Ok(Ok(result)) => result,
+        };
+        eprintln!("bosn cache maintenance: {}", legacy_summary(&attempt));
+        let tick = MaintenanceTick {
+            recovery: Ok(HelperCleanupRetry::default()),
+            attempt,
+            persistence: Ok(()),
+        };
+        match async_engine::cancellable(
+            stop,
+            super::maintenance_reporting::persist(registry, &tick),
+        )
+        .await
+        {
+            Err(_) => false,
+            Ok(Err(error)) => {
+                eprintln!("bosn cache maintenance persistence failed: {error}");
+                true
+            }
+            Ok(Ok(())) => true,
         }
     }
 
@@ -158,6 +218,49 @@ impl DockerActBackend {
             {
                 return;
             }
+        }
+    }
+}
+
+/// One line for the daemon log: what a legacy pass reclaimed, kept, or why it failed.
+fn legacy_summary(attempt: &Result<MaintenanceHelperAttempt, String>) -> String {
+    let helper = match attempt {
+        Err(error) => return format!("legacy pass failed: {error}"),
+        Ok(helper) => helper,
+    };
+    let cleanup = match &helper.cleanup {
+        Ok(()) => String::new(),
+        Err(error) => format!("; helper cleanup failed: {error}"),
+    };
+    match &helper.outcome {
+        Err(error) => format!("legacy pass failed: {error}{cleanup}"),
+        Ok(outcome) => {
+            let namespaces = outcome.report.namespaces.as_deref().unwrap_or_default();
+            let reclaimed: u64 = namespaces
+                .iter()
+                .filter_map(|ns| ns.retention.as_ref())
+                .map(|r| r.reclaimed_archive_bytes)
+                .sum();
+            format!(
+                "legacy pass over {} namespace(s): reclaimed {reclaimed} archive bytes, \
+                 {} bytes remain (budget {} per namespace){}{}{cleanup}",
+                namespaces.len(),
+                outcome
+                    .report
+                    .remaining_completed_bytes
+                    .map_or_else(|| "unknown".into(), |b| b.to_string()),
+                outcome.report.budget_bytes,
+                if outcome.report.partial {
+                    ", partial"
+                } else {
+                    ""
+                },
+                if outcome.diagnostic.is_empty() {
+                    String::new()
+                } else {
+                    format!("; {}", outcome.diagnostic.trim())
+                },
+            )
         }
     }
 }

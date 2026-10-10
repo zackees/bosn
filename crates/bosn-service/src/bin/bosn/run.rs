@@ -354,6 +354,26 @@ fn execute(arguments: RunArguments) -> Result<i32, String> {
     }
 }
 
+/// Bytes `<state>/daemon.log` may reach before the next start rotates it to `daemon.log.1`.
+const DAEMON_LOG_ROTATE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The started daemon's stderr: `<state>/daemon.log`, appended (#545). The daemon's maintenance
+/// and retention passes report only there, and a daemon started on demand used to discard it,
+/// so whether a pass had run could not be checked. Rotated once per start past
+/// [`DAEMON_LOG_ROTATE_BYTES`], so at most two files of about that size are kept. A log that
+/// cannot be opened never blocks the start.
+fn daemon_log(state_dir: &Path) -> std::process::Stdio {
+    let path = state_dir.join("daemon.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > DAEMON_LOG_ROTATE_BYTES) {
+        let _ = std::fs::rename(&path, state_dir.join("daemon.log.1"));
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_or_else(|_| std::process::Stdio::null(), std::process::Stdio::from)
+}
+
 /// Start `bosn daemon serve` for this state directory when none answers.
 pub(crate) fn ensure_daemon(
     runtime: &Runtime,
@@ -379,7 +399,7 @@ pub(crate) fn ensure_daemon(
         .arg(state_dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(daemon_log(state_dir));
     detach(&mut command);
     let mut child = command
         .spawn()

@@ -112,8 +112,9 @@ fn counts(
 }
 
 impl RetentionReport {
-    fn validate(&self, policy: CachePolicy) -> Result<(), String> {
-        if self.budget_bytes != policy.repository_max_bytes {
+    /// `namespace_budget` is the per-namespace ceiling the pass was asked to apply.
+    pub(crate) fn validate(&self, namespace_budget: i64) -> Result<(), String> {
+        if self.budget_bytes != namespace_budget {
             return Err("namespace retention ceiling mismatch".into());
         }
         counts(
@@ -184,7 +185,7 @@ impl CohortReport {
                 return Err("cohort namespace identity or page mismatch".into());
             }
             if let Some(retention) = &store.retention {
-                retention.validate(policy)?;
+                retention.validate(policy.repository_max_bytes)?;
             }
             if !report.partial {
                 let retention = store
