@@ -314,7 +314,11 @@ fn every_daemon_command_refuses_a_daemon_from_another_release_with_the_remedy() 
             .enable_all()
             .build()
             .unwrap()
-            .run(bosn_service::Service::new(server_state).serve())
+            .run(
+                bosn_service::Service::new(server_state)
+                    .with_reported_protocol(0)
+                    .serve(),
+            )
     });
     let client = Client::for_state(&state).unwrap();
     let deadline = Instant::now() + READY_DEADLINE;
@@ -339,7 +343,7 @@ fn every_daemon_command_refuses_a_daemon_from_another_release_with_the_remedy() 
     );
     assert!(
         stderr.contains(&format!(
-            "but this client is bosn {}",
+            "but this client is bosn {} speaking protocol",
             env!("CARGO_PKG_VERSION")
         )),
         "{stderr}"
@@ -473,7 +477,7 @@ fn assert_every_family_refuses(state: &Path, workspace: &Path) {
         );
         assert!(
             stderr.contains(&format!(
-                "but this client is bosn {}",
+                "but this client is bosn {} speaking protocol",
                 env!("CARGO_PKG_VERSION")
             )),
             "{family:?}: {stderr}"

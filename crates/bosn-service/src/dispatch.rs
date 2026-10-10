@@ -11,7 +11,7 @@ pub(crate) struct ConnectionContext {
     pub(crate) adopt: Arc<dyn SetupAdoptExecutor>,
     pub(crate) reconcile: Arc<dyn SetupReconcileExecutor>,
     pub(crate) state_dir: PathBuf,
-    pub(crate) release_version: Arc<str>,
+    pub(crate) identity: Arc<DaemonIdentity>,
     pub(crate) ci: ci::CiRuntime,
 }
 
@@ -44,7 +44,7 @@ pub(crate) async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Re
         adopt,
         reconcile,
         state_dir,
-        release_version,
+        identity,
         ci,
     } = context;
     if !peer_is_authorized(&s.peer_identity()?.user_id, &ipc::current_user_id()?) {
@@ -67,8 +67,8 @@ pub(crate) async fn handle(mut s: AsyncStream, context: ConnectionContext) -> Re
         match r.operation {
             1 => ReplyWire {
                 code: 10,
-                daemon_version: release_version.to_string(),
-                daemon_protocol: DAEMON_PROTOCOL,
+                daemon_version: identity.release.clone(),
+                daemon_protocol: identity.protocol,
                 ..Default::default()
             },
             2 => {

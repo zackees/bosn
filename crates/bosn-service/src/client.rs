@@ -18,7 +18,8 @@ impl Client {
     }
     /// Ping the daemon and return the release version it reports. Empty means
     /// a daemon that predates the version handshake (bosn 0.1.5 and older).
-    /// Compare it with [`daemon_version_mismatch`] before submitting work.
+    /// Compatibility is decided by [`daemon_identity`](Self::daemon_identity)
+    /// and [`daemon_version_mismatch`] (#509).
     pub async fn daemon_version(&self) -> Result<String, Error> {
         self.daemon_identity()
             .await
