@@ -1,9 +1,11 @@
 //! The one pre-flight every daemon-backed command runs before it sends work (#324).
 //!
-//! A daemon from another release can misread a request and answer with a reset
-//! connection or a refusal, which the command would report as a bare "request
-//! failed". Ask for the version first -- the one request every release answers --
-//! and refuse with both versions and the remedy instead.
+//! A daemon on another wire protocol can misread a request and answer with a
+//! reset connection or a refusal, which the command would report as a bare
+//! "request failed". Ask for the daemon's identity first -- the one request
+//! every release answers -- and refuse with both protocols and the remedy
+//! instead. Compatibility is by protocol window (#509); comparing releases is
+//! the legacy path for a protocol-0 daemon only.
 
 use super::*;
 
@@ -26,7 +28,7 @@ pub(crate) fn daemon_mismatch(
 }
 
 /// Exit with the mismatch, as JSON on stdout or text on stderr, before
-/// `command` sends anything to a daemon from another release.
+/// `command` sends anything to a daemon it cannot talk to.
 /// `command` is the CLI spelling (`setup ensure`); its JSON `action` is the
 /// snake-case form every command's JSON already uses (`setup_ensure`).
 pub(crate) fn require_matching_daemon(

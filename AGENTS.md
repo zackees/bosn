@@ -184,11 +184,13 @@ Decided 2026-10-09.
   sends work (#324), and `bosn mcp` runs it once at startup against a live
   daemon: an incompatible daemon is refused with both releases, both
   protocols and the remedy, never a bare "request failed".
-- **Clients accept by protocol (#509 phase 2).** A daemon reporting this
-  client's `DAEMON_PROTOCOL` is accepted whatever its release (a one-line
-  release-skew note goes to stderr); another protocol is refused. A daemon
-  reporting protocol 0 predates the handshake and keeps the exact-release
-  check. `daemon_version_mismatch` is the one place this is decided.
+- **Clients accept by protocol (#509 phases 2 and 5).** A daemon whose
+  protocol window holds this client's `DAEMON_PROTOCOL` is accepted whatever
+  its release (a one-line release-skew note goes to stderr); otherwise it is
+  refused. The release guard is retired to the legacy path: only a daemon
+  reporting protocol 0 (it predates the handshake) is still compared by exact
+  release (`legacy_release_matches`). `daemon_version_mismatch` is the one
+  place this is decided.
 - **The daemon serves a protocol window (#509 phase 3).** It advertises
   `[DAEMON_PROTOCOL_MIN, DAEMON_PROTOCOL]` on ping, and every request carries
   the client's protocol. A bump of `DAEMON_PROTOCOL` keeps the previous
