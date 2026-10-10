@@ -206,6 +206,50 @@ fn response_envelope_rejects_wrong_correlation_protocol_kind_and_encoding() {
 }
 
 #[test]
+fn an_idle_daemon_stops_for_a_handoff() {
+    let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+    let state = temporary.path().join("state");
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.run(async {
+        let server = async_engine::launch(Service::new(state.clone()).serve());
+        let client = wait_for_client(&state).await;
+        // No jobs, CI runs or leases: the daemon itself agrees to stop (#509 phase 4).
+        assert_eq!(client.stop_if_idle().await.unwrap(), IdleHandoff::Stopping);
+        stopped(server).await;
+    });
+}
+
+#[test]
+fn a_busy_daemon_is_never_stopped_for_a_handoff() {
+    let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+    let state = temporary.path().join("state");
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.run(async {
+        let server = async_engine::launch(Service::new(state.clone()).serve());
+        let client = wait_for_client(&state).await;
+        let job = client
+            .submit_job("workspace", "stack", "sha256:abc")
+            .await
+            .unwrap();
+        let IdleHandoff::Busy(reason) = client.stop_if_idle().await.unwrap() else {
+            panic!("a daemon with a running job agreed to stop");
+        };
+        assert!(reason.contains("1 unfinished job(s)"), "{reason}");
+        assert_eq!(client.job_status(job).await.unwrap().state, "Running");
+        client.shutdown().await.unwrap();
+        stopped(server).await;
+    });
+}
+
+#[test]
 fn peer_authorization_fails_closed_for_empty_or_other_user() {
     assert!(peer_is_authorized("current-user", "current-user"));
     assert!(!peer_is_authorized("", "current-user"));
@@ -847,10 +891,12 @@ const PROTOCOL_SURFACE: [&str; 6] = [
 ];
 // #509 phase 3 added the protocol-window fields (request tag 29, reply tags
 // 68-69, refusal code 5) without a bump: each is additive, so a protocol-1 peer
-// on either side still reads every message it did before.
+// on either side still reads every message it did before. Phase 4 added
+// operation 39 and reply code 32 the same way: an older daemon answers the
+// unknown operation, which the client reads as "no handoff".
 const PROTOCOL_FINGERPRINT: (u32, &str) = (
     DAEMON_PROTOCOL,
-    "4e4b92b83c36cb0756c00b5c4e0cc178e28af94b44ddc726263683e5b20c67c3",
+    "4a9173aa426cda39eb9788dd4a227e5637989e3ef622c8f3be3e9463e6eb76c5",
 );
 
 #[test]

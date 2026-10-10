@@ -51,8 +51,12 @@ impl Service {
     /// The wire protocol this daemon reports on ping, overriding
     /// [`DAEMON_PROTOCOL`]. A test seam: zero emulates a daemon that predates
     /// the protocol handshake (#509).
-    pub fn with_reported_protocol(self, protocol: u32) -> Self {
-        self.with_protocol_window(protocol, protocol)
+    pub fn with_reported_protocol(mut self, protocol: u32) -> Self {
+        // Like a daemon from before the window: it reports no minimum.
+        let identity = Arc::make_mut(&mut self.identity);
+        identity.protocol = protocol;
+        identity.protocol_min = 0;
+        self
     }
     /// The protocol window this daemon serves and reports, overriding
     /// `[DAEMON_PROTOCOL_MIN, DAEMON_PROTOCOL]`. A test seam (#509 phase 3).

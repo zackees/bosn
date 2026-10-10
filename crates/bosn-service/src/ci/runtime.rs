@@ -248,6 +248,11 @@ impl CiRuntime {
         }
     }
 
+    /// Queued plus running CI runs (#509 idle handoff).
+    pub(crate) fn active_runs(&self) -> usize {
+        let state = self.lock();
+        state.scheduler.running() + state.scheduler.queued()
+    }
     fn lock(&self) -> MutexGuard<'_, CiState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }

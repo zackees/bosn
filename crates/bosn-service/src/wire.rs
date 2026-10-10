@@ -351,6 +351,8 @@ pub(crate) enum Reply {
     Pong(DaemonIdentity),
     Status(Status),
     Shutdown,
+    /// Code 32: an idle handoff the daemon refused because it is busy (#509).
+    Busy(String),
     Job(u64),
     JobStatus(JobStatus),
     Cancelled,
@@ -400,6 +402,7 @@ pub(crate) fn decode_reply(v: ReplyWire) -> Result<Reply, Error> {
             reconciliation_required: v.reconciliation_required,
         })),
         30 => Ok(Reply::Shutdown),
+        crate::handoff::CODE_BUSY => Ok(Reply::Busy(v.job_error)),
         40 => Ok(Reply::Job(v.job_id)),
         50 => Ok(Reply::JobStatus(JobStatus {
             id: v.job_id,

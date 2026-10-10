@@ -951,7 +951,7 @@ impl Client {
         self.call_within(request, IO_DEADLINE).await
     }
     /// One request whose reply may take up to `reply_deadline` to arrive.
-    async fn call_within(
+    pub(crate) async fn call_within(
         &self,
         request: Request,
         reply_deadline: Duration,

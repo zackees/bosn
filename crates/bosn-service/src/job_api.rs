@@ -98,6 +98,8 @@ pub(crate) enum JobCommand {
     List {
         reply: async_engine::OneshotSender<String>,
     },
+    /// How many jobs are queued or running (#509 idle handoff).
+    Unfinished(async_engine::OneshotSender<usize>),
     Stop(async_engine::OneshotSender<()>),
 }
 
@@ -333,6 +335,14 @@ impl JobActor {
         if self.sender.send(JobCommand::Stop(reply)).await.is_ok() {
             let _ = wait.await;
         }
+    }
+    pub(crate) async fn unfinished(&self) -> Result<usize, Error> {
+        let (reply, wait) = async_engine::oneshot_channel();
+        self.sender
+            .send(JobCommand::Unfinished(reply))
+            .await
+            .map_err(|_| Error::ActorClosed)?;
+        wait.await.map_err(|_| Error::ActorClosed)
     }
     pub(crate) async fn list(&self) -> Result<String, Error> {
         let (reply, wait) = async_engine::oneshot_channel();
