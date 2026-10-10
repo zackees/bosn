@@ -82,11 +82,15 @@ jobs:
       tier: ${{ steps.select.outputs.tier }}
       test: ${{ steps.select.outputs.test }}
       full: ${{ steps.select.outputs.full }}
+      widget: ${{ steps.select.outputs.widget }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.commit_sha || github.event.pull_request.head.sha || github.sha }}
+          # History for the widget path diff against the PR base / push before.
+          fetch-depth: 0
+          persist-credentials: false
       - name: Select CI tier
         id: select
         env:
@@ -483,10 +487,11 @@ jobs:
         run: python ci/verify_installed_wheel.py --installer pip "dist/bosn-*.whl"
 
   # The desktop widget links WebKitGTK, which the core workspace never does
-  # (ci/lint_no_webview_in_core.py); Linux-native widget changes select ci-widget.
+  # (ci/lint_no_webview_in_core.py). A change under crates/bosn-widget/ selects
+  # it by path (select-tier's `widget`); `ci-widget` forces it. Required check.
   widget:
     name: Desktop widget (Linux, WebKitGTK)
-    if: ${{ !cancelled() && (needs.select-tier.outputs.full == 'true' || contains(github.event.pull_request.labels.*.name, 'ci-widget')) }}
+    if: ${{ !cancelled() && (needs.select-tier.outputs.widget == 'true' || contains(github.event.pull_request.labels.*.name, 'ci-widget')) }}
     needs: [select-tier]
     runs-on: ubuntu-latest
     steps:
