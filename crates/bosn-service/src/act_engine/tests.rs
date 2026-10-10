@@ -477,8 +477,9 @@ fn snapshot_storage_exec_is_required_but_other_tmpfs_cannot_gain_exec() {
     }
 }
 
-// One test per fixture mode (#600): nextest runs them in parallel, so the
-// 31 s slow-remove case no longer serialises the other five.
+// One test per fixture mode (#600): nextest runs them in parallel. The
+// slow-remove case outlasts the test-scale CONTROL budget (#503), so it
+// proves removal runs under DELETE in seconds rather than 31 s.
 #[cfg(target_os = "linux")]
 #[test]
 fn actor_commits_before_create_and_start_and_refuses_uncertain_removal_success() {
@@ -528,6 +529,7 @@ fn actor_commits_before_create_and_start_and_refuses_uncertain_removal(mode: &st
     const SCRIPT: &str = r#"
 import json, pathlib, sqlite3, sys, time
 db, observation, mode, log = sys.argv[1:5]
+mode, _, delay = mode.partition(':')
 args = sys.argv[5:]
 with pathlib.Path(log).open('a') as out: out.write(json.dumps(args)+'\n')
 record=json.loads(sqlite3.connect('file:'+db+'?mode=ro',uri=True).execute("SELECT detail FROM events WHERE kind LIKE 'act.engine.v1:%' ORDER BY id DESC LIMIT 1").fetchone()[0])
@@ -547,7 +549,7 @@ elif args[:2]==['container','start']:
 elif args[:2]==['container','rm']:
  assert record['state']=='cleanup_required' and record['engine_id']=='1'*64
  assert args[-1]=='1'*64
- if mode=='slow-remove': time.sleep(31)
+ if mode=='slow-remove': time.sleep(float(delay))
  print('1'*64)
 elif args[:2]==['container','ls']:
  if mode=='probe-failed': sys.exit(8)
@@ -561,6 +563,10 @@ else: sys.exit(9)
         let observation = dir.path().join("inspect.json");
         let log = dir.path().join("commands.jsonl");
         std::fs::write(&fixture, SCRIPT).unwrap();
+        // Longer than one control call, well inside the delete budget.
+        let delay = super::budgets::CONTROL + std::time::Duration::from_secs(2);
+        assert!(delay < super::budgets::DELETE);
+        let fixture_mode = format!("{mode}:{}", delay.as_secs_f64());
         std::fs::write(&observation, serde_json::to_vec(&document()).unwrap()).unwrap();
         let engine = DockerEngine::synthetic_for_test(
             "python3",
@@ -568,7 +574,7 @@ else: sys.exit(9)
                 fixture.to_string_lossy().into_owned(),
                 db.to_string_lossy().into_owned(),
                 observation.to_string_lossy().into_owned(),
-                mode.into(),
+                fixture_mode,
                 log.to_string_lossy().into_owned(),
             ],
         );

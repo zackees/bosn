@@ -216,6 +216,7 @@ mod transport_tests {
     use kernal_api::{async_engine::RuntimeBuilder, platform::fs::TemporaryDirectory};
     const SCRIPT: &str = r#"import pathlib, sys, time
 artifact, state, log, name, mode = sys.argv[1:6]
+mode, _, delay = mode.partition(':')
 state, log = pathlib.Path(state), pathlib.Path(log)
 args = sys.argv[6:]
 if args[:2] == ['volume', 'ls']:
@@ -225,7 +226,7 @@ elif args[:2] == ['volume', 'inspect']:
     print(pathlib.Path(artifact).read_text())
 elif args[:2] == ['volume', 'rm']:
     log.write_text(args[2])
-    if mode == 'slow-remove': time.sleep(11)
+    if mode == 'slow-remove': time.sleep(float(delay))
     if mode == 'attached': sys.exit(1)
     if mode != 'persists': state.rename(state.with_name('removed'))
     if mode == 'lost_ack': sys.exit(1)
@@ -250,6 +251,10 @@ else: sys.exit(2)
             let log = dir.path().join("removed-name");
             let script = dir.path().join("docker.py");
             std::fs::write(&script, SCRIPT).unwrap();
+            // Outlasts one storage control call, well inside the delete budget.
+            let delay = super::super::budgets::STORAGE_CONTROL + std::time::Duration::from_secs(2);
+            assert!(delay < super::super::budgets::DELETE);
+            let fixture_mode = format!("{mode}:{}", delay.as_secs_f64());
             std::fs::write(&state, "present").unwrap();
             let document = serde_json::json!([{"Name":name,"Driver":"local","Scope":"local","Options":null,"Labels":labels(&intent,OWNER).unwrap()}]);
             std::fs::write(&artifact, serde_json::to_vec(&document).unwrap()).unwrap();
@@ -261,7 +266,7 @@ else: sys.exit(2)
                     state.to_string_lossy().into_owned(),
                     log.to_string_lossy().into_owned(),
                     name.clone(),
-                    mode.into(),
+                    fixture_mode.clone(),
                 ],
             );
             RuntimeBuilder::multi_thread()
