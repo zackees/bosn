@@ -5,11 +5,9 @@
 //! to it and held.
 //!
 //! Run with:
-//! `soldr cargo test -j1 -p bosn-service --test managed_retention_docker --locked -- --ignored --exact live_docker_managed_retention_reclaims_a_real_setup_app`
+//! `soldr cargo test -j1 -p bosn-service --test integration --locked -- --ignored --exact managed_retention_docker::live_docker_managed_retention_reclaims_a_real_setup_app`
 
-mod support;
-
-use support::setup_docker::*;
+use crate::support::setup_docker::*;
 
 #[test]
 #[ignore = "requires a local Docker daemon and the pinned Alpine image"]

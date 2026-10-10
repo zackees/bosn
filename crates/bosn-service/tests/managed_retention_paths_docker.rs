@@ -4,12 +4,10 @@
 //! Run them against a throwaway engine with a throwaway machine state root, for example a
 //! privileged `docker:29.7.2` daemon whose socket is `$DOCKER_HOST`, and with
 //! `XDG_STATE_HOME` pointing at an empty temporary directory:
-//! `soldr cargo test -j1 -p bosn-service --test managed_retention_paths_docker --locked -- --ignored --test-threads 1`
+//! `soldr cargo test -j1 -p bosn-service --test integration --locked -- managed_retention_paths_docker:: --ignored --test-threads 1`
 
-mod support;
-
-use support::retention_docker::*;
-use support::setup_docker::*;
+use crate::support::retention_docker::*;
+use crate::support::setup_docker::*;
 
 /// A `bosn.toml` stack with no command (so it runs the idle keepalive), a reclaimable
 /// stack-scoped volume and a pinned one, and one task that uses both.

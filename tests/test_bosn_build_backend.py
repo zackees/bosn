@@ -201,6 +201,8 @@ def test_native_cli_explicit_soldr_preserves_flags(backend, monkeypatch):
         "bosn-python",
         "--bin",
         "bosn-native",
+        "--features",
+        "wheel",
         "--message-format=json-render-diagnostics",
         "--target",
         target.triple,

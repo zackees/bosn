@@ -7,7 +7,7 @@
 //! workflow that cleans its tree still builds the uncommitted work (#394).
 //! A `--trigger pr` run carries the base branch as `origin/main`, with
 //! enough history for `git merge-base origin/main HEAD` (#403).
-//! Run with `cargo test -p bosn-service --test ci_checkout_live -- --ignored`.
+//! Run with `cargo test -p bosn-service --test integration -- ci_checkout_live:: --ignored`.
 
 use std::{path::Path, process::Command};
 

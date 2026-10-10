@@ -4,7 +4,7 @@
 //! receiving an unbounded response.
 //!
 //! Run with:
-//! `cargo test -p bosn-service --test ci_agent_live -- --ignored`
+//! `cargo test -p bosn-service --test integration -- ci_agent_live:: --ignored`
 //! It needs Docker; the first run pulls the pinned engine and runner images.
 
 use std::{

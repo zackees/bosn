@@ -6,9 +6,7 @@
 //! bind that workspace and the volumes they mounted. They need a local Docker
 //! daemon and the pre-pulled `PINNED_ALPINE` image.
 
-mod support;
-
-use support::setup_docker::*;
+use crate::support::setup_docker::*;
 
 /// A temporary workspace, its private daemon, and teardown of every
 /// container (and its volumes) that binds the workspace.
@@ -206,7 +204,7 @@ fn stack_manifest(marker: &str, tasks: &[(&str, &str)]) -> String {
 }
 
 /// Run with:
-/// `soldr cargo test -j1 -p bosn-service --test stack_task_docker --locked -- --ignored --exact live_docker_stack_task_runs_with_the_conventional_umask`
+/// `soldr cargo test -j1 -p bosn-service --test integration --locked -- --ignored --exact stack_task_docker::live_docker_stack_task_runs_with_the_conventional_umask`
 ///
 /// `docker exec` starts its process with umask 0000, so without an explicit
 /// umask every file a task created was group- and world-writable (#365).
@@ -242,7 +240,7 @@ const HEARTBEAT_PROBE: &str = "a=$(cat /state/beat); sleep 1.5; b=$(cat /state/b
      if [ \"$a\" = \"$b\" ]; then echo heartbeat=still; else echo heartbeat=alive; fi";
 
 /// Run with:
-/// `soldr cargo test -j1 -p bosn-service --test stack_task_docker --locked -- --ignored --exact live_docker_a_retired_generation_stops_before_the_next_one_runs`
+/// `soldr cargo test -j1 -p bosn-service --test integration --locked -- --ignored --exact stack_task_docker::live_docker_a_retired_generation_stops_before_the_next_one_runs`
 ///
 /// A stack's generation rolls over when its `bosn.toml` changes. The retired
 /// container used to keep running, with any daemon a task started in it, in
@@ -291,7 +289,7 @@ fn live_docker_a_retired_generation_stops_before_the_next_one_runs() {
 }
 
 /// Run with:
-/// `soldr cargo test -j1 -p bosn-service --test stack_task_docker --locked -- --ignored --exact live_docker_a_retired_generation_keeps_running_until_its_last_task_ends`
+/// `soldr cargo test -j1 -p bosn-service --test integration --locked -- --ignored --exact stack_task_docker::live_docker_a_retired_generation_keeps_running_until_its_last_task_ends`
 ///
 /// A task still running in a retired generation holds an execution session,
 /// which protects its container (#383): the next generation's task does not

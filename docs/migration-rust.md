@@ -155,7 +155,7 @@ uv run pyright
 PYTHON_BIN="$PWD/.venv/bin/python"
 PYTHON_LIB="$("$PYTHON_BIN" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
 PYO3_PYTHON="$PYTHON_BIN" LD_LIBRARY_PATH="$PYTHON_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-  soldr cargo test -j1 -p bosn-python --lib --locked --no-default-features --features embedded-python-tests
+  soldr cargo test -j1 -p bosn-python --lib --locked --features embedded-python-tests
 ```
 
 The wheel proof builds a platform wheel, then installs it into a clean virtual
@@ -179,15 +179,16 @@ separate Linux lane remains the Docker integration test.
 
 The Linux Rust CI lane also validates the reviewed `kernal-api` revision and
 the locked Cargo resolution before running every ordinary Rust test. The PyO3
-crate is tested with its explicit embedded-Python test feature, since the wheel
-feature correctly leaves CPython symbols for the installed interpreter:
+crate is tested in the same build with its explicit embedded-Python test
+feature. Only the wheel build selects `extension-module`, which leaves CPython
+symbols for the installed interpreter:
 
 ```bash
 python ci/verify_kernel_boundary.py
 cargo metadata --locked --format-version 1 --no-deps
-cargo test --workspace --exclude bosn-python --locked
 PYO3_PYTHON="$(command -v python)" \
-  cargo test -p bosn-python --lib --locked --no-default-features --features embedded-python-tests
+  cargo nextest run --workspace --locked --features bosn-python/embedded-python-tests
+cargo test --workspace --exclude bosn-python --doc --locked
 ```
 
 Ignored Docker and Hermes acceptance tests remain opt-in; the Rust CI lane does

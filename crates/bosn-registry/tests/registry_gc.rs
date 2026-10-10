@@ -1,7 +1,6 @@
 //! Setup and manifest GC previews, repairs, rollovers and `setup done`.
 
-mod common;
-use common::*;
+use crate::common::*;
 
 #[test]
 #[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]

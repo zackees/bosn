@@ -5,6 +5,9 @@ edition = "2024"
 rust-version = "1.95"
 # Internal: amalgamated into the crates.io `bosn` crate at release.
 publish = false
+# One integration-test binary (tests/integration.rs) instead of one per file:
+# each would relink the whole crate graph after every edit (bosn#503).
+autotests = false
 
 [features]
 # Test harness only; excludes the cross-language lock helper from normal builds.
@@ -32,3 +35,7 @@ kernal-api = { version = "=0.1.28", default-features = false, features = ["sqlit
 
 [lints]
 workspace = true
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"

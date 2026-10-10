@@ -17,17 +17,24 @@ crate-type = ["cdylib"]
 [[bin]]
 name = "bosn-native"
 path = "../bosn-service/src/bin/bosn.rs"
+# The same source's unit tests run as bosn-service's `bosn` bin; testing it a
+# second time here would only relink the CLI in the workspace test build.
+test = false
 
 [features]
 # One stable CPython ABI floor across Linux, Windows, and both Darwin wheels.
 # Do not remove this to make a host-specific cp311 wheel: #252's Linux-hosted
 # cross release contract is explicitly abi3-py310.
-default = ["extension-module", "pyo3/abi3-py310"]
-# Maturin builds the production wheel as an extension module, which correctly
-# leaves CPython symbols for the host interpreter to provide.
+default = ["pyo3/abi3-py310"]
+# The wheel build selects `wheel` ([tool.maturin] features and the backend's CLI
+# build). It is not a default, so the workspace test build links CPython and
+# system OpenSSL and tests this crate in the same nextest run as the rest
+# (bosn#503); vendored OpenSSL would serialise a ~40 s C build ahead of it.
+wheel = ["extension-module", "dep:openssl-sys"]
+# An extension module leaves CPython symbols for the host interpreter.
 extension-module = ["pyo3/extension-module"]
 # Test-only: link CPython and initialize it for the fake-daemon boundary test.
-# Run with `--no-default-features --features embedded-python-tests`.
+# Run with `--features bosn-python/embedded-python-tests` (see ci.yml).
 embedded-python-tests = ["pyo3/auto-initialize"]
 
 [dependencies]
@@ -47,8 +54,9 @@ serde_json = "=1.0.149"
 # libcrypto (no auditwheel `bosn.libs/` copy, no `.data/scripts/` sidecars, no
 # `$ORIGIN` rpath). Not a direct API dependency: it only selects the feature.
 # macOS (Security.framework) and Windows (SChannel) never build OpenSSL.
+# Only the `wheel` feature selects it.
 [target.'cfg(target_os = "linux")'.dependencies]
-openssl-sys = { version = "=0.9.117", features = ["vendored"] }
+openssl-sys = { version = "=0.9.117", features = ["vendored"], optional = true }
 
 [build-dependencies]
 # Only for the embedded-python-tests rpath (see build.rs); same pin as pyo3's own.

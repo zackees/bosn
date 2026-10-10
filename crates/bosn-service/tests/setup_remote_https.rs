@@ -3,17 +3,15 @@
 //! This exercises the normal kernel-backed HTTPS transport through the native
 //! Bosn CLI. No test transport, raw HTTP client, or Docker control is used.
 
-mod support;
-
 use std::{
     ffi::OsStr,
     path::Path,
     process::{Command, Output},
 };
 
+use crate::support::tls_setup_server::{TlsSetupServer, certificate_path};
 use kernal_api::hash::sha256_bytes;
 use serde_json::Value;
-use support::tls_setup_server::{TlsSetupServer, certificate_path};
 
 const TEST_SECRET: &str = "bosn-remote-test-secret-must-not-persist";
 const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -89,7 +87,7 @@ fn state_text(path: &Path) -> String {
 }
 
 /// Run with:
-/// `soldr cargo test -j1 -p bosn-service --test setup_remote_https --locked`
+/// `soldr cargo test -j1 -p bosn-service --test integration --locked -- setup_remote_https::`
 ///
 /// The public fixture identity is local test data, trusted only by the native
 /// CLI children. The server never reaches Docker; `setup plan` is the highest

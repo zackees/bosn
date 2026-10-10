@@ -12,7 +12,7 @@
 //!   and stopping the daemon leaves nothing it owned on the host.
 //!
 //! Run with:
-//! `cargo test -p bosn-service --test ci_live -- --ignored --test-threads 1`
+//! `cargo test -p bosn-service --test integration -- ci_live:: --ignored --test-threads 1`
 //! It needs Docker and network access (runner image, `actions/cache`).
 //! The leak check compares what bosn owns on the host engine (its ownership
 //! label and engine names), so other tools using Docker concurrently do not
