@@ -157,7 +157,27 @@ impl Service {
                 .await
                 .map_err(|_| Error::ActorClosed)??,
             Ok(None) => return Err(Error::Protocol("registry identity unavailable")),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 'mint: {
+                // #545: the machine catalog remembers which registry this state directory held.
+                // Restoring that id keeps everything it created owned; nothing else is restored.
+                let state_dir = self.state_dir.clone();
+                if let Some(id) = async_engine::launch_blocking(move || {
+                    managed_retention::catalog::cataloged_identity(&state_dir)
+                })
+                .await
+                .map_err(|_| Error::ActorClosed)?
+                {
+                    eprintln!(
+                        "bosn: {} is missing; restoring registry identity {id} from the machine \
+                         catalog (its ownership records are lost, its labelled objects stay owned)",
+                        db.display()
+                    );
+                    break 'mint async_engine::launch_blocking(move || {
+                        Registry::create_writer(&db, &id)
+                    })
+                    .await
+                    .map_err(|_| Error::ActorClosed)??;
+                }
                 // A missing database is either a genuine first run or the loss
                 // of the record of what this machine owns. Only the engine can
                 // tell those apart, so ask it before minting an identity that
