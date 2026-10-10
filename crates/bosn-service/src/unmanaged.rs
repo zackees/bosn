@@ -58,18 +58,30 @@ impl UnmanagedCensus {
     }
 }
 
-/// Run the bounded read-only census against one engine.
-///
-/// `our_registry` is this registry's UUID, used to separate *our* artifacts from everything
-/// else. When it is unknown every complete label set resolves to `ForeignRegistry`, which
-/// protects rather than exposes.
+/// Run the bounded read-only census against one engine, each read bounded by
+/// [`CENSUS_READ_DEADLINE`].
 #[must_use]
 pub fn unmanaged_census(
     engine: &DockerEngine,
     our_registry: Option<&str>,
     config: CensusConfig,
 ) -> UnmanagedCensus {
-    let options = RunOptions::bounded(CENSUS_READ_DEADLINE, CENSUS_READ_OUTPUT_LIMIT);
+    unmanaged_census_within(engine, our_registry, config, CENSUS_READ_DEADLINE)
+}
+
+/// Run the bounded read-only census against one engine, each read bounded by `deadline`.
+///
+/// `our_registry` is this registry's UUID, used to separate *our* artifacts from everything
+/// else. When it is unknown every complete label set resolves to `ForeignRegistry`, which
+/// protects rather than exposes.
+#[must_use]
+pub fn unmanaged_census_within(
+    engine: &DockerEngine,
+    our_registry: Option<&str>,
+    config: CensusConfig,
+    deadline: Duration,
+) -> UnmanagedCensus {
+    let options = RunOptions::bounded(deadline, CENSUS_READ_OUTPUT_LIMIT);
     let mut unreadable = Vec::new();
     let report = match engine.system_df_verbose(options) {
         Ok(CensusRead::Document(text)) => match serde_json::from_str::<SystemDfReport>(&text) {

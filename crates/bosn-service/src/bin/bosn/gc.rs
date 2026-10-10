@@ -53,11 +53,15 @@ pub(crate) fn run_gc_unmanaged(mut arguments: impl Iterator<Item = std::ffi::OsS
     let mut apply = false;
     let mut yes = false;
     let mut json_output = false;
+    let mut deadline = None;
     while let Some(argument) = arguments.next() {
         match argument.to_string_lossy().as_ref() {
             "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
             "--ttl-seconds" => {
                 set_once_parsed(&mut ttl_seconds, arguments.next(), parse_ttl_seconds)
+            }
+            "--census-deadline-ms" => {
+                set_once_parsed(&mut deadline, arguments.next(), parse_census_deadline)
             }
             "--include" => match arguments.next().and_then(|value| {
                 value
@@ -143,14 +147,11 @@ pub(crate) fn run_gc_unmanaged(mut arguments: impl Iterator<Item = std::ffi::OsS
         return;
     }
     let config = census_config(ttl_seconds);
-    let (scan, our_registry) = scan_host(&state_dir, config);
+    let deadline = census_deadline(deadline);
+    let (scan, our_registry) = scan_host(&state_dir, config, deadline);
     if !scan.is_trustworthy() {
-        // A plan is never built from a partial census.
-        for detail in &scan.unreadable {
-            eprintln!("gc --unmanaged: partial: {detail}");
-        }
-        eprintln!("gc --unmanaged: the census was incomplete, so nothing is proposed");
-        std::process::exit(1);
+        // A plan is never built from a partial census, but the caller is still told why.
+        incomplete_census(&scan, deadline, json_output);
     }
     let plan = bosn_core::plan(&scan.artifacts, our_registry.as_deref(), config, &include);
     if json_output {
@@ -235,6 +236,44 @@ pub(crate) fn run_gc_unmanaged(mut arguments: impl Iterator<Item = std::ffi::OsS
             plan.review.len()
         );
     }
+}
+
+/// Report an incomplete census and exit non-zero (#316).
+///
+/// `--json` still writes one document to stdout, with the same `partial` and `unreadable`
+/// fields `bosn scan --json` uses, so "could not look" never reads as "nothing to reclaim".
+fn incomplete_census(
+    scan: &bosn_service::unmanaged::UnmanagedCensus,
+    deadline: std::time::Duration,
+    json_output: bool,
+) -> ! {
+    let deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
+    if json_output {
+        println!(
+            "{}",
+            json!({
+                "action": "gc_unmanaged_preview",
+                "preview_only": true,
+                "apply_available": false,
+                "partial": true,
+                "unreadable": scan.unreadable,
+                "census_deadline_ms": deadline_ms,
+                "bytes": 0,
+                "candidates": [],
+                "review": [],
+                "report_only": [],
+            })
+        );
+    }
+    for detail in &scan.unreadable {
+        eprintln!("gc --unmanaged: partial: {detail}");
+    }
+    eprintln!(
+        "gc --unmanaged: the census itself was incomplete (each read is bounded by {deadline_ms} ms; \
+         raise it with --census-deadline-ms), so nothing is proposed. This does not mean nothing \
+         is reclaimable."
+    );
+    std::process::exit(1);
 }
 
 pub(crate) fn run_gc_apply(mut arguments: impl Iterator<Item = std::ffi::OsString>) {
