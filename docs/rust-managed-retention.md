@@ -147,6 +147,13 @@ existed) stays `foreign-registry` too; a label alone does not prove its registry
 directory on a filesystem that is not mounted looks deleted; the ordinary age gates are the
 margin for that case.
 
+For those pre-catalog registries the operator decides once per registry (AGENTS.md, "Automatic
+retention"). `bosn gc release-registry` lists every registry id Docker objects carry, with object
+counts. `bosn gc release-registry <UUID> --yes` writes a catalog entry for it whose state
+directory is a path Bosn never creates, so the machine daemon treats it as abandoned and its next
+pass reclaims the objects under every ordinary gate. It refuses this machine's own registry and a
+cataloged registry whose database still exists, and removes nothing itself.
+
 ## Idle keepalive containers are stopped (#545, #536)
 
 A setup or manifest app with no declared command runs the fixed keepalive

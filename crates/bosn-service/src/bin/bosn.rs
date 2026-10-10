@@ -46,6 +46,8 @@ mod daemon_exe;
 mod gc;
 #[path = "bosn/gc_owned.rs"]
 mod gc_owned;
+#[path = "bosn/gc_release.rs"]
+mod gc_release;
 #[path = "bosn/health.rs"]
 mod health;
 #[path = "bosn/job.rs"]
@@ -275,6 +277,7 @@ fn usage() -> ! {
     eprintln!(
         "   or: bosn gc owned --state-dir STATE_DIR --container-ttl-secs N --volume-ttl-secs N --image-ttl-secs N [--max-bytes N] [--apply --yes] [--json]"
     );
+    eprintln!("   or: bosn gc release-registry [UUID --yes]");
     eprintln!(
         "   or: bosn gc preview --state-dir STATE_DIR --workspace WORKSPACE [--after CURSOR] [--limit 1..=64] [--json]"
     );

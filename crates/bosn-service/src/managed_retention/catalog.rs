@@ -116,6 +116,77 @@ fn cataloged_identity_at(root: &Path, state_dir: &Path) -> Option<String> {
     found
 }
 
+/// Where a released registry's tombstone entry points: a path this code never creates.
+const RELEASED: &str = ".released";
+
+/// What [`release_registry`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Release {
+    /// The registry is now cataloged as abandoned; the machine daemon reclaims for it.
+    Released,
+    /// It was already cataloged with a missing database.
+    AlreadyAbandoned,
+}
+
+/// Operator decision for an object's registry that predates the catalog (#545, see AGENTS.md
+/// "Automatic retention"): record that registry as abandoned, so the machine daemon reclaims its
+/// objects under every ordinary ownership, age, liveness and pin gate.
+///
+/// Refused for this machine's own registry and for any cataloged registry whose database still
+/// exists (a live peer). Nothing is removed here.
+pub fn release_registry(registry_id: &str) -> Result<Release, String> {
+    let root = crate::mcp::native_state_dir().join(DIRECTORY);
+    let ours = bosn_registry::Registry::open_read_only(
+        crate::mcp::native_state_dir().join("registry.sqlite3"),
+    )
+    .ok()
+    .and_then(|registry| registry.registry_id().ok());
+    release_at(&root, ours.as_deref(), registry_id)
+}
+
+/// Every registry id Docker objects carry, with object counts, and any read that failed.
+pub fn labelled_registries() -> (std::collections::BTreeMap<String, usize>, Vec<String>) {
+    use crate::service::registry_identity::RegistryIdentityProbe as _;
+    let prior = crate::service::registry_identity::DockerIdentityProbe.probe();
+    let mut counts = std::collections::BTreeMap::new();
+    for object in prior.objects {
+        *counts.entry(object.registry_id).or_default() += 1;
+    }
+    (counts, prior.unreadable)
+}
+
+fn release_at(root: &Path, ours: Option<&str>, registry_id: &str) -> Result<Release, String> {
+    if !valid_registry_id(registry_id) {
+        return Err(format!("{registry_id:?} is not a registry id (a UUID)"));
+    }
+    if ours == Some(registry_id) {
+        return Err("that is this machine's own registry".into());
+    }
+    if let Some(entry) = read_entry(&root.join(format!("{registry_id}.json"))) {
+        return match entry.state_dir.join("registry.sqlite3").try_exists() {
+            Ok(false) => Ok(Release::AlreadyAbandoned),
+            _ => Err(format!(
+                "registry {registry_id} is live: its database at {} still exists",
+                entry.state_dir.display()
+            )),
+        };
+    }
+    std::fs::create_dir_all(root).map_err(|error| error.to_string())?;
+    let entry = Entry {
+        schema: SCHEMA,
+        registry_id: registry_id.to_owned(),
+        state_dir: root.join(RELEASED).join(registry_id),
+    };
+    let text = serde_json::to_vec(&entry).map_err(|error| error.to_string())?;
+    let staging = root.join(format!(".{registry_id}.{}.tmp", std::process::id()));
+    std::fs::write(&staging, text).map_err(|error| error.to_string())?;
+    std::fs::rename(&staging, root.join(format!("{registry_id}.json"))).map_err(|error| {
+        let _ = std::fs::remove_file(&staging);
+        error.to_string()
+    })?;
+    Ok(Release::Released)
+}
+
 /// Registries this pass may reclaim for: empty unless `state_dir` is the machine state directory.
 pub(super) fn abandoned(state_dir: &Path, our_registry: Option<&str>) -> BTreeSet<String> {
     let (Some(root), Some(ours)) = (machine_root(), our_registry) else {
@@ -263,6 +334,29 @@ mod tests {
         // A second registry claiming the same directory makes the answer ambiguous.
         enroll_at(&root, &lost, OURS).unwrap();
         assert_eq!(cataloged_identity_at(&root, &lost), None);
+    }
+
+    #[test]
+    fn an_operator_release_abandons_only_an_unknown_or_dead_registry() {
+        let temporary = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+        let root = temporary.path().join("catalog");
+        let live = registry_dir(temporary.path(), "live", LIVE);
+        enroll_at(&root, &live, LIVE).unwrap();
+        assert!(
+            release_at(&root, Some(OURS), OURS).is_err(),
+            "never our own"
+        );
+        assert!(
+            release_at(&root, Some(OURS), LIVE).is_err(),
+            "never a live peer"
+        );
+        assert!(release_at(&root, Some(OURS), "not-a-uuid").is_err());
+        assert_eq!(release_at(&root, Some(OURS), GONE), Ok(Release::Released));
+        assert_eq!(abandoned_at(&root, OURS), BTreeSet::from([GONE.to_owned()]));
+        assert_eq!(
+            release_at(&root, Some(OURS), GONE),
+            Ok(Release::AlreadyAbandoned)
+        );
     }
 
     #[test]
