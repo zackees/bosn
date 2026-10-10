@@ -518,9 +518,6 @@ impl DockerActBackend {
         let work = invocation.work();
         let mut args = owned(&["exec", "-w"]);
         args.push(format!("{work}/src"));
-        for env in invocation.scope.iter().flat_map(RunScope::act_env) {
-            args.extend(["--env".into(), env]);
-        }
         for (key, value) in [
             ("HOME", "home"),
             ("XDG_CACHE_HOME", "home/.cache"),
@@ -537,13 +534,16 @@ impl DockerActBackend {
             args.push(key.clone());
         }
         args.push(engine.into());
-        // The run's processes, act's included, count against its cgroup.
-        args.extend(invocation.scope.iter().flat_map(RunScope::enter));
         let legacy = match route {
             Some(super::cache_cohort::CacheRoute::Legacy(namespace)) => Some(namespace),
             _ => None,
         };
         args.extend(legacy_lease::command(legacy));
+        // In a scope, act runs under `act serve` (zackees/act2#62), inside
+        // the run's cgroup; this client holds the lease while it streams.
+        if let Some(scope) = &invocation.scope {
+            args.extend(scope.exec_args(secrets.0.iter().map(|(name, _)| name.as_str())));
+        }
         args
     }
 }
@@ -791,9 +791,14 @@ impl ActEngineBackend for DockerActBackend {
             )
             .await?;
             if let Some(scope) = &invocation.scope {
-                let open = scope.open_script();
-                self.checked("run scope", Self::exec(engine, &open), CONTROL_DEADLINE)
+                let admitted = self
+                    .checked(
+                        "act serve admission",
+                        Self::exec(engine, &scope.admit_script()),
+                        CONTROL_DEADLINE,
+                    )
                     .await?;
+                scope.verify_admitted(&admitted)?;
             }
             self.copy_inputs(engine, invocation, source, event).await
         })
@@ -806,7 +811,7 @@ impl ActEngineBackend for DockerActBackend {
     ) -> BoxFuture<'a, Result<(), String>> {
         let close = Self::exec(engine, &scope.close_script());
         Box::pin(async move {
-            self.checked("run scope cleanup", close, CLEANUP_DEADLINE)
+            self.checked("act serve close", close, CLEANUP_DEADLINE)
                 .await
                 .map(|_| ())
         })

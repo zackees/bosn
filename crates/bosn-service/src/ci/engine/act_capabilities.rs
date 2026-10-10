@@ -31,6 +31,8 @@ pub(super) fn validate(
         "qualified-job-identity-v1",
         "step-stage-result-v1",
         "cache-exact-delete-v1",
+        // Runs in a scope are forwarded to `act serve` (#547).
+        "serve-v1",
     ]
     .into_iter()
     .chain(selected_outputs.then_some("selected-job-outputs-v1"))
@@ -52,7 +54,7 @@ pub(super) fn validate(
 mod tests {
     use super::validate;
 
-    const DOCUMENT: &str = r#"{"schema_version":1,"producer":"act2","version":"candidate","capabilities":["qualified-job-identity-v1","step-stage-result-v1","cache-exact-delete-v1"]}"#;
+    const DOCUMENT: &str = r#"{"schema_version":1,"producer":"act2","version":"candidate","capabilities":["qualified-job-identity-v1","step-stage-result-v1","cache-exact-delete-v1","serve-v1"]}"#;
 
     #[test]
     fn requires_local_exact_key_cleanup_before_workflow_execution() {
