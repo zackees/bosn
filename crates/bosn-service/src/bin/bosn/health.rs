@@ -55,7 +55,7 @@ pub(crate) fn run_doctor(arguments: impl Iterator<Item = std::ffi::OsString>) {
 /// noise it is meant not to be.
 pub(crate) fn doctor_unmanaged_warning(state_dir: &Path) {
     let config = census_config(None);
-    let (scan, _) = scan_host(state_dir, config);
+    let (scan, _) = scan_host(state_dir, config, census_deadline(None));
     let owned = bosn_service::owned_accounting::summarize(&scan.artifacts, scan.census.partial);
     for line in owned.warning_lines(warning_threshold(None, None)) {
         eprintln!("{line}");

@@ -13,6 +13,7 @@ pub(crate) fn run_scan(mut arguments: impl Iterator<Item = std::ffi::OsString>) 
     let mut warn_objects = None;
     let mut json_output = false;
     let mut ack = false;
+    let mut deadline = None;
     while let Some(argument) = arguments.next() {
         match argument.to_string_lossy().as_ref() {
             "--state-dir" => set_once_parsed(&mut state_dir, arguments.next(), parse_state_dir),
@@ -22,6 +23,9 @@ pub(crate) fn run_scan(mut arguments: impl Iterator<Item = std::ffi::OsString>) 
             "--warn-bytes" => set_once_parsed(&mut warn_bytes, arguments.next(), parse_ttl_seconds),
             "--warn-objects" => {
                 set_once_parsed(&mut warn_objects, arguments.next(), parse_ttl_seconds)
+            }
+            "--census-deadline-ms" => {
+                set_once_parsed(&mut deadline, arguments.next(), parse_census_deadline)
             }
             "--ack" if !ack => {
                 ack = true;
@@ -38,7 +42,7 @@ pub(crate) fn run_scan(mut arguments: impl Iterator<Item = std::ffi::OsString>) 
     let state_dir = state_dir.unwrap_or_else(bosn_service::mcp::default_state_dir);
     let config = census_config(ttl_seconds);
     let threshold = warning_threshold(warn_bytes, warn_objects);
-    let (scan, our_registry) = scan_host(&state_dir, config);
+    let (scan, our_registry) = scan_host(&state_dir, config, census_deadline(deadline));
     let census = &scan.census;
     let warning = bosn_core::warning(census, threshold);
     let acknowledged = bosn_core::acknowledgement_suppresses(
@@ -111,6 +115,19 @@ pub(crate) fn census_config(ttl_seconds: Option<f64>) -> bosn_core::CensusConfig
     }
 }
 
+/// `--census-deadline-ms`: a positive per-read deadline for the census.
+pub(crate) fn parse_census_deadline(value: std::ffi::OsString) -> Result<std::time::Duration, ()> {
+    let millis = parse_u64(value)?;
+    (millis > 0)
+        .then(|| std::time::Duration::from_millis(millis))
+        .ok_or(())
+}
+
+/// The per-read census deadline, defaulting to the documented 30 seconds.
+pub(crate) fn census_deadline(parsed: Option<std::time::Duration>) -> std::time::Duration {
+    parsed.unwrap_or(bosn_service::unmanaged::CENSUS_READ_DEADLINE)
+}
+
 pub(crate) fn warning_threshold(
     bytes: Option<f64>,
     objects: Option<f64>,
@@ -136,12 +153,18 @@ pub(crate) fn now_seconds() -> f64 {
 pub(crate) fn scan_host(
     state_dir: &Path,
     config: bosn_core::CensusConfig,
+    deadline: std::time::Duration,
 ) -> (bosn_service::unmanaged::UnmanagedCensus, Option<String>) {
     let our_registry = bosn_registry::Registry::open_read_only(state_dir.join("registry.sqlite3"))
         .ok()
         .and_then(|registry| registry.registry_id().ok());
     let engine = DockerEngine::docker();
-    let scan = bosn_service::unmanaged::unmanaged_census(&engine, our_registry.as_deref(), config);
+    let scan = bosn_service::unmanaged::unmanaged_census_within(
+        &engine,
+        our_registry.as_deref(),
+        config,
+        deadline,
+    );
     (scan, our_registry)
 }
 

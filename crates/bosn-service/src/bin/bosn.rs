@@ -261,9 +261,11 @@ fn usage() -> ! {
         "   or: bosn job logs --state-dir STATE_DIR --job-id ID [--after CURSOR] [--limit 1..={MAX_JOB_LOG_LIMIT}] [--json]"
     );
     eprintln!("   or: bosn job cancel --state-dir STATE_DIR --job-id ID [--json]");
-    eprintln!("   or: bosn scan [--state-dir STATE_DIR] [--ttl-seconds N] [--ack] [--json]");
     eprintln!(
-        "   or: bosn gc --unmanaged [--state-dir STATE_DIR] [--ttl-seconds N] [--include ID]... [--apply --yes] [--json]"
+        "   or: bosn scan [--state-dir STATE_DIR] [--ttl-seconds N] [--census-deadline-ms N] [--ack] [--json]"
+    );
+    eprintln!(
+        "   or: bosn gc --unmanaged [--state-dir STATE_DIR] [--ttl-seconds N] [--census-deadline-ms N] [--include ID]... [--apply --yes] [--json]"
     );
     eprintln!(
         "   or: bosn gc owned --state-dir STATE_DIR --container-ttl-secs N --volume-ttl-secs N --image-ttl-secs N [--max-bytes N] [--apply --yes] [--json]"

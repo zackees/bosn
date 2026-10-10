@@ -152,7 +152,9 @@ It is assembled from bounded, read-only engine reads:
 | `docker volume inspect <names…>` | volume creation time, which the accounting document does not report at all |
 
 Every read carries an explicit deadline and output cap. A volume the engine does not answer
-for stays unaged, and an unaged artifact is protected.
+for stays unaged, and an unaged artifact is protected. The per-read deadline defaults to
+30 s; `bosn scan` and `bosn gc --unmanaged` take `--census-deadline-ms N` for a slow engine
+(#316). The default is not raised silently, because a slow engine is worth seeing.
 
 **Bytes are approximate; identity is exact.** Docker's own accounting surfaces
 (`docker system df -v --format json`, `docker buildx du`) report human-unit strings with
@@ -212,6 +214,12 @@ bosn gc --unmanaged --include <id>   # opt one Tier 2 item into the plan
 ```
 
 Preview is the default and deletion is explicit, matching the existing `gc` convention.
+
+An incomplete census never yields a plan, and the preview still says so (#316): it exits
+non-zero, and with `--json` it writes one document to stdout with `"partial": true`, the
+`unreadable` reasons (the same field names `bosn scan --json` uses), the
+`census_deadline_ms` in force, `"apply_available": false` and empty candidate lists, so
+"could not look" is never read as "nothing to reclaim".
 Bare `bosn gc` keeps today's behaviour unchanged: owned resources only.
 
 ### Removal is daemon-owned, and re-derives its own plan
