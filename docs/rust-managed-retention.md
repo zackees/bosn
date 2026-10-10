@@ -107,6 +107,26 @@ as `held`, and the maintenance log prints a `kept owned object(s): ...` line whe
 actionable reason (anything other than young or alive) is present, so "nothing to reclaim" and
 "held for foreign ownership" no longer look the same.
 
+## Setup containers and manifest volumes (#545)
+
+Setup containers (`bosn-setup-v2-*`) and manifest volumes (`bosn-v-*`) are created with the
+setup label set (`setup-managed`, `setup-content-sha256`, `setup-container`), not the canonical
+ownership set, and an existing Docker object can never gain a label. The pass therefore also
+discovers objects by `com.zackees.bosn.setup-managed`, and proves each one against **this**
+registry: exactly one `setup-container:` / `manifest-container:` / `manifest-volume:` record must
+match its kind, exact engine name and content digest. The record supplies the stack, generation,
+scope and workspace. Without such a record the object is held as `incomplete-labels`; a name is
+never evidence. `manifest-guest:` containers and setup images are not reclaimed this way.
+
+The proof can only make an object harder to remove: its age is the shorter of Docker's creation
+age and the record's idle time (`last_used`), and a lease, execution session or pending volume
+creation intent naming it counts as in use. Both are re-read immediately before each removal.
+
+A manifest volume's declared `retention` is honoured, so a `pinned` volume stays. A container
+record's `Pinned` is not: every setup and manifest ensure writes it unconditionally and no command
+sets or clears it, so it is bookkeeping rather than a human promise. A container is protected by
+liveness, leases and sessions instead, and an explicit `pinned` label on the object still wins.
+
 ## Stopped setup containers are reported by default (#518)
 
 `bosn-setup-v2-*` containers are created with `docker container create` and **no `--rm`**, and
