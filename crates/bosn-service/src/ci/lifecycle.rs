@@ -145,17 +145,16 @@ async fn save_toolcache(
     }
 }
 
-/// Sample the engine's storage into `peak`, warning in the log the first
+/// Record one storage sample into `peak`, warning in the log the first
 /// time it is low. A failed sample keeps its first error and never changes
 /// the run.
-async fn sample_storage(
-    backend: &dyn ActEngineBackend,
-    engine: &str,
+fn record_storage(
+    sample: Result<StorageUsage, String>,
     peak: &mut StoragePeak,
     unsampled: &mut Option<String>,
     observer: &mut dyn EngineObserver,
 ) {
-    match backend.storage_usage(engine).await {
+    match sample {
         Ok(usage) => {
             if peak.record(usage) {
                 observer.note(&storage::low_warning(usage));
@@ -166,6 +165,72 @@ async fn sample_storage(
         }
     }
 }
+
+/// What the drain loop woke up for.
+enum Drained {
+    Sampled(Result<StorageUsage, String>),
+    Line(Option<EngineLine>),
+    Tick,
+}
+
+/// Forward act's output to `observer` until the sender closes, sampling the
+/// engine's storage alongside (#538). A slow storage probe runs concurrently
+/// with the drain and never delays a line; at most one probe is in flight,
+/// and the next starts [`storage::SAMPLE_INTERVAL`] after the last finished.
+/// A probe still running at EOF gets at most [`FINAL_SAMPLE_GRACE`].
+pub(super) async fn drain_output(
+    backend: &dyn ActEngineBackend,
+    engine: &str,
+    receiver: &mut async_engine::Receiver<EngineLine>,
+    peak: &mut StoragePeak,
+    unsampled: &mut Option<String>,
+    observer: &mut dyn EngineObserver,
+) {
+    let mut sampling = None;
+    let mut next_sample = Instant::now();
+    loop {
+        if sampling.is_none() && Instant::now() >= next_sample {
+            sampling = Some(backend.storage_usage(engine));
+        }
+        let event = {
+            let mut recv = std::pin::pin!(async_engine::timeout(PROGRESS_TICK, receiver.recv()));
+            std::future::poll_fn(|cx| {
+                if let Some(probe) = sampling.as_mut()
+                    && let std::task::Poll::Ready(sample) = probe.as_mut().poll(cx)
+                {
+                    return std::task::Poll::Ready(Drained::Sampled(sample));
+                }
+                recv.as_mut().poll(cx).map(|polled| match polled {
+                    Ok(line) => Drained::Line(line),
+                    Err(_) => Drained::Tick,
+                })
+            })
+            .await
+        };
+        match event {
+            Drained::Sampled(sample) => {
+                sampling = None;
+                next_sample = Instant::now() + storage::SAMPLE_INTERVAL;
+                record_storage(sample, peak, unsampled, observer);
+            }
+            Drained::Line(Some(line)) => observer.line(line),
+            Drained::Line(None) => {
+                // Keep a probe already running when act ends, but never let it
+                // hold up the run for longer than a short grace (#538).
+                if let Some(probe) = sampling
+                    && let Ok(sample) = async_engine::timeout(FINAL_SAMPLE_GRACE, probe).await
+                {
+                    record_storage(sample, peak, unsampled, observer);
+                }
+                break;
+            }
+            Drained::Tick => observer.tick(),
+        }
+    }
+}
+
+/// How long a storage probe still running when act ends may delay the run.
+const FINAL_SAMPLE_GRACE: Duration = Duration::from_secs(2);
 
 /// How long saving the tool cache may delay the engine's removal.
 const TOOLCACHE_SAVE_DEADLINE: Duration = Duration::from_secs(120);
@@ -537,21 +602,14 @@ pub async fn run_on_engine(
             end
         };
         let mut unsampled = None;
-        let drain = async {
-            let mut next_sample = Instant::now();
-            loop {
-                if Instant::now() >= next_sample {
-                    next_sample = Instant::now() + storage::SAMPLE_INTERVAL;
-                    sample_storage(backend, held.engine(), &mut peak, &mut unsampled, observer)
-                        .await;
-                }
-                match async_engine::timeout(PROGRESS_TICK, receiver.recv()).await {
-                    Ok(Some(line)) => observer.line(line),
-                    Ok(None) => break,
-                    Err(_) => observer.tick(),
-                }
-            }
-        };
+        let drain = drain_output(
+            backend,
+            held.engine(),
+            &mut receiver,
+            &mut peak,
+            &mut unsampled,
+            observer,
+        );
         let (end, ()) = async_engine::join(execute, drain).await;
         observer.note(&format!("act finished in {}", laps.lap()));
         match (peak.peak(), unsampled) {

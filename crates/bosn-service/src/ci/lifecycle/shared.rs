@@ -8,8 +8,6 @@
 //! sizing or pins changed) runs on its own per-run engine instead
 //! ([`super::run_on_engine`]), so nothing waits for the shared one to drain.
 
-use std::time::Instant;
-
 use kernal_api::async_engine::{self, CancellationToken};
 
 use super::{
@@ -20,8 +18,8 @@ use super::{
         spare::SparePlan,
         storage::{self, StoragePeak},
     },
-    CleanupEnd, EngineObserver, EnginePlan, EngineReport, ExecutionEnd, Laps, PROGRESS_TICK,
-    close_scope, run_on_engine, sample_storage, save_toolcache,
+    CleanupEnd, EngineObserver, EnginePlan, EngineReport, ExecutionEnd, Laps, close_scope,
+    drain_output, run_on_engine, save_toolcache,
 };
 use crate::RegistryActor;
 
@@ -207,20 +205,14 @@ async fn execute(
         end
     };
     let mut unsampled = None;
-    let drain = async {
-        let mut next_sample = Instant::now();
-        loop {
-            if Instant::now() >= next_sample {
-                next_sample = Instant::now() + storage::SAMPLE_INTERVAL;
-                sample_storage(backend, engine, peak, &mut unsampled, observer).await;
-            }
-            match async_engine::timeout(PROGRESS_TICK, receiver.recv()).await {
-                Ok(Some(line)) => observer.line(line),
-                Ok(None) => break,
-                Err(_) => observer.tick(),
-            }
-        }
-    };
+    let drain = drain_output(
+        backend,
+        engine,
+        &mut receiver,
+        peak,
+        &mut unsampled,
+        observer,
+    );
     let (end, ()) = async_engine::join(run, drain).await;
     observer.note(&format!("act finished in {}", laps.lap()));
     if let Some(usage) = peak.peak() {
