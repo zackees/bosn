@@ -84,6 +84,18 @@ living implementation spec.
     vendored dependency (kernal-api#427). Dropping `bosn_build_backend.py` entirely still waits on
     **soldr#3239** (native aux-bin staging).
 
+- **Test install profile (#600, decided 2026-10-09): `./install` builds a `dev`-profile
+  wheel.** It exports `BOSN_WHEEL_PROFILE=dev` (unless already set), so both the
+  `bosn-native` CLI and the extension build with Cargo's `dev` profile; the backend
+  accepts only `release` (the default) or `dev`. This is the wheel the local gate and
+  the `linux` lane test. The gate must check what ci.yml checks, and it still does: the
+  `linux` job runs the same `./install` remotely. Release-profile wheels are built
+  **only** by the `native-wheel`/Darwin lanes (full CI) and `auto-release.yml`, which run
+  `uv build` without the variable and verify the result; that is where release
+  optimisation is proven. Fleet precedent: soldr's own backend defaults to
+  `--profile dev` for dev installs and builds release only for `soldr wheel --release`.
+  Never set `BOSN_WHEEL_PROFILE` in a release or native-wheel lane.
+
 ## Releasing (the pretag release gate)
 
 - **The version is written once**: `[workspace.package].version` in the root `Cargo.toml`
@@ -230,13 +242,5 @@ Decided 2026-10-09.
   per-run Docker proxy runs in the daemon on the host, in that directory, so act and
   its job containers reach Docker only through their run's proxy. No proxy binary is
   shipped into the engine. The directory is frozen in the creation profile
-  (`docker_socket`) and removed with the engine.
-- **Shared engine rollout (2026-10-09, #547 step 2).** `[engine] shared` defaults to
-  on for Linux daemons: concurrent runs lease slots (ports `40000+2·slot`) in one
-  long-lived engine, each in its own run scope, and the engine retires after
-  `[engine] idle_retire_secs` (default 600) with no run. Per-run engines remain for
-  `shared = false`, non-Linux daemons, and a run whose wanted engine differs from a
-  busy shared one. Spares are not kept while sharing is on. act's `act-<…>` job
-  volumes are renamed with the run key by the run proxy; `act-toolcache` stays shared
-  and is seeded once per engine. Step 4 (#547) removes the per-run path. Non-Linux daemons (Docker Desktop VMs)
+  (`docker_socket`) and removed with the engine. Non-Linux daemons (Docker Desktop VMs)
   bind nothing and keep per-run engines.

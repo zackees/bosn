@@ -119,8 +119,8 @@ def test_native_cli_imports_the_complete_v4_fixture_without_changing_source(
         "--yes",
         "--json",
     ]
-    # ./install already built this candidate's release CLI. Test that artifact
-    # rather than compiling an unrelated debug profile serially with cargo run.
+    # ./install already built this candidate's CLI (dev profile). Test that artifact
+    # rather than compiling it again serially with cargo run.
     with tempfile.TemporaryFile() as output:
         subprocess.run(command, check=True, stdout=output, stderr=subprocess.STDOUT)
         output.seek(0)

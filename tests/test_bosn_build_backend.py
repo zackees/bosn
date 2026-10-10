@@ -34,6 +34,7 @@ def test_soldr_environment_exists(monkeypatch):
 @pytest.fixture
 def backend(monkeypatch, tmp_path):
     monkeypatch.delenv("CARGO_TARGET_DIR", raising=False)
+    monkeypatch.delenv("BOSN_WHEEL_PROFILE", raising=False)
     fake = ModuleType("maturin")
     names = (
         "build_wheel",
@@ -205,6 +206,32 @@ def test_native_cli_explicit_soldr_preserves_flags(backend, monkeypatch):
         target.triple,
     ]
     assert "PYO3_CROSS_PYTHON_VERSION" not in os.environ
+
+
+def test_release_profile_is_the_default_and_maturin_keeps_its_own(backend):
+    module, _ = backend
+    assert module._build_profile().cargo_arguments == ("--release",)
+    assert module._wheel_config(None)["maturin.build-args"] == ["--compatibility", "pypi"]
+
+
+def test_dev_profile_builds_both_artifacts_in_dev(backend, monkeypatch):
+    module, _ = backend
+    monkeypatch.setenv("BOSN_WHEEL_PROFILE", "dev")
+    assert module._build_profile().cargo_arguments == ("--profile", "dev")
+    assert module._build_profile().directory == "debug"
+    assert module._wheel_config(None)["maturin.build-args"] == [
+        "--profile",
+        "dev",
+        "--compatibility",
+        "pypi",
+    ]
+
+
+def test_unknown_profile_refuses(backend, monkeypatch):
+    module, _ = backend
+    monkeypatch.setenv("BOSN_WHEEL_PROFILE", "fast")
+    with pytest.raises(RuntimeError, match="not a supported Bosn build profile"):
+        module._build_profile()
 
 
 def native_artifact_stream(module, binary, *, manifest=None, success=True):

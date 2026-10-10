@@ -477,10 +477,47 @@ fn snapshot_storage_exec_is_required_but_other_tmpfs_cannot_gain_exec() {
     }
 }
 
+// One test per fixture mode (#600): nextest runs them in parallel, so the
+// 31 s slow-remove case no longer serialises the other five.
 #[cfg(target_os = "linux")]
 #[test]
+fn actor_commits_before_create_and_start_and_refuses_uncertain_removal_success() {
+    actor_commits_before_create_and_start_and_refuses_uncertain_removal("success");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn actor_commits_before_create_and_start_and_refuses_uncertain_removal_slow_remove() {
+    actor_commits_before_create_and_start_and_refuses_uncertain_removal("slow-remove");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn actor_commits_before_create_and_start_and_refuses_uncertain_removal_foreign() {
+    actor_commits_before_create_and_start_and_refuses_uncertain_removal("foreign");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn actor_commits_before_create_and_start_and_refuses_uncertain_removal_start_failed() {
+    actor_commits_before_create_and_start_and_refuses_uncertain_removal("start-failed");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn actor_commits_before_create_and_start_and_refuses_uncertain_removal_probe_failed() {
+    actor_commits_before_create_and_start_and_refuses_uncertain_removal("probe-failed");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn actor_commits_before_create_and_start_and_refuses_uncertain_removal_still_present() {
+    actor_commits_before_create_and_start_and_refuses_uncertain_removal("still-present");
+}
+
+#[cfg(target_os = "linux")]
 #[expect(clippy::too_many_lines, reason = "baseline, ci.yml#229")]
-fn actor_commits_before_create_and_start_and_refuses_uncertain_removal() {
+fn actor_commits_before_create_and_start_and_refuses_uncertain_removal(mode: &str) {
     use bosn_registry::{
         Registry,
         act::{ActEngineState, ActRunOutcome},
@@ -517,14 +554,7 @@ elif args[:2]==['container','ls']:
  if mode=='still-present': print('1'*64)
 else: sys.exit(9)
 "#;
-    for mode in [
-        "success",
-        "slow-remove",
-        "foreign",
-        "start-failed",
-        "probe-failed",
-        "still-present",
-    ] {
+    {
         let dir = TemporaryDirectory::new().unwrap();
         let db = dir.path().join("registry.sqlite3");
         let fixture = dir.path().join("docker.py");

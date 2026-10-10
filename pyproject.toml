@@ -35,7 +35,9 @@ dev = [
 # bosn_build_backend stays the PEP 517 backend: it builds and stages the CLI,
 # then delegates the extension build to maturin.
 [build-system]
-requires = ["maturin>=1.15,<2"]
+# patchelf comes from PyPI rather than the OS (#600): maturin's Linux wheel
+# repair needs it, and no lane has to apt-get it.
+requires = ["maturin>=1.15,<2", "patchelf>=0.17; sys_platform == 'linux'"]
 build-backend = "bosn_build_backend"
 backend-path = ["."]
 
@@ -56,6 +58,7 @@ cache-keys = [
     { file = "crates/**/*.json" },
     { file = "src/bosn/**/*.py" },
     { env = "BOSN_WHEEL_TARGET" },
+    { env = "BOSN_WHEEL_PROFILE" },
     { env = "CARGO_BUILD_TARGET" },
     { env = "RUSTUP_TOOLCHAIN" },
     { env = "MACOSX_DEPLOYMENT_TARGET" },
