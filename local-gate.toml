@@ -23,7 +23,11 @@ guard = "tests/conftest.py"
 run = ["bosn", "ci", "run", "--workspace", ".", "--workflow", ".github/workflows/ci.yml", "--event", "workflow_dispatch", "--input", "tier=test", "--mode", "minimal", "--engine", "act", "--timeout-secs", "3600", "--wait", "--deadline-ms", "3600000", "--json", "--ci-output", "verify:skip_rust", "--ci-output", "select-tier:test", "--job", "rust"]
 tools = ["bosn", "docker", "uv", "python"]
 
+# GATE-007 `light`: this lane runs concurrently with the heavy Rust lane
+# instead of after it (bosn#503). Both execute in their own isolated engines;
+# measured on one tree, sequential 704 s vs concurrent 388 s.
 [gate.lanes.tests]
+weight = "light"
 run = ["bosn", "ci", "run", "--workspace", ".", "--workflow", ".github/workflows/ci.yml", "--event", "workflow_dispatch", "--input", "tier=test", "--mode", "minimal", "--engine", "act", "--timeout-secs", "3600", "--wait", "--deadline-ms", "3600000", "--json", "--ci-output", "verify:skip_rust", "--ci-output", "select-tier:test", "--job", "linux"]
 tools = ["bosn", "docker", "uv", "python"]
 
