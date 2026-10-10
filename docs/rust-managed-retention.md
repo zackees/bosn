@@ -215,6 +215,51 @@ This does **not** widen any existing destructive path:
   are not pinned.
 - `gc --unmanaged` is untouched and still refuses to act on a partial census.
 
+## Storage bounds, BuildKit scope, startup and upgrades (#545)
+
+What a machine running the daemon is expected to converge to without manual Docker cleanup:
+
+| Object | Bound | Mechanism |
+|---|---|---|
+| Stopped setup / manifest / macOS-guest container | removed 6 h after creation and last registry use | managed pass (`container_ttl`) |
+| Idle setup keepalive container | stopped once idle past 6 h, then removed as above | idle retirement, re-checked before the stop |
+| Unpinned owned volume (warm, stack, machine) | removed 14 days after last use once nothing mounts it | managed pass (`volume_ttl`) |
+| Bosn-built setup / manifest image (`bosn-setup:<sha256>`) | removed 30 days after last use once no container uses it | managed pass (`image_ttl`), proven by its registry record |
+| Shared CI engine (Linux) | retired after `[engine] idle_retire_secs` (default 600) with no run | CI shared engine (#547) |
+| Per-run act storage volume | removed with its engine; proven absent | CI run cleanup |
+| Objects of a deleted `--state-dir` | reclaimed by the machine daemon under the same gates | machine catalog |
+
+Not bounded by retention, by design:
+
+- **Pinned objects**: a manifest volume declared `retention = "pinned"` (every macOS guest's
+  `storage` volume is), the shared `bosn-ci-cache-v1` cache (bounded by its own cache budget,
+  `bosn ci cache`), and anything carrying an explicit `pinned` label.
+- **Pulled images** (`[app] image = ...`): a public image may be shared with the operator's own
+  work, so it is never proven owned and never removed. Built images are.
+- **Running containers that are not the keepalive** (a declared app command, a running macOS
+  guest). They are in use; `bosn scan` lists them with their uptime.
+- **Foreign registries** that predate the machine catalog: see "Abandoned state directories".
+
+**Cold-rebuild cost.** Every reclaimed object is reproducible: the next `setup ensure` rebuilds a
+removed `bosn-setup:` image and recreates its container, and a removed unpinned volume starts
+empty, so the first run after a long idle period pays the build or cache warm-up again. Pin what
+must survive idle periods.
+
+**BuildKit and build cache are out of scope.** Inline setup builds go through the engine's
+default builder; its build cache, and any external `buildx` builder container with its state
+volume (for example `moby/buildkit:buildx-stable-1`), are not Bosn objects: they carry no Bosn
+labels and no registry record. Bosn never prunes, stops or removes them. Bound them with Docker's
+own settings (`builder.gc` in `daemon.json`, or `docker buildx prune` / `docker builder prune`).
+
+**Startup and upgrades.** Retention runs only inside a running daemon: the first pass at daemon
+start, then every hour. A machine therefore needs the daemon kept running, which
+`bosn daemon autostart` registers (a user `systemd` unit on Linux, a `launchd` agent on macOS).
+An upgrade replaces the binary and the next daemon start runs the new pass; the daemon version
+contract (#509) hands an idle daemon over to the authoritative executable, so an upgraded
+install does not keep running the old policy. Retention needs no migration: it reads the
+registry and Docker labels as they are, and its defaults apply to a state directory with no
+`retention.toml`.
+
 ## Known limits
 
 - **The registry reset.** Every GC path requires a registry row. A registry that is reset or
