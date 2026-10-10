@@ -19,6 +19,19 @@ pub fn maintenance_pass(state_dir: &Path) {
     let policy = RetentionPolicy::default();
     let apply = auto_retention_enabled(state_dir);
     let engine = DockerEngine::docker();
+    // #545: an idle keepalive is "running" and so held as in use forever. Stop the provably idle
+    // ones first, so this same pass can reclaim them and the volumes they pinned.
+    if apply {
+        let idle = super::idle::retire_idle_keepalives(
+            &engine,
+            state_dir,
+            policy.container_ttl,
+            super::idle::MAX_STOPS_PER_PASS,
+        );
+        for line in idle.report_lines() {
+            eprintln!("bosn retention: {line}");
+        }
+    }
     let outcome = managed_retention_pass(&engine, state_dir, policy, apply);
     report_pass(&outcome);
 }

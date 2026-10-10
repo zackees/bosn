@@ -846,6 +846,9 @@ const VOLUME_MOUNT_TYPE: &str = "volume";
 struct LabelledConfig {
     #[serde(rename = "Labels", default, deserialize_with = "null_as_empty_map")]
     labels: std::collections::BTreeMap<String, String>,
+    /// A container's own command; `null` for an image without one.
+    #[serde(rename = "Cmd", default)]
+    cmd: Option<Vec<String>>,
 }
 
 impl ContainerDetail {
@@ -950,6 +953,7 @@ mod report;
 use report::{auto_retention_enabled, pass_report_line, setup_container_report_line};
 pub use report::{maintenance_pass, report_pass};
 
+mod idle;
 mod registered;
 mod sizes;
 
