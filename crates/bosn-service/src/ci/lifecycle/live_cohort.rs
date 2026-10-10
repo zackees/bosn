@@ -104,6 +104,7 @@ fn cohort_route_restores_across_jobs_and_successive_owned_engines() {
                     },
                     secrets: Default::default(),
                     params: Default::default(),
+                    scope: None,
                 },
             };
             let mut observer = Collect::default();

@@ -24,8 +24,8 @@ use std::{
 };
 
 use bosn_registry::act::{
-    ActEngineBinding, ActEngineIntent, ActEngineObservation, ActEngineRecord, ActEngineState,
-    ActRunOutcome,
+    ActEngineBinding, ActEngineDockerSocket, ActEngineIntent, ActEngineObservation,
+    ActEngineRecord, ActEngineState, ActRunOutcome,
 };
 use kernal_api::async_engine::{self, CancellationToken};
 
@@ -318,10 +318,19 @@ impl<'a> Claim<'a> {
     }
 }
 
-/// The run's engine under its claim, and whether it is already prepared.
+/// The run's engine under its claim, whether it is already prepared, and
+/// the socket directory it binds (#547).
 struct Acquired<'a> {
     claim: Claim<'a>,
     prepared: bool,
+    socket: Option<ActEngineDockerSocket>,
+}
+
+fn docker_socket(intent: &ActEngineIntent) -> Option<ActEngineDockerSocket> {
+    intent
+        .creation_profile
+        .as_ref()
+        .and_then(|profile| profile.docker_socket.clone())
 }
 
 /// Claim the plan's spare (retiring it and falling back to a new engine when
@@ -354,6 +363,7 @@ async fn acquire<'a>(
                 return Ok(Acquired {
                     claim,
                     prepared: true,
+                    socket: docker_socket(&spare.intent),
                 });
             }
             Err(error) => {
@@ -379,6 +389,7 @@ async fn acquire<'a>(
     Ok(Acquired {
         claim,
         prepared: false,
+        socket: docker_socket(&plan.intent),
     })
 }
 
@@ -416,6 +427,10 @@ pub async fn run_on_engine(
     let mut claim = None;
     let mut laps = Laps::new();
     let mut peak = StoragePeak::default();
+    // The run's scope inside the engine (#547): its proxy, and the engine it
+    // must be closed in once anything of it may exist.
+    let mut proxy = None;
+    let mut scoped = None;
     let execution = 'run: {
         let acquired = match acquire(
             registry,
@@ -432,6 +447,13 @@ pub async fn run_on_engine(
             Err(error) => break 'run ExecutionEnd::EngineFailed(error),
         };
         let held = claim.insert(acquired.claim);
+        if let (Some(scope), Some(socket)) = (&plan.invocation.scope, &acquired.socket) {
+            match super::run_proxy::RunProxy::start(socket, scope) {
+                Ok(started) => proxy = Some(started),
+                Err(error) => break 'run ExecutionEnd::EngineFailed(error),
+            }
+            scoped = Some((held.engine().to_owned(), scope));
+        }
         let how = if acquired.prepared {
             "spare engine claimed"
         } else {
@@ -454,6 +476,7 @@ pub async fn run_on_engine(
             backend
                 .prepare_run(
                     held.engine(),
+                    &plan.invocation,
                     &plan.source,
                     &plan.event,
                     plan.intent
@@ -475,11 +498,8 @@ pub async fn run_on_engine(
         if let Err(error) = held.verify().await {
             break 'run ExecutionEnd::EngineFailed(error);
         }
-        match async_engine::timeout_at(
-            deadline,
-            backend.list(held.engine(), &plan.invocation.workflow_arg()),
-        )
-        .await
+        match async_engine::timeout_at(deadline, backend.list(held.engine(), &plan.invocation))
+            .await
         {
             Err(_) => break 'run ExecutionEnd::TimedOut,
             Ok(Ok(listing)) => observer.declared(&listing),
@@ -526,6 +546,11 @@ pub async fn run_on_engine(
             (None, Some(error)) => observer.note(&format!("engine storage not sampled: {error}")),
             (None, None) => {}
         }
+        // The run's processes and containers go before its tool cache is
+        // saved, so no job is still writing it.
+        if let Some((engine, scope)) = scoped.take() {
+            close_scope(backend, &engine, scope, observer).await;
+        }
         let end = match end {
             Ok(ExecEnd::Exited(code)) => ExecutionEnd::Exited(code),
             Ok(ExecEnd::TimedOut) => ExecutionEnd::TimedOut,
@@ -557,6 +582,10 @@ pub async fn run_on_engine(
         }
         end
     };
+    if let Some((engine, scope)) = scoped.take() {
+        close_scope(backend, &engine, scope, observer).await;
+    }
+    drop(proxy);
     let outcome = registry_outcome(&execution);
     let token = claim.as_ref().map(|held| held.token.clone());
     // The claimed engine's key: a spare's own UUID once one was claimed.
@@ -588,6 +617,21 @@ pub async fn run_on_engine(
         cleanup,
         engine_id,
         storage: peak.peak(),
+    }
+}
+
+/// Close the run's scope in its engine, noting (never failing on) an error:
+/// the engine's removal, or its next use, finds what is left.
+async fn close_scope(
+    backend: &dyn ActEngineBackend,
+    engine: &str,
+    scope: &super::engine::RunScope,
+    observer: &mut dyn EngineObserver,
+) {
+    match async_engine::timeout(CLEANUP_BUDGET, backend.close_scope(engine, scope)).await {
+        Ok(Ok(())) => observer.note("run scope cleaned up: no container, network or volume left"),
+        Ok(Err(error)) => observer.note(&format!("run scope not cleaned up: {error}")),
+        Err(_) => observer.note("run scope not cleaned up: timed out"),
     }
 }
 

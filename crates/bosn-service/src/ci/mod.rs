@@ -78,6 +78,7 @@ pub mod provider;
 pub mod remote_only;
 pub mod reply;
 pub mod report;
+pub mod run_proxy;
 pub mod runtime;
 pub mod scheduler;
 pub mod schema;

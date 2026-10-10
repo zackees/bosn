@@ -49,7 +49,11 @@ mod readiness;
 mod tool_recovery;
 use act_install::act_archive;
 pub(crate) use act_install::install_act_script;
+mod invocation;
+pub use invocation::{ActInvocation, LOCAL_RUNNER_LABELS};
 mod lines;
+mod run_scope;
+pub use run_scope::{RunLimits, RunScope};
 mod runner_tools;
 mod toolcache;
 use lines::LineBuffer;
@@ -116,82 +120,6 @@ impl std::fmt::Debug for SecretEnv {
         f.debug_list()
             .entries(self.0.iter().map(|(k, _)| k))
             .finish()
-    }
-}
-
-/// The act command, built only from validated semantic fields.
-#[derive(Clone, Debug)]
-pub struct ActInvocation {
-    pub event: String,
-    pub workflow: String,
-    /// bosn rewrote the workflow, so act runs the overlay's copy (#424).
-    pub workflow_overlaid: bool,
-    pub job: Option<String>,
-    /// Typed repository route; cohort selection requires verified enrollment.
-    pub cache_route: super::cache_cohort::CacheRoute,
-    /// Passed to act as `-s NAME`; values travel only in the docker client's
-    /// environment (`exec --env NAME`), never in argv.
-    pub secrets: SecretEnv,
-    /// act `--input`, `--matrix` and `--env` (#430), validated at submit.
-    pub params: super::params::RunParams,
-}
-
-/// The `runs-on` labels act runs locally, all on the pinned runner image;
-/// any other is unsupported ([`super::matrix_runner`] decides it per matrix
-/// leg).
-pub const LOCAL_RUNNER_LABELS: [&str; 3] = ["ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04"];
-
-impl ActInvocation {
-    /// The workflow act plans: bosn's rewrite when there is one. The
-    /// workspace jobs check out always holds the original (#424).
-    pub fn workflow_arg(&self) -> String {
-        if self.workflow_overlaid {
-            format!("{ENGINE_WORK}/overlay/{}", self.workflow)
-        } else {
-            self.workflow.clone()
-        }
-    }
-
-    /// Arguments after `act`. Platform mappings cover the Linux labels; any
-    /// other `runs-on` is reported unsupported by act and never passes.
-    pub fn args(&self) -> Vec<String> {
-        let mut args = vec![
-            self.event.clone(),
-            "-W".into(),
-            self.workflow_arg(),
-            // Local reusable workflows and composite actions bosn rewrote.
-            "--workflow-overlay".into(),
-            format!("{ENGINE_WORK}/overlay"),
-            "--eventpath".into(),
-            format!("{ENGINE_WORK}/event.json"),
-            "--json".into(),
-            "--pull=false".into(),
-            "--action-cache-path".into(),
-            format!("{ENGINE_CACHE}/actions"),
-            // Legacy in-place checkouts race between concurrent runs
-            // (zackees/clud#1724); the new cache extracts per run.
-            "--use-new-action-cache".into(),
-            // Per engine, so concurrent runs never share artifacts or ports.
-            "--artifact-server-path".into(),
-            format!("{ENGINE_WORK}/artifacts"),
-        ];
-        args.extend(self.cache_route.args());
-        args.extend(["--env".into(), runner_tools::path_env()]);
-        let runner = runner_tag();
-        for label in LOCAL_RUNNER_LABELS {
-            args.push("-P".into());
-            args.push(format!("{label}={runner}"));
-        }
-        for (name, _) in &self.secrets.0 {
-            args.push("-s".into());
-            args.push(name.clone());
-        }
-        if let Some(job) = &self.job {
-            args.push("-j".into());
-            args.push(job.clone());
-        }
-        args.extend(self.params.act_args());
-        args
     }
 }
 
@@ -276,9 +204,12 @@ pub trait ActEngineBackend: Send + Sync {
     /// What one run needs on a prepared engine: seed act's tool cache from
     /// the machine-wide store as of now, and stream in the frozen source and
     /// event payload.
+    /// Seed the tool cache, open the invocation's run scope (#547) when it
+    /// has one, and stream the frozen inputs into the run's work tree.
     fn prepare_run<'a>(
         &'a self,
         engine: &'a str,
+        invocation: &'a ActInvocation,
         source: &'a Path,
         event: &'a Path,
         generation: Option<&'a bosn_registry::act::ActToolGenerationBinding>,
@@ -287,8 +218,14 @@ pub trait ActEngineBackend: Send + Sync {
     fn list<'a>(
         &'a self,
         engine: &'a str,
-        workflow: &'a str,
+        invocation: &'a ActInvocation,
     ) -> BoxFuture<'a, Result<String, String>>;
+    /// Remove everything a run scope left in the engine and prove it gone.
+    fn close_scope<'a>(
+        &'a self,
+        engine: &'a str,
+        scope: &'a RunScope,
+    ) -> BoxFuture<'a, Result<(), String>>;
     fn execute<'a>(
         &'a self,
         engine: &'a str,
@@ -348,6 +285,8 @@ pub trait ActEngineBackend: Send + Sync {
 }
 
 const CONTROL_DEADLINE: Duration = Duration::from_secs(60);
+/// Killing a run's processes and removing its containers (#547).
+const CLEANUP_DEADLINE: Duration = Duration::from_secs(180);
 /// A storage sample holds up the run's log drain; it is short or skipped.
 const SAMPLE_DEADLINE: Duration = Duration::from_secs(10);
 const PULL_DEADLINE: Duration = Duration::from_secs(30 * 60);
@@ -455,17 +394,29 @@ impl DockerActBackend {
 
     /// Stream the frozen source and bosn's overlay (each as a tar) and the
     /// event payload into the engine's work directory.
-    async fn copy_inputs(&self, engine: &str, source: &Path, event: &Path) -> Result<(), String> {
-        self.copy_tree(engine, source, "src").await?;
+    async fn copy_inputs(
+        &self,
+        engine: &str,
+        invocation: &ActInvocation,
+        source: &Path,
+        event: &Path,
+    ) -> Result<(), String> {
+        let root = invocation
+            .scope
+            .as_ref()
+            .map_or_else(String::new, |scope| format!("{}/", scope.work_relative()));
+        self.copy_tree(engine, source, &format!("{root}src"))
+            .await?;
         let overlay = super::store::overlay_beside(source);
         if overlay.is_dir() {
-            self.copy_tree(engine, &overlay, "overlay").await?;
+            self.copy_tree(engine, &overlay, &format!("{root}overlay"))
+                .await?;
         }
         self.stream_in(
             "event copy",
             engine,
             event,
-            &format!("cat > {ENGINE_WORK}/event.json"),
+            &format!("cat > {}/event.json", invocation.work()),
         )
         .await
     }
@@ -553,11 +504,16 @@ impl DockerActBackend {
     /// writable home on the engine's storage (its root is read-only).
     fn act_exec(
         engine: &str,
+        invocation: &ActInvocation,
         secrets: &SecretEnv,
         route: Option<&super::cache_cohort::CacheRoute>,
     ) -> Vec<String> {
+        let work = invocation.work();
         let mut args = owned(&["exec", "-w"]);
-        args.push(format!("{ENGINE_WORK}/src"));
+        args.push(format!("{work}/src"));
+        for env in invocation.scope.iter().flat_map(RunScope::act_env) {
+            args.extend(["--env".into(), env]);
+        }
         for (key, value) in [
             ("HOME", "home"),
             ("XDG_CACHE_HOME", "home/.cache"),
@@ -565,7 +521,7 @@ impl DockerActBackend {
             ("TMPDIR", "tmp"),
         ] {
             args.push("--env".into());
-            args.push(format!("{key}={ENGINE_WORK}/{value}"));
+            args.push(format!("{key}={work}/{value}"));
         }
         // Secret values reach act only through the docker client's own
         // environment (`--env NAME` copies it); never through argv.
@@ -574,6 +530,8 @@ impl DockerActBackend {
             args.push(key.clone());
         }
         args.push(engine.into());
+        // The run's processes, act's included, count against its cgroup.
+        args.extend(invocation.scope.iter().flat_map(RunScope::enter));
         let legacy = match route {
             Some(super::cache_cohort::CacheRoute::Legacy(namespace)) => Some(namespace),
             _ => None,
@@ -806,6 +764,7 @@ impl ActEngineBackend for DockerActBackend {
     fn prepare_run<'a>(
         &'a self,
         engine: &'a str,
+        invocation: &'a ActInvocation,
         source: &'a Path,
         event: &'a Path,
         generation: Option<&'a bosn_registry::act::ActToolGenerationBinding>,
@@ -823,19 +782,38 @@ impl ActEngineBackend for DockerActBackend {
                 PULL_DEADLINE,
             )
             .await?;
-            self.copy_inputs(engine, source, event).await
+            if let Some(scope) = &invocation.scope {
+                let open = scope.open_script();
+                self.checked("run scope", Self::exec(engine, &open), CONTROL_DEADLINE)
+                    .await?;
+            }
+            self.copy_inputs(engine, invocation, source, event).await
+        })
+    }
+
+    fn close_scope<'a>(
+        &'a self,
+        engine: &'a str,
+        scope: &'a RunScope,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        let close = Self::exec(engine, &scope.close_script());
+        Box::pin(async move {
+            self.checked("run scope cleanup", close, CLEANUP_DEADLINE)
+                .await
+                .map(|_| ())
         })
     }
 
     fn list<'a>(
         &'a self,
         engine: &'a str,
-        workflow: &'a str,
+        invocation: &'a ActInvocation,
     ) -> BoxFuture<'a, Result<String, String>> {
         Box::pin(async move {
-            let mut args = Self::act_exec(engine, &SecretEnv::default(), None);
-            args.extend(owned(&["-l", "-W", workflow, "--workflow-overlay"]));
-            args.push(format!("{ENGINE_WORK}/overlay"));
+            let mut args = Self::act_exec(engine, invocation, &SecretEnv::default(), None);
+            let workflow = invocation.workflow_arg();
+            args.extend(owned(&["-l", "-W", &workflow, "--workflow-overlay"]));
+            args.push(format!("{}/overlay", invocation.work()));
             self.checked("act -l", args, CONTROL_DEADLINE).await
         })
     }
@@ -855,8 +833,12 @@ impl ActEngineBackend for DockerActBackend {
             if let super::cache_cohort::CacheRoute::Cohort { policy, .. } = invocation.cache_route {
                 self.agree_cache_policy(engine, policy).await?;
             }
-            let mut args =
-                Self::act_exec(engine, &invocation.secrets, Some(&invocation.cache_route));
+            let mut args = Self::act_exec(
+                engine,
+                invocation,
+                &invocation.secrets,
+                Some(&invocation.cache_route),
+            );
             args.extend(invocation.args());
             let (events, mut receiver) = async_engine::channel(256);
             let docker = invocation
