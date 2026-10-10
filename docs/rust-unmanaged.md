@@ -177,6 +177,11 @@ tail of any command that ran a maintenance pass (S4). At most once per invocatio
 `bosn status` verb in the native CLI; `doctor` is the always-on surface — the one a user runs
 when something is wrong, and the one that would have caught #147.
 
+`doctor`'s census is bounded overall, not just per read (#300): the whole pass gets 5 s
+(`census_deadline_ms: 5000` in `doctor --json`), and each read gets only what is left. It
+runs before the report is printed, and the report's `unmanaged_census` field says
+`complete`, `incomplete` or `unavailable` — never clean when the census did not finish.
+
 1. **Yellow, ALL CAPS headline.** Detail lines stay mixed-case — an all-caps table is
    unreadable and the shouting must mean something.
 2. **stderr**, matching the existing precedent for problem output.

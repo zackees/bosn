@@ -100,3 +100,28 @@ fn a_zero_or_malformed_deadline_is_a_usage_error() {
         assert!(output.stdout.is_empty(), "a usage error writes no document");
     }
 }
+
+/// #300: doctor's census is bounded overall, so a stalled engine cannot hold the process
+/// past the caller's budget after the report is printed. Before the fix this took the 30 s
+/// per-read default.
+#[test]
+fn doctor_json_is_bounded_and_reports_an_incomplete_census() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    stalling_docker(dir.path());
+    let (output, elapsed) = run(dir.path(), &["doctor", "--json"]);
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "doctor finishes inside the wheel smoke's 10 s budget: {elapsed:?}"
+    );
+    assert!(output.status.success(), "doctor itself succeeded");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.lines().count(), 1, "one result line: {stdout}");
+    let document: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout is one JSON document");
+    assert_eq!(document["action"], "doctor");
+    assert_eq!(document["daemon"], "unavailable");
+    assert_eq!(document["unmanaged_census"], "unavailable");
+    assert_eq!(document["census_deadline_ms"], 5000);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("census unavailable"), "{stderr}");
+}
