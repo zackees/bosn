@@ -204,6 +204,13 @@ impl Service {
         let _run_http = run_http::start(&self.state_dir).await.map_err(Error::Io)?;
         eprintln!("bosn run output listening on {}", _run_http.local_addr);
         let act_owner = registry.registry_id()?;
+        // #545: enroll in the machine catalog, so if this state directory is later deleted the
+        // machine daemon can still reclaim what this registry created.
+        if let Err(error) = managed_retention::catalog::enroll(&self.state_dir, &act_owner) {
+            eprintln!(
+                "bosn retention: could not enroll this registry in the machine catalog: {error}"
+            );
+        }
         let act_image_proofs = act_engine::bundled_engine_manifests()
             .map_err(|error| Error::Io(std::io::Error::other(error.to_string())))?;
         let ep = endpoint(&self.state_dir)?;

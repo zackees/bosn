@@ -127,6 +127,26 @@ record's `Pinned` is not: every setup and manifest ensure writes it unconditiona
 sets or clears it, so it is bookkeeping rather than a human promise. A container is protected by
 liveness, leases and sessions instead, and an explicit `pinned` label on the object still wins.
 
+## Abandoned state directories (#545)
+
+Objects created under a temporary or deleted `--state-dir` carry complete labels naming a registry
+nothing will open again. Every other registry correctly treats them as foreign, so they used to
+leak forever. Every daemon now enrolls `{schema, registry_id, state_dir}` in a machine catalog,
+`<native state dir>/registries/<registry-id>.json` (the platform default, ignoring
+`BOSN_STATE_DIR`), whatever state directory it was started with.
+
+Only the **machine daemon** (whose state directory is that native default) acts on the catalog,
+and only for a registry whose cataloged state directory definitely no longer contains a
+`registry.sqlite3`. Objects naming such an abandoned registry are judged as if this registry
+owned them, under every ordinary gate (running/mounted, pin, age), re-checked before removal.
+Once no container, volume or image names it any more, its catalog entry is deleted.
+
+Live peers stay protected: a registry whose database still exists is foreign, and its objects
+are never touched. An object naming a registry the catalog never saw (created before the catalog
+existed) stays `foreign-registry` too; a label alone does not prove its registry is gone. A state
+directory on a filesystem that is not mounted looks deleted; the ordinary age gates are the
+margin for that case.
+
 ## Idle keepalive containers are stopped (#545, #536)
 
 A setup or manifest app with no declared command runs the fixed keepalive

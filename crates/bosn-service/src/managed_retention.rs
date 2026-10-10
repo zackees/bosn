@@ -137,15 +137,13 @@ pub fn managed_retention_pass(
     policy: RetentionPolicy,
     apply: bool,
 ) -> ManagedRetentionOutcome {
-    let our_registry = bosn_registry::Registry::open_read_only(state_dir.join("registry.sqlite3"))
-        .ok()
-        .and_then(|registry| registry.registry_id().ok());
-
     // #545: setup containers and manifest volumes carry only the setup label set; their
-    // ownership proof is this registry's record of creating them. An unreadable registry proves
-    // nothing, so such objects then stay held as incompletely labelled.
-    let ownership = registered::RegisteredOwnership::load(state_dir).ok();
-    let (artifacts, stopped_containers, refusal) = observe_owned(engine, ownership.as_ref());
+    // ownership proof is this registry's record of creating them. The machine daemon may also
+    // reclaim for registries whose state directory is gone (see `catalog`). An unreadable source
+    // proves nothing, so the objects it would cover stay held.
+    let authority = authority::Authority::load(state_dir);
+    let our_registry = authority.our().map(str::to_owned);
+    let (artifacts, stopped_containers, refusal) = observe_owned(engine, &authority);
     // #518: this report is unconditional. A default install has no `retention.toml`, so nothing
     // would ever delete these — but the operator still has to be told the pile is growing.
     let setup_containers = SetupContainerReport {
@@ -209,6 +207,8 @@ pub fn managed_retention_pass(
                 }
             }
         }
+        // #545: forget abandoned registries this pass (or an earlier one) emptied.
+        catalog::forget_emptied(engine, authority.abandoned());
     }
 
     ManagedRetentionOutcome {
@@ -235,7 +235,7 @@ pub fn managed_retention_pass(
 /// incomplete candidate list is indistinguishable from an empty one.
 fn observe_owned(
     engine: &DockerEngine,
-    ownership: Option<&registered::RegisteredOwnership>,
+    authority: &authority::Authority,
 ) -> (
     Vec<bosn_core::ObservedArtifact>,
     Vec<StoppedSetupContainer>,
@@ -257,7 +257,7 @@ fn observe_owned(
         engine,
         options,
         &probes,
-        ownership,
+        authority,
         &mut artifacts,
         &mut stopped_containers,
         &mut unreadable,
@@ -266,7 +266,7 @@ fn observe_owned(
         engine,
         options,
         &probes,
-        ownership,
+        authority,
         &mut artifacts,
         &mut unreadable,
     );
@@ -274,6 +274,7 @@ fn observe_owned(
         engine,
         options,
         bosn_core::LABEL_KIND,
+        authority,
         &mut artifacts,
         &mut unreadable,
     );
@@ -310,7 +311,7 @@ fn observe_containers(
     engine: &DockerEngine,
     options: RunOptions,
     probes: &[&str],
-    ownership: Option<&registered::RegisteredOwnership>,
+    authority: &authority::Authority,
     artifacts: &mut Vec<bosn_core::ObservedArtifact>,
     stopped_containers: &mut Vec<StoppedSetupContainer>,
     unreadable: &mut Vec<String>,
@@ -346,8 +347,7 @@ fn observe_containers(
                     pinned_volumes: entry.pinned_volume_names(),
                 });
             }
-            let proven = Proven::of(
-                ownership,
+            let proven = authority.prove(
                 ResourceKind::Container,
                 entry.engine_name(),
                 entry.labels(),
@@ -374,7 +374,7 @@ fn observe_volumes(
     engine: &DockerEngine,
     options: RunOptions,
     probes: &[&str],
-    ownership: Option<&registered::RegisteredOwnership>,
+    authority: &authority::Authority,
     artifacts: &mut Vec<bosn_core::ObservedArtifact>,
     unreadable: &mut Vec<String>,
 ) {
@@ -408,14 +408,8 @@ fn observe_volumes(
             let bytes = entry
                 .size_bytes()
                 .or_else(|| sizes.get(&entry.name).copied());
-            let proven = Proven::of(
-                ownership,
-                ResourceKind::Volume,
-                &entry.name,
-                entry.labels,
-                age,
-                in_use,
-            );
+            let proven =
+                authority.prove(ResourceKind::Volume, &entry.name, entry.labels, age, in_use);
             artifacts.push(bosn_core::ObservedArtifact {
                 id: entry.name,
                 kind: ResourceKind::Volume,
@@ -436,6 +430,7 @@ fn observe_images(
     engine: &DockerEngine,
     options: RunOptions,
     probe: &str,
+    authority: &authority::Authority,
     artifacts: &mut Vec<bosn_core::ObservedArtifact>,
     unreadable: &mut Vec<String>,
 ) {
@@ -461,13 +456,20 @@ fn observe_images(
             let Some(age) = entry.created_age(now_seconds()) else {
                 continue;
             };
+            let proven = authority.prove(
+                ResourceKind::Image,
+                &entry.id,
+                entry.labels(),
+                age,
+                !image_is_unused(engine, &entry.id, options),
+            );
             artifacts.push(bosn_core::ObservedArtifact {
                 id: entry.id.clone(),
                 kind: ResourceKind::Image,
-                labels: entry.labels(),
-                signals: signals(!image_is_unused(engine, &entry.id, options)),
+                labels: proven.labels,
+                signals: signals(proven.in_use),
                 bytes: entry.size_bytes(),
-                age_seconds: Some(age),
+                age_seconds: Some(proven.age),
             });
         }
     }
@@ -506,7 +508,7 @@ fn revalidate(
 ) -> Result<Recheck, String> {
     let options = RunOptions::bounded(RETENTION_READ_DEADLINE, RETENTION_OUTPUT_LIMIT);
     // A fresh registry read: a lease or session taken since the plan was built must protect.
-    let ownership = registered::RegisteredOwnership::load(state_dir).ok();
+    let authority = authority::Authority::load(state_dir);
     let (name, labels, age, in_use, bytes) = match candidate.kind {
         ResourceKind::Container => {
             let probe = vec![candidate.id.clone()];
@@ -576,14 +578,7 @@ fn revalidate(
             candidate.id
         ));
     };
-    let proven = Proven::of(
-        ownership.as_ref(),
-        candidate.kind,
-        &name,
-        labels,
-        age,
-        in_use,
-    );
+    let proven = authority.prove(candidate.kind, &name, labels, age, in_use);
     let fresh = bosn_core::ObservedArtifact {
         id: candidate.id.clone(),
         kind: candidate.kind,
@@ -705,45 +700,6 @@ fn labeled_union(
         }
     }
     complete.then_some(ids)
-}
-
-/// One observation after the registry had its say (#545).
-struct Proven {
-    labels: BTreeMap<String, String>,
-    age: f64,
-    in_use: bool,
-}
-
-impl Proven {
-    /// Apply a registry proof when the object is setup-labelled and recorded; otherwise the
-    /// engine's own labels stand and `classify_managed` judges them as they are.
-    ///
-    /// A proof can only make an object *harder* to remove: its age becomes the shorter of the
-    /// engine age and the registry's idle time, and a lease, session or creation intent marks it
-    /// in use.
-    fn of(
-        ownership: Option<&registered::RegisteredOwnership>,
-        kind: ResourceKind,
-        name: &str,
-        labels: BTreeMap<String, String>,
-        age: f64,
-        in_use: bool,
-    ) -> Self {
-        match ownership
-            .and_then(|ownership| ownership.normalize(kind, name, &labels, now_seconds()))
-        {
-            Some(proof) => Self {
-                labels: proof.labels,
-                age: age.min(proof.idle_seconds),
-                in_use: in_use || proof.protected,
-            },
-            None => Self {
-                labels,
-                age,
-                in_use,
-            },
-        }
-    }
 }
 
 /// Parse an inspect document, recording a refusal rather than discarding it.
@@ -953,6 +909,8 @@ mod report;
 use report::{auto_retention_enabled, pass_report_line, setup_container_report_line};
 pub use report::{maintenance_pass, report_pass};
 
+mod authority;
+pub(crate) mod catalog;
 mod idle;
 mod registered;
 mod sizes;
