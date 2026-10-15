@@ -12,7 +12,7 @@ use std::path::Path;
 
 use bosn_core::runner_images::{DECLARATION_PATH, RunnerSource, RunnerTable};
 
-use super::ENGINE_CACHE;
+use super::{ENGINE_CACHE, ENGINE_WORK};
 
 /// The run's runner table: the built-in one plus the declaration in the
 /// snapshot at `root`, if any. A malformed declaration refuses the run.
@@ -71,6 +71,9 @@ pub fn ensure_scripts(runners: &[(String, RunnerSource)]) -> Vec<String> {
 ///   Dockerfile with no context and labelled with the Dockerfile's digest,
 ///   then saved and recorded.
 ///
+/// The engine's root filesystem is read-only, so the Docker client keeps its
+/// config (buildx state) under the engine's work directory.
+///
 /// One lock per engine serialises producers, so concurrent runs build once.
 pub fn ensure_script(source: &RunnerSource) -> String {
     use base64::Engine as _;
@@ -93,6 +96,7 @@ pub fn ensure_script(source: &RunnerSource) -> String {
     let archive = tag.replace([':', '/'], "-");
     format!(
         "set -eu; dir={ENGINE_CACHE}/images; mkdir -p \"$dir\"; \
+         export DOCKER_CONFIG={ENGINE_WORK}/runner-images-docker; mkdir -p \"$DOCKER_CONFIG\"; \
          exec 8>\"$dir/.runner-images.lock\"; flock -x 8; \
          tag='{tag}'; key='{key}'; tar=\"$dir/{archive}.tar\"; record=\"$tar.id\"; \
          proven() {{ id=$(docker image inspect --format '{{{{.Id}}}}' \"$tag\" 2>/dev/null) || return 1; \

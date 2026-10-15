@@ -566,7 +566,14 @@ mod tests {
         std::fs::write(&path, original).unwrap();
         let out = dir.path().join("overlay/ci.yml");
         let mut localized = Localized::default();
-        localize(&path, &out, "example/demo", &mut localized).unwrap();
+        localize(
+            &path,
+            &out,
+            "example/demo",
+            &Default::default(),
+            &mut localized,
+        )
+        .unwrap();
         assert_eq!(localized, Localized::default());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         assert!(!out.exists(), "nothing to overlay");
