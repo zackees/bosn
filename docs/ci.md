@@ -274,6 +274,10 @@ a literal `runs-on` for those jobs.
 **runner table**; any other label is `unsupported`, and the job and the
 run's `incomplete` reason name the label and say how to allow it. Plain bosn
 stacks and tasks are not gated: they run any image or Dockerfile.
+act maps some `ubuntu-*` labels (`ubuntu-20.04`, ...) to its own unpinned
+default images; bosn gates a literal `ubuntu-*` label outside the table the
+same way it gates a matrix leg, so such a job is `unsupported`, never run on
+an unpinned image.
 
 Each entry maps a label to an image that is pinned one of two ways:
 

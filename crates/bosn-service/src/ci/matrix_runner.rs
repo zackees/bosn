@@ -10,7 +10,9 @@
 //! Windows leg on Linux and calls it a pass.
 //!
 //! bosn takes that decision away from act. In the run's copy of the workflow,
-//! a job whose `runs-on` is one matrix expression ([`gate`]):
+//! a job whose `runs-on` is one matrix expression, or a literal `ubuntu-*`
+//! label outside the run's runner table (act would run it on its own unpinned
+//! default image), ([`gate`]):
 //! - runs on `ubuntu-latest`, a constant, so there is nothing to race on;
 //! - runs each of its steps only when the leg's own runner (the original
 //!   expression, evaluated per leg by the step's `if:`, which act never
@@ -78,6 +80,22 @@ impl Job {
             .contains("matrix")
             .then(|| expression.to_string())
     }
+
+    /// A literal `ubuntu-*` label the table does not allow, as a quoted
+    /// expression. act maps some of those (`ubuntu-20.04`, ...) to its own
+    /// unpinned default images, so bosn gates them instead of leaving them
+    /// to act; any other literal act already reports unsupported.
+    fn unallowed_literal(&self, runners: &RunnerTable) -> Option<String> {
+        if self.container.is_some() || self.steps.is_empty() {
+            return None;
+        }
+        let label = self.runs_on.as_ref()?.as_str()?.trim();
+        (label.starts_with("ubuntu-")
+            && !label.contains("${{")
+            && !label.contains('\'')
+            && runners.resolve(label).is_none())
+        .then(|| format!("'{label}'"))
+    }
 }
 
 /// `E` for `${{ E }}`; `None` for anything else.
@@ -103,7 +121,11 @@ pub fn gate(document: &mut Value, runners: &RunnerTable) -> Vec<String> {
         let Some(id) = id.as_str() else { continue };
         let Some(runner) = serde_yaml::from_value::<Job>(job.clone())
             .ok()
-            .and_then(|parsed| parsed.matrix_runner())
+            .and_then(|parsed| {
+                parsed
+                    .matrix_runner()
+                    .or_else(|| parsed.unallowed_literal(runners))
+            })
         else {
             continue;
         };
@@ -224,5 +246,21 @@ mod tests {
         );
         assert!(shown.contains(".github/bosn-runners.toml"), "{shown}");
         assert!(leg_reason("ubuntu-26.04").contains("not as a matrix leg"));
+    }
+
+    #[test]
+    fn a_literal_ubuntu_label_outside_the_table_is_gated_not_left_to_acts_defaults() {
+        let mut document: Value = serde_yaml::from_str(
+            "jobs:\n  old: {runs-on: ubuntu-20.04, steps: [{run: x}]}\n  new: {runs-on: ubuntu-26.04, steps: [{run: x}]}\n",
+        )
+        .unwrap();
+        assert_eq!(gate(&mut document, &RunnerTable::builtin()), ["old"]);
+        let old = &document["jobs"]["old"];
+        assert_eq!(old["runs-on"], "ubuntu-latest");
+        assert_eq!(
+            old["steps"][1]["env"]["BOSN_RUNS_ON"],
+            "${{ 'ubuntu-20.04' }}"
+        );
+        assert_eq!(document["jobs"]["new"]["runs-on"], "ubuntu-26.04");
     }
 }
