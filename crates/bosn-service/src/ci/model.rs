@@ -448,11 +448,7 @@ impl ActParser {
         }
         job.observe_start(act.time.as_deref());
         if notice == Notice::Unsupported {
-            job.status = ItemStatus::Completed;
-            job.conclusion = Some(ItemConclusion::Unsupported);
-            if job.reason.is_none() {
-                job.reason = unsupported_reason(&act.msg);
-            }
+            job.mark_unsupported(unsupported_reason(&act.msg));
         }
         // An unsupported leg stays unsupported: bosn's gate step for it
         // ([`super::matrix_runner`]) ends in a successful job.
@@ -584,6 +580,17 @@ impl From<ActResult> for ItemConclusion {
             ActResult::Skipped => Self::Skipped,
             ActResult::Cancelled => Self::Cancelled,
             ActResult::Failure => Self::Failure,
+        }
+    }
+}
+
+impl Job {
+    /// The job needs a runner bosn cannot supervise; keep the first reason.
+    fn mark_unsupported(&mut self, reason: Option<String>) {
+        self.status = ItemStatus::Completed;
+        self.conclusion = Some(ItemConclusion::Unsupported);
+        if self.reason.is_none() {
+            self.reason = reason;
         }
     }
 }
