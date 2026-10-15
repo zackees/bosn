@@ -353,7 +353,14 @@ mod tests {
         let output = root.path().join("localized.yml");
         std::fs::write(&source, "jobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: go test ./...\n      - uses: codecov/codecov-action@v5\n        if: github.repository == 'nektos/act'\n").unwrap();
         let mut changes = super::super::checkout::Localized::default();
-        super::super::checkout::localize(&source, &output, "zackees/act2", &mut changes).unwrap();
+        super::super::checkout::localize(
+            &source,
+            &output,
+            "zackees/act2",
+            &Default::default(),
+            &mut changes,
+        )
+        .unwrap();
         assert!(changes.remote_only.is_empty());
         let document: Value =
             serde_yaml::from_str(&std::fs::read_to_string(output).unwrap()).unwrap();
@@ -386,7 +393,14 @@ mod tests {
         )
         .unwrap();
         let mut changes = super::super::checkout::Localized::default();
-        super::super::checkout::localize(&source, &output, "nektos/act", &mut changes).unwrap();
+        super::super::checkout::localize(
+            &source,
+            &output,
+            "nektos/act",
+            &Default::default(),
+            &mut changes,
+        )
+        .unwrap();
         assert_eq!(
             changes.inactive_remote_steps, 0,
             "the guard selects on this repository: nothing is inactive"

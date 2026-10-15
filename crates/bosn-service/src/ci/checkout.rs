@@ -70,6 +70,7 @@ pub struct Localized {
 /// writing each changed file to the same relative path under `overlay`.
 /// `root` itself is only read.
 pub fn localize_tree(root: &Path, overlay: &Path, repository: &str) -> io::Result<Localized> {
+    let runners = super::engine::runner_images::load_table(root).map_err(io::Error::other)?;
     let yaml = |path: &Path| path.extension().is_some_and(|e| e == "yml" || e == "yaml");
     let mut files: Vec<_> = match std::fs::read_dir(root.join(".github/workflows")) {
         Ok(entries) => entries
@@ -95,7 +96,13 @@ pub fn localize_tree(root: &Path, overlay: &Path, repository: &str) -> io::Resul
     let mut localized = Localized::default();
     for file in files {
         let relative = file.strip_prefix(root).unwrap_or(&file).to_path_buf();
-        if localize(&file, &overlay.join(&relative), repository, &mut localized)? {
+        if localize(
+            &file,
+            &overlay.join(&relative),
+            repository,
+            &runners,
+            &mut localized,
+        )? {
             localized.files.push(relative);
         }
     }
@@ -109,6 +116,7 @@ pub fn localize(
     workflow: &Path,
     out: &Path,
     repository: &str,
+    runners: &bosn_core::runner_images::RunnerTable,
     localized: &mut Localized,
 ) -> io::Result<bool> {
     let text = std::fs::read_to_string(workflow)?;
@@ -120,7 +128,7 @@ pub fn localize(
     changes.inactive_remote_steps =
         super::remote_only::freeze_inactive_steps(&mut document, repository);
     changes.remote_only = super::remote_only::confine(&mut document);
-    changes.runner_gated = super::matrix_runner::gate(&mut document);
+    changes.runner_gated = super::matrix_runner::gate(&mut document, runners);
     changes.trapped = super::flush::add_traps(&mut document);
     let changed = changes != Localized::default();
     if changed {
@@ -558,7 +566,14 @@ mod tests {
         std::fs::write(&path, original).unwrap();
         let out = dir.path().join("overlay/ci.yml");
         let mut localized = Localized::default();
-        localize(&path, &out, "example/demo", &mut localized).unwrap();
+        localize(
+            &path,
+            &out,
+            "example/demo",
+            &Default::default(),
+            &mut localized,
+        )
+        .unwrap();
         assert_eq!(localized, Localized::default());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         assert!(!out.exists(), "nothing to overlay");

@@ -1,6 +1,8 @@
 //! The act command line, built only from validated semantic fields.
 
-use super::{ENGINE_CACHE, ENGINE_WORK, RunScope, SecretEnv, runner_tag, runner_tools};
+use bosn_core::runner_images::{RunnerSource, RunnerTable};
+
+use super::{ENGINE_CACHE, ENGINE_WORK, RunScope, SecretEnv, runner_tools};
 
 /// The act command, built only from validated semantic fields.
 #[derive(Clone, Debug)]
@@ -21,12 +23,54 @@ pub struct ActInvocation {
     /// inside the shared engine (#547); the lease sets its slot. `None` only
     /// in tests that drive act without serve.
     pub scope: Option<RunScope>,
+    /// The `runs-on` labels act maps (`-P label=tag`), each to its image from
+    /// the run's [`RunnerTable`]; any other label is unsupported. Images other
+    /// than the default are built or loaded before the run
+    /// ([`super::runner_images`]).
+    pub runners: Vec<(String, RunnerSource)>,
 }
 
-/// The `runs-on` labels act runs locally, all on the pinned runner image;
-/// any other is unsupported ([`super::super::matrix_runner`] decides it per matrix
-/// leg).
-pub const LOCAL_RUNNER_LABELS: [&str; 3] = ["ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04"];
+/// The labels every run maps: the built-in ones on the default image, which
+/// `act serve prepare` loads anyway.
+pub fn default_runners() -> Vec<(String, RunnerSource)> {
+    RunnerTable::builtin()
+        .entries()
+        .filter(|(_, source)| source.is_default())
+        .map(|(label, source)| (label.to_owned(), source.clone()))
+        .collect()
+}
+
+/// The labels a run maps: the default ones, plus every other table entry
+/// whose label the repository's workflow text names (`texts`), so a run
+/// builds or loads only the images it can use.
+pub fn runners_for<'a>(
+    table: &RunnerTable,
+    texts: impl IntoIterator<Item = &'a str> + Clone,
+) -> Vec<(String, RunnerSource)> {
+    table
+        .entries()
+        .filter(|(label, source)| {
+            source.is_default() || texts.clone().into_iter().any(|t| names_label(t, label))
+        })
+        .map(|(label, source)| (label.to_owned(), source.clone()))
+        .collect()
+}
+
+/// Whether `text` names `label` as a whole token, so `ubuntu-26.04-arm`
+/// does not count as `ubuntu-26.04`.
+fn names_label(text: &str, label: &str) -> bool {
+    let word = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_');
+    text.match_indices(label).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let mut rest = text[at + label.len()..].chars();
+        let continues = match rest.next() {
+            Some('.') => rest.next().is_some_and(word),
+            Some(c) => word(c),
+            None => false,
+        };
+        !before.is_some_and(|c| word(c) || c == '.') && !continues
+    })
+}
 
 impl ActInvocation {
     /// The workflow act plans: bosn's rewrite when there is one. The
@@ -75,10 +119,9 @@ impl ActInvocation {
         }
         args.extend(self.cache_route.args());
         args.extend(["--env".into(), runner_tools::path_env()]);
-        let runner = runner_tag();
-        for label in LOCAL_RUNNER_LABELS {
+        for (label, source) in &self.runners {
             args.push("-P".into());
-            args.push(format!("{label}={runner}"));
+            args.push(format!("{label}={}", source.tag()));
         }
         for (name, _) in &self.secrets.0 {
             args.push("-s".into());

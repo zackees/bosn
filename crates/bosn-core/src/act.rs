@@ -259,7 +259,9 @@ impl ActAdapterV1 {
                 return Err(refuse("invalid, duplicate or foreign required cell"));
             }
             if cell.proof_scope == ActProofScope::LocalLinux
-                && !matches!(cell.runner.as_str(), "ubuntu-latest" | "ubuntu-22.04")
+                && crate::runner_images::RunnerTable::builtin()
+                    .resolve(&cell.runner)
+                    .is_none()
             {
                 return Err(refuse(
                     "local Linux declaration cannot cover a foreign runner",
@@ -684,7 +686,9 @@ mod conformance_tests {
     #[test]
     fn unsupported_linux_runner_remains_required_as_github_only() {
         let mut config = adapter();
-        config.cells[0].runner = "ubuntu-24.04".into();
+        config.cells[0].runner = "ubuntu-26.04".into();
+        assert!(config.validate().is_ok(), "built-in runner table label");
+        config.cells[0].runner = "ubuntu-20.04".into();
         assert!(config.validate().is_err());
         config.cells[0].proof_scope = ActProofScope::GithubOnly;
         let plan =

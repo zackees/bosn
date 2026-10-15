@@ -262,8 +262,64 @@ A matrix leg is keyed by its job name plus the matrix values that name does
 not show (`CI/Native wheel (ubuntu-latest) (3.11)`), never by act's leg
 number, and sits in its job's stage. A job whose `runs-on` is a matrix
 expression is decided per leg by bosn, not act (act 0.2.88 lets the first leg
-overwrite every leg's `runs-on`): a leg whose own runner is not a local Linux
-label is `unsupported`, every time (#404).
+overwrite every leg's `runs-on`): a leg whose own runner is not a label on
+the default runner image is `unsupported`, every time (#404). A gated matrix
+job runs on the default image, so a leg on another table image (such as
+`ubuntu-26.04`) is reported unsupported rather than run on the wrong one; use
+a literal `runs-on` for those jobs.
+
+## Runner images (which `runs-on` labels run locally)
+
+`bosn ci run` runs a job only when its `runs-on` label is in the run's
+**runner table**; any other label is `unsupported`, and the job and the
+run's `incomplete` reason name the label and say how to allow it. Plain bosn
+stacks and tasks are not gated: they run any image or Dockerfile.
+act maps some `ubuntu-*` labels (`ubuntu-20.04`, ...) to its own unpinned
+default images; bosn gates a literal `ubuntu-*` label outside the table the
+same way it gates a matrix leg, so such a job is `unsupported`, never run on
+an unpinned image.
+
+Each entry maps a label to an image that is pinned one of two ways:
+
+- **by manifest digest** (`name@sha256:<64 hex>`): pulled by digest inside
+  the engine, its repo digest checked, then saved;
+- **by Dockerfile**: built inside the engine with no build context (so no
+  `COPY` of repository files), labelled `com.zackees.bosn.runner.source` with
+  the sha256 of the Dockerfile's bytes, tagged
+  `bosn/act-runner-build:<12 hex of that digest>`, then saved.
+
+Either way the image is kept as a tar in the cache volume's `images/` with a
+record of `<source digest> <image ID>`. A later run loads the tar and uses it
+only if `docker image inspect` shows the recorded image ID; a tar that fails
+is discarded and the image produced again. One lock per engine serialises
+producers, so concurrent runs build an image once. Only images the
+repository's workflows name are produced for a run.
+
+The built-in table:
+
+| label | image |
+|-------|-------|
+| `ubuntu-latest`, `ubuntu-24.04`, `ubuntu-22.04` | `catthehacker/ubuntu:act-24.04`, pinned by digest and proven by `act serve prepare` (unchanged) |
+| `ubuntu-26.04` | `crates/bosn-core/src/runner_images/ubuntu-26.04.Dockerfile`: `ubuntu:26.04` pinned by digest, apt packages pinned by an Ubuntu archive snapshot, Node 24.19.0 pinned by sha256 (where the default image keeps it), plus git, git-lfs, curl, wget, sudo, zstd, tar, gzip, unzip, zip, xz, jq, python3, build-essential, ssh and gnupg. The first run on an engine builds it (a few minutes) |
+
+A repository allows more labels in `.github/bosn-runners.toml`, read from the
+run's own source snapshot, so the declaration is versioned with the workflows
+it serves and covered by the run's recorded tree digest:
+
+```toml
+[runners."gpu-runner"]
+image = "ghcr.io/org/runner@sha256:<64 hex>"
+
+[runners."ubuntu-26.04-cuda"]
+dockerfile = ".github/runners/cuda.Dockerfile"
+```
+
+A declaration that is malformed, names an unpinned image, a Dockerfile
+outside the repository or missing, or redeclares a built-in label refuses
+the run. The machine's `config.toml` is deliberately not a place for runners:
+what a workflow's jobs run on belongs to the repository, not to whichever
+machine runs it. The fleet adapter's `local_linux` cells accept the built-in
+labels.
 
 ## Jobs only GitHub can run (`remote_only`)
 
@@ -527,8 +583,8 @@ stubbed job.
   - Every artifact is pinned in one place (`crates/bosn-service/src/ci/pins.rs`).
     act is downloaded into the cache volume from the pinned release URL; the
     tarball and the binary inside are checked against their pinned sha256s.
-    The runner image (`catthehacker/ubuntu:act-24.04`, linux/amd64, pinned by
-    manifest digest) is loaded by `act serve prepare` from the cache volume's
+    The default runner image (`catthehacker/ubuntu:act-24.04`, linux/amd64,
+    pinned by manifest digest; other labels are in "Runner images" above) is loaded by `act serve prepare` from the cache volume's
     image tar, or pulled by digest once and saved there; either way
     `docker image inspect` must then show exactly the pinned manifest, config,
     execution config and rootfs, proven against the publisher bytes the daemon

@@ -15,7 +15,8 @@ pub use bosn_core::act::ACT_VERSION;
 
 /// The runner image every `ubuntu-*` label maps to: the linux/amd64 manifest
 /// of `catthehacker/ubuntu:act-24.04`.
-pub const RUNNER_IMAGE: &str = "docker.io/catthehacker/ubuntu@sha256:4f2d5083a9d10d018c1c511eb8665cd480553c11975e78fd903a46daa830768b";
+/// It is the default entry of [`bosn_core::runner_images::RunnerTable`].
+pub const RUNNER_IMAGE: &str = bosn_core::runner_images::DEFAULT_RUNNER_IMAGE;
 /// Original PATH of the pinned runner, preserved when adding hosted tools.
 pub const RUNNER_PATH: &str = "/opt/acttoolcache/node/24.19.0/x64/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin";
 /// The config [`RUNNER_IMAGE`]'s manifest names.

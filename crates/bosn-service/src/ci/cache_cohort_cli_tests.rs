@@ -82,6 +82,7 @@ fn published_act_plans_workflows_with_typed_legacy_and_cohort_routes() {
                 secrets: Default::default(),
                 params: Default::default(),
                 scope: None,
+                runners: crate::ci::engine::default_runners(),
             }
             .args();
             args.push("-l".into());
