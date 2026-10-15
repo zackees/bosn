@@ -914,9 +914,11 @@ const PROTOCOL_SURFACE: [&str; 6] = [
 // dispatcher and zero recoveries; an older client ignores them), so no bump.
 // #500 changed only `ci/model.rs` parsing and moved its tests out; no
 // serialized type changed.
+// #642 changed only `ci/model.rs` parsing: an unsupported job now fills the
+// existing optional `reason` with its label and remedy; no type changed.
 const PROTOCOL_FINGERPRINT: (u32, &str) = (
     DAEMON_PROTOCOL,
-    "d88cd1921459d0ba68bfbbdc9fe7b0ff82bca8074ff9c6331df77f51cf31cc0a",
+    "d306e5f5d18d807cf00ddc523f3b8399540ccde351b9e53921b240f7db0eecd8",
 );
 
 #[test]
