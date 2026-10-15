@@ -14,14 +14,16 @@
 //! - runs on `ubuntu-latest`, a constant, so there is nothing to race on;
 //! - runs each of its steps only when the leg's own runner (the original
 //!   expression, evaluated per leg by the step's `if:`, which act never
-//!   writes back) is one bosn runs locally ([`LOCAL_RUNNER_LABELS`]);
+//!   writes back) is one of the run's [`RunnerTable`] labels on the default
+//!   image (the job itself runs there, so a leg on another table image would
+//!   run on the wrong one);
 //! - otherwise runs only a last step that prints [`MARK`] and that runner,
 //!   which the parser reads as the leg being unsupported.
 
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
 
-use super::engine::LOCAL_RUNNER_LABELS;
+use bosn_core::runner_images::{RunnerTable, unsupported_message};
 
 /// What the gate step prints before the leg's runner: unlikely in real output
 /// and not `::`-prefixed, so act never reads it as a workflow command.
@@ -35,10 +37,21 @@ pub const STEP_ID: &str = "bosn-unsupported-runner";
 pub fn describe(line: &str) -> String {
     match line.strip_prefix(MARK) {
         Some(runner) => format!(
-            "bosn: runs-on {} is not a local runner; this leg is unsupported",
-            runner.trim()
+            "bosn: {}; this leg is unsupported",
+            leg_reason(runner.trim())
         ),
         None => line.to_string(),
+    }
+}
+
+/// Why a gated leg did not run: its label is not in the table, or it is on
+/// an image other than the default, which a gated matrix job cannot use.
+pub fn leg_reason(runner: &str) -> String {
+    match RunnerTable::builtin().resolve(runner) {
+        Some(source) if !source.is_default() => format!(
+            "runs-on {runner} runs only as a job's literal runs-on, not as a matrix leg (#404)"
+        ),
+        _ => unsupported_message(runner),
     }
 }
 
@@ -75,7 +88,13 @@ fn unwrap_expression(text: &str) -> Option<&str> {
 
 /// Gate every job of a workflow document whose `runs-on` is a matrix
 /// expression; returns the gated job IDs.
-pub fn gate(document: &mut Value) -> Vec<String> {
+pub fn gate(document: &mut Value, runners: &RunnerTable) -> Vec<String> {
+    let local: Vec<&str> = runners
+        .entries()
+        .filter(|(_, source)| source.is_default())
+        .map(|(label, _)| label)
+        .collect();
+    let first = bosn_core::runner_images::DEFAULT_RUNNER_LABELS[0];
     let Some(jobs) = document.get_mut("jobs").and_then(Value::as_mapping_mut) else {
         return Vec::new();
     };
@@ -91,16 +110,16 @@ pub fn gate(document: &mut Value) -> Vec<String> {
         let Some(job) = job.as_mapping_mut() else {
             continue;
         };
-        gate_job(job, &runner);
+        gate_job(job, &runner, &local, first);
         gated.push(id.to_string());
     }
     gated
 }
 
-fn gate_job(job: &mut Mapping, runner: &str) {
-    let labels = serde_json::to_string(&LOCAL_RUNNER_LABELS).unwrap_or_default();
+fn gate_job(job: &mut Mapping, runner: &str, labels: &[&str], first: &str) {
+    let labels = serde_json::to_string(labels).unwrap_or_default();
     let local = format!("contains(fromJSON('{labels}'), {runner})");
-    job.insert("runs-on".into(), LOCAL_RUNNER_LABELS[0].into());
+    job.insert("runs-on".into(), first.into());
     let Some(steps) = job.get_mut("steps").and_then(Value::as_sequence_mut) else {
         return;
     };
@@ -143,7 +162,7 @@ mod tests {
     use super::*;
 
     const LOCAL: &str =
-        r#"contains(fromJSON('["ubuntu-latest","ubuntu-24.04","ubuntu-22.04"]'), matrix.os)"#;
+        r#"contains(fromJSON('["ubuntu-22.04","ubuntu-24.04","ubuntu-latest"]'), matrix.os)"#;
 
     #[test]
     fn a_matrix_runner_is_decided_per_leg_by_bosn_not_act() {
@@ -158,7 +177,10 @@ mod tests {
             .unwrap()
             .push(serde_yaml::from_str("{if: '${{ always() }}', run: echo post}").unwrap());
         document["jobs"]["wheel2"] = wheel;
-        assert_eq!(gate(&mut document), ["wheel", "wheel2"]);
+        assert_eq!(
+            gate(&mut document, &RunnerTable::builtin()),
+            ["wheel", "wheel2"]
+        );
         let wheel = &document["jobs"]["wheel"];
         assert_eq!(wheel["runs-on"], "ubuntu-latest", "nothing left to race on");
         assert_eq!(wheel["name"], "Wheel (${{ matrix.os }})");
@@ -188,7 +210,19 @@ mod tests {
         )
         .unwrap();
         let before = document.clone();
-        assert!(gate(&mut document).is_empty());
+        assert!(gate(&mut document, &RunnerTable::builtin()).is_empty());
         assert_eq!(document, before);
+    }
+
+    #[test]
+    fn an_unsupported_leg_names_its_label_and_the_remedy() {
+        let line = format!("{MARK} windows-2022");
+        let shown = describe(&line);
+        assert!(
+            shown.contains("runs-on windows-2022 has no bosn runner image"),
+            "{shown}"
+        );
+        assert!(shown.contains(".github/bosn-runners.toml"), "{shown}");
+        assert!(leg_reason("ubuntu-26.04").contains("not as a matrix leg"));
     }
 }

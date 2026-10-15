@@ -333,6 +333,20 @@ impl RunTree {
         }
     }
 
+    /// The distinct reasons unsupported jobs give, in job order.
+    pub fn unsupported_reasons(&self) -> Vec<String> {
+        let mut reasons: Vec<String> = Vec::new();
+        for job in self.jobs() {
+            if job.conclusion == Some(ItemConclusion::Unsupported)
+                && let Some(reason) = &job.reason
+                && !reasons.contains(reason)
+            {
+                reasons.push(reason.clone());
+            }
+        }
+        reasons
+    }
+
     pub fn unsupported_jobs(&self) -> Vec<String> {
         self.jobs()
             .filter(|j| j.conclusion == Some(ItemConclusion::Unsupported))
@@ -436,6 +450,9 @@ impl ActParser {
         if notice == Notice::Unsupported {
             job.status = ItemStatus::Completed;
             job.conclusion = Some(ItemConclusion::Unsupported);
+            if job.reason.is_none() {
+                job.reason = unsupported_reason(&act.msg);
+            }
         }
         // An unsupported leg stays unsupported: bosn's gate step for it
         // ([`super::matrix_runner`]) ends in a successful job.
@@ -569,6 +586,19 @@ impl From<ActResult> for ItemConclusion {
             ActResult::Failure => Self::Failure,
         }
     }
+}
+
+/// Why a job's runner is unsupported, naming its label and how to allow it:
+/// from act's "Skipping unsupported platform -- Try running with `-P L=...`"
+/// or from bosn's matrix gate line.
+fn unsupported_reason(msg: &str) -> Option<String> {
+    if let Some(runner) = msg.strip_prefix(super::matrix_runner::MARK) {
+        return Some(super::matrix_runner::leg_reason(runner.trim()));
+    }
+    let (_, rest) = msg.split_once("-P ")?;
+    let (label, _) = rest.split_once('=')?;
+    let label = label.trim_matches(|c: char| c == '[' || c == ']' || c.is_whitespace());
+    (!label.is_empty()).then(|| bosn_core::runner_images::unsupported_message(label))
 }
 
 /// What an act message announces, classified once.

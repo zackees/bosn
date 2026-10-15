@@ -99,6 +99,7 @@ impl CiRuntime {
             cache: spec.cache.clone(),
         };
         let scope = run_scope(&record.id, &intent)?;
+        let runners = super::super::engine::runner_images::runners(&self.store.source(&record.id))?;
         Ok(EnginePlan {
             act: spec.act,
             intent,
@@ -119,6 +120,7 @@ impl CiRuntime {
                 secrets: self.secrets(record)?,
                 params: record.params.clone(),
                 scope: Some(scope),
+                runners,
             },
             cache: spec.cache,
             deadline,

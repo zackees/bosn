@@ -356,6 +356,7 @@ mod tests {
             secrets: Default::default(),
             params: installer(),
             scope: None,
+            runners: crate::ci::engine::default_runners(),
         }
         .args();
         assert_eq!(args[0], "workflow_call");

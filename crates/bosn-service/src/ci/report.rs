@@ -44,7 +44,7 @@ pub fn conclude(
             } else if !tree.unsupported_jobs().is_empty() {
                 (
                     Conclusion::Incomplete,
-                    Some("some jobs need runners bosn cannot supervise".into()),
+                    Some(unsupported_summary(&tree.unsupported_reasons())),
                 )
             } else if !declared.errors.is_empty() || tree.qualified_coverage_missing(declared) {
                 (
@@ -183,6 +183,16 @@ pub fn report(
     }
 }
 
+/// The incomplete run's reason: every unsupported label and how to allow it.
+fn unsupported_summary(reasons: &[String]) -> String {
+    let base = "some jobs need runners bosn cannot supervise";
+    if reasons.is_empty() {
+        base.into()
+    } else {
+        format!("{base}: {}", reasons.join("; "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +224,16 @@ mod tests {
         let report = report(&record, Some("http://127.0.0.1:7341"), |_, _| Vec::new());
         assert_eq!(report.jobs.succeeded, 1);
         assert_eq!(report.jobs.unsupported, ["w/mac"]);
+        let reasons = record.tree.unsupported_reasons();
+        assert_eq!(
+            reasons,
+            [bosn_core::runner_images::unsupported_message(
+                "macos-latest"
+            )]
+        );
+        assert!(
+            unsupported_summary(&reasons).contains("runs-on macos-latest has no bosn runner image")
+        );
         // A job that never ran keeps its declared key, the job ID.
         assert_eq!(report.jobs.skipped, ["late"]);
         assert!(

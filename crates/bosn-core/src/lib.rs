@@ -11,6 +11,7 @@ pub mod compose;
 pub mod config;
 pub mod manifest;
 pub mod retention;
+pub mod runner_images;
 pub mod setup;
 pub mod unmanaged;
 

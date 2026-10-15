@@ -49,9 +49,10 @@ mod tool_recovery;
 use act_install::act_archive;
 pub(crate) use act_install::install_act_script;
 mod invocation;
-pub use invocation::{ActInvocation, LOCAL_RUNNER_LABELS};
+pub use invocation::{ActInvocation, default_runners, runners_for};
 mod lines;
 mod run_scope;
+pub mod runner_images;
 pub use run_scope::{Closed, MAX_SLOTS, RunLimits, RunScope, ToolCacheSave, doctor_args};
 mod runner_tools;
 mod toolcache;
@@ -765,6 +766,12 @@ impl ActEngineBackend for DockerActBackend {
                 PULL_DEADLINE,
             )
             .await?;
+            // Runner images other than the default, from the run's table:
+            // loaded from the cache volume or produced once, then proven.
+            for script in runner_images::ensure_scripts(&invocation.runners) {
+                self.checked("runner image", Self::exec(engine, &script), PULL_DEADLINE)
+                    .await?;
+            }
             if let Some(scope) = &invocation.scope {
                 let admitted = self
                     .checked(
