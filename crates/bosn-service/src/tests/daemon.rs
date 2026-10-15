@@ -918,7 +918,7 @@ const PROTOCOL_SURFACE: [&str; 6] = [
 // existing optional `reason` with its label and remedy; no type changed.
 const PROTOCOL_FINGERPRINT: (u32, &str) = (
     DAEMON_PROTOCOL,
-    "d306e5f5d18d807cf00ddc523f3b8399540ccde351b9e53921b240f7db0eecd8",
+    "37c6dbfa7b97fd842f8863cce0b47d531a914624570420c45e215a9fafb90282",
 );
 
 #[test]
