@@ -90,21 +90,20 @@ impl Layout {
         *self.slot(window) = Presence::Absent;
     }
 
-    /// Only explicit commands create compact windows; activity never does.
-    pub fn has_compact_window(&self) -> bool {
-        self.bubble != Presence::Absent || self.panel != Presence::Absent
+    /// Only an explicit Show creates the bubble; activity never does.
+    pub fn has_bubble(&self) -> bool {
+        self.bubble != Presence::Absent
     }
 
-    /// Hide compact surfaces if live placement disappears, without taking focus.
+    /// Hide the bubble once a tray host shows the status, or once its
+    /// placement is gone, without taking focus. The panel is the user's: it
+    /// does not depend on placement and only their clicks hide it.
     pub fn status_steps(&self, hosted: bool, positioned: bool) -> Vec<Step> {
-        let mut steps = Vec::new();
         if self.bubble == Presence::Shown && (hosted || !positioned) {
-            steps.push(Step::Hide(Window::Bubble));
+            vec![Step::Hide(Window::Bubble)]
+        } else {
+            Vec::new()
         }
-        if self.panel == Presence::Shown && !positioned {
-            steps.push(Step::Hide(Window::Panel));
-        }
-        steps
     }
 
     /// An explicit Show reveals details without toggling an already open panel.
@@ -210,19 +209,30 @@ mod tests {
     }
 
     #[test]
-    fn placement_loss_hides_explicit_details_without_stealing_focus() {
+    fn the_panel_stays_open_without_placement_or_a_tray() {
         let mut layout = Layout::default();
-        for step in layout.plan(WidgetCommand::Toggle) {
-            layout.record(&step);
+        apply(&mut layout, WidgetCommand::Toggle);
+        assert!(!layout.has_bubble(), "the panel is not the bubble");
+        for hosted in [false, true] {
+            for positioned in [false, true] {
+                assert!(layout.status_steps(hosted, positioned).is_empty());
+            }
         }
-        assert!(layout.has_compact_window());
+        assert_eq!(layout.presence(Window::Panel), Presence::Shown);
+    }
+
+    #[test]
+    fn the_bubble_hides_for_a_tray_host_or_lost_placement() {
+        let mut layout = Layout::default();
+        apply(&mut layout, WidgetCommand::Show);
+        assert!(layout.has_bubble());
         assert!(layout.status_steps(false, true).is_empty());
-        let hidden = layout.status_steps(true, false);
-        assert_eq!(hidden, vec![Step::Hide(Window::Panel)]);
-        for step in hidden {
-            layout.record(&step);
+        for (hosted, positioned) in [(true, true), (false, false)] {
+            assert_eq!(
+                layout.status_steps(hosted, positioned),
+                vec![Step::Hide(Window::Bubble)]
+            );
         }
-        assert!(layout.status_steps(false, true).is_empty());
     }
 
     #[test]

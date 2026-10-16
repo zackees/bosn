@@ -134,8 +134,18 @@ impl Windows {
         self.perform(self.layout.plan(command), views, client).await
     }
 
-    async fn show_panel(&mut self, views: &ExternalWebviewClient, client: &Client) -> Flow {
+    /// An explicit Show (a second `bosn widget`): open the details panel,
+    /// and the status bubble too when no tray host shows the status.
+    async fn reveal(
+        &mut self,
+        hosted: bool,
+        views: &ExternalWebviewClient,
+        client: &Client,
+    ) -> Flow {
         self.forget_closed().await;
+        if !hosted {
+            let _ = self.apply(WidgetCommand::Show, views, client).await;
+        }
         self.perform(self.layout.show_panel_steps(), views, client)
             .await
     }
@@ -168,7 +178,9 @@ impl Windows {
         views: &ExternalWebviewClient,
         client: &Client,
     ) {
-        let positioned = self.layout.has_compact_window() && crate::placement::configured().await;
+        // Only the bubble needs the compositor's placement; probe it only
+        // while a bubble exists.
+        let positioned = self.layout.has_bubble() && crate::placement::configured().await;
         for step in self.layout.status_steps(hosted, positioned) {
             if self.execute(&step, views, client).await {
                 self.layout.record(&step);
@@ -207,7 +219,7 @@ impl Windows {
                 ok
             }
             Step::Show(window) => {
-                if *window != Window::Full && !crate::placement::configured().await {
+                if *window == Window::Bubble && !crate::placement::configured().await {
                     if let Some(handle) = self.slot(*window) {
                         let _ = handle.hide().await;
                     }
@@ -254,14 +266,16 @@ async fn grant(client: &Client, path: &str) -> Option<WebviewUrlGrant> {
     WebviewUrlGrant::new(&page_url(client, path).await?).ok()
 }
 
-/// Open `window` on a daemon page, presented for this display.
+/// Open `window` on a daemon page, presented for this display. The panel
+/// and full view always open: compositor placement only positions the panel.
+/// The undecorated bubble needs it, or it would float wherever it landed.
 async fn open(
     views: &ExternalWebviewClient,
     client: &Client,
     window: Window,
     path: &str,
 ) -> Option<WebviewHandle> {
-    if window != Window::Full && !crate::placement::configured().await {
+    if window == Window::Bubble && !crate::placement::configured().await {
         return None;
     }
     let url = page_url(client, path).await?;
@@ -348,8 +362,8 @@ pub async fn run(views: ExternalWebviewClient, state_dir: std::path::PathBuf, ex
         match widget(&client, CiRequest::WidgetPoll { pid }).await {
             Ok(reply) => {
                 for command in reply.commands {
-                    let flow = if command == WidgetCommand::Show && online {
-                        windows.show_panel(&views, &client).await
+                    let flow = if command == WidgetCommand::Show {
+                        windows.reveal(online, &views, &client).await
                     } else {
                         windows.apply(command, &views, &client).await
                     };

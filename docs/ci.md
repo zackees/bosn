@@ -154,16 +154,28 @@ session, keeps status in the desktop tray, and opens daemon pages only when
 requested, each signed in with its own single-use grant:
 
 - a **system-tray icon** on Linux desktops with a StatusNotifierItem host (KDE
-  Plasma and compatible trays): always active, with current CI status in its
-  title/tooltip. Clicking toggles details; its menu opens the dashboard or quits;
+  Plasma and compatible trays): always active, with what is running and how
+  the last run ended in its tooltip. Clicking it, or **Show activity** in its
+  menu, pops the activity panel up or down; the menu also opens the dashboard
+  or quits;
 - a small **bubble** (`/widget/bubble`) when a tray host is unavailable: running,
   queued and failed counts, coloured by the worst state. It opens only on an
   explicit request with live KDE dock placement; host loss and activity never
   open it. Other desktops keep compact windows hidden until a supported dock
   placement strategy is available (kernal-api#393);
-- a **panel** (`/widget/panel`), toggled from the bubble: runs across
-  workspaces with actor, branch, SHA (`+dirty`) and progress, plus runner
-  controls;
+- an **activity panel** (`/widget/panel`), toggled from the tray icon or the
+  bubble. It shows:
+  - running, queued, failed (last 24 hours) and slot counts;
+  - a banner when queued runs are held (drained, every slot busy, cache
+    clearing, a stalled dispatcher) with its one-click remedy;
+  - runs across workspaces, filterable to active or failed, each with
+    workflow and job, repository, branch, SHA (`dirty`), actor, live elapsed
+    time and job progress. Click a run to open it in the dashboard; hover it
+    to retry or cancel;
+  - runner controls under **Manage runners**: concurrency, drain or resume,
+    cache size, pruning, clearing and quit.
+
+  Esc or ✕ hides it;
 - one **full view** (the dashboard).
 
 The pages never call native code. A click POSTs to the daemon
@@ -225,15 +237,19 @@ silent.
 opened once, at its final size, and then reused:
 
 - The bubble is undecorated and transparent, and asks to stay above other
-  windows and out of the taskbar. Compact windows are created only when the
-  installed KDE Wayland dock placement is enabled, loaded and executing its
-  geometry handler. Bounded live probes require a fresh compositor-owned
-  readiness transition after successful geometry readback; stale configuration
-  or an unloaded/failed script keeps compact windows hidden. No fixed top-left or
+  windows and out of the taskbar. It is created only when the installed KDE
+  Wayland dock placement is enabled, loaded and executing its geometry handler.
+  Bounded live probes require a fresh compositor-owned readiness transition
+  after successful geometry readback; stale configuration or an
+  unloaded/failed script keeps the bubble hidden. No fixed top-left or
   compositor-default center position is requested. A portable work-area
   capability remains tracked in zackees/kernal-api#393.
-- The panel is shown and hidden by explicit clicks; startup and activity never
-  open it or take focus. It is not closed and reopened.
+- The activity panel always opens when asked; it never waits on placement.
+  It asks to stay above other windows. Where the placement script runs, the
+  script puts it in the corner. Elsewhere, or with a stalled script, it opens
+  where the compositor puts it, with a title bar to move or close it. It
+  is shown and hidden by explicit clicks; startup and activity never open it
+  or take focus. It is not closed and reopened.
 - The full view navigates to the new page and takes focus, so there is only
   ever one.
 

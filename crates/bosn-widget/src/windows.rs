@@ -15,7 +15,7 @@ pub const APP_ID: &str = "dev.bosn.widget";
 pub enum Window {
     /// The dock-adjacent status fallback when the tray host is absent.
     Bubble,
-    /// The panel the bubble toggles.
+    /// The activity popup the tray icon (or bubble) toggles.
     Panel,
     /// The one full-view dashboard window.
     Full,
@@ -37,7 +37,7 @@ impl Window {
         match self {
             // The ring is 52 px plus a 4 px focus outline on each side.
             Self::Bubble => (72, 72),
-            Self::Panel => (420, 640),
+            Self::Panel => (440, 620),
             Self::Full => (1280, 800),
         }
     }
@@ -71,7 +71,11 @@ impl Window {
                     .always_on_top(true)
                     .skip_taskbar(true))
             }
-            Self::Panel | Self::Full => Ok(options),
+            // A tray popup: above other windows so a click always shows it,
+            // but decorated so it can be moved and closed where no
+            // placement script puts it in the corner.
+            Self::Panel => Ok(options.always_on_top(true)),
+            Self::Full => Ok(options),
         }
     }
 }
@@ -126,15 +130,15 @@ mod tests {
     }
 
     #[test]
-    fn the_panel_and_full_view_are_ordinary_decorated_windows() {
-        for (window, title, size) in [
-            (Window::Panel, "bosn panel", (420, 640)),
-            (Window::Full, "bosn", (1280, 800)),
+    fn the_panel_pops_up_above_and_the_full_view_is_ordinary() {
+        for (window, title, size, above) in [
+            (Window::Panel, "bosn panel", (440, 620), true),
+            (Window::Full, "bosn", (1280, 800), false),
         ] {
             let options = window.options(support(BestEffort::Requested)).unwrap();
             assert!(options.has_decorations());
             assert!(!options.is_transparent());
-            assert!(!options.is_always_on_top());
+            assert_eq!(options.is_always_on_top(), above);
             assert!(!options.skips_taskbar());
             assert_eq!(options.logical_position(), None);
             assert_eq!(options.title(), title);

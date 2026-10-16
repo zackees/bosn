@@ -1,4 +1,5 @@
-//! Permit compact windows only with installed compositor-owned dock placement.
+//! Whether the installed compositor-owned dock placement is live. The bubble
+//! needs it; the panel only uses it to sit in the corner.
 
 use std::{future::Future, io::Read, path::PathBuf, time::Duration};
 
@@ -63,8 +64,8 @@ impl Readiness {
         (self == Self::StalePulse).then_some(
             "KWin reports placement script bosn-widget-corner loaded, but its readiness \
              pulse did not change within 12 probes (1.2s); the script is likely stopped. \
-             Compact panel refused. Recover with `bosn widget install`, which reloads only \
-             the owned placement script.",
+             The panel opens unplaced and the fallback bubble stays hidden. Recover with \
+             `bosn widget install`, which reloads only the owned placement script.",
         )
     }
 }
@@ -151,8 +152,12 @@ fn installed_configuration() -> bool {
 }
 
 pub async fn configured() -> bool {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let readiness = live_ready(installed_configuration(), bus).await;
-    if let Some(message) = readiness.diagnostic() {
+    // Once per process: the check repeats while a bubble is up.
+    if let Some(message) = readiness.diagnostic()
+        && !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
         eprintln!("bosn-widget: {message}");
     }
     readiness == Readiness::Ready
