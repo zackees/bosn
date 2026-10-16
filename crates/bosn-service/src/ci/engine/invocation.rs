@@ -26,7 +26,7 @@ pub struct ActInvocation {
 /// The `runs-on` labels act runs locally, all on the pinned runner image;
 /// any other is unsupported ([`super::super::matrix_runner`] decides it per matrix
 /// leg).
-pub const LOCAL_RUNNER_LABELS: [&str; 3] = ["ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04"];
+pub const LOCAL_RUNNER_LABELS: [&str; 4] = ["ubuntu-latest", "ubuntu-26.04", "ubuntu-24.04", "ubuntu-22.04"];
 
 impl ActInvocation {
     /// The workflow act plans: bosn's rewrite when there is one. The
