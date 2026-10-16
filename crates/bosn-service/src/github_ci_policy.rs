@@ -156,15 +156,55 @@ impl CiPolicy {
     /// and a job that sends something else is not using this proxy as
     /// designed.
     pub fn authorize(&self, authorization: Option<&str>) -> Result<(), &'static str> {
-        let _ = authorization;
-        Ok(()) // RED: stub
+        let Some(value) = authorization else {
+            return Err("no Authorization header; send the job's GITHUB_TOKEN");
+        };
+        let token = value
+            .strip_prefix("Bearer ")
+            .or_else(|| value.strip_prefix("bearer "))
+            .or_else(|| value.strip_prefix("token "))
+            .map(str::trim);
+        match token {
+            Some(token) if self.fake.matches(token) => Ok(()),
+            Some(token) if FakeToken::looks_fake(token) => {
+                Err("token belongs to another bosn run; only this run's GITHUB_TOKEN is accepted")
+            }
+            _ => Err("foreign token refused; only this run's bosn GITHUB_TOKEN is accepted"),
+        }
     }
 
     /// Decide one authorized request. `path` is the encoded path without
     /// the query; `body` is the request body (only `POST /graphql` has one).
     pub fn decide(&self, method: &str, path: &str, query: Option<&str>, body: &[u8]) -> Decision {
-        let _ = (method, path, query, body);
-        Decision::Forward // RED: stub
+        if crate::github_proxy::canonical_path(path).is_err() {
+            return Decision::Refuse(403, "path is not a canonical API path");
+        }
+        match method {
+            "GET" | "HEAD" => {
+                if crate::github_proxy::check_request(method, path).is_ok() || self.is_ci_read(path)
+                {
+                    Decision::Forward
+                } else {
+                    Decision::Refuse(403, "endpoint is not on the read allowlist")
+                }
+            }
+            "POST" if path == "/graphql" => {
+                if graphql_is_query(body) {
+                    Decision::Forward
+                } else {
+                    Decision::Refuse(403, "only GraphQL queries are forwarded, never mutations")
+                }
+            }
+            "DELETE" if self.is_cache_delete(path, query) => match self.writes {
+                GithubWrites::Off => Decision::Refuse(
+                    403,
+                    "writes are off for this run; pass --github-writes=dry-run or on",
+                ),
+                GithubWrites::DryRun => Decision::DryRun,
+                GithubWrites::On => Decision::Forward,
+            },
+            _ => Decision::Refuse(403, "method and endpoint are not on the write allowlist"),
+        }
     }
 
     /// `/repos/{own}/{rest}` → `rest`, comparing owner and name the way

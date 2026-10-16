@@ -70,9 +70,43 @@ echo "bosn: api.github.com goes through this run's GitHub proxy ($proxy); GITHUB
 /// overlay's copy when bosn already rewrote the file). Returns the number of
 /// jobs given the step.
 pub fn inject(source: &Path, overlay: &Path, step: &Value) -> io::Result<usize> {
-        let _ = (source, overlay, step);
-        Ok(0) // RED: stub
+    let workflows = source.join(".github/workflows");
+    let entries = match std::fs::read_dir(&workflows) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut files: Vec<_> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "yml" || e == "yaml"))
+        .collect();
+    files.sort();
+    let mut total = 0;
+    for file in files {
+        let relative = file.strip_prefix(source).unwrap_or(&file);
+        let out = overlay.join(relative);
+        let input = if out.is_file() {
+            out.clone()
+        } else {
+            file.clone()
+        };
+        let text = std::fs::read_to_string(&input)?;
+        let mut document: Value = serde_yaml::from_str(&text).map_err(io::Error::other)?;
+        let added = prepend(&mut document, step);
+        if added > 0 {
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(
+                &out,
+                serde_yaml::to_string(&document).map_err(io::Error::other)?,
+            )?;
+            total += added;
+        }
     }
+    Ok(total)
+}
 
 fn prepend(document: &mut Value, step: &Value) -> usize {
     let Some(jobs) = document.get_mut("jobs").and_then(Value::as_mapping_mut) else {

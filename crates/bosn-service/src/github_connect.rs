@@ -166,8 +166,64 @@ pub struct Inner {
 /// either the intercepted TLS session or a blind tunnel. Errors only end
 /// this connection. `log` receives one line per refused CONNECT.
 pub fn serve_client(stream: TcpStream, ca: &InterceptCa, inner: &Inner, log: &dyn Fn(String)) {
-        let _ = (stream, ca, inner, log); // RED: stub
+    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+    let Ok(mut reader) = stream.try_clone().map(BufReader::new) else {
+        return;
+    };
+    let mut writer = stream;
+    let head = match http1::read_head(&mut reader) {
+        Ok(Some(head)) => head,
+        _ => return,
+    };
+    let mut parts = head.start.split(' ');
+    let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+    if method != "CONNECT" {
+        log(format!(
+            "[github-api-proxy] {method} (not CONNECT) -> 405 refused; only HTTPS_PROXY tunnels are served"
+        ));
+        let _ = writer.write_all(
+            b"HTTP/1.1 405 Method Not Allowed\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+        );
+        return;
     }
+    let Some((host, port)) = target
+        .rsplit_once(':')
+        .and_then(|(h, p)| Some((h.to_ascii_lowercase(), p.parse::<u16>().ok()?)))
+    else {
+        let _ = writer.write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n");
+        return;
+    };
+    if !reader.buffer().is_empty() {
+        // A client never sends tunnel bytes before the 200.
+        return;
+    }
+    let ok = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+    if host == INTERCEPTED_HOST && port == 443 {
+        if writer.write_all(ok).is_err() {
+            return;
+        }
+        let Ok(tls) = ca.acceptor.accept(writer) else {
+            return;
+        };
+        let _ = serve_intercepted(tls, inner);
+    } else {
+        let Some(upstream) = (host.as_str(), port)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut addrs| {
+                addrs.find_map(|a| TcpStream::connect_timeout(&a, Duration::from_secs(15)).ok())
+            })
+        else {
+            let _ = writer.write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n");
+            return;
+        };
+        if writer.write_all(ok).is_err() {
+            return;
+        }
+        tunnel(writer, upstream);
+    }
+}
 
 /// Copy bytes both ways until either side closes.
 fn tunnel(client: TcpStream, upstream: TcpStream) {
