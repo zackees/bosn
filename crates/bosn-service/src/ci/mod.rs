@@ -65,6 +65,7 @@ pub mod config;
 pub mod engine;
 pub mod events;
 pub mod flush;
+pub mod github;
 pub mod lifecycle;
 pub mod limits;
 pub mod machine;

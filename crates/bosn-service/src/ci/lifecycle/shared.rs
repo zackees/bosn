@@ -112,11 +112,31 @@ async fn in_scope(
         Ok(scope) => scope,
         Err(error) => return (ExecutionEnd::EngineFailed(error), CleanupEnd::Removed),
     };
-    let invocation = ActInvocation {
+    let mut invocation = ActInvocation {
         scope: Some(scope.clone()),
         ..plan.invocation.clone()
     };
     let engine = lease.engine_id.as_str();
+    if let Some(github) = &plan.github {
+        // The relay must listen before act starts any job (#650).
+        match github.attach(backend, engine, &scope).await {
+            Ok(port) => {
+                invocation
+                    .params
+                    .env
+                    .insert(crate::github_bootstrap::PORT_ENV.into(), port.to_string());
+                observer.note(&format!(
+                    "GitHub proxy relay listening in the engine on port {port}"
+                ));
+            }
+            Err(error) => {
+                return (
+                    ExecutionEnd::EngineFailed(format!("github proxy relay: {error}")),
+                    CleanupEnd::Removed,
+                );
+            }
+        }
+    }
     let end = execute(
         backend,
         shared,
@@ -129,6 +149,11 @@ async fn in_scope(
         peak,
     )
     .await;
+    if let Some(github) = &plan.github
+        && let Err(error) = github.detach(backend, engine).await
+    {
+        observer.note(&format!("GitHub proxy relay not stopped cleanly: {error}"));
+    }
     let cleanup = match close_scope(backend, engine, &scope, observer, laps).await {
         Ok(()) => CleanupEnd::Removed,
         Err(error) => CleanupEnd::Failed(error),

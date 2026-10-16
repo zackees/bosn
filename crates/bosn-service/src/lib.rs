@@ -66,7 +66,14 @@ pub mod docker_api;
 pub mod docker_proxy;
 mod executors;
 mod gc_apply;
+pub mod github_bootstrap;
+pub mod github_ci_policy;
+#[cfg(target_os = "linux")]
+pub mod github_connect;
+pub mod github_http1;
 pub mod github_proxy;
+#[cfg(target_os = "linux")]
+pub mod github_relay;
 mod handoff;
 pub use handoff::IdleHandoff;
 mod job_api;

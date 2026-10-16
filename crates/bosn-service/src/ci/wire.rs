@@ -3,6 +3,7 @@
 
 use std::{path::Path, time::Duration};
 
+use crate::github_ci_policy::GithubWrites;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -90,6 +91,10 @@ pub struct SubmitRequest {
     /// Opt-in daemon-owned secrets by name (only `github_token`).
     #[serde(default)]
     pub secrets: Vec<String>,
+    /// `--github-proxy` (#650): a per-run fake `GITHUB_TOKEN` swapped for the
+    /// host credential by the daemon, with this writes mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_proxy: Option<GithubWrites>,
     /// Workflow inputs, a matrix filter and extra env (#430).
     #[serde(default, skip_serializing_if = "RunParams::is_empty")]
     pub params: RunParams,
@@ -150,6 +155,9 @@ impl SubmitRequest {
                 .any(|s| crate::secrets::secret_env_name(s).is_none())
         {
             return refuse("unknown secret (only github_token is supported)");
+        }
+        if self.github_proxy.is_some() && !self.secrets.is_empty() {
+            return refuse("--github-proxy replaces --github-token; pass one of them");
         }
         self.params
             .validate(self.trigger)
@@ -320,6 +328,9 @@ pub struct RunRecord {
     /// Opt-in secret names; values never leave the daemon's secret store.
     #[serde(default)]
     pub secrets: Vec<String>,
+    /// `--github-proxy` and its writes mode (#650); no value is recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_proxy: Option<GithubWrites>,
     pub log_records: u64,
     #[serde(default)]
     pub tree: RunTree,
@@ -367,6 +378,7 @@ impl RunRecord {
             retry_of: None,
             timeout_secs: request.timeout().as_secs(),
             secrets: request.secrets.clone(),
+            github_proxy: request.github_proxy,
             log_records: 0,
             tree: RunTree::default(),
             params: request.params.clone(),
@@ -431,6 +443,7 @@ impl RunRecord {
             payload_sha256: self.payload_sha256.clone(),
             timeout_secs: self.timeout_secs,
             secrets: self.secrets.clone(),
+            github_proxy: self.github_proxy,
             params: self.params.clone(),
         }
     }

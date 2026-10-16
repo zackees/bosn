@@ -44,6 +44,12 @@ cmd = "soldr toolchain ensure --json && soldr cargo check -p bosn-service --lock
 stack = "test"
 cmd = "soldr toolchain ensure --json && soldr cargo test -p bosn-service --lib ci::engine --locked && soldr cargo test -p bosn-service --lib ci::pins --locked && uv run --no-project --with pytest pytest tests/test_runner_tools.py"
 
+# Focused isolated tests of `bosn ci run --github-proxy` (#650): the policy,
+# the CONNECT front, the relay scripts and the bootstrap step.
+[task.github-proxy-test]
+stack = "test"
+cmd = "soldr toolchain ensure --json && soldr cargo test -p bosn-service --lib github --locked"
+
 # Focused isolated protocol-boundary tests; shares the existing Rust build state.
 [task.ci-capabilities-test]
 stack = "test"

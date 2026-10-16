@@ -12,6 +12,9 @@ pub(crate) struct RunObserver {
     pub(crate) job: Option<String>,
     /// Masks secret values in act output before it is parsed or stored.
     pub(crate) masker: SecretMasker,
+    /// `--github-proxy` (#650): the proxy's per-request lines, already free
+    /// of token values, appended to the run log as they come.
+    pub(crate) proxy_logs: Option<kernal_api::async_engine::Receiver<String>>,
     pub(crate) seq: u64,
     pub(crate) last_publish: Instant,
 }
@@ -45,6 +48,27 @@ impl RunObserver {
         });
     }
 
+    /// Append the GitHub proxy's pending lines (masked like act output).
+    pub(crate) fn drain_proxy(&mut self) {
+        let mut lines = Vec::new();
+        if let Some(rx) = &mut self.proxy_logs {
+            while let Ok(line) = rx.try_recv() {
+                lines.push(line);
+            }
+        }
+        for line in lines {
+            let seq = self.next_seq();
+            let text = self.masker.mask_text(&line);
+            self.append(LogRecord {
+                seq,
+                stream: "bosn".into(),
+                job: None,
+                section: None,
+                text,
+            });
+        }
+    }
+
     pub(crate) fn next_seq(&mut self) -> u64 {
         self.seq += 1;
         self.seq
@@ -53,6 +77,7 @@ impl RunObserver {
 
 impl EngineObserver for RunObserver {
     fn note(&mut self, text: &str) {
+        self.drain_proxy();
         let seq = self.next_seq();
         self.append(LogRecord {
             seq,
@@ -68,11 +93,13 @@ impl EngineObserver for RunObserver {
         self.publish();
     }
     fn tick(&mut self) {
+        self.drain_proxy();
         if self.last_publish.elapsed() > PUBLISH_INTERVAL {
             self.publish();
         }
     }
     fn line(&mut self, line: EngineLine) {
+        self.drain_proxy();
         // A line the parser drops (bosn's end-of-output mark) takes no seq.
         let seq = self.seq + 1;
         let record = match line {

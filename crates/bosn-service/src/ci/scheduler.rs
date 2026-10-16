@@ -20,6 +20,8 @@ pub struct RunKey {
     pub payload_sha256: String,
     pub timeout_secs: u64,
     pub secrets: Vec<String>,
+    /// `--github-proxy` (#650): a different run when it differs.
+    pub github_proxy: Option<crate::github_ci_policy::GithubWrites>,
     /// Inputs, matrix filter and env (#430): a different run when they differ.
     pub params: super::params::RunParams,
 }
@@ -147,6 +149,7 @@ mod tests {
             payload_sha256: "p".into(),
             timeout_secs: 60,
             secrets: Vec::new(),
+            github_proxy: None,
             params: Default::default(),
         }
     }

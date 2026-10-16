@@ -111,6 +111,7 @@ fn fake_record() -> crate::ci::RunRecord {
         pr_number: None,
         timeout_secs: None,
         secrets: Vec::new(),
+        github_proxy: None,
         params: Default::default(),
     };
     crate::ci::RunRecord::queued(

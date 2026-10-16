@@ -35,6 +35,11 @@ base64 = "=0.22.1"
 futures-util = "=0.3.34"
 time = { version = "=0.3.55", features = ["formatting", "parsing"] }
 
+# The per-run CA and TLS of `bosn ci run --github-proxy` (#650), Linux
+# only; it is already in the lock through kernal-api's TLS on Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl = "=0.10.81"
+
 [dev-dependencies]
 native-tls = "=0.2.18"
 tempfile = "=3.27.0"
