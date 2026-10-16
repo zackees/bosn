@@ -107,6 +107,9 @@ impl RunScope {
     pub fn key(&self) -> &str {
         &self.key
     }
+    pub fn slot(&self) -> u16 {
+        self.slot
+    }
     pub fn label(&self) -> &str {
         &self.label
     }

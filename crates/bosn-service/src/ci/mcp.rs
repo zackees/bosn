@@ -136,6 +136,12 @@ struct RunArgs {
     timeout_secs: Option<u64>,
     #[serde(default)]
     github_token: bool,
+    /// `--github-proxy` (#650): a per-run stand-in token, swapped by the daemon.
+    #[serde(default)]
+    github_proxy: bool,
+    /// `--github-writes`; only with `github_proxy`.
+    #[serde(default)]
+    github_writes: Option<crate::github_ci_policy::GithubWrites>,
     /// `--input`, `--matrix` and `--env` (#430), validated with the plan.
     #[serde(default)]
     inputs: std::collections::BTreeMap<String, String>,
@@ -172,6 +178,8 @@ impl RunArgs {
             } else {
                 Vec::new()
             },
+            github_proxy: (self.github_proxy || self.github_writes.is_some())
+                .then(|| self.github_writes.unwrap_or_default()),
         }
     }
 }
@@ -354,6 +362,8 @@ fn run_schema() -> Value {
             "pr_title": {"type": "string", "maxLength": 4096, "description": "Synthetic PR title (trigger pr only); recorded in run identity."},
             "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 43200},
             "github_token": {"type": "boolean", "description": "Pass the daemon-owned github_token to the workflow."},
+            "github_proxy": {"type": "boolean", "description": "Give jobs a per-run stand-in GITHUB_TOKEN that the daemon swaps for the host's gh credential on allowlisted api.github.com calls; the real token never enters a container."},
+            "github_writes": {"type": "string", "enum": ["off", "dry-run", "on"], "description": "With github_proxy: allowlisted writes (Actions cache deletes) are refused (off, the default), logged and answered without being sent (dry-run), or sent (on)."},
             "inputs": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Workflow inputs (trigger workflow_dispatch or workflow_call)."},
             "matrix": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Run only the matrix legs whose key has this value (act --matrix K:V)."},
             "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra job environment (act --env K=V); never a secret."}

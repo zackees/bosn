@@ -32,6 +32,8 @@ pub struct SubmitOptions {
     pub timeout_secs: Option<u64>,
     /// Opt-in daemon-owned secrets by name (`github_token`).
     pub secrets: Vec<String>,
+    /// `--github-proxy` and its writes mode (#650).
+    pub github_proxy: Option<crate::github_ci_policy::GithubWrites>,
     /// Workflow inputs, a matrix filter and extra env (#430).
     pub params: RunParams,
 }
@@ -182,6 +184,7 @@ pub async fn stage_submission(
         pr_number: options.pr_number,
         timeout_secs: options.timeout_secs,
         secrets: options.secrets,
+        github_proxy: options.github_proxy,
         params: options.params,
     })
 }

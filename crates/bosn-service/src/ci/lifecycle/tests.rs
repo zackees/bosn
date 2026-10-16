@@ -74,6 +74,7 @@ pub fn plan(run: &str, deadline: Duration) -> EnginePlan {
         cache: test_cache(),
         deadline: async_engine::Deadline::after(deadline),
         shared: shared_plan(run),
+        github: None,
     }
 }
 /// The shared engine a plan for `run` would make: the run's engine shape,

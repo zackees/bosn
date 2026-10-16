@@ -646,6 +646,13 @@ act as `-s GITHUB_TOKEN`.
 - A missing secret runs anonymously, which GitHub limits to 60 API requests
   per hour. A refused secret (wrong permissions, or a symlink) fails the run.
 
+`bosn ci run --github-proxy [--github-writes=off|dry-run|on]` (#650) runs
+jobs with a per-run stand-in `GITHUB_TOKEN`. The daemon swaps it for the
+host's `gh auth token` on allowlisted `api.github.com` calls, which reach it
+through `HTTPS_PROXY`. The real token never enters a container. Writes are a
+closed list (Actions cache deletes in the run's own repository) and stay off
+unless dry-run or on. See [github-api-proxy.md](github-api-proxy.md#bosn-ci-run---github-proxy-650).
+
 ## State
 
 All runtime state is under the daemon state directory (`ci/`):

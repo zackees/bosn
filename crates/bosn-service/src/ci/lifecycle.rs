@@ -44,6 +44,9 @@ pub struct EnginePlan {
     pub deadline: async_engine::Deadline,
     /// The shared engine to make when there is none (#547).
     pub shared: super::spare::SparePlan,
+    /// `--github-proxy` (#650): the run's proxy, attached once the run has
+    /// a scope in the engine.
+    pub github: Option<std::sync::Arc<super::github::RunGithub>>,
 }
 
 /// How the workflow execution itself ended.

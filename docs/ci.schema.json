@@ -654,6 +654,26 @@
       ],
       "type": "object"
     },
+    "GithubWrites": {
+      "description": "`--github-writes`: what happens to an allowlisted write.",
+      "oneOf": [
+        {
+          "const": "off",
+          "description": "Refused with 403, like every write outside the allowlist.",
+          "type": "string"
+        },
+        {
+          "const": "dry-run",
+          "description": "Logged and answered `204` without being forwarded.",
+          "type": "string"
+        },
+        {
+          "const": "on",
+          "description": "Forwarded with the real credential.",
+          "type": "string"
+        }
+      ]
+    },
     "Group": {
       "properties": {
         "jobs": {
@@ -1626,6 +1646,17 @@
             "null"
           ]
         },
+        "github_proxy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GithubWrites"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`--github-proxy` and its writes mode (#650); no value is recorded."
+        },
         "id": {
           "type": "string"
         },
@@ -2175,6 +2206,17 @@
             "string",
             "null"
           ]
+        },
+        "github_proxy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GithubWrites"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`--github-proxy` (#650): a per-run fake `GITHUB_TOKEN` swapped for the\nhost credential by the daemon, with this writes mode."
         },
         "job": {
           "type": [
