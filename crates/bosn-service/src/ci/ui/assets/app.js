@@ -82,45 +82,97 @@ async function showRun() {
       el("pre", {}, f.tail.join("\n"))));
   }
   parts.push(el("h3", {}, "Jobs"), tree(run));
-  parts.push(el("h3", {}, "Log"), el("pre", { id: "log" }, ""));
+  parts.push(logDetails("Full log", "full", {}, run));
   $("detail").replaceChildren(...parts);
-  loadLog({});
+}
+
+// Expanded jobs and steps survive the live re-render; a finished run's logs
+// are fetched once per row, a live run's on every re-render.
+const opened = new Set();
+const logCache = new Map();
+const seen = new Set(); // rows already shown once: a failure opens itself only the first time
+let openedRun = null;
+
+function seconds(ms) {
+  return ms == null ? "" : ms < 1000 ? `${ms} ms` : `${Math.round(ms / 1000)}s`;
+}
+
+function row(status, name, ms) {
+  const w = status || "queued";
+  return el("summary", {},
+    el("span", { class: `icon ${w}`, title: w.replace("_", " ") }, ICON[w] || "•"),
+    el("span", { class: "name" }, name),
+    el("span", { class: "duration" }, seconds(ms)));
+}
+
+function jobHeader(job) {
+  const w = job.conclusion || job.status || "queued";
+  const took = seconds(job.duration_ms);
+  return el("summary", { class: "job-header" },
+    el("span", { class: `icon ${w}` }, ICON[w] || "•"),
+    el("span", {},
+      el("span", { class: "job-name" }, (job.name || job.job_id || job.key).trim()),
+      el("span", { class: "meta" }, ` ${w.replace("_", " ")}${took ? ` in ${took}` : ""}`)));
+}
+
+const FAILED = new Set(["failure", "error", "timed_out"]);
+
+function collapsible(key, summary, body, onOpen, failed) {
+  const details = el("details", {}, summary, body);
+  if (failed && !seen.has(key)) opened.add(key);
+  seen.add(key);
+  details.addEventListener("toggle", () => {
+    if (details.open) { opened.add(key); if (onOpen) onOpen(); } else opened.delete(key);
+  });
+  if (opened.has(key)) { details.open = true; if (onOpen) onOpen(); }
+  return details;
+}
+
+function logDetails(title, key, filter, run) {
+  const pre = el("pre", { class: "log" }, "");
+  return el("div", { class: "full-log" },
+    collapsible(key, el("summary", {}, el("strong", {}, title)), pre, () => loadLog(pre, key, filter, run)));
 }
 
 function tree(run) {
-  const groups = (run.tree && run.tree.groups) || [];
-  if (!groups.length) return el("p", { class: "hint" }, "No jobs yet.");
-  return el("ul", { class: "tree" }, ...groups.map((group) => el("li", {},
-    el("span", { class: "meta" }, `stage ${group.name}`),
-    el("ul", {}, ...group.jobs.map((job) => el("li", { class: "job" },
-      el("button", { type: "button", onclick: () => loadLog({ job: job.key }) },
-        badge(job.conclusion || job.status), " ", job.key,
-        job.reason ? el("span", { class: "meta" }, ` ${job.reason}`) : ""),
-      el("ul", { class: "steps" }, ...job.sections.map((s) => el("li", { class: "step" },
-        el("button", { type: "button", onclick: () => loadLog({ job: job.key, section: `${s.stage}:${s.id}` }) },
-          badge(s.conclusion || s.status), ` ${s.stage} ${s.name}`,
-          s.duration_ms != null ? el("span", { class: "meta" }, ` ${s.duration_ms} ms`) : ""))))))))));
+  if (openedRun !== run.id) { opened.clear(); logCache.clear(); seen.clear(); openedRun = run.id; }
+  const jobs = ((run.tree && run.tree.groups) || []).flatMap((group) => group.jobs);
+  if (!jobs.length) return el("p", { class: "hint" }, "No jobs yet.");
+  return el("div", { class: "jobs" }, ...jobs.map((job) => {
+    const steps = job.sections.map((s) => {
+      const key = `step ${job.key} ${s.stage}:${s.id}`;
+      const name = s.stage === "Pre" || s.stage === "Post" ? `${s.stage} ${s.name}` : s.name;
+      const pre = el("pre", { class: "log" }, "");
+      const filter = { job: job.key, section: `${s.stage}:${s.id}` };
+      return collapsible(key, row(s.conclusion || s.status, name, s.duration_ms), pre,
+        () => loadLog(pre, key, filter, run), FAILED.has(s.conclusion));
+    });
+    const body = el("div", { class: "steps" },
+      job.reason ? el("p", { class: "meta" }, job.reason) : "", ...steps);
+    return el("section", { class: "job" },
+      collapsible(`job ${job.key}`, jobHeader(job), body, null, FAILED.has(job.conclusion)));
+  }));
 }
 
-// Cursor-paged log for the selected run (optionally one job or step).
-async function loadLog(filter) {
-  const pre = $("log");
-  if (!pre || !selected) return;
-  pre.textContent = "";
+// Cursor-paged log for one job step (or the whole run) into `pre`.
+async function loadLog(pre, key, filter, run) {
+  const done = run.state === "done";
+  if (done && logCache.has(key)) { pre.replaceChildren(logCache.get(key).cloneNode(true)); return; }
+  const all = document.createDocumentFragment();
   let since = 0;
   for (let page = 0; page < 40; page++) {
     const q = new URLSearchParams({ since_seq: since, limit: 1000, ...filter });
-    const logs = await api(`/v1/runs/${selected}/logs?${q}`);
-    const lines = document.createDocumentFragment();
+    const logs = await api(`/v1/runs/${run.id}/logs?${q}`);
     for (const record of logs.records) {
       const stream = record.stream === "stderr" ? "stderr" : record.stream === "stdout" ? "stdout" : "bosn";
-      lines.append(el("span", { class: `log-line ${stream}` },
-        el("span", { class: "log-channel" }, `[${stream}] `), record.text), "\n");
+      all.append(el("span", { class: `log-line ${stream}` }, record.text.replace(/\n$/, "")));
     }
-    pre.append(lines);
     since = logs.next_seq;
     if (!logs.more) break;
   }
+  if (!all.childNodes.length) all.append(el("span", { class: "log-line bosn" }, "No output."));
+  if (done) logCache.set(key, all.cloneNode(true));
+  pre.replaceChildren(all);
 }
 
 // Live feed: debounce refreshes; a resync refetches everything.

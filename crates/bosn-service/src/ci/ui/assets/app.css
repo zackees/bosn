@@ -32,13 +32,31 @@ ul { list-style: none; margin: 0; padding: 0; }
 .success { color: var(--ok); } .failure, .error, .timed_out { color: var(--fail); }
 .cancelled, .skipped, .remote_only, .incomplete, .refused, .unsupported, .queued { color: var(--warn); }
 .running, .in_progress { color: var(--run); }
-.tree li { margin: 2px 0; }
-.tree .job > button, .tree .step > button { border: 0; background: transparent; padding: 1px 4px; text-align: left; }
-.tree .steps { margin-left: 22px; }
-pre#log { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px;
-          max-height: 55vh; overflow: auto; white-space: pre-wrap; font: 12px/1.4 ui-monospace, monospace; }
+.jobs { display: grid; gap: 12px; }
+.job { border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+.job summary { list-style: none; cursor: pointer; }
+.job summary::-webkit-details-marker { display: none; }
+.job-header { display: flex; gap: 10px; align-items: baseline; padding: 10px 14px; }
+.job > details[open] > .job-header { border-bottom: 1px solid var(--line); }
+.job-name { font-weight: 600; color: var(--run); }
+.steps { padding: 6px 8px; }
+.steps > p { margin: 4px 8px; }
+.steps summary { display: flex; gap: 10px; align-items: center; padding: 5px 8px; border-radius: 6px; }
+.steps summary::before { content: "›"; width: 10px; color: var(--muted); transition: transform .1s; }
+.steps details[open] > summary::before { transform: rotate(90deg); }
+.steps summary:hover, .steps details[open] > summary { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+.steps .name { flex: 1; overflow-wrap: anywhere; }
+.duration { color: var(--muted); font: 12px ui-monospace, monospace; white-space: nowrap; }
+.icon { width: 16px; text-align: center; font-weight: 700; }
+summary:focus-visible { outline: 2px solid var(--run); outline-offset: -2px; }
+pre.log { margin: 4px 0 8px 28px; padding: 6px 0; max-height: 60vh; overflow: auto; counter-reset: line;
+          white-space: pre-wrap; font: 12px/1.5 ui-monospace, monospace; }
+.log-line { display: block; padding-left: 4.5em; text-indent: -4.5em; }
+.log-line::before { counter-increment: line; content: counter(line); display: inline-block; width: 3.5em;
+                    margin-right: 1em; text-align: right; color: var(--muted); text-indent: 0; user-select: none; }
 .log-line.stderr { color: var(--fail); }
 .log-line.bosn { color: var(--muted); }
-.log-channel { font-weight: 700; }
+.full-log { margin-top: 16px; }
+.full-log > details > summary { cursor: pointer; padding: 4px 0; }
 .failure-box { border-left: 3px solid var(--fail); padding: 4px 10px; margin: 8px 0; }
 button.confirming { border-color: var(--fail); color: var(--fail); }
