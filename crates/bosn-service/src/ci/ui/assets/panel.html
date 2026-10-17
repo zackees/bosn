@@ -2,26 +2,72 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>bosn panel</title>
 <link rel="stylesheet" href="/widget/widget.css">
 </head>
 <body class="panel">
-<header>
-  <strong>bosn ci</strong>
-  <span id="runners" role="status" aria-live="polite"></span>
+<header class="top">
+  <div class="brand">
+    <span class="mark" aria-hidden="true"></span>
+    <strong>Bosn CI</strong>
+    <span id="link" class="link" role="status" aria-live="polite" title="Connected to the daemon"></span>
+  </div>
+  <div class="top-actions">
+    <button id="open-full" type="button" class="ghost" title="Open the full dashboard">Dashboard ↗</button>
+    <button id="hide" type="button" class="icon" aria-label="Hide panel (Esc)" title="Hide (Esc)">✕</button>
+  </div>
 </header>
-<div class="controls">
-  <button id="open-full" type="button">Open full view</button>
-  <button id="drain" type="button">Drain</button>
-  <button id="resume" type="button">Resume</button>
-  <label>Limit <input id="limit" type="number" min="1" max="256" size="3"></label>
-  <button id="set-limit" type="button">Set</button>
-  <span id="prune-slot"></span>
-  <span id="clear-cache-slot"></span>
-  <span id="cache" role="status" aria-live="polite"></span>
-  <span id="quit-slot"></span>
-</div>
-<ul id="runs" aria-label="Runs across workspaces"></ul>
+
+<section class="stats" aria-label="Runner status">
+  <button type="button" class="stat running" data-filter="active"><b id="stat-running">0</b><span>running</span></button>
+  <button type="button" class="stat queued" data-filter="active"><b id="stat-queued">0</b><span>queued</span></button>
+  <button type="button" class="stat failed" data-filter="failed"><b id="stat-failed">0</b><span>failed</span></button>
+  <div class="stat capacity"><b id="stat-limit">–</b><span>slots</span></div>
+</section>
+
+<div id="banner" class="banner" role="status" aria-live="polite" hidden></div>
+
+<nav class="filters" aria-label="Filter runs">
+  <button type="button" data-filter="all" aria-pressed="true">All</button>
+  <button type="button" data-filter="active" aria-pressed="false">Active</button>
+  <button type="button" data-filter="failed" aria-pressed="false">Failed</button>
+</nav>
+
+<main class="list">
+  <ul id="runs" aria-label="Runs across workspaces"></ul>
+  <div id="empty" class="empty" hidden></div>
+</main>
+
+<details id="manage" class="manage">
+  <summary>Manage runners</summary>
+  <div class="manage-body">
+    <div class="row">
+      <span>Concurrent runs</span>
+      <span class="stepper">
+        <button id="limit-down" type="button" class="icon" aria-label="Fewer concurrent runs">−</button>
+        <input id="limit" type="number" min="1" max="256" aria-label="Concurrent run limit">
+        <button id="limit-up" type="button" class="icon" aria-label="More concurrent runs">+</button>
+      </span>
+    </div>
+    <div class="row">
+      <span id="drain-text">New runs start when a slot is free.</span>
+      <button id="drain-toggle" type="button">Drain</button>
+    </div>
+    <div class="row">
+      <span id="cache">Cache: not measured</span>
+      <button id="measure-cache" type="button">Measure</button>
+    </div>
+    <div class="row wrap">
+      <span id="prune-slot"></span>
+      <span id="clear-cache-slot"></span>
+      <span id="quit-slot"></span>
+    </div>
+  </div>
+</details>
+
+<footer class="foot"><span id="updated">Connecting…</span><span class="keys">Esc to hide</span></footer>
+<div id="toast" class="toast" role="alert" hidden></div>
 <script src="/shared.js"></script>
 <script src="/widget/widget.js"></script>
 </body>
